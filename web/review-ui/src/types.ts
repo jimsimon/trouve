@@ -134,10 +134,10 @@ export interface ReviewTask {
   model?: string;
   session_id?: string;
   thread_id?: string;
-  prompt: string;
-  output: string;
-  thinking: string;
-  tool_output: string;
+  prompt?: string;
+  output?: string;
+  thinking?: string;
+  tool_output?: string;
   candidate_issue_count: number;
   confirmed_issue_count: number;
   provider_wait_ms: number;
@@ -146,7 +146,7 @@ export interface ReviewTask {
   cached_input_tokens: number;
   output_tokens: number;
   tool_call_count: number;
-  error: string;
+  error?: string;
   created_at: string;
   started_at?: string;
   completed_at?: string;

@@ -29,3 +29,10 @@ test("appending to an already bounded transcript retains the newest output", () 
     appended.lastIndexOf(LIVE_OUTPUT_OMITTED_MARKER),
   );
 });
+
+test("the first review output delta does not prepend undefined", () => {
+  assert.equal(
+    appendBoundedReviewOutput(undefined, "I'll examine the change."),
+    "I'll examine the change.",
+  );
+});

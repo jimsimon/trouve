@@ -41,6 +41,10 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REVIEWER_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_REVIEWER_TIMEOUT_SECONDS";
+const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REVIEW_COORDINATOR_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_COORDINATOR_TIMEOUT_SECONDS";
+const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
@@ -127,6 +131,42 @@ fn code_review_timeout() -> Duration {
                 "invalid code-review timeout; using the default"
             );
             DEFAULT_REVIEW_TIMEOUT
+        }
+    }
+}
+
+fn code_review_coordinator_timeout() -> Duration {
+    let Ok(value) = std::env::var(REVIEW_COORDINATOR_TIMEOUT_ENV) else {
+        return DEFAULT_REVIEW_COORDINATOR_TIMEOUT;
+    };
+    match parse_code_review_timeout(&value) {
+        Some(timeout) => timeout,
+        None => {
+            tracing::warn!(
+                variable = REVIEW_COORDINATOR_TIMEOUT_ENV,
+                value,
+                default_seconds = DEFAULT_REVIEW_COORDINATOR_TIMEOUT.as_secs(),
+                "invalid code-review coordinator timeout; using the default"
+            );
+            DEFAULT_REVIEW_COORDINATOR_TIMEOUT
+        }
+    }
+}
+
+fn code_review_reviewer_timeout() -> Duration {
+    let Ok(value) = std::env::var(REVIEWER_TIMEOUT_ENV) else {
+        return DEFAULT_REVIEWER_TIMEOUT;
+    };
+    match parse_code_review_timeout(&value) {
+        Some(timeout) => timeout,
+        None => {
+            tracing::warn!(
+                variable = REVIEWER_TIMEOUT_ENV,
+                value,
+                default_seconds = DEFAULT_REVIEWER_TIMEOUT.as_secs(),
+                "invalid code-review reviewer timeout; using the default"
+            );
+            DEFAULT_REVIEWER_TIMEOUT
         }
     }
 }
@@ -3089,14 +3129,18 @@ impl Engine {
                             )?
                             .ok_or_else(|| anyhow!("review task was cancelled before dispatch"))?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
+                        let timeout_label =
+                            format!("reviewer {} batch {}", reviewer.name, batch_index + 1);
                         let (turn, parsed) = engine
-                            .run_parsed_code_review_turn(
+                            .run_timed_parsed_code_review_turn(
                                 &job,
                                 &task.id,
                                 &thread.id,
                                 prompt,
                                 &superseded,
                                 &active_threads,
+                                code_review_reviewer_timeout(),
+                                &timeout_label,
                             )
                             .await?;
                         let candidates = parsed
@@ -3218,14 +3262,17 @@ impl Engine {
                 )?
                 .ok_or_else(|| anyhow!("coordinator task was cancelled before dispatch"))?;
             self.emit_code_review_task(&job.id, task.clone())?;
+            let coordinator_timeout = code_review_coordinator_timeout();
             let turn = self
-                .run_parsed_code_review_turn(
+                .run_timed_parsed_code_review_turn(
                     &job,
                     &task.id,
                     &coordinator.id,
                     prompt,
                     superseded,
                     active_threads,
+                    coordinator_timeout,
+                    "final review editor",
                 )
                 .await;
             let turn = match turn {
@@ -3437,6 +3484,49 @@ impl Engine {
             )
         })?;
         Ok((turn, parsed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_timed_parsed_code_review_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        task_id: &str,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+        timeout: Duration,
+        timeout_label: &str,
+    ) -> Result<(ReviewTurnResult, ReviewOutput)> {
+        match tokio::time::timeout(
+            timeout,
+            self.run_parsed_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                prompt,
+                superseded,
+                active_threads,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if let Err(error) = self.cancel_turn(thread_id) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        thread_id,
+                        %error,
+                        "failed to cancel timed-out code-review task"
+                    );
+                }
+                bail!(
+                    "{timeout_label} timed out after {}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                )
+            }
+        }
     }
 
     async fn run_semantic_routing_turn(
@@ -6711,6 +6801,11 @@ mod tests {
     fn review_duration_settings_must_be_positive_seconds() {
         assert_eq!(DEFAULT_RECONCILE_INTERVAL, Duration::from_secs(60));
         assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(15 * 60));
+        assert_eq!(DEFAULT_REVIEWER_TIMEOUT, Duration::from_secs(5 * 60));
+        assert_eq!(
+            DEFAULT_REVIEW_COORDINATOR_TIMEOUT,
+            Duration::from_secs(3 * 60)
+        );
         assert_eq!(
             parse_code_review_poll_interval(" 15 "),
             Some(Duration::from_secs(15))

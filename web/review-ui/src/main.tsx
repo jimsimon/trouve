@@ -1565,17 +1565,17 @@ function JobDetailPane({
                 )}
                 <OutputBlock
                   title="Assistant output"
-                  value={selectedTask.output}
+                  value={selectedTask.output ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 <OutputBlock
                   title="Reasoning"
-                  value={selectedTask.thinking}
+                  value={selectedTask.thinking ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 <OutputBlock
                   title="Tool output"
-                  value={selectedTask.tool_output}
+                  value={selectedTask.tool_output ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 {selectedTask.prompt && (
