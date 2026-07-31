@@ -666,7 +666,7 @@ fn sanitize_title(raw: &str) -> Result<String> {
         .trim_end_matches(['.', '!', '?', ':', ';'])
         .trim();
     let words = line.split_whitespace().count();
-    if !(2..=7).contains(&words) || line.chars().count() > 80 || line.contains(['<', '>', '{', '}'])
+    if !(2..=5).contains(&words) || line.chars().count() > 80 || line.contains(['<', '>', '{', '}'])
     {
         bail!("session title model returned an invalid title");
     }
@@ -691,6 +691,7 @@ mod tests {
             "Fix prompt drafts between sessions"
         );
         assert!(sanitize_title("one").is_err());
+        assert!(sanitize_title("Adaptive session naming uses available resources").is_err());
         assert!(
             sanitize_title("Adaptive session naming takes CPU load and memory into account")
                 .is_err()
