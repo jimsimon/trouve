@@ -25,10 +25,10 @@ const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STAGE_RUNTIME: u8 = 1;
 const STAGE_MODEL: u8 = 2;
-// Five words remains the generation target, but one extra word is still a
-// concise navigation title and often preserves a required qualifier. Keep
+// Five words remains the generation target, but up to two extra words can
+// preserve required qualifiers without making a poor navigation title. Keep
 // this hard acceptance limit separate from the prompt's softer target.
-const MAX_ACCEPTED_TITLE_WORDS: usize = 6;
+const MAX_ACCEPTED_TITLE_WORDS: usize = 7;
 const TITLE_SYSTEM_PROMPT: &str = "Create a concise navigation title for the user's primary \
 software request or question. First identify the requested outcome across the whole prompt. Title \
 that outcome, not background observations, examples, prompt wording, or a guessed solution. Do not \
@@ -729,9 +729,12 @@ mod tests {
             "Fix OAuth PKCE Redirect URI Mismatch"
         );
         assert!(sanitize_title("one").is_err());
+        assert_eq!(
+            sanitize_title("Avoid GPU contention during local session naming").unwrap(),
+            "Avoid GPU contention during local session naming"
+        );
         assert!(
-            sanitize_title("Adaptive session naming takes CPU load and memory into account")
-                .is_err()
+            sanitize_title("Avoid GPU resource contention during local session naming").is_err()
         );
         assert!(sanitize_title("<tool_call>bad title</tool_call>").is_err());
     }
