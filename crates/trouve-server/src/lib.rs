@@ -719,11 +719,14 @@ async fn info(State(engine): State<Arc<Engine>>) -> Json<ServerInfo> {
 }
 
 #[utoipa::path(get, path = "/v1/code-review",
-    responses((status = 200, body = CodeReviewDashboard), (status = 500, body = ErrorBody)))]
+    responses((status = 200, body = CodeReviewDashboard,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot"))),
+        (status = 500, body = ErrorBody)))]
 async fn code_review_dashboard(
     State(engine): State<Arc<Engine>>,
-) -> Result<Json<CodeReviewDashboard>, ApiError> {
-    Ok(Json(engine.code_review_dashboard()?))
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, dashboard) = engine.code_review_dashboard_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(dashboard)))
 }
 
 #[derive(Debug, Deserialize)]

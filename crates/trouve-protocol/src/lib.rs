@@ -127,7 +127,10 @@ pub use requests::*;
 // 1.20: Git & Worktrees settings expose a persisted session-title compute
 // resource policy spanning adaptive, mixed GPU/CPU, GPU-only, and CPU-only
 // placement (additive).
-pub const PROTOCOL_VERSION: &str = "1.20";
+// 1.21: the code-review dashboard response includes the server event cursor
+// for its snapshot so clients can resume SSE without replaying retained
+// code-review update history (additive).
+pub const PROTOCOL_VERSION: &str = "1.21";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

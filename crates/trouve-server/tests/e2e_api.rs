@@ -4041,14 +4041,16 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     let base = format!("http://{addr}/v1/code-review");
     let client = reqwest::Client::new();
 
-    let empty: serde_json::Value = client
-        .get(&base)
-        .send()
-        .await
+    let empty_response = client.get(&base).send().await.unwrap();
+    let empty_cursor = empty_response
+        .headers()
+        .get(trouve_protocol::EVENT_CURSOR_HEADER)
         .unwrap()
-        .json()
-        .await
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
         .unwrap();
+    let empty: serde_json::Value = empty_response.json().await.unwrap();
     assert_eq!(empty["app"]["configured"], false);
     assert_eq!(empty["repositories"], serde_json::json!([]));
     assert!(empty["reviewers"].as_array().unwrap().len() >= 12);
@@ -4135,14 +4137,17 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .unwrap();
     assert!(response.status().is_success());
 
-    let dashboard: serde_json::Value = client
-        .get(&base)
-        .send()
-        .await
+    let dashboard_response = client.get(&base).send().await.unwrap();
+    let dashboard_cursor = dashboard_response
+        .headers()
+        .get(trouve_protocol::EVENT_CURSOR_HEADER)
         .unwrap()
-        .json()
-        .await
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
         .unwrap();
+    assert!(dashboard_cursor > empty_cursor);
+    let dashboard: serde_json::Value = dashboard_response.json().await.unwrap();
     assert_eq!(dashboard["repositories"][0]["repository"], "acme/widgets");
     assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
     assert_eq!(dashboard["repositories"][0]["model"], "anthropic/claude");

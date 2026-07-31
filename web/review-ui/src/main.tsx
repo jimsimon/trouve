@@ -51,6 +51,14 @@ import {
   thinkingOptions,
   thinkingSelectionIsValid,
 } from "./model-settings";
+import {
+  LIVE_OUTPUT_BATCH_MS,
+  appendBoundedReviewOutput,
+  boundReviewOutput,
+  boundReviewTaskOutput,
+  reviewTaskSummary,
+  type ReviewOutputField,
+} from "./review-output";
 import { jobStatusClass, safeExternalUrl } from "./security";
 import type {
   Dashboard,
@@ -78,6 +86,8 @@ import type {
 Chart.register(...registerables);
 
 type Section = "overview" | "jobs" | "repositories" | "reviewers" | "stats" | "settings";
+
+const SERVER_EVENT_REFRESH_DEBOUNCE_MS = 100;
 
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: "overview", label: "Overview", icon: "◫" },
@@ -296,18 +306,47 @@ function App() {
   const [dashboardError, setDashboardError] = useState("");
   const [configurationError, setConfigurationError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [serverEventAfter, setServerEventAfter] = useState<number | null>(null);
+  const serverEventCursorRef = useRef(0);
+  const dashboardLoadRef = useRef<{
+    promise: Promise<void> | null;
+    reloadRequested: boolean;
+  }>({ promise: null, reloadRequested: false });
 
-  const loadDashboard = async (quiet = false): Promise<void> => {
-    if (!quiet) setLoading(true);
-    try {
-      setDashboard(await getDashboard());
-      setDashboardError("");
-    } catch (cause) {
-      setDashboardError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (!quiet) setLoading(false);
+  const loadDashboard = useCallback((quiet = false): Promise<void> => {
+    const state = dashboardLoadRef.current;
+    if (state.promise) {
+      state.reloadRequested = true;
+      return state.promise;
     }
-  };
+    const request = (async (): Promise<void> => {
+      if (!quiet) setLoading(true);
+      try {
+        do {
+          state.reloadRequested = false;
+          try {
+            const snapshot = await getDashboard();
+            serverEventCursorRef.current = Math.max(
+              serverEventCursorRef.current,
+              snapshot.cursor,
+            );
+            setServerEventAfter((current) => current ?? snapshot.cursor);
+            setDashboard(snapshot.dashboard);
+            setDashboardError("");
+          } catch (cause) {
+            setDashboardError(cause instanceof Error ? cause.message : String(cause));
+          }
+        } while (state.reloadRequested);
+      } finally {
+        if (!quiet) setLoading(false);
+      }
+    })();
+    state.promise = request;
+    void request.finally(() => {
+      if (state.promise === request) state.promise = null;
+    });
+    return request;
+  }, []);
 
   const loadConfiguration = async (): Promise<void> => {
     const results = await Promise.allSettled([
@@ -327,7 +366,7 @@ function App() {
     if (!window.location.hash) navigate("overview");
     void loadDashboard();
     return () => window.removeEventListener("hashchange", onHash);
-  }, []);
+  }, [loadDashboard]);
 
   const needsConfiguration =
     route.section === "repositories" ||
@@ -337,14 +376,23 @@ function App() {
     if (needsConfiguration) void loadConfiguration();
   }, [needsConfiguration]);
 
-  useEffect(() => openServerEvents(() => void loadDashboard(true)), []);
-
-  const active = dashboard?.jobs.some((job) => job.status === "running" || job.status === "queued");
   useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => void loadDashboard(true), 5_000);
-    return () => window.clearInterval(timer);
-  }, [active]);
+    if (serverEventAfter === null) return;
+    let refreshTimer: number | undefined;
+    const close = openServerEvents(serverEventAfter, (event) => {
+      if (event.cursor <= serverEventCursorRef.current) return;
+      serverEventCursorRef.current = event.cursor;
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = undefined;
+        void loadDashboard(true);
+      }, SERVER_EVENT_REFRESH_DEBOUNCE_MS);
+    });
+    return () => {
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
+      close();
+    };
+  }, [serverEventAfter, loadDashboard]);
 
   const error = dashboardError || (needsConfiguration ? configurationError : "");
   const content = dashboard ? (
@@ -695,8 +743,10 @@ function JobDetailPane({
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
   const taskRequestsRef = useRef(new Set<string>());
-  const detailStatusRef = useRef(detail?.job.status);
-  detailStatusRef.current = detail?.job.status;
+  const selectedTaskIdRef = useRef(selectedTaskId);
+  const taskDetailsRef = useRef(taskDetails);
+  selectedTaskIdRef.current = selectedTaskId;
+  taskDetailsRef.current = taskDetails;
   const load = useCallback(async (): Promise<JobDetail | undefined> => {
     const requestedJobId = jobId;
     try {
@@ -726,9 +776,15 @@ function JobDetailPane({
         return next;
       });
       try {
-        const next = await getTask(jobId, taskId);
-        if (aliveRef.current === jobId && next.job_id === jobId) {
-          setTaskDetails((current) => ({ ...current, [taskId]: next }));
+        const next = boundReviewTaskOutput(await getTask(jobId, taskId));
+        if (
+          aliveRef.current === jobId &&
+          next.job_id === jobId &&
+          selectedTaskIdRef.current === taskId
+        ) {
+          const details = { [taskId]: next };
+          taskDetailsRef.current = details;
+          setTaskDetails(details);
         }
       } catch (cause) {
         if (aliveRef.current === jobId) {
@@ -746,6 +802,8 @@ function JobDetailPane({
     aliveRef.current = jobId;
     setDetail(null);
     setSelectedTaskId("");
+    selectedTaskIdRef.current = "";
+    taskDetailsRef.current = {};
     setTaskDetails({});
     setTaskLoading("");
     setTaskErrors({});
@@ -760,41 +818,99 @@ function JobDetailPane({
 
   useEffect(() => {
     if (eventCursor === null) return;
-    const timeouts = new Set<number>();
+    type PendingOutput = Partial<Record<ReviewOutputField, string>>;
+    const pendingOutput = new Map<string, PendingOutput>();
+    let outputTimer: number | undefined;
+    let detailReloadTimer: number | undefined;
+    let missedHiddenOutput = false;
+
+    const scheduleDetailReload = (): void => {
+      if (detailReloadTimer !== undefined) window.clearTimeout(detailReloadTimer);
+      detailReloadTimer = window.setTimeout(() => {
+        detailReloadTimer = undefined;
+        void load();
+      }, 150);
+    };
+
+    const flushOutput = (): void => {
+      outputTimer = undefined;
+      if (document.visibilityState !== "visible") {
+        missedHiddenOutput ||= pendingOutput.size > 0;
+        pendingOutput.clear();
+        return;
+      }
+      const patches = new Map(pendingOutput);
+      pendingOutput.clear();
+      if (!patches.size) return;
+      setTaskDetails((current) => {
+        let next = current;
+        for (const [taskId, streams] of patches) {
+          const task = next[taskId];
+          if (!task) continue;
+          let updated = task;
+          for (const [field, text] of Object.entries(streams) as Array<
+            [ReviewOutputField, string]
+          >) {
+            updated = {
+              ...updated,
+              [field]: appendBoundedReviewOutput(updated[field], text),
+            };
+          }
+          if (updated !== task) {
+            if (next === current) next = { ...current };
+            next[taskId] = updated;
+          }
+        }
+        taskDetailsRef.current = next;
+        return next;
+      });
+    };
+
+    const scheduleOutputFlush = (): void => {
+      if (outputTimer !== undefined || document.visibilityState !== "visible") return;
+      outputTimer = window.setTimeout(flushOutput, LIVE_OUTPUT_BATCH_MS);
+    };
+
+    const syncVisibility = (): void => {
+      if (document.visibilityState !== "visible") {
+        if (outputTimer !== undefined) window.clearTimeout(outputTimer);
+        outputTimer = undefined;
+        missedHiddenOutput ||= pendingOutput.size > 0;
+        pendingOutput.clear();
+        return;
+      }
+      if (!missedHiddenOutput) return;
+      missedHiddenOutput = false;
+      const taskId = selectedTaskIdRef.current;
+      taskDetailsRef.current = {};
+      setTaskDetails({});
+      void load();
+      if (taskId) void loadTask(taskId);
+    };
+
+    document.addEventListener("visibilitychange", syncVisibility);
     const close = openJobEvents(jobId, eventCursor, (event) => {
       if (aliveRef.current !== jobId) return;
       if (event.type === "code_review.output_delta" && event.task_id && event.text) {
-        setDetail((current) => {
-          if (!current) return current;
-          const field =
-            event.stream === "thinking"
-              ? "thinking"
-              : event.stream === "tool"
-                ? "tool_output"
-                : "output";
-          return {
-            ...current,
-            tasks: current.tasks.map((task) =>
-              task.id === event.task_id
-                ? { ...task, [field]: `${task[field]}${event.text}` }
-                : task,
-            ),
-          };
-        });
-        setTaskDetails((current) => {
-          const task = current[event.task_id!];
-          if (!task) return current;
-          const field =
-            event.stream === "thinking"
-              ? "thinking"
-              : event.stream === "tool"
-                ? "tool_output"
-                : "output";
-          return {
-            ...current,
-            [task.id]: { ...task, [field]: `${task[field]}${event.text}` },
-          };
-        });
+        if (event.task_id !== selectedTaskIdRef.current) return;
+        if (document.visibilityState !== "visible") {
+          missedHiddenOutput = true;
+          return;
+        }
+        if (!taskDetailsRef.current[event.task_id]) {
+          void loadTask(event.task_id);
+          return;
+        }
+        const field: ReviewOutputField =
+          event.stream === "thinking"
+            ? "thinking"
+            : event.stream === "tool"
+              ? "tool_output"
+              : "output";
+        const streams = pendingOutput.get(event.task_id) ?? {};
+        streams[field] = appendBoundedReviewOutput(streams[field] ?? "", event.text);
+        pendingOutput.set(event.task_id, streams);
+        scheduleOutputFlush();
       } else if (
         event.type === "code_review.routing_updated" &&
         event.routing_decisions
@@ -803,34 +919,46 @@ function JobDetailPane({
           current ? { ...current, routing_decisions: event.routing_decisions } : current,
         );
       } else if (event.type === "code_review.task_updated" && event.task) {
+        const task = event.task;
+        pendingOutput.delete(task.id);
+        if (!pendingOutput.size && outputTimer !== undefined) {
+          window.clearTimeout(outputTimer);
+          outputTimer = undefined;
+        }
+        const summary = reviewTaskSummary(task);
         setDetail((current) => {
           if (!current) return current;
-          const exists = current.tasks.some((task) => task.id === event.task?.id);
+          const exists = current.tasks.some((currentTask) => currentTask.id === task.id);
           return {
             ...current,
             tasks: exists
-              ? current.tasks.map((task) => (task.id === event.task?.id ? event.task! : task))
-              : [...current.tasks, event.task!],
+              ? current.tasks.map((currentTask) =>
+                  currentTask.id === task.id ? summary : currentTask,
+                )
+              : [...current.tasks, summary],
           };
         });
-        setTaskDetails((current) => ({
-          ...current,
-          [event.task!.id]: event.task!,
-        }));
-        const timeout = window.setTimeout(() => {
-          timeouts.delete(timeout);
-          void load();
-        }, 150);
-        timeouts.add(timeout);
+        if (task.id === selectedTaskIdRef.current) {
+          if (document.visibilityState === "visible") {
+            const details = { [task.id]: boundReviewTaskOutput(task) };
+            taskDetailsRef.current = details;
+            setTaskDetails(details);
+          } else {
+            missedHiddenOutput = true;
+          }
+        }
+        scheduleDetailReload();
       } else {
-        void load();
+        scheduleDetailReload();
       }
     });
     return () => {
-      for (const timeout of timeouts) window.clearTimeout(timeout);
+      document.removeEventListener("visibilitychange", syncVisibility);
+      if (outputTimer !== undefined) window.clearTimeout(outputTimer);
+      if (detailReloadTimer !== undefined) window.clearTimeout(detailReloadTimer);
       close();
     };
-  }, [jobId, eventCursor, load]);
+  }, [jobId, eventCursor, load, loadTask]);
 
   useEffect(() => {
     if (!detail?.tasks.length) {
@@ -849,20 +977,13 @@ function JobDetailPane({
   }, [selectedTaskId, taskDetails, taskErrors, loadTask]);
 
   useEffect(() => {
-    aliveRef.current = jobId;
-    const timer = window.setInterval(() => {
-      if (
-        detailStatusRef.current === "running" ||
-        detailStatusRef.current === "queued"
-      ) {
-        void load();
-      }
-    }, 3_000);
-    return () => {
-      if (aliveRef.current === jobId) aliveRef.current = null;
-      window.clearInterval(timer);
-    };
-  }, [jobId, load]);
+    setTaskDetails((current) => {
+      const retained = selectedTaskId ? current[selectedTaskId] : undefined;
+      const next = retained ? { [selectedTaskId]: retained } : {};
+      taskDetailsRef.current = next;
+      return next;
+    });
+  }, [selectedTaskId]);
 
   const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
     if (!detail) return;
@@ -1486,15 +1607,22 @@ function OutputBlock({
 }) {
   const preRef = useRef<HTMLPreElement>(null);
   const pinnedRef = useRef(true);
+  const boundedValue = boundReviewOutput(value);
   useEffect(() => {
-    if (!followTail || !pinnedRef.current) return;
+    if (
+      !followTail ||
+      !pinnedRef.current ||
+      document.visibilityState !== "visible"
+    ) {
+      return;
+    }
     const frame = window.requestAnimationFrame(() => {
       const element = preRef.current;
       if (element && pinnedRef.current) element.scrollTop = element.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [followTail, value]);
-  if (!value) return null;
+  }, [followTail, boundedValue]);
+  if (!boundedValue) return null;
   return (
     <section class="output-block">
       <h3>{title}</h3>
@@ -1508,7 +1636,7 @@ function OutputBlock({
             element.scrollHeight - element.scrollTop - element.clientHeight <= 16;
         }}
       >
-        {value}
+        {boundedValue}
       </pre>
     </section>
   );

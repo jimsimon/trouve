@@ -19,14 +19,9 @@ import type {
 } from "./types";
 import type { CliInfo, CliInstallStatus } from "./cli";
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/v1${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
+const EVENT_CURSOR_HEADER = "x-trouve-event-cursor";
+
+async function decodeApiResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }));
     throw new Error(body.message ?? `Request failed (${response.status})`);
@@ -35,7 +30,35 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body ? (JSON.parse(body) as T) : (undefined as T);
 }
 
-export const getDashboard = (): Promise<Dashboard> => api("/code-review");
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(`/v1${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+  return decodeApiResponse<T>(response);
+}
+
+export interface DashboardSnapshot {
+  dashboard: Dashboard;
+  cursor: number;
+}
+
+export async function getDashboard(): Promise<DashboardSnapshot> {
+  const response = await fetch("/v1/code-review", {
+    headers: { "Content-Type": "application/json" },
+  });
+  const dashboard = await decodeApiResponse<Dashboard>(response);
+  const cursorValue = response.headers.get(EVENT_CURSOR_HEADER);
+  const cursor = cursorValue === null ? Number.NaN : Number(cursorValue);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) {
+    throw new Error("Review dashboard response is missing a valid event cursor");
+  }
+  return { dashboard, cursor };
+}
+
 export const getJob = (id: string): Promise<JobDetail> =>
   api(`/code-review/jobs/${encodeURIComponent(id)}?include_task_content=false`);
 export const getTask = (jobId: string, taskId: string): Promise<ReviewTask> =>
@@ -205,12 +228,15 @@ export const submitLoginCode = (
     body: JSON.stringify({ callback_url: code }),
   });
 
-export function openServerEvents(onReviewUpdate: () => void): () => void {
-  const source = new EventSource("/v1/events");
+export function openServerEvents(
+  after: number,
+  onReviewUpdate: (event: EventEnvelope) => void,
+): () => void {
+  const source = new EventSource(`/v1/events?after=${encodeURIComponent(after)}`);
   source.onmessage = (message) => {
     try {
       const event = JSON.parse(message.data) as EventEnvelope;
-      if (event.type === "code_review.updated") onReviewUpdate();
+      if (event.type === "code_review.updated") onReviewUpdate(event);
     } catch {
       // Reconnect/replay will deliver the next complete event.
     }

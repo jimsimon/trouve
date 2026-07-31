@@ -850,7 +850,18 @@ impl ProtocolClient {
     // --- automated code reviews ---------------------------------------------
 
     pub async fn code_review_dashboard(&self) -> Result<CodeReviewDashboard> {
-        self.get_json("/code-review").await
+        Ok(self.code_review_dashboard_snapshot().await?.1)
+    }
+
+    pub async fn code_review_dashboard_snapshot(&self) -> Result<(u64, CodeReviewDashboard)> {
+        let path = "/code-review";
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, path).await
     }
 
     pub async fn code_review_job(&self, id: &str) -> Result<CodeReviewJobDetail> {
