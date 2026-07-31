@@ -49,12 +49,15 @@ Prompt: Would SQLite or RocksDB better fit the local event store?\n\
 Title: Compare SQLite and RocksDB\n\n\
 /no_think";
 
-fn title_messages(prompt: &str) -> serde_json::Value {
-    serde_json::json!([
-        { "role": "system", "content": TITLE_SYSTEM_PROMPT },
-        { "role": "user", "content": prompt }
-    ])
-}
+const TITLE_FIXED_MESSAGE_BYTES: usize = TITLE_SYSTEM_PROMPT.len();
+// Reserve the output and fixed message budgets plus a conservative allowance
+// for Qwen3's chat-template wrappers. The remaining bytes bound token-dense
+// prompts by their worst-case byte fallback.
+const TITLE_CHAT_TEMPLATE_TOKEN_RESERVE: usize = 128;
+const MAX_TITLE_PROMPT_BYTES: usize = crate::local::TITLE_MODEL_CONTEXT as usize
+    - MAX_TITLE_TOKENS
+    - TITLE_FIXED_MESSAGE_BYTES
+    - TITLE_CHAT_TEMPLATE_TOKEN_RESERVE;
 
 #[derive(Debug)]
 enum InstallState {
@@ -299,7 +302,7 @@ impl TitleModelManager {
         // Once a sidecar has been started, on-demand policies must release it
         // even if the HTTP request times out or its output is rejected.
         self.schedule_idle_release();
-        let prompt = crate::title::cap_prompt(prompt);
+        let prompt = cap_title_model_prompt(prompt);
         let response = tokio::time::timeout(GENERATION_TIMEOUT, async {
             self.http
                 .post(format!("{base_url}/chat/completions"))
@@ -587,6 +590,25 @@ impl TitleModelManager {
     }
 }
 
+fn cap_title_model_prompt(prompt: &str) -> &str {
+    let prompt = crate::title::cap_prompt(prompt);
+    if prompt.len() <= MAX_TITLE_PROMPT_BYTES {
+        return prompt;
+    }
+    let mut end = MAX_TITLE_PROMPT_BYTES;
+    while !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    &prompt[..end]
+}
+
+fn title_messages(prompt: &str) -> serde_json::Value {
+    serde_json::json!([
+        { "role": "system", "content": TITLE_SYSTEM_PROMPT },
+        { "role": "user", "content": prompt }
+    ])
+}
+
 fn install_progress_key(
     stage: &AtomicU8,
     progress: &trouve_agents::install::Progress,
@@ -714,8 +736,9 @@ mod tests {
     use trouve_protocol::{TitleModelLoadBehavior, TitleModelResourcePolicy};
 
     use super::{
-        MAX_TITLE_CHARS, MAX_TITLE_TOKENS, TitleModelManager, install_progress_key, sanitize_title,
-        title_messages,
+        MAX_TITLE_CHARS, MAX_TITLE_PROMPT_BYTES, MAX_TITLE_TOKENS,
+        TITLE_CHAT_TEMPLATE_TOKEN_RESERVE, TitleModelManager, cap_title_model_prompt,
+        install_progress_key, sanitize_title, title_messages,
     };
 
     #[test]
@@ -765,6 +788,28 @@ mod tests {
         // Byte fallback needs at most one token per UTF-8 byte; the strict
         // inequality leaves room for the model to emit its stop token.
         assert!(MAX_TITLE_TOKENS > title.len());
+    }
+
+    #[test]
+    fn request_budget_fits_token_dense_prompts_in_the_title_context() {
+        let prompt = "x".repeat(MAX_TITLE_PROMPT_BYTES);
+        let messages = title_messages(&prompt);
+        let content_bytes: usize = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["content"].as_str().unwrap().len())
+            .sum();
+
+        assert!(
+            content_bytes + TITLE_CHAT_TEMPLATE_TOKEN_RESERVE + MAX_TITLE_TOKENS
+                <= crate::local::TITLE_MODEL_CONTEXT as usize
+        );
+
+        let non_ascii = "\u{10000}".repeat(crate::title::MAX_PROMPT_CHARS);
+        let capped = cap_title_model_prompt(&non_ascii);
+        assert!(capped.len() <= MAX_TITLE_PROMPT_BYTES);
+        assert!(non_ascii.starts_with(capped));
     }
 
     #[test]
