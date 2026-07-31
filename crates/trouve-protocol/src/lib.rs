@@ -133,7 +133,9 @@ pub use requests::*;
 // 1.22: persisted automated code-review total, reviewer, and final-editor
 // deadlines; GET/PUT /v1/config/code-review; and the
 // settings.code_review_updated replacement-snapshot event (additive).
-pub const PROTOCOL_VERSION: &str = "1.22";
+// 1.23: automated code-review timeout schemas advertise their existing
+// positive-seconds constraint (additive).
+pub const PROTOCOL_VERSION: &str = "1.23";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

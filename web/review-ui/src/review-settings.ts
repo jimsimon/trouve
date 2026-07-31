@@ -1,5 +1,8 @@
 import type { CodeReviewSettings } from "./types";
 
+export const TIMEOUT_MINUTES_INPUT_MIN = String(1 / 60);
+export const TIMEOUT_MINUTES_INPUT_STEP = TIMEOUT_MINUTES_INPUT_MIN;
+
 export function timeoutMinutes(seconds: number): string {
   return String(seconds / 60);
 }

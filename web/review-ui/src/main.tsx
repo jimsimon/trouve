@@ -61,7 +61,12 @@ import {
   reviewTaskSummary,
   type ReviewOutputField,
 } from "./review-output";
-import { reviewSettingsFromMinutes, timeoutMinutes } from "./review-settings";
+import {
+  TIMEOUT_MINUTES_INPUT_MIN,
+  TIMEOUT_MINUTES_INPUT_STEP,
+  reviewSettingsFromMinutes,
+  timeoutMinutes,
+} from "./review-settings";
 import { jobStatusClass, safeExternalUrl } from "./security";
 import type {
   CodeReviewSettings,
@@ -2749,8 +2754,8 @@ function ReviewTimeoutSettings({
               Total review timeout (minutes)
               <input
                 type="number"
-                min="1"
-                step="1"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
                 required
                 value={total}
                 onInput={(event) => setTotal(event.currentTarget.value)}
@@ -2761,8 +2766,8 @@ function ReviewTimeoutSettings({
               Reviewer timeout (minutes)
               <input
                 type="number"
-                min="1"
-                step="1"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
                 required
                 value={reviewer}
                 onInput={(event) => setReviewer(event.currentTarget.value)}
@@ -2773,8 +2778,8 @@ function ReviewTimeoutSettings({
               Final editor timeout (minutes)
               <input
                 type="number"
-                min="1"
-                step="1"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
                 required
                 value={coordinator}
                 onInput={(event) => setCoordinator(event.currentTarget.value)}

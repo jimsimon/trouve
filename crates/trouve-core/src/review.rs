@@ -3599,6 +3599,7 @@ impl Engine {
         {
             Ok(result) => result,
             Err(_) => {
+                active_threads.lock().unwrap().remove(thread_id);
                 if let Err(error) = self.cancel_turn(thread_id) {
                     tracing::warn!(
                         job_id = %job.id,
