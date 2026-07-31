@@ -4126,10 +4126,11 @@ impl Engine {
             "/repos/{}/pulls/{}/reviews",
             job.repository, job.pull_number
         );
+        let event = github_review_event(!findings.is_empty());
         let request = serde_json::json!({
             "commit_id": job.head_sha,
             "body": review_body,
-            "event": "COMMENT",
+            "event": event,
             "comments": comments,
         });
         let response = api
@@ -4171,7 +4172,7 @@ impl Engine {
                 &serde_json::json!({
                     "commit_id": job.head_sha,
                     "body": fallback,
-                    "event": "COMMENT",
+                    "event": event,
                 }),
             )
             .await?;
@@ -4606,6 +4607,14 @@ impl Engine {
 
 fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bool>) -> bool {
     status == "failed" && finish_transition != Some(false)
+}
+
+fn github_review_event(has_findings: bool) -> &'static str {
+    if has_findings {
+        "REQUEST_CHANGES"
+    } else {
+        "APPROVE"
+    }
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -6017,6 +6026,12 @@ fn merge_review_task_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_review_verdict_matches_confirmed_findings() {
+        assert_eq!(github_review_event(false), "APPROVE");
+        assert_eq!(github_review_event(true), "REQUEST_CHANGES");
+    }
 
     struct RouterThinkingProvider {
         stall: bool,
