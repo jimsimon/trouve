@@ -2814,7 +2814,6 @@ impl Store {
         pull_number: u64,
         base_ref: &str,
         head_sha: &str,
-        config_hash: &str,
     ) -> Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -2823,17 +2822,11 @@ impl Store {
                 "SELECT id FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?5)
+                   AND (base_ref != ?3 OR head_sha != ?4)
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map(
-                params![
-                    repository,
-                    pull_number as i64,
-                    base_ref,
-                    head_sha,
-                    config_hash
-                ],
+                params![repository, pull_number as i64, base_ref, head_sha],
                 |row| row.get(0),
             )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2845,17 +2838,14 @@ impl Store {
                      error = ?5, completed_at = ?6
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?7)",
+                   AND (base_ref != ?3 OR head_sha != ?4)",
                 params![
                     repository,
                     pull_number as i64,
                     base_ref,
                     head_sha,
-                    format!(
-                        "superseded by pull request revision {base_ref}..{head_sha} or review configuration"
-                    ),
+                    format!("superseded by pull request revision {base_ref}..{head_sha}"),
                     chrono::Utc::now().to_rfc3339(),
-                    config_hash,
                 ],
             )?;
         }
@@ -2936,6 +2926,53 @@ impl Store {
             .query_row(
                 "SELECT 1 FROM code_review_jobs WHERE dedupe_key = ?1",
                 params![dedupe_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn code_review_job_exists_for_revision(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        base_ref: &str,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND base_ref = ?3 AND head_sha = ?4
+                 LIMIT 1",
+                params![repository, pull_number as i64, base_ref, head_sha],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn code_review_job_has_prior_revision(
+        &self,
+        id: &str,
+        repository: &str,
+        pull_number: u64,
+        base_ref: &str,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM code_review_jobs AS prior
+                 WHERE prior.repository = ?2 AND prior.pull_number = ?3
+                   AND prior.base_ref = ?4 AND prior.head_sha = ?5
+                   AND prior.rowid < (
+                     SELECT current.rowid FROM code_review_jobs AS current
+                     WHERE current.id = ?1
+                   )
+                 LIMIT 1",
+                params![id, repository, pull_number as i64, base_ref, head_sha],
                 |_| Ok(()),
             )
             .optional()?
@@ -3092,8 +3129,8 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Persist the complete routing snapshot once. Interrupted executions and
-    /// persona retries reuse it instead of making different routing choices.
+    /// Persist the complete routing snapshot once. Interrupted execution of
+    /// the same job reuses it instead of making different routing choices.
     pub fn save_code_review_routing_decisions(
         &self,
         job_id: &str,
@@ -3449,7 +3486,8 @@ impl Store {
     /// Successful task attempts remain durable and are reused when the job
     /// resumes. New queued rows retain each failed attempt for inspection
     /// while making the newest attempt authoritative for persona rollups.
-    pub fn retry_code_review_persona(
+    #[cfg(test)]
+    pub(crate) fn retry_code_review_persona(
         &self,
         id: &str,
         reviewer_id: &str,
@@ -4329,6 +4367,7 @@ impl Store {
     pub fn retry_code_review_job(
         &self,
         id: &str,
+        new_job: &NewCodeReviewJob,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -4366,6 +4405,9 @@ impl Store {
         }
         let new_id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
+        let reviewers = serde_json::to_string(&new_job.reviewers)?;
+        let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
+        let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
         tx.execute(
             "INSERT INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number,
@@ -4375,15 +4417,37 @@ impl Store {
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
                      coordinator_thinking_level)
-             SELECT ?2, ?3, installation_id, repository, pull_number,
-                    pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
-                    'queued', model, prompt, identities, config_hash, ?4,
-                    review_base_sha, review_scope, id, total_reviewers,
-                    routing_mode, semantic_routing, included_reviewer_ids,
-                    excluded_reviewer_ids, router_model, router_thinking_level,
-                    coordinator_thinking_level
-             FROM code_review_jobs WHERE id = ?1",
-            params![id, new_id, format!("retry:{id}:{new_id}"), now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'retry',
+                     'queued', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                     ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            params![
+                new_id,
+                new_job.dedupe_key,
+                new_job.installation_id as i64,
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.pull_title,
+                new_job.pull_url,
+                new_job.head_sha,
+                new_job.base_ref,
+                new_job.head_ref,
+                new_job.model,
+                new_job.prompt,
+                reviewers,
+                new_job.config_hash,
+                now,
+                new_job.review_base_sha,
+                code_review_scope_str(new_job.scope),
+                id,
+                new_job.reviewers.len() as i64,
+                code_review_routing_mode_str(new_job.routing_mode),
+                new_job.semantic_routing,
+                included_reviewer_ids,
+                excluded_reviewer_ids,
+                new_job.router_model,
+                new_job.router_thinking_level,
+                new_job.coordinator_thinking_level,
+            ],
         )?;
         tx.execute(
             "UPDATE code_review_jobs SET retried_by = ?2 WHERE id = ?1",
@@ -6602,7 +6666,7 @@ mod tests {
                 .save_code_review_routing_decisions(&queued.id, &replacement)
                 .unwrap(),
             routing_decisions,
-            "routing is a once-only snapshot and retries must reuse it"
+            "routing is a once-only snapshot for the existing job"
         );
 
         let task = store
@@ -6791,14 +6855,63 @@ mod tests {
                 .is_empty()
         );
 
-        let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
+        let latest_reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .skip(2)
+            .take(1)
+            .collect::<Vec<_>>();
+        let replacement = store
+            .retry_code_review_job(
+                &queued.id,
+                &NewCodeReviewJob {
+                    dedupe_key: "acme/widgets#42:retry:latest-config".into(),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets now".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "3333333333333333333333333333333333333333".into(),
+                    review_base_sha: "2222222222222222222222222222222222222222".into(),
+                    base_ref: "1111111111111111111111111111111111111111".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: "retry".into(),
+                    retry_of: Some(queued.id.clone()),
+                    model: Some("provider/latest".into()),
+                    coordinator_thinking_level: Some("high".into()),
+                    router_model: Some("provider/latest-router".into()),
+                    router_thinking_level: Some("medium".into()),
+                    prompt: "Use the latest policy".into(),
+                    reviewers: latest_reviewers.clone(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Automatic,
+                    semantic_routing: true,
+                    included_reviewer_ids: vec!["performance".into()],
+                    excluded_reviewer_ids: vec!["accessibility".into()],
+                    config_hash: "latest-config".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
         assert_eq!(
             replacement.coordinator_thinking_level.as_deref(),
-            Some("medium")
+            Some("high")
         );
-        assert_eq!(replacement.router_model.as_deref(), Some("provider/router"));
-        assert_eq!(replacement.router_thinking_level.as_deref(), Some("low"));
+        assert_eq!(replacement.model.as_deref(), Some("provider/latest"));
+        assert_eq!(
+            replacement.router_model.as_deref(),
+            Some("provider/latest-router")
+        );
+        assert_eq!(replacement.router_thinking_level.as_deref(), Some("medium"));
+        assert_eq!(replacement.progress.total_reviewers, 1);
+        assert_eq!(
+            store
+                .code_review_job(&replacement.id)
+                .unwrap()
+                .unwrap()
+                .prompt,
+            "Use the latest policy"
+        );
         let jobs = store.list_code_review_jobs(10).unwrap();
         assert_eq!(jobs[0].id, queued.id);
         assert_eq!(jobs[0].status, "running");
@@ -7228,14 +7341,43 @@ mod tests {
         let old_config = enqueue("old-config", "base-2", "head-2", "old-config");
         let current = enqueue("current", "base-2", "head-2", "config");
 
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-3")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_has_prior_revision(
+                    &old_config.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_job_has_prior_revision(
+                    &current.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap()
+        );
+
         let mut superseded = store
-            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2", "config")
+            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
             .unwrap();
-        let mut expected = vec![
-            old_head.id.clone(),
-            old_base.id.clone(),
-            old_config.id.clone(),
-        ];
+        let mut expected = vec![old_head.id.clone(), old_base.id.clone()];
         superseded.sort();
         expected.sort();
         assert_eq!(superseded, expected);
@@ -7266,6 +7408,16 @@ mod tests {
                 .status,
             "queued"
         );
+        assert_eq!(
+            store
+                .code_review_job(&old_config.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued",
+            "configuration changes apply to new jobs without superseding existing snapshots"
+        );
         assert!(
             !store
                 .set_code_review_job_session(&old_base.id, "se_late", "th_late")
@@ -7279,6 +7431,81 @@ mod tests {
         assert_eq!(
             store.pending_code_review_job_cleanups().unwrap(),
             vec![(old_head.id, "se_old".into())]
+        );
+    }
+
+    #[test]
+    fn configuration_changes_do_not_supersede_a_running_review() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |suffix: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: format!("acme/widgets#42:{suffix}"),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "head-2".into(),
+                    review_base_sha: "base-2".into(),
+                    base_ref: "base-2".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: "automatic".into(),
+                    retry_of: None,
+                    model: None,
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: String::new(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "old-config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        let running = enqueue("old-config");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            running.id
+        );
+
+        assert!(
+            store
+                .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .code_review_job(&running.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "running"
+        );
+
+        assert_eq!(
+            store
+                .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-3")
+                .unwrap(),
+            vec![running.id.clone()],
+            "a running review still becomes stale when the pull request commit changes"
+        );
+        assert_eq!(
+            store
+                .code_review_job(&running.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
         );
     }
 

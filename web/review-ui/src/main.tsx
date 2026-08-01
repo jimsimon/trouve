@@ -1022,13 +1022,9 @@ function JobDetailPane({
     const action = `persona:${reviewerId}`;
     setBusy(action);
     try {
-      await retryPersona(detail.job.id, reviewerId);
+      const replacement = await retryPersona(detail.job.id, reviewerId);
       onChanged();
-      const refreshed = await load();
-      const retriedTask = pickPreferredTask(
-        refreshed?.tasks.filter((task) => task.reviewer_id === reviewerId) ?? [],
-      );
-      setSelectedTaskId(retriedTask?.id ?? "");
+      navigate("jobs", replacement.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
