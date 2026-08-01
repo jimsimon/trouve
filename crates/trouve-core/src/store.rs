@@ -450,6 +450,19 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 /// Repair terminal rows created by older builds without disturbing failed or
 /// cancelled tasks, whose last active stage remains useful diagnostic state.
 fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-terminal-task-lifecycle-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
     conn.execute(
         "UPDATE code_review_tasks
          SET lifecycle_stage = 'completed',
@@ -457,6 +470,10 @@ fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()>
          WHERE status IN ('succeeded', 'not_applicable')
            AND (lifecycle_stage != 'completed' OR last_progress_at IS NULL)",
         [],
+    )?;
+    conn.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
 }
@@ -3298,18 +3315,7 @@ impl Store {
             "UPDATE code_review_tasks
              SET status = 'failed', completed_at = ?1,
                  error = 'server restarted while task was running',
-                 model_elapsed_ms = CASE
-                   WHEN model_started_at IS NULL THEN model_elapsed_ms
-                   ELSE model_elapsed_ms + MAX(
-                     0,
-                     CAST(
-                       (julianday(?1) - MAX(
-                         julianday(model_started_at),
-                         julianday(COALESCE(last_progress_at, model_started_at))
-                       )) * 86400000 AS INTEGER
-                     )
-                   )
-                 END
+                 model_started_at = NULL
              WHERE status IN ('queued', 'running')
                AND job_id IN (SELECT id FROM code_review_jobs WHERE status = 'running')",
             params![now],
@@ -5705,7 +5711,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_backfills_terminal_code_review_task_lifecycle_repeatably() {
+    fn migration_backfills_terminal_code_review_task_lifecycle_once() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(
@@ -5732,7 +5738,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_migrations(&conn).unwrap();
         apply_migrations(&conn).unwrap();
 
         let succeeded: (String, Option<String>) = conn
@@ -5764,6 +5769,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(failed, ("queued".into(), None));
+
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-terminal-task-lifecycle-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
+        conn.execute(
+            "UPDATE code_review_tasks
+             SET lifecycle_stage = 'queued', last_progress_at = NULL
+             WHERE id = 'succeeded'",
+            [],
+        )
+        .unwrap();
+        apply_migrations(&conn).unwrap();
+        let gated: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'succeeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(gated, ("queued".into(), None));
     }
 
     #[test]
@@ -7880,7 +7912,8 @@ mod tests {
             .find(|task| task.id == interrupted.id)
             .unwrap();
         assert_eq!(interrupted.status, "failed");
-        assert!(interrupted.model_elapsed_ms >= 4_000);
+        assert_eq!(interrupted.model_elapsed_ms, 1_200);
+        assert!(interrupted.model_started_at.is_none());
         let retry = detail
             .tasks
             .iter()

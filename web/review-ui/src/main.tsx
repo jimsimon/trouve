@@ -61,6 +61,7 @@ import {
   reviewTaskSummary,
   type ReviewOutputField,
 } from "./review-output";
+import { liveModelElapsed } from "./review-progress";
 import {
   MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
@@ -145,16 +146,6 @@ function liveElapsed(
   if (status !== "running" || !startedAt) return baseline;
   const liveAge = Math.max(0, now - new Date(startedAt).getTime());
   return Math.max(baseline, liveAge);
-}
-
-function liveModelElapsed(task: ReviewTask, now: number): number {
-  if (task.status !== "running" || !task.model_started_at) {
-    return task.model_elapsed_ms;
-  }
-  return Math.max(
-    task.model_elapsed_ms,
-    Math.max(0, now - new Date(task.model_started_at).getTime()),
-  );
 }
 
 function taskLifecycleLabel(stage: ReviewTask["lifecycle_stage"]): string {

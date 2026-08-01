@@ -157,7 +157,7 @@ export interface ReviewTask {
   error?: string;
   created_at: string;
   started_at?: string;
-  model_started_at?: string;
+  model_started_at?: string | null;
   last_progress_at?: string;
   completed_at?: string;
   elapsed_ms: number;
@@ -171,7 +171,7 @@ export interface ReviewTaskProgress {
   cached_input_tokens: number;
   output_tokens: number;
   tool_call_count: number;
-  model_started_at?: string;
+  model_started_at: string | null;
   last_progress_at: string;
 }
 

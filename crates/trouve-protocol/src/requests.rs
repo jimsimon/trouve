@@ -1146,7 +1146,7 @@ pub struct CodeReviewTaskProgress {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub tool_call_count: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub model_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_progress_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2187,5 +2187,26 @@ mod tests {
                 serde_json::json!(canonical)
             );
         }
+    }
+
+    #[test]
+    fn code_review_task_progress_serializes_a_model_clock_reset_as_null() {
+        let progress = CodeReviewTaskProgress {
+            lifecycle_stage: CodeReviewTaskLifecycleStage::RepairingOutput,
+            provider_wait_ms: 0,
+            model_elapsed_ms: 42,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            tool_call_count: 0,
+            model_started_at: None,
+            last_progress_at: chrono::Utc::now(),
+        };
+
+        let value = serde_json::to_value(progress).unwrap();
+        assert_eq!(
+            value.get("model_started_at"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

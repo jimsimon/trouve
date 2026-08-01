@@ -4012,7 +4012,9 @@ impl Engine {
             .map(|event| event.cursor)
             .unwrap_or(0);
         let mut replay = VecDeque::new();
-        let mut lifecycle_stage = initial_stage;
+        let mut lifecycle_stage = code_review_dispatch_stage(initial_stage);
+        let mut observed_stage = lifecycle_stage;
+        let mut coalesce_observed_stage = false;
         let initial_model_timing =
             if initial_stage == trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput {
                 CodeReviewModelTiming::Reset
@@ -4046,50 +4048,92 @@ impl Engine {
             }
             let envelope = match replay.pop_front() {
                 Some(envelope) => envelope,
-                None => match if cancellation_requested {
-                    events.recv().await
-                } else {
-                    tokio::select! {
-                        received = events.recv() => received,
-                        _ = superseded.cancelled() => {
-                            let _ = self.cancel_turn(thread_id);
-                            cancellation_requested = true;
+                None => {
+                    let progress_wait = REVIEW_TASK_PROGRESS_INTERVAL
+                        .saturating_sub(last_progress_persisted.elapsed());
+                    let received = if cancellation_requested {
+                        tokio::select! {
+                            received = events.recv() => Some(received),
+                            _ = tokio::time::sleep(progress_wait) => None,
+                        }
+                    } else {
+                        tokio::select! {
+                            received = events.recv() => Some(received),
+                            _ = tokio::time::sleep(progress_wait) => None,
+                            _ = superseded.cancelled() => {
+                                let _ = self.cancel_turn(thread_id);
+                                cancellation_requested = true;
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(received) = received else {
+                        if observed_stage != lifecycle_stage || model_started.is_some() {
+                            let metrics = code_review_task_metrics_snapshot(
+                                &metrics_base,
+                                model_started,
+                                tool_call_count,
+                                None,
+                            );
+                            self.persist_code_review_task_progress(
+                                task_id,
+                                observed_stage,
+                                &metrics,
+                                CodeReviewModelTiming::Preserve,
+                            )
+                            .await?;
+                            lifecycle_stage = observed_stage;
+                            coalesce_observed_stage = false;
+                        }
+                        last_progress_persisted = Instant::now();
+                        if projected.should_flush() {
+                            projected.flush(self, &job.id, task_id)?;
+                        }
+                        continue;
+                    };
+                    match received {
+                        Ok(envelope) => envelope,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                skipped,
+                                "review event receiver lagged; replaying persisted events"
+                            );
+                            replay = VecDeque::from(
+                                self.store
+                                    .events_after(&scope, after)
+                                    .context("replaying review events after receiver lag")?,
+                            );
                             continue;
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            bail!("review event stream closed");
+                        }
                     }
-                } {
-                    Ok(envelope) => envelope,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            job_id = %job.id,
-                            skipped,
-                            "review event receiver lagged; replaying persisted events"
-                        );
-                        replay = VecDeque::from(
-                            self.store
-                                .events_after(&scope, after)
-                                .context("replaying review events after receiver lag")?,
-                        );
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        bail!("review event stream closed");
-                    }
-                },
+                }
             };
             if envelope.scope != scope || envelope.cursor <= after {
                 continue;
             }
             after = envelope.cursor;
-            let mut next_stage = lifecycle_stage;
             let mut model_timing = CodeReviewModelTiming::Preserve;
-            let mut coalesce_tool_transition = false;
             match envelope.event {
+                Event::TurnCapacityAcquired {
+                    turn: event_turn, ..
+                } if event_turn == turn => {
+                    // The engine has already persisted provider wait and the
+                    // post-capacity stage before publishing this thread event.
+                    lifecycle_stage = initial_stage;
+                    observed_stage = initial_stage;
+                    coalesce_observed_stage = false;
+                    last_progress_persisted = Instant::now();
+                }
                 Event::TurnStarted {
                     turn: event_turn, ..
                 } if event_turn == turn => {
                     model_started.get_or_insert_with(Instant::now);
-                    next_stage = initial_stage;
+                    observed_stage = initial_stage;
+                    coalesce_observed_stage = false;
                     model_timing = CodeReviewModelTiming::Started;
                 }
                 Event::AssistantDelta {
@@ -4097,37 +4141,40 @@ impl Engine {
                     text,
                 } if event_turn == turn => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Assistant, &text);
-                    next_stage = output_stage;
+                    observed_stage = output_stage;
+                    coalesce_observed_stage = false;
                 }
                 Event::AssistantThinking {
                     turn: event_turn,
                     text,
                 } if event_turn == turn => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Thinking, &text);
-                    next_stage = output_stage;
+                    observed_stage = output_stage;
+                    coalesce_observed_stage = false;
                 }
                 Event::ToolOutput { chunk, .. } => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Tool, &chunk);
-                    next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
-                    coalesce_tool_transition = true;
+                    observed_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
+                    coalesce_observed_stage = true;
                 }
                 Event::ToolRequested {
                     turn: event_turn, ..
                 } if event_turn == turn => {
                     tool_call_count += 1;
-                    next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
-                    coalesce_tool_transition = true;
+                    observed_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
+                    coalesce_observed_stage = true;
                 }
                 Event::ToolCompleted { .. } => {
-                    next_stage = output_stage;
-                    coalesce_tool_transition = true;
+                    observed_stage = output_stage;
+                    coalesce_observed_stage = true;
                 }
                 Event::AssistantMessage {
                     turn: event_turn,
                     content,
                 } if event_turn == turn => {
                     output = content;
-                    next_stage = output_stage;
+                    observed_stage = output_stage;
+                    coalesce_observed_stage = false;
                 }
                 Event::QuestionRequested { request_id, .. } => {
                     let _ = self.resolve_question(&request_id, None);
@@ -4147,7 +4194,7 @@ impl Engine {
                         task_id,
                         output_stage,
                         &metrics,
-                        CodeReviewModelTiming::Preserve,
+                        CodeReviewModelTiming::Reset,
                     )
                     .await?;
                     usage = event_usage;
@@ -4163,13 +4210,22 @@ impl Engine {
                         tool_call_count,
                         None,
                     );
-                    self.persist_code_review_task_progress(
-                        task_id,
-                        lifecycle_stage,
-                        &metrics,
-                        CodeReviewModelTiming::Preserve,
-                    )
-                    .await?;
+                    if let Err(progress_error) = self
+                        .persist_code_review_task_progress(
+                            task_id,
+                            observed_stage,
+                            &metrics,
+                            CodeReviewModelTiming::Reset,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            task_id,
+                            error = %progress_error,
+                            "failed to persist terminal progress after model turn failure"
+                        );
+                    }
                     bail!("model review failed: {error}");
                 }
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
@@ -4179,13 +4235,22 @@ impl Engine {
                         tool_call_count,
                         None,
                     );
-                    self.persist_code_review_task_progress(
-                        task_id,
-                        lifecycle_stage,
-                        &metrics,
-                        CodeReviewModelTiming::Preserve,
-                    )
-                    .await?;
+                    if let Err(progress_error) = self
+                        .persist_code_review_task_progress(
+                            task_id,
+                            observed_stage,
+                            &metrics,
+                            CodeReviewModelTiming::Reset,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            task_id,
+                            error = %progress_error,
+                            "failed to persist terminal progress after model turn cancellation"
+                        );
+                    }
                     if superseded.is_cancelled() {
                         bail!("stale: review was superseded while the model was running");
                     }
@@ -4194,8 +4259,8 @@ impl Engine {
                 _ => {}
             }
             if code_review_task_progress_due(
-                next_stage != lifecycle_stage,
-                coalesce_tool_transition,
+                observed_stage != lifecycle_stage,
+                coalesce_observed_stage,
                 model_timing == CodeReviewModelTiming::Started,
                 last_progress_persisted.elapsed(),
             ) {
@@ -4205,9 +4270,15 @@ impl Engine {
                     tool_call_count,
                     None,
                 );
-                self.persist_code_review_task_progress(task_id, next_stage, &metrics, model_timing)
-                    .await?;
-                lifecycle_stage = next_stage;
+                self.persist_code_review_task_progress(
+                    task_id,
+                    observed_stage,
+                    &metrics,
+                    model_timing,
+                )
+                .await?;
+                lifecycle_stage = observed_stage;
+                coalesce_observed_stage = false;
                 last_progress_persisted = Instant::now();
             }
             if projected.should_flush() {
@@ -6136,6 +6207,16 @@ fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) ->
     )
 }
 
+fn code_review_dispatch_stage(
+    initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
+) -> trouve_protocol::CodeReviewTaskLifecycleStage {
+    if initial_stage == trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput {
+        initial_stage
+    } else {
+        trouve_protocol::CodeReviewTaskLifecycleStage::WaitingForCapacity
+    }
+}
+
 fn code_review_task_progress_due(
     lifecycle_changed: bool,
     coalesce_tool_transition: bool,
@@ -6195,16 +6276,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_lifecycle_transitions_are_coalesced_until_the_progress_interval() {
+    fn review_progress_preserves_capacity_and_coalesced_tool_stages() {
+        use trouve_protocol::CodeReviewTaskLifecycleStage;
+
+        assert_eq!(
+            code_review_dispatch_stage(CodeReviewTaskLifecycleStage::StartingModel),
+            CodeReviewTaskLifecycleStage::WaitingForCapacity
+        );
+        assert_eq!(
+            code_review_dispatch_stage(CodeReviewTaskLifecycleStage::RepairingOutput),
+            CodeReviewTaskLifecycleStage::RepairingOutput
+        );
+
+        let persisted_stage = CodeReviewTaskLifecycleStage::RunningModel;
+        let observed_stage = CodeReviewTaskLifecycleStage::RunningTool;
+        let coalesce_observed_stage = true;
         assert!(!code_review_task_progress_due(
-            true,
-            true,
+            observed_stage != persisted_stage,
+            coalesce_observed_stage,
             false,
             Duration::from_millis(10),
         ));
         assert!(code_review_task_progress_due(
-            true,
-            true,
+            observed_stage != persisted_stage,
+            coalesce_observed_stage,
             false,
             REVIEW_TASK_PROGRESS_INTERVAL,
         ));
