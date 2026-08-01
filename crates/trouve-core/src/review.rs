@@ -2847,21 +2847,23 @@ impl Engine {
                 ),
             ),
         };
-        if status == "failed" {
-            tracing::error!(
-                job_id = %job_id,
-                repository = %record.job.repository,
-                pull_number = record.job.pull_number,
-                error = %error,
-                "code-review job failed"
-            );
-        }
         let finish_recorded =
             match self
                 .store
                 .finish_code_review_job(&job_id, status, &review_url, &error)
             {
-                Ok(_) => true,
+                Ok(transitioned) => {
+                    if transitioned && status == "failed" {
+                        tracing::error!(
+                            job_id = %job_id,
+                            repository = %record.job.repository,
+                            pull_number = record.job.pull_number,
+                            error = %error,
+                            "code-review job failed"
+                        );
+                    }
+                    true
+                }
                 Err(finish_error) => {
                     self.record_review_error(format!("finishing review job: {finish_error:#}"));
                     false
