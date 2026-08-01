@@ -1285,8 +1285,7 @@ pub struct CodeReviewCandidateRejection {
     pub reason: String,
 }
 
-/// A confirmed issue produced by the coordinator and, when possible,
-/// published as an inline GitHub review comment.
+/// The outcome of attempting to publish a finding as an inline GitHub comment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewFindingPublicationStatus {
@@ -1297,10 +1296,12 @@ pub enum CodeReviewFindingPublicationStatus {
     Published,
     /// The finding had no valid path/line pair for an inline comment.
     NotEligible,
-    /// GitHub rejected the inline comment because its line was not placeable.
+    /// GitHub did not publish the inline comment.
     Failed,
 }
 
+/// A confirmed issue produced by the coordinator and, when possible,
+/// published as an inline GitHub review comment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFinding {
     pub id: String,

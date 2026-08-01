@@ -71,6 +71,7 @@ const CHECK_DETAILS_TRUNCATION_MARKER: &str =
     "\n\n---\nDetails truncated; open the trouve dashboard for complete output.";
 const LIFECYCLE_COMMENT_MAX_BYTES: usize = 65_000;
 const LIFECYCLE_FINDINGS_MAX_BYTES: usize = 32_000;
+const LIFECYCLE_FAILED_FINDINGS_MIN_BYTES: usize = 8_000;
 const LIFECYCLE_PROMPT_MAX_BYTES: usize = 12_000;
 const LIFECYCLE_SUMMARY_MAX_BYTES: usize = 6_000;
 const LIFECYCLE_ERROR_MAX_BYTES: usize = 4_000;
@@ -4317,12 +4318,10 @@ impl Engine {
     ) -> Result<String> {
         let mut comments = Vec::new();
         let mut eligible_findings = Vec::new();
+        let mut ineligible_ids = Vec::new();
         for finding in findings {
             if finding.line == 0 || finding.path.trim().is_empty() {
-                self.store.set_code_review_finding_publication_status(
-                    &finding.id,
-                    trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
-                )?;
+                ineligible_ids.push(finding.id.as_str());
             } else {
                 comments.push(serde_json::json!({
                     "path": finding.path,
@@ -4333,44 +4332,69 @@ impl Engine {
                 eligible_findings.push(finding);
             }
         }
+        self.store.set_code_review_findings_publication_status(
+            &ineligible_ids,
+            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        )?;
         if comments.is_empty() {
             return Ok(String::new());
         }
+        let eligible_ids = eligible_findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
         let path = format!(
             "/repos/{}/pulls/{}/reviews",
             job.repository, job.pull_number
         );
         let request = inline_review_request(job, comments);
-        let response = api
+        let response = match api
             .request(reqwest::Method::POST, &path)
             .json(&request)
             .send()
-            .await?;
-        let status = response.status();
-        let rate = rate_info(response.headers());
-        let body = response.text().await?;
-        self.record_review_rate(rate);
-        if status.is_success() {
-            let published = serde_json::from_str::<PublishedReview>(&body)?;
-            for finding in &eligible_findings {
-                self.store.set_code_review_finding_publication_status(
-                    &finding.id,
-                    trouve_protocol::CodeReviewFindingPublicationStatus::Published,
-                )?;
-            }
-            self.capture_published_review_comments(api, job, published.id, findings)
-                .await?;
-            Ok(published.html_url)
-        } else if status.as_u16() == 422 && review_comments_failed_to_place(&body) {
-            for finding in eligible_findings {
-                self.store.set_code_review_finding_publication_status(
-                    &finding.id,
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.store.set_code_review_findings_publication_status(
+                    &eligible_ids,
                     trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
                 )?;
+                return Err(error.into());
             }
-            Ok(String::new())
+        };
+        let status = response.status();
+        let rate = rate_info(response.headers());
+        self.record_review_rate(rate);
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                self.store.set_code_review_findings_publication_status(
+                    &eligible_ids,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                )?;
+                return Err(error.into());
+            }
+        };
+        if status.is_success() {
+            let published = serde_json::from_str::<PublishedReview>(&body)?;
+            self.store.set_code_review_findings_publication_status(
+                &eligible_ids,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+            )?;
+            self.capture_published_review_comments(api, job, published.id, findings)
+                .await;
+            Ok(published.html_url)
         } else {
-            bail!("GitHub API {status}: {}", compact_api_error(&body))
+            self.store.set_code_review_findings_publication_status(
+                &eligible_ids,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+            )?;
+            if status.as_u16() == 422 && review_comments_failed_to_place(&body) {
+                Ok(String::new())
+            } else {
+                bail!("GitHub API {status}: {}", compact_api_error(&body))
+            }
         }
     }
 
@@ -4585,8 +4609,13 @@ impl Engine {
             comment.id,
             &comment.html_url,
         )?;
-        self.store
-            .set_code_review_job_lifecycle_comment_url(&job.id, &comment.html_url)?;
+        if self
+            .store
+            .set_code_review_job_lifecycle_comment_url(&job.id, &comment.html_url)?
+        {
+            self.emit_code_review_job_updated(&job.id)?;
+            self.emit_code_review_updated(Some(job.id.clone()))?;
+        }
         for duplicate_id in discovered_ids
             .into_iter()
             .filter(|comment_id| *comment_id != comment.id)
@@ -4770,40 +4799,70 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         review_id: u64,
         findings: &[trouve_protocol::CodeReviewFinding],
-    ) -> Result<()> {
+    ) {
         if findings.is_empty() {
-            return Ok(());
+            return;
         }
-        let mut comments = Vec::new();
+        let target_count = findings
+            .iter()
+            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
+            .count();
+        let mut matched = HashSet::new();
         for page in 1..=REVIEW_COMMENT_MAX_PAGES {
-            let (page_comments, rate): (Vec<PublishedReviewComment>, _) = api
+            let response: Result<(Vec<PublishedReviewComment>, _)> = api
                 .get(&format!(
                     "/repos/{}/pulls/{}/reviews/{review_id}/comments?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
                     job.repository, job.pull_number
                 ))
-                .await?;
+                .await;
+            let (page_comments, rate) = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        review_id,
+                        page,
+                        %error,
+                        "capturing published review comment URLs failed"
+                    );
+                    break;
+                }
+            };
             self.record_review_rate(rate);
             let count = page_comments.len();
-            comments.extend(page_comments);
-            if count < REVIEW_COMMENT_PAGE_SIZE {
-                break;
-            }
-        }
-        for finding in findings {
-            let marker = format!("trouve-code-review finding:{}", finding.id);
-            if let Some(comment) = comments
-                .iter()
-                .find(|comment| comment.body.contains(&marker))
-            {
-                self.store.update_code_review_finding_publication(
+            for finding in findings {
+                if finding.line == 0
+                    || finding.path.trim().is_empty()
+                    || matched.contains(&finding.id)
+                {
+                    continue;
+                }
+                let marker = format!("trouve-code-review finding:{}", finding.id);
+                let Some(comment) = page_comments
+                    .iter()
+                    .find(|comment| comment.body.contains(&marker))
+                else {
+                    continue;
+                };
+                matched.insert(finding.id.clone());
+                if let Err(error) = self.store.update_code_review_finding_publication(
                     &finding.id,
                     Some(comment.id),
                     &comment.html_url,
                     None,
-                )?;
+                ) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        finding_id = %finding.id,
+                        %error,
+                        "recording published review comment URL failed"
+                    );
+                }
+            }
+            if matched.len() == target_count || count < REVIEW_COMMENT_PAGE_SIZE {
+                break;
             }
         }
-        Ok(())
     }
 }
 
@@ -5067,7 +5126,7 @@ fn append_lifecycle_finding_section(
     maximum: usize,
     publication_note: bool,
 ) -> usize {
-    if findings.is_empty() || maximum == 0 {
+    if findings.is_empty() {
         return 0;
     }
     let start = body.len();
@@ -5189,11 +5248,16 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             finding.github_publication_status
                 == trouve_protocol::CodeReviewFindingPublicationStatus::Failed
         });
+    let failed_reserve = if failed_findings.is_empty() {
+        0
+    } else {
+        LIFECYCLE_FAILED_FINDINGS_MIN_BYTES.min(LIFECYCLE_FINDINGS_MAX_BYTES)
+    };
     let used = append_lifecycle_finding_section(
         &mut body,
         "### Confirmed issues",
         &confirmed_findings,
-        LIFECYCLE_FINDINGS_MAX_BYTES,
+        LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(failed_reserve),
         true,
     );
     append_lifecycle_finding_section(
@@ -5346,6 +5410,7 @@ fn review_comments_failed_to_place(body: &str) -> bool {
                     .get("field")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
+                let field = field.rsplit('.').next().unwrap_or(field);
                 let code = error
                     .get("code")
                     .and_then(serde_json::Value::as_str)
@@ -5353,8 +5418,9 @@ fn review_comments_failed_to_place(body: &str) -> bool {
                 matches!(
                     resource,
                     "PullRequestReviewComment" | "PullRequestReviewThread"
-                ) && ((matches!(field, "line" | "start_line" | "position")
-                    && matches!(code, "invalid" | "missing" | "custom"))
+                ) && ((matches!(field, "line" | "start_line" | "position" | "path")
+                    && matches!(code, "invalid" | "missing" | "missing_field" | "custom"))
+                    || (field == "diff_hunk" && matches!(code, "missing" | "missing_field"))
                     || error.get("message").is_some_and(placement_error))
             }
             _ => false,
@@ -7019,6 +7085,14 @@ mod tests {
             state.lifecycle_comment_url,
             "https://github.com/acme/widgets/pull/42#issuecomment-10"
         );
+        let update_events = engine
+            .store
+            .events_after(&Scope::CodeReviewJob(job.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| matches!(envelope.event, Event::CodeReviewJobUpdated { .. }))
+            .count();
+        assert_eq!(update_events, 1);
     }
 
     #[test]
@@ -7188,12 +7262,16 @@ mod tests {
                 line: index as u64 + 1,
                 side: "RIGHT".into(),
                 severity: "medium".into(),
-                body: large_body.clone(),
+                body: if index + 1 == MAX_CANDIDATE_FINDINGS {
+                    "Failed publication remains visible".into()
+                } else {
+                    large_body.clone()
+                },
                 prompt_for_agents: "Fix this issue.".into(),
                 sources: Vec::new(),
             })
             .collect::<Vec<_>>();
-        store
+        let persisted = store
             .save_code_review_result(
                 &queued.id,
                 &"summary ".repeat(2_000),
@@ -7201,6 +7279,16 @@ mod tests {
                 findings.len() as u64,
                 &findings,
                 &[],
+            )
+            .unwrap();
+        store
+            .set_code_review_finding_publication_status(
+                &persisted
+                    .iter()
+                    .find(|finding| finding.body == "Failed publication remains visible")
+                    .unwrap()
+                    .id,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
             )
             .unwrap();
         store
@@ -7212,6 +7300,8 @@ mod tests {
         assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
         assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
         assert!(body.contains("additional finding(s) omitted"));
+        assert!(body.contains("### Inline comments that failed to post"));
+        assert!(body.contains("Failed publication remains visible"));
         assert!(body.contains("Review summary truncated"));
         assert!(body.contains("Prompt truncated"));
     }
@@ -7347,8 +7437,7 @@ mod tests {
 
         engine
             .capture_published_review_comments(&api, &job, 77, &findings)
-            .await
-            .unwrap();
+            .await;
         server.await.unwrap();
         let stored = engine.store.code_review_findings(&job.id).unwrap();
         assert_eq!(
@@ -7361,10 +7450,213 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn published_review_comment_capture_is_best_effort() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:comment-capture-failure");
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "Two issues.",
+                "Fix both.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/first.rs".into(),
+                        line: 10,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        body: "First issue.".into(),
+                        prompt_for_agents: "Fix the first issue.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/second.rs".into(),
+                        line: 20,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        body: "Second issue.".into(),
+                        prompt_for_agents: "Fix the second issue.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        store
+            .set_code_review_findings_publication_status(
+                &ids,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+            )
+            .unwrap();
+        let first_id = findings[0].id.clone();
+        let first_page = serde_json::to_string(
+            &(0..REVIEW_COMMENT_PAGE_SIZE)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": index + 1,
+                        "html_url": format!("https://github.com/comment-{index}"),
+                        "body": if index == 0 {
+                            format!("finding\n<!-- trouve-code-review finding:{first_id} -->")
+                        } else {
+                            "unrelated inline comment".into()
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("200 OK", first_page),
+                (
+                    "500 Internal Server Error",
+                    "{\"message\":\"unavailable\"}".into(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .capture_published_review_comments(&api, &job, 77, &findings)
+            .await;
+        server.await.unwrap();
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        assert!(!stored[0].github_comment_url.is_empty());
+        assert!(stored.iter().all(|finding| {
+            finding.github_publication_status
+                == trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        }));
+    }
+
+    #[tokio::test]
+    async fn publication_errors_record_terminal_finding_outcomes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:publication-failure");
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "Two issues.",
+                "Fix both.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 42,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        body: "Eligible issue.".into(),
+                        prompt_for_agents: "Fix it.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: String::new(),
+                        line: 0,
+                        side: "RIGHT".into(),
+                        severity: "low".into(),
+                        body: "General issue.".into(),
+                        prompt_for_agents: "Fix it too.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = r#"{"message":"service unavailable"}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert!(engine.publish_review(&api, &job, &findings).await.is_err());
+        server.await.unwrap();
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .find(|finding| finding.path == "src/lib.rs")
+                .unwrap()
+                .github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        );
+        assert_eq!(
+            stored
+                .iter()
+                .find(|finding| finding.path.is_empty())
+                .unwrap()
+                .github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
+        );
+    }
+
     #[test]
     fn only_line_placement_validation_errors_are_suppressed() {
         for body in [
             r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"line","code":"invalid"}]}"#,
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"path","code":"invalid"}]}"#,
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"pull_request_review_thread.line","code":"custom","message":"pull_request_review_thread.line must be part of the diff"},{"resource":"PullRequestReviewComment","field":"pull_request_review_thread.diff_hunk","code":"missing_field"}]}"#,
             r#"{"message":"Validation Failed","errors":["Pull request review thread line must be part of the diff"]}"#,
         ] {
             assert!(review_comments_failed_to_place(body), "{body}");
@@ -7385,17 +7677,26 @@ mod tests {
         let published = enqueue_test_review_job(&store, "acme/widgets#42:published-url");
         store.claim_code_review_job().unwrap().unwrap();
         store
+            .set_code_review_job_lifecycle_comment_url(
+                &published.id,
+                "https://github.com/acme/widgets/pull/42#issuecomment-10",
+            )
+            .unwrap();
+        assert!(
+            store
+                .code_review_job(&published.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .review_url
+                .is_empty()
+        );
+        store
             .finish_code_review_job(
                 &published.id,
                 "succeeded",
                 "https://github.com/acme/widgets/pull/42#pullrequestreview-99",
                 "",
-            )
-            .unwrap();
-        store
-            .set_code_review_job_lifecycle_comment_url(
-                &published.id,
-                "https://github.com/acme/widgets/pull/42#issuecomment-10",
             )
             .unwrap();
         let published = store.code_review_job(&published.id).unwrap().unwrap().job;
@@ -7411,13 +7712,22 @@ mod tests {
         let no_review = enqueue_test_review_job(&store, "acme/widgets#42:lifecycle-url");
         store.claim_code_review_job().unwrap().unwrap();
         store
-            .finish_code_review_job(&no_review.id, "succeeded", "", "")
-            .unwrap();
-        store
             .set_code_review_job_lifecycle_comment_url(
                 &no_review.id,
                 "https://github.com/acme/widgets/pull/42#issuecomment-11",
             )
+            .unwrap();
+        assert!(
+            store
+                .code_review_job(&no_review.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .review_url
+                .is_empty()
+        );
+        store
+            .finish_code_review_job(&no_review.id, "succeeded", "", "")
             .unwrap();
         let no_review = store.code_review_job(&no_review.id).unwrap().unwrap().job;
         assert_eq!(no_review.review_url, no_review.lifecycle_comment_url);

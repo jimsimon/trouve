@@ -4629,6 +4629,7 @@
       },
       "CodeReviewFinding": {
         "type": "object",
+        "description": "A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.",
         "required": [
           "id",
           "job_id",
@@ -4707,7 +4708,7 @@
       },
       "CodeReviewFindingPublicationStatus": {
         "type": "string",
-        "description": "A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.",
+        "description": "The outcome of attempting to publish a finding as an inline GitHub comment.",
         "enum": [
           "pending",
           "published",

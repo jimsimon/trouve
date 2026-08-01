@@ -428,7 +428,6 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN model_started_at TEXT",
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
-    "UPDATE code_review_findings SET github_publication_status = 'published' WHERE github_comment_url != '' AND github_publication_status = 'pending'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -444,6 +443,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         }
     }
     backfill_terminal_code_review_task_lifecycle(conn)?;
+    migrate_code_review_finding_publication_status(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     Ok(())
@@ -477,6 +477,19 @@ fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()>
     conn.execute(
         "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE code_review_findings
+         SET github_publication_status = 'published'
+         WHERE github_comment_url != '' AND github_publication_status = 'pending';
+         UPDATE code_review_findings
+         SET github_publication_status = 'not_eligible'
+         WHERE github_publication_status = 'pending'
+           AND (trim(path) = '' OR line <= 0);",
     )?;
     Ok(())
 }
@@ -4153,16 +4166,34 @@ impl Store {
         id: &str,
         status: trouve_protocol::CodeReviewFindingPublicationStatus,
     ) -> Result<bool> {
+        Ok(self.set_code_review_findings_publication_status(&[id], status)? > 0)
+    }
+
+    pub fn set_code_review_findings_publication_status(
+        &self,
+        ids: &[&str],
+        status: trouve_protocol::CodeReviewFindingPublicationStatus,
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let status = match status {
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending => "pending",
             trouve_protocol::CodeReviewFindingPublicationStatus::Published => "published",
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => "not_eligible",
             trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
         };
-        Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_findings SET github_publication_status = ?2 WHERE id = ?1",
-            params![id, status],
-        )? > 0)
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut updated = 0;
+        for id in ids {
+            updated += tx.execute(
+                "UPDATE code_review_findings SET github_publication_status = ?2 WHERE id = ?1",
+                params![id, status],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
@@ -4732,7 +4763,14 @@ impl Store {
         error: &str,
     ) -> Result<bool> {
         let updated = self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
+            "UPDATE code_review_jobs
+             SET status = ?2,
+                 review_url = CASE
+                     WHEN ?3 != '' THEN ?3
+                     WHEN lifecycle_comment_url != '' THEN lifecycle_comment_url
+                     ELSE review_url
+                 END,
+                 error = ?4,
                     completed_at = ?5
              WHERE id = ?1 AND status = 'running'",
             params![
@@ -4987,8 +5025,15 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
              SET lifecycle_comment_url = ?2,
-                 review_url = CASE WHEN review_url = '' THEN ?2 ELSE review_url END
-             WHERE id = ?1",
+                 review_url = CASE
+                     WHEN status IN ('succeeded', 'failed', 'cancelled', 'stale')
+                          AND review_url = '' THEN ?2
+                     ELSE review_url
+                 END
+             WHERE id = ?1
+               AND (lifecycle_comment_url != ?2
+                    OR (status IN ('succeeded', 'failed', 'cancelled', 'stale')
+                        AND review_url = ''))",
             params![id, url],
         )? > 0)
     }
@@ -5845,6 +5890,42 @@ mod tests {
             ),
             15_000
         );
+    }
+
+    #[test]
+    fn migration_backfills_legacy_finding_publication_outcomes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_review_findings (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                github_comment_url TEXT NOT NULL,
+                github_publication_status TEXT NOT NULL
+             );
+             INSERT INTO code_review_findings VALUES
+                ('published', 'src/lib.rs', 10, 'https://github.com/comment', 'pending'),
+                ('empty-path', '', 10, '', 'pending'),
+                ('zero-line', 'src/lib.rs', 0, '', 'pending'),
+                ('eligible', 'src/lib.rs', 10, '', 'pending');",
+        )
+        .unwrap();
+
+        migrate_code_review_finding_publication_status(&conn).unwrap();
+        migrate_code_review_finding_publication_status(&conn).unwrap();
+
+        let status = |id| {
+            conn.query_row(
+                "SELECT github_publication_status FROM code_review_findings WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status("published"), "published");
+        assert_eq!(status("empty-path"), "not_eligible");
+        assert_eq!(status("zero-line"), "not_eligible");
+        assert_eq!(status("eligible"), "pending");
     }
 
     #[test]
