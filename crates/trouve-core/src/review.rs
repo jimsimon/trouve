@@ -2847,6 +2847,15 @@ impl Engine {
                 ),
             ),
         };
+        if status == "failed" {
+            tracing::error!(
+                job_id = %job_id,
+                repository = %record.job.repository,
+                pull_number = record.job.pull_number,
+                error = %error,
+                "code-review job failed"
+            );
+        }
         let finish_recorded =
             match self
                 .store
@@ -3440,12 +3449,21 @@ impl Engine {
         )?;
 
         let publication_started = Instant::now();
+        // Reviewer and coordinator work can outlive the installation token
+        // used during preparation. Rebuild the client here so the token cache
+        // can refresh a token that is expired or within its five-minute
+        // safety window before any publication request is sent.
+        let api = self
+            .installation_api(job.installation_id)
+            .await
+            .context("refreshing GitHub App credentials before publication")?;
         let (current, rate): (GithubPullRequest, _) = api
             .get_cached(
                 &format!("/repos/{}/pulls/{}", job.repository, job.pull_number),
                 &self.code_review.rest_cache,
             )
-            .await?;
+            .await
+            .context("revalidating pull request before publication")?;
         self.record_review_rate(rate);
         if current.state != "open"
             || current.base.sha != job.base_ref
@@ -3499,7 +3517,8 @@ impl Engine {
         )?;
         let review_url = self
             .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
-            .await?;
+            .await
+            .context("publishing GitHub pull request review")?;
         let fixed = self
             .resolve_fixed_review_findings(
                 &api,
@@ -3507,7 +3526,8 @@ impl Engine {
                 &previous_findings,
                 &parsed.resolved_finding_ids,
             )
-            .await?;
+            .await
+            .context("resolving previously reported GitHub review findings")?;
         self.store
             .set_code_review_job_fixed_issue_count(&job.id, fixed)?;
         self.store.mark_code_review_published(
