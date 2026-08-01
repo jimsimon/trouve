@@ -40,7 +40,9 @@ const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(35);
+const REVIEW_THREAD_MAX_PAGES: usize = 10;
+const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(305);
+const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -3690,12 +3692,6 @@ impl Engine {
             .context("resolving previously reported GitHub review findings")?;
         self.store
             .set_code_review_job_fixed_issue_count(&job.id, fixed)?;
-        self.store.mark_code_review_published(
-            &job.repository,
-            job.pull_number,
-            &job.base_ref,
-            &job.head_sha,
-        )?;
         self.store.set_code_review_job_phase_elapsed(
             &job.id,
             CodeReviewJobPhase::Publication,
@@ -4224,6 +4220,14 @@ impl Engine {
                 &comments,
             )
             .await?;
+        self.store.record_code_review_publication(
+            &job.id,
+            &job.repository,
+            job.pull_number,
+            &job.base_ref,
+            &job.head_sha,
+            &published.html_url,
+        )?;
         if comments_published {
             self.capture_published_review_comments(api, job, published.id, findings)
                 .await?;
@@ -4592,7 +4596,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("invalid repository"))?;
         let mut after: Option<String> = None;
         let mut threads = HashMap::new();
-        loop {
+        for page in 0..REVIEW_THREAD_MAX_PAGES {
             let (response, rate): (serde_json::Value, _) = api
                 .post(
                     "/graphql",
@@ -4615,7 +4619,10 @@ impl Engine {
             let page_info =
                 &response["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"];
             if !page_info["hasNextPage"].as_bool().unwrap_or(false) {
-                break;
+                return Ok(threads);
+            }
+            if page + 1 == REVIEW_THREAD_MAX_PAGES {
+                bail!("GitHub review-thread pagination exceeded the page limit");
             }
             let cursor = page_info["endCursor"]
                 .as_str()
@@ -4626,7 +4633,7 @@ impl Engine {
             }
             after = Some(cursor.to_owned());
         }
-        Ok(threads)
+        unreachable!("review-thread pagination always returns or errors")
     }
 
     async fn reconcile_user_resolved_review_findings(
@@ -4725,6 +4732,7 @@ impl Engine {
             };
             let was_resolved =
                 state.is_resolved == Some(true) || state.finding.status == "dismissed";
+            reopened |= state.recheck_pending;
             let (changed, generation) = self.store.record_code_review_thread_state(
                 &state.finding.id,
                 thread_id,
@@ -4735,24 +4743,22 @@ impl Engine {
                 reopened |= was_resolved && !is_resolved;
             }
             all_resolved &= *is_resolved;
-            state_key.push((state.finding.id.as_str(), generation, *is_resolved));
+            state_key.push((state.finding.id.clone(), generation, *is_resolved));
         }
         for job_id in &changed_jobs {
             self.emit_code_review_updated(Some(job_id.clone()))?;
         }
-        let persisted_reopen = state_key
-            .iter()
-            .any(|(_, generation, is_resolved)| !is_resolved && *generation > 1);
-        if !all_resolved && !reopened && !persisted_reopen {
-            return Ok(());
-        }
 
         state_key.sort_unstable();
         let state_fingerprint = serde_json::to_vec(&state_key)?;
-        let generation = format!("{:x}", Sha256::digest(state_fingerprint));
-        let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+        let state_hash = format!("{:x}", Sha256::digest(state_fingerprint));
+        let finding_ids = state_key
+            .iter()
+            .map(|(finding_id, _, _)| finding_id.as_str())
+            .collect::<Vec<_>>();
+        let new_job = NewCodeReviewJob {
             dedupe_key: format!(
-                "{}#{}:{}:{}:thread-recheck:{generation}:{config_hash}",
+                "{}#{}:{}:{}:thread-recheck:{config_hash}",
                 repository.repository, pull.number, pull.base.sha, pull.head.sha
             ),
             installation_id: repository.installation_id,
@@ -4778,7 +4784,14 @@ impl Engine {
             included_reviewer_ids: repository.included_reviewer_ids.clone(),
             excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
             config_hash: config_hash.to_owned(),
-        })?;
+        };
+        let job = self.store.enqueue_code_review_thread_recheck(
+            &new_job,
+            &state_hash,
+            &finding_ids,
+            (!state_key.is_empty() && all_resolved) || reopened,
+            MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
+        )?;
         drop(publication_guard);
         if let Some(job) = job {
             self.emit_code_review_updated(Some(job.id.clone()))?;
@@ -6392,6 +6405,76 @@ mod tests {
     }
 
     #[test]
+    fn thread_rechecks_retry_terminal_failures_without_looping_or_exceeding_the_cap() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut request = test_review_job_request("acme/widgets#42:thread-recheck");
+        request.trigger = "thread-recheck".into();
+
+        let first = store
+            .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "", "temporary failure")
+            .unwrap();
+
+        let retry = store
+            .enqueue_code_review_thread_recheck(&request, "state-a", &[], false, 3)
+            .unwrap()
+            .unwrap();
+        assert_ne!(retry.id, first.id);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            retry.id
+        );
+        store
+            .finish_code_review_job(&retry.id, "succeeded", "review-url", "")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-b", &[], false, 3)
+                .unwrap()
+                .is_none()
+        );
+
+        let third = store
+            .enqueue_code_review_thread_recheck(&request, "state-b", &[], true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        store
+            .finish_code_review_job(&third.id, "failed", "", "another failure")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-c", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+
+        let rechecks = store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.trigger == "thread-recheck")
+            .count();
+        assert_eq!(rechecks, 3);
+    }
+
+    #[test]
     fn failed_job_findings_are_not_reused_as_published_findings() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:failed-findings");
@@ -6430,12 +6513,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let published_job =
+            enqueue_test_review_job(&store, "acme/widgets#42:published-then-failed");
+        store.claim_code_review_job().unwrap().unwrap();
+        let published_findings = store
+            .save_code_review_result(
+                &published_job.id,
+                "Published issue",
+                "Fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/published.rs".into(),
+                    line: 9,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "This issue reached GitHub before capture failed.".into(),
+                    prompt_for_agents: "Fix the published issue.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &published_job.id,
+                "acme/widgets",
+                42,
+                &published_job.review_base_sha,
+                &published_job.head_sha,
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &published_job.id,
+                "failed",
+                "",
+                "capturing review comments failed",
+            )
+            .unwrap();
+        let open = store.open_code_review_findings("acme/widgets", 42).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, published_findings[0].id);
     }
 
     #[tokio::test]
     async fn review_thread_loading_follows_graphql_pagination() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+        assert!(
+            REVIEW_RECONCILIATION_TIMEOUT.as_secs()
+                > GITHUB_REQUEST_TIMEOUT.as_secs() * REVIEW_THREAD_MAX_PAGES as u64
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -6553,6 +6683,16 @@ mod tests {
             )
             .unwrap();
         store
+            .record_code_review_publication(
+                &job.id,
+                "acme/widgets",
+                42,
+                &job.review_base_sha,
+                &job.head_sha,
+                "review-url",
+            )
+            .unwrap();
+        store
             .finish_code_review_job(&job.id, "succeeded", "review-url", "")
             .unwrap();
         assert!(
@@ -6560,14 +6700,6 @@ mod tests {
                 .code_review_pull_has_active_job("acme/widgets", 42, &job.head_sha)
                 .unwrap()
         );
-        store
-            .mark_code_review_published(
-                "acme/widgets",
-                42,
-                "1111111111111111111111111111111111111111",
-                "2222222222222222222222222222222222222222",
-            )
-            .unwrap();
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
             store,
@@ -6805,37 +6937,41 @@ mod tests {
         dedupe_key: &str,
     ) -> trouve_protocol::CodeReviewJob {
         store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: dedupe_key.into(),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Ship widgets".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: Some("provider/default".into()),
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: "Review it".into(),
-                reviewers: crate::reviewers::built_in_reviewers()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                routing_mode: CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
+            .enqueue_code_review_job(&test_review_job_request(dedupe_key))
             .unwrap()
             .unwrap()
+    }
+
+    fn test_review_job_request(dedupe_key: &str) -> NewCodeReviewJob {
+        NewCodeReviewJob {
+            dedupe_key: dedupe_key.into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "2222222222222222222222222222222222222222".into(),
+            review_base_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "main".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "automatic".into(),
+            retry_of: None,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "Review it".into(),
+            reviewers: crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .take(1)
+                .collect(),
+            routing_mode: CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            config_hash: "config".into(),
+        }
     }
 
     #[tokio::test]
