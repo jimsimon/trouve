@@ -69,9 +69,9 @@ struct ModelCandidate {
     provider_model: String,
     info: trouve_protocol::ModelInfo,
     executor: ModelExecutor,
-    /// Local runtimes and loopback endpoints keep their provider prefix so a
-    /// downloaded model cannot silently merge with a hosted model that has
-    /// the same account-visible id.
+    /// Managed local runtimes and user-configured local endpoints keep their
+    /// provider prefix so a downloaded model cannot silently merge with a
+    /// hosted model that has the same account-visible id.
     provider_qualified: bool,
 }
 
@@ -189,11 +189,20 @@ impl TurnAccounting {
 }
 
 impl ModelCandidate {
-    fn selection_id(&self) -> String {
-        model_selection_id(&self.provider_model, &self.info.id, self.provider_qualified)
+    fn automatic_selection_id(&self) -> Option<String> {
+        if self.provider_qualified {
+            None
+        } else {
+            neutral_model_id(&self.provider_model).map(|model| format!("auto/{model}"))
+        }
+    }
+
+    fn concrete_selection_id(&self) -> String {
+        format!("{}/{}", self.provider_id, self.provider_model)
     }
 }
 
+#[cfg(test)]
 fn model_selection_id(
     provider_model: &str,
     qualified_id: &str,
@@ -202,7 +211,17 @@ fn model_selection_id(
     if provider_qualified {
         return qualified_id.to_string();
     }
-    neutral_model_id(provider_model).unwrap_or_else(|| qualified_id.to_string())
+    neutral_model_id(provider_model)
+        .map(|model| format!("auto/{model}"))
+        .unwrap_or_else(|| qualified_id.to_string())
+}
+
+/// The shared model name selected by an automatic route. Bare names are a
+/// compatibility alias for catalogs emitted before protocol 2.2.
+fn automatic_model_name(selection: &str) -> Option<&str> {
+    selection
+        .strip_prefix("auto/")
+        .or_else(|| (!selection.contains('/')).then_some(selection))
 }
 
 /// Conservative cross-provider identity. models.dev has already normalized
@@ -319,6 +338,55 @@ fn common_price(
         .iter()
         .all(|candidate| get(&candidate.info) == Some(first))
         .then_some(first)
+}
+
+fn routed_model_info(
+    id: String,
+    mut candidates: Vec<ModelCandidate>,
+) -> trouve_protocol::RoutedModelInfo {
+    candidates.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.provider_model.cmp(&b.provider_model))
+    });
+    let first = &candidates[0].info;
+    let display_name = if candidates
+        .iter()
+        .all(|candidate| candidate.info.display_name == first.display_name)
+    {
+        first.display_name.clone()
+    } else {
+        id.clone()
+    };
+    let context_window = candidates
+        .iter()
+        .map(|candidate| candidate.info.context_window)
+        .filter(|window| *window > 0)
+        .min()
+        .unwrap_or(0);
+    trouve_protocol::RoutedModelInfo {
+        id,
+        display_name,
+        context_window,
+        supports_tools: candidates
+            .iter()
+            .all(|candidate| candidate.info.supports_tools),
+        input_price_per_mtok: common_price(&candidates, |model| model.input_price_per_mtok),
+        output_price_per_mtok: common_price(&candidates, |model| model.output_price_per_mtok),
+        options_schema: routed_options_schema(
+            &candidates
+                .iter()
+                .map(|candidate| &candidate.info)
+                .collect::<Vec<_>>(),
+        ),
+        routes: candidates
+            .iter()
+            .map(|candidate| trouve_protocol::ModelRouteInfo {
+                provider_id: candidate.provider_id.clone(),
+                provider_model: candidate.provider_model.clone(),
+            })
+            .collect(),
+    }
 }
 
 fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8, i64) {
@@ -1144,7 +1212,7 @@ impl Engine {
                 config
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "gpt-4.1-mini".into()),
+                    .unwrap_or_else(|| "auto/gpt-4.1-mini".into()),
             ),
             default_thinking_level: RwLock::new(config.default_thinking_level.clone()),
             default_permission_mode: RwLock::new(
@@ -1348,8 +1416,9 @@ impl Engine {
     /// models cannot run, so listing them only clutters the picker.
     ///
     /// While the server is offline, only models that can actually run are
-    /// listed: the built-in local provider and loopback endpoints (Ollama
-    /// etc.). Remote providers and vendor backends are dropped instead of
+    /// listed: the built-in local provider and user-configured local endpoints
+    /// (Ollama, llama.cpp, vLLM, etc.). Remote providers and vendor backends
+    /// are dropped instead of
     /// degrading to static/fallback catalogs of models every turn would
     /// fail on; clients gate prompt entry on this list being non-empty.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
@@ -1363,69 +1432,25 @@ impl Engine {
         models
     }
 
-    /// Provider-neutral catalog for current clients. The provider-qualified
-    /// `/models` catalog remains intact for compatibility and explicit route
-    /// pinning.
+    /// Model-selector catalog for current clients. Shared hosted models have
+    /// an `auto/<model>` entry plus one concrete entry per provider. Local,
+    /// user-configured local endpoints, and transport-owned models expose only
+    /// concrete entries. `/models` remains the compatibility catalog.
     pub async fn list_model_routes(&self) -> Vec<trouve_protocol::RoutedModelInfo> {
         let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
         for candidate in self.available_model_candidates().await {
             grouped
-                .entry(candidate.selection_id())
+                .entry(candidate.concrete_selection_id())
                 .or_default()
-                .push(candidate);
+                .push(candidate.clone());
+            if let Some(id) = candidate.automatic_selection_id() {
+                grouped.entry(id).or_default().push(candidate);
+            }
         }
 
         grouped
             .into_iter()
-            .map(|(id, mut candidates)| {
-                candidates.sort_by(|a, b| {
-                    a.provider_id
-                        .cmp(&b.provider_id)
-                        .then_with(|| a.provider_model.cmp(&b.provider_model))
-                });
-                let first = &candidates[0].info;
-                let display_name = if candidates
-                    .iter()
-                    .all(|candidate| candidate.info.display_name == first.display_name)
-                {
-                    first.display_name.clone()
-                } else {
-                    id.clone()
-                };
-                let context_window = candidates
-                    .iter()
-                    .map(|candidate| candidate.info.context_window)
-                    .filter(|window| *window > 0)
-                    .min()
-                    .unwrap_or(0);
-                trouve_protocol::RoutedModelInfo {
-                    id,
-                    display_name,
-                    context_window,
-                    supports_tools: candidates
-                        .iter()
-                        .all(|candidate| candidate.info.supports_tools),
-                    input_price_per_mtok: common_price(&candidates, |model| {
-                        model.input_price_per_mtok
-                    }),
-                    output_price_per_mtok: common_price(&candidates, |model| {
-                        model.output_price_per_mtok
-                    }),
-                    options_schema: routed_options_schema(
-                        &candidates
-                            .iter()
-                            .map(|candidate| &candidate.info)
-                            .collect::<Vec<_>>(),
-                    ),
-                    routes: candidates
-                        .iter()
-                        .map(|candidate| trouve_protocol::ModelRouteInfo {
-                            provider_id: candidate.provider_id.clone(),
-                            provider_model: candidate.provider_model.clone(),
-                        })
-                        .collect(),
-                }
-            })
+            .map(|(id, candidates)| routed_model_info(id, candidates))
             .collect()
     }
 
@@ -1504,16 +1529,45 @@ impl Engine {
         candidates
     }
 
-    /// Resolve a provider-neutral id to runnable routes, applying open
-    /// circuits, reported exhaustion, user preference, live subscription
+    /// Resolve an automatic id to runnable routes, applying thread affinity,
+    /// open circuits, reported exhaustion, user preference, live subscription
     /// headroom, and learned success. A provider-qualified id is an explicit
     /// pin and resolves to that route only.
     async fn resolve_model_candidates(
         &self,
-        model: &str,
+        thread: &Thread,
     ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let model = thread.model.as_str();
         let all = self.available_model_candidates().await;
-        if let Some(candidate) = all.iter().find(|candidate| candidate.info.id == model) {
+        if let Some(automatic_model) = automatic_model_name(model) {
+            let candidates: Vec<_> = all
+                .into_iter()
+                .filter(|candidate| {
+                    candidate
+                        .automatic_selection_id()
+                        .as_deref()
+                        .and_then(|id| id.strip_prefix("auto/"))
+                        == Some(automatic_model)
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Err(EngineError::BadRequest(format!(
+                    "no provider is configured and available for {model}"
+                )));
+            }
+            let affinity = self
+                .store
+                .thread_route_affinity(&thread.id)
+                .map_err(EngineError::Internal)?;
+            return self
+                .rank_model_candidates(model, candidates, affinity.as_ref())
+                .await;
+        }
+
+        if let Some(candidate) = all
+            .iter()
+            .find(|candidate| candidate.concrete_selection_id() == model)
+        {
             return Ok(vec![candidate.clone()]);
         }
         // Preserve the legacy provider-qualified escape hatch even for
@@ -1539,21 +1593,16 @@ impl Engine {
                 }]);
             }
         }
-        let candidates: Vec<_> = all
-            .into_iter()
-            .filter(|candidate| candidate.selection_id() == model)
-            .collect();
-        if candidates.is_empty() {
-            return Err(EngineError::BadRequest(format!(
-                "model {model} has no available provider route"
-            )));
-        }
-        self.rank_model_candidates(candidates).await
+        Err(EngineError::BadRequest(format!(
+            "selected provider route {model} is not configured or available"
+        )))
     }
 
     async fn rank_model_candidates(
         &self,
+        selection: &str,
         mut candidates: Vec<ModelCandidate>,
+        affinity: Option<&(String, String)>,
     ) -> Result<Vec<ModelCandidate>, EngineError> {
         let learned = self.store.route_health().map_err(EngineError::Internal)?;
         let now = chrono::Utc::now().timestamp();
@@ -1580,7 +1629,7 @@ impl Engine {
                 .min()
                 .unwrap_or(now);
             return Err(EngineError::Conflict(format!(
-                "all routes for this model are cooling down; retry in {} seconds",
+                "no provider for {selection} is currently available; all routes are cooling down; retry in {} seconds",
                 retry_after.saturating_sub(now).max(1)
             )));
         }
@@ -1609,7 +1658,13 @@ impl Engine {
                 candidate.provider_model.clone(),
             ));
             let last_success = route.and_then(|health| health.last_success_at);
+            let sticky = affinity.is_some_and(|(provider_id, provider_model)| {
+                candidate.provider_id == *provider_id
+                    && candidate.provider_model == *provider_model
+                    && rank.0 < 2
+            });
             let score = (
+                u8::from(!sticky),
                 u8::from(rank.0 >= 2),
                 u8::from(preferred.is_none()),
                 preferred.unwrap_or(usize::MAX),
@@ -1622,9 +1677,9 @@ impl Engine {
         }))
         .await;
         if scored.iter().all(|(_, rank, _)| rank.0 >= 3) {
-            return Err(EngineError::Conflict(
-                "every route for this model reports exhausted capacity".into(),
-            ));
+            return Err(EngineError::Conflict(format!(
+                "no provider for {selection} currently has remaining usage"
+            )));
         }
         scored.retain(|(_, rank, _)| rank.0 < 3);
         scored.sort_by(|(score_a, _, a), (score_b, _, b)| {
@@ -1668,8 +1723,9 @@ impl Engine {
         rank
     }
 
-    /// Provider ids that keep working without internet: the built-in local
-    /// provider plus configured loopback endpoints.
+    /// Provider ids that keep working without internet: the built-in managed
+    /// `local` provider plus user-configured OpenAI-compatible endpoints on
+    /// localhost or a loopback IP (for example Ollama, llama.cpp, or vLLM).
     fn offline_capable_provider_ids(&self) -> std::collections::HashSet<String> {
         let mut ids: std::collections::HashSet<String> = ["local".to_string()].into();
         let config = self.config.lock().unwrap();
@@ -3250,7 +3306,7 @@ impl Engine {
     }
 
     /// Set the default model for new threads. Provider-qualified values pin
-    /// one route; provider-neutral values are selected dynamically.
+    /// one route; `auto/<model>` values are selected dynamically.
     pub fn set_default_model(
         &self,
         model: &str,
@@ -5079,7 +5135,8 @@ impl Engine {
         &self,
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
-        if !model.contains('/') {
+        if let Some(automatic_model) = automatic_model_name(model) {
+            let catalog_id = format!("auto/{automatic_model}");
             let routes =
                 tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, self.list_model_routes())
                     .await
@@ -5090,7 +5147,7 @@ impl Engine {
                     })?;
             return routes
                 .into_iter()
-                .find(|candidate| candidate.id == model)
+                .find(|candidate| candidate.id == catalog_id)
                 .map(|candidate| trouve_protocol::ModelInfo {
                     id: candidate.id,
                     display_name: candidate.display_name,
@@ -8683,7 +8740,7 @@ mod tests {
         );
         assert_eq!(
             model_selection_id("qwen2.5-coder:7b", "openrouter/qwen2.5-coder:7b", false),
-            "qwen2.5-coder:7b"
+            "auto/qwen2.5-coder:7b"
         );
         assert_eq!(
             model_selection_id("default", "cursor/default", false),
@@ -8713,7 +8770,7 @@ mod tests {
 
         assert_eq!(
             model_selection_id(model_name_for_provider("openai", &api.id), &api.id, false),
-            "gpt-5.6-sol"
+            "auto/gpt-5.6-sol"
         );
         assert_eq!(
             model_selection_id(
@@ -8721,7 +8778,7 @@ mod tests {
                 &codex.id,
                 false
             ),
-            "gpt-5.6-sol"
+            "auto/gpt-5.6-sol"
         );
         assert_eq!(api.display_name, codex.display_name);
         assert_eq!(api.context_window, codex.context_window);

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.1"
+    "version": "2.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -5909,7 +5909,7 @@
               "string",
               "null"
             ],
-            "description": "Provider-neutral model id from `/v1/model-routes`. A provider-qualified\nid from `/v1/models` explicitly pins the thread to that route."
+            "description": "Model id from `/v1/model-routes`. `auto/<model>` selects dynamically;\n`provider/<model>` explicitly pins the thread to that route. Bare\nneutral ids remain accepted for compatibility."
           },
           "model_options": {
             "type": "object",
@@ -6028,7 +6028,7 @@
           },
           {
             "type": "object",
-            "description": "The concrete provider route chosen for a provider-neutral model. A\nlater event for the same turn records a safe route failover.",
+            "description": "The concrete provider route chosen for an automatic model. A later\nevent for the same turn records a safe route failover.",
             "required": [
               "turn",
               "model",
@@ -7073,7 +7073,7 @@
           },
           {
             "type": "object",
-            "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (local provider,\nloopback endpoints); clients gate prompt entry on having usable\nmodels and announce recovery. `ServerInfo.online` carries the same\nstate for initial fetches.",
+            "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (the managed `local`\nprovider and user-configured local endpoints); clients gate prompt\nentry on having usable models and announce recovery.\n`ServerInfo.online` carries the same\nstate for initial fetches.",
             "required": [
               "online",
               "type"
@@ -7912,7 +7912,7 @@
       },
       "ModelRouteInfo": {
         "type": "object",
-        "description": "One concrete provider route for a provider-neutral model selection.\n`provider_model` is the provider's own model id, without trouve's\nprovider prefix, and is the value passed to that provider at execution.",
+        "description": "One concrete provider route for an automatic or pinned model selection.\n`provider_model` is the provider's own model id, without trouve's\nprovider prefix, and is the value passed to that provider at execution.",
         "required": [
           "provider_id",
           "provider_model"
@@ -8199,7 +8199,7 @@
         "properties": {
           "default_model": {
             "type": "string",
-            "description": "Default provider-neutral model for new threads. Provider-qualified\nlegacy values remain supported and pin one route."
+            "description": "Default model for new threads. `auto/<model>` selects dynamically and\n`provider/<model>` pins one route. Bare neutral values remain accepted."
           },
           "default_permission_mode": {
             "$ref": "#/components/schemas/PermissionMode",
@@ -8514,7 +8514,7 @@
       },
       "RoutedModelInfo": {
         "type": "object",
-        "description": "A stable model identity that one or more currently available providers\ncan run. Clients use this catalog for provider-neutral model pickers;\n[`ModelInfo`] remains the provider-qualified compatibility catalog.",
+        "description": "A model-picker entry. Automatic entries contain every compatible route;\nconcrete provider entries contain exactly one. [`ModelInfo`] remains the\nprovider-qualified compatibility catalog.",
         "required": [
           "id",
           "display_name",
@@ -8535,7 +8535,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Provider-neutral id stored on new threads (for example\n\"gpt-5.4-codex\"). Models without a safe neutral identity retain their\nprovider-qualified id and have exactly one route."
+            "description": "`auto/<model>` for dynamic routing, or `provider/<model>` for a hard\npin. Models without a safe shared identity have only concrete entries."
           },
           "input_price_per_mtok": {
             "type": [
@@ -8753,7 +8753,7 @@
           },
           "model": {
             "type": "string",
-            "description": "Provider-neutral model id, or a provider-qualified id to pin a route."
+            "description": "`auto/<model>` id, or a provider-qualified id to pin a route."
           }
         }
       },
@@ -9256,7 +9256,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "`auto/<model>` selects dynamically; `provider/<model>` is a hard pin.\nChanging this value clears the thread's automatic route affinity."
           },
           "model_options": {
             "type": [

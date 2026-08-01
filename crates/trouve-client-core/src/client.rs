@@ -328,8 +328,8 @@ impl ProtocolClient {
         self.get_json("/models").await
     }
 
-    /// Provider-neutral model catalog used by model selectors. Each entry
-    /// carries the concrete routes the harness may choose at turn time.
+    /// Model-selector catalog containing both `auto/<model>` dynamic choices
+    /// and concrete `provider/<model>` pins.
     pub async fn list_model_routes(&self) -> Result<Vec<RoutedModelInfo>> {
         self.get_json("/model-routes").await
     }

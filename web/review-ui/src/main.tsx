@@ -1950,7 +1950,7 @@ function RepositoryEditor({
           <label>
             Coordinator and fallback model
             <select
-              value={modelSelectionValue(draft.model)}
+              value={modelSelectionValue(models, draft.model)}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
                 const selectedCoordinatorModel = modelForSelection(models, model);
@@ -2020,7 +2020,7 @@ function RepositoryEditor({
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
-              value={modelSelectionValue(draft.router_model)}
+              value={modelSelectionValue(models, draft.router_model)}
               disabled={!semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
@@ -2166,7 +2166,7 @@ function RepositoryEditor({
                   <label>
                     Model
                     <select
-                      value={modelSelectionValue(override?.model)}
+                      value={modelSelectionValue(models, override?.model)}
                       onChange={(event) => {
                         const model = event.currentTarget.value || undefined;
                         const selectedModel = modelForSelection(
@@ -2350,7 +2350,7 @@ function ReviewerEditor({
       <label>
         Default model
         <select
-          value={modelSelectionValue(draft.model)}
+          value={modelSelectionValue(models, draft.model)}
           onChange={(event) => {
             const model = event.currentTarget.value || undefined;
             setDraft({
@@ -2857,7 +2857,7 @@ function ReviewModeSettings({
             <label>
               Default model
               <select
-                value={modelSelectionValue(model)}
+                value={modelSelectionValue(models, model)}
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
@@ -3203,7 +3203,7 @@ function ProviderSettings({
         <label>
           Global default model
           <select
-            value={modelSelectionValue(defaultModel)}
+            value={modelSelectionValue(models, defaultModel)}
             onChange={(event) => {
               const next = event.currentTarget.value;
               setDefaultModel(next);

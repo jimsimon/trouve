@@ -1761,14 +1761,10 @@ impl Controller {
         }
     }
 
-    /// Index of a provider-neutral id, also accepting a legacy pinned route.
+    /// Index of an automatic or concrete id, also accepting pre-2.2 aliases.
     fn model_index_of(&self, model: Option<&str>) -> i32 {
         model
-            .and_then(|id| {
-                self.models
-                    .iter()
-                    .position(|model| routed_model_matches(model, id))
-            })
+            .and_then(|id| routed_model_index(&self.models, id))
             .map(|i| i as i32)
             .unwrap_or(-1)
     }
@@ -2512,9 +2508,7 @@ impl Controller {
                     .position(|m| m.id == thread.mode)
                     .map(|i| i as i32)
                     .unwrap_or(-1),
-                self.models
-                    .iter()
-                    .position(|model| routed_model_matches(model, &thread.model))
+                routed_model_index(&self.models, &thread.model)
                     .map(|i| i as i32)
                     .unwrap_or(-1),
                 permission_index_of(Some(thread.permission_mode)),
@@ -2530,11 +2524,8 @@ impl Controller {
     /// model's options schema; selections from the thread's stored options.
     fn push_model_knobs(&mut self) {
         let thread = self.current_thread.and_then(|i| self.threads.get(i));
-        let info = thread.and_then(|thread| {
-            self.models
-                .iter()
-                .find(|model| routed_model_matches(model, &thread.model))
-        });
+        let info =
+            thread.and_then(|thread| routed_model_for_selection(&self.models, &thread.model));
 
         let thinking = info.and_then(|m| thinking_property(&m.options_schema));
         let (key, values, default) = match thinking {
@@ -3160,11 +3151,8 @@ impl Controller {
             ui::set_context(&self.ui, 0.0, false, false, "no thread selected".into());
             return;
         };
-        let catalog_window = self
-            .models
-            .iter()
-            .find(|model| routed_model_matches(model, &thread.model))
-            .map(|m| m.context_window);
+        let catalog_window =
+            routed_model_for_selection(&self.models, &thread.model).map(|m| m.context_window);
         let vm = self.vms.entry(thread.id.clone()).or_default();
         // A window reported live by the provider (codex sends the real one
         // with token usage) beats the static catalog guess.
@@ -4118,9 +4106,7 @@ impl Controller {
                     .as_ref()
                     .and_then(|level| {
                         let model_id = m.default_model.as_deref().unwrap_or(&default_model);
-                        self.models
-                            .iter()
-                            .find(|model| model.id == model_id)
+                        routed_model_for_selection(&self.models, model_id)
                             .and_then(|model| thinking_property(&model.options_schema))
                             .and_then(|(_, values, _)| {
                                 values.iter().position(|value| value == level)
@@ -5394,11 +5380,7 @@ impl Controller {
                 let model = selected_mode
                     .as_ref()
                     .and_then(|m| m.default_model.clone())
-                    .filter(|selection| {
-                        self.models
-                            .iter()
-                            .any(|known| routed_model_matches(known, selection))
-                    });
+                    .filter(|selection| routed_model_index(&self.models, selection).is_some());
                 let mut model_options = if model.is_some() {
                     serde_json::Map::new()
                 } else {
@@ -7386,6 +7368,9 @@ fn routed_model_matches(model: &RoutedModelInfo, selection: &str) -> bool {
     if model.id == selection {
         return true;
     }
+    if !selection.contains('/') && model.id.strip_prefix("auto/") == Some(selection) {
+        return true;
+    }
     let Some((provider_id, provider_model)) = selection.split_once('/') else {
         return false;
     };
@@ -7393,6 +7378,36 @@ fn routed_model_matches(model: &RoutedModelInfo, selection: &str) -> bool {
         .routes
         .iter()
         .any(|route| route.provider_id == provider_id && route.provider_model == provider_model)
+}
+
+/// Exact catalog ids win across the whole list before compatibility route
+/// matching. Otherwise an `auto/` row could capture a concrete provider pin
+/// merely because that provider is one of its routes.
+fn routed_model_index(models: &[RoutedModelInfo], selection: &str) -> Option<usize> {
+    models
+        .iter()
+        .position(|model| model.id == selection)
+        .or_else(|| {
+            if selection.contains('/') {
+                None
+            } else {
+                models
+                    .iter()
+                    .position(|model| model.id.strip_prefix("auto/") == Some(selection))
+            }
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .position(|model| routed_model_matches(model, selection))
+        })
+}
+
+fn routed_model_for_selection<'a>(
+    models: &'a [RoutedModelInfo],
+    selection: &str,
+) -> Option<&'a RoutedModelInfo> {
+    routed_model_index(models, selection).and_then(|index| models.get(index))
 }
 
 /// The thinking-style enum in a model's options schema, if any: property
@@ -8204,8 +8219,8 @@ mod tests {
         format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
         model_health_rank, model_health_view, pr_badge, project_session_prs,
         provider_login_requires_code, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, routed_model_matches, session_title_fallback, should_open_chat_at_tail,
-        thinking_property,
+        reorder_id, routed_model_index, routed_model_matches, session_title_fallback,
+        should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -8849,23 +8864,39 @@ mod tests {
     }
 
     #[test]
-    fn routed_model_matching_accepts_neutral_and_pinned_ids() {
-        let model = RoutedModelInfo {
-            id: "gpt-shared".into(),
+    fn routed_model_matching_accepts_automatic_aliases_and_pinned_ids() {
+        let automatic = RoutedModelInfo {
+            id: "auto/gpt-shared".into(),
             display_name: "GPT Shared".into(),
             context_window: 100_000,
             supports_tools: true,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({}),
-            routes: vec![trouve_protocol::ModelRouteInfo {
-                provider_id: "codex".into(),
-                provider_model: "gpt-shared".into(),
-            }],
+            routes: vec![
+                trouve_protocol::ModelRouteInfo {
+                    provider_id: "codex".into(),
+                    provider_model: "gpt-shared".into(),
+                },
+                trouve_protocol::ModelRouteInfo {
+                    provider_id: "openai".into(),
+                    provider_model: "gpt-shared".into(),
+                },
+            ],
         };
-        assert!(routed_model_matches(&model, "gpt-shared"));
-        assert!(routed_model_matches(&model, "codex/gpt-shared"));
-        assert!(!routed_model_matches(&model, "cursor/gpt-shared"));
+        let pinned = RoutedModelInfo {
+            id: "codex/gpt-shared".into(),
+            routes: vec![automatic.routes[0].clone()],
+            ..automatic.clone()
+        };
+        let models = vec![automatic.clone(), pinned];
+
+        assert!(routed_model_matches(&automatic, "gpt-shared"));
+        assert!(routed_model_matches(&automatic, "codex/gpt-shared"));
+        assert!(!routed_model_matches(&automatic, "cursor/gpt-shared"));
+        assert_eq!(routed_model_index(&models, "gpt-shared"), Some(0));
+        assert_eq!(routed_model_index(&models, "auto/gpt-shared"), Some(0));
+        assert_eq!(routed_model_index(&models, "codex/gpt-shared"), Some(1));
     }
 
     #[test]

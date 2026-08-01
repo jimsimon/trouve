@@ -140,7 +140,9 @@ pub use requests::*;
 // with fully routed selection (breaking).
 // 2.1: provider-neutral model routes, preferred provider ordering, and
 // model.route_selected handoff events (all additive).
-pub const PROTOCOL_VERSION: &str = "2.1";
+// 2.2: model-route catalogs expose auto-prefixed dynamic choices alongside
+// concrete provider pins; bare neutral ids remain accepted as aliases.
+pub const PROTOCOL_VERSION: &str = "2.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 /// Provider-specific option-schema keys that represent the canonical
 /// `thinking_level` setting. Order is significant: clients prefer the first

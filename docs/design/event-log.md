@@ -73,7 +73,7 @@ Thread scope:
 - `turn.started` `{turn, mode, model}` / `turn.completed` `{turn, usage,
   checkpoint_id?}` / `turn.failed` `{turn, error}`
 - `model.route_selected` `{turn, model, provider_id, provider_model, reason}`
-  — the concrete route chosen for a provider-neutral model; the first route
+  — the concrete route chosen for an `auto/` model; the first route
   uses `reason: initial`, then repeats with `reason: capacity_failover` when an
   exhausted route hands off the turn, or `reason: route_failover` when a safely
   retryable unavailable route does so

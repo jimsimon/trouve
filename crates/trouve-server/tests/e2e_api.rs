@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -1654,7 +1654,7 @@ async fn neutral_native_model_resumes_on_capacity_exhaustion() {
             .with_config_dir(None)
             .with_provider("native-a", preferred.clone())
             .with_provider("native-b", fallback.clone())
-            .with_default_model("native-shared-model"),
+            .with_default_model("auto/native-shared-model"),
     );
     let (client, base, thread_id) = start_routing_test_thread(
         engine,
@@ -1939,7 +1939,7 @@ async fn neutral_model_crosses_from_native_provider_to_agent_backend() {
         permissions: std::sync::Mutex::new(Vec::new()),
     });
     let config = Config {
-        default_model: Some("cross-model".into()),
+        default_model: Some("auto/cross-model".into()),
         provider_order: vec!["native-cross".into(), "backend-cross".into()],
         ..Default::default()
     };
@@ -2022,7 +2022,7 @@ async fn neutral_model_crosses_from_agent_backend_to_native_provider() {
         permissions: std::sync::Mutex::new(Vec::new()),
     });
     let config = Config {
-        default_model: Some("cross-model".into()),
+        default_model: Some("auto/cross-model".into()),
         provider_order: vec!["backend-cross".into(), "native-cross".into()],
         ..Default::default()
     };
@@ -2109,6 +2109,243 @@ struct UnavailableRouteProvider {
     calls: AtomicUsize,
 }
 
+struct StickyRouteProvider {
+    name: &'static str,
+    fail: AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl StickyRouteProvider {
+    fn new(name: &'static str, fail: bool) -> Self {
+        Self {
+            name,
+            fail: AtomicBool::new(fail),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for StickyRouteProvider {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/sticky-model", self.name),
+            display_name: "Sticky Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(ProviderError::Api("503 test route unavailable".into()));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta(format!(
+                "completed by {}",
+                self.name
+            ))),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn automatic_route_stays_sticky_until_it_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let sticky = Arc::new(StickyRouteProvider::new("sticky-a", false));
+    let alternate = Arc::new(StickyRouteProvider::new("sticky-b", false));
+    let config = Config {
+        default_model: Some("auto/sticky-model".into()),
+        provider_order: vec!["sticky-a".into(), "sticky-b".into()],
+        ..Default::default()
+    };
+    let engine = Arc::new(
+        Engine::new(
+            Store::open(&tmp.path().join("db/trouve.db")).unwrap(),
+            tmp.path().join("data"),
+            &config,
+        )
+        .with_config_dir(None)
+        .with_provider("sticky-a", sticky.clone())
+        .with_provider("sticky-b", alternate.clone()),
+    );
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Sticky route",
+        RoutingThreadSettings::default(),
+    )
+    .await;
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    for turn in 1..=2 {
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": format!("turn {turn}")}))
+            .send()
+            .await
+            .unwrap();
+        let events = wait_for_event(&client, &events_url, |event| {
+            event["type"] == "turn.completed" && event["turn"] == turn
+        })
+        .await;
+        let selected = events
+            .iter()
+            .find(|event| event["type"] == "model.route_selected" && event["turn"] == turn)
+            .unwrap();
+        assert_eq!(selected["provider_id"], "sticky-a");
+
+        if turn == 1 {
+            let response = client
+                .put(format!("{base}/config/provider-order"))
+                .json(&serde_json::json!({
+                    "provider_ids": ["sticky-b", "sticky-a"]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        }
+    }
+
+    sticky.fail.store(true, Ordering::SeqCst);
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "fail over"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 3
+    })
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected" && event["turn"] == 3)
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0]["provider_id"], "sticky-a");
+    assert_eq!(selected[1]["provider_id"], "sticky-b");
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "stay on the fallback"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 4
+    })
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected" && event["turn"] == 4)
+        .collect();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["provider_id"], "sticky-b");
+    assert_eq!(sticky.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(alternate.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn explicit_provider_pin_does_not_fail_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let pinned = Arc::new(StickyRouteProvider::new("pin-a", true));
+    let working = Arc::new(StickyRouteProvider::new("pin-b", false));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("pin-a", pinned.clone())
+            .with_provider("pin-b", working.clone())
+            .with_default_model("pin-a/sticky-model"),
+    );
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Pinned route",
+        RoutingThreadSettings::default(),
+    )
+    .await;
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "use only the selected provider"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |event| event["type"] == "turn.failed").await;
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "turn.failed")
+        .unwrap()["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("selected provider route pin-a/sticky-model failed"));
+    assert_eq!(pinned.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(working.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn automatic_route_reports_when_no_provider_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let first = Arc::new(StickyRouteProvider::new("down-a", true));
+    let second = Arc::new(StickyRouteProvider::new("down-b", true));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("down-a", first)
+            .with_provider("down-b", second)
+            .with_default_model("auto/sticky-model"),
+    );
+    let (client, base, thread_id) =
+        start_routing_test_thread(engine, &repo, "No route", RoutingThreadSettings::default())
+            .await;
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "try every viable route"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |event| event["type"] == "turn.failed").await;
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "turn.failed")
+        .unwrap()["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("no provider is currently able to run auto/sticky-model"));
+    assert!(error.contains("tried 2 route(s)"));
+}
+
 #[async_trait::async_trait]
 impl Provider for UnavailableRouteProvider {
     fn id(&self) -> &str {
@@ -2156,7 +2393,7 @@ async fn route_circuit_breaker_bounds_attempts_and_skips_failures_next_turn() {
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let mut engine = Engine::new(store, tmp.path().join("data"), &Config::default())
         .with_config_dir(None)
-        .with_default_model("guarded-model");
+        .with_default_model("auto/guarded-model");
     let mut routes = Vec::new();
     for (name, available) in [
         ("route-a", false),
@@ -2197,7 +2434,7 @@ async fn route_circuit_breaker_bounds_attempts_and_skips_failures_next_turn() {
         .unwrap()["error"]
         .as_str()
         .unwrap();
-    assert!(error.contains("stopped after 4 route attempts"));
+    assert!(error.contains("unable to route auto/guarded-model after 4 route attempts"));
     assert_eq!(routes[0].calls.load(Ordering::SeqCst), 1);
     assert_eq!(routes[1].calls.load(Ordering::SeqCst), 1);
     assert_eq!(routes[2].calls.load(Ordering::SeqCst), 1);
@@ -2382,7 +2619,7 @@ async fn cancelling_backend_turn_aborts_open_tool_cards() {
         Engine::new(store, tmp.path().join("data"), &Config::default())
             .with_config_dir(None)
             .with_backend("hanging", Arc::new(HangingToolBackend))
-            .with_default_model("cancel-model"),
+            .with_default_model("auto/cancel-model"),
     );
     let (client, base, thread_id) = start_routing_test_thread(
         engine,
@@ -2437,7 +2674,7 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
             .with_config_dir(None)
             .with_backend("preferred", preferred.clone())
             .with_backend("fallback", fallback.clone())
-            .with_default_model("shared-model"),
+            .with_default_model("auto/shared-model"),
     );
     let (client, base, thread_id) =
         start_routing_test_thread(engine, &repo, "Routing", RoutingThreadSettings::default()).await;
@@ -2454,9 +2691,19 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|model| model["id"] == "shared-model")
-        .expect("provider-neutral catalog entry");
+        .find(|model| model["id"] == "auto/shared-model")
+        .expect("automatic catalog entry");
     assert_eq!(shared["routes"].as_array().unwrap().len(), 2);
+    for provider in ["preferred", "fallback"] {
+        let pinned = routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == format!("{provider}/shared-model"))
+            .expect("provider-specific catalog entry");
+        assert_eq!(pinned["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(pinned["routes"][0]["provider_id"], provider);
+    }
     let thread: serde_json::Value = client
         .get(format!("{base}/threads/{thread_id}"))
         .send()
@@ -2465,7 +2712,7 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
         .json()
         .await
         .unwrap();
-    assert_eq!(thread["model"], "shared-model");
+    assert_eq!(thread["model"], "auto/shared-model");
     let events_url = format!("{base}/threads/{thread_id}/events");
 
     client

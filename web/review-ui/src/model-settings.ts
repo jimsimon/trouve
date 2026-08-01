@@ -29,16 +29,32 @@ export function modelForSelection<T extends ModelWithOptions>(
   selection?: string,
 ): T | undefined {
   if (!selection) return undefined;
+  const exact = models.find((model) => model.id === selection);
+  if (exact) return exact;
+  if (!selection.includes("/")) {
+    const automatic = models.find((model) => model.id === `auto/${selection}`);
+    if (automatic) return automatic;
+  }
   return models.find((model) =>
-    model.id === selection || model.routes?.some(
+    model.routes?.some(
       (route) => `${route.provider_id}/${route.provider_model}` === selection,
     ),
   );
 }
 
-/** Preserve the persisted selection; provider-qualified values are pins. */
-export function modelSelectionValue(selection?: string): string {
-  return selection ?? "";
+/** Map pre-2.2 bare automatic ids to their catalog row; preserve hard pins. */
+export function modelSelectionValue(
+  models: readonly ModelWithOptions[],
+  selection?: string,
+): string {
+  if (!selection) return "";
+  if (
+    !selection.includes("/")
+    && models.some((model) => model.id === `auto/${selection}`)
+  ) {
+    return `auto/${selection}`;
+  }
+  return selection;
 }
 
 /** Extra picker row needed to display a persisted pin or unavailable id. */
@@ -46,7 +62,12 @@ export function supplementalModelSelection(
   models: readonly ModelWithOptions[],
   selection?: string,
 ): { value: string; kind: "pinned" | "unavailable" } | undefined {
-  if (!selection || models.some((model) => model.id === selection)) return undefined;
+  if (
+    !selection
+    || models.some((model) => model.id === modelSelectionValue(models, selection))
+  ) {
+    return undefined;
+  }
   return {
     value: selection,
     kind: modelForSelection(models, selection) ? "pinned" : "unavailable",
