@@ -3103,20 +3103,22 @@ async fn code_review_execution_settings_persist_and_publish() {
         .put(format!("{base}/config/code-review"))
         .json(&serde_json::json!({
             "max_parallel_reviews": trouve_protocol::MAX_PARALLEL_REVIEWS + 1,
-            "total_timeout_seconds": 600,
-            "reviewer_timeout_seconds": 300,
-            "coordinator_timeout_seconds": 300
+            "total_timeout_seconds": 1_200,
+            "reviewer_timeout_seconds": 720,
+            "coordinator_timeout_seconds": 360
         }))
         .send()
         .await
         .unwrap();
+    assert_eq!(excessive_concurrency.status(), reqwest::StatusCode::OK);
+    let compatible_settings: serde_json::Value = excessive_concurrency.json().await.unwrap();
     assert_eq!(
-        excessive_concurrency.status(),
-        reqwest::StatusCode::BAD_REQUEST
+        compatible_settings["max_parallel_reviews"],
+        trouve_protocol::MAX_PARALLEL_REVIEWS
     );
 
     let persisted = std::fs::read_to_string(&config_file).unwrap();
-    assert!(persisted.contains("code_review_max_parallel_reviews = 4"));
+    assert!(persisted.contains("code_review_max_parallel_reviews = 32"));
     assert!(persisted.contains("code_review_timeout_seconds = 1200"));
     assert!(persisted.contains("code_review_reviewer_timeout_seconds = 720"));
     assert!(persisted.contains("code_review_coordinator_timeout_seconds = 360"));

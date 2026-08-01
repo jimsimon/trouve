@@ -2794,8 +2794,9 @@ function ReviewExecutionSettings({
             </label>
           </div>
           <p class="field-help">
-            Higher concurrency increases provider usage and may encounter provider rate limits.
-            Environment review variables take precedence over these persisted values.
+            Higher concurrency increases provider usage and may encounter provider rate limits. The
+            maximum is {MAX_PARALLEL_REVIEWS}. Environment review variables take precedence over
+            these persisted values.
           </p>
           <div class="action-row">
             <button type="submit" disabled={busy}>

@@ -73,7 +73,8 @@ pub struct Config {
     pub github_review_app: Option<GithubReviewAppConfig>,
     /// Maximum number of automated code-review jobs that may run at once.
     /// Unset uses the built-in default (or the environment override when
-    /// present).
+    /// present). Positive values above 32 are accepted for compatibility and
+    /// normalized to 32 at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review_max_parallel_reviews: Option<u32>,
     /// Whole automated code-review job deadline. Unset uses the built-in

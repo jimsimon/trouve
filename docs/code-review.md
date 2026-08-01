@@ -246,7 +246,9 @@ overrides are `TROUVE_TURN_CONCURRENCY` and
 `TROUVE_BACKGROUND_TURN_CONCURRENCY`; review orchestration can be narrowed
 further with `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
 `TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
-a server restart.
+a server restart. Review-job concurrency has a hard maximum of 32; larger
+persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to
+32 with a server warning.
 
 ## Backup and upgrades
 

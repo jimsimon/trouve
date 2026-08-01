@@ -5,7 +5,7 @@
 //! and turns each immutable PR head into a normal trouve review session.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -179,6 +179,20 @@ fn positive_concurrency_from_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn bounded_review_job_concurrency(limit: u32, source: &'static str) -> u32 {
+    if limit > MAX_PARALLEL_REVIEWS {
+        tracing::warn!(
+            source,
+            requested = limit,
+            maximum = MAX_PARALLEL_REVIEWS,
+            "code-review job concurrency exceeds the safety limit; reducing it"
+        );
+        MAX_PARALLEL_REVIEWS
+    } else {
+        limit
+    }
+}
+
 #[derive(Default)]
 pub struct CodeReviewRuntime {
     started: AtomicBool,
@@ -188,6 +202,7 @@ pub struct CodeReviewRuntime {
     reconcile_lock: tokio::sync::Mutex<()>,
     poll_wake: Notify,
     job_wake: Notify,
+    warned_job_concurrency_override: AtomicUsize,
     running: Mutex<HashMap<String, RunningReview>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
     projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -1300,12 +1315,21 @@ impl Engine {
     }
 
     pub fn code_review_settings(&self) -> CodeReviewSettings {
-        let config = self.config.lock().unwrap();
+        let mut config = self.config.lock().unwrap();
+        let max_parallel_reviews = match config.code_review_max_parallel_reviews {
+            Some(0) | None => DEFAULT_MAX_PARALLEL_REVIEWS,
+            Some(limit) => bounded_review_job_concurrency(limit, "persisted config"),
+        };
+        if config
+            .code_review_max_parallel_reviews
+            .is_some_and(|limit| limit > MAX_PARALLEL_REVIEWS)
+        {
+            // Normalize in memory once so reads do not repeatedly warn. The
+            // next settings write persists the compatible clamped value.
+            config.code_review_max_parallel_reviews = Some(max_parallel_reviews);
+        }
         CodeReviewSettings {
-            max_parallel_reviews: config
-                .code_review_max_parallel_reviews
-                .filter(|limit| (1..=MAX_PARALLEL_REVIEWS).contains(limit))
-                .unwrap_or(DEFAULT_MAX_PARALLEL_REVIEWS),
+            max_parallel_reviews,
             total_timeout_seconds: config
                 .code_review_timeout_seconds
                 .filter(|seconds| *seconds > 0)
@@ -1349,13 +1373,10 @@ impl Engine {
         &self,
         request: SetCodeReviewSettingsRequest,
     ) -> Result<(u64, CodeReviewSettings), EngineError> {
-        if request
-            .max_parallel_reviews
-            .is_some_and(|limit| !(1..=MAX_PARALLEL_REVIEWS).contains(&limit))
-        {
-            return Err(EngineError::BadRequest(format!(
-                "max parallel reviews must be between 1 and {MAX_PARALLEL_REVIEWS}"
-            )));
+        if request.max_parallel_reviews == Some(0) {
+            return Err(EngineError::BadRequest(
+                "max parallel reviews must be positive".into(),
+            ));
         }
         if request.total_timeout_seconds == 0
             || request.reviewer_timeout_seconds == 0
@@ -1377,13 +1398,14 @@ impl Engine {
         }
         let settings = {
             let mut config = self.config.lock().unwrap();
-            let current_max_parallel_reviews = config
-                .code_review_max_parallel_reviews
-                .filter(|limit| (1..=MAX_PARALLEL_REVIEWS).contains(limit))
-                .unwrap_or(DEFAULT_MAX_PARALLEL_REVIEWS);
+            let current_max_parallel_reviews = match config.code_review_max_parallel_reviews {
+                Some(0) | None => DEFAULT_MAX_PARALLEL_REVIEWS,
+                Some(limit) => bounded_review_job_concurrency(limit, "persisted config"),
+            };
             let settings = CodeReviewSettings {
                 max_parallel_reviews: request
                     .max_parallel_reviews
+                    .map(|limit| bounded_review_job_concurrency(limit, "API request"))
                     .unwrap_or(current_max_parallel_reviews),
                 total_timeout_seconds: request.total_timeout_seconds,
                 reviewer_timeout_seconds: request.reviewer_timeout_seconds,
@@ -1406,8 +1428,27 @@ impl Engine {
 
     fn effective_code_review_job_concurrency(&self) -> usize {
         let configured = self.code_review_settings().max_parallel_reviews as usize;
-        positive_concurrency_from_env(REVIEW_JOB_CONCURRENCY_ENV, configured)
-            .min(MAX_PARALLEL_REVIEWS as usize)
+        let requested = positive_concurrency_from_env(REVIEW_JOB_CONCURRENCY_ENV, configured);
+        if requested > MAX_PARALLEL_REVIEWS as usize {
+            let previously_warned = self
+                .code_review
+                .warned_job_concurrency_override
+                .swap(requested, Ordering::Relaxed);
+            if previously_warned != requested {
+                tracing::warn!(
+                    variable = REVIEW_JOB_CONCURRENCY_ENV,
+                    requested,
+                    maximum = MAX_PARALLEL_REVIEWS,
+                    "code-review job concurrency override exceeds the safety limit; reducing it"
+                );
+            }
+            MAX_PARALLEL_REVIEWS as usize
+        } else {
+            self.code_review
+                .warned_job_concurrency_override
+                .store(0, Ordering::Relaxed);
+            requested
+        }
     }
 
     pub fn code_review_job_detail(
@@ -6998,19 +7039,29 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("reviewer timeout cannot exceed"));
 
-        for invalid_limit in [0, MAX_PARALLEL_REVIEWS + 1] {
-            let error = engine
-                .set_code_review_settings(SetCodeReviewSettingsRequest {
-                    max_parallel_reviews: Some(invalid_limit),
-                    total_timeout_seconds: 900,
-                    reviewer_timeout_seconds: 600,
-                    coordinator_timeout_seconds: 300,
-                })
-                .unwrap_err();
-            assert!(error.to_string().contains(&format!(
-                "max parallel reviews must be between 1 and {MAX_PARALLEL_REVIEWS}"
-            )));
-        }
+        let error = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(0),
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 600,
+                coordinator_timeout_seconds: 300,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max parallel reviews must be positive")
+        );
+
+        let (_, compatible) = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(MAX_PARALLEL_REVIEWS + 1),
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 600,
+                coordinator_timeout_seconds: 300,
+            })
+            .unwrap();
+        assert_eq!(compatible.max_parallel_reviews, MAX_PARALLEL_REVIEWS);
 
         let invalid_config = crate::config::Config {
             code_review_max_parallel_reviews: Some(MAX_PARALLEL_REVIEWS + 1),
@@ -7025,8 +7076,17 @@ mod tests {
             invalid_config_engine
                 .code_review_settings()
                 .max_parallel_reviews,
-            DEFAULT_MAX_PARALLEL_REVIEWS
+            MAX_PARALLEL_REVIEWS
         );
+        let (_, normalized_legacy) = invalid_config_engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: None,
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 600,
+                coordinator_timeout_seconds: 300,
+            })
+            .unwrap();
+        assert_eq!(normalized_legacy.max_parallel_reviews, MAX_PARALLEL_REVIEWS);
 
         let expected = CodeReviewSettings {
             max_parallel_reviews: 4,
