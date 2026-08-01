@@ -62,6 +62,7 @@ import {
   type ReviewOutputField,
 } from "./review-output";
 import {
+  MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
   TIMEOUT_MINUTES_INPUT_STEP,
   reviewSettingsFromMinutes,
@@ -2747,6 +2748,7 @@ function ReviewExecutionSettings({
               <input
                 type="number"
                 min="1"
+                max={MAX_PARALLEL_REVIEWS}
                 step="1"
                 required
                 value={maxParallel}

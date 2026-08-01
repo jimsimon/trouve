@@ -274,7 +274,7 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
 .settings-card { display: flex; flex-direction: column; gap: 15px; padding: 18px; }
 .settings-card form { display: flex; flex-direction: column; gap: 12px; }
 .review-mode-settings, .review-timeout-settings { margin-bottom: 16px; }
-.review-timeout-settings .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.review-timeout-settings .form-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .health-list { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .health-list > div { display: flex; gap: 8px; align-items: flex-start; padding: 9px; border-radius: 7px; background: var(--surface-2); }
 .health-list i { flex: 0 0 8px; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--red); }

@@ -5409,6 +5409,7 @@
             "format": "int32",
             "description": "Maximum number of review jobs that may execute concurrently.",
             "default": 2,
+            "maximum": 32,
             "minimum": 1
           },
           "reviewer_timeout_seconds": {
@@ -8571,6 +8572,7 @@
             ],
             "format": "int32",
             "description": "Maximum number of review jobs that may execute concurrently. Omission\npreserves the current value for compatibility with older clients.",
+            "maximum": 32,
             "minimum": 1
           },
           "reviewer_timeout_seconds": {

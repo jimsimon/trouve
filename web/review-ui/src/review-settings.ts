@@ -2,6 +2,7 @@ import type { CodeReviewSettings } from "./types";
 
 export const TIMEOUT_MINUTES_INPUT_MIN = String(1 / 60);
 export const TIMEOUT_MINUTES_INPUT_STEP = TIMEOUT_MINUTES_INPUT_MIN;
+export const MAX_PARALLEL_REVIEWS = 32;
 
 export function timeoutMinutes(seconds: number): string {
   return String(seconds / 60);
@@ -23,8 +24,12 @@ export function reviewSettingsFromMinutes(
   coordinator: string,
 ): CodeReviewSettings {
   const maxParallelReviews = Number(maxParallel);
-  if (!Number.isSafeInteger(maxParallelReviews) || maxParallelReviews <= 0) {
-    throw new Error("Max parallel reviews must be a positive whole number");
+  if (
+    !Number.isSafeInteger(maxParallelReviews) ||
+    maxParallelReviews <= 0 ||
+    maxParallelReviews > MAX_PARALLEL_REVIEWS
+  ) {
+    throw new Error(`Max parallel reviews must be a whole number from 1 to ${MAX_PARALLEL_REVIEWS}`);
   }
   const settings = {
     max_parallel_reviews: maxParallelReviews,

@@ -3099,6 +3099,22 @@ async fn code_review_execution_settings_persist_and_publish() {
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    let excessive_concurrency = client
+        .put(format!("{base}/config/code-review"))
+        .json(&serde_json::json!({
+            "max_parallel_reviews": trouve_protocol::MAX_PARALLEL_REVIEWS + 1,
+            "total_timeout_seconds": 600,
+            "reviewer_timeout_seconds": 300,
+            "coordinator_timeout_seconds": 300
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        excessive_concurrency.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
     let persisted = std::fs::read_to_string(&config_file).unwrap();
     assert!(persisted.contains("code_review_max_parallel_reviews = 4"));
     assert!(persisted.contains("code_review_timeout_seconds = 1200"));

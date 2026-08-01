@@ -1418,8 +1418,13 @@ pub struct CodeReviewStats {
     pub repositories: Vec<CodeReviewRepositoryStats>,
 }
 
+/// Historical default for simultaneously running automated review jobs.
+pub const DEFAULT_MAX_PARALLEL_REVIEWS: u32 = 2;
+/// Hard safety ceiling for simultaneously running automated review jobs.
+pub const MAX_PARALLEL_REVIEWS: u32 = 32;
+
 const fn default_max_parallel_reviews() -> u32 {
-    2
+    DEFAULT_MAX_PARALLEL_REVIEWS
 }
 
 /// Persisted execution settings for automated code reviews.
@@ -1427,7 +1432,7 @@ const fn default_max_parallel_reviews() -> u32 {
 pub struct CodeReviewSettings {
     /// Maximum number of review jobs that may execute concurrently.
     #[serde(default = "default_max_parallel_reviews")]
-    #[schema(minimum = 1, default = 2)]
+    #[schema(minimum = 1, maximum = 32, default = 2)]
     pub max_parallel_reviews: u32,
     /// Whole-job deadline, including preparation, reviewers, final editing,
     /// and publication.
@@ -1448,7 +1453,7 @@ pub struct SetCodeReviewSettingsRequest {
     /// Maximum number of review jobs that may execute concurrently. Omission
     /// preserves the current value for compatibility with older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(minimum = 1)]
+    #[schema(minimum = 1, maximum = 32)]
     pub max_parallel_reviews: Option<u32>,
     /// Whole-job deadline, including preparation, reviewers, final editing,
     /// and publication.

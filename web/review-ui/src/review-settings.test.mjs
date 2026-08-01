@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
   TIMEOUT_MINUTES_INPUT_STEP,
   reviewSettingsFromMinutes,
@@ -42,6 +43,10 @@ test("review timeout settings reject invalid deadlines", () => {
   );
   assert.throws(
     () => reviewSettingsFromMinutes("1.5", "10", "5", "3"),
-    /Max parallel reviews must be a positive whole number/,
+    /Max parallel reviews must be a whole number from 1 to 32/,
+  );
+  assert.throws(
+    () => reviewSettingsFromMinutes(String(MAX_PARALLEL_REVIEWS + 1), "10", "5", "3"),
+    /Max parallel reviews must be a whole number from 1 to 32/,
   );
 });

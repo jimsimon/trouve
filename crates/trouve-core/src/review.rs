@@ -21,9 +21,10 @@ use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
     CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, CodeReviewRoutingDecision,
     CodeReviewRoutingMode, CodeReviewRoutingReason, CodeReviewRoutingSource, CodeReviewSettings,
-    ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus,
-    PermissionMode, ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope,
-    SetCodeReviewSettingsRequest, UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
+    ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest,
+    DEFAULT_MAX_PARALLEL_REVIEWS, Event, GithubAppStatus, MAX_PARALLEL_REVIEWS, PermissionMode,
+    ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope, SetCodeReviewSettingsRequest,
+    UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
@@ -46,7 +47,6 @@ const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REVIEW_COORDINATOR_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_COORDINATOR_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
-const DEFAULT_REVIEW_JOB_CONCURRENCY: u32 = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
 const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
@@ -1304,8 +1304,8 @@ impl Engine {
         CodeReviewSettings {
             max_parallel_reviews: config
                 .code_review_max_parallel_reviews
-                .filter(|limit| *limit > 0)
-                .unwrap_or(DEFAULT_REVIEW_JOB_CONCURRENCY),
+                .filter(|limit| (1..=MAX_PARALLEL_REVIEWS).contains(limit))
+                .unwrap_or(DEFAULT_MAX_PARALLEL_REVIEWS),
             total_timeout_seconds: config
                 .code_review_timeout_seconds
                 .filter(|seconds| *seconds > 0)
@@ -1349,10 +1349,13 @@ impl Engine {
         &self,
         request: SetCodeReviewSettingsRequest,
     ) -> Result<(u64, CodeReviewSettings), EngineError> {
-        if request.max_parallel_reviews == Some(0) {
-            return Err(EngineError::BadRequest(
-                "max parallel reviews must be positive".into(),
-            ));
+        if request
+            .max_parallel_reviews
+            .is_some_and(|limit| !(1..=MAX_PARALLEL_REVIEWS).contains(&limit))
+        {
+            return Err(EngineError::BadRequest(format!(
+                "max parallel reviews must be between 1 and {MAX_PARALLEL_REVIEWS}"
+            )));
         }
         if request.total_timeout_seconds == 0
             || request.reviewer_timeout_seconds == 0
@@ -1372,23 +1375,28 @@ impl Engine {
                 "final editor timeout cannot exceed the total review timeout".into(),
             ));
         }
-        let settings = CodeReviewSettings {
-            max_parallel_reviews: request
-                .max_parallel_reviews
-                .unwrap_or_else(|| self.code_review_settings().max_parallel_reviews),
-            total_timeout_seconds: request.total_timeout_seconds,
-            reviewer_timeout_seconds: request.reviewer_timeout_seconds,
-            coordinator_timeout_seconds: request.coordinator_timeout_seconds,
-        };
-        {
+        let settings = {
             let mut config = self.config.lock().unwrap();
+            let current_max_parallel_reviews = config
+                .code_review_max_parallel_reviews
+                .filter(|limit| (1..=MAX_PARALLEL_REVIEWS).contains(limit))
+                .unwrap_or(DEFAULT_MAX_PARALLEL_REVIEWS);
+            let settings = CodeReviewSettings {
+                max_parallel_reviews: request
+                    .max_parallel_reviews
+                    .unwrap_or(current_max_parallel_reviews),
+                total_timeout_seconds: request.total_timeout_seconds,
+                reviewer_timeout_seconds: request.reviewer_timeout_seconds,
+                coordinator_timeout_seconds: request.coordinator_timeout_seconds,
+            };
             config.code_review_max_parallel_reviews = Some(settings.max_parallel_reviews);
             config.code_review_timeout_seconds = Some(settings.total_timeout_seconds);
             config.code_review_reviewer_timeout_seconds = Some(settings.reviewer_timeout_seconds);
             config.code_review_coordinator_timeout_seconds =
                 Some(settings.coordinator_timeout_seconds);
             self.persist_config(&config);
-        }
+            settings
+        };
         let envelope = self
             .store
             .append_event(Scope::Server, Event::CodeReviewSettingsUpdated { settings })?;
@@ -1399,6 +1407,7 @@ impl Engine {
     fn effective_code_review_job_concurrency(&self) -> usize {
         let configured = self.code_review_settings().max_parallel_reviews as usize;
         positive_concurrency_from_env(REVIEW_JOB_CONCURRENCY_ENV, configured)
+            .min(MAX_PARALLEL_REVIEWS as usize)
     }
 
     pub fn code_review_job_detail(
@@ -6989,18 +6998,34 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("reviewer timeout cannot exceed"));
 
-        let error = engine
-            .set_code_review_settings(SetCodeReviewSettingsRequest {
-                max_parallel_reviews: Some(0),
-                total_timeout_seconds: 900,
-                reviewer_timeout_seconds: 600,
-                coordinator_timeout_seconds: 300,
-            })
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("max parallel reviews must be positive")
+        for invalid_limit in [0, MAX_PARALLEL_REVIEWS + 1] {
+            let error = engine
+                .set_code_review_settings(SetCodeReviewSettingsRequest {
+                    max_parallel_reviews: Some(invalid_limit),
+                    total_timeout_seconds: 900,
+                    reviewer_timeout_seconds: 600,
+                    coordinator_timeout_seconds: 300,
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "max parallel reviews must be between 1 and {MAX_PARALLEL_REVIEWS}"
+            )));
+        }
+
+        let invalid_config = crate::config::Config {
+            code_review_max_parallel_reviews: Some(MAX_PARALLEL_REVIEWS + 1),
+            ..Default::default()
+        };
+        let invalid_config_engine = Engine::new(
+            crate::store::Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &invalid_config,
+        );
+        assert_eq!(
+            invalid_config_engine
+                .code_review_settings()
+                .max_parallel_reviews,
+            DEFAULT_MAX_PARALLEL_REVIEWS
         );
 
         let expected = CodeReviewSettings {
