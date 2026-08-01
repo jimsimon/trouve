@@ -1098,6 +1098,17 @@ impl Engine {
         Ok(())
     }
 
+    fn emit_code_review_tasks(
+        &self,
+        tasks: Vec<trouve_protocol::CodeReviewTask>,
+    ) -> Result<(), EngineError> {
+        for task in tasks {
+            let job_id = task.job_id.clone();
+            self.emit_code_review_task(&job_id, task)?;
+        }
+        Ok(())
+    }
+
     fn emit_code_review_routing(
         &self,
         job_id: &str,
@@ -1516,12 +1527,14 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
-        let job = self
+        let transition = self
             .store
             .request_code_review_job_cancel(id)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        let job = transition.job;
         self.code_review.cancel_job(id);
+        self.emit_code_review_tasks(transition.updated_tasks)?;
         self.emit_code_review_job_updated(id)?;
         self.emit_code_review_updated(Some(id.to_owned()))?;
         if job.status == "cancelled" {
@@ -1534,12 +1547,14 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
-        let replacement = self
+        let retry = self
             .store
             .retry_code_review_job(id)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        let replacement = retry.replacement;
         self.code_review.cancel_job(id);
+        self.emit_code_review_tasks(retry.predecessor_tasks)?;
         self.emit_code_review_job_updated(id)?;
         self.emit_code_review_updated(Some(id.to_owned()))?;
         self.emit_code_review_updated(Some(replacement.id.clone()))?;
@@ -1557,11 +1572,13 @@ impl Engine {
         // session. Retry cleanup once more here so a transient cleanup delay
         // does not unnecessarily block a persona retry.
         self.retry_code_review_cleanup().await;
-        let job = self
+        let transition = self
             .store
             .retry_code_review_persona(id, reviewer_id)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        let job = transition.job;
+        self.emit_code_review_tasks(transition.updated_tasks)?;
         self.emit_code_review_job_updated(id)?;
         self.emit_code_review_updated(Some(id.to_owned()))?;
         self.sync_code_review_projection(&job).await;
@@ -1574,11 +1591,13 @@ impl Engine {
         id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
         self.retry_code_review_cleanup().await;
-        let job = self
+        let transition = self
             .store
             .retry_code_review_final_editor(id)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        let job = transition.job;
+        self.emit_code_review_tasks(transition.updated_tasks)?;
         self.emit_code_review_job_updated(id)?;
         self.emit_code_review_updated(Some(id.to_owned()))?;
         self.sync_code_review_projection(&job).await;
@@ -2482,8 +2501,15 @@ impl Engine {
                 )?;
                 let review_superseded = !superseded.is_empty();
                 if review_superseded {
-                    self.code_review.cancel_superseded(&superseded);
-                    for job_id in superseded {
+                    let superseded_ids = superseded
+                        .iter()
+                        .map(|transition| transition.job.id.clone())
+                        .collect::<Vec<_>>();
+                    self.code_review.cancel_superseded(&superseded_ids);
+                    for transition in superseded {
+                        let job_id = transition.job.id;
+                        self.emit_code_review_tasks(transition.updated_tasks)?;
+                        self.emit_code_review_job_updated(&job_id)?;
                         self.emit_code_review_updated(Some(job_id))?;
                     }
                 }
@@ -2946,19 +2972,24 @@ impl Engine {
                 ),
             ),
         };
-        let (finish_recorded, finish_transition) =
-            match self
-                .store
-                .finish_code_review_job(&job_id, status, &review_url, &error)
-            {
-                Ok(transitioned) => (true, Some(transitioned)),
-                Err(finish_error) => {
-                    self.record_review_error(format!(
-                        "finishing review job {job_id}: {finish_error:#}"
-                    ));
-                    (false, None)
-                }
-            };
+        let (finish_recorded, finish_transition, updated_tasks) = match self
+            .store
+            .finish_code_review_job(&job_id, status, &review_url, &error)
+        {
+            Ok(transition) => {
+                let transitioned = transition.is_some();
+                let updated_tasks = transition
+                    .map(|transition| transition.updated_tasks)
+                    .unwrap_or_default();
+                (true, Some(transitioned), updated_tasks)
+            }
+            Err(finish_error) => {
+                self.record_review_error(format!(
+                    "finishing review job {job_id}: {finish_error:#}"
+                ));
+                (false, None, Vec::new())
+            }
+        };
         if should_log_code_review_job_failure(status, finish_transition) {
             tracing::error!(
                 job_id = %job_id,
@@ -2976,6 +3007,7 @@ impl Engine {
         if finish_recorded {
             self.retry_code_review_cleanup().await;
         }
+        let _ = self.emit_code_review_tasks(updated_tasks);
         let _ = self.emit_code_review_job_updated(&job_id);
         let _ = self.emit_code_review_updated(Some(job_id));
     }
@@ -6173,6 +6205,81 @@ mod tests {
             })
             .unwrap()
             .unwrap()
+    }
+
+    fn queue_test_final_editor_retry(
+        store: &crate::store::Store,
+        dedupe_key: &str,
+    ) -> (
+        trouve_protocol::CodeReviewJob,
+        trouve_protocol::CodeReviewTask,
+    ) {
+        let job = enqueue_test_review_job(store, dedupe_key);
+        store.claim_code_review_job().unwrap().unwrap();
+        let coordinator = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: job.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                reviewer_id: None,
+                reviewer_name: "Final review editor".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "Select final findings".into(),
+            })
+            .unwrap();
+        store
+            .finish_code_review_task(&coordinator.id, "failed", "", 0, "editor failed")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "failed", "", "editor failed")
+            .unwrap()
+            .unwrap();
+        let mut retry = store
+            .retry_code_review_final_editor(&job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.updated_tasks.len(), 1);
+        (job, retry.updated_tasks.remove(0))
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_and_replacement_emit_cancelled_task_snapshots() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let (cancelled_job, cancelled_task) =
+            queue_test_final_editor_retry(&store, "acme/widgets#42:event-cancel");
+        let engine = Arc::new(Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        ));
+
+        engine
+            .cancel_code_review_job(&cancelled_job.id)
+            .await
+            .unwrap();
+        let (replaced_job, replaced_task) =
+            queue_test_final_editor_retry(&engine.store, "acme/widgets#42:event-retry");
+        engine.retry_review_job(&replaced_job.id).await.unwrap();
+
+        for (job_id, task_id) in [
+            (cancelled_job.id, cancelled_task.id),
+            (replaced_job.id, replaced_task.id),
+        ] {
+            let events = engine
+                .store
+                .events_after(&Scope::CodeReviewJob(job_id.clone()), 0)
+                .unwrap();
+            assert!(events.iter().any(|envelope| matches!(
+                &envelope.event,
+                Event::CodeReviewTaskUpdated {
+                    job_id: event_job_id,
+                    task,
+                } if event_job_id == &job_id && task.id == task_id && task.status == "cancelled"
+            )));
+        }
     }
 
     #[tokio::test]
