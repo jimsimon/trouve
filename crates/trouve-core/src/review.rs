@@ -3172,7 +3172,7 @@ impl Engine {
             },
         );
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
-        let queued_coordinator = self
+        let mut queued_coordinator = self
             .store
             .code_review_tasks(&job.id)?
             .into_iter()
@@ -3458,6 +3458,16 @@ impl Engine {
             .collect::<Vec<_>>();
         let coordinator_started = Instant::now();
         let parsed = if candidates.is_empty() && previous_findings.is_empty() {
+            if let Some(task) = queued_coordinator.take() {
+                let skipped = self
+                    .store
+                    .skip_code_review_task(
+                        &task.id,
+                        "No candidate or open finding required final editing on retry.",
+                    )?
+                    .ok_or_else(|| anyhow!("coordinator task was cancelled before dispatch"))?;
+                self.emit_code_review_task(&job.id, skipped)?;
+            }
             ReviewOutput {
                 summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
                 findings: Vec::new(),
@@ -3473,7 +3483,7 @@ impl Engine {
                 &previous_findings,
                 &diff_files,
             )?;
-            let task = if let Some(task) = queued_coordinator {
+            let task = if let Some(task) = queued_coordinator.take() {
                 task
             } else {
                 let task = self.store.create_code_review_task(&NewCodeReviewTask {
@@ -3491,11 +3501,12 @@ impl Engine {
             };
             let task = self
                 .store
-                .start_code_review_task(
+                .start_code_review_task_with_prompt(
                     &task.id,
                     &coordinator.session_id,
                     &coordinator.id,
                     &coordinator.model,
+                    &prompt,
                 )?
                 .ok_or_else(|| anyhow!("coordinator task was cancelled before dispatch"))?;
             self.emit_code_review_task(&job.id, task.clone())?;

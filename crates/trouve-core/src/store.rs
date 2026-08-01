@@ -3194,17 +3194,40 @@ impl Store {
         thread_id: &str,
         model: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        self.start_code_review_task_inner(id, session_id, thread_id, model, None)
+    }
+
+    pub fn start_code_review_task_with_prompt(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        self.start_code_review_task_inner(id, session_id, thread_id, model, Some(prompt))
+    }
+
+    fn start_code_review_task_inner(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+        model: &str,
+        prompt: Option<&str>,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET status = 'running', session_id = ?2, thread_id = ?3,
-                 model = ?4, started_at = ?5, error = ''
+                 model = ?4, prompt = COALESCE(?5, prompt), started_at = ?6, error = ''
              WHERE id = ?1 AND status = 'queued'",
             params![
                 id,
                 session_id,
                 thread_id,
                 model,
+                prompt,
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
@@ -4496,7 +4519,11 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_tasks
              SET status = 'cancelled', completed_at = ?2, error = ?3
-             WHERE job_id = ?1 AND status IN ('queued', 'running')",
+             WHERE job_id = ?1 AND status IN ('queued', 'running')
+               AND EXISTS (
+                 SELECT 1 FROM code_review_jobs
+                 WHERE id = ?1 AND status NOT IN ('queued', 'running')
+               )",
             params![job_id, chrono::Utc::now().to_rfc3339(), error],
         )?;
         Ok(())
@@ -7146,12 +7173,77 @@ mod tests {
         assert_eq!(editor_retry.progress.completed_reviewers, 1);
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         assert!(detail.tasks.iter().any(|task| task.id == coordinator.id));
-        assert!(detail.tasks.iter().any(|task| task.role
-            == trouve_protocol::CodeReviewTaskRole::Coordinator
-            && task.status == "queued"));
+        let queued_coordinator = detail
+            .tasks
+            .iter()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            })
+            .unwrap()
+            .clone();
         assert!(!detail.tasks.iter().any(|task| task.role
             == trouve_protocol::CodeReviewTaskRole::Reviewer
             && task.status == "queued"));
+
+        // A stale worker finishing the previous attempt must not cancel work
+        // queued by a concurrent scoped retry.
+        store
+            .cancel_active_code_review_tasks(&queued.id, "stale worker cleanup")
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        assert_eq!(
+            detail
+                .tasks
+                .iter()
+                .find(|task| task.id == queued_coordinator.id)
+                .unwrap()
+                .status,
+            "queued"
+        );
+
+        store.claim_code_review_job().unwrap().unwrap();
+        let started = store
+            .start_code_review_task_with_prompt(
+                &queued_coordinator.id,
+                "se_editor_retry",
+                "th_editor_retry",
+                "provider/default",
+                "Recomputed final findings prompt",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.prompt, "Recomputed final findings prompt");
+        store
+            .finish_code_review_task(&started.id, "failed", "", 0, "retry failed")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "retry failed")
+            .unwrap();
+
+        store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let queued_coordinator = detail
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            })
+            .unwrap();
+        let skipped = store
+            .skip_code_review_task(
+                &queued_coordinator.id,
+                "No candidate or open finding required final editing on retry.",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.status, "not_applicable");
     }
 
     #[test]
