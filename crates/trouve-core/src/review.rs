@@ -39,6 +39,8 @@ const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(35);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -838,6 +840,8 @@ impl GithubApi {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent("trouve-code-review")
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(GITHUB_REQUEST_TIMEOUT)
                 .build()?,
             authorization,
             base_url: base_url.into(),
@@ -2589,15 +2593,28 @@ impl Engine {
                     "processing pull request {}#{} failed: {error:#}",
                     repository.repository, pull_number
                 ));
-            } else if let Err(error) = self
-                .reconcile_user_resolved_review_findings(&api, &repository.repository, &pull)
-                .await
-            {
-                had_errors = true;
-                self.record_review_error(format!(
-                    "reconciling resolved review findings for {}#{} failed: {error:#}",
-                    repository.repository, pull_number
-                ));
+            } else {
+                let reconciliation = tokio::time::timeout(
+                    REVIEW_RECONCILIATION_TIMEOUT,
+                    self.reconcile_user_resolved_review_findings(
+                        &api,
+                        repository,
+                        &reviewers,
+                        &config_hash,
+                        &pull,
+                    ),
+                )
+                .await;
+                if let Err(error) = reconciliation
+                    .map_err(|_| anyhow!("review-thread reconciliation timed out"))
+                    .and_then(|result| result)
+                {
+                    had_errors = true;
+                    self.record_review_error(format!(
+                        "reconciling resolved review findings for {}#{} failed: {error:#}",
+                        repository.repository, pull_number
+                    ));
+                }
             }
         }
         // A request can race with a PR being closed. Once the complete open-PR
@@ -4251,9 +4268,7 @@ impl Engine {
             if status.as_u16() != 422 {
                 bail!("GitHub API {status}: {}", compact_api_error(&response_body));
             }
-            if event != "COMMENT"
-                && (!include_comments || github_rejected_own_pull_verdict(&response_body))
-            {
+            if github_review_should_fallback_to_comment(event, &response_body) {
                 event = "COMMENT";
                 continue;
             }
@@ -4555,15 +4570,18 @@ impl Engine {
         pull_number: u64,
     ) -> Result<HashMap<u64, (String, bool)>> {
         let query = r#"
-          query ReviewThreads($owner: String!, $name: String!, $number: Int!) {
+          query ReviewThreads(
+            $owner: String!, $name: String!, $number: Int!, $after: String
+          ) {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
-                reviewThreads(first: 100) {
+                reviewThreads(first: 100, after: $after) {
                   nodes {
                     id
                     isResolved
                     comments(first: 50) { nodes { databaseId } }
                   }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
             }
@@ -4572,143 +4590,201 @@ impl Engine {
         let (owner, name) = repository
             .split_once('/')
             .ok_or_else(|| anyhow!("invalid repository"))?;
-        let (response, rate): (serde_json::Value, _) = api
-            .post(
-                "/graphql",
-                &serde_json::json!({
-                    "query": query,
-                    "variables": {
-                        "owner": owner,
-                        "name": name,
-                        "number": pull_number,
-                    }
-                }),
-            )
-            .await?;
-        self.record_review_rate(rate);
-        if response["errors"].is_array() {
-            bail!("GitHub GraphQL error while loading review threads");
+        let mut after: Option<String> = None;
+        let mut threads = HashMap::new();
+        loop {
+            let (response, rate): (serde_json::Value, _) = api
+                .post(
+                    "/graphql",
+                    &serde_json::json!({
+                        "query": query,
+                        "variables": {
+                            "owner": owner,
+                            "name": name,
+                            "number": pull_number,
+                            "after": after,
+                        }
+                    }),
+                )
+                .await?;
+            self.record_review_rate(rate);
+            if response["errors"].is_array() {
+                bail!("GitHub GraphQL error while loading review threads");
+            }
+            threads.extend(review_threads_by_comment(&response));
+            let page_info =
+                &response["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"];
+            if !page_info["hasNextPage"].as_bool().unwrap_or(false) {
+                break;
+            }
+            let cursor = page_info["endCursor"]
+                .as_str()
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or_else(|| anyhow!("GitHub review-thread page omitted its end cursor"))?;
+            if after.as_deref() == Some(cursor) {
+                bail!("GitHub review-thread pagination cursor did not advance");
+            }
+            after = Some(cursor.to_owned());
         }
-        Ok(review_threads_by_comment(&response))
+        Ok(threads)
     }
 
     async fn reconcile_user_resolved_review_findings(
         &self,
         api: &GithubApi,
-        repository: &str,
+        repository: &CodeReviewRepository,
+        reviewers: &[ReviewerProfile],
+        config_hash: &str,
         pull: &GithubPullRequest,
     ) -> Result<()> {
-        let publication_lock = self.code_review.publication_lock(repository, pull.number);
-        let _publication_guard = publication_lock.lock().await;
-        let pull_state = self.store.code_review_pull_state(repository, pull.number)?;
+        let pull_state = self
+            .store
+            .code_review_pull_state(&repository.repository, pull.number)?;
         if pull_state.last_reviewed_head_sha != pull.head.sha
             || self.store.code_review_pull_has_active_job(
-                repository,
+                &repository.repository,
                 pull.number,
                 &pull.head.sha,
             )?
         {
             return Ok(());
         }
-        let open_findings = self
+        let initial_findings = self
             .store
-            .open_code_review_findings(repository, pull.number)?;
-        if open_findings.is_empty()
-            || open_findings
+            .reconcilable_code_review_findings(&repository.repository, pull.number)?;
+        if initial_findings.is_empty()
+            || initial_findings
                 .iter()
-                .all(|finding| finding.github_comment_id.is_none())
+                .all(|state| state.finding.github_comment_id.is_none())
         {
             return Ok(());
         }
         let thread_by_comment = self
-            .load_review_threads(api, repository, pull.number)
+            .load_review_threads(api, &repository.repository, pull.number)
             .await?;
-        let resolved = open_findings
-            .iter()
-            .filter_map(|finding| {
-                let (thread_id, is_resolved) =
-                    thread_by_comment.get(&finding.github_comment_id?)?;
-                is_resolved.then(|| (finding, thread_id))
-            })
-            .collect::<Vec<_>>();
-        if resolved.is_empty() {
+        let publication_lock = self
+            .code_review
+            .publication_lock(&repository.repository, pull.number);
+        let Ok(publication_guard) = publication_lock.try_lock() else {
+            return Ok(());
+        };
+        let pull_state = self
+            .store
+            .code_review_pull_state(&repository.repository, pull.number)?;
+        if pull_state.last_reviewed_head_sha != pull.head.sha
+            || self.store.code_review_pull_has_active_job(
+                &repository.repository,
+                pull.number,
+                &pull.head.sha,
+            )?
+        {
             return Ok(());
         }
 
-        if resolved.len() == open_findings.len()
-            && !self
-                .publish_resolved_findings_approval(api, repository, pull)
-                .await?
-        {
+        let findings = self
+            .store
+            .reconcilable_code_review_findings(&repository.repository, pull.number)?;
+        let initial_ids = initial_findings
+            .iter()
+            .map(|state| {
+                (
+                    &state.finding.id,
+                    state.finding.github_comment_id,
+                    state.is_resolved,
+                    state.generation,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let current_ids = findings
+            .iter()
+            .map(|state| {
+                (
+                    &state.finding.id,
+                    state.finding.github_comment_id,
+                    state.is_resolved,
+                    state.generation,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if initial_ids != current_ids {
             return Ok(());
         }
 
         let mut changed_jobs = HashSet::new();
-        for (finding, thread_id) in resolved {
-            self.store.update_code_review_finding_publication(
-                &finding.id,
-                finding.github_comment_id,
-                &finding.github_comment_url,
-                Some(thread_id),
+        let mut reopened = false;
+        let mut state_key = Vec::new();
+        let mut all_resolved = true;
+        for state in &findings {
+            let Some(comment_id) = state.finding.github_comment_id else {
+                all_resolved = false;
+                continue;
+            };
+            let Some((thread_id, is_resolved)) = thread_by_comment.get(&comment_id) else {
+                all_resolved = false;
+                continue;
+            };
+            let was_resolved =
+                state.is_resolved == Some(true) || state.finding.status == "dismissed";
+            let (changed, generation) = self.store.record_code_review_thread_state(
+                &state.finding.id,
+                thread_id,
+                *is_resolved,
             )?;
-            if self
-                .store
-                .resolve_code_review_finding(&finding.id, "dismissed")?
-            {
-                changed_jobs.insert(finding.job_id.clone());
+            if changed {
+                changed_jobs.insert(state.finding.job_id.clone());
+                reopened |= was_resolved && !is_resolved;
             }
+            all_resolved &= *is_resolved;
+            state_key.push((state.finding.id.as_str(), generation, *is_resolved));
         }
-        for job_id in changed_jobs {
-            self.emit_code_review_updated(Some(job_id))?;
+        for job_id in &changed_jobs {
+            self.emit_code_review_updated(Some(job_id.clone()))?;
+        }
+        let persisted_reopen = state_key
+            .iter()
+            .any(|(_, generation, is_resolved)| !is_resolved && *generation > 1);
+        if !all_resolved && !reopened && !persisted_reopen {
+            return Ok(());
+        }
+
+        state_key.sort_unstable();
+        let state_fingerprint = serde_json::to_vec(&state_key)?;
+        let generation = format!("{:x}", Sha256::digest(state_fingerprint));
+        let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+            dedupe_key: format!(
+                "{}#{}:{}:{}:thread-recheck:{generation}:{config_hash}",
+                repository.repository, pull.number, pull.base.sha, pull.head.sha
+            ),
+            installation_id: repository.installation_id,
+            repository: repository.repository.clone(),
+            pull_number: pull.number,
+            pull_title: pull.title.clone(),
+            pull_url: pull.html_url.clone(),
+            head_sha: pull.head.sha.clone(),
+            review_base_sha: pull.base.sha.clone(),
+            base_ref: pull.base.sha.clone(),
+            head_ref: pull.head.name.clone(),
+            scope: trouve_protocol::CodeReviewJobScope::Full,
+            trigger: "thread-recheck".into(),
+            retry_of: None,
+            model: repository.model.clone(),
+            coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
+            router_model: repository.router_model.clone(),
+            router_thinking_level: repository.router_thinking_level.clone(),
+            prompt: repository.prompt.clone(),
+            reviewers: reviewers.to_vec(),
+            routing_mode: repository.routing_mode,
+            semantic_routing: repository.semantic_routing,
+            included_reviewer_ids: repository.included_reviewer_ids.clone(),
+            excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
+            config_hash: config_hash.to_owned(),
+        })?;
+        drop(publication_guard);
+        if let Some(job) = job {
+            self.emit_code_review_updated(Some(job.id.clone()))?;
+            self.code_review.job_wake.notify_one();
         }
         Ok(())
-    }
-
-    async fn publish_resolved_findings_approval(
-        &self,
-        api: &GithubApi,
-        repository: &str,
-        pull: &GithubPullRequest,
-    ) -> Result<bool> {
-        if self
-            .store
-            .code_review_pull_has_active_job(repository, pull.number, &pull.head.sha)?
-        {
-            return Ok(false);
-        }
-        let path = format!("/repos/{repository}/pulls/{}", pull.number);
-        let (current, rate): (GithubPullRequest, _) = api.get(&path).await?;
-        self.record_review_rate(rate);
-        if current.state != "open"
-            || current.base.sha != pull.base.sha
-            || current.head.sha != pull.head.sha
-        {
-            bail!("stale: pull request revision changed before approval");
-        }
-        if self
-            .store
-            .code_review_pull_has_active_job(repository, pull.number, &pull.head.sha)?
-        {
-            return Ok(false);
-        }
-        let body = format!(
-            "All Trouve inline findings for this revision have been resolved.\n\n\
-             <!-- trouve-code-review resolution-approval:{} -->",
-            pull.head.sha
-        );
-        self.submit_github_review(
-            api,
-            &format!("{path}/reviews"),
-            &pull.head.sha,
-            GithubReviewBodies {
-                primary: body.clone(),
-                without_inline_comments: body,
-            },
-            github_review_event(false),
-            &[],
-        )
-        .await?;
-        Ok(true)
     }
 
     async fn resolve_fixed_review_findings(
@@ -4834,6 +4910,10 @@ fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
     let body = response_body.to_ascii_lowercase();
     body.contains("own pull request")
         && (body.contains("approve") || body.contains("request changes"))
+}
+
+fn github_review_should_fallback_to_comment(event: &str, response_body: &str) -> bool {
+    event != "COMMENT" && github_rejected_own_pull_verdict(response_body)
 }
 
 fn review_threads_by_comment(response: &serde_json::Value) -> HashMap<u64, (String, bool)> {
@@ -6290,6 +6370,14 @@ mod tests {
         assert!(!github_rejected_own_pull_verdict(
             r#"{"message":"line must be part of the diff"}"#
         ));
+        assert!(!github_review_should_fallback_to_comment(
+            "APPROVE",
+            r#"{"message":"commit_id is not part of the pull request"}"#
+        ));
+        assert!(github_review_should_fallback_to_comment(
+            "APPROVE",
+            r#"{"message":"Can not approve your own pull request"}"#
+        ));
     }
 
     #[test]
@@ -6303,8 +6391,131 @@ mod tests {
         assert!(!store.claim_code_review_publication(&older.id).unwrap());
     }
 
+    #[test]
+    fn failed_job_findings_are_not_reused_as_published_findings() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:failed-findings");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &job.id,
+                "Unpublished issue",
+                "Fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "This review never reached GitHub.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .open_code_review_findings("acme/widgets", 42)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .finish_code_review_job(&job.id, "failed", "", "GitHub rejected the review")
+            .unwrap();
+        assert!(
+            store
+                .open_code_review_findings("acme/widgets", 42)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
-    async fn resolved_inline_findings_on_unchanged_head_publish_approval() {
+    async fn review_thread_loading_follows_graphql_pagination() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected_after, comment_id, thread_id, has_next, end_cursor) in [
+                ("\"after\":null", 10, "PRRT_1", true, Some("cursor-1")),
+                ("\"after\":\"cursor-1\"", 20, "PRRT_2", false, None),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(headers_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.contains(expected_after), "{request}");
+                let response_body = serde_json::json!({
+                    "data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "nodes": [{
+                            "id": thread_id,
+                            "isResolved": true,
+                            "comments": {"nodes": [{"databaseId": comment_id}]}
+                        }],
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}
+                    }}}}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let threads = engine
+            .load_review_threads(&api, "acme/widgets", 42)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(threads.get(&10), Some(&("PRRT_1".into(), true)));
+        assert_eq!(threads.get(&20), Some(&("PRRT_2".into(), true)));
+    }
+
+    #[tokio::test]
+    async fn resolved_inline_findings_on_unchanged_head_queue_full_recheck() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -6367,62 +6578,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (expected, status, response_body, expected_body) in [
+            for (expected, status, response_body) in [true, false].map(|is_resolved| {
                 (
                     "post /graphql http/1.1\r\n",
                     "200 OK",
                     serde_json::json!({
-                        "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [{
-                            "id": "PRRT_1",
-                            "isResolved": true,
-                            "comments": {"nodes": [{"databaseId": 99}]}
-                        }]}}}}
+                        "data": {"repository": {"pullRequest": {"reviewThreads": {
+                            "nodes": [{
+                                "id": "PRRT_1",
+                                "isResolved": is_resolved,
+                                "comments": {"nodes": [{"databaseId": 99}]}
+                            }],
+                            "pageInfo": {"hasNextPage": false, "endCursor": null}
+                        }}}}
                     })
                     .to_string(),
-                    None,
-                ),
-                (
-                    "get /repos/acme/widgets/pulls/42 http/1.1\r\n",
-                    "200 OK",
-                    serde_json::json!({
-                        "number": 42,
-                        "title": "Ship widgets",
-                        "html_url": "https://github.com/acme/widgets/pull/42",
-                        "draft": false,
-                        "state": "open",
-                        "base": {
-                            "ref": "main",
-                            "sha": "1111111111111111111111111111111111111111"
-                        },
-                        "head": {
-                            "ref": "ship",
-                            "sha": "2222222222222222222222222222222222222222"
-                        },
-                        "requested_reviewers": []
-                    })
-                    .to_string(),
-                    None,
-                ),
-                (
-                    "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
-                    "422 Unprocessable Entity",
-                    serde_json::json!({
-                        "message": "Can not approve your own pull request"
-                    })
-                    .to_string(),
-                    Some("\"event\":\"approve\""),
-                ),
-                (
-                    "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
-                    "200 OK",
-                    serde_json::json!({
-                        "id": 123,
-                        "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-123"
-                    })
-                    .to_string(),
-                    Some("\"event\":\"comment\""),
-                ),
-            ] {
+                )
+            }) {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 2048];
@@ -6452,9 +6624,6 @@ mod tests {
                 }
                 let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
                 assert!(request.starts_with(expected), "{request}");
-                if let Some(expected_body) = expected_body {
-                    assert!(request.contains(expected_body), "{request}");
-                }
                 let response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
@@ -6485,15 +6654,72 @@ mod tests {
             },
             requested_reviewers: Vec::new(),
         };
+        let repository = CodeReviewRepository {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: Vec::new(),
+            routing_mode: CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            reviewer_overrides: Vec::new(),
+        };
 
         engine
-            .reconcile_user_resolved_review_findings(&api, "acme/widgets", &pull)
+            .reconcile_user_resolved_review_findings(&api, &repository, &[], "config", &pull)
+            .await
+            .unwrap();
+        let first_recheck = engine
+            .store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.trigger == "thread-recheck")
+            .unwrap();
+        assert_eq!(first_recheck.status, "queued");
+        assert_eq!(
+            first_recheck.scope,
+            trouve_protocol::CodeReviewJobScope::Full
+        );
+        assert_eq!(
+            engine
+                .store
+                .claim_code_review_job()
+                .unwrap()
+                .unwrap()
+                .job
+                .id,
+            first_recheck.id
+        );
+        engine
+            .store
+            .finish_code_review_job(&first_recheck.id, "failed", "", "test failure")
+            .unwrap();
+
+        engine
+            .reconcile_user_resolved_review_findings(&api, &repository, &[], "config", &pull)
             .await
             .unwrap();
         server.await.unwrap();
         let findings = engine.store.code_review_findings(&job.id).unwrap();
-        assert_eq!(findings[0].status, "dismissed");
+        assert_eq!(findings[0].status, "open");
         assert_eq!(findings[0].github_thread_id.as_deref(), Some("PRRT_1"));
+        let rechecks = engine
+            .store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.trigger == "thread-recheck")
+            .collect::<Vec<_>>();
+        assert_eq!(rechecks.len(), 2);
+        assert!(rechecks.iter().any(|job| job.status == "queued"));
     }
 
     struct RouterThinkingProvider {
