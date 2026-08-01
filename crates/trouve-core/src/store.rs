@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS threads (
   permission_mode TEXT NOT NULL,
   model_options TEXT NOT NULL DEFAULT '{}',
   todos TEXT NOT NULL DEFAULT '[]',
+  route_provider_id TEXT,
+  route_provider_model TEXT,
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
@@ -6925,6 +6927,39 @@ impl Store {
             .append_pending_events(pending)?
             .pop()
             .expect("one lifecycle event returns one envelope"))
+    }
+
+    /// Last successful concrete route for this thread's automatic model.
+    /// Model changes clear the two columns in the same update statement.
+    pub fn thread_route_affinity(&self, id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT route_provider_id, route_provider_model FROM threads WHERE id = ?1",
+            params![id],
+            |row| {
+                let provider_id: Option<String> = row.get(0)?;
+                let provider_model: Option<String> = row.get(1)?;
+                Ok(provider_id.zip(provider_model))
+            },
+        )
+        .optional()
+        .map(|row| row.flatten())
+        .map_err(Into::into)
+    }
+
+    pub fn set_thread_route_affinity(
+        &self,
+        id: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = ?2, route_provider_model = ?3
+             WHERE id = ?1",
+            params![id, provider_id, provider_model],
+        )?;
+        Ok(())
     }
 
     /// Replace the current todo snapshot for exactly one thread.
@@ -16459,6 +16494,52 @@ mod tests {
 
         store.clear_route_health("provider").unwrap();
         assert!(store.route_health().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_route_affinity_persists_until_the_model_changes() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_affinity");
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+
+        store
+            .set_thread_route_affinity("th_affinity", "codex", "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            store.thread_route_affinity("th_affinity").unwrap(),
+            Some(("codex".into(), "gpt-5.6-sol".into()))
+        );
+
+        store
+            .update_thread("th_affinity", Some("plan"), None, None, None)
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread("th_affinity", None, Some("p/m"), None, None)
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread(
+                "th_affinity",
+                None,
+                Some("auto/claude-sonnet-4-5"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
     }
 
     /// Opening a database created before backend_sessions was keyed by

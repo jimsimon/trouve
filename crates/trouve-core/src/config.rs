@@ -38,8 +38,9 @@ pub struct Config {
     /// route history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_order: Vec<String>,
-    /// Default provider-neutral model for new threads. A provider-qualified
-    /// value remains supported and explicitly pins that route.
+    /// Default model for new threads. `auto/<model>` selects dynamically; a
+    /// provider-qualified value explicitly pins that route. Bare neutral ids
+    /// remain supported for compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Global thinking level for new threads. The selected model's options

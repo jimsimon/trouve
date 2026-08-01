@@ -42,7 +42,7 @@ impl Engine {
             .unwrap_or_else(modes::fallback_mode);
 
         let mut candidates = self
-            .resolve_model_candidates(&thread.model)
+            .resolve_model_candidates(thread)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
         let total_candidates = candidates.len();
@@ -292,6 +292,13 @@ impl Engine {
                     self.turn_scheduler.record_outcome(&route.provider_id, None);
                     self.store
                         .record_route_success(&route.provider_id, &route.provider_model)?;
+                    if automatic_model_name(&thread.model).is_some() {
+                        self.store.set_thread_route_affinity(
+                            &thread.id,
+                            &route.provider_id,
+                            &route.provider_model,
+                        )?;
+                    }
                     accounting.finalize_cost();
                     self.store.record_usage(
                         &session.id,
@@ -350,17 +357,52 @@ impl Engine {
                         "model route opened its circuit"
                     );
                     let has_next = route_index + 1 < candidates.len();
-                    if !failure.safe_to_retry || !has_next {
-                        let untried = total_candidates.saturating_sub(attempted_candidates);
-                        if failure.safe_to_retry && untried > 0 {
+                    if !failure.safe_to_retry {
+                        if automatic_model_name(&thread.model).is_some() && has_next {
                             bail!(
-                                "{}; stopped after {} route attempts ({} alternate routes remain untried and will be considered next turn)",
+                                "automatic model {} failed on {}/{} and cannot safely switch providers: {}",
+                                thread.model,
+                                route.provider_id,
+                                route.provider_model,
                                 failure.message,
-                                attempted_candidates,
-                                untried,
                             );
                         }
-                        bail!(failure.message);
+                        bail!(
+                            "selected provider route {}/{} failed: {}",
+                            route.provider_id,
+                            route.provider_model,
+                            failure.message,
+                        );
+                    }
+                    if !has_next {
+                        let untried = total_candidates.saturating_sub(attempted_candidates);
+                        if automatic_model_name(&thread.model).is_some() {
+                            if untried == 0 {
+                                bail!(
+                                    "no provider is currently able to run {}; tried {} route(s). Last error from {}/{}: {}",
+                                    thread.model,
+                                    attempted_candidates,
+                                    route.provider_id,
+                                    route.provider_model,
+                                    failure.message,
+                                );
+                            }
+                            bail!(
+                                "unable to route {} after {} route attempts; {} alternate route(s) remain deferred until the next turn. Last error from {}/{}: {}",
+                                thread.model,
+                                attempted_candidates,
+                                untried,
+                                route.provider_id,
+                                route.provider_model,
+                                failure.message,
+                            );
+                        }
+                        bail!(
+                            "selected provider route {}/{} failed: {}",
+                            route.provider_id,
+                            route.provider_model,
+                            failure.message,
+                        );
                     }
                     let next = &candidates[route_index + 1];
                     self.store.append_event(

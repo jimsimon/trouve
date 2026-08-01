@@ -298,8 +298,9 @@ pub struct CreateThreadRequest {
     /// Agent persona id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Provider-neutral model id from `/v1/model-routes`. A provider-qualified
-    /// id from `/v1/models` explicitly pins the thread to that route.
+    /// Model id from `/v1/model-routes`. `auto/<model>` selects dynamically;
+    /// `provider/<model>` explicitly pins the thread to that route. Bare
+    /// neutral ids remain accepted for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Model-specific options validated against the model's options schema.
@@ -595,6 +596,8 @@ pub struct ThreadViewQuery {
 pub struct UpdateThreadRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// `auto/<model>` selects dynamically; `provider/<model>` is a hard pin.
+    /// Changing this value clears the thread's automatic route affinity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Replaces the thread's model options when present.
@@ -2627,8 +2630,8 @@ pub struct ProvidersResponse {
     /// are appended deterministically.
     #[serde(default)]
     pub provider_order: Vec<String>,
-    /// Default provider-neutral model for new threads. Provider-qualified
-    /// legacy values remain supported and pin one route.
+    /// Default model for new threads. `auto/<model>` selects dynamically and
+    /// `provider/<model>` pins one route. Bare neutral values remain accepted.
     pub default_model: String,
     /// Global thinking level for new threads. None leaves the selected
     /// model at its own default.
@@ -2680,7 +2683,7 @@ pub struct UpsertProviderRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetDefaultModelRequest {
-    /// Provider-neutral model id, or a provider-qualified id to pin a route.
+    /// `auto/<model>` id, or a provider-qualified id to pin a route.
     pub model: String,
     /// Global thinking level for the selected model. Omitted when the model
     /// has no thinking knob, preserving the existing global setting for
@@ -3093,7 +3096,7 @@ pub struct ModelInfo {
     pub options_schema: serde_json::Value,
 }
 
-/// One concrete provider route for a provider-neutral model selection.
+/// One concrete provider route for an automatic or pinned model selection.
 /// `provider_model` is the provider's own model id, without trouve's
 /// provider prefix, and is the value passed to that provider at execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -3102,14 +3105,13 @@ pub struct ModelRouteInfo {
     pub provider_model: String,
 }
 
-/// A stable model identity that one or more currently available providers
-/// can run. Clients use this catalog for provider-neutral model pickers;
-/// [`ModelInfo`] remains the provider-qualified compatibility catalog.
+/// A model-picker entry. Automatic entries contain every compatible route;
+/// concrete provider entries contain exactly one. [`ModelInfo`] remains the
+/// provider-qualified compatibility catalog.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RoutedModelInfo {
-    /// Provider-neutral id stored on new threads (for example
-    /// "gpt-5.4-codex"). Models without a safe neutral identity retain their
-    /// provider-qualified id and have exactly one route.
+    /// `auto/<model>` for dynamic routing, or `provider/<model>` for a hard
+    /// pin. Models without a safe shared identity have only concrete entries.
     pub id: String,
     pub display_name: String,
     /// Smallest context window across the available routes, so clients never
