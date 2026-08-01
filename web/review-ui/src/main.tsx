@@ -62,6 +62,7 @@ import {
   type ReviewOutputField,
 } from "./review-output";
 import {
+  MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
   TIMEOUT_MINUTES_INPUT_STEP,
   reviewSettingsFromMinutes,
@@ -2658,7 +2659,7 @@ function SettingsPage({
         globalThinking={providers?.default_thinking_level}
         onChanged={onChanged}
       />
-      <ReviewTimeoutSettings settings={reviewSettings} onChanged={onChanged} />
+      <ReviewExecutionSettings settings={reviewSettings} onChanged={onChanged} />
       <div class="settings-grid">
         <GithubAppSettings app={app} onChanged={onChanged} />
         <ProviderSettings providers={providers} models={models} onChanged={onChanged} />
@@ -2667,13 +2668,16 @@ function SettingsPage({
   );
 }
 
-function ReviewTimeoutSettings({
+function ReviewExecutionSettings({
   settings,
   onChanged,
 }: {
   settings: CodeReviewSettings | null;
   onChanged: () => void;
 }) {
+  const [maxParallel, setMaxParallel] = useState(
+    settings ? String(settings.max_parallel_reviews) : "",
+  );
   const [total, setTotal] = useState(settings ? timeoutMinutes(settings.total_timeout_seconds) : "");
   const [reviewer, setReviewer] = useState(
     settings ? timeoutMinutes(settings.reviewer_timeout_seconds) : "",
@@ -2685,10 +2689,12 @@ function ReviewTimeoutSettings({
   const [message, flash] = useFlash();
   useEffect(() => {
     if (!settings) return;
+    setMaxParallel(String(settings.max_parallel_reviews));
     setTotal(timeoutMinutes(settings.total_timeout_seconds));
     setReviewer(timeoutMinutes(settings.reviewer_timeout_seconds));
     setCoordinator(timeoutMinutes(settings.coordinator_timeout_seconds));
   }, [
+    settings?.max_parallel_reviews,
     settings?.total_timeout_seconds,
     settings?.reviewer_timeout_seconds,
     settings?.coordinator_timeout_seconds,
@@ -2697,8 +2703,8 @@ function ReviewTimeoutSettings({
   return (
     <section class="panel settings-card review-timeout-settings">
       <PanelTitle
-        title="Review timeouts"
-        subtitle="Deadlines for unattended review jobs. New jobs snapshot these values when they start."
+        title="Review execution"
+        subtitle="Concurrency and deadlines for unattended review jobs."
       />
       {settings ? (
         <form
@@ -2706,8 +2712,10 @@ function ReviewTimeoutSettings({
             event.preventDefault();
             setBusy(true);
             try {
-              await saveReviewSettings(reviewSettingsFromMinutes(total, reviewer, coordinator));
-              flash("Review timeouts saved");
+              await saveReviewSettings(
+                reviewSettingsFromMinutes(maxParallel, total, reviewer, coordinator),
+              );
+              flash("Review execution settings saved");
               onChanged();
             } catch (cause) {
               flash(cause instanceof Error ? cause.message : String(cause));
@@ -2717,6 +2725,19 @@ function ReviewTimeoutSettings({
           }}
         >
           <div class="form-grid">
+            <label>
+              Max parallel reviews
+              <input
+                type="number"
+                min="1"
+                max={MAX_PARALLEL_REVIEWS}
+                step="1"
+                required
+                value={maxParallel}
+                onInput={(event) => setMaxParallel(event.currentTarget.value)}
+              />
+              <small>Concurrent pull-request review jobs. Changes apply immediately.</small>
+            </label>
             <label>
               Total review timeout (minutes)
               <input
@@ -2755,17 +2776,19 @@ function ReviewTimeoutSettings({
             </label>
           </div>
           <p class="field-help">
-            Environment timeout variables take precedence over these persisted values.
+            Higher concurrency increases provider usage and may encounter provider rate limits. The
+            maximum is {MAX_PARALLEL_REVIEWS}. Environment review variables take precedence over
+            these persisted values.
           </p>
           <div class="action-row">
             <button type="submit" disabled={busy}>
-              {busy ? "Saving…" : "Save review timeouts"}
+              {busy ? "Saving…" : "Save review execution settings"}
             </button>
             {message && <span role="status">{message}</span>}
           </div>
         </form>
       ) : (
-        <p class="muted">Review timeout configuration is unavailable.</p>
+        <p class="muted">Review execution configuration is unavailable.</p>
       )}
     </section>
   );

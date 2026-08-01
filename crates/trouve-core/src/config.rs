@@ -71,6 +71,12 @@ pub struct Config {
     /// private key and webhook secret live in the secret store, never here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_review_app: Option<GithubReviewAppConfig>,
+    /// Maximum number of automated code-review jobs that may run at once.
+    /// Unset uses the built-in default (or the environment override when
+    /// present). Positive values above 32 are accepted for compatibility and
+    /// normalized to 32 at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review_max_parallel_reviews: Option<u32>,
     /// Whole automated code-review job deadline. Unset uses the built-in
     /// default (or the environment override when present).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +275,7 @@ mod tests {
         cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
         cfg.title_model_resource_policy =
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
+        cfg.code_review_max_parallel_reviews = Some(4);
         cfg.code_review_timeout_seconds = Some(1_200);
         cfg.code_review_reviewer_timeout_seconds = Some(720);
         cfg.code_review_coordinator_timeout_seconds = Some(360);
@@ -282,6 +289,7 @@ mod tests {
             cfg.title_model_resource_policy,
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
         );
+        assert_eq!(cfg.code_review_max_parallel_reviews, Some(4));
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
         assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));

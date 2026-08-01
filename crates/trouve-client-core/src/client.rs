@@ -548,6 +548,7 @@ impl ProtocolClient {
             .http
             .put(format!("{}{path}", self.base))
             .json(&SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(settings.max_parallel_reviews),
                 total_timeout_seconds: settings.total_timeout_seconds,
                 reviewer_timeout_seconds: settings.reviewer_timeout_seconds,
                 coordinator_timeout_seconds: settings.coordinator_timeout_seconds,

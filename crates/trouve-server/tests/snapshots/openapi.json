@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.0"
+    "version": "2.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -5391,7 +5391,7 @@
       },
       "CodeReviewSettings": {
         "type": "object",
-        "description": "Persisted execution deadlines for automated code reviews.",
+        "description": "Persisted execution settings for automated code reviews.",
         "required": [
           "total_timeout_seconds",
           "reviewer_timeout_seconds",
@@ -5402,6 +5402,14 @@
             "type": "integer",
             "format": "int64",
             "description": "Deadline for the final review editor.",
+            "minimum": 1
+          },
+          "max_parallel_reviews": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of review jobs that may execute concurrently.",
+            "default": 2,
+            "maximum": 32,
             "minimum": 1
           },
           "reviewer_timeout_seconds": {
@@ -8544,7 +8552,7 @@
       },
       "SetCodeReviewSettingsRequest": {
         "type": "object",
-        "description": "Replace the persisted automated code-review execution deadlines\n(`PUT /v1/config/code-review`).",
+        "description": "Replace the persisted automated code-review execution settings\n(`PUT /v1/config/code-review`).",
         "required": [
           "total_timeout_seconds",
           "reviewer_timeout_seconds",
@@ -8555,6 +8563,15 @@
             "type": "integer",
             "format": "int64",
             "description": "Deadline for the final review editor.",
+            "minimum": 1
+          },
+          "max_parallel_reviews": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum number of review jobs that may execute concurrently. Omission\npreserves the current value for compatibility with older clients;\nvalues above 32 are accepted and normalized to 32 in the response.",
             "minimum": 1
           },
           "reviewer_timeout_seconds": {

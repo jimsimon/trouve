@@ -138,7 +138,11 @@ pub use requests::*;
 // 2.0: persona routing becomes persona selection with Manual/Additive/
 // Automatic policies; Automatic replaces Thorough's run-everything semantics
 // with fully routed selection (breaking).
-pub const PROTOCOL_VERSION: &str = "2.0";
+// 2.1: code-review execution settings expose a persisted, live-updatable
+// maximum number of concurrently running review jobs (additive).
+// 2.2: code-review concurrency requests remain positive and unbounded on the
+// wire, while values above 32 are normalized to the response maximum of 32.
+pub const PROTOCOL_VERSION: &str = "2.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

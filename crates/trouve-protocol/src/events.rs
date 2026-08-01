@@ -491,6 +491,7 @@ mod tests {
     fn code_review_settings_event_uses_namespaced_tag() {
         let event = Event::CodeReviewSettingsUpdated {
             settings: crate::CodeReviewSettings {
+                max_parallel_reviews: 4,
                 total_timeout_seconds: 900,
                 reviewer_timeout_seconds: 600,
                 coordinator_timeout_seconds: 300,
@@ -498,9 +499,28 @@ mod tests {
         };
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "settings.code_review_updated");
+        assert_eq!(value["settings"]["max_parallel_reviews"], 4);
         assert_eq!(value["settings"]["total_timeout_seconds"], 900);
         assert_eq!(value["settings"]["reviewer_timeout_seconds"], 600);
         assert_eq!(value["settings"]["coordinator_timeout_seconds"], 300);
+    }
+
+    #[test]
+    fn historical_code_review_settings_events_default_parallelism() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "settings.code_review_updated",
+            "settings": {
+                "total_timeout_seconds": 900,
+                "reviewer_timeout_seconds": 600,
+                "coordinator_timeout_seconds": 300
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::CodeReviewSettingsUpdated { settings }
+                if settings.max_parallel_reviews == 2
+        ));
     }
 
     #[test]
