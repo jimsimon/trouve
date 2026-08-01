@@ -34,7 +34,8 @@ use crate::store::{
     CodeReviewTaskMetrics, NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
 };
 use crate::tools::{
-    ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositoryMergeBase, ReviewRepositorySync,
+    ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositoryHistoryCleanup,
+    ReviewRepositoryMergeBase, ReviewRepositorySync,
 };
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
@@ -1216,6 +1217,36 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    fn flush_pending_code_review_events(&self, job_id: &str) -> Result<(), EngineError> {
+        for pending in self.store.pending_code_review_events(job_id)? {
+            self.store
+                .append_event(Scope::CodeReviewJob(job_id.to_owned()), pending.event)?;
+            self.store.complete_code_review_pending_event(pending.id)?;
+        }
+        Ok(())
+    }
+
+    fn retry_code_review_event_outbox(&self) {
+        let job_ids = match self.store.code_review_jobs_with_pending_events(100) {
+            Ok(job_ids) => job_ids,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "listing pending code-review transition events: {error:#}"
+                ));
+                return;
+            }
+        };
+        for job_id in job_ids {
+            if let Err(error) = self.flush_pending_code_review_events(&job_id) {
+                tracing::warn!(
+                    job_id = %job_id,
+                    %error,
+                    "could not replay pending code-review transition events"
+                );
+            }
+        }
     }
 
     fn project_code_review_output(
@@ -2924,6 +2955,7 @@ impl Engine {
             let mut running_jobs = tokio::task::JoinSet::new();
             loop {
                 worker_engine.retry_code_review_cleanup().await;
+                worker_engine.retry_code_review_event_outbox();
                 let job_concurrency = worker_engine.effective_code_review_job_concurrency();
                 let mut claim_failed = false;
                 while running_jobs.len() < job_concurrency {
@@ -3009,6 +3041,26 @@ impl Engine {
                     );
                 }
             }
+        }
+        if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
+            && let Err(cleanup_error) = self
+                .executor
+                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                    worktree: self
+                        .data_dir
+                        .join("review-repositories")
+                        .join(&record.job.repository),
+                    pull_number: record.job.pull_number,
+                })
+                .await
+        {
+            tracing::warn!(
+                job_id = %job_id,
+                repository = %record.job.repository,
+                pull_number = record.job.pull_number,
+                error = %cleanup_error,
+                "could not delete temporary review-history refs during job cleanup"
+            );
         }
         self.code_review.running.lock().unwrap().remove(&job_id);
         let cancellation_requested = self
@@ -3280,7 +3332,7 @@ impl Engine {
                         .executor
                         .review_repository_diff(&ReviewRepositoryDiff {
                             worktree: session.worktree_path.clone().into(),
-                            base_sha: previous_merge_base,
+                            base_sha: previous_merge_base.clone(),
                             head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
                         })
                         .await;
@@ -3290,14 +3342,49 @@ impl Engine {
                                 filter_previously_reviewed_hunks(&diff_files, &previous_diff);
                             (Arc::new(filtered), reused)
                         }
-                        Err(_) => (diff_files, 0),
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                previous_base = %previous_merge_base,
+                                previous_head = %previous_pull_state.last_reviewed_head_sha,
+                                %error,
+                                "could not load the previous review diff; reviewing the full current diff"
+                            );
+                            (diff_files, 0)
+                        }
                     }
                 }
-                Err(_) => (diff_files, 0),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        previous_base = %previous_pull_state.last_reviewed_base_sha,
+                        previous_head = %previous_pull_state.last_reviewed_head_sha,
+                        %error,
+                        "could not resolve the previous review merge base; reviewing the full current diff"
+                    );
+                    (diff_files, 0)
+                }
             }
         } else {
             (diff_files, 0)
         };
+        if incremental_candidate
+            && let Err(error) = self
+                .executor
+                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                    worktree: repository_path.clone(),
+                    pull_number: job.pull_number,
+                })
+                .await
+        {
+            tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                %error,
+                "could not delete temporary review-history refs"
+            );
+        }
         let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
         let batch_digest = review_batch_digest(
             &job.review_base_sha,
@@ -3308,9 +3395,7 @@ impl Engine {
         let snapshot = self
             .store
             .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
-        for task in snapshot.superseded_tasks {
-            self.emit_code_review_task(&job.id, task)?;
-        }
+        self.flush_pending_code_review_events(&job.id)?;
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
@@ -3367,19 +3452,9 @@ impl Engine {
                 }
             }
         }
-        let completed_reviewers = if batch_snapshot_changed {
-            0
-        } else {
-            self.store.completed_code_review_personas(&job.id)?
-        };
-        self.store.set_code_review_job_progress(
-            &job.id,
-            completed_reviewers,
-            catalog_reviewer_count as u64,
-        )?;
-        self.emit_code_review_progress(&job.id)?;
         let mut planned = Vec::new();
         let mut task_results = Vec::new();
+        let mut prompt_replaced_task_ids = Vec::new();
         // Interleave personas by batch so the first concurrency window makes
         // progress on every focused reviewer instead of serializing all
         // batches for the first persona.
@@ -3428,6 +3503,7 @@ impl Engine {
                 let existing = latest_tasks.remove(&(reviewer.id.clone(), batch_index as u64));
                 match existing {
                     Some(task) if task.prompt != prompt => {
+                        prompt_replaced_task_ids.push(task.id);
                         planned.push((
                             reviewer.clone(),
                             batch_index,
@@ -3493,6 +3569,25 @@ impl Engine {
                     }
                 }
             }
+        }
+        let completed_reviewers = if prompt_replaced_task_ids.is_empty() {
+            self.store.completed_code_review_personas(&job.id)?
+        } else {
+            let completed = self.store.supersede_code_review_tasks_for_prompt_change(
+                &job.id,
+                &prompt_replaced_task_ids,
+                catalog_reviewer_count as u64,
+            )?;
+            self.flush_pending_code_review_events(&job.id)?;
+            completed
+        };
+        self.store.set_code_review_job_progress(
+            &job.id,
+            completed_reviewers,
+            catalog_reviewer_count as u64,
+        )?;
+        if prompt_replaced_task_ids.is_empty() {
+            self.emit_code_review_progress(&job.id)?;
         }
         self.store.set_code_review_job_phase_elapsed(
             &job.id,

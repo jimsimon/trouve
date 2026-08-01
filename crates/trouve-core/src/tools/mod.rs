@@ -30,6 +30,7 @@ use trouve_providers::ToolSpec;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
 
 #[cfg(unix)]
 fn isolate_review_git_process(command: &mut tokio::process::Command) {
@@ -38,6 +39,24 @@ fn isolate_review_git_process(command: &mut tokio::process::Command) {
 
 #[cfg(not(unix))]
 fn isolate_review_git_process(_command: &mut tokio::process::Command) {}
+
+#[cfg(windows)]
+async fn terminate_windows_review_git_tree(pid: Option<u32>) -> std::io::Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let status = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "taskkill exited with {status}"
+        )))
+    }
+}
 
 #[cfg(unix)]
 fn signal_review_git_process_group(pid: Option<u32>, signal: i32) -> std::io::Result<()> {
@@ -56,42 +75,140 @@ fn signal_review_git_process_group(pid: Option<u32>, signal: i32) -> std::io::Re
     }
 }
 
-async fn terminate_review_git_process(
-    child: &mut tokio::process::Child,
+#[cfg(unix)]
+fn review_git_process_group_exists(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+async fn wait_for_review_git_process_group_exit(pid: Option<u32>) -> bool {
+    let deadline = tokio::time::Instant::now() + REVIEW_FETCH_TERMINATION_GRACE;
+    while review_git_process_group_exists(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+#[cfg(unix)]
+async fn quiesce_review_git_process_group(pid: Option<u32>) -> std::io::Result<()> {
+    if !review_git_process_group_exists(pid) {
+        return Ok(());
+    }
+    let _ = signal_review_git_process_group(pid, libc::SIGTERM);
+    if wait_for_review_git_process_group_exit(pid).await {
+        return Ok(());
+    }
+    signal_review_git_process_group(pid, libc::SIGKILL)?;
+    if wait_for_review_git_process_group_exit(pid).await {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "review git process group remained alive after SIGKILL",
+        ))
+    }
+}
+
+struct ReviewGitChildGuard {
+    child: Option<tokio::process::Child>,
     pid: Option<u32>,
-) -> std::io::Result<()> {
+    repository_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    armed: bool,
+}
+
+impl ReviewGitChildGuard {
+    fn new(
+        child: tokio::process::Child,
+        repository_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+            repository_guard: Some(repository_guard),
+            armed: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("review git child is present")
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReviewGitChildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        let _ = signal_review_git_process_group(self.pid, libc::SIGKILL);
+        #[cfg(not(any(unix, windows)))]
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pid = self.pid;
+        let repository_guard = self.repository_guard.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                #[cfg(windows)]
+                let _ = terminate_windows_review_git_tree(pid).await;
+                let _ = child.wait().await;
+                #[cfg(unix)]
+                let _ = quiesce_review_git_process_group(pid).await;
+                #[cfg(not(any(unix, windows)))]
+                let _ = pid;
+                drop(repository_guard);
+            });
+        }
+    }
+}
+
+async fn terminate_review_git_process(guard: &mut ReviewGitChildGuard) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        let pid = guard.pid;
         let _ = signal_review_git_process_group(pid, libc::SIGTERM);
-        if let Ok(result) = tokio::time::timeout(REVIEW_FETCH_TERMINATION_GRACE, child.wait()).await
-        {
-            return result.map(|_| ());
+        match tokio::time::timeout(REVIEW_FETCH_TERMINATION_GRACE, guard.child_mut().wait()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                let _ = signal_review_git_process_group(pid, libc::SIGKILL);
+                guard.child_mut().wait().await?;
+            }
         }
-        if signal_review_git_process_group(pid, libc::SIGKILL).is_err() {
-            child.start_kill()?;
-        }
-        child.wait().await?;
-        Ok(())
+        quiesce_review_git_process_group(pid).await
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        child.start_kill()?;
-        child.wait().await?;
+        #[cfg(windows)]
+        terminate_windows_review_git_tree(guard.pid).await?;
+        #[cfg(not(windows))]
+        guard.child_mut().start_kill()?;
+        guard.child_mut().wait().await?;
         Ok(())
     }
 }
 
-fn cleanup_review_fetch_locks(repository_path: &Path, history_ref: &str) {
+fn cleanup_review_fetch_locks(repository_path: &Path, history_refs: &[String]) {
     let git_dir = repository_path.join(".git");
-    for lock in [
-        git_dir.join("FETCH_HEAD.lock"),
-        git_dir.join("packed-refs.lock"),
-        git_dir.join("shallow.lock"),
-        git_dir
+    for history_ref in history_refs {
+        let lock = git_dir
             .join("refs/remotes/origin")
-            .join(format!("{history_ref}.lock")),
-    ] {
+            .join(format!("{history_ref}.lock"));
         match std::fs::remove_file(&lock) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -102,15 +219,34 @@ fn cleanup_review_fetch_locks(repository_path: &Path, history_ref: &str) {
     }
 }
 
+async fn read_bounded_review_fetch_stderr(mut stderr: tokio::process::ChildStderr) -> String {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = REVIEW_FETCH_STDERR_MAX_BYTES.saturating_sub(captured.len());
+                captured.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
+    }
+    String::from_utf8_lossy(&captured).trim().to_owned()
+}
+
 async fn run_optional_review_fetch(
     repository_path: &Path,
     auth: &str,
-    refspec: String,
-    history_ref: &str,
+    refspecs: &[String],
+    history_refs: &[String],
+    repository_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> std::result::Result<(), String> {
     let mut command = tokio::process::Command::new("git");
     command
-        .args(["fetch", "--force", "--no-tags", "origin", &refspec])
+        .args(["fetch", "--force", "--no-tags", "origin"])
+        .args(refspecs)
         .current_dir(repository_path)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
@@ -118,23 +254,54 @@ async fn run_optional_review_fetch(
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     isolate_review_git_process(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("running optional git fetch: {error}"))?;
-    let pid = child.id();
-    match tokio::time::timeout(REVIEW_OPTIONAL_FETCH_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("waiting for optional git fetch: {error}")),
-        Err(_) => {
-            terminate_review_git_process(&mut child, pid)
-                .await
-                .map_err(|error| format!("terminating optional git fetch: {error}"))?;
-            cleanup_review_fetch_locks(repository_path, history_ref);
-            Ok(())
-        }
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "optional git fetch stderr was not captured".to_owned())?;
+    let stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
+    let mut guard = ReviewGitChildGuard::new(child, repository_guard);
+    let status =
+        match tokio::time::timeout(REVIEW_OPTIONAL_FETCH_TIMEOUT, guard.child_mut().wait()).await {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                quiesce_review_git_process_group(guard.pid)
+                    .await
+                    .map_err(|error| format!("stopping optional git fetch helpers: {error}"))?;
+                status
+            }
+            Ok(Err(error)) => return Err(format!("waiting for optional git fetch: {error}")),
+            Err(_) => {
+                terminate_review_git_process(&mut guard)
+                    .await
+                    .map_err(|error| format!("terminating optional git fetch: {error}"))?;
+                cleanup_review_fetch_locks(repository_path, history_refs);
+                guard.disarm();
+                let stderr = stderr_task.await.unwrap_or_default();
+                return Err(format!(
+                    "optional git fetch timed out after {}s{}",
+                    REVIEW_OPTIONAL_FETCH_TIMEOUT.as_secs(),
+                    if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {stderr}")
+                    }
+                ));
+            }
+        };
+    guard.disarm();
+    let stderr = stderr_task.await.unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else if stderr.is_empty() {
+        Err(format!("optional git fetch exited with {status}"))
+    } else {
+        Err(format!("optional git fetch exited with {status}: {stderr}"))
     }
 }
 
@@ -275,6 +442,14 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("review repository merge-base is unavailable in this executor".into())
     }
+    /// Drop temporary per-pull refs after rewritten-history comparison has
+    /// consumed the historical objects they kept reachable.
+    async fn cleanup_review_repository_history(
+        &self,
+        _request: &ReviewRepositoryHistoryCleanup,
+    ) -> Result<(), String> {
+        Err("review repository history cleanup is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -304,6 +479,11 @@ pub struct ReviewRepositoryMergeBase {
     pub worktree: PathBuf,
     pub base_sha: String,
     pub head_sha: String,
+}
+
+pub struct ReviewRepositoryHistoryCleanup {
+    pub worktree: PathBuf,
+    pub pull_number: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,7 +643,7 @@ impl ToolExecutor for LocalToolExecutor {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        let _repository_guard = repository_lock.lock().await;
+        let repository_guard = repository_lock.lock_owned().await;
         let parent = repository_path
             .parent()
             .ok_or_else(|| "invalid review repository path".to_string())?;
@@ -547,9 +727,12 @@ impl ToolExecutor for LocalToolExecutor {
                 ));
             }
         }
-        // Keep at most three reusable historical refs per pull request. The
-        // bounded names are overwritten by later reviews instead of pinning
-        // every force-pushed commit forever.
+        // One optional fetch covers every missing historical commit so the
+        // repository mutex is never held across three independent network
+        // timeouts. The refs are removed as soon as comparison consumes them.
+        let mut history_refs = Vec::new();
+        let mut history_refspecs = Vec::new();
+        let mut missing_shas = Vec::new();
         for (index, sha) in request.optional_shas.iter().take(3).enumerate() {
             let present = run(vec![
                 "cat-file".into(),
@@ -560,16 +743,66 @@ impl ToolExecutor for LocalToolExecutor {
             .is_ok();
             if !present {
                 let history_ref = format!("trouve-history-{}-{index}", request.pull_number);
-                let _ = run_optional_review_fetch(
-                    &repository_path,
-                    &auth,
-                    format!("+{sha}:refs/remotes/origin/{history_ref}"),
-                    &history_ref,
-                )
-                .await;
+                history_refspecs.push(format!("+{sha}:refs/remotes/origin/{history_ref}"));
+                history_refs.push(history_ref);
+                missing_shas.push(sha.clone());
             }
         }
+        if history_refspecs.is_empty() {
+            drop(repository_guard);
+        } else if let Err(error) = run_optional_review_fetch(
+            &repository_path,
+            &auth,
+            &history_refspecs,
+            &history_refs,
+            repository_guard,
+        )
+        .await
+        {
+            tracing::warn!(
+                repository = %request.repository,
+                pull_number = request.pull_number,
+                shas = ?missing_shas,
+                %error,
+                "optional review-history fetch failed; continuing with the full diff if reuse is unavailable"
+            );
+        }
         Ok(repository_path)
+    }
+
+    async fn cleanup_review_repository_history(
+        &self,
+        request: &ReviewRepositoryHistoryCleanup,
+    ) -> Result<(), String> {
+        let repository_lock = {
+            let mut locks = self.review_repository_locks.lock().unwrap();
+            locks
+                .entry(request.worktree.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _repository_guard = repository_lock.lock().await;
+        for index in 0..3 {
+            let reference = format!(
+                "refs/remotes/origin/trouve-history-{}-{index}",
+                request.pull_number
+            );
+            let output = tokio::process::Command::new("git")
+                .args(["update-ref", "-d", &reference])
+                .current_dir(&request.worktree)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| format!("deleting temporary review ref {reference}: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "deleting temporary review ref {reference}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn review_repository_diff(
@@ -695,13 +928,56 @@ mod tests {
         let unrelated = git_dir.join("index.lock");
         std::fs::write(&unrelated, "keep").unwrap();
 
-        cleanup_review_fetch_locks(dir.path(), "trouve-history-42-0");
+        cleanup_review_fetch_locks(dir.path(), &["trouve-history-42-0".into()]);
 
-        assert!(!git_dir.join("FETCH_HEAD.lock").exists());
-        assert!(!git_dir.join("packed-refs.lock").exists());
-        assert!(!git_dir.join("shallow.lock").exists());
+        assert!(git_dir.join("FETCH_HEAD.lock").exists());
+        assert!(git_dir.join("packed-refs.lock").exists());
+        assert!(git_dir.join("shallow.lock").exists());
         assert!(!refs.join("trouve-history-42-0.lock").exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn review_history_cleanup_deletes_all_bounded_pull_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init"]).status.success());
+        assert!(git(&["config", "user.name", "Test"]).status.success());
+        assert!(
+            git(&["config", "user.email", "test@example.com"])
+                .status
+                .success()
+        );
+        std::fs::write(dir.path().join("file"), "content").unwrap();
+        assert!(git(&["add", "file"]).status.success());
+        assert!(git(&["commit", "-m", "seed"]).status.success());
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        for index in 0..3 {
+            let reference = format!("refs/remotes/origin/trouve-history-42-{index}");
+            assert!(git(&["update-ref", &reference, &head]).status.success());
+        }
+
+        LocalToolExecutor::default()
+            .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                worktree: dir.path().to_path_buf(),
+                pull_number: 42,
+            })
+            .await
+            .unwrap();
+
+        for index in 0..3 {
+            let reference = format!("refs/remotes/origin/trouve-history-42-{index}");
+            assert!(!git(&["show-ref", "--verify", &reference]).status.success());
+        }
     }
 
     #[cfg(unix)]
@@ -710,11 +986,53 @@ mod tests {
         let mut command = tokio::process::Command::new("sleep");
         command.arg("60").kill_on_drop(true);
         isolate_review_git_process(&mut command);
+        let child = command.spawn().unwrap();
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let mut guard = ReviewGitChildGuard::new(child, repository_lock.clone().lock_owned().await);
+        let pid = guard.pid;
+
+        terminate_review_git_process(&mut guard).await.unwrap();
+        guard.disarm();
+
+        assert!(!review_git_process_group_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_direct_child_does_not_leave_process_group_helpers() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 &").kill_on_drop(true);
+        isolate_review_git_process(&mut command);
         let mut child = command.spawn().unwrap();
         let pid = child.id();
+        child.wait().await.unwrap();
+        assert!(review_git_process_group_exists(pid));
 
-        terminate_review_git_process(&mut child, pid).await.unwrap();
+        quiesce_review_git_process_group(pid).await.unwrap();
 
-        assert!(child.try_wait().unwrap().is_some());
+        assert!(!review_git_process_group_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_guard_reaps_descendants_before_releasing_repository() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 & wait").kill_on_drop(true);
+        isolate_review_git_process(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = ReviewGitChildGuard::new(child, repository_lock.clone().lock_owned().await);
+
+        drop(guard);
+        let reacquired = tokio::time::timeout(
+            REVIEW_FETCH_TERMINATION_GRACE * 2,
+            repository_lock.clone().lock_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!review_git_process_group_exists(pid));
+        drop(reacquired);
     }
 }
