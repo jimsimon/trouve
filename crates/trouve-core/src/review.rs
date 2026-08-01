@@ -633,7 +633,6 @@ fn manual_request_can_satisfy_automatic_review(
 #[derive(Deserialize)]
 struct PublishedReview {
     id: u64,
-    html_url: String,
 }
 
 #[derive(Deserialize)]
@@ -3654,7 +3653,7 @@ impl Engine {
             &candidate_rejections,
         )?;
         let review_url = self
-            .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
+            .publish_review(&api, &job, &persisted)
             .await
             .context("publishing GitHub pull request review")?;
         let fixed = self
@@ -4305,25 +4304,18 @@ impl Engine {
         &self,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
-        summary: &str,
-        prompt_for_agents: &str,
         findings: &[trouve_protocol::CodeReviewFinding],
     ) -> Result<String> {
-        let summary = if summary.trim().is_empty() {
-            if findings.is_empty() {
-                "No actionable issues found.".to_string()
+        let lifecycle_comment_url = {
+            let state = self
+                .store
+                .code_review_pull_state(&job.repository, job.pull_number)?;
+            if state.lifecycle_comment_url.is_empty() {
+                job.pull_url.clone()
             } else {
-                format!("Found {} actionable issue(s).", findings.len())
+                state.lifecycle_comment_url
             }
-        } else {
-            summary.to_owned()
         };
-        let personas = self
-            .store
-            .code_review_job_detail(&job.id)?
-            .map(|detail| detail.personas)
-            .unwrap_or_default();
-        let review_body = render_review_body(job, &summary, prompt_for_agents, findings, &personas);
         let comments: Vec<_> = findings
             .iter()
             .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
@@ -4336,16 +4328,14 @@ impl Engine {
                 })
             })
             .collect();
+        if comments.is_empty() {
+            return Ok(lifecycle_comment_url);
+        }
         let path = format!(
             "/repos/{}/pulls/{}/reviews",
             job.repository, job.pull_number
         );
-        let request = serde_json::json!({
-            "commit_id": job.head_sha,
-            "body": review_body,
-            "event": "COMMENT",
-            "comments": comments,
-        });
+        let request = inline_review_request(job, comments);
         let response = api
             .request(reqwest::Method::POST, &path)
             .json(&request)
@@ -4359,38 +4349,15 @@ impl Engine {
             let published = serde_json::from_str::<PublishedReview>(&body)?;
             self.capture_published_review_comments(api, job, published.id, findings)
                 .await?;
-            return Ok(published.html_url);
+            Ok(lifecycle_comment_url)
+        } else if status.as_u16() == 422 {
+            // A model can name a line that is not commentable in GitHub's
+            // diff. The terminal lifecycle comment preserves those findings
+            // in its dedicated unplaced-inline-comments section.
+            Ok(lifecycle_comment_url)
+        } else {
+            bail!("GitHub API {status}: {}", compact_api_error(&body))
         }
-        if status.as_u16() != 422 || comments.is_empty() {
-            bail!("GitHub API {status}: {}", compact_api_error(&body));
-        }
-
-        // A model can name a line that is not commentable in GitHub's diff.
-        // Preserve the review instead of failing it: fold findings into the
-        // summary and retry without inline comments.
-        let mut fallback = review_body;
-        fallback.push_str("\n\n### Inline comments that GitHub could not place\n\n");
-        for finding in findings {
-            fallback.push_str(&format!(
-                "- `{}` line {} [{}]: {}\n",
-                finding.path,
-                finding.line,
-                finding.severity.to_ascii_uppercase(),
-                finding.body
-            ));
-        }
-        let (published, rate): (PublishedReview, _) = api
-            .post(
-                &path,
-                &serde_json::json!({
-                    "commit_id": job.head_sha,
-                    "body": fallback,
-                    "event": "COMMENT",
-                }),
-            )
-            .await?;
-        self.record_review_rate(rate);
-        Ok(published.html_url)
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -4475,7 +4442,7 @@ impl Engine {
             "status": status,
             "details_url": job.pull_url,
             "output": {
-                "title": format!("trouve review: {}", job.status),
+                "title": format!("Trouve Code Review: {}", display_review_status(&job.status)),
                 "summary": check_summary,
                 "text": check_details,
             }
@@ -4928,7 +4895,7 @@ fn render_check_details(
             body.push_str(&format!(
                 "| {} | {} | {}/{} | {} | {} |\n",
                 markdown_table_cell(&persona.reviewer_name),
-                markdown_table_cell(&persona.status),
+                display_review_status(&persona.status),
                 persona.completed_batches,
                 persona.total_batches,
                 compact_elapsed(persona.elapsed_ms),
@@ -4997,6 +4964,20 @@ fn markdown_table_cell(value: &str) -> String {
         .replace('\n', "<br>")
 }
 
+fn display_review_status(status: &str) -> String {
+    status
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
     let icon = match job.status.as_str() {
@@ -5008,11 +4989,10 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         _ => "❌",
     };
     let mut body = format!(
-        "## {icon} trouve review {status}\n\n\
+        "## {icon} Trouve Code Review — {status}\n\n\
          **Progress:** {complete}/{total} reviewer personas ({percent}%)  \n\
-         **Scope:** {scope} `{base}`…`{head}`  \n\
-         **Elapsed:** pending {pending}, running {running}\n\n",
-        status = job.status,
+         **Scope:** {scope} `{base}`…`{head}`  \n",
+        status = display_review_status(&job.status),
         complete = job.progress.completed_reviewers,
         total = job.progress.total_reviewers,
         percent = job.progress.percent,
@@ -5022,18 +5002,33 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         },
         base = &job.review_base_sha[..job.review_base_sha.len().min(8)],
         head = &job.head_sha[..job.head_sha.len().min(8)],
+    );
+    if job.status == "succeeded" {
+        body.push_str(&format!(
+            "**Result:** {} confirmed issue(s)  \n",
+            detail.findings.len()
+        ));
+    }
+    body.push_str(&format!(
+        "**Elapsed:** pending {pending}, running {running}\n\n",
         pending = compact_elapsed(job.pending_elapsed_ms),
         running = compact_elapsed(job.running_elapsed_ms),
-    );
+    ));
     if !detail.personas.is_empty() {
+        body.push_str("### Reviewer coverage\n\n");
         body.push_str("| Reviewer | Status | Model | Elapsed | Candidates | Confirmed |\n");
         body.push_str("| --- | --- | --- | ---: | ---: | ---: |\n");
         for persona in &detail.personas {
+            let models = if persona.models.is_empty() {
+                "—".to_string()
+            } else {
+                persona.models.join(", ")
+            };
             body.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} |\n",
-                persona.reviewer_name,
-                persona.status,
-                persona.models.join(", "),
+                markdown_table_cell(&persona.reviewer_name),
+                display_review_status(&persona.status),
+                markdown_table_cell(&models),
                 compact_elapsed(persona.elapsed_ms),
                 persona.candidate_issue_count,
                 persona.confirmed_issue_count
@@ -5043,8 +5038,55 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     }
     if !detail.summary.is_empty() {
         body.push_str(&format!("{}\n\n", detail.summary));
+    } else if job.status == "succeeded" {
+        if detail.findings.is_empty() {
+            body.push_str("No actionable issues found.\n\n");
+        } else {
+            body.push_str(&format!(
+                "Found {} actionable issue(s).\n\n",
+                detail.findings.len()
+            ));
+        }
     }
-    if !detail.prompt_for_agents.is_empty() {
+    if !detail.findings.is_empty() {
+        body.push_str("### Confirmed issues\n\n");
+        for finding in &detail.findings {
+            let location = if finding.github_comment_url.is_empty() {
+                format!("`{}` line {}", finding.path, finding.line)
+            } else {
+                format!(
+                    "[`{}` line {}]({})",
+                    finding.path, finding.line, finding.github_comment_url
+                )
+            };
+            body.push_str(&format!(
+                "- **{}** — {}: {}\n",
+                finding.severity.to_ascii_uppercase(),
+                location,
+                finding.body
+            ));
+        }
+        body.push('\n');
+    }
+    let unplaced_findings = detail
+        .findings
+        .iter()
+        .filter(|finding| finding.github_comment_url.is_empty())
+        .collect::<Vec<_>>();
+    if job.status == "succeeded" && !unplaced_findings.is_empty() {
+        body.push_str("### Inline comments that failed to post\n\n");
+        for finding in unplaced_findings {
+            body.push_str(&format!(
+                "- `{}` line {} [{}]: {}\n",
+                finding.path,
+                finding.line,
+                finding.severity.to_ascii_uppercase(),
+                finding.body
+            ));
+        }
+        body.push('\n');
+    }
+    if !detail.findings.is_empty() && !detail.prompt_for_agents.is_empty() {
         body.push_str(&format!(
             "<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n",
             safe_prompt_fence(&detail.prompt_for_agents)
@@ -5052,6 +5094,9 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     }
     if !job.error.is_empty() {
         body.push_str(&format!("**Error:** {}\n\n", job.error));
+    }
+    if job.status == "succeeded" {
+        body.push_str("_Reviewed by Trouve._\n\n");
     }
     body.push_str(&lifecycle_comment_marker(&job.id));
     body
@@ -5085,16 +5130,14 @@ fn review_prompt_for_agents(
     summary: &str,
     findings: &[ReviewFinding],
 ) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
     let mut prompt = format!(
         "Address every confirmed trouve code-review issue on {} pull request #{} at commit {}.\n\
          Review summary: {}\n",
         job.repository, job.pull_number, job.head_sha, summary
     );
-    if findings.is_empty() {
-        prompt
-            .push_str("No confirmed issues were reported; verify that no code change is required.");
-        return prompt;
-    }
     prompt.push_str("\nConfirmed issues:\n");
     for (index, finding) in findings.iter().enumerate() {
         prompt.push_str(&format!(
@@ -5139,62 +5182,15 @@ fn render_inline_finding(finding: &trouve_protocol::CodeReviewFinding) -> String
     )
 }
 
-fn render_review_body(
+fn inline_review_request(
     job: &trouve_protocol::CodeReviewJob,
-    summary: &str,
-    prompt_for_agents: &str,
-    findings: &[trouve_protocol::CodeReviewFinding],
-    personas: &[trouve_protocol::CodeReviewPersonaResult],
-) -> String {
-    let mut body = format!(
-        "## trouve code review\n\n{summary}\n\n\
-         **Scope:** {scope} review of `{base}`…`{head}`  \n\
-         **Result:** {issues} confirmed issue(s)\n\n### Reviewer coverage\n\n",
-        scope = match job.scope {
-            trouve_protocol::CodeReviewJobScope::Incremental => "incremental",
-            trouve_protocol::CodeReviewJobScope::Full => "full branch",
-        },
-        base = &job.review_base_sha[..job.review_base_sha.len().min(8)],
-        head = &job.head_sha[..job.head_sha.len().min(8)],
-        issues = findings.len(),
-    );
-    for persona in personas {
-        body.push_str(&format!(
-            "- **{}** — {}; {}/{} batch(es), {}, {} confirmed issue(s)\n",
-            persona.reviewer_name,
-            persona.status.replace('_', " "),
-            persona.completed_batches,
-            persona.total_batches,
-            compact_elapsed(persona.elapsed_ms),
-            persona.confirmed_issue_count,
-        ));
-    }
-    if !findings.is_empty() {
-        body.push_str("\n### Confirmed issues\n\n");
-        for finding in findings {
-            let location = if finding.github_comment_url.is_empty() {
-                format!("`{}` line {}", finding.path, finding.line)
-            } else {
-                format!(
-                    "[`{}` line {}]({})",
-                    finding.path, finding.line, finding.github_comment_url
-                )
-            };
-            body.push_str(&format!(
-                "- **{}** — {}: {}\n",
-                finding.severity.to_ascii_uppercase(),
-                location,
-                finding.body
-            ));
-        }
-    }
-    body.push_str(&format!(
-        "\n<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n\
-         _Reviewed by trouve._\n\n<!-- trouve-code-review summary job:{} -->",
-        safe_prompt_fence(prompt_for_agents),
-        job.id
-    ));
-    body
+    comments: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "commit_id": job.head_sha,
+        "event": "COMMENT",
+        "comments": comments,
+    })
 }
 
 fn apply_reviewer_overrides(
@@ -6864,11 +6860,116 @@ mod tests {
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
 
         let body = render_lifecycle_comment(&detail);
-        assert!(body.starts_with("## ❌ trouve review failed"));
+        assert!(body.starts_with("## ❌ Trouve Code Review — Failed"));
         assert!(
             body.contains("**Error:** model review remained invalid after one JSON repair attempt")
         );
-        assert!(!body.contains("trouve review running"));
+        assert!(!body.contains("Trouve Code Review — Running"));
+    }
+
+    #[test]
+    fn successful_lifecycle_comment_merges_review_results() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:merged-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        let task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("reliability".into()),
+                reviewer_name: "Reliability & Error Handling".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/reviewer".into()),
+                prompt: "Review failure paths".into(),
+            })
+            .unwrap();
+        store
+            .skip_code_review_task(&task.id, "No relevant changes")
+            .unwrap()
+            .unwrap();
+        store
+            .save_code_review_result(
+                &queued.id,
+                "The review found one actionable issue.",
+                "Fix the confirmed issue.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "Handle the error before returning.".into(),
+                    prompt_for_agents: "Add error handling and a regression test.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "succeeded",
+                "https://github.com/acme/widgets/pull/42#issuecomment-10",
+                "",
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+        assert!(body.starts_with("## 🟡 Trouve Code Review — Succeeded"));
+        assert!(body.contains("### Reviewer coverage"));
+        assert!(body.contains("| Reliability & Error Handling | Not Applicable |"));
+        assert!(body.contains("**Result:** 1 confirmed issue(s)"));
+        assert!(body.contains("### Confirmed issues"));
+        assert!(body.contains("- **HIGH** — `src/lib.rs` line 42: Handle the error"));
+        assert!(body.contains("### Inline comments that failed to post"));
+        assert!(body.contains("<summary>Prompt for agents</summary>"));
+        assert!(body.contains("_Reviewed by Trouve._"));
+    }
+
+    #[test]
+    fn no_issue_review_omits_agent_prompt() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:no-issue-prompt");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &queued.id,
+                "No issues found.",
+                "This prompt must remain hidden.",
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "", "")
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+        assert!(!body.contains("Prompt for agents"));
+        assert!(review_prompt_for_agents(&queued, "No issues found.", &[]).is_empty());
+    }
+
+    #[test]
+    fn inline_review_submission_has_no_second_comment_body() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:inline-only-review");
+        let request = inline_review_request(
+            &job,
+            vec![serde_json::json!({
+                "path": "src/lib.rs",
+                "line": 42,
+                "side": "RIGHT",
+                "body": "Inline finding"
+            })],
+        );
+
+        assert!(request.get("body").is_none());
+        assert_eq!(request["event"], "COMMENT");
+        assert_eq!(request["comments"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -6952,7 +7053,7 @@ mod tests {
         assert!(running.contains("Reviewers are examining the current revision."));
         assert!(running.contains("### Reviewer status"));
         assert!(running.contains("Reliability & Error Handling"));
-        assert!(running.contains("| running | 0/1 |"));
+        assert!(running.contains("| Running | 0/1 |"));
         assert!(!running.contains("stale router failure"));
 
         store
