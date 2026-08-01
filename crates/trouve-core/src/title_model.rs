@@ -306,31 +306,7 @@ impl TitleModelManager {
         let response = tokio::time::timeout(GENERATION_TIMEOUT, async {
             self.http
                 .post(format!("{base_url}/chat/completions"))
-                .json(&serde_json::json!({
-                    "model": crate::local::TITLE_MODEL_ID,
-                    "stream": false,
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "top_k": 20,
-                    // Repetition is unlikely in a title this short. A positive
-                    // penalty made the small model substitute less accurate
-                    // wording in the title-quality corpus.
-                    "presence_penalty": 0.0,
-                    "seed": 0,
-                    // Sized above the validator's character ceiling so a
-                    // valid title is never cut off at the token budget.
-                    "max_tokens": MAX_TITLE_TOKENS,
-                    // Every request shares the instructions and examples, so
-                    // retaining their KV prefix reduces subsequent prefill.
-                    "cache_prompt": true,
-                    // Avoid spending the output budget on Qwen3's
-                    // reasoning trace. `/no_think` remains in the prompt as a
-                    // model-level fallback for runtimes that ignore kwargs.
-                    "chat_template_kwargs": {
-                        "enable_thinking": false
-                    },
-                    "messages": title_messages(prompt)
-                }))
+                .json(&title_request(prompt))
                 .send()
                 .await?
                 .error_for_status()?
@@ -602,6 +578,36 @@ fn cap_title_model_prompt(prompt: &str) -> &str {
     &prompt[..end]
 }
 
+fn title_request(prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": crate::local::TITLE_MODEL_ID,
+        "stream": false,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        // Repetition is unlikely in a title this short. A positive penalty
+        // made the small model substitute less accurate wording in the
+        // title-quality corpus.
+        "presence_penalty": 0.0,
+        "seed": 0,
+        // Sized above the validator's character ceiling so a valid title is
+        // never cut off at the token budget. Stop after the first line because
+        // sanitize_title ignores every subsequent line.
+        "max_tokens": MAX_TITLE_TOKENS,
+        "stop": ["\n"],
+        // Every request shares the instructions and examples, so retaining
+        // their KV prefix reduces subsequent prefill.
+        "cache_prompt": true,
+        // Avoid spending the output budget on Qwen3's reasoning trace.
+        // `/no_think` remains in the prompt as a model-level fallback for
+        // runtimes that ignore kwargs.
+        "chat_template_kwargs": {
+            "enable_thinking": false
+        },
+        "messages": title_messages(prompt)
+    })
+}
+
 fn title_messages(prompt: &str) -> serde_json::Value {
     serde_json::json!([
         { "role": "system", "content": TITLE_SYSTEM_PROMPT },
@@ -738,7 +744,7 @@ mod tests {
     use super::{
         MAX_TITLE_CHARS, MAX_TITLE_PROMPT_BYTES, MAX_TITLE_TOKENS,
         TITLE_CHAT_TEMPLATE_TOKEN_RESERVE, TitleModelManager, cap_title_model_prompt,
-        install_progress_key, sanitize_title, title_messages,
+        install_progress_key, sanitize_title, title_messages, title_request,
     };
 
     #[test]
@@ -793,8 +799,8 @@ mod tests {
     #[test]
     fn request_budget_fits_token_dense_prompts_in_the_title_context() {
         let prompt = "x".repeat(MAX_TITLE_PROMPT_BYTES);
-        let messages = title_messages(&prompt);
-        let content_bytes: usize = messages
+        let request = title_request(&prompt);
+        let content_bytes: usize = request["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -810,6 +816,14 @@ mod tests {
         let capped = cap_title_model_prompt(&non_ascii);
         assert!(capped.len() <= MAX_TITLE_PROMPT_BYTES);
         assert!(non_ascii.starts_with(capped));
+    }
+
+    #[test]
+    fn request_stops_after_the_first_generated_line() {
+        let request = title_request("Explain the title request limits");
+
+        assert_eq!(request["max_tokens"], MAX_TITLE_TOKENS);
+        assert_eq!(request["stop"], serde_json::json!(["\n"]));
     }
 
     #[test]
