@@ -156,6 +156,12 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    async fn review_repository_merge_base(
+        &self,
+        _request: &ReviewRepositoryMergeBase,
+    ) -> Result<String, String> {
+        Err("review repository merge-base is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -169,12 +175,22 @@ pub struct ReviewRepositorySync {
     pub pull_number: u64,
     pub base_sha: String,
     pub head_sha: String,
+    /// Historical commits used only to reduce rewritten-history review
+    /// scope. Failure to fetch one must not prevent the current review.
+    pub optional_shas: Vec<String>,
     pub token: String,
 }
 
 pub struct ReviewRepositoryDiff {
     pub worktree: PathBuf,
     pub base_sha: String,
+    pub head_sha: String,
+}
+
+pub struct ReviewRepositoryMergeBase {
+    pub worktree: PathBuf,
+    pub base_sha: String,
+    pub head_sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,26 +404,43 @@ impl ToolExecutor for LocalToolExecutor {
         ])
         .await
         .is_ok();
-        if base_present && head_present {
-            return Ok(repository_path);
+        if !base_present || !head_present {
+            let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
+            run(vec![
+                "fetch".into(),
+                "--force".into(),
+                "--no-tags".into(),
+                "origin".into(),
+                format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
+                format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
+            ])
+            .await?;
+            let actual = run(vec!["rev-parse".into(), pull_ref]).await?;
+            if actual != request.head_sha {
+                return Err(format!(
+                    "pull request moved while fetching: expected {}, got {actual}",
+                    request.head_sha
+                ));
+            }
         }
-
-        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
-        run(vec![
-            "fetch".into(),
-            "--force".into(),
-            "--no-tags".into(),
-            "origin".into(),
-            format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
-            format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
-        ])
-        .await?;
-        let actual = run(vec!["rev-parse".into(), pull_ref]).await?;
-        if actual != request.head_sha {
-            return Err(format!(
-                "pull request moved while fetching: expected {}, got {actual}",
-                request.head_sha
-            ));
+        for sha in &request.optional_shas {
+            let present = run(vec![
+                "cat-file".into(),
+                "-e".into(),
+                format!("{sha}^{{commit}}"),
+            ])
+            .await
+            .is_ok();
+            if !present {
+                let _ = run(vec![
+                    "fetch".into(),
+                    "--force".into(),
+                    "--no-tags".into(),
+                    "origin".into(),
+                    format!("+{sha}:refs/remotes/origin/trouve-history-{sha}"),
+                ])
+                .await;
+            }
         }
         Ok(repository_path)
     }
@@ -418,20 +451,35 @@ impl ToolExecutor for LocalToolExecutor {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         let worktree = request.worktree.clone();
         let base_sha = request.base_sha.clone();
+        let head_sha = request.head_sha.clone();
         tokio::task::spawn_blocking(move || {
-            let paths = crate::git::session_diff_files(&worktree, &base_sha)
+            let paths = crate::git::diff_files_between(&worktree, &base_sha, &head_sha)
                 .map_err(|error| error.to_string())?;
             paths
                 .into_iter()
                 .map(|path| {
-                    let diff = crate::git::session_diff_path(&worktree, &base_sha, &path)
-                        .map_err(|error| error.to_string())?;
+                    let diff =
+                        crate::git::diff_path_between(&worktree, &base_sha, &head_sha, &path)
+                            .map_err(|error| error.to_string())?;
                     Ok(ReviewDiffFile { path, diff })
                 })
                 .collect()
         })
         .await
         .map_err(|error| format!("review diff task failed: {error}"))?
+    }
+
+    async fn review_repository_merge_base(
+        &self,
+        request: &ReviewRepositoryMergeBase,
+    ) -> Result<String, String> {
+        let worktree = request.worktree.clone();
+        let base_sha = request.base_sha.clone();
+        let head_sha = request.head_sha.clone();
+        tokio::task::spawn_blocking(move || crate::git::merge_base(&worktree, &base_sha, &head_sha))
+            .await
+            .map_err(|error| format!("review merge-base task failed: {error}"))?
+            .map_err(|error| error.to_string())
     }
 
     async fn evict_worktree(&self, worktree: &Path) {
