@@ -218,6 +218,18 @@ pub enum BackendError {
     Io(#[from] std::io::Error),
 }
 
+impl BackendError {
+    /// Whether the vendor harness positively reported exhausted request
+    /// capacity. Generic protocol and I/O errors are intentionally terminal
+    /// because their side-effect outcome may be unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        let Self::Protocol(message) = self else {
+            return false;
+        };
+        trouve_providers::is_capacity_exhaustion_message(message)
+    }
+}
+
 pub type BackendEventStream = BoxStream<'static, Result<BackendEvent, BackendError>>;
 
 /// Best-effort provider health. Implementations should keep this fast;
@@ -716,6 +728,14 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn backend_capacity_errors_use_the_shared_classifier() {
+        assert!(BackendError::Protocol("HTTP 429".into()).is_capacity_exhausted());
+        assert!(BackendError::Protocol("quota_exceeded".into()).is_capacity_exhausted());
+        assert!(!BackendError::Protocol("HTTP 14290".into()).is_capacity_exhausted());
+        assert!(!BackendError::Io(std::io::Error::other("HTTP 429")).is_capacity_exhausted());
+    }
 
     #[tokio::test]
     async fn coalesces_delta_kinds_without_reordering_controls() {

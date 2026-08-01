@@ -132,6 +132,17 @@ pub enum Event {
         mode: String,
         model: String,
     },
+    /// The concrete provider route chosen for an automatic model. A later
+    /// event for the same turn records a safe route failover.
+    #[serde(rename = "model.route_selected")]
+    ModelRouteSelected {
+        turn: u64,
+        model: String,
+        provider_id: String,
+        provider_model: String,
+        /// "initial", "capacity_failover", or "route_failover".
+        reason: String,
+    },
     #[serde(rename = "turn.completed")]
     TurnCompleted {
         turn: u64,
@@ -363,9 +374,10 @@ pub enum Event {
     },
     /// The server's internet reachability changed (it is the one talking to
     /// model vendors, so it owns this state). While offline, `/v1/models`
-    /// lists only models that can run without internet (local provider,
-    /// loopback endpoints); clients gate prompt entry on having usable
-    /// models and announce recovery. `ServerInfo.online` carries the same
+    /// lists only models that can run without internet (the managed `local`
+    /// provider and user-configured local endpoints); clients gate prompt
+    /// entry on having usable models and announce recovery.
+    /// `ServerInfo.online` carries the same
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },

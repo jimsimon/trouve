@@ -337,6 +337,7 @@ export interface Provider {
 
 export interface ProvidersResponse {
   providers: Provider[];
+  provider_order?: string[];
   default_model: string;
   default_thinking_level?: string;
 }
@@ -356,6 +357,10 @@ export interface Model {
   id: string;
   display_name: string;
   options_schema?: unknown;
+  routes: Array<{
+    provider_id: string;
+    provider_model: string;
+  }>;
 }
 
 export interface AgentMode {

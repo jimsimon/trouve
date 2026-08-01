@@ -102,6 +102,51 @@ pub enum ProviderError {
     Auth(String),
 }
 
+impl ProviderError {
+    /// Whether the provider positively reported exhausted request capacity.
+    /// This deliberately excludes generic transport failures: retrying those
+    /// through another provider could replay a side effect whose outcome is
+    /// unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        match self {
+            Self::Api(message) | Self::Request(message) => is_capacity_exhaustion_message(message),
+            Self::Auth(_) => false,
+        }
+    }
+}
+
+/// Whether a provider or vendor-backend error positively reports exhausted
+/// request capacity. Kept here so native and agent adapters cannot drift on
+/// which failures are safe to route elsewhere.
+pub fn is_capacity_exhaustion_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_standalone_token(&message, "429")
+        || [
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "insufficient_quota",
+            "resource_exhausted",
+            "capacity exhausted",
+            "capacity_exhausted",
+            "usage limit",
+            "usage_limit",
+        ]
+        .iter()
+        .any(|signal| message.contains(signal))
+}
+
+fn contains_standalone_token(message: &str, token: &str) -> bool {
+    message.match_indices(token).any(|(start, _)| {
+        let before = message[..start].chars().next_back();
+        let after = message[start + token.len()..].chars().next();
+        before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
+}
+
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
 const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
@@ -220,6 +265,21 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_messages_require_a_standalone_http_status() {
+        for message in [
+            "HTTP 429 Too Many Requests",
+            "request failed (429)",
+            "status=429",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            assert!(is_capacity_exhaustion_message(message), "{message}");
+        }
+        for message in ["HTTP 14290", "error E429x", "request 4290 failed"] {
+            assert!(!is_capacity_exhaustion_message(message), "{message}");
+        }
+    }
 
     #[tokio::test]
     async fn native_provider_deltas_are_coalesced_without_crossing_boundaries() {

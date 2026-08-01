@@ -30,3 +30,5 @@ sequentially.
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
 | [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
+| [0021](0021-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Accepted |
+| [0022](0022-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |
