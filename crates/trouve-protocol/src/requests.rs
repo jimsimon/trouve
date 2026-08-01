@@ -1418,9 +1418,17 @@ pub struct CodeReviewStats {
     pub repositories: Vec<CodeReviewRepositoryStats>,
 }
 
-/// Persisted execution deadlines for automated code reviews.
+const fn default_max_parallel_reviews() -> u32 {
+    2
+}
+
+/// Persisted execution settings for automated code reviews.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewSettings {
+    /// Maximum number of review jobs that may execute concurrently.
+    #[serde(default = "default_max_parallel_reviews")]
+    #[schema(minimum = 1, default = 2)]
+    pub max_parallel_reviews: u32,
     /// Whole-job deadline, including preparation, reviewers, final editing,
     /// and publication.
     #[schema(minimum = 1)]
@@ -1433,10 +1441,15 @@ pub struct CodeReviewSettings {
     pub coordinator_timeout_seconds: u64,
 }
 
-/// Replace the persisted automated code-review execution deadlines
+/// Replace the persisted automated code-review execution settings
 /// (`PUT /v1/config/code-review`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SetCodeReviewSettingsRequest {
+    /// Maximum number of review jobs that may execute concurrently. Omission
+    /// preserves the current value for compatibility with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1)]
+    pub max_parallel_reviews: Option<u32>,
     /// Whole-job deadline, including preparation, reviewers, final editing,
     /// and publication.
     #[schema(minimum = 1)]

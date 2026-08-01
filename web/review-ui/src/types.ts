@@ -154,6 +154,7 @@ export interface ReviewTask {
 }
 
 export interface CodeReviewSettings {
+  max_parallel_reviews: number;
   total_timeout_seconds: number;
   reviewer_timeout_seconds: number;
   coordinator_timeout_seconds: number;

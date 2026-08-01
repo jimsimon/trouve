@@ -17,11 +17,17 @@ function timeoutSeconds(value: string, label: string): number {
 }
 
 export function reviewSettingsFromMinutes(
+  maxParallel: string,
   total: string,
   reviewer: string,
   coordinator: string,
 ): CodeReviewSettings {
+  const maxParallelReviews = Number(maxParallel);
+  if (!Number.isSafeInteger(maxParallelReviews) || maxParallelReviews <= 0) {
+    throw new Error("Max parallel reviews must be a positive whole number");
+  }
   const settings = {
+    max_parallel_reviews: maxParallelReviews,
     total_timeout_seconds: timeoutSeconds(total, "Total review timeout"),
     reviewer_timeout_seconds: timeoutSeconds(reviewer, "Reviewer timeout"),
     coordinator_timeout_seconds: timeoutSeconds(coordinator, "Final editor timeout"),

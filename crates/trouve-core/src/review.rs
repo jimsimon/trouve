@@ -46,7 +46,7 @@ const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REVIEW_COORDINATOR_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_COORDINATOR_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
-const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
+const DEFAULT_REVIEW_JOB_CONCURRENCY: u32 = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
 const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
@@ -1302,6 +1302,10 @@ impl Engine {
     pub fn code_review_settings(&self) -> CodeReviewSettings {
         let config = self.config.lock().unwrap();
         CodeReviewSettings {
+            max_parallel_reviews: config
+                .code_review_max_parallel_reviews
+                .filter(|limit| *limit > 0)
+                .unwrap_or(DEFAULT_REVIEW_JOB_CONCURRENCY),
             total_timeout_seconds: config
                 .code_review_timeout_seconds
                 .filter(|seconds| *seconds > 0)
@@ -1320,6 +1324,7 @@ impl Engine {
     fn effective_code_review_settings(&self) -> CodeReviewSettings {
         let configured = self.code_review_settings();
         CodeReviewSettings {
+            max_parallel_reviews: configured.max_parallel_reviews,
             total_timeout_seconds: code_review_timeout(Duration::from_secs(
                 configured.total_timeout_seconds,
             ))
@@ -1344,6 +1349,11 @@ impl Engine {
         &self,
         request: SetCodeReviewSettingsRequest,
     ) -> Result<(u64, CodeReviewSettings), EngineError> {
+        if request.max_parallel_reviews == Some(0) {
+            return Err(EngineError::BadRequest(
+                "max parallel reviews must be positive".into(),
+            ));
+        }
         if request.total_timeout_seconds == 0
             || request.reviewer_timeout_seconds == 0
             || request.coordinator_timeout_seconds == 0
@@ -1363,12 +1373,16 @@ impl Engine {
             ));
         }
         let settings = CodeReviewSettings {
+            max_parallel_reviews: request
+                .max_parallel_reviews
+                .unwrap_or_else(|| self.code_review_settings().max_parallel_reviews),
             total_timeout_seconds: request.total_timeout_seconds,
             reviewer_timeout_seconds: request.reviewer_timeout_seconds,
             coordinator_timeout_seconds: request.coordinator_timeout_seconds,
         };
         {
             let mut config = self.config.lock().unwrap();
+            config.code_review_max_parallel_reviews = Some(settings.max_parallel_reviews);
             config.code_review_timeout_seconds = Some(settings.total_timeout_seconds);
             config.code_review_reviewer_timeout_seconds = Some(settings.reviewer_timeout_seconds);
             config.code_review_coordinator_timeout_seconds =
@@ -1378,7 +1392,13 @@ impl Engine {
         let envelope = self
             .store
             .append_event(Scope::Server, Event::CodeReviewSettingsUpdated { settings })?;
+        self.code_review.job_wake.notify_one();
         Ok((envelope.cursor, settings))
+    }
+
+    fn effective_code_review_job_concurrency(&self) -> usize {
+        let configured = self.code_review_settings().max_parallel_reviews as usize;
+        positive_concurrency_from_env(REVIEW_JOB_CONCURRENCY_ENV, configured)
     }
 
     pub fn code_review_job_detail(
@@ -2743,34 +2763,46 @@ impl Engine {
                 }
             }
         });
-        let job_concurrency = positive_concurrency_from_env(
-            REVIEW_JOB_CONCURRENCY_ENV,
-            DEFAULT_REVIEW_JOB_CONCURRENCY,
-        );
-        tracing::info!(job_concurrency, "starting code-review workers");
-        for worker_index in 0..job_concurrency {
-            let worker_engine = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    worker_engine.retry_code_review_cleanup().await;
+        let job_concurrency = self.effective_code_review_job_concurrency();
+        tracing::info!(job_concurrency, "starting code-review scheduler");
+        let worker_engine = self.clone();
+        tokio::spawn(async move {
+            let mut running_jobs = tokio::task::JoinSet::new();
+            loop {
+                worker_engine.retry_code_review_cleanup().await;
+                let job_concurrency = worker_engine.effective_code_review_job_concurrency();
+                let mut claim_failed = false;
+                while running_jobs.len() < job_concurrency {
                     match worker_engine.store.claim_code_review_job() {
-                        Ok(Some(record)) => worker_engine.run_code_review_job(record).await,
-                        Ok(None) => {
-                            tokio::select! {
-                                _ = tokio::time::sleep(JOB_IDLE_INTERVAL) => {}
-                                _ = worker_engine.code_review.job_wake.notified() => {}
-                            }
+                        Ok(Some(record)) => {
+                            let engine = worker_engine.clone();
+                            running_jobs.spawn(async move {
+                                engine.run_code_review_job(record).await;
+                            });
                         }
+                        Ok(None) => break,
                         Err(error) => {
-                            worker_engine.record_review_error(format!(
-                                "worker {worker_index} claiming review job: {error:#}"
-                            ));
-                            tokio::time::sleep(JOB_IDLE_INTERVAL).await;
+                            worker_engine
+                                .record_review_error(format!("claiming review job: {error:#}"));
+                            claim_failed = true;
+                            break;
                         }
                     }
                 }
-            });
-        }
+
+                tokio::select! {
+                    result = running_jobs.join_next(), if !running_jobs.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            worker_engine.record_review_error(format!(
+                                "review job task failed: {error}"
+                            ));
+                        }
+                    }
+                    _ = tokio::time::sleep(JOB_IDLE_INTERVAL) => {}
+                    _ = worker_engine.code_review.job_wake.notified(), if !claim_failed => {}
+                }
+            }
+        });
     }
 
     async fn run_code_review_job(self: &Arc<Self>, record: CodeReviewJobRecord) {
@@ -6940,6 +6972,7 @@ mod tests {
         assert_eq!(
             engine.code_review_settings(),
             CodeReviewSettings {
+                max_parallel_reviews: 2,
                 total_timeout_seconds: 15 * 60,
                 reviewer_timeout_seconds: 10 * 60,
                 coordinator_timeout_seconds: 5 * 60,
@@ -6948,6 +6981,7 @@ mod tests {
 
         let error = engine
             .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(2),
                 total_timeout_seconds: 900,
                 reviewer_timeout_seconds: 901,
                 coordinator_timeout_seconds: 300,
@@ -6955,13 +6989,29 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("reviewer timeout cannot exceed"));
 
+        let error = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(0),
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 600,
+                coordinator_timeout_seconds: 300,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max parallel reviews must be positive")
+        );
+
         let expected = CodeReviewSettings {
+            max_parallel_reviews: 4,
             total_timeout_seconds: 1_200,
             reviewer_timeout_seconds: 720,
             coordinator_timeout_seconds: 360,
         };
         let (cursor, saved) = engine
             .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: Some(expected.max_parallel_reviews),
                 total_timeout_seconds: expected.total_timeout_seconds,
                 reviewer_timeout_seconds: expected.reviewer_timeout_seconds,
                 coordinator_timeout_seconds: expected.coordinator_timeout_seconds,
@@ -6970,6 +7020,16 @@ mod tests {
         assert_eq!(saved, expected);
         assert_eq!(engine.code_review_settings(), expected);
         assert!(cursor > 0);
+
+        let (_, saved) = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                max_parallel_reviews: None,
+                total_timeout_seconds: expected.total_timeout_seconds,
+                reviewer_timeout_seconds: expected.reviewer_timeout_seconds,
+                coordinator_timeout_seconds: expected.coordinator_timeout_seconds,
+            })
+            .unwrap();
+        assert_eq!(saved.max_parallel_reviews, expected.max_parallel_reviews);
         assert!(
             engine
                 .store()
