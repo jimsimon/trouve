@@ -131,6 +131,14 @@ export interface ReviewTask {
   batch_index: number;
   batch_count: number;
   status: string;
+  lifecycle_stage:
+    | "queued"
+    | "waiting_for_capacity"
+    | "starting_model"
+    | "running_model"
+    | "running_tool"
+    | "repairing_output"
+    | "completed";
   model?: string;
   session_id?: string;
   thread_id?: string;
@@ -149,8 +157,22 @@ export interface ReviewTask {
   error?: string;
   created_at: string;
   started_at?: string;
+  model_started_at?: string;
+  last_progress_at?: string;
   completed_at?: string;
   elapsed_ms: number;
+}
+
+export interface ReviewTaskProgress {
+  lifecycle_stage: ReviewTask["lifecycle_stage"];
+  provider_wait_ms: number;
+  model_elapsed_ms: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  tool_call_count: number;
+  model_started_at?: string;
+  last_progress_at: string;
 }
 
 export interface CodeReviewSettings {
@@ -395,7 +417,7 @@ export interface EventEnvelope {
   stream?: "assistant" | "thinking" | "tool";
   text?: string;
   task?: ReviewTask;
-  progress?: Progress;
+  progress?: Progress | ReviewTaskProgress;
   routing_decisions?: RoutingDecision[];
   settings?: CodeReviewSettings;
 }

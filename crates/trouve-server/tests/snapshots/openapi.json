@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.5"
+    "version": "2.6"
   },
   "paths": {
     "/v1/approvals": {
@@ -5720,6 +5720,17 @@
           "job_id": {
             "type": "string"
           },
+          "last_progress_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "lifecycle_stage": {
+            "$ref": "#/components/schemas/CodeReviewTaskLifecycleStage",
+            "description": "Current stage while active; last observed stage after failure or\ncancellation."
+          },
           "model": {
             "type": [
               "string",
@@ -5732,6 +5743,13 @@
             "format": "int64",
             "description": "Wall time from model dispatch through tool iterations and completion.",
             "minimum": 0
+          },
+          "model_started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           },
           "output": {
             "type": "string"
@@ -5795,6 +5813,79 @@
           },
           "tool_output": {
             "type": "string"
+          }
+        }
+      },
+      "CodeReviewTaskLifecycleStage": {
+        "type": "string",
+        "description": "Current lifecycle stage for an active review task, or the last observed\nstage when a task fails or is cancelled.",
+        "enum": [
+          "queued",
+          "waiting_for_capacity",
+          "starting_model",
+          "running_model",
+          "running_tool",
+          "repairing_output",
+          "completed"
+        ]
+      },
+      "CodeReviewTaskProgress": {
+        "type": "object",
+        "description": "Small, durable progress snapshot emitted while a review task is running.",
+        "required": [
+          "lifecycle_stage",
+          "provider_wait_ms",
+          "model_elapsed_ms",
+          "input_tokens",
+          "cached_input_tokens",
+          "output_tokens",
+          "tool_call_count",
+          "last_progress_at"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_progress_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lifecycle_stage": {
+            "$ref": "#/components/schemas/CodeReviewTaskLifecycleStage"
+          },
+          "model_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model_started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "provider_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tool_call_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -6679,6 +6770,33 @@
                 "type": "string",
                 "enum": [
                   "code_review.task_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A compact task lifecycle/metrics snapshot changed while the task was\nrunning. Clients merge it into their retained task representation.",
+            "required": [
+              "job_id",
+              "task_id",
+              "progress",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "progress": {
+                "$ref": "#/components/schemas/CodeReviewTaskProgress"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.task_progress_updated"
                 ]
               }
             }

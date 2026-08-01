@@ -763,7 +763,7 @@ IFS= read -r line # session/new, then exit without responding
 }
 
 #[tokio::test]
-async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
+async fn cursor_adapter_routes_yolo_and_read_only_through_agent_mode_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
@@ -816,8 +816,10 @@ async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
     let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
 
-    // Read-only turns run in cursor's plan mode (fresh process: the shared
-    // ACP child is per-backend, so use a new backend instance).
+    // Read-only turns still run in Cursor's agent mode (fresh process: the
+    // ACP child is per-backend, so use a new backend instance). Trouve's
+    // approval guard, not Cursor's mode, remains responsible for denying
+    // mutations.
     let tmp2 = tempfile::tempdir().unwrap();
     let stub2 = cursor_acp_stub(tmp2.path());
     let backend2 = CursorBackend::new("cursor", Some(stub2.clone()), None);
@@ -831,7 +833,7 @@ async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
         }
     }
     let mode = std::fs::read_to_string(format!("{stub2}.mode")).unwrap();
-    assert!(mode.contains("\"value\":\"plan\""), "{mode}");
+    assert!(mode.contains("\"value\":\"agent\""), "{mode}");
 }
 
 #[tokio::test]

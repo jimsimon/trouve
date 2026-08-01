@@ -88,6 +88,7 @@ import type {
   ReviewJob,
   RoutingDecision,
   ReviewTask,
+  ReviewTaskProgress,
   ReviewStats,
   ReviewerOverride,
   ReviewerProfile,
@@ -144,6 +145,41 @@ function liveElapsed(
   if (status !== "running" || !startedAt) return baseline;
   const liveAge = Math.max(0, now - new Date(startedAt).getTime());
   return Math.max(baseline, liveAge);
+}
+
+function liveModelElapsed(task: ReviewTask, now: number): number {
+  if (task.status !== "running" || !task.model_started_at) {
+    return task.model_elapsed_ms;
+  }
+  return Math.max(
+    task.model_elapsed_ms,
+    Math.max(0, now - new Date(task.model_started_at).getTime()),
+  );
+}
+
+function taskLifecycleLabel(stage: ReviewTask["lifecycle_stage"]): string {
+  switch (stage) {
+    case "waiting_for_capacity":
+      return "Waiting for capacity";
+    case "starting_model":
+      return "Starting model";
+    case "running_model":
+      return "Running model";
+    case "running_tool":
+      return "Running tool";
+    case "repairing_output":
+      return "Repairing output";
+    case "completed":
+      return "Completed";
+    default:
+      return "Queued";
+  }
+}
+
+function isReviewTaskProgress(
+  progress: EventEnvelope["progress"],
+): progress is ReviewTaskProgress {
+  return Boolean(progress && "lifecycle_stage" in progress);
 }
 
 function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
@@ -911,6 +947,31 @@ function JobDetailPane({
         setDetail((current) =>
           current ? { ...current, routing_decisions: event.routing_decisions } : current,
         );
+      } else if (
+        event.type === "code_review.task_progress_updated" &&
+        event.task_id &&
+        isReviewTaskProgress(event.progress)
+      ) {
+        const taskId = event.task_id;
+        const progress = event.progress;
+        const mergeProgress = (task: ReviewTask): ReviewTask => ({ ...task, ...progress });
+        setDetail((current) =>
+          current
+            ? {
+                ...current,
+                tasks: current.tasks.map((task) =>
+                  task.id === taskId ? mergeProgress(task) : task,
+                ),
+              }
+            : current,
+        );
+        setTaskDetails((current) => {
+          const task = current[taskId];
+          if (!task) return current;
+          const next = { ...current, [taskId]: mergeProgress(task) };
+          taskDetailsRef.current = next;
+          return next;
+        });
       } else if (event.type === "code_review.task_updated" && event.task) {
         const task = event.task;
         pendingOutput.delete(task.id);
@@ -1518,12 +1579,16 @@ function JobDetailPane({
                 )}
                 <dl class="task-facts">
                   <div>
+                    <dt>Lifecycle</dt>
+                    <dd>{taskLifecycleLabel(selectedTask.lifecycle_stage)}</dd>
+                  </div>
+                  <div>
                     <dt>Capacity wait</dt>
                     <dd>{duration(selectedTask.provider_wait_ms)}</dd>
                   </div>
                   <div>
                     <dt>Model/tools</dt>
-                    <dd>{duration(selectedTask.model_elapsed_ms)}</dd>
+                    <dd>{duration(liveModelElapsed(selectedTask, now))}</dd>
                   </div>
                   <div>
                     <dt>Tokens</dt>
@@ -1539,6 +1604,10 @@ function JobDetailPane({
                   <div>
                     <dt>Tool calls</dt>
                     <dd>{selectedTask.tool_call_count}</dd>
+                  </div>
+                  <div>
+                    <dt>Last progress</dt>
+                    <dd>{formatDate(selectedTask.last_progress_at)}</dd>
                   </div>
                   <div>
                     <dt>Candidates / confirmed</dt>

@@ -62,6 +62,7 @@ const GITHUB_REST_CACHE_MAX_ENTRIES: usize = 512;
 const GITHUB_REST_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const REVIEW_OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
+const REVIEW_TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
@@ -726,6 +727,9 @@ struct ReviewTurnResult {
 struct ReviewTurnRequest {
     prompt: String,
     tools_enabled: bool,
+    initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
+    output_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
+    metrics_base: CodeReviewTaskMetrics,
 }
 
 impl ReviewTurnRequest {
@@ -733,6 +737,9 @@ impl ReviewTurnRequest {
         Self {
             prompt,
             tools_enabled: true,
+            initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage::StartingModel,
+            output_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel,
+            metrics_base: CodeReviewTaskMetrics::default(),
         }
     }
 
@@ -740,7 +747,15 @@ impl ReviewTurnRequest {
         Self {
             prompt,
             tools_enabled: false,
+            initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+            output_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+            metrics_base: CodeReviewTaskMetrics::default(),
         }
+    }
+
+    fn with_metrics_base(mut self, metrics_base: CodeReviewTaskMetrics) -> Self {
+        self.metrics_base = metrics_base;
+        self
     }
 }
 
@@ -1095,6 +1110,39 @@ impl Engine {
                 task: Box::new(task),
             },
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn emit_code_review_task_progress(
+        &self,
+        record: crate::store::CodeReviewTaskProgressRecord,
+    ) -> Result<(), EngineError> {
+        self.store.append_event(
+            Scope::CodeReviewJob(record.job_id.clone()),
+            Event::CodeReviewTaskProgressUpdated {
+                job_id: record.job_id,
+                task_id: record.task_id,
+                progress: record.progress,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn persist_code_review_task_progress(
+        &self,
+        task_id: &str,
+        lifecycle_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
+        metrics: &CodeReviewTaskMetrics,
+        mark_model_started: bool,
+    ) -> Result<()> {
+        if let Some(progress) = self.store.set_code_review_task_progress(
+            task_id,
+            lifecycle_stage,
+            metrics,
+            mark_model_started,
+        )? {
+            self.emit_code_review_task_progress(progress)?;
+        }
         Ok(())
     }
 
@@ -3668,8 +3716,6 @@ impl Engine {
                 active_threads,
             )
             .await?;
-        self.store
-            .set_code_review_task_metrics(task_id, &turn.metrics)?;
         let initial_error = match parse_review_output(&turn.output) {
             Ok(parsed) => return Ok((turn, parsed)),
             Err(error) => error,
@@ -3683,7 +3729,8 @@ impl Engine {
                 ReviewTurnRequest::json_repair(review_output_repair_prompt(
                     &initial_error,
                     &turn.output,
-                )),
+                ))
+                .with_metrics_base(turn.metrics.clone()),
                 superseded,
                 active_threads,
             )
@@ -3693,8 +3740,6 @@ impl Engine {
             })?;
         merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
         turn.output = repaired.output;
-        self.store
-            .set_code_review_task_metrics(task_id, &turn.metrics)?;
         let parsed = parse_review_output(&turn.output).with_context(|| {
             format!(
                 "model review remained invalid after one JSON repair attempt; \
@@ -3767,8 +3812,6 @@ impl Engine {
                 active_threads,
             )
             .await?;
-        self.store
-            .set_code_review_task_metrics(task_id, &turn.metrics)?;
         let initial_error = match parse_semantic_routing_output(&turn.output) {
             Ok(parsed) => return Ok((turn, parsed)),
             Err(error) => error,
@@ -3781,7 +3824,8 @@ impl Engine {
                 ReviewTurnRequest::json_repair(semantic_routing_repair_prompt(
                     &initial_error,
                     &turn.output,
-                )),
+                ))
+                .with_metrics_base(turn.metrics.clone()),
                 superseded,
                 active_threads,
             )
@@ -3791,8 +3835,6 @@ impl Engine {
             })?;
         merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
         turn.output = repaired.output;
-        self.store
-            .set_code_review_task_metrics(task_id, &turn.metrics)?;
         let parsed = parse_semantic_routing_output(&turn.output).with_context(|| {
             format!(
                 "semantic routing remained invalid after one JSON repair attempt; \
@@ -3951,6 +3993,13 @@ impl Engine {
         request: ReviewTurnRequest,
         superseded: &CancellationToken,
     ) -> Result<ReviewTurnResult> {
+        let ReviewTurnRequest {
+            prompt,
+            tools_enabled,
+            initial_stage,
+            output_stage,
+            metrics_base,
+        } = request;
         ensure_review_current(superseded)?;
         let scope = Scope::Thread(thread_id.to_string());
         let mut events = self.store.subscribe_scope(&scope);
@@ -3961,10 +4010,13 @@ impl Engine {
             .map(|event| event.cursor)
             .unwrap_or(0);
         let mut replay = VecDeque::new();
-        let accepted = if request.tools_enabled {
-            self.send_message(thread_id, request.prompt, Vec::new())?
+        let mut lifecycle_stage = initial_stage;
+        self.persist_code_review_task_progress(task_id, lifecycle_stage, &metrics_base, false)?;
+        let mut last_progress_persisted = Instant::now();
+        let accepted = if tools_enabled {
+            self.send_message(thread_id, prompt, Vec::new())?
         } else {
-            self.send_message_without_tools(thread_id, request.prompt)?
+            self.send_message_without_tools(thread_id, prompt)?
         };
         let turn = accepted.turn;
         let mut output = String::new();
@@ -4015,32 +4067,54 @@ impl Engine {
                 continue;
             }
             after = envelope.cursor;
+            let mut next_stage = lifecycle_stage;
+            let mut force_progress = false;
+            let mut mark_model_started = false;
             match envelope.event {
                 Event::TurnStarted {
                     turn: event_turn, ..
-                } if event_turn == turn => model_started = Some(Instant::now()),
+                } if event_turn == turn => {
+                    model_started.get_or_insert_with(Instant::now);
+                    next_stage = initial_stage;
+                    force_progress = true;
+                    mark_model_started = true;
+                }
                 Event::AssistantDelta {
                     turn: event_turn,
                     text,
                 } if event_turn == turn => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Assistant, &text);
+                    next_stage = output_stage;
                 }
                 Event::AssistantThinking {
                     turn: event_turn,
                     text,
                 } if event_turn == turn => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Thinking, &text);
+                    next_stage = output_stage;
                 }
                 Event::ToolOutput { chunk, .. } => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Tool, &chunk);
+                    next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
                 }
                 Event::ToolRequested {
                     turn: event_turn, ..
-                } if event_turn == turn => tool_call_count += 1,
+                } if event_turn == turn => {
+                    tool_call_count += 1;
+                    next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
+                    force_progress = true;
+                }
+                Event::ToolCompleted { .. } => {
+                    next_stage = output_stage;
+                    force_progress = true;
+                }
                 Event::AssistantMessage {
                     turn: event_turn,
                     content,
-                } if event_turn == turn => output = content,
+                } if event_turn == turn => {
+                    output = content;
+                    next_stage = output_stage;
+                }
                 Event::QuestionRequested { request_id, .. } => {
                     let _ = self.resolve_question(&request_id, None);
                 }
@@ -4049,20 +4123,72 @@ impl Engine {
                     usage: event_usage,
                     ..
                 } if event_turn == turn => {
+                    let metrics = code_review_task_metrics_snapshot(
+                        &metrics_base,
+                        model_started,
+                        tool_call_count,
+                        Some(&event_usage),
+                    );
+                    self.persist_code_review_task_progress(task_id, output_stage, &metrics, false)?;
                     usage = event_usage;
                     break;
                 }
                 Event::TurnFailed {
                     turn: event_turn,
                     error,
-                } if event_turn == turn => bail!("model review failed: {error}"),
+                } if event_turn == turn => {
+                    let metrics = code_review_task_metrics_snapshot(
+                        &metrics_base,
+                        model_started,
+                        tool_call_count,
+                        None,
+                    );
+                    self.persist_code_review_task_progress(
+                        task_id,
+                        lifecycle_stage,
+                        &metrics,
+                        false,
+                    )?;
+                    bail!("model review failed: {error}");
+                }
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
+                    let metrics = code_review_task_metrics_snapshot(
+                        &metrics_base,
+                        model_started,
+                        tool_call_count,
+                        None,
+                    );
+                    self.persist_code_review_task_progress(
+                        task_id,
+                        lifecycle_stage,
+                        &metrics,
+                        false,
+                    )?;
                     if superseded.is_cancelled() {
                         bail!("stale: review was superseded while the model was running");
                     }
                     bail!("model review was cancelled");
                 }
                 _ => {}
+            }
+            if force_progress
+                || next_stage != lifecycle_stage
+                || last_progress_persisted.elapsed() >= REVIEW_TASK_PROGRESS_INTERVAL
+            {
+                let metrics = code_review_task_metrics_snapshot(
+                    &metrics_base,
+                    model_started,
+                    tool_call_count,
+                    None,
+                );
+                self.persist_code_review_task_progress(
+                    task_id,
+                    next_stage,
+                    &metrics,
+                    mark_model_started,
+                )?;
+                lifecycle_stage = next_stage;
+                last_progress_persisted = Instant::now();
             }
             if projected.should_flush() {
                 projected.flush(self, &job.id, task_id)?;
@@ -4075,15 +4201,12 @@ impl Engine {
         }
         Ok(ReviewTurnResult {
             output,
-            metrics: CodeReviewTaskMetrics {
-                model_elapsed_ms: model_started
-                    .map(|started| started.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
-                    .unwrap_or(0),
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+            metrics: code_review_task_metrics_snapshot(
+                &CodeReviewTaskMetrics::default(),
+                model_started,
                 tool_call_count,
-            },
+                Some(&usage),
+            ),
         })
     }
 
@@ -5991,6 +6114,28 @@ fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) ->
          when there are no findings, rejected candidates, or resolved findings.\n\n\
          <malformed-review-output>\n{malformed_output}\n</malformed-review-output>"
     )
+}
+
+fn code_review_task_metrics_snapshot(
+    base: &CodeReviewTaskMetrics,
+    model_started: Option<Instant>,
+    tool_call_count: u64,
+    usage: Option<&trouve_protocol::Usage>,
+) -> CodeReviewTaskMetrics {
+    let usage = usage.cloned().unwrap_or_default();
+    CodeReviewTaskMetrics {
+        model_elapsed_ms: base.model_elapsed_ms.saturating_add(
+            model_started
+                .map(|started| started.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+                .unwrap_or_default(),
+        ),
+        input_tokens: base.input_tokens.saturating_add(usage.input_tokens),
+        cached_input_tokens: base
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens),
+        output_tokens: base.output_tokens.saturating_add(usage.output_tokens),
+        tool_call_count: base.tool_call_count.saturating_add(tool_call_count),
+    }
 }
 
 fn merge_review_task_metrics(
