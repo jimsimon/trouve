@@ -316,21 +316,7 @@ impl TitleModelManager {
         })
         .await
         .context("session title generation timed out")??;
-        // A truncated title can still look like 2-7 whole words, so reject it
-        // here instead of letting sanitize_title accept a cut-off last word.
-        if response
-            .pointer("/choices/0/finish_reason")
-            .and_then(serde_json::Value::as_str)
-            == Some("length")
-        {
-            bail!("session title generation hit the token limit");
-        }
-        let raw = response
-            .pointer("/choices/0/message/content")
-            .and_then(serde_json::Value::as_str)
-            .context("session title model returned no text")?;
-        let title = sanitize_title(raw)?;
-        Ok(title)
+        title_from_response(&response)
     }
 
     fn schedule_idle_release(self: &Arc<Self>) {
@@ -716,22 +702,49 @@ async fn stream_to_part(
     Ok((downloaded, format!("{:x}", hash.finalize())))
 }
 
+fn title_from_response(response: &serde_json::Value) -> Result<String> {
+    let raw = response
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .context("session title model returned no text")?;
+    let (title, line_terminated) = sanitize_title_candidate(raw)?;
+    // An unterminated title can still look like 2-7 whole words after the
+    // model exhausts its budget. A terminated first line is complete and safe
+    // to recover even when ignored trailing output caused the length finish.
+    if response
+        .pointer("/choices/0/finish_reason")
+        .and_then(serde_json::Value::as_str)
+        == Some("length")
+        && !line_terminated
+    {
+        bail!("session title generation hit the token limit");
+    }
+    Ok(title)
+}
+
+#[cfg(test)]
 fn sanitize_title(raw: &str) -> Result<String> {
+    sanitize_title_candidate(raw).map(|(title, _)| title)
+}
+
+fn sanitize_title_candidate(raw: &str) -> Result<(String, bool)> {
     // A runtime that ignores `chat_template_kwargs` falls back to the
-    // prompt-level `/no_think`, which still leaves an empty reasoning block
-    // in the content. Drop it so the title after it can be recovered; an
-    // unterminated block means thinking consumed the output budget.
-    let raw = match raw.trim_start().strip_prefix("<think>") {
+    // prompt-level `/no_think`. Depending on the chat template, content can
+    // contain the whole empty block or only its closing tag. Drop either so
+    // the title after it can be recovered; an unterminated opening block means
+    // thinking consumed the output budget.
+    let trimmed = raw.trim_start();
+    let raw = match trimmed.strip_prefix("<think>") {
         Some(rest) => rest
             .split_once("</think>")
             .map(|(_, after)| after)
             .unwrap_or(""),
-        None => raw,
+        None => trimmed.strip_prefix("</think>").unwrap_or(raw),
     };
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
+    let (line, line_terminated) = raw
+        .split_inclusive('\n')
+        .map(|chunk| (chunk.trim(), chunk.ends_with('\n')))
+        .find(|(line, _)| !line.is_empty())
         .context("session title model returned empty text")?;
     let line = line
         .strip_prefix("Title:")
@@ -749,7 +762,7 @@ fn sanitize_title(raw: &str) -> Result<String> {
     {
         bail!("session title model returned an invalid title");
     }
-    Ok(line.to_string())
+    Ok((line.to_string(), line_terminated))
 }
 
 #[cfg(test)]
@@ -764,7 +777,7 @@ mod tests {
     use super::{
         MAX_TITLE_CHARS, MAX_TITLE_PROMPT_BYTES, MAX_TITLE_TOKENS,
         TITLE_CHAT_TEMPLATE_TOKEN_RESERVE, TitleModelManager, cap_title_model_prompt,
-        install_progress_key, sanitize_title, title_request,
+        install_progress_key, sanitize_title, title_from_response, title_request,
     };
 
     #[test]
@@ -794,9 +807,32 @@ mod tests {
             sanitize_title("<think>\n\n</think>\n\nImprove Session Titles").unwrap(),
             "Improve Session Titles"
         );
+        assert_eq!(
+            sanitize_title("</think>\n\nImprove Session Titles").unwrap(),
+            "Improve Session Titles"
+        );
         // An unterminated reasoning block means thinking consumed the entire
         // output budget; there is no title to recover.
         assert!(sanitize_title("<think>\nstill reasoning about the task").is_err());
+    }
+
+    #[test]
+    fn recovers_only_complete_titles_from_length_limited_responses() {
+        let response = |content| {
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": { "content": content }
+                }]
+            })
+        };
+
+        assert_eq!(
+            title_from_response(&response("Improve Session Titles\nignored trailing output"))
+                .unwrap(),
+            "Improve Session Titles"
+        );
+        assert!(title_from_response(&response("Improve Session Tit")).is_err());
     }
 
     #[test]
