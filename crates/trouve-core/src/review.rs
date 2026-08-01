@@ -34,7 +34,10 @@ use crate::store::{
     CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewManualRequest, CodeReviewTaskMetrics,
     NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
 };
-use crate::tools::{ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync};
+use crate::tools::{
+    ReviewAnchor, ReviewDiffFile, ReviewRepositoryAnchors, ReviewRepositoryDiff,
+    ReviewRepositorySync,
+};
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
@@ -67,6 +70,10 @@ const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
 const CHECK_DETAILS_MAX_CHARS: usize = 60_000;
+const REVIEW_BODY_MAX_BYTES: usize = 60_000;
+const REVIEW_BODY_SUMMARY_MAX_BYTES: usize = 4_000;
+const REVIEW_BODY_COVERAGE_MAX_BYTES: usize = 8_000;
+const REVIEW_BODY_PROMPT_MAX_BYTES: usize = 8_000;
 const CHECK_DETAILS_TRUNCATION_MARKER: &str =
     "\n\n---\nDetails truncated; open the trouve dashboard for complete output.";
 const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
@@ -808,6 +815,7 @@ fn default_review_side() -> String {
     "RIGHT".into()
 }
 
+#[derive(Clone)]
 struct GithubApi {
     http: reqwest::Client,
     authorization: String,
@@ -3429,6 +3437,13 @@ impl Engine {
             bail!("reviewers returned more than {MAX_CANDIDATE_FINDINGS} candidate findings");
         }
         let candidates = structurally_valid_candidates(candidates, &diff_files);
+        let candidates = self
+            .retain_candidates_with_valid_anchors(
+                Path::new(&session.worktree_path),
+                &job.head_sha,
+                candidates,
+            )
+            .await?;
         let previous_findings = self
             .store
             .open_code_review_findings(&job.repository, job.pull_number)?
@@ -3520,13 +3535,18 @@ impl Engine {
                 .iter()
                 .map(|finding| finding.id.as_str())
                 .collect::<HashSet<_>>();
+            let findings =
+                coordinator_validated_findings(validated.findings, &candidates, &diff_files);
+            let findings = self
+                .retain_findings_with_valid_anchors(
+                    Path::new(&session.worktree_path),
+                    &job.head_sha,
+                    findings,
+                )
+                .await?;
             ReviewOutput {
                 summary: validated.summary,
-                findings: coordinator_validated_findings(
-                    validated.findings,
-                    &candidates,
-                    &diff_files,
-                ),
+                findings,
                 rejected_candidates: validated.rejected_candidates,
                 resolved_finding_ids: validated
                     .resolved_finding_ids
@@ -4093,8 +4113,83 @@ impl Engine {
         })
     }
 
-    async fn publish_review(
+    async fn valid_outside_anchor_set(
         &self,
+        worktree: &Path,
+        head_sha: &str,
+        anchors: Vec<ReviewAnchor>,
+    ) -> Result<HashSet<(String, u64)>> {
+        if anchors.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let valid = self
+            .executor
+            .review_repository_valid_anchors(&ReviewRepositoryAnchors {
+                worktree: worktree.to_path_buf(),
+                head_sha: head_sha.to_string(),
+                anchors,
+            })
+            .await
+            .map_err(|error| anyhow!(error))?;
+        Ok(valid
+            .into_iter()
+            .map(|anchor| (anchor.path, anchor.line))
+            .collect())
+    }
+
+    async fn retain_candidates_with_valid_anchors(
+        &self,
+        worktree: &Path,
+        head_sha: &str,
+        candidates: Vec<CandidateFinding>,
+    ) -> Result<Vec<CandidateFinding>> {
+        let anchors = candidates
+            .iter()
+            .filter(|candidate| candidate.finding.outside_diff)
+            .map(|candidate| ReviewAnchor {
+                path: candidate.finding.path.clone(),
+                line: candidate.finding.line,
+            })
+            .collect();
+        let valid = self
+            .valid_outside_anchor_set(worktree, head_sha, anchors)
+            .await?;
+        Ok(candidates
+            .into_iter()
+            .filter(|candidate| {
+                !candidate.finding.outside_diff
+                    || valid.contains(&(candidate.finding.path.clone(), candidate.finding.line))
+            })
+            .collect())
+    }
+
+    async fn retain_findings_with_valid_anchors(
+        &self,
+        worktree: &Path,
+        head_sha: &str,
+        findings: Vec<ReviewFinding>,
+    ) -> Result<Vec<ReviewFinding>> {
+        let anchors = findings
+            .iter()
+            .filter(|finding| finding.outside_diff)
+            .map(|finding| ReviewAnchor {
+                path: finding.path.clone(),
+                line: finding.line,
+            })
+            .collect();
+        let valid = self
+            .valid_outside_anchor_set(worktree, head_sha, anchors)
+            .await?;
+        Ok(findings
+            .into_iter()
+            .filter(|finding| {
+                !finding.outside_diff || valid.contains(&(finding.path.clone(), finding.line))
+            })
+            .collect())
+    }
+
+    async fn publish_review(
+        self: &Arc<Self>,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
         summary: &str,
@@ -4115,7 +4210,14 @@ impl Engine {
             .code_review_job_detail(&job.id)?
             .map(|detail| detail.personas)
             .unwrap_or_default();
-        let review_body = render_review_body(job, &summary, prompt_for_agents, findings, &personas);
+        let review_body = render_review_body(
+            job,
+            &summary,
+            prompt_for_agents,
+            findings,
+            &personas,
+            ReviewBodyMode::Normal,
+        );
         let inline_findings = findings
             .iter()
             .filter(|finding| !finding.outside_diff)
@@ -4153,8 +4255,6 @@ impl Engine {
         self.record_review_rate(rate);
         if status.is_success() {
             let published = serde_json::from_str::<PublishedReview>(&body)?;
-            self.capture_published_review_comments(api, job, published.id, &inline_findings)
-                .await?;
             for finding in findings.iter().filter(|finding| finding.outside_diff) {
                 self.store.update_code_review_finding_publication(
                     &finding.id,
@@ -4162,6 +4262,23 @@ impl Engine {
                     &published.html_url,
                     None,
                 )?;
+            }
+            if let Err(error) = self
+                .capture_published_review_comments(api, job, published.id, &inline_findings)
+                .await
+            {
+                tracing::warn!(
+                    job_id = %job.id,
+                    review_id = published.id,
+                    %error,
+                    "GitHub accepted the review, but inline comment reconciliation failed"
+                );
+                self.queue_published_review_comment_reconciliation(
+                    api.clone(),
+                    job.clone(),
+                    published.id,
+                    inline_findings,
+                );
             }
             return Ok(published.html_url);
         }
@@ -4173,17 +4290,14 @@ impl Engine {
         // out of the inline payload. Preserve the review if GitHub still
         // rejects a supposedly commentable line (for example because its
         // server-side diff representation differs from local git).
-        let mut fallback = review_body;
-        fallback.push_str("\n\n### Comments GitHub could not place inline\n\n");
-        for finding in &inline_findings {
-            fallback.push_str(&format!(
-                "- `{}` line {} [{}]: {}\n",
-                finding.path,
-                finding.line,
-                finding.severity.to_ascii_uppercase(),
-                finding.body
-            ));
-        }
+        let fallback = render_review_body(
+            job,
+            &summary,
+            prompt_for_agents,
+            findings,
+            &personas,
+            ReviewBodyMode::InlineFallback,
+        );
         let (published, rate): (PublishedReview, _) = api
             .post(
                 &path,
@@ -4629,6 +4743,41 @@ impl Engine {
         }
         Ok(())
     }
+
+    fn queue_published_review_comment_reconciliation(
+        self: &Arc<Self>,
+        api: GithubApi,
+        job: trouve_protocol::CodeReviewJob,
+        review_id: u64,
+        findings: Vec<trouve_protocol::CodeReviewFinding>,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            for delay in [
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            ] {
+                tokio::time::sleep(delay).await;
+                match engine
+                    .capture_published_review_comments(&api, &job, review_id, &findings)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = engine.emit_code_review_job_updated(&job.id);
+                        let _ = engine.emit_code_review_updated(Some(job.id.clone()));
+                        return;
+                    }
+                    Err(error) => tracing::warn!(
+                        job_id = %job.id,
+                        review_id,
+                        %error,
+                        "retrying published review comment reconciliation"
+                    ),
+                }
+            }
+        });
+    }
 }
 
 fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bool>) -> bool {
@@ -4952,23 +5101,72 @@ fn render_inline_finding(finding: &trouve_protocol::CodeReviewFinding) -> String
     )
 }
 
-fn render_outside_diff_findings(findings: &[&trouve_protocol::CodeReviewFinding]) -> String {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewBodyMode {
+    Normal,
+    InlineFallback,
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n\n… truncated; open the trouve dashboard for complete output.";
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes <= MARKER.len() {
+        return String::new();
+    }
+    let mut keep = max_bytes - MARKER.len();
+    while !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{MARKER}", &value[..keep])
+}
+
+fn render_finding_group(
+    title: &str,
+    findings: &[&trouve_protocol::CodeReviewFinding],
+    max_bytes: usize,
+) -> String {
     if findings.is_empty() {
         return String::new();
     }
-    let mut body = format!(
-        "\n<details><summary>⚠️ Outside diff range comments ({})</summary>\n\n",
+    let prefix = format!(
+        "\n<details><summary>{title} ({})</summary>\n\n",
         findings.len()
     );
+    let suffix = "</details>\n";
+    if prefix.len() + suffix.len() > max_bytes {
+        return String::new();
+    }
+    let mut body = prefix;
+    let mut rendered = 0;
     for finding in findings {
-        body.push_str(&format!(
+        let entry = format!(
             "#### `{}` line {}\n\n{}\n\n",
             finding.path,
             finding.line,
             render_inline_finding(finding)
-        ));
+        );
+        let omitted_note = format!(
+            "_{} finding(s) omitted here to stay within GitHub's review-body limit; open the trouve dashboard for complete output._\n\n",
+            findings.len().saturating_sub(rendered + 1)
+        );
+        if body.len() + entry.len() + omitted_note.len() + suffix.len() > max_bytes {
+            break;
+        }
+        body.push_str(&entry);
+        rendered += 1;
     }
-    body.push_str("</details>\n");
+    if rendered < findings.len() {
+        let omitted = format!(
+            "_{} finding(s) omitted here to stay within GitHub's review-body limit; open the trouve dashboard for complete output._\n\n",
+            findings.len() - rendered
+        );
+        if body.len() + omitted.len() + suffix.len() <= max_bytes {
+            body.push_str(&omitted);
+        }
+    }
+    body.push_str(suffix);
     body
 }
 
@@ -4978,11 +5176,13 @@ fn render_review_body(
     prompt_for_agents: &str,
     findings: &[trouve_protocol::CodeReviewFinding],
     personas: &[trouve_protocol::CodeReviewPersonaResult],
+    mode: ReviewBodyMode,
 ) -> String {
+    let summary = truncate_utf8_bytes(summary, REVIEW_BODY_SUMMARY_MAX_BYTES);
     let mut body = format!(
         "## trouve code review\n\n{summary}\n\n\
          **Scope:** {scope} review of `{base}`…`{head}`  \n\
-         **Result:** {issues} confirmed issue(s)\n\n### Reviewer coverage\n\n",
+         **Result:** {issues} confirmed issue(s)\n",
         scope = match job.scope {
             trouve_protocol::CodeReviewJobScope::Incremental => "incremental",
             trouve_protocol::CodeReviewJobScope::Full => "full branch",
@@ -4991,8 +5191,9 @@ fn render_review_body(
         head = &job.head_sha[..job.head_sha.len().min(8)],
         issues = findings.len(),
     );
+    let mut coverage = String::from("\n### Reviewer coverage\n\n");
     for persona in personas {
-        body.push_str(&format!(
+        coverage.push_str(&format!(
             "- **{}** — {}; {}/{} batch(es), {}, {} confirmed issue(s)\n",
             persona.reviewer_name,
             persona.status.replace('_', " "),
@@ -5002,33 +5203,59 @@ fn render_review_body(
             persona.confirmed_issue_count,
         ));
     }
+    body.push_str(&truncate_utf8_bytes(
+        &coverage,
+        REVIEW_BODY_COVERAGE_MAX_BYTES,
+    ));
     let inline_findings = findings
         .iter()
         .filter(|finding| !finding.outside_diff)
         .collect::<Vec<_>>();
-    if !inline_findings.is_empty() {
-        body.push_str("\n### Inline comments\n\n");
-        for finding in inline_findings {
-            body.push_str(&format!(
-                "- **{}** — `{}` line {}: {}\n",
-                finding.severity.to_ascii_uppercase(),
-                finding.path,
-                finding.line,
-                finding.body
-            ));
-        }
-    }
     let outside_findings = findings
         .iter()
         .filter(|finding| finding.outside_diff)
         .collect::<Vec<_>>();
-    body.push_str(&render_outside_diff_findings(&outside_findings));
     body.push_str(&format!(
+        "\n**Placement:** {} inline comment(s); {} outside-diff comment(s).\n",
+        inline_findings.len(),
+        outside_findings.len()
+    ));
+    let prompt = truncate_utf8_bytes(
+        &safe_prompt_fence(prompt_for_agents),
+        REVIEW_BODY_PROMPT_MAX_BYTES,
+    );
+    let footer = format!(
         "\n<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n\
          _Reviewed by trouve._\n\n<!-- trouve-code-review summary job:{} -->",
-        safe_prompt_fence(prompt_for_agents),
-        job.id
+        prompt, job.id
+    );
+    let detail_budget = REVIEW_BODY_MAX_BYTES.saturating_sub(body.len() + footer.len());
+    let fallback_count = if mode == ReviewBodyMode::InlineFallback {
+        inline_findings.len()
+    } else {
+        0
+    };
+    let detailed_count = outside_findings.len() + fallback_count;
+    let outside_budget = if outside_findings.is_empty() || detailed_count == 0 {
+        0
+    } else {
+        detail_budget.saturating_mul(outside_findings.len()) / detailed_count
+    };
+    let fallback_budget = detail_budget.saturating_sub(outside_budget);
+    body.push_str(&render_finding_group(
+        "⚠️ Outside diff range comments",
+        &outside_findings,
+        outside_budget,
     ));
+    if mode == ReviewBodyMode::InlineFallback {
+        body.push_str(&render_finding_group(
+            "Comments GitHub could not place inline",
+            &inline_findings,
+            fallback_budget,
+        ));
+    }
+    body.push_str(&footer);
+    debug_assert!(body.len() <= REVIEW_BODY_MAX_BYTES);
     body
 }
 
@@ -5942,6 +6169,7 @@ fn normalize_finding(
         .to_string();
     finding.body = finding.body.trim().chars().take(4_000).collect();
     let safe_path = !finding.path.is_empty()
+        && !finding.path.chars().any(char::is_control)
         && !Path::new(&finding.path).is_absolute()
         && Path::new(&finding.path)
             .components()
@@ -5949,7 +6177,8 @@ fn normalize_finding(
     if !safe_path || finding.line == 0 || finding.body.is_empty() {
         return None;
     }
-    let mut left = finding.side.eq_ignore_ascii_case("LEFT");
+    let requested_side = finding.side.trim().to_ascii_uppercase();
+    let mut left = requested_side == "LEFT";
     if valid.contains(&(finding.path.clone(), finding.line, left)) {
         finding.outside_diff = false;
     } else {
@@ -5957,8 +6186,12 @@ fn normalize_finding(
             left = !left;
             finding.outside_diff = false;
         } else {
+            if requested_side != "RIGHT" {
+                return None;
+            }
             // GitHub cannot attach a line thread outside the patch. Keep the
-            // exact head-revision anchor for a review-body finding instead.
+            // exact RIGHT-side head-revision anchor for validation against
+            // the immutable review commit.
             left = false;
             finding.outside_diff = true;
         }
@@ -6434,6 +6667,100 @@ mod tests {
         assert!(long.is_char_boundary(retained));
         assert_eq!(&bounded[..retained], &long[..retained]);
         assert!(bounded.ends_with(CHECK_DETAILS_TRUNCATION_MARKER));
+    }
+
+    #[tokio::test]
+    async fn accepted_review_persists_outside_urls_when_comment_capture_fails() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:capture-failure");
+        let new_finding = |path: &str, outside_diff: bool| NewCodeReviewFinding {
+            path: path.into(),
+            line: 1,
+            side: "RIGHT".into(),
+            outside_diff,
+            severity: "medium".into(),
+            body: format!("Issue in {path}"),
+            prompt_for_agents: format!("Fix {path}"),
+            sources: Vec::new(),
+        };
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "Two issues",
+                "Fix both issues",
+                2,
+                &[
+                    new_finding("src/inline.rs", false),
+                    new_finding("src/outside.rs", true),
+                ],
+                &[],
+            )
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, status, body) in [
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
+                    "200 OK",
+                    r#"{"id":99,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-99"}"#,
+                ),
+                (
+                    "get /repos/acme/widgets/pulls/42/reviews/99/comments?per_page=100 http/1.1\r\n",
+                    "500 Internal Server Error",
+                    r#"{"message":"temporary failure"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let review_url = engine
+            .publish_review(&api, &job, "Two issues", "Fix both issues", &findings)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            review_url,
+            "https://github.com/acme/widgets/pull/42#pullrequestreview-99"
+        );
+        let persisted = engine.store.code_review_findings(&job.id).unwrap();
+        let outside = persisted
+            .iter()
+            .find(|finding| finding.outside_diff)
+            .unwrap();
+        assert_eq!(outside.github_comment_id, None);
+        assert_eq!(outside.github_comment_url, review_url);
     }
 
     #[tokio::test]
@@ -7054,6 +7381,7 @@ mod tests {
                 candidate("b/src/lib.rs", "LEFT", "real issue"),
                 candidate("src/lib.rs", "RIGHT", "real issue"),
                 candidate("src/other.rs", "RIGHT", "not in diff"),
+                candidate("src/old.rs", "LEFT", "old revision line"),
                 candidate("../secrets", "RIGHT", "unsafe path"),
             ],
             &files,
@@ -7090,11 +7418,95 @@ mod tests {
             resolved_at: None,
         };
 
-        let body = render_outside_diff_findings(&[&finding]);
+        let body = render_finding_group(
+            "⚠️ Outside diff range comments",
+            &[&finding],
+            REVIEW_BODY_MAX_BYTES,
+        );
         assert!(body.contains("Outside diff range comments (1)"));
         assert!(body.contains("`src/consumer.rs` line 47"));
         assert!(body.contains("trouve-code-review finding:rvf_outside"));
         assert!(body.contains("Prompt for agents"));
+    }
+
+    fn review_body_test_job() -> trouve_protocol::CodeReviewJob {
+        serde_json::from_value(serde_json::json!({
+            "id": "rvj_test",
+            "installation_id": 1,
+            "repository": "owner/repository",
+            "pull_number": 7,
+            "pull_title": "Review body test",
+            "pull_url": "https://github.example/owner/repository/pull/7",
+            "head_sha": "2222222222222222222222222222222222222222",
+            "review_base_sha": "1111111111111111111111111111111111111111",
+            "base_ref": "1111111111111111111111111111111111111111",
+            "head_ref": "feature",
+            "trigger": "automatic",
+            "status": "running",
+            "created_at": "2026-08-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn review_body_test_finding(
+        index: usize,
+        outside_diff: bool,
+    ) -> trouve_protocol::CodeReviewFinding {
+        trouve_protocol::CodeReviewFinding {
+            id: format!("rvf_{index}"),
+            job_id: "rvj_test".into(),
+            path: format!("src/consumer_{index}.rs"),
+            line: 47,
+            side: "RIGHT".into(),
+            outside_diff,
+            severity: "high".into(),
+            body: "x".repeat(4_000),
+            prompt_for_agents: "y".repeat(4_000),
+            status: "open".into(),
+            sources: Vec::new(),
+            github_comment_id: None,
+            github_comment_url: String::new(),
+            github_thread_id: None,
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn review_body_stays_within_github_limit_for_many_outside_findings() {
+        let findings = (0..MAX_CANDIDATE_FINDINGS)
+            .map(|index| review_body_test_finding(index, true))
+            .collect::<Vec<_>>();
+        let body = render_review_body(
+            &review_body_test_job(),
+            &"summary ".repeat(2_000),
+            &"aggregate prompt ".repeat(2_000),
+            &findings,
+            &[],
+            ReviewBodyMode::Normal,
+        );
+
+        assert!(body.len() <= REVIEW_BODY_MAX_BYTES);
+        assert!(body.contains("finding(s) omitted"));
+        assert!(body.contains("<!-- trouve-code-review summary job:rvj_test -->"));
+    }
+
+    #[test]
+    fn fallback_body_replaces_inline_listing_instead_of_duplicating_it() {
+        let mut finding = review_body_test_finding(1, false);
+        finding.body = "inline-only-detail".into();
+        finding.prompt_for_agents = "fix inline-only-detail".into();
+        let body = render_review_body(
+            &review_body_test_job(),
+            "One issue",
+            "Aggregate prompt",
+            &[finding],
+            &[],
+            ReviewBodyMode::InlineFallback,
+        );
+
+        assert!(!body.contains("### Inline comments"));
+        assert!(body.contains("Comments GitHub could not place inline (1)"));
+        assert_eq!(body.matches("### HIGH issue").count(), 1);
     }
 
     #[test]

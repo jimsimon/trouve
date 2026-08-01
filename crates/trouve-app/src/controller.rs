@@ -3517,7 +3517,7 @@ impl Controller {
                             .filter(|finding| finding.status == "open")
                             .map(|finding| ui::PrReviewFindingView {
                                 location: if finding.outside_diff {
-                                    format!("{}:{} · outside diff", finding.path, finding.line)
+                                    format!("outside diff · {}:{}", finding.path, finding.line)
                                 } else {
                                     format!("{}:{}", finding.path, finding.line)
                                 },
