@@ -5284,10 +5284,12 @@ fn non_semantic_routing_reasons(
         }],
         CodeReviewRoutingMode::Additive | CodeReviewRoutingMode::Automatic => {
             let mut reasons = Vec::new();
-            if crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str()) {
+            if job.routing_mode == CodeReviewRoutingMode::Additive
+                && crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str())
+            {
                 reasons.push(CodeReviewRoutingReason {
                     source: CodeReviewRoutingSource::Baseline,
-                    detail: "part of automatic selection's correctness baseline".into(),
+                    detail: "part of Additive selection's correctness baseline".into(),
                 });
             }
             if job.routing_mode == CodeReviewRoutingMode::Additive
@@ -5336,7 +5338,8 @@ fn build_routing_decisions(
                 reasons,
             });
         }
-        if !decisions[start..].iter().any(|decision| decision.selected)
+        if job.routing_mode == CodeReviewRoutingMode::Additive
+            && !decisions[start..].iter().any(|decision| decision.selected)
             && let Some(fallback) = decisions.get_mut(start)
         {
             fallback.selected = true;
@@ -5381,7 +5384,7 @@ fn semantic_routing_prompt(
         .join("\n");
     format!(
         "Route complete diff batch {batch_number}/{batch_count} for pull request #{number}. \
-         Baseline and deterministic reviewers have already been selected. Choose only additional \
+         Personas matched by non-semantic routing have already been selected. Choose only additional \
          personas whose focused expertise is materially relevant to a plausible defect in this \
          batch. Selection may only add coverage; returning none is expected when the existing \
          routing is sufficient.\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
@@ -7829,7 +7832,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_ignores_additive_core_personas() {
+    fn automatic_routing_has_no_baseline_or_additive_core_personas() {
         let reviewers = crate::reviewers::built_in_reviewers()
             .into_iter()
             .filter(|reviewer| ["correctness", "reliability"].contains(&reviewer.id.as_str()))
@@ -7852,8 +7855,14 @@ mod tests {
             .iter()
             .find(|decision| decision.reviewer_id == "reliability")
             .unwrap();
-        assert!(correctness.selected);
+        assert!(!correctness.selected);
         assert!(!reliability.selected);
+        assert!(decisions.iter().all(|decision| {
+            decision
+                .reasons
+                .iter()
+                .all(|reason| reason.source != CodeReviewRoutingSource::Baseline)
+        }));
         assert!(
             reliability
                 .reasons
@@ -7918,7 +7927,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_keeps_a_fallback_when_no_signal_matches() {
+    fn additive_routing_keeps_a_fallback_when_no_signal_matches() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let mut job = enqueue_test_review_job(&store, "acme/widgets#42:routing-fallback");
         job.routing_mode = CodeReviewRoutingMode::Additive;

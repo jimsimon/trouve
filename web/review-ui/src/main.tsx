@@ -205,7 +205,7 @@ function routingReasonLabel(
     case "core":
       return "Manual selection";
     case "baseline":
-      return "Automatic baseline";
+      return "Additive baseline";
     case "deterministic":
       return "Diff signal";
     case "semantic":
@@ -2082,7 +2082,7 @@ function RepositoryEditor({
               <strong>Semantic triage</strong>
               <small>
                 Run one lightweight, tool-free routing pass per batch. It may add relevant
-                personas but cannot remove baseline, deterministic, or enabled core personas.
+                personas but cannot remove personas selected by diff signals or Additive policy.
               </small>
             </span>
           </label>
