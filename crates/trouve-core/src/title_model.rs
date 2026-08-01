@@ -589,10 +589,11 @@ fn title_request(prompt: &str) -> serde_json::Value {
         "presence_penalty": 1.5,
         "seed": 0,
         // Sized above the validator's character ceiling so a valid title is
-        // never cut off at the token budget. Stop after the first line because
-        // sanitize_title ignores every subsequent line.
+        // never cut off at the token budget. No stop sequence: the model may
+        // legitimately open with a blank line or a `<think>` block, and any
+        // early stop would fire before the title. Runaway generation is
+        // bounded by this cap and by GENERATION_TIMEOUT.
         "max_tokens": MAX_TITLE_TOKENS,
-        "stop": ["\n"],
         // Every request shares the instructions and examples, so retaining
         // their KV prefix reduces subsequent prefill.
         "cache_prompt": true,
@@ -716,6 +717,17 @@ async fn stream_to_part(
 }
 
 fn sanitize_title(raw: &str) -> Result<String> {
+    // A runtime that ignores `chat_template_kwargs` falls back to the
+    // prompt-level `/no_think`, which still leaves an empty reasoning block
+    // in the content. Drop it so the title after it can be recovered; an
+    // unterminated block means thinking consumed the output budget.
+    let raw = match raw.trim_start().strip_prefix("<think>") {
+        Some(rest) => rest
+            .split_once("</think>")
+            .map(|(_, after)| after)
+            .unwrap_or(""),
+        None => raw,
+    };
     let line = raw
         .lines()
         .map(str::trim)
@@ -773,6 +785,21 @@ mod tests {
     }
 
     #[test]
+    fn recovers_titles_after_leading_blank_lines_and_think_blocks() {
+        assert_eq!(
+            sanitize_title("\n\nImprove Session Titles").unwrap(),
+            "Improve Session Titles"
+        );
+        assert_eq!(
+            sanitize_title("<think>\n\n</think>\n\nImprove Session Titles").unwrap(),
+            "Improve Session Titles"
+        );
+        // An unterminated reasoning block means thinking consumed the entire
+        // output budget; there is no title to recover.
+        assert!(sanitize_title("<think>\nstill reasoning about the task").is_err());
+    }
+
+    #[test]
     fn output_budget_covers_maximum_length_non_ascii_title() {
         let title = format!("{} {}", "\u{10000}".repeat(39), "\u{10000}".repeat(40));
 
@@ -806,11 +833,11 @@ mod tests {
     }
 
     #[test]
-    fn request_stops_after_the_first_generated_line() {
+    fn request_has_no_stop_sequence_that_could_fire_before_the_title() {
         let request = title_request("Explain the title request limits");
 
         assert_eq!(request["max_tokens"], MAX_TITLE_TOKENS);
-        assert_eq!(request["stop"], serde_json::json!(["\n"]));
+        assert!(request.get("stop").is_none());
     }
 
     #[test]
