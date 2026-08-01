@@ -2,6 +2,7 @@ import { Chart, registerables } from "chart.js";
 import { render } from "preact";
 import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import packageMetadata from "../package.json";
 import "./styles.css";
 import {
   api,
@@ -399,7 +400,7 @@ function App() {
           <span class="brand-mark">t</span>
           <span>
             <strong>trouve</strong>
-            <small>code reviews</small>
+            <small>code reviews · v{packageMetadata.version}</small>
           </span>
         </a>
         <nav aria-label="Dashboard sections">

@@ -392,6 +392,10 @@ mod tests {
             "params": {"protocolVersion": "2024-11-05"}});
         let response = handle_request(&cache, &init).unwrap();
         assert_eq!(response["result"]["serverInfo"]["name"], "trouve-search");
+        assert_eq!(
+            response["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = handle_request(&cache, &list).unwrap();

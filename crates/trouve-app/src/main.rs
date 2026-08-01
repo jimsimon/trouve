@@ -113,6 +113,15 @@ fn workspace_arg() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Report the release embedded by Cargo without initializing the GUI. This
+/// keeps packaged desktop binaries inspectable on headless hosts and in
+/// release verification jobs.
+fn version_requested() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+}
+
 /// Enable Slint 1.17's Skia dirty-region renderer before the UI platform is
 /// constructed. Without it, changing a tiny activity transform submits the
 /// entire scene again. Keep the upstream variable externally overridable for
@@ -178,6 +187,11 @@ fn install_window_activity_tracking(
 }
 
 fn main() -> anyhow::Result<()> {
+    if version_requested() {
+        println!("trouve {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     enable_skia_partial_rendering();
 
     // Must precede both the external-server client path and the embedded
@@ -217,6 +231,7 @@ fn main() -> anyhow::Result<()> {
     slint::set_xdg_app_id("trouve")?;
 
     let window = AppWindow::new()?;
+    window.set_app_version(env!("CARGO_PKG_VERSION").into());
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
     let quit_when_idle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
