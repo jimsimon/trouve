@@ -142,6 +142,11 @@ pub use requests::*;
 // model.route_selected handoff events (all additive).
 pub const PROTOCOL_VERSION: &str = "2.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
+/// Provider-specific option-schema keys that represent the canonical
+/// `thinking_level` setting. Order is significant: clients prefer the first
+/// advertised property when a schema contains more than one alias.
+pub const THINKING_OPTION_KEYS: [&str; 4] =
+    ["thinking_level", "reasoning_effort", "effort", "reasoning"];
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

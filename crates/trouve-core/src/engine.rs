@@ -16,9 +16,9 @@ use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
-    TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
-    Workspace,
+    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, THINKING_OPTION_KEYS,
+    Thread, ToolStatus, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -40,6 +40,11 @@ const MAX_ROUTE_ATTEMPTS_PER_TURN: usize = 4;
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
 const BACKEND_EVENT_BATCH_MAX: usize = 64;
 const BACKEND_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Live vendor allowance probes are expensive (process or network I/O), but
+/// remain useful for route ranking. Cache them briefly and retain the timeout
+/// when refreshing a stale provider entry.
+const SUBSCRIPTION_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const SUBSCRIPTION_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
@@ -120,7 +125,7 @@ enum RouteAttemptResult {
 struct TurnAccounting {
     usage: Usage,
     context_input_tokens: u64,
-    native_cost_known: bool,
+    cost_known: bool,
 }
 
 impl Default for TurnAccounting {
@@ -128,7 +133,7 @@ impl Default for TurnAccounting {
         Self {
             usage: Usage::default(),
             context_input_tokens: 0,
-            native_cost_known: true,
+            cost_known: true,
         }
     }
 }
@@ -152,7 +157,7 @@ impl TurnAccounting {
             Some(cost) => {
                 self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
             }
-            None => self.native_cost_known = false,
+            None => self.cost_known = false,
         }
         if usage.context_window.is_some() {
             self.usage.context_window = usage.context_window;
@@ -164,8 +169,11 @@ impl TurnAccounting {
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;
         self.usage.cached_input_tokens += usage.cached_input_tokens;
-        if let Some(cost) = usage.cost_usd {
-            self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
+        match usage.cost_usd {
+            Some(cost) => {
+                self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
+            }
+            None => self.cost_known = false,
         }
         if usage.context_window.is_some() {
             self.usage.context_window = usage.context_window;
@@ -174,7 +182,7 @@ impl TurnAccounting {
     }
 
     fn finalize_cost(&mut self) {
-        if !self.native_cost_known {
+        if !self.cost_known {
             self.usage.cost_usd = None;
         }
     }
@@ -569,9 +577,6 @@ pub enum EngineError {
     Internal(#[from] anyhow::Error),
 }
 
-const THINKING_OPTION_KEYS: [&str; 4] =
-    ["thinking_level", "reasoning_effort", "effort", "reasoning"];
-
 fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
     if level.is_some_and(|value| value.trim().is_empty()) {
         return Err(EngineError::BadRequest(
@@ -711,6 +716,7 @@ fn normalize_thinking_option(
 
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
+type SubscriptionHealthCacheEntry = Arc<tokio::sync::Mutex<Option<(Instant, (u8, i64))>>>;
 
 pub struct Engine {
     pub(crate) store: Store,
@@ -729,6 +735,10 @@ pub struct Engine {
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
+    /// Short-lived, per-provider live allowance ranks. Each entry has its own
+    /// async lock so concurrent turns share one refresh without serializing
+    /// probes for different providers.
+    subscription_health_cache: Mutex<HashMap<String, SubscriptionHealthCacheEntry>>,
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
@@ -1108,6 +1118,7 @@ impl Engine {
             injected_providers: Mutex::new(injected_providers),
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
+            subscription_health_cache: Mutex::new(HashMap::new()),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
@@ -1283,6 +1294,7 @@ impl Engine {
     /// Register (or replace) an agent backend instance under an id. Survives
     /// config-driven registry reloads (tests, embedders).
     pub fn with_backend(self, id: &str, backend: Arc<dyn AgentBackend>) -> Self {
+        self.subscription_health_cache.lock().unwrap().remove(id);
         self.injected_backends
             .lock()
             .unwrap()
@@ -1586,15 +1598,10 @@ impl Engine {
         let mut scored = futures::future::join_all(candidates.into_iter().map(|candidate| async {
             let rank = match &candidate.executor {
                 ModelExecutor::Native(_) => (1u8, 0i64),
-                ModelExecutor::Backend(backend) => match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    backend.subscription_health(),
-                )
-                .await
-                {
-                    Ok(Some(health)) => subscription_health_rank(&health),
-                    _ => (1, 0),
-                },
+                ModelExecutor::Backend(backend) => {
+                    self.cached_subscription_health_rank(&candidate.provider_id, backend)
+                        .await
+                }
             };
             let preferred = preference.get(candidate.provider_id.as_str()).copied();
             let route = learned.get(&(
@@ -1630,6 +1637,35 @@ impl Engine {
             .into_iter()
             .map(|(_, _, candidate)| candidate)
             .collect())
+    }
+
+    async fn cached_subscription_health_rank(
+        &self,
+        provider_id: &str,
+        backend: &Arc<dyn AgentBackend>,
+    ) -> (u8, i64) {
+        let entry = {
+            let mut cache = self.subscription_health_cache.lock().unwrap();
+            cache
+                .entry(provider_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+                .clone()
+        };
+        let mut cached = entry.lock().await;
+        if let Some((at, rank)) = *cached
+            && at.elapsed() < SUBSCRIPTION_HEALTH_CACHE_TTL
+        {
+            return rank;
+        }
+        let rank =
+            match tokio::time::timeout(SUBSCRIPTION_HEALTH_TIMEOUT, backend.subscription_health())
+                .await
+            {
+                Ok(Some(health)) => subscription_health_rank(&health),
+                _ => (1, 0),
+            };
+        *cached = Some((Instant::now(), rank));
+        rank
     }
 
     /// Provider ids that keep working without internet: the built-in local
@@ -1930,15 +1966,9 @@ impl Engine {
     /// Replace the explicit provider preference prefix. Omitted providers
     /// remain routable after the listed entries.
     pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
-        let known: HashSet<String> = self
-            .providers
-            .read()
-            .unwrap()
-            .keys()
-            .chain(self.backends.read().unwrap().keys())
-            .cloned()
-            .chain(self.config.lock().unwrap().providers.keys().cloned())
-            .collect();
+        let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
+        known.extend(self.backends.read().unwrap().keys().cloned());
+        known.extend(self.config.lock().unwrap().providers.keys().cloned());
         let mut seen = HashSet::new();
         for id in provider_ids {
             if !known.contains(id) {
@@ -3403,6 +3433,7 @@ impl Engine {
             backends.insert(id.clone(), b.clone());
         }
         *self.backends.write().unwrap() = backends;
+        self.subscription_health_cache.lock().unwrap().clear();
     }
 
     pub fn thread_usage(
@@ -8315,6 +8346,137 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CountingHealthBackend {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for CountingHealthBackend {
+        fn id(&self) -> &str {
+            "counting"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(trouve_protocol::SubscriptionHealth {
+                provider_id: self.id().into(),
+                status: "ok".into(),
+                plan: "test".into(),
+                windows: vec![trouve_protocol::SubscriptionWindow {
+                    label: "test window".into(),
+                    used_percent: 37,
+                    resets: String::new(),
+                }],
+                credits: String::new(),
+                note: String::new(),
+            })
+        }
+
+        async fn start_login(
+            &self,
+        ) -> std::result::Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+            Err(trouve_agents::BackendError::Protocol(
+                "not used by this test".into(),
+            ))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> std::result::Result<trouve_agents::BackendEventStream, trouve_agents::BackendError>
+        {
+            Err(trouve_agents::BackendError::Protocol(
+                "not used by this test".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn unpriced_backend_attempt_makes_aggregate_cost_unknown() {
+        let mut accounting = TurnAccounting::default();
+        accounting.add_backend(&Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cost_usd: Some(0.25),
+            ..Default::default()
+        });
+        accounting.add_backend(&Usage {
+            input_tokens: 20,
+            output_tokens: 3,
+            cost_usd: None,
+            ..Default::default()
+        });
+
+        accounting.finalize_cost();
+
+        assert_eq!(accounting.usage.input_tokens, 30);
+        assert_eq!(accounting.usage.output_tokens, 5);
+        assert_eq!(accounting.usage.cost_usd, None);
+    }
+
+    #[tokio::test]
+    async fn subscription_health_rank_is_cached_per_provider_until_ttl() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        let backend = Arc::new(CountingHealthBackend {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend_trait: Arc<dyn AgentBackend> = backend.clone();
+
+        assert_eq!(
+            engine
+                .cached_subscription_health_rank("counting", &backend_trait)
+                .await,
+            (0, 37)
+        );
+        assert_eq!(
+            engine
+                .cached_subscription_health_rank("counting", &backend_trait)
+                .await,
+            (0, 37)
+        );
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let entry = engine
+            .subscription_health_cache
+            .lock()
+            .unwrap()
+            .get("counting")
+            .unwrap()
+            .clone();
+        let mut cached = entry.lock().await;
+        let (at, _) = cached.as_mut().unwrap();
+        *at = at.checked_sub(SUBSCRIPTION_HEALTH_CACHE_TTL).unwrap();
+        drop(cached);
+
+        assert_eq!(
+            engine
+                .cached_subscription_health_rank("counting", &backend_trait)
+                .await,
+            (0, 37)
+        );
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,

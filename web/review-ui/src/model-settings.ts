@@ -36,12 +36,21 @@ export function modelForSelection<T extends ModelWithOptions>(
   );
 }
 
-/** Value suitable for a neutral model picker while retaining unknown ids. */
-export function modelSelectionValue(
+/** Preserve the persisted selection; provider-qualified values are pins. */
+export function modelSelectionValue(selection?: string): string {
+  return selection ?? "";
+}
+
+/** Extra picker row needed to display a persisted pin or unavailable id. */
+export function supplementalModelSelection(
   models: readonly ModelWithOptions[],
   selection?: string,
-): string {
-  return modelForSelection(models, selection)?.id ?? selection ?? "";
+): { value: string; kind: "pinned" | "unavailable" } | undefined {
+  if (!selection || models.some((model) => model.id === selection)) return undefined;
+  return {
+    value: selection,
+    kind: modelForSelection(models, selection) ? "pinned" : "unavailable",
+  };
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {

@@ -2546,7 +2546,7 @@ impl Controller {
             .and_then(|k| thread?.model_options.get(k)?.as_str().map(String::from))
             .or_else(|| {
                 let options = &thread?.model_options;
-                ["thinking_level", "reasoning_effort", "effort", "reasoning"]
+                trouve_protocol::THINKING_OPTION_KEYS
                     .iter()
                     .find_map(|key| options.get(*key)?.as_str().map(String::from))
             })
@@ -5404,7 +5404,7 @@ impl Controller {
                 } else {
                     self.current_model_options()
                 };
-                for key in ["thinking_level", "reasoning_effort", "effort", "reasoning"] {
+                for key in trouve_protocol::THINKING_OPTION_KEYS {
                     model_options.remove(key);
                 }
                 if let Some(level) = selected_mode
@@ -6428,22 +6428,31 @@ impl Controller {
                 }
             }
             UiCommand::MoveProviderPriority(id, offset) => {
-                let Some(index) = self
-                    .provider_order
-                    .iter()
-                    .position(|provider| provider == &id)
-                else {
+                let mut order = match self.client.list_providers().await {
+                    Ok(providers) => providers.provider_order,
+                    Err(error) => {
+                        ui::set_settings_status(
+                            &self.ui,
+                            format!("failed to refresh provider priority: {error:#}"),
+                        );
+                        return Ok(());
+                    }
+                };
+                let Some(index) = order.iter().position(|provider| provider == &id) else {
+                    self.provider_order = order;
+                    self.refresh_settings().await;
                     ui::set_settings_status(&self.ui, format!("provider {id} is no longer listed"));
                     return Ok(());
                 };
-                let Some(last) = self.provider_order.len().checked_sub(1) else {
+                let Some(last) = order.len().checked_sub(1) else {
                     return Ok(());
                 };
                 let target = (index as i64 + i64::from(offset)).clamp(0, last as i64) as usize;
                 if target == index {
+                    self.provider_order = order;
+                    self.refresh_settings().await;
                     return Ok(());
                 }
-                let mut order = self.provider_order.clone();
                 order.swap(index, target);
                 match self.client.set_provider_order(order.clone()).await {
                     Ok(()) => {
@@ -7391,7 +7400,7 @@ fn routed_model_matches(model: &RoutedModelInfo, selection: &str) -> bool {
 /// differently (anthropic: thinking_level, codex: reasoning_effort,
 /// Cursor-only ACP adapters: effort or reasoning).
 fn thinking_property(schema: &serde_json::Value) -> Option<(String, Vec<String>, Option<String>)> {
-    for key in ["thinking_level", "reasoning_effort", "effort", "reasoning"] {
+    for key in trouve_protocol::THINKING_OPTION_KEYS {
         let Some(prop) = schema.pointer(&format!("/properties/{key}")) else {
             continue;
         };

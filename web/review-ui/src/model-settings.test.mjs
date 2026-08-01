@@ -5,6 +5,7 @@ import {
   defaultThinkingSelection,
   modelForSelection,
   modelSelectionValue,
+  supplementalModelSelection,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
@@ -22,8 +23,17 @@ test("provider-qualified selections resolve through neutral model routes", () =>
   assert.equal(modelForSelection(models, "gpt-5.6-sol"), models[0]);
   assert.equal(modelForSelection(models, "codex/gpt-5.6-sol"), models[0]);
   assert.equal(modelForSelection(models, "cursor/gpt-5.6-sol"), undefined);
-  assert.equal(modelSelectionValue(models, "openai/gpt-5.6-sol"), "gpt-5.6-sol");
-  assert.equal(modelSelectionValue(models, "unknown/model"), "unknown/model");
+  assert.equal(modelSelectionValue("openai/gpt-5.6-sol"), "openai/gpt-5.6-sol");
+  assert.equal(modelSelectionValue("unknown/model"), "unknown/model");
+  assert.deepEqual(supplementalModelSelection(models, "openai/gpt-5.6-sol"), {
+    value: "openai/gpt-5.6-sol",
+    kind: "pinned",
+  });
+  assert.deepEqual(supplementalModelSelection(models, "unknown/model"), {
+    value: "unknown/model",
+    kind: "unavailable",
+  });
+  assert.equal(supplementalModelSelection(models, "gpt-5.6-sol"), undefined);
 });
 
 test("thinking options follow the model-advertised schema key", () => {
