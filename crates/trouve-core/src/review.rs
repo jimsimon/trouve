@@ -30,8 +30,8 @@ use trouve_protocol::{
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError};
 use crate::store::{
-    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewManualRequest, CodeReviewTaskMetrics,
-    NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
+    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewManualRequest, CodeReviewModelTiming,
+    CodeReviewTaskMetrics, NewCodeReviewFinding, NewCodeReviewJob, NewCodeReviewTask,
 };
 use crate::tools::{ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync};
 
@@ -1113,35 +1113,37 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn emit_code_review_task_progress(
+    pub(crate) async fn emit_code_review_task_progress(
         &self,
         record: crate::store::CodeReviewTaskProgressRecord,
     ) -> Result<(), EngineError> {
-        self.store.append_event(
-            Scope::CodeReviewJob(record.job_id.clone()),
-            Event::CodeReviewTaskProgressUpdated {
-                job_id: record.job_id,
-                task_id: record.task_id,
-                progress: record.progress,
-            },
-        )?;
+        self.store
+            .append_events_async(
+                Scope::CodeReviewJob(record.job_id.clone()),
+                vec![Event::CodeReviewTaskProgressUpdated {
+                    job_id: record.job_id,
+                    task_id: record.task_id,
+                    progress: record.progress,
+                }],
+            )
+            .await?;
         Ok(())
     }
 
-    fn persist_code_review_task_progress(
+    async fn persist_code_review_task_progress(
         &self,
         task_id: &str,
         lifecycle_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
         metrics: &CodeReviewTaskMetrics,
-        mark_model_started: bool,
+        model_timing: CodeReviewModelTiming,
     ) -> Result<()> {
         if let Some(progress) = self.store.set_code_review_task_progress(
             task_id,
             lifecycle_stage,
             metrics,
-            mark_model_started,
+            model_timing,
         )? {
-            self.emit_code_review_task_progress(progress)?;
+            self.emit_code_review_task_progress(progress).await?;
         }
         Ok(())
     }
@@ -4011,7 +4013,19 @@ impl Engine {
             .unwrap_or(0);
         let mut replay = VecDeque::new();
         let mut lifecycle_stage = initial_stage;
-        self.persist_code_review_task_progress(task_id, lifecycle_stage, &metrics_base, false)?;
+        let initial_model_timing =
+            if initial_stage == trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput {
+                CodeReviewModelTiming::Reset
+            } else {
+                CodeReviewModelTiming::Preserve
+            };
+        self.persist_code_review_task_progress(
+            task_id,
+            lifecycle_stage,
+            &metrics_base,
+            initial_model_timing,
+        )
+        .await?;
         let mut last_progress_persisted = Instant::now();
         let accepted = if tools_enabled {
             self.send_message(thread_id, prompt, Vec::new())?
@@ -4068,16 +4082,15 @@ impl Engine {
             }
             after = envelope.cursor;
             let mut next_stage = lifecycle_stage;
-            let mut force_progress = false;
-            let mut mark_model_started = false;
+            let mut model_timing = CodeReviewModelTiming::Preserve;
+            let mut coalesce_tool_transition = false;
             match envelope.event {
                 Event::TurnStarted {
                     turn: event_turn, ..
                 } if event_turn == turn => {
                     model_started.get_or_insert_with(Instant::now);
                     next_stage = initial_stage;
-                    force_progress = true;
-                    mark_model_started = true;
+                    model_timing = CodeReviewModelTiming::Started;
                 }
                 Event::AssistantDelta {
                     turn: event_turn,
@@ -4096,17 +4109,18 @@ impl Engine {
                 Event::ToolOutput { chunk, .. } => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Tool, &chunk);
                     next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
+                    coalesce_tool_transition = true;
                 }
                 Event::ToolRequested {
                     turn: event_turn, ..
                 } if event_turn == turn => {
                     tool_call_count += 1;
                     next_stage = trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool;
-                    force_progress = true;
+                    coalesce_tool_transition = true;
                 }
                 Event::ToolCompleted { .. } => {
                     next_stage = output_stage;
-                    force_progress = true;
+                    coalesce_tool_transition = true;
                 }
                 Event::AssistantMessage {
                     turn: event_turn,
@@ -4129,7 +4143,13 @@ impl Engine {
                         tool_call_count,
                         Some(&event_usage),
                     );
-                    self.persist_code_review_task_progress(task_id, output_stage, &metrics, false)?;
+                    self.persist_code_review_task_progress(
+                        task_id,
+                        output_stage,
+                        &metrics,
+                        CodeReviewModelTiming::Preserve,
+                    )
+                    .await?;
                     usage = event_usage;
                     break;
                 }
@@ -4147,8 +4167,9 @@ impl Engine {
                         task_id,
                         lifecycle_stage,
                         &metrics,
-                        false,
-                    )?;
+                        CodeReviewModelTiming::Preserve,
+                    )
+                    .await?;
                     bail!("model review failed: {error}");
                 }
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
@@ -4162,8 +4183,9 @@ impl Engine {
                         task_id,
                         lifecycle_stage,
                         &metrics,
-                        false,
-                    )?;
+                        CodeReviewModelTiming::Preserve,
+                    )
+                    .await?;
                     if superseded.is_cancelled() {
                         bail!("stale: review was superseded while the model was running");
                     }
@@ -4171,22 +4193,20 @@ impl Engine {
                 }
                 _ => {}
             }
-            if force_progress
-                || next_stage != lifecycle_stage
-                || last_progress_persisted.elapsed() >= REVIEW_TASK_PROGRESS_INTERVAL
-            {
+            if code_review_task_progress_due(
+                next_stage != lifecycle_stage,
+                coalesce_tool_transition,
+                model_timing == CodeReviewModelTiming::Started,
+                last_progress_persisted.elapsed(),
+            ) {
                 let metrics = code_review_task_metrics_snapshot(
                     &metrics_base,
                     model_started,
                     tool_call_count,
                     None,
                 );
-                self.persist_code_review_task_progress(
-                    task_id,
-                    next_stage,
-                    &metrics,
-                    mark_model_started,
-                )?;
+                self.persist_code_review_task_progress(task_id, next_stage, &metrics, model_timing)
+                    .await?;
                 lifecycle_stage = next_stage;
                 last_progress_persisted = Instant::now();
             }
@@ -6116,6 +6136,17 @@ fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) ->
     )
 }
 
+fn code_review_task_progress_due(
+    lifecycle_changed: bool,
+    coalesce_tool_transition: bool,
+    model_started: bool,
+    since_last_persist: Duration,
+) -> bool {
+    model_started
+        || (lifecycle_changed && !coalesce_tool_transition)
+        || since_last_persist >= REVIEW_TASK_PROGRESS_INTERVAL
+}
+
 fn code_review_task_metrics_snapshot(
     base: &CodeReviewTaskMetrics,
     model_started: Option<Instant>,
@@ -6162,6 +6193,34 @@ fn merge_review_task_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_lifecycle_transitions_are_coalesced_until_the_progress_interval() {
+        assert!(!code_review_task_progress_due(
+            true,
+            true,
+            false,
+            Duration::from_millis(10),
+        ));
+        assert!(code_review_task_progress_due(
+            true,
+            true,
+            false,
+            REVIEW_TASK_PROGRESS_INTERVAL,
+        ));
+        assert!(code_review_task_progress_due(
+            true,
+            false,
+            false,
+            Duration::ZERO,
+        ));
+        assert!(code_review_task_progress_due(
+            false,
+            false,
+            true,
+            Duration::ZERO,
+        ));
+    }
 
     struct RouterThinkingProvider {
         stall: bool,

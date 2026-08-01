@@ -5157,7 +5157,7 @@ impl Engine {
                 .store
                 .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?
         {
-            self.emit_code_review_task_progress(progress)?;
+            self.emit_code_review_task_progress(progress).await?;
         }
         self.store.append_event(
             scope.clone(),

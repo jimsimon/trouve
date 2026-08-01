@@ -1580,7 +1580,9 @@ function JobDetailPane({
                 <dl class="task-facts">
                   <div>
                     <dt>Lifecycle</dt>
-                    <dd>{taskLifecycleLabel(selectedTask.lifecycle_stage)}</dd>
+                    <dd aria-live="polite">
+                      {taskLifecycleLabel(selectedTask.lifecycle_stage)}
+                    </dd>
                   </div>
                   <div>
                     <dt>Capacity wait</dt>

@@ -440,8 +440,24 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             }
         }
     }
+    backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    Ok(())
+}
+
+/// Lifecycle columns were added after code-review tasks were already durable.
+/// Repair terminal rows created by older builds without disturbing failed or
+/// cancelled tasks, whose last active stage remains useful diagnostic state.
+fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE code_review_tasks
+         SET lifecycle_stage = 'completed',
+             last_progress_at = COALESCE(last_progress_at, completed_at, started_at, created_at)
+         WHERE status IN ('succeeded', 'not_applicable')
+           AND (lifecycle_stage != 'completed' OR last_progress_at IS NULL)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -631,6 +647,22 @@ fn elapsed_ms(
         .signed_duration_since(started)
         .num_milliseconds()
         .max(0) as u64
+}
+
+fn finalize_code_review_model_elapsed(
+    recorded_model_elapsed_ms: i64,
+    model_started_at: Option<String>,
+    last_progress_at: Option<String>,
+    finished: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    let recorded = recorded_model_elapsed_ms.max(0) as u64;
+    let Some(started) = parse_optional_datetime(model_started_at) else {
+        return recorded;
+    };
+    let progress_anchor = parse_optional_datetime(last_progress_at)
+        .filter(|progress| *progress >= started)
+        .unwrap_or(started);
+    recorded.saturating_add(elapsed_ms(progress_anchor, finished))
 }
 
 fn job_elapsed_ms(
@@ -847,6 +879,13 @@ pub struct CodeReviewTaskMetrics {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub tool_call_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeReviewModelTiming {
+    Preserve,
+    Reset,
+    Started,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3258,7 +3297,19 @@ impl Store {
         tx.execute(
             "UPDATE code_review_tasks
              SET status = 'failed', completed_at = ?1,
-                 error = 'server restarted while task was running'
+                 error = 'server restarted while task was running',
+                 model_elapsed_ms = CASE
+                   WHEN model_started_at IS NULL THEN model_elapsed_ms
+                   ELSE model_elapsed_ms + MAX(
+                     0,
+                     CAST(
+                       (julianday(?1) - MAX(
+                         julianday(model_started_at),
+                         julianday(COALESCE(last_progress_at, model_started_at))
+                       )) * 86400000 AS INTEGER
+                     )
+                   )
+                 END
              WHERE status IN ('queued', 'running')
                AND job_id IN (SELECT id FROM code_review_jobs WHERE status = 'running')",
             params![now],
@@ -3556,7 +3607,10 @@ impl Store {
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET provider_wait_ms = provider_wait_ms + ?2,
-                 lifecycle_stage = 'starting_model',
+                 lifecycle_stage = CASE
+                   WHEN lifecycle_stage = 'waiting_for_capacity' THEN 'starting_model'
+                   ELSE lifecycle_stage
+                 END,
                  last_progress_at = ?3
              WHERE thread_id = ?1 AND status = 'running'",
             params![thread_id, provider_wait_ms as i64, now],
@@ -3579,18 +3633,22 @@ impl Store {
         id: &str,
         lifecycle_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
         metrics: &CodeReviewTaskMetrics,
-        mark_model_started: bool,
+        model_timing: CodeReviewModelTiming,
     ) -> Result<Option<CodeReviewTaskProgressRecord>> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        let model_started_at = mark_model_started.then_some(now.as_str());
+        let (replace_model_started_at, model_started_at) = match model_timing {
+            CodeReviewModelTiming::Preserve => (false, None),
+            CodeReviewModelTiming::Reset => (true, None),
+            CodeReviewModelTiming::Started => (true, Some(now.as_str())),
+        };
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET model_elapsed_ms = ?2, input_tokens = ?3,
                  cached_input_tokens = ?4, output_tokens = ?5,
                  tool_call_count = ?6, lifecycle_stage = ?7,
-                 model_started_at = COALESCE(model_started_at, ?8),
-                 last_progress_at = ?9
+                 model_started_at = CASE WHEN ?8 THEN ?9 ELSE model_started_at END,
+                 last_progress_at = ?10
              WHERE id = ?1 AND status = 'running'",
             params![
                 id,
@@ -3600,6 +3658,7 @@ impl Store {
                 metrics.output_tokens as i64,
                 metrics.tool_call_count as i64,
                 code_review_task_lifecycle_stage_str(lifecycle_stage),
+                replace_model_started_at,
                 model_started_at,
                 now,
             ],
@@ -3647,7 +3706,7 @@ impl Store {
         let now = chrono::Utc::now();
         let current = conn
             .query_row(
-                "SELECT model_started_at, model_elapsed_ms, lifecycle_stage
+                "SELECT model_started_at, model_elapsed_ms, lifecycle_stage, last_progress_at
                  FROM code_review_tasks WHERE id = ?1",
                 params![id],
                 |row| {
@@ -3655,18 +3714,23 @@ impl Store {
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((model_started_at, recorded_model_elapsed_ms, current_stage)) = current else {
+        let Some((model_started_at, recorded_model_elapsed_ms, current_stage, last_progress_at)) =
+            current
+        else {
             return Ok(None);
         };
         let model_elapsed_ms = if matches!(status, "failed" | "cancelled") {
-            parse_optional_datetime(model_started_at)
-                .map(|started| elapsed_ms(started, now))
-                .unwrap_or_default()
-                .max(recorded_model_elapsed_ms.max(0) as u64)
+            finalize_code_review_model_elapsed(
+                recorded_model_elapsed_ms,
+                model_started_at,
+                last_progress_at,
+                now,
+            )
         } else {
             recorded_model_elapsed_ms.max(0) as u64
         };
@@ -4790,9 +4854,14 @@ impl Store {
              SET status = 'cancelled', completed_at = ?2, error = ?3,
                  model_elapsed_ms = CASE
                    WHEN model_started_at IS NULL THEN model_elapsed_ms
-                   ELSE MAX(
-                     model_elapsed_ms,
-                     CAST((julianday(?2) - julianday(model_started_at)) * 86400000 AS INTEGER)
+                   ELSE model_elapsed_ms + MAX(
+                     0,
+                     CAST(
+                       (julianday(?2) - MAX(
+                         julianday(model_started_at),
+                         julianday(COALESCE(last_progress_at, model_started_at))
+                       )) * 86400000 AS INTEGER
+                     )
                    )
                  END
              WHERE job_id = ?1 AND status IN ('queued', 'running')",
@@ -5633,6 +5702,82 @@ mod tests {
             .unwrap();
 
         assert_eq!(redundant_indexes, 0);
+    }
+
+    #[test]
+    fn migration_backfills_terminal_code_review_task_lifecycle_repeatably() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_review_jobs
+                    (id, dedupe_key, installation_id, repository, pull_number, pull_title,
+                     pull_url, head_sha, base_ref, head_ref, trigger, status, created_at)
+             VALUES ('job', 'migration-job', 7, 'acme/widgets', 42, 'Widgets',
+                     'https://github.com/acme/widgets/pull/42', 'head', 'main', 'ship',
+                     'automatic', 'succeeded', '2026-01-01T00:00:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at, started_at,
+                     completed_at)
+             VALUES ('succeeded', 'job', 'reviewer', 'succeeded', 'queued',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z',
+                     '2026-01-01T00:02:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at, started_at)
+             VALUES ('not-applicable', 'job', 'reviewer', 'not_applicable', 'queued',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at)
+             VALUES ('failed', 'job', 'reviewer', 'failed', 'queued',
+                     '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+
+        let succeeded: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'succeeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(succeeded.0, "completed");
+        assert_eq!(succeeded.1.as_deref(), Some("2026-01-01T00:02:00Z"));
+        let not_applicable: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'not-applicable'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_applicable.0, "completed");
+        assert_eq!(not_applicable.1.as_deref(), Some("2026-01-01T00:01:00Z"));
+        let failed: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'failed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(failed, ("queued".into(), None));
+    }
+
+    #[test]
+    fn failed_model_elapsed_adds_only_time_since_the_last_persisted_snapshot() {
+        let finished = "2026-01-01T00:00:20Z".parse().unwrap();
+        assert_eq!(
+            finalize_code_review_model_elapsed(
+                5_000,
+                Some("2026-01-01T00:00:00Z".into()),
+                Some("2026-01-01T00:00:10Z".into()),
+                finished,
+            ),
+            15_000
+        );
     }
 
     #[test]
@@ -7146,13 +7291,56 @@ mod tests {
                     output_tokens: 12,
                     tool_call_count: 2,
                 },
-                true,
+                CodeReviewModelTiming::Started,
             )
             .unwrap()
             .unwrap();
         assert!(progress.progress.model_started_at.is_some());
         assert_eq!(progress.progress.model_elapsed_ms, 23);
         assert_eq!(progress.progress.tool_call_count, 2);
+        let repair = store
+            .set_code_review_task_progress(
+                &task.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 23,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 12,
+                    tool_call_count: 2,
+                },
+                CodeReviewModelTiming::Reset,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(repair.progress.model_started_at.is_none());
+        let repair_capacity = store
+            .set_code_review_task_provider_wait("th_review", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair_capacity.progress.provider_wait_ms, 22);
+        assert_eq!(
+            repair_capacity.progress.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let repair_started = store
+            .set_code_review_task_progress(
+                &task.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 23,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 12,
+                    tool_call_count: 2,
+                },
+                CodeReviewModelTiming::Started,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(repair_started.progress.model_started_at.is_some());
+        assert!(repair_started.progress.model_started_at > progress.progress.model_started_at);
         assert!(
             store
                 .append_code_review_task_output(
@@ -7170,7 +7358,7 @@ mod tests {
             finished_task.lifecycle_stage,
             trouve_protocol::CodeReviewTaskLifecycleStage::Completed
         );
-        assert_eq!(finished_task.provider_wait_ms, 17);
+        assert_eq!(finished_task.provider_wait_ms, 22);
         assert_eq!(finished_task.model_elapsed_ms, 23);
         assert_eq!(finished_task.tool_call_count, 2);
         let partial = store.code_review_job_detail(&queued.id).unwrap().unwrap();
@@ -7459,7 +7647,7 @@ mod tests {
                         model_elapsed_ms: 11 + batch_index,
                         ..CodeReviewTaskMetrics::default()
                     },
-                    true,
+                    CodeReviewModelTiming::Started,
                 )
                 .unwrap()
                 .unwrap();
@@ -7652,6 +7840,32 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        store
+            .set_code_review_task_progress(
+                &interrupted.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 1_200,
+                    ..CodeReviewTaskMetrics::default()
+                },
+                CodeReviewModelTiming::Started,
+            )
+            .unwrap()
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_tasks
+                 SET model_started_at = ?2, last_progress_at = ?3
+                 WHERE id = ?1",
+                params![
+                    interrupted.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+                    (chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
 
         store.recover_code_review_jobs().unwrap();
 
@@ -7660,15 +7874,13 @@ mod tests {
         assert_eq!(detail.tasks.len(), 3);
         assert_eq!(detail.personas[0].status, "queued");
         assert_eq!(detail.personas[0].completed_batches, 1);
-        assert_eq!(
-            detail
-                .tasks
-                .iter()
-                .find(|task| task.id == interrupted.id)
-                .unwrap()
-                .status,
-            "failed"
-        );
+        let interrupted = detail
+            .tasks
+            .iter()
+            .find(|task| task.id == interrupted.id)
+            .unwrap();
+        assert_eq!(interrupted.status, "failed");
+        assert!(interrupted.model_elapsed_ms >= 4_000);
         let retry = detail
             .tasks
             .iter()
