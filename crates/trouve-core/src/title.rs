@@ -10,7 +10,7 @@ const MAX_WORDS: usize = 16;
 const MAX_CHARS: usize = 96;
 const MAX_SCANNED_WORDS: usize = MAX_WORDS + 16;
 /// Shared character cap for heuristic scanning and model input. The model
-/// applies a tighter byte cap for token-dense UTF-8 prompts.
+/// unconditionally applies a stricter byte cap before generation.
 pub(crate) const MAX_PROMPT_CHARS: usize = 768;
 const REQUEST_MARKERS: &[&str] = &[
     "is there a way ",
