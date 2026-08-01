@@ -1,6 +1,6 @@
-import type { RoutingMode, RoutingSource } from "./types";
+import type { RoutingMode } from "./types";
 
-export function routingReasonLabel(source: RoutingSource, mode: RoutingMode): string {
+export function routingReasonLabel(source: string, mode: RoutingMode): string {
   switch (source) {
     case "core":
       return "Manual selection";
@@ -18,5 +18,7 @@ export function routingReasonLabel(source: RoutingSource, mode: RoutingMode): st
       return "Additive core";
     case "thorough":
       return "Legacy thorough mode";
+    default:
+      return source;
   }
 }

@@ -8,3 +8,7 @@ test("baseline routing labels follow the durable job mode", () => {
   assert.equal(routingReasonLabel("baseline", "automatic"), "Automatic baseline");
   assert.equal(routingReasonLabel("baseline", "manual"), "Routing baseline");
 });
+
+test("unknown routing sources remain visible", () => {
+  assert.equal(routingReasonLabel("future-router", "automatic"), "future-router");
+});
