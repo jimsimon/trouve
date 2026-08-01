@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, ThreadViewSnapshot,
@@ -433,7 +433,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
 ];
 
-fn apply_migrations(conn: &Connection) -> Result<()> {
+fn apply_migrations(conn: &mut Connection) -> Result<()> {
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -481,9 +481,10 @@ fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()>
     Ok(())
 }
 
-fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<()> {
+fn migrate_code_review_finding_publication_status(conn: &mut Connection) -> Result<()> {
     const MIGRATION_ID: &str = "code-review-finding-publication-status-v1";
-    let applied = conn
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
         .query_row(
             "SELECT 1 FROM store_migrations WHERE id = ?1",
             [MIGRATION_ID],
@@ -492,10 +493,11 @@ fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<(
         .optional()?
         .is_some();
     if applied {
+        tx.commit()?;
         return Ok(());
     }
 
-    conn.execute_batch(
+    tx.execute_batch(
         "UPDATE code_review_findings
          SET github_publication_status = 'published'
          WHERE github_comment_url != '' AND github_publication_status = 'pending';
@@ -504,10 +506,11 @@ fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<(
          WHERE github_publication_status = 'pending'
            AND (trim(path) = '' OR line <= 0);",
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
         params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1711,12 +1714,12 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        apply_migrations(&conn)?;
+        apply_migrations(&mut conn)?;
         // Claims belong to dispatcher tasks in this process. After a crash
         // there is no worker to own them, so make the prompts visible and
         // explicitly dispatchable again instead of losing them.
@@ -1728,11 +1731,11 @@ impl Store {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         // Match on-disk behavior so tests exercise the same constraints.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        apply_migrations(&conn)?;
+        apply_migrations(&mut conn)?;
         conn.execute(
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
@@ -5789,13 +5792,13 @@ mod tests {
     #[test]
     fn migration_removes_redundant_routing_decisions_index() {
         let store = Store::open_in_memory().unwrap();
-        let conn = store.conn.lock().unwrap();
+        let mut conn = store.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE INDEX code_review_routing_decisions_job
              ON code_review_routing_decisions (job_id, batch_index, reviewer_id)",
         )
         .unwrap();
-        apply_migrations(&conn).unwrap();
+        apply_migrations(&mut conn).unwrap();
         let redundant_indexes = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -5912,7 +5915,7 @@ mod tests {
 
     #[test]
     fn migration_backfills_legacy_finding_publication_outcomes() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE store_migrations (
                 id TEXT PRIMARY KEY,
@@ -5933,20 +5936,27 @@ mod tests {
         )
         .unwrap();
 
-        migrate_code_review_finding_publication_status(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_publication_migration_marker
+             BEFORE INSERT ON store_migrations
+             WHEN NEW.id = 'code-review-finding-publication-status-v1'
+             BEGIN
+                SELECT RAISE(FAIL, 'migration marker write blocked');
+             END;",
+        )
+        .unwrap();
+        assert!(migrate_code_review_finding_publication_status(&mut conn).is_err());
+        assert_eq!(publication_status(&conn, "published"), "pending");
+        assert_eq!(publication_status(&conn, "empty-path"), "pending");
+        conn.execute_batch("DROP TRIGGER reject_publication_migration_marker")
+            .unwrap();
 
-        let status = |id| {
-            conn.query_row(
-                "SELECT github_publication_status FROM code_review_findings WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(status("published"), "published");
-        assert_eq!(status("empty-path"), "not_eligible");
-        assert_eq!(status("zero-line"), "not_eligible");
-        assert_eq!(status("eligible"), "pending");
+        migrate_code_review_finding_publication_status(&mut conn).unwrap();
+
+        assert_eq!(publication_status(&conn, "published"), "published");
+        assert_eq!(publication_status(&conn, "empty-path"), "not_eligible");
+        assert_eq!(publication_status(&conn, "zero-line"), "not_eligible");
+        assert_eq!(publication_status(&conn, "eligible"), "pending");
 
         conn.execute(
             "UPDATE code_review_findings SET github_publication_status = 'pending'
@@ -5954,8 +5964,8 @@ mod tests {
             [],
         )
         .unwrap();
-        migrate_code_review_finding_publication_status(&conn).unwrap();
-        assert_eq!(status("empty-path"), "pending");
+        migrate_code_review_finding_publication_status(&mut conn).unwrap();
+        assert_eq!(publication_status(&conn, "empty-path"), "pending");
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM store_migrations
@@ -5966,6 +5976,71 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn publication_status_migration_serializes_concurrent_openers() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("concurrent-migration.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE code_review_findings (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                github_comment_url TEXT NOT NULL,
+                github_publication_status TEXT NOT NULL
+             );
+             INSERT INTO code_review_findings VALUES
+                ('published', 'src/lib.rs', 10, 'https://github.com/comment', 'pending');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let openers = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = Connection::open(database).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    migrate_code_review_finding_publication_status(&mut conn)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for opener in openers {
+            opener.join().unwrap().unwrap();
+        }
+
+        let conn = Connection::open(database).unwrap();
+        assert_eq!(publication_status(&conn, "published"), "published");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-finding-publication-status-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    fn publication_status(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT github_publication_status FROM code_review_findings WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
