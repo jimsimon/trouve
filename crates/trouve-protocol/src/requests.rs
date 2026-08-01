@@ -1287,6 +1287,20 @@ pub struct CodeReviewCandidateRejection {
 
 /// A confirmed issue produced by the coordinator and, when possible,
 /// published as an inline GitHub review comment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewFindingPublicationStatus {
+    /// Publication has not completed or its legacy outcome is unknown.
+    #[default]
+    Pending,
+    /// GitHub accepted the inline comment. Its URL may still be unavailable.
+    Published,
+    /// The finding had no valid path/line pair for an inline comment.
+    NotEligible,
+    /// GitHub rejected the inline comment because its line was not placeable.
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFinding {
     pub id: String,
@@ -1306,6 +1320,8 @@ pub struct CodeReviewFinding {
     pub github_comment_id: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_comment_url: String,
+    #[serde(default)]
+    pub github_publication_status: CodeReviewFindingPublicationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

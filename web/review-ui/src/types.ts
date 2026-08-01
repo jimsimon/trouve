@@ -224,6 +224,7 @@ export interface Finding {
   sources: FindingSource[];
   github_comment_id?: number;
   github_comment_url: string;
+  github_publication_status: "pending" | "published" | "not_eligible" | "failed";
   github_thread_id?: string;
   resolved_at?: string;
 }

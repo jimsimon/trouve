@@ -1457,7 +1457,9 @@ function JobDetailPane({
               {candidateRejections.length} rejected · {job.fixed_issue_count} fixed
             </p>
           </div>
-          <CopyButton text={detail.prompt_for_agents} label="Copy fix-all prompt" />
+          {detail.prompt_for_agents && (
+            <CopyButton text={detail.prompt_for_agents} label="Copy fix-all prompt" />
+          )}
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
         {detail.findings.map((finding) => (

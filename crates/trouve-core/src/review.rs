@@ -69,6 +69,14 @@ const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
 const CHECK_DETAILS_MAX_CHARS: usize = 60_000;
 const CHECK_DETAILS_TRUNCATION_MARKER: &str =
     "\n\n---\nDetails truncated; open the trouve dashboard for complete output.";
+const LIFECYCLE_COMMENT_MAX_BYTES: usize = 65_000;
+const LIFECYCLE_FINDINGS_MAX_BYTES: usize = 32_000;
+const LIFECYCLE_PROMPT_MAX_BYTES: usize = 12_000;
+const LIFECYCLE_SUMMARY_MAX_BYTES: usize = 6_000;
+const LIFECYCLE_ERROR_MAX_BYTES: usize = 4_000;
+const LIFECYCLE_FINDING_BODY_MAX_BYTES: usize = 2_000;
+const LIFECYCLE_COMMENT_TRUNCATION_MARKER: &str =
+    "\n\n---\nComment truncated; open the trouve dashboard for complete review details.";
 const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
 const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
@@ -633,6 +641,7 @@ fn manual_request_can_satisfy_automatic_review(
 #[derive(Deserialize)]
 struct PublishedReview {
     id: u64,
+    html_url: String,
 }
 
 #[derive(Deserialize)]
@@ -4306,30 +4315,26 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
     ) -> Result<String> {
-        let lifecycle_comment_url = {
-            let state = self
-                .store
-                .code_review_pull_state(&job.repository, job.pull_number)?;
-            if state.lifecycle_comment_url.is_empty() {
-                job.pull_url.clone()
+        let mut comments = Vec::new();
+        let mut eligible_findings = Vec::new();
+        for finding in findings {
+            if finding.line == 0 || finding.path.trim().is_empty() {
+                self.store.set_code_review_finding_publication_status(
+                    &finding.id,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+                )?;
             } else {
-                state.lifecycle_comment_url
-            }
-        };
-        let comments: Vec<_> = findings
-            .iter()
-            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
-            .map(|finding| {
-                serde_json::json!({
+                comments.push(serde_json::json!({
                     "path": finding.path,
                     "line": finding.line,
                     "side": if finding.side.eq_ignore_ascii_case("LEFT") { "LEFT" } else { "RIGHT" },
                     "body": render_inline_finding(finding),
-                })
-            })
-            .collect();
+                }));
+                eligible_findings.push(finding);
+            }
+        }
         if comments.is_empty() {
-            return Ok(lifecycle_comment_url);
+            return Ok(String::new());
         }
         let path = format!(
             "/repos/{}/pulls/{}/reviews",
@@ -4347,14 +4352,23 @@ impl Engine {
         self.record_review_rate(rate);
         if status.is_success() {
             let published = serde_json::from_str::<PublishedReview>(&body)?;
+            for finding in &eligible_findings {
+                self.store.set_code_review_finding_publication_status(
+                    &finding.id,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+                )?;
+            }
             self.capture_published_review_comments(api, job, published.id, findings)
                 .await?;
-            Ok(lifecycle_comment_url)
-        } else if status.as_u16() == 422 {
-            // A model can name a line that is not commentable in GitHub's
-            // diff. The terminal lifecycle comment preserves those findings
-            // in its dedicated unplaced-inline-comments section.
-            Ok(lifecycle_comment_url)
+            Ok(published.html_url)
+        } else if status.as_u16() == 422 && review_comments_failed_to_place(&body) {
+            for finding in eligible_findings {
+                self.store.set_code_review_finding_publication_status(
+                    &finding.id,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                )?;
+            }
+            Ok(String::new())
         } else {
             bail!("GitHub API {status}: {}", compact_api_error(&body))
         }
@@ -4760,13 +4774,21 @@ impl Engine {
         if findings.is_empty() {
             return Ok(());
         }
-        let (comments, rate): (Vec<PublishedReviewComment>, _) = api
-            .get(&format!(
-                "/repos/{}/pulls/{}/reviews/{review_id}/comments?per_page=100",
-                job.repository, job.pull_number
-            ))
-            .await?;
-        self.record_review_rate(rate);
+        let mut comments = Vec::new();
+        for page in 1..=REVIEW_COMMENT_MAX_PAGES {
+            let (page_comments, rate): (Vec<PublishedReviewComment>, _) = api
+                .get(&format!(
+                    "/repos/{}/pulls/{}/reviews/{review_id}/comments?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                    job.repository, job.pull_number
+                ))
+                .await?;
+            self.record_review_rate(rate);
+            let count = page_comments.len();
+            comments.extend(page_comments);
+            if count < REVIEW_COMMENT_PAGE_SIZE {
+                break;
+            }
+        }
         for finding in findings {
             let marker = format!("trouve-code-review finding:{}", finding.id);
             if let Some(comment) = comments
@@ -4978,6 +5000,115 @@ fn display_review_status(status: &str) -> String {
         .join(" ")
 }
 
+fn bounded_utf8(value: &str, maximum: usize, marker: &str) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut marker_keep = marker.len().min(maximum);
+    while !marker.is_char_boundary(marker_keep) {
+        marker_keep -= 1;
+    }
+    let marker = &marker[..marker_keep];
+    let mut keep = maximum.saturating_sub(marker.len());
+    while !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut bounded = value[..keep].to_owned();
+    bounded.push_str(marker);
+    bounded
+}
+
+fn lifecycle_finding_entry(
+    finding: &trouve_protocol::CodeReviewFinding,
+    publication_note: bool,
+) -> String {
+    let path = bounded_utf8(&finding.path, 512, "…");
+    let location = if finding.github_comment_url.is_empty() {
+        format!("`{path}` line {}", finding.line)
+    } else {
+        format!(
+            "[`{path}` line {}]({})",
+            finding.line, finding.github_comment_url
+        )
+    };
+    let note = if publication_note {
+        match finding.github_publication_status {
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+                if finding.github_comment_url.is_empty() =>
+            {
+                " _(inline comment posted; link unavailable)_"
+            }
+            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => {
+                " _(not eligible for an inline comment)_"
+            }
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending => {
+                " _(inline publication pending)_"
+            }
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    let finding_body = bounded_utf8(
+        &finding.body,
+        LIFECYCLE_FINDING_BODY_MAX_BYTES,
+        "… _(finding text truncated)_",
+    );
+    format!(
+        "- **{}** — {location}: {finding_body}{note}\n",
+        finding.severity.to_ascii_uppercase()
+    )
+}
+
+fn append_lifecycle_finding_section(
+    body: &mut String,
+    heading: &str,
+    findings: &[&trouve_protocol::CodeReviewFinding],
+    maximum: usize,
+    publication_note: bool,
+) -> usize {
+    if findings.is_empty() || maximum == 0 {
+        return 0;
+    }
+    let start = body.len();
+    body.push_str(heading);
+    body.push_str("\n\n");
+    for (index, finding) in findings.iter().enumerate() {
+        let entry = lifecycle_finding_entry(finding, publication_note);
+        let omitted_after_entry = findings.len() - index - 1;
+        let reserve = if omitted_after_entry == 0 {
+            0
+        } else {
+            format!("- _{omitted_after_entry} additional finding(s) omitted._\n").len()
+        };
+        if body.len() - start + entry.len() + reserve > maximum {
+            let omitted = findings.len() - index;
+            let omitted_marker = format!("- _{omitted} additional finding(s) omitted._\n");
+            body.push_str(&omitted_marker);
+            break;
+        }
+        body.push_str(&entry);
+    }
+    body.push('\n');
+    body.len() - start
+}
+
+fn finish_lifecycle_comment(mut body: String, job_id: &str) -> String {
+    let marker = lifecycle_comment_marker(job_id);
+    if body.len() + marker.len() <= LIFECYCLE_COMMENT_MAX_BYTES {
+        body.push_str(&marker);
+        return body;
+    }
+    let suffix = format!("{LIFECYCLE_COMMENT_TRUNCATION_MARKER}\n\n{marker}");
+    let mut keep = LIFECYCLE_COMMENT_MAX_BYTES.saturating_sub(suffix.len());
+    while !body.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    body.truncate(keep);
+    body.push_str(&suffix);
+    body
+}
+
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
     let icon = match job.status.as_str() {
@@ -5026,9 +5157,9 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             };
             body.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} |\n",
-                markdown_table_cell(&persona.reviewer_name),
+                bounded_utf8(&markdown_table_cell(&persona.reviewer_name), 512, "…"),
                 display_review_status(&persona.status),
-                markdown_table_cell(&models),
+                bounded_utf8(&markdown_table_cell(&models), 512, "…"),
                 compact_elapsed(persona.elapsed_ms),
                 persona.candidate_issue_count,
                 persona.confirmed_issue_count
@@ -5037,7 +5168,12 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         body.push('\n');
     }
     if !detail.summary.is_empty() {
-        body.push_str(&format!("{}\n\n", detail.summary));
+        body.push_str(&bounded_utf8(
+            &detail.summary,
+            LIFECYCLE_SUMMARY_MAX_BYTES,
+            "\n\n_Review summary truncated._",
+        ));
+        body.push_str("\n\n");
     } else if job.status == "succeeded" {
         if detail.findings.is_empty() {
             body.push_str("No actionable issues found.\n\n");
@@ -5048,58 +5184,50 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
             ));
         }
     }
-    if !detail.findings.is_empty() {
-        body.push_str("### Confirmed issues\n\n");
-        for finding in &detail.findings {
-            let location = if finding.github_comment_url.is_empty() {
-                format!("`{}` line {}", finding.path, finding.line)
-            } else {
-                format!(
-                    "[`{}` line {}]({})",
-                    finding.path, finding.line, finding.github_comment_url
-                )
-            };
-            body.push_str(&format!(
-                "- **{}** — {}: {}\n",
-                finding.severity.to_ascii_uppercase(),
-                location,
-                finding.body
-            ));
-        }
-        body.push('\n');
-    }
-    let unplaced_findings = detail
-        .findings
-        .iter()
-        .filter(|finding| finding.github_comment_url.is_empty())
-        .collect::<Vec<_>>();
-    if job.status == "succeeded" && !unplaced_findings.is_empty() {
-        body.push_str("### Inline comments that failed to post\n\n");
-        for finding in unplaced_findings {
-            body.push_str(&format!(
-                "- `{}` line {} [{}]: {}\n",
-                finding.path,
-                finding.line,
-                finding.severity.to_ascii_uppercase(),
-                finding.body
-            ));
-        }
-        body.push('\n');
-    }
+    let (failed_findings, confirmed_findings): (Vec<_>, Vec<_>) =
+        detail.findings.iter().partition(|finding| {
+            finding.github_publication_status
+                == trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+        });
+    let used = append_lifecycle_finding_section(
+        &mut body,
+        "### Confirmed issues",
+        &confirmed_findings,
+        LIFECYCLE_FINDINGS_MAX_BYTES,
+        true,
+    );
+    append_lifecycle_finding_section(
+        &mut body,
+        "### Inline comments that failed to post",
+        &failed_findings,
+        LIFECYCLE_FINDINGS_MAX_BYTES.saturating_sub(used),
+        false,
+    );
     if !detail.findings.is_empty() && !detail.prompt_for_agents.is_empty() {
+        let prompt = bounded_utf8(
+            &safe_prompt_fence(&detail.prompt_for_agents),
+            LIFECYCLE_PROMPT_MAX_BYTES,
+            "\n[Prompt truncated; open the trouve dashboard for the complete prompt.]",
+        );
         body.push_str(&format!(
             "<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n",
-            safe_prompt_fence(&detail.prompt_for_agents)
+            prompt
         ));
     }
     if !job.error.is_empty() {
-        body.push_str(&format!("**Error:** {}\n\n", job.error));
+        body.push_str(&format!(
+            "**Error:** {}\n\n",
+            bounded_utf8(
+                &job.error,
+                LIFECYCLE_ERROR_MAX_BYTES,
+                "… _(error truncated)_"
+            )
+        ));
     }
     if job.status == "succeeded" {
         body.push_str("_Reviewed by Trouve._\n\n");
     }
-    body.push_str(&lifecycle_comment_marker(&job.id));
-    body
+    finish_lifecycle_comment(body, &job.id)
 }
 
 fn safe_prompt_fence(text: &str) -> String {
@@ -5188,9 +5316,58 @@ fn inline_review_request(
 ) -> serde_json::Value {
     serde_json::json!({
         "commit_id": job.head_sha,
+        "body": format!("<!-- trouve-code-review inline-review job:{} -->", job.id),
         "event": "COMMENT",
         "comments": comments,
     })
+}
+
+fn review_comments_failed_to_place(body: &str) -> bool {
+    fn placement_error(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(message) => {
+                let message = message.to_ascii_lowercase();
+                [
+                    "line must be part of the diff",
+                    "line is not part of the diff",
+                    "line could not be resolved",
+                    "position is invalid",
+                    "invalid position",
+                ]
+                .iter()
+                .any(|needle| message.contains(needle))
+            }
+            serde_json::Value::Object(error) => {
+                let resource = error
+                    .get("resource")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let field = error
+                    .get("field")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let code = error
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                matches!(
+                    resource,
+                    "PullRequestReviewComment" | "PullRequestReviewThread"
+                ) && ((matches!(field, "line" | "start_line" | "position")
+                    && matches!(code, "invalid" | "missing" | "custom"))
+                    || error.get("message").is_some_and(placement_error))
+            }
+            _ => false,
+        }
+    }
+
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(errors) = payload.get("errors").and_then(serde_json::Value::as_array) else {
+        return payload.get("message").is_some_and(placement_error);
+    };
+    !errors.is_empty() && errors.iter().all(placement_error)
 }
 
 fn apply_reviewer_overrides(
@@ -6923,9 +7100,120 @@ mod tests {
         assert!(body.contains("**Result:** 1 confirmed issue(s)"));
         assert!(body.contains("### Confirmed issues"));
         assert!(body.contains("- **HIGH** — `src/lib.rs` line 42: Handle the error"));
-        assert!(body.contains("### Inline comments that failed to post"));
+        assert!(body.contains("_(inline publication pending)_"));
+        assert!(!body.contains("### Inline comments that failed to post"));
         assert!(body.contains("<summary>Prompt for agents</summary>"));
         assert!(body.contains("_Reviewed by Trouve._"));
+    }
+
+    #[test]
+    fn lifecycle_comment_renders_each_finding_under_its_publication_outcome() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:finding-outcomes");
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result(
+                &queued.id,
+                "Two confirmed issues.",
+                "Fix both issues.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/failed.rs".into(),
+                        line: 10,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        body: "Failed inline body".into(),
+                        prompt_for_agents: "Fix failed inline issue.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/published.rs".into(),
+                        line: 20,
+                        side: "RIGHT".into(),
+                        severity: "medium".into(),
+                        body: "Published inline body".into(),
+                        prompt_for_agents: "Fix published inline issue.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        let failed = findings
+            .iter()
+            .find(|finding| finding.path == "src/failed.rs")
+            .unwrap();
+        let published = findings
+            .iter()
+            .find(|finding| finding.path == "src/published.rs")
+            .unwrap();
+        store
+            .set_code_review_finding_publication_status(
+                &failed.id,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+            )
+            .unwrap();
+        store
+            .set_code_review_finding_publication_status(
+                &published.id,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "", "")
+            .unwrap();
+
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let body = render_lifecycle_comment(&detail);
+        let confirmed = body.find("### Confirmed issues").unwrap();
+        let failed_section = body
+            .find("### Inline comments that failed to post")
+            .unwrap();
+        assert!(confirmed < failed_section);
+        assert_eq!(body.matches("Published inline body").count(), 1);
+        assert_eq!(body.matches("Failed inline body").count(), 1);
+        assert!(body.contains("_(inline comment posted; link unavailable)_"));
+    }
+
+    #[test]
+    fn lifecycle_comment_is_bounded_and_keeps_its_marker() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:bounded-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        let large_body = "🦀".repeat(2_000);
+        let findings = (0..MAX_CANDIDATE_FINDINGS)
+            .map(|index| NewCodeReviewFinding {
+                path: format!("src/generated-{index}.rs"),
+                line: index as u64 + 1,
+                side: "RIGHT".into(),
+                severity: "medium".into(),
+                body: large_body.clone(),
+                prompt_for_agents: "Fix this issue.".into(),
+                sources: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .save_code_review_result(
+                &queued.id,
+                &"summary ".repeat(2_000),
+                &"prompt ".repeat(10_000),
+                findings.len() as u64,
+                &findings,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "", "")
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+        assert!(body.len() <= LIFECYCLE_COMMENT_MAX_BYTES);
+        assert!(body.ends_with(&lifecycle_comment_marker(&queued.id)));
+        assert!(body.contains("additional finding(s) omitted"));
+        assert!(body.contains("Review summary truncated"));
+        assert!(body.contains("Prompt truncated"));
     }
 
     #[test]
@@ -6954,7 +7242,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_review_submission_has_no_second_comment_body() {
+    fn inline_review_submission_uses_a_nonempty_hidden_body() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:inline-only-review");
         let request = inline_review_request(
@@ -6967,9 +7255,172 @@ mod tests {
             })],
         );
 
-        assert!(request.get("body").is_none());
+        let body = request["body"].as_str().unwrap();
+        assert!(!body.is_empty());
+        assert_eq!(
+            body,
+            format!("<!-- trouve-code-review inline-review job:{} -->", job.id)
+        );
         assert_eq!(request["event"], "COMMENT");
         assert_eq!(request["comments"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn published_review_comment_capture_paginates() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:comment-pagination");
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "Handle the error.".into(),
+                    prompt_for_agents: "Handle the error and test it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let finding_id = findings[0].id.clone();
+        let first_page = serde_json::to_string(
+            &(0..REVIEW_COMMENT_PAGE_SIZE)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": index + 1,
+                        "html_url": format!("https://github.com/comment-{index}"),
+                        "body": "unrelated inline comment"
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let second_page = serde_json::to_string(&vec![serde_json::json!({
+            "id": 101,
+            "html_url": "https://github.com/acme/widgets/pull/42#discussion_r101",
+            "body": format!("finding\n<!-- trouve-code-review finding:{finding_id} -->")
+        })])
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (page, body) in [(1, first_page), (2, second_page)] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(&format!(
+                    "get /repos/acme/widgets/pulls/42/reviews/77/comments?per_page=100&page={page} http/1.1\r\n"
+                )));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .capture_published_review_comments(&api, &job, 77, &findings)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        assert_eq!(
+            stored[0].github_comment_url,
+            "https://github.com/acme/widgets/pull/42#discussion_r101"
+        );
+        assert_eq!(
+            stored[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+    }
+
+    #[test]
+    fn only_line_placement_validation_errors_are_suppressed() {
+        for body in [
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"line","code":"invalid"}]}"#,
+            r#"{"message":"Validation Failed","errors":["Pull request review thread line must be part of the diff"]}"#,
+        ] {
+            assert!(review_comments_failed_to_place(body), "{body}");
+        }
+        for body in [
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReview","field":"body","code":"missing"}]}"#,
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReview","field":"commit_id","code":"invalid"}]}"#,
+            r#"{"message":"Pull request is not open"}"#,
+            r#"{"message":"Validation Failed","errors":[{"field":"line","code":"invalid"},{"field":"body","code":"missing"}]}"#,
+        ] {
+            assert!(!review_comments_failed_to_place(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_url_only_fills_an_absent_published_review_url() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let published = enqueue_test_review_job(&store, "acme/widgets#42:published-url");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(
+                &published.id,
+                "succeeded",
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-99",
+                "",
+            )
+            .unwrap();
+        store
+            .set_code_review_job_lifecycle_comment_url(
+                &published.id,
+                "https://github.com/acme/widgets/pull/42#issuecomment-10",
+            )
+            .unwrap();
+        let published = store.code_review_job(&published.id).unwrap().unwrap().job;
+        assert_eq!(
+            published.review_url,
+            "https://github.com/acme/widgets/pull/42#pullrequestreview-99"
+        );
+        assert_eq!(
+            published.lifecycle_comment_url,
+            "https://github.com/acme/widgets/pull/42#issuecomment-10"
+        );
+
+        let no_review = enqueue_test_review_job(&store, "acme/widgets#42:lifecycle-url");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(&no_review.id, "succeeded", "", "")
+            .unwrap();
+        store
+            .set_code_review_job_lifecycle_comment_url(
+                &no_review.id,
+                "https://github.com/acme/widgets/pull/42#issuecomment-11",
+            )
+            .unwrap();
+        let no_review = store.code_review_job(&no_review.id).unwrap().unwrap().job;
+        assert_eq!(no_review.review_url, no_review.lifecycle_comment_url);
     }
 
     #[test]

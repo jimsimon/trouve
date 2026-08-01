@@ -291,6 +291,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   status TEXT NOT NULL DEFAULT 'open',
   github_comment_id INTEGER,
   github_comment_url TEXT NOT NULL DEFAULT '',
+  github_publication_status TEXT NOT NULL DEFAULT 'pending',
   github_thread_id TEXT,
   resolved_at TEXT,
   created_at TEXT NOT NULL
@@ -426,6 +427,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN lifecycle_stage TEXT NOT NULL DEFAULT 'queued'",
     "ALTER TABLE code_review_tasks ADD COLUMN model_started_at TEXT",
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
+    "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
+    "UPDATE code_review_findings SET github_publication_status = 'published' WHERE github_comment_url != '' AND github_publication_status = 'pending'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -4133,6 +4136,7 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
              SET github_comment_id = ?2, github_comment_url = ?3,
+                 github_publication_status = 'published',
                  github_thread_id = COALESCE(?4, github_thread_id)
              WHERE id = ?1",
             params![
@@ -4141,6 +4145,23 @@ impl Store {
                 comment_url,
                 thread_id
             ],
+        )? > 0)
+    }
+
+    pub fn set_code_review_finding_publication_status(
+        &self,
+        id: &str,
+        status: trouve_protocol::CodeReviewFindingPublicationStatus,
+    ) -> Result<bool> {
+        let status = match status {
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending => "pending",
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published => "published",
+            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => "not_eligible",
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
+        };
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings SET github_publication_status = ?2 WHERE id = ?1",
+            params![id, status],
         )? > 0)
     }
 
@@ -4162,7 +4183,8 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, job_id, path, line, side, severity, body,
                         prompt_for_agents, status, github_comment_id,
-                        github_comment_url, github_thread_id, resolved_at
+                        github_comment_url, github_publication_status,
+                        github_thread_id, resolved_at
                  FROM code_review_findings
                  WHERE job_id = ?1 ORDER BY path, line, id",
             )?;
@@ -4180,8 +4202,18 @@ impl Store {
                     sources: Vec::new(),
                     github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                     github_comment_url: row.get(10)?,
-                    github_thread_id: row.get(11)?,
-                    resolved_at: parse_optional_datetime(row.get(12)?),
+                    github_publication_status: match row.get::<_, String>(11)?.as_str() {
+                        "published" => {
+                            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+                        }
+                        "not_eligible" => {
+                            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
+                        }
+                        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
+                    },
+                    github_thread_id: row.get(12)?,
+                    resolved_at: parse_optional_datetime(row.get(13)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -4953,7 +4985,10 @@ impl Store {
 
     pub fn set_code_review_job_lifecycle_comment_url(&self, id: &str, url: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET lifecycle_comment_url = ?2 WHERE id = ?1",
+            "UPDATE code_review_jobs
+             SET lifecycle_comment_url = ?2,
+                 review_url = CASE WHEN review_url = '' THEN ?2 ELSE review_url END
+             WHERE id = ?1",
             params![id, url],
         )? > 0)
     }
