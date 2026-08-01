@@ -2811,6 +2811,60 @@ fn session_diff_path_with_cancel(
     })
 }
 
+/// Common ancestor used by a pull-request comparison.
+pub fn merge_base(repo: &Path, base_ref: &str, head_ref: &str) -> Result<String> {
+    ensure_safe_ref(base_ref)?;
+    ensure_safe_ref(head_ref)?;
+    git(repo, &["merge-base", base_ref, head_ref])
+}
+
+/// Every changed path between two immutable commits in git's deterministic
+/// diff order. Review orchestration uses this instead of the session helpers,
+/// which intentionally include uncommitted worktree changes.
+pub fn diff_files_between(repo: &Path, base_ref: &str, head_ref: &str) -> Result<Vec<String>> {
+    ensure_safe_ref(base_ref)?;
+    ensure_safe_ref(head_ref)?;
+    let output = git_untrimmed(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--end-of-options",
+            base_ref,
+            head_ref,
+        ],
+    )?;
+    Ok(output
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Unified diff for one path between two immutable commits.
+pub fn diff_path_between(
+    repo: &Path,
+    base_ref: &str,
+    head_ref: &str,
+    path: &str,
+) -> Result<String> {
+    ensure_safe_ref(base_ref)?;
+    ensure_safe_ref(head_ref)?;
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("invalid repository-relative diff path: {path:?}");
+    }
+    git(
+        repo,
+        &["diff", "--end-of-options", base_ref, head_ref, "--", path],
+    )
+}
+
 /// URL of the named remote (usually "origin"), if configured.
 pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
     git(worktree, &["remote", "get-url", remote])
@@ -3937,6 +3991,38 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn immutable_review_diff_supports_rewritten_commit_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let common = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        run(tmp.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(tmp.path().join("a.txt"), "one\nfeature\n").unwrap();
+        run(tmp.path(), &["add", "a.txt"]);
+        run(tmp.path(), &["commit", "-m", "feature"]);
+        let feature = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        run(tmp.path(), &["checkout", "main"]);
+        std::fs::write(tmp.path().join("base.txt"), "advanced\n").unwrap();
+        run(tmp.path(), &["add", "base.txt"]);
+        run(tmp.path(), &["commit", "-m", "advance base"]);
+        let advanced_base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("uncommitted.txt"), "noise\n").unwrap();
+
+        assert_eq!(
+            merge_base(tmp.path(), &advanced_base, &feature).unwrap(),
+            common
+        );
+        assert_eq!(
+            diff_files_between(tmp.path(), &common, &feature).unwrap(),
+            ["a.txt"]
+        );
+        let diff = diff_path_between(tmp.path(), &common, &feature, "a.txt").unwrap();
+        assert!(diff.contains("+feature"));
+        assert!(!diff.contains("uncommitted"));
     }
 
     #[test]
