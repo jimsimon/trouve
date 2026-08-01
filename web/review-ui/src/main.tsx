@@ -1577,7 +1577,9 @@ function JobDetailPane({
             <div class="action-row">
               <CopyButton text={finding.prompt_for_agents} />
               <ExternalLink href={finding.github_comment_url}>
-                {finding.outside_diff ? "Open review comment ↗" : "Open inline comment ↗"}
+                {finding.github_comment_id != null
+                  ? "Open inline comment ↗"
+                  : "Open review comment ↗"}
               </ExternalLink>
             </div>
           </article>
