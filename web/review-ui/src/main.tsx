@@ -870,6 +870,7 @@ function JobDetailPane({
     setTaskErrors({});
     setEventCursor(null);
     setRoutingOpen(false);
+    setBusy("");
     setRetryStatus("");
     activityGroupButtonRefs.current = {};
     taskRequestsRef.current.clear();
@@ -1149,49 +1150,69 @@ function JobDetailPane({
 
   const retryFailedPersona = async (reviewerId: string): Promise<void> => {
     if (!detail) return;
+    const submittedJobId = detail.job.id;
     const action = `persona:${reviewerId}`;
     const label =
-      detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ??
+      detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ||
       "Reviewer persona";
     setBusy(action);
     setRetryStatus(`Retrying ${label}…`);
     try {
-      await retryPersona(detail.job.id, reviewerId);
-      activityGroupButtonRefs.current[action]?.focus();
-      setRetryStatus(`${label} retry queued.`);
-      onChanged();
-      const refreshed = await load();
-      const retriedTask = pickPreferredTask(
-        refreshed?.tasks.filter((task) => task.reviewer_id === reviewerId) ?? [],
-      );
-      setSelectedTaskId(retriedTask?.id ?? "");
+      await retryPersona(submittedJobId, reviewerId);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setRetryStatus(`${label} retry failed.`);
+      if (aliveRef.current === submittedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setRetryStatus(`${label} retry failed.`);
+        setBusy("");
+      }
+      return;
+    }
+    if (aliveRef.current !== submittedJobId) return;
+    activityGroupButtonRefs.current[action]?.focus();
+    setRetryStatus(`${label} retry queued.`);
+    onChanged();
+    try {
+      const refreshed = await load();
+      if (aliveRef.current === submittedJobId && refreshed) {
+        const retriedTask = pickPreferredTask(
+          refreshed.tasks.filter((task) => task.reviewer_id === reviewerId),
+        );
+        setSelectedTaskId(retriedTask?.id ?? "");
+      }
     } finally {
-      setBusy("");
+      if (aliveRef.current === submittedJobId) setBusy("");
     }
   };
 
   const retryFailedFinalEditor = async (): Promise<void> => {
     if (!detail) return;
+    const submittedJobId = detail.job.id;
     setBusy("final-editor");
     setRetryStatus("Retrying Final review editor…");
     try {
-      await retryFinalEditor(detail.job.id);
-      activityGroupButtonRefs.current.coordinator?.focus();
-      setRetryStatus("Final review editor retry queued.");
-      onChanged();
-      const refreshed = await load();
-      const retriedTask = pickPreferredTask(
-        refreshed?.tasks.filter((task) => task.role === "coordinator") ?? [],
-      );
-      setSelectedTaskId(retriedTask?.id ?? "");
+      await retryFinalEditor(submittedJobId);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setRetryStatus("Final review editor retry failed.");
+      if (aliveRef.current === submittedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setRetryStatus("Final review editor retry failed.");
+        setBusy("");
+      }
+      return;
+    }
+    if (aliveRef.current !== submittedJobId) return;
+    activityGroupButtonRefs.current.coordinator?.focus();
+    setRetryStatus("Final review editor retry queued.");
+    onChanged();
+    try {
+      const refreshed = await load();
+      if (aliveRef.current === submittedJobId && refreshed) {
+        const retriedTask = pickPreferredTask(
+          refreshed.tasks.filter((task) => task.role === "coordinator"),
+        );
+        setSelectedTaskId(retriedTask?.id ?? "");
+      }
     } finally {
-      setBusy("");
+      if (aliveRef.current === submittedJobId) setBusy("");
     }
   };
 
@@ -1335,6 +1356,15 @@ function JobDetailPane({
       tasks: coordinatorTasks,
     });
   }
+  const latestReviewerTasks = new Map<string, ReviewTask>();
+  detail.tasks
+    .filter((task) => task.role === "reviewer" && task.reviewer_id)
+    .forEach((task) => {
+      latestReviewerTasks.set(`${task.reviewer_id}:${task.batch_index}`, task);
+    });
+  const finalEditorRetryBlocked = [...latestReviewerTasks.values()].some(
+    (task) => !["succeeded", "not_applicable"].includes(task.status),
+  );
   const selectedTaskSummary =
     detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
   const retainedTask = selectedTaskSummary ? taskDetails[selectedTaskSummary.id] : undefined;
@@ -1662,10 +1692,15 @@ function JobDetailPane({
             <nav class="activity-groups" aria-label="Review personas and batches">
               {activityGroups.map((group) => {
                 const active = group.id === selectedGroup?.id;
+                const coordinatorRetryBlocked =
+                  group.id === "coordinator" && finalEditorRetryBlocked;
                 const retryable =
                   job.status === "failed" &&
-                  (group.status === "failed" || group.status === "cancelled") &&
-                  Boolean(group.persona || group.id === "coordinator");
+                  (group.persona
+                    ? ["failed", "cancelled", "queued", "running"].includes(group.status)
+                    : group.id === "coordinator" &&
+                      ["failed", "cancelled"].includes(group.status) &&
+                      !coordinatorRetryBlocked);
                 const retrying = group.persona
                   ? busy === `persona:${group.persona.reviewer_id}`
                   : group.id === "coordinator" && busy === "final-editor";
@@ -1700,6 +1735,11 @@ function JobDetailPane({
                           {retrying ? "Retrying…" : "Retry"}
                         </button>
                       )}
+                      {job.status === "failed" &&
+                        ["failed", "cancelled"].includes(group.status) &&
+                        coordinatorRetryBlocked && (
+                          <small class="retry-blocked">Retry personas first</small>
+                        )}
                     </div>
                     {active && group.tasks.length > 1 && (
                       <div class="batch-tabs">
