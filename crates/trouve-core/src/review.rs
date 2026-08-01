@@ -2580,6 +2580,15 @@ impl Engine {
                     "processing pull request {}#{} failed: {error:#}",
                     repository.repository, pull_number
                 ));
+            } else if let Err(error) = self
+                .reconcile_user_resolved_review_findings(&api, &repository.repository, &pull)
+                .await
+            {
+                had_errors = true;
+                self.record_review_error(format!(
+                    "reconciling resolved review findings for {}#{} failed: {error:#}",
+                    repository.repository, pull_number
+                ));
             }
         }
         // A request can race with a PR being closed. Once the complete open-PR
@@ -4460,16 +4469,12 @@ impl Engine {
         Ok(ids)
     }
 
-    async fn resolve_fixed_review_findings(
+    async fn load_review_threads(
         &self,
         api: &GithubApi,
-        job: &trouve_protocol::CodeReviewJob,
-        previous_findings: &[trouve_protocol::CodeReviewFinding],
-        resolved_ids: &[String],
-    ) -> Result<u64> {
-        if resolved_ids.is_empty() {
-            return Ok(0);
-        }
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<HashMap<u64, (String, bool)>> {
         let query = r#"
           query ReviewThreads($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
@@ -4485,8 +4490,7 @@ impl Engine {
             }
           }
         "#;
-        let (owner, name) = job
-            .repository
+        let (owner, name) = repository
             .split_once('/')
             .ok_or_else(|| anyhow!("invalid repository"))?;
         let (response, rate): (serde_json::Value, _) = api
@@ -4497,7 +4501,7 @@ impl Engine {
                     "variables": {
                         "owner": owner,
                         "name": name,
-                        "number": job.pull_number,
+                        "number": pull_number,
                     }
                 }),
             )
@@ -4506,22 +4510,123 @@ impl Engine {
         if response["errors"].is_array() {
             bail!("GitHub GraphQL error while loading review threads");
         }
-        let threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let mut thread_by_comment = HashMap::new();
-        for thread in threads {
-            let Some(thread_id) = thread["id"].as_str() else {
-                continue;
-            };
-            let resolved = thread["isResolved"].as_bool().unwrap_or(false);
-            for comment in thread["comments"]["nodes"].as_array().into_iter().flatten() {
-                if let Some(comment_id) = comment["databaseId"].as_u64() {
-                    thread_by_comment.insert(comment_id, (thread_id.to_owned(), resolved));
-                }
+        Ok(review_threads_by_comment(&response))
+    }
+
+    async fn reconcile_user_resolved_review_findings(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        pull: &GithubPullRequest,
+    ) -> Result<()> {
+        let pull_state = self.store.code_review_pull_state(repository, pull.number)?;
+        if pull_state.last_reviewed_head_sha != pull.head.sha
+            || self.store.code_review_pull_has_active_job(
+                repository,
+                pull.number,
+                &pull.head.sha,
+            )?
+        {
+            return Ok(());
+        }
+        let open_findings = self
+            .store
+            .open_code_review_findings(repository, pull.number)?;
+        if open_findings.is_empty()
+            || open_findings
+                .iter()
+                .all(|finding| finding.github_comment_id.is_none())
+        {
+            return Ok(());
+        }
+        let thread_by_comment = self
+            .load_review_threads(api, repository, pull.number)
+            .await?;
+        let resolved = open_findings
+            .iter()
+            .filter_map(|finding| {
+                let (thread_id, is_resolved) =
+                    thread_by_comment.get(&finding.github_comment_id?)?;
+                is_resolved.then(|| (finding, thread_id))
+            })
+            .collect::<Vec<_>>();
+        if resolved.is_empty() {
+            return Ok(());
+        }
+
+        if resolved.len() == open_findings.len() {
+            self.publish_resolved_findings_approval(api, repository, pull)
+                .await?;
+        }
+
+        let mut changed_jobs = HashSet::new();
+        for (finding, thread_id) in resolved {
+            self.store.update_code_review_finding_publication(
+                &finding.id,
+                finding.github_comment_id,
+                &finding.github_comment_url,
+                Some(thread_id),
+            )?;
+            if self
+                .store
+                .resolve_code_review_finding(&finding.id, "dismissed")?
+            {
+                changed_jobs.insert(finding.job_id.clone());
             }
         }
+        for job_id in changed_jobs {
+            self.emit_code_review_updated(Some(job_id))?;
+        }
+        Ok(())
+    }
+
+    async fn publish_resolved_findings_approval(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        pull: &GithubPullRequest,
+    ) -> Result<()> {
+        let path = format!("/repos/{repository}/pulls/{}", pull.number);
+        let (current, rate): (GithubPullRequest, _) = api.get(&path).await?;
+        self.record_review_rate(rate);
+        if current.state != "open"
+            || current.base.sha != pull.base.sha
+            || current.head.sha != pull.head.sha
+        {
+            bail!("stale: pull request revision changed before approval");
+        }
+        let body = format!(
+            "All Trouve inline findings for this revision have been resolved.\n\n\
+             <!-- trouve-code-review resolution-approval:{} -->",
+            pull.head.sha
+        );
+        let (_published, rate): (PublishedReview, _) = api
+            .post(
+                &format!("{path}/reviews"),
+                &serde_json::json!({
+                    "commit_id": pull.head.sha,
+                    "body": body,
+                    "event": github_review_event(false),
+                }),
+            )
+            .await?;
+        self.record_review_rate(rate);
+        Ok(())
+    }
+
+    async fn resolve_fixed_review_findings(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+        previous_findings: &[trouve_protocol::CodeReviewFinding],
+        resolved_ids: &[String],
+    ) -> Result<u64> {
+        if resolved_ids.is_empty() {
+            return Ok(0);
+        }
+        let thread_by_comment = self
+            .load_review_threads(api, &job.repository, job.pull_number)
+            .await?;
         let mut fixed = 0_u64;
         for finding in previous_findings {
             if !resolved_ids.contains(&finding.id) {
@@ -4615,6 +4720,26 @@ fn github_review_event(has_findings: bool) -> &'static str {
     } else {
         "APPROVE"
     }
+}
+
+fn review_threads_by_comment(response: &serde_json::Value) -> HashMap<u64, (String, bool)> {
+    let threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut thread_by_comment = HashMap::new();
+    for thread in threads {
+        let Some(thread_id) = thread["id"].as_str() else {
+            continue;
+        };
+        let resolved = thread["isResolved"].as_bool().unwrap_or(false);
+        for comment in thread["comments"]["nodes"].as_array().into_iter().flatten() {
+            if let Some(comment_id) = comment["databaseId"].as_u64() {
+                thread_by_comment.insert(comment_id, (thread_id.to_owned(), resolved));
+            }
+        }
+    }
+    thread_by_comment
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -6031,6 +6156,187 @@ mod tests {
     fn github_review_verdict_matches_confirmed_findings() {
         assert_eq!(github_review_event(false), "APPROVE");
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn resolved_inline_findings_on_unchanged_head_publish_approval() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:resolved-approval");
+        assert!(
+            store
+                .code_review_pull_has_active_job("acme/widgets", 42, &job.head_sha)
+                .unwrap()
+        );
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One confirmed issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "Handle the missing case.".into(),
+                    prompt_for_agents: "Handle the missing case.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &findings[0].id,
+                Some(99),
+                "https://github.com/acme/widgets/pull/42#discussion_r99",
+                None,
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "review-url", "")
+            .unwrap();
+        assert!(
+            !store
+                .code_review_pull_has_active_job("acme/widgets", 42, &job.head_sha)
+                .unwrap()
+        );
+        store
+            .mark_code_review_published(
+                "acme/widgets",
+                42,
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222",
+            )
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, response_body, expected_body) in [
+                (
+                    "post /graphql http/1.1\r\n",
+                    serde_json::json!({
+                        "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [{
+                            "id": "PRRT_1",
+                            "isResolved": true,
+                            "comments": {"nodes": [{"databaseId": 99}]}
+                        }]}}}}
+                    })
+                    .to_string(),
+                    None,
+                ),
+                (
+                    "get /repos/acme/widgets/pulls/42 http/1.1\r\n",
+                    serde_json::json!({
+                        "number": 42,
+                        "title": "Ship widgets",
+                        "html_url": "https://github.com/acme/widgets/pull/42",
+                        "draft": false,
+                        "state": "open",
+                        "base": {
+                            "ref": "main",
+                            "sha": "1111111111111111111111111111111111111111"
+                        },
+                        "head": {
+                            "ref": "ship",
+                            "sha": "2222222222222222222222222222222222222222"
+                        },
+                        "requested_reviewers": []
+                    })
+                    .to_string(),
+                    None,
+                ),
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
+                    serde_json::json!({
+                        "id": 123,
+                        "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-123"
+                    })
+                    .to_string(),
+                    Some("\"event\":\"approve\""),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(headers_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                if let Some(expected_body) = expected_body {
+                    assert!(request.contains(expected_body), "{request}");
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let pull = GithubPullRequest {
+            number: 42,
+            title: "Ship widgets".into(),
+            html_url: "https://github.com/acme/widgets/pull/42".into(),
+            draft: false,
+            state: "open".into(),
+            base: GithubPullRef {
+                name: "main".into(),
+                sha: "1111111111111111111111111111111111111111".into(),
+            },
+            head: GithubPullRef {
+                name: "ship".into(),
+                sha: "2222222222222222222222222222222222222222".into(),
+            },
+            requested_reviewers: Vec::new(),
+        };
+
+        engine
+            .reconcile_user_resolved_review_findings(&api, "acme/widgets", &pull)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let findings = engine.store.code_review_findings(&job.id).unwrap();
+        assert_eq!(findings[0].status, "dismissed");
+        assert_eq!(findings[0].github_thread_id.as_deref(), Some("PRRT_1"));
     }
 
     struct RouterThinkingProvider {

@@ -2863,6 +2863,24 @@ impl Store {
         Ok(ids)
     }
 
+    pub fn code_review_pull_has_active_job(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND status IN ('queued', 'running')
+                 LIMIT 1
+             )",
+            params![repository, pull_number as i64, head_sha],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn list_code_review_jobs(
         &self,
         limit: usize,
