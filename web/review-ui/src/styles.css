@@ -186,7 +186,7 @@ dd { margin: 5px 0 0; }
 .activity-group-summary > button:first-child > span:first-child { min-width: 0; }
 .activity-group-summary > button:first-child strong, .activity-group-summary > button:first-child small { display: block; overflow: hidden; text-overflow: ellipsis; }
 .activity-group-summary > button:first-child small { margin-top: 3px; color: var(--muted); font-size: 10px; white-space: nowrap; }
-.retry-persona { flex: 0 0 auto; margin-right: 8px; }
+.retry-activity { flex: 0 0 auto; margin-right: 8px; }
 .batch-tabs { display: grid; gap: 3px; padding: 0 7px 7px; }
 .batch-tabs button { display: flex; justify-content: space-between; align-items: center; padding: 6px 7px; border-color: transparent; background: #080c12; color: var(--muted); font-size: 10px; }
 .batch-tabs button.active { border-color: #315f94; color: var(--text); background: #12243b; }

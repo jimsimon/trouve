@@ -9714,6 +9714,86 @@ impl Store {
         Ok(Some(retried.job))
     }
 
+    /// Resume a failed job at its final editing phase while retaining all
+    /// successful reviewer task outputs.
+    pub fn retry_code_review_final_editor(
+        &self,
+        id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old = tx
+            .query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )
+            .optional()?;
+        let Some(old) = old else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if old.job.status != "failed" {
+            anyhow::bail!("the final review editor can only be retried after the review job fails");
+        }
+        if old.job.session_id.is_some() {
+            anyhow::bail!("review session cleanup is still pending; retry shortly");
+        }
+
+        let latest = tx
+            .query_row(
+                &format!(
+                    "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
+                     WHERE job_id = ?1 AND role = 'coordinator'
+                     ORDER BY rowid DESC LIMIT 1"
+                ),
+                params![id],
+                row_to_code_review_task,
+            )
+            .optional()?;
+        let Some(latest) = latest else {
+            anyhow::bail!("final review editor was not started for review job {id}");
+        };
+        if !matches!(latest.status.as_str(), "failed" | "cancelled") {
+            anyhow::bail!("the final review editor has no failed or cancelled attempt to retry");
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO code_review_tasks
+                    (id, job_id, role, reviewer_id, reviewer_name, batch_index,
+                     batch_count, status, model, prompt, created_at)
+             VALUES (?1, ?2, 'coordinator', NULL, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
+            params![
+                crate::new_id("rvt"),
+                id,
+                latest.reviewer_name,
+                latest.batch_index as i64,
+                latest.batch_count as i64,
+                latest.model,
+                latest.prompt,
+                now,
+            ],
+        )?;
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET status = 'queued', started_at = NULL, completed_at = NULL,
+                 error = '', cancel_requested = 0, publication_claimed = 0
+             WHERE id = ?1 AND status = 'failed'",
+            params![id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("review job changed before the final editor retry was queued");
+        }
+        let retried = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+            params![id],
+            row_to_code_review_job,
+        )?;
+        tx.commit()?;
+        Ok(Some(retried.job))
+    }
+
     pub fn save_code_review_result(
         &self,
         job_id: &str,
@@ -21598,7 +21678,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_persona_retries_failed_and_cancelled_batches() {
+    fn scoped_review_retries_preserve_successful_reviewer_batches() {
         let store = Store::open_in_memory().unwrap();
         let reviewer = crate::reviewers::built_in_reviewers().remove(0);
         let queued = store
@@ -21786,6 +21866,54 @@ mod tests {
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(detail.tasks.iter().any(|task| task.id == "rvt_z_old"));
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
+
+        store
+            .set_code_review_job_progress(&queued.id, 1, 1)
+            .unwrap();
+        let coordinator = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                reviewer_id: None,
+                reviewer_name: "Final review editor".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "Select the final findings".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &coordinator.id,
+                "se_editor",
+                "th_editor",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&coordinator.id, "failed", "", 0, "final editor timed out")
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "final editor timed out")
+            .unwrap();
+
+        let editor_retry = store
+            .retry_code_review_final_editor(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(editor_retry.id, queued.id);
+        assert_eq!(editor_retry.status, "queued");
+        assert_eq!(editor_retry.progress.completed_reviewers, 1);
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        assert!(detail.tasks.iter().any(|task| task.id == coordinator.id));
+        assert!(detail.tasks.iter().any(|task| task.role
+            == trouve_protocol::CodeReviewTaskRole::Coordinator
+            && task.status == "queued"));
+        assert!(!detail.tasks.iter().any(|task| task.role
+            == trouve_protocol::CodeReviewTaskRole::Reviewer
+            && task.status == "queued"));
     }
 
     #[tokio::test]
