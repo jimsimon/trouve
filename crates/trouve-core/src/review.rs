@@ -2847,28 +2847,28 @@ impl Engine {
                 ),
             ),
         };
-        let finish_recorded =
+        let (finish_recorded, finish_transition) =
             match self
                 .store
                 .finish_code_review_job(&job_id, status, &review_url, &error)
             {
-                Ok(transitioned) => {
-                    if transitioned && status == "failed" {
-                        tracing::error!(
-                            job_id = %job_id,
-                            repository = %record.job.repository,
-                            pull_number = record.job.pull_number,
-                            error = %error,
-                            "code-review job failed"
-                        );
-                    }
-                    true
-                }
+                Ok(transitioned) => (true, Some(transitioned)),
                 Err(finish_error) => {
-                    self.record_review_error(format!("finishing review job: {finish_error:#}"));
-                    false
+                    self.record_review_error(format!(
+                        "finishing review job {job_id}: {finish_error:#}"
+                    ));
+                    (false, None)
                 }
             };
+        if should_log_code_review_job_failure(status, finish_transition) {
+            tracing::error!(
+                job_id = %job_id,
+                repository = %record.job.repository,
+                pull_number = record.job.pull_number,
+                error = %error,
+                "code-review job failed"
+            );
+        }
         // Superseding can make the guarded finish a no-op, but the already
         // terminal row still needs its Check Run/comment projection.
         if let Ok(Some(completed)) = self.store.code_review_job(&job_id) {
@@ -4516,6 +4516,10 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bool>) -> bool {
+    status == "failed" && finish_transition != Some(false)
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -6377,6 +6381,14 @@ mod tests {
         .to_string();
         assert!(error.contains("review status comment failed: comment unavailable"));
         assert!(error.contains("Check Run failed: check unavailable"));
+    }
+
+    #[test]
+    fn review_failure_logging_distinguishes_store_errors_from_supersession() {
+        assert!(should_log_code_review_job_failure("failed", Some(true)));
+        assert!(should_log_code_review_job_failure("failed", None));
+        assert!(!should_log_code_review_job_failure("failed", Some(false)));
+        assert!(!should_log_code_review_job_failure("stale", None));
     }
 
     #[test]
