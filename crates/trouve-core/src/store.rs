@@ -4444,7 +4444,15 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET publication_claimed = 1
              WHERE id = ?1 AND status = 'running'
-               AND cancel_requested = 0 AND publication_claimed = 0",
+               AND cancel_requested = 0 AND publication_claimed = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND newer.rowid > code_review_jobs.rowid
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
             params![id],
         )? > 0)
     }

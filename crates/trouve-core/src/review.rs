@@ -283,6 +283,10 @@ impl CodeReviewRuntime {
         lock
     }
 
+    fn publication_lock(&self, repository: &str, pull_number: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.projection_lock(format!("publication:{repository}#{pull_number}"))
+    }
+
     fn cancel_superseded(&self, job_ids: &[String]) {
         let running = self.running.lock().unwrap();
         for job_id in job_ids {
@@ -633,6 +637,11 @@ fn manual_request_can_satisfy_automatic_review(
 struct PublishedReview {
     id: u64,
     html_url: String,
+}
+
+struct GithubReviewBodies {
+    primary: String,
+    without_inline_comments: String,
 }
 
 #[derive(Deserialize)]
@@ -3546,6 +3555,11 @@ impl Engine {
         )?;
 
         let publication_started = Instant::now();
+        let publication_lock = self
+            .code_review
+            .publication_lock(&job.repository, job.pull_number);
+        let _publication_guard = publication_lock.lock().await;
+        ensure_review_current(superseded)?;
         // Reviewer and coordinator work can outlive the installation token
         // used during preparation. Rebuild the client here so the token cache
         // can refresh a token that is expired or within its five-minute
@@ -3554,11 +3568,9 @@ impl Engine {
             .installation_api(job.installation_id)
             .await
             .context("refreshing GitHub App credentials before publication")?;
+        let pull_path = format!("/repos/{}/pulls/{}", job.repository, job.pull_number);
         let (current, rate): (GithubPullRequest, _) = api
-            .get_cached(
-                &format!("/repos/{}/pulls/{}", job.repository, job.pull_number),
-                &self.code_review.rest_cache,
-            )
+            .get(&pull_path)
             .await
             .context("revalidating pull request before publication")?;
         self.record_review_rate(rate);
@@ -3569,7 +3581,7 @@ impl Engine {
             bail!("stale: pull request revision changed before the review was published");
         }
         if !self.store.claim_code_review_publication(&job.id)? {
-            bail!("stale: review was cancelled before publication");
+            bail!("stale: review was cancelled or replaced before publication");
         }
         let candidate_count = candidates.len() as u64;
         let stored_findings = parsed
@@ -3612,8 +3624,42 @@ impl Engine {
             &stored_findings,
             &candidate_rejections,
         )?;
+        ensure_review_current(superseded)?;
+        let (current, rate): (GithubPullRequest, _) = api
+            .get(&pull_path)
+            .await
+            .context("revalidating pull request before publication")?;
+        self.record_review_rate(rate);
+        if current.state != "open"
+            || current.base.sha != job.base_ref
+            || current.head.sha != job.head_sha
+        {
+            bail!("stale: pull request revision changed before the review was published");
+        }
+        ensure_review_current(superseded)?;
+        let previous_finding_ids = previous_findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        let resolved_finding_ids = parsed
+            .resolved_finding_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let has_unresolved_findings = review_has_unresolved_findings(
+            persisted.len(),
+            &previous_finding_ids,
+            &resolved_finding_ids,
+        );
         let review_url = self
-            .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
+            .publish_review(
+                &api,
+                &job,
+                &parsed.summary,
+                &prompt_for_agents,
+                &persisted,
+                has_unresolved_findings,
+            )
             .await
             .context("publishing GitHub pull request review")?;
         let fixed = self
@@ -4103,6 +4149,7 @@ impl Engine {
         summary: &str,
         prompt_for_agents: &str,
         findings: &[trouve_protocol::CodeReviewFinding],
+        has_unresolved_findings: bool,
     ) -> Result<String> {
         let summary = if summary.trim().is_empty() {
             if findings.is_empty() {
@@ -4135,36 +4182,8 @@ impl Engine {
             "/repos/{}/pulls/{}/reviews",
             job.repository, job.pull_number
         );
-        let event = github_review_event(!findings.is_empty());
-        let request = serde_json::json!({
-            "commit_id": job.head_sha,
-            "body": review_body,
-            "event": event,
-            "comments": comments,
-        });
-        let response = api
-            .request(reqwest::Method::POST, &path)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        let rate = rate_info(response.headers());
-        let body = response.text().await?;
-        self.record_review_rate(rate);
-        if status.is_success() {
-            let published = serde_json::from_str::<PublishedReview>(&body)?;
-            self.capture_published_review_comments(api, job, published.id, findings)
-                .await?;
-            return Ok(published.html_url);
-        }
-        if status.as_u16() != 422 || comments.is_empty() {
-            bail!("GitHub API {status}: {}", compact_api_error(&body));
-        }
-
-        // A model can name a line that is not commentable in GitHub's diff.
-        // Preserve the review instead of failing it: fold findings into the
-        // summary and retry without inline comments.
-        let mut fallback = review_body;
+        let event = github_review_event(has_unresolved_findings);
+        let mut fallback = review_body.clone();
         fallback.push_str("\n\n### Inline comments that GitHub could not place\n\n");
         for finding in findings {
             fallback.push_str(&format!(
@@ -4175,18 +4194,78 @@ impl Engine {
                 finding.body
             ));
         }
-        let (published, rate): (PublishedReview, _) = api
-            .post(
+        let (published, comments_published) = self
+            .submit_github_review(
+                api,
                 &path,
-                &serde_json::json!({
-                    "commit_id": job.head_sha,
-                    "body": fallback,
-                    "event": event,
-                }),
+                &job.head_sha,
+                GithubReviewBodies {
+                    primary: review_body,
+                    without_inline_comments: fallback,
+                },
+                event,
+                &comments,
             )
             .await?;
-        self.record_review_rate(rate);
+        if comments_published {
+            self.capture_published_review_comments(api, job, published.id, findings)
+                .await?;
+        }
         Ok(published.html_url)
+    }
+
+    async fn submit_github_review(
+        &self,
+        api: &GithubApi,
+        path: &str,
+        commit_id: &str,
+        bodies: GithubReviewBodies,
+        requested_event: &str,
+        comments: &[serde_json::Value],
+    ) -> Result<(PublishedReview, bool)> {
+        let mut body = bodies.primary;
+        let mut event = requested_event;
+        let mut include_comments = !comments.is_empty();
+        loop {
+            let request = serde_json::json!({
+                "commit_id": commit_id,
+                "body": body,
+                "event": event,
+                "comments": if include_comments { comments } else { &[] },
+            });
+            let response = api
+                .request(reqwest::Method::POST, path)
+                .json(&request)
+                .send()
+                .await?;
+            let status = response.status();
+            let rate = rate_info(response.headers());
+            let response_body = response.text().await?;
+            self.record_review_rate(rate);
+            if status.is_success() {
+                return Ok((
+                    serde_json::from_str::<PublishedReview>(&response_body)?,
+                    include_comments,
+                ));
+            }
+            if status.as_u16() != 422 {
+                bail!("GitHub API {status}: {}", compact_api_error(&response_body));
+            }
+            if event != "COMMENT"
+                && (!include_comments || github_rejected_own_pull_verdict(&response_body))
+            {
+                event = "COMMENT";
+                continue;
+            }
+            if include_comments {
+                // A model can name a line that is not commentable in GitHub's
+                // diff. Preserve the review by folding findings into its body.
+                include_comments = false;
+                body = bodies.without_inline_comments.clone();
+                continue;
+            }
+            bail!("GitHub API {status}: {}", compact_api_error(&response_body));
+        }
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -4519,6 +4598,8 @@ impl Engine {
         repository: &str,
         pull: &GithubPullRequest,
     ) -> Result<()> {
+        let publication_lock = self.code_review.publication_lock(repository, pull.number);
+        let _publication_guard = publication_lock.lock().await;
         let pull_state = self.store.code_review_pull_state(repository, pull.number)?;
         if pull_state.last_reviewed_head_sha != pull.head.sha
             || self.store.code_review_pull_has_active_job(
@@ -4554,9 +4635,12 @@ impl Engine {
             return Ok(());
         }
 
-        if resolved.len() == open_findings.len() {
-            self.publish_resolved_findings_approval(api, repository, pull)
-                .await?;
+        if resolved.len() == open_findings.len()
+            && !self
+                .publish_resolved_findings_approval(api, repository, pull)
+                .await?
+        {
+            return Ok(());
         }
 
         let mut changed_jobs = HashSet::new();
@@ -4585,7 +4669,13 @@ impl Engine {
         api: &GithubApi,
         repository: &str,
         pull: &GithubPullRequest,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self
+            .store
+            .code_review_pull_has_active_job(repository, pull.number, &pull.head.sha)?
+        {
+            return Ok(false);
+        }
         let path = format!("/repos/{repository}/pulls/{}", pull.number);
         let (current, rate): (GithubPullRequest, _) = api.get(&path).await?;
         self.record_review_rate(rate);
@@ -4595,23 +4685,30 @@ impl Engine {
         {
             bail!("stale: pull request revision changed before approval");
         }
+        if self
+            .store
+            .code_review_pull_has_active_job(repository, pull.number, &pull.head.sha)?
+        {
+            return Ok(false);
+        }
         let body = format!(
             "All Trouve inline findings for this revision have been resolved.\n\n\
              <!-- trouve-code-review resolution-approval:{} -->",
             pull.head.sha
         );
-        let (_published, rate): (PublishedReview, _) = api
-            .post(
-                &format!("{path}/reviews"),
-                &serde_json::json!({
-                    "commit_id": pull.head.sha,
-                    "body": body,
-                    "event": github_review_event(false),
-                }),
-            )
-            .await?;
-        self.record_review_rate(rate);
-        Ok(())
+        self.submit_github_review(
+            api,
+            &format!("{path}/reviews"),
+            &pull.head.sha,
+            GithubReviewBodies {
+                primary: body.clone(),
+                without_inline_comments: body,
+            },
+            github_review_event(false),
+            &[],
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn resolve_fixed_review_findings(
@@ -4720,6 +4817,23 @@ fn github_review_event(has_findings: bool) -> &'static str {
     } else {
         "APPROVE"
     }
+}
+
+fn review_has_unresolved_findings(
+    current_finding_count: usize,
+    previous_finding_ids: &[&str],
+    resolved_finding_ids: &[&str],
+) -> bool {
+    current_finding_count > 0
+        || previous_finding_ids
+            .iter()
+            .any(|id| !resolved_finding_ids.contains(id))
+}
+
+fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
+    let body = response_body.to_ascii_lowercase();
+    body.contains("own pull request")
+        && (body.contains("approve") || body.contains("request changes"))
 }
 
 fn review_threads_by_comment(response: &serde_json::Value) -> HashMap<u64, (String, bool)> {
@@ -6158,6 +6272,37 @@ mod tests {
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
     }
 
+    #[test]
+    fn github_review_verdict_keeps_unresolved_previous_findings_open() {
+        assert!(review_has_unresolved_findings(1, &[], &[]));
+        assert!(review_has_unresolved_findings(0, &["old"], &[]));
+        assert!(!review_has_unresolved_findings(0, &["old"], &["old"]));
+    }
+
+    #[test]
+    fn own_pull_verdict_rejections_are_detected_without_hiding_line_errors() {
+        assert!(github_rejected_own_pull_verdict(
+            r#"{"message":"Can not approve your own pull request"}"#
+        ));
+        assert!(github_rejected_own_pull_verdict(
+            r#"{"message":"Can not request changes on your own pull request"}"#
+        ));
+        assert!(!github_rejected_own_pull_verdict(
+            r#"{"message":"line must be part of the diff"}"#
+        ));
+    }
+
+    #[test]
+    fn newer_same_revision_job_blocks_older_publication() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let older = enqueue_test_review_job(&store, "acme/widgets#42:older");
+        let claimed = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(claimed.job.id, older.id);
+        enqueue_test_review_job(&store, "acme/widgets#42:newer");
+
+        assert!(!store.claim_code_review_publication(&older.id).unwrap());
+    }
+
     #[tokio::test]
     async fn resolved_inline_findings_on_unchanged_head_publish_approval() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -6222,9 +6367,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (expected, response_body, expected_body) in [
+            for (expected, status, response_body, expected_body) in [
                 (
                     "post /graphql http/1.1\r\n",
+                    "200 OK",
                     serde_json::json!({
                         "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [{
                             "id": "PRRT_1",
@@ -6237,6 +6383,7 @@ mod tests {
                 ),
                 (
                     "get /repos/acme/widgets/pulls/42 http/1.1\r\n",
+                    "200 OK",
                     serde_json::json!({
                         "number": 42,
                         "title": "Ship widgets",
@@ -6258,12 +6405,22 @@ mod tests {
                 ),
                 (
                     "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
+                    "422 Unprocessable Entity",
+                    serde_json::json!({
+                        "message": "Can not approve your own pull request"
+                    })
+                    .to_string(),
+                    Some("\"event\":\"approve\""),
+                ),
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews http/1.1\r\n",
+                    "200 OK",
                     serde_json::json!({
                         "id": 123,
                         "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-123"
                     })
                     .to_string(),
-                    Some("\"event\":\"approve\""),
+                    Some("\"event\":\"comment\""),
                 ),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -6299,7 +6456,7 @@ mod tests {
                     assert!(request.contains(expected_body), "{request}");
                 }
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
                     response_body.len()
                 );
