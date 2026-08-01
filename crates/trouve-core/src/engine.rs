@@ -1615,6 +1615,7 @@ fn resolved_thinking_level(
 
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
+type SubscriptionHealthCacheEntry = Arc<tokio::sync::Mutex<Option<(Instant, (u8, i64))>>>;
 
 const GITHUB_PR_DETAIL_CACHE_CAPACITY: usize = 48;
 
@@ -1904,6 +1905,10 @@ pub struct Engine {
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
+    /// Short-lived, per-provider live allowance ranks. Each entry has its own
+    /// async lock so concurrent turns share one refresh without serializing
+    /// probes for different providers.
+    subscription_health_cache: Mutex<HashMap<String, SubscriptionHealthCacheEntry>>,
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
@@ -2337,6 +2342,7 @@ impl Engine {
             injected_providers: Mutex::new(injected_providers),
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
+            subscription_health_cache: Mutex::new(HashMap::new()),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
@@ -2766,6 +2772,7 @@ impl Engine {
     /// Register (or replace) an agent backend instance under an id. Survives
     /// config-driven registry reloads (tests, embedders).
     pub fn with_backend(self, id: &str, backend: Arc<dyn AgentBackend>) -> Self {
+        self.subscription_health_cache.lock().unwrap().remove(id);
         self.injected_backends
             .lock()
             .unwrap()
@@ -3093,15 +3100,10 @@ impl Engine {
         let mut scored = futures::future::join_all(candidates.into_iter().map(|candidate| async {
             let rank = match &candidate.executor {
                 ModelExecutor::Native(_) => (1u8, 0i64),
-                ModelExecutor::Backend(backend) => match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    backend.subscription_health(),
-                )
-                .await
-                {
-                    Ok(Some(health)) => subscription_health_rank(&health),
-                    _ => (1, 0),
-                },
+                ModelExecutor::Backend(backend) => {
+                    self.cached_subscription_health_rank(&candidate.provider_id, backend)
+                        .await
+                }
             };
             let preferred = preference.get(candidate.provider_id.as_str()).copied();
             let route = learned.get(&(
@@ -3137,6 +3139,35 @@ impl Engine {
             .into_iter()
             .map(|(_, _, candidate)| candidate)
             .collect())
+    }
+
+    async fn cached_subscription_health_rank(
+        &self,
+        provider_id: &str,
+        backend: &Arc<dyn AgentBackend>,
+    ) -> (u8, i64) {
+        let entry = {
+            let mut cache = self.subscription_health_cache.lock().unwrap();
+            cache
+                .entry(provider_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+                .clone()
+        };
+        let mut cached = entry.lock().await;
+        if let Some((at, rank)) = *cached
+            && at.elapsed() < SUBSCRIPTION_HEALTH_CACHE_TTL
+        {
+            return rank;
+        }
+        let rank =
+            match tokio::time::timeout(SUBSCRIPTION_HEALTH_TIMEOUT, backend.subscription_health())
+                .await
+            {
+                Ok(Some(health)) => subscription_health_rank(&health),
+                _ => (1, 0),
+            };
+        *cached = Some((Instant::now(), rank));
+        rank
     }
 
     /// Provider ids that keep working without internet: the built-in local
@@ -3439,15 +3470,9 @@ impl Engine {
     /// Replace the explicit provider preference prefix. Omitted providers
     /// remain routable after the listed entries.
     pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
-        let known: HashSet<String> = self
-            .providers
-            .read()
-            .unwrap()
-            .keys()
-            .chain(self.backends.read().unwrap().keys())
-            .cloned()
-            .chain(self.config.lock().unwrap().providers.keys().cloned())
-            .collect();
+        let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
+        known.extend(self.backends.read().unwrap().keys().cloned());
+        known.extend(self.config.lock().unwrap().providers.keys().cloned());
         let mut seen = HashSet::new();
         for id in provider_ids {
             if !known.contains(id) {
@@ -5012,6 +5037,7 @@ impl Engine {
             backends.insert(id.clone(), b.clone());
         }
         *self.backends.write().unwrap() = backends;
+        self.subscription_health_cache.lock().unwrap().clear();
     }
 
     pub fn thread_usage(

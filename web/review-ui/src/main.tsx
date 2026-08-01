@@ -51,6 +51,7 @@ import {
   defaultThinkingSelection,
   modelForSelection,
   modelSelectionValue,
+  supplementalModelSelection,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
@@ -130,6 +131,31 @@ function navigate(section: Section, id = ""): void {
 
 function formatDate(value?: string): string {
   return value ? new Date(value).toLocaleString() : "—";
+}
+
+function ModelOptions({
+  models,
+  selection,
+}: {
+  models: readonly Model[];
+  selection?: string;
+}) {
+  const supplemental = supplementalModelSelection(models, selection);
+  return (
+    <>
+      {supplemental && (
+        <option value={supplemental.value} key={`selected:${supplemental.value}`}>
+          {supplemental.kind === "pinned" ? "Pinned provider route" : "Unavailable model"}
+          {" · "}{supplemental.value}
+        </option>
+      )}
+      {models.map((model) => (
+        <option value={model.id} key={model.id}>
+          {model.display_name} · {model.id}
+        </option>
+      ))}
+    </>
+  );
 }
 
 function duration(milliseconds: number): string {
@@ -2132,7 +2158,7 @@ function RepositoryEditor({
           <label>
             Coordinator and fallback model
             <select
-              value={modelSelectionValue(models, draft.model)}
+              value={modelSelectionValue(draft.model)}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
                 const selectedCoordinatorModel = modelForSelection(models, model);
@@ -2171,11 +2197,7 @@ function RepositoryEditor({
               }}
             >
               <option value="">Select a model</option>
-              {models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name} · {model.id}
-                </option>
-              ))}
+              <ModelOptions models={models} selection={draft.model} />
             </select>
             <small>
               {models.length
@@ -2206,7 +2228,7 @@ function RepositoryEditor({
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
-              value={modelSelectionValue(models, draft.router_model)}
+              value={modelSelectionValue(draft.router_model)}
               disabled={!semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
@@ -2225,11 +2247,7 @@ function RepositoryEditor({
               }}
             >
               <option value="">Inherit coordinator/fallback model</option>
-              {models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name} · {model.id}
-                </option>
-              ))}
+              <ModelOptions models={models} selection={draft.router_model} />
             </select>
             <small>
               Runs the lightweight, read-only triage pass that may add relevant personas.
@@ -2362,7 +2380,7 @@ function RepositoryEditor({
                   <label>
                     Model
                     <select
-                      value={modelSelectionValue(models, override?.model)}
+                      value={modelSelectionValue(override?.model)}
                       onChange={(event) => {
                         const model = event.currentTarget.value || undefined;
                         const selectedModel = modelForSelection(
@@ -2381,11 +2399,7 @@ function RepositoryEditor({
                       <option value="">
                         Inherit · {reviewer.model || draft.model || "no model"}
                       </option>
-                      {models.map((model) => (
-                        <option value={model.id} key={model.id}>
-                          {model.display_name} · {model.id}
-                        </option>
-                      ))}
+                      <ModelOptions models={models} selection={override?.model} />
                     </select>
                     <small>
                       Overrides the model for this persona in this repository only.
@@ -2550,7 +2564,7 @@ function ReviewerEditor({
       <label>
         Default model
         <select
-          value={modelSelectionValue(models, draft.model)}
+          value={modelSelectionValue(draft.model)}
           onChange={(event) => {
             const model = event.currentTarget.value || undefined;
             setDraft({
@@ -2565,11 +2579,7 @@ function ReviewerEditor({
           }}
         >
           <option value="">Inherit repository/system</option>
-          {models.map((model) => (
-            <option value={model.id} key={model.id}>
-              {model.display_name} · {model.id}
-            </option>
-          ))}
+          <ModelOptions models={models} selection={draft.model} />
         </select>
         <small>
           Sets this persona's reusable model. Repository-specific persona overrides take
@@ -3118,7 +3128,7 @@ function ReviewPersonaSettings({
             <label>
               Default model
               <select
-                value={modelSelectionValue(models, model)}
+                value={modelSelectionValue(model)}
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
@@ -3131,11 +3141,7 @@ function ReviewPersonaSettings({
                 <option value="">
                   Inherit global{globalModel ? ` · ${globalModel}` : ""}
                 </option>
-                {models.map((candidate) => (
-                  <option value={candidate.id} key={candidate.id}>
-                    {candidate.display_name} · {candidate.id}
-                  </option>
-                ))}
+                <ModelOptions models={models} selection={model} />
               </select>
               <small>
                 Manual review threads inherit this model. Automated jobs continue to use
@@ -3484,7 +3490,7 @@ function ProviderSettings({
         <label>
           Global default model
           <select
-            value={modelSelectionValue(models, defaultModel)}
+            value={modelSelectionValue(defaultModel)}
             onChange={(event) => {
               const next = event.currentTarget.value;
               setDefaultModel(next);
@@ -3497,9 +3503,7 @@ function ProviderSettings({
             }}
             required
           >
-            {models.map((model) => (
-              <option value={model.id} key={model.id}>{model.display_name} · {model.id}</option>
-            ))}
+            <ModelOptions models={models} selection={defaultModel} />
           </select>
           <small>
             Base model for interactive threads and settings that inherit the global default.
