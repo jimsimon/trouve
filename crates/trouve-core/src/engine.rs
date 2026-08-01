@@ -6304,12 +6304,10 @@ impl Engine {
         // than surfacing that the provider omitted the required metadata.
         let live = provider.list_models().await;
         let known = provider.models();
-        let reported_context_window = live
-            .iter()
-            .chain(known.iter())
-            .find(|m| m.id == thread.model)
-            .map(|m| m.context_window)
-            .filter(|w| *w > 0);
+        let reported_context_window = live.iter().chain(known.iter()).find_map(|m| {
+            (model_name_for_provider(provider.id(), &m.id) == model_name && m.context_window > 0)
+                .then_some(m.context_window)
+        });
         let context_window = (context_window > 0)
             .then_some(context_window)
             .or(reported_context_window);

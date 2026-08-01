@@ -33,13 +33,12 @@ use trouve_protocol::{
     QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, RoutedModelInfo, Scope,
     SendMessageRequest, ServerInfo, Session, SessionDiff, SetCodeReviewSettingsRequest,
-    SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
-    SetProviderOrderRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
-    TerminalResizeRequest, Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest,
+    SetLocalEnabledRequest, SetProviderOrderRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 

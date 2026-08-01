@@ -6436,16 +6436,13 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("provider {id} is no longer listed"));
                     return Ok(());
                 };
-                let target = if offset < 0 {
-                    index.checked_sub(1)
-                } else {
-                    index
-                        .checked_add(1)
-                        .filter(|target| *target < self.provider_order.len())
-                };
-                let Some(target) = target else {
+                let Some(last) = self.provider_order.len().checked_sub(1) else {
                     return Ok(());
                 };
+                let target = (index as i64 + i64::from(offset)).clamp(0, last as i64) as usize;
+                if target == index {
+                    return Ok(());
+                }
                 let mut order = self.provider_order.clone();
                 order.swap(index, target);
                 match self.client.set_provider_order(order.clone()).await {

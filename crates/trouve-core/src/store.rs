@@ -5821,6 +5821,12 @@ mod tests {
         assert_eq!(second.consecutive_failures, 2);
         assert!(second.retry_after.unwrap() >= now + 20);
 
+        let third = store
+            .record_route_failure("provider", "model", 10, 25)
+            .unwrap();
+        assert_eq!(third.consecutive_failures, 3);
+        assert!(third.retry_after.unwrap() >= now + 25);
+
         store.record_route_success("provider", "model").unwrap();
         let health = store.route_health().unwrap();
         let route = &health[&("provider".to_string(), "model".to_string())];

@@ -569,6 +569,14 @@ impl Provider for CompactingProvider {
         }]
     }
 
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut models = self.models();
+        // Exercise compaction's route-specific metadata fallback: the routed
+        // catalog has no window, while the provider's static metadata does.
+        models[0].context_window = 0;
+        models
+    }
+
     async fn stream_chat(
         &self,
         _model: &str,
@@ -638,7 +646,7 @@ async fn compaction_summarizes_transcript_near_context_window() {
                     calls: AtomicUsize::new(0),
                 }),
             )
-            .with_default_model("scripted/tiny-model"),
+            .with_default_model("tiny-model"),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1648,42 +1656,13 @@ async fn neutral_native_model_resumes_on_capacity_exhaustion() {
             .with_provider("native-b", fallback.clone())
             .with_default_model("native-shared-model"),
     );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let router = trouve_server::build_router(engine);
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let base = format!("http://{addr}/v1");
-    let client = reqwest::Client::new();
-
-    let ws: serde_json::Value = client
-        .post(format!("{base}/workspaces"))
-        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let session: serde_json::Value = client
-        .post(format!("{base}/sessions"))
-        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Native routing"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let thread: serde_json::Value = client
-        .post(format!("{base}/threads"))
-        .json(&serde_json::json!({"session_id": session["id"]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let thread_id = thread["id"].as_str().unwrap();
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Native routing",
+        RoutingThreadSettings::default(),
+    )
+    .await;
 
     client
         .post(format!("{base}/threads/{thread_id}/messages"))
@@ -2342,6 +2321,107 @@ impl trouve_agents::AgentBackend for CapacityBackend {
     }
 }
 
+struct HangingToolBackend;
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for HangingToolBackend {
+    fn id(&self) -> &str {
+        "hanging"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "hanging/cancel-model".into(),
+            display_name: "Cancel Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        _turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let started = futures::stream::iter([Ok(trouve_agents::BackendEvent::ToolStarted {
+            call_id: "cancelled_tool".into(),
+            tool: "shell".into(),
+            args: serde_json::json!({"cmd": "still running"}),
+        })]);
+        let pending = futures::stream::pending::<
+            Result<trouve_agents::BackendEvent, trouve_agents::BackendError>,
+        >();
+        Ok(Box::pin(started.chain(pending)))
+    }
+}
+
+#[tokio::test]
+async fn cancelling_backend_turn_aborts_open_tool_cards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("hanging", Arc::new(HangingToolBackend))
+            .with_default_model("cancel-model"),
+    );
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Cancel backend tool",
+        RoutingThreadSettings::default(),
+    )
+    .await;
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "start a tool"}))
+        .send()
+        .await
+        .unwrap();
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "tool.started" && event["call_id"] == "cancelled_tool"
+    })
+    .await;
+
+    let response = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.cancelled"
+    })
+    .await;
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool.completed"
+            && event["call_id"] == "cancelled_tool"
+            && event["status"] == "aborted"
+    }));
+}
+
 #[tokio::test]
 async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2359,13 +2439,8 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
             .with_backend("fallback", fallback.clone())
             .with_default_model("shared-model"),
     );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let router = trouve_server::build_router(engine);
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let base = format!("http://{addr}/v1");
-    let client = reqwest::Client::new();
+    let (client, base, thread_id) =
+        start_routing_test_thread(engine, &repo, "Routing", RoutingThreadSettings::default()).await;
 
     let routes: serde_json::Value = client
         .get(format!("{base}/model-routes"))
@@ -2382,28 +2457,8 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
         .find(|model| model["id"] == "shared-model")
         .expect("provider-neutral catalog entry");
     assert_eq!(shared["routes"].as_array().unwrap().len(), 2);
-
-    let ws: serde_json::Value = client
-        .post(format!("{base}/workspaces"))
-        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let session: serde_json::Value = client
-        .post(format!("{base}/sessions"))
-        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Routing"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
     let thread: serde_json::Value = client
-        .post(format!("{base}/threads"))
-        .json(&serde_json::json!({"session_id": session["id"]}))
+        .get(format!("{base}/threads/{thread_id}"))
         .send()
         .await
         .unwrap()
@@ -2411,7 +2466,6 @@ async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
         .await
         .unwrap();
     assert_eq!(thread["model"], "shared-model");
-    let thread_id = thread["id"].as_str().unwrap();
     let events_url = format!("{base}/threads/{thread_id}/events");
 
     client
