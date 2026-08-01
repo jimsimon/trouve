@@ -482,6 +482,19 @@ fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()>
 }
 
 fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-finding-publication-status-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
     conn.execute_batch(
         "UPDATE code_review_findings
          SET github_publication_status = 'published'
@@ -490,6 +503,10 @@ fn migrate_code_review_finding_publication_status(conn: &Connection) -> Result<(
          SET github_publication_status = 'not_eligible'
          WHERE github_publication_status = 'pending'
            AND (trim(path) = '' OR line <= 0);",
+    )?;
+    conn.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
 }
@@ -5027,13 +5044,14 @@ impl Store {
              SET lifecycle_comment_url = ?2,
                  review_url = CASE
                      WHEN status IN ('succeeded', 'failed', 'cancelled', 'stale')
-                          AND review_url = '' THEN ?2
+                          AND (review_url = '' OR review_url = lifecycle_comment_url) THEN ?2
                      ELSE review_url
                  END
              WHERE id = ?1
                AND (lifecycle_comment_url != ?2
                     OR (status IN ('succeeded', 'failed', 'cancelled', 'stale')
-                        AND review_url = ''))",
+                        AND (review_url = ''
+                             OR (review_url = lifecycle_comment_url AND review_url != ?2))))",
             params![id, url],
         )? > 0)
     }
@@ -5896,7 +5914,11 @@ mod tests {
     fn migration_backfills_legacy_finding_publication_outcomes() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE code_review_findings (
+            "CREATE TABLE store_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE code_review_findings (
                 id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
                 line INTEGER NOT NULL,
@@ -5912,7 +5934,6 @@ mod tests {
         .unwrap();
 
         migrate_code_review_finding_publication_status(&conn).unwrap();
-        migrate_code_review_finding_publication_status(&conn).unwrap();
 
         let status = |id| {
             conn.query_row(
@@ -5926,6 +5947,25 @@ mod tests {
         assert_eq!(status("empty-path"), "not_eligible");
         assert_eq!(status("zero-line"), "not_eligible");
         assert_eq!(status("eligible"), "pending");
+
+        conn.execute(
+            "UPDATE code_review_findings SET github_publication_status = 'pending'
+             WHERE id = 'empty-path'",
+            [],
+        )
+        .unwrap();
+        migrate_code_review_finding_publication_status(&conn).unwrap();
+        assert_eq!(status("empty-path"), "pending");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-finding-publication-status-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
