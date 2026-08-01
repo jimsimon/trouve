@@ -1569,6 +1569,23 @@ impl Engine {
         Ok(job)
     }
 
+    pub async fn retry_review_final_editor(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
+        self.retry_code_review_cleanup().await;
+        let job = self
+            .store
+            .retry_code_review_final_editor(id)
+            .map_err(|error| EngineError::BadRequest(error.to_string()))?
+            .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        self.emit_code_review_job_updated(id)?;
+        self.emit_code_review_updated(Some(id.to_owned()))?;
+        self.sync_code_review_projection(&job).await;
+        self.code_review.job_wake.notify_one();
+        Ok(job)
+    }
+
     pub async fn request_code_review(
         self: &Arc<Self>,
         request: trouve_protocol::RequestCodeReviewRequest,
@@ -3155,6 +3172,15 @@ impl Engine {
             },
         );
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
+        let queued_coordinator = self
+            .store
+            .code_review_tasks(&job.id)?
+            .into_iter()
+            .rev()
+            .find(|task| {
+                task.role == trouve_protocol::CodeReviewTaskRole::Coordinator
+                    && task.status == "queued"
+            });
         let mut latest_tasks = HashMap::new();
         for task in existing_tasks {
             if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
@@ -3447,17 +3473,22 @@ impl Engine {
                 &previous_findings,
                 &diff_files,
             )?;
-            let task = self.store.create_code_review_task(&NewCodeReviewTask {
-                job_id: job.id.clone(),
-                role: trouve_protocol::CodeReviewTaskRole::Coordinator,
-                reviewer_id: None,
-                reviewer_name: "Final review editor".into(),
-                batch_index: 0,
-                batch_count: 1,
-                model: Some(coordinator.model.clone()),
-                prompt: prompt.clone(),
-            })?;
-            self.emit_code_review_task(&job.id, task.clone())?;
+            let task = if let Some(task) = queued_coordinator {
+                task
+            } else {
+                let task = self.store.create_code_review_task(&NewCodeReviewTask {
+                    job_id: job.id.clone(),
+                    role: trouve_protocol::CodeReviewTaskRole::Coordinator,
+                    reviewer_id: None,
+                    reviewer_name: "Final review editor".into(),
+                    batch_index: 0,
+                    batch_count: 1,
+                    model: Some(coordinator.model.clone()),
+                    prompt: prompt.clone(),
+                })?;
+                self.emit_code_review_task(&job.id, task.clone())?;
+                task
+            };
             let task = self
                 .store
                 .start_code_review_task(

@@ -28,6 +28,7 @@ import {
   refreshReviews,
   requestReview,
   resetMode,
+  retryFinalEditor,
   retryJob,
   retryPersona,
   saveDefaultModel,
@@ -1017,6 +1018,24 @@ function JobDetailPane({
     }
   };
 
+  const retryFailedFinalEditor = async (): Promise<void> => {
+    if (!detail) return;
+    setBusy("final-editor");
+    try {
+      await retryFinalEditor(detail.job.id);
+      onChanged();
+      const refreshed = await load();
+      const retriedTask = pickPreferredTask(
+        refreshed?.tasks.filter((task) => task.role === "coordinator") ?? [],
+      );
+      setSelectedTaskId(retriedTask?.id ?? "");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
   if (!detail) {
     return (
       <aside class="panel job-detail">
@@ -1416,6 +1435,13 @@ function JobDetailPane({
             <nav class="activity-groups" aria-label="Review personas and batches">
               {activityGroups.map((group) => {
                 const active = group.id === selectedGroup?.id;
+                const retryable =
+                  job.status === "failed" &&
+                  (group.status === "failed" || group.status === "cancelled") &&
+                  Boolean(group.persona || group.id === "coordinator");
+                const retrying = group.persona
+                  ? busy === `persona:${group.persona.reviewer_id}`
+                  : group.id === "coordinator" && busy === "final-editor";
                 return (
                   <div class={`activity-group${active ? " active" : ""}`} key={group.id}>
                     <div class="activity-group-summary">
@@ -1426,19 +1452,19 @@ function JobDetailPane({
                         </span>
                         <StatusPill status={group.status} />
                       </button>
-                      {job.status === "failed" &&
-                        (group.status === "failed" || group.status === "cancelled") &&
-                        group.persona && (
+                      {retryable && (
                           <button
-                            class="compact ghost retry-persona"
+                            class="compact ghost retry-activity"
                             type="button"
                             disabled={Boolean(busy)}
-                            onClick={() => void retryFailedPersona(group.persona!.reviewer_id)}
+                            onClick={() =>
+                              void (group.persona
+                                ? retryFailedPersona(group.persona.reviewer_id)
+                                : retryFailedFinalEditor())
+                            }
                             aria-label={`Retry ${group.name}`}
                           >
-                            {busy === `persona:${group.persona.reviewer_id}`
-                              ? "Retrying…"
-                              : "Retry"}
+                            {retrying ? "Retrying…" : "Retry"}
                           </button>
                         )}
                     </div>
