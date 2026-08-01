@@ -3052,7 +3052,15 @@ impl Engine {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let reviewer_count = reviewers.len();
+        let catalog_reviewer_count = reviewers.len();
+        let selected_reviewer_count = selected_reviewer_count(
+            &routing_decisions,
+            if batches.is_empty() {
+                0
+            } else {
+                catalog_reviewer_count
+            },
+        );
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
         for task in existing_tasks {
@@ -3066,7 +3074,7 @@ impl Engine {
         self.store.set_code_review_job_progress(
             &job.id,
             completed_reviewers,
-            reviewer_count as u64,
+            catalog_reviewer_count as u64,
         )?;
         self.emit_code_review_progress(&job.id)?;
         let mut planned = Vec::new();
@@ -3332,11 +3340,7 @@ impl Engine {
         let coordinator_started = Instant::now();
         let parsed = if candidates.is_empty() && previous_findings.is_empty() {
             ReviewOutput {
-                summary: format!(
-                    "{} reviewer(s) examined {} changed file(s); no actionable issues were confirmed.",
-                    reviewer_count,
-                    diff_files.len()
-                ),
+                summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
                 findings: Vec::new(),
                 rejected_candidates: Vec::new(),
                 resolved_finding_ids: Vec::new(),
@@ -5350,6 +5354,32 @@ fn build_routing_decisions(
         }
     }
     decisions
+}
+
+fn selected_reviewer_count(
+    routing_decisions: &[CodeReviewRoutingDecision],
+    legacy_fallback: usize,
+) -> usize {
+    if routing_decisions.is_empty() {
+        return legacy_fallback;
+    }
+    routing_decisions
+        .iter()
+        .filter(|decision| decision.selected)
+        .map(|decision| decision.reviewer_id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn no_candidate_review_summary(reviewer_count: usize, changed_file_count: usize) -> String {
+    if reviewer_count == 0 {
+        return format!(
+            "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
+        );
+    }
+    format!(
+        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s); no actionable issues were confirmed."
+    )
 }
 
 fn semantic_routing_candidates<'a>(
@@ -7806,6 +7836,11 @@ mod tests {
                 .iter()
                 .any(|reason| reason.source == CodeReviewRoutingSource::Included)
         );
+        assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 4);
+        assert_eq!(
+            no_candidate_review_summary(4, 1),
+            "4 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
+        );
     }
 
     #[test]
@@ -7868,6 +7903,11 @@ mod tests {
                 .reasons
                 .iter()
                 .all(|reason| reason.source != CodeReviewRoutingSource::Included)
+        );
+        assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 0);
+        assert_eq!(
+            no_candidate_review_summary(0, 1),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
         );
     }
 
