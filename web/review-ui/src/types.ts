@@ -218,6 +218,7 @@ export interface Finding {
   path: string;
   line: number;
   side: string;
+  outside_diff: boolean;
   severity: string;
   confidence?: string;
   title: string;
