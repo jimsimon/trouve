@@ -1356,6 +1356,7 @@ function JobDetailPane({
             <header>
               <strong>
                 {finding.severity.toUpperCase()} · {finding.path}:{finding.line}
+                {finding.outside_diff && " · outside diff"}
               </strong>
               <StatusPill status={finding.status} />
             </header>
@@ -1365,7 +1366,9 @@ function JobDetailPane({
             </small>
             <div class="action-row">
               <CopyButton text={finding.prompt_for_agents} />
-              <ExternalLink href={finding.github_comment_url}>Open inline comment ↗</ExternalLink>
+              <ExternalLink href={finding.github_comment_url}>
+                {finding.outside_diff ? "Open review comment ↗" : "Open inline comment ↗"}
+              </ExternalLink>
             </div>
           </article>
         ))}

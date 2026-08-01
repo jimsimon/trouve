@@ -5,6 +5,7 @@
 //! and turns each immutable PR head into a normal trouve review session.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -681,6 +682,10 @@ struct ReviewFinding {
     line: u64,
     #[serde(default = "default_review_side")]
     side: String,
+    /// Derived from the immutable base-to-head diff during structural
+    /// validation. Model-provided values are never trusted.
+    #[serde(default)]
+    outside_diff: bool,
     #[serde(default)]
     severity: String,
     body: String,
@@ -3586,6 +3591,7 @@ impl Engine {
                     path: finding.path.clone(),
                     line: finding.line,
                     side: finding.side.clone(),
+                    outside_diff: finding.outside_diff,
                     severity: finding.severity.clone(),
                     body: finding.body.clone(),
                     prompt_for_agents: finding_prompt_for_agents(&job, finding),
@@ -4110,9 +4116,13 @@ impl Engine {
             .map(|detail| detail.personas)
             .unwrap_or_default();
         let review_body = render_review_body(job, &summary, prompt_for_agents, findings, &personas);
-        let comments: Vec<_> = findings
+        let inline_findings = findings
             .iter()
-            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
+            .filter(|finding| !finding.outside_diff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let comments: Vec<_> = inline_findings
+            .iter()
             .map(|finding| {
                 serde_json::json!({
                     "path": finding.path,
@@ -4143,20 +4153,29 @@ impl Engine {
         self.record_review_rate(rate);
         if status.is_success() {
             let published = serde_json::from_str::<PublishedReview>(&body)?;
-            self.capture_published_review_comments(api, job, published.id, findings)
+            self.capture_published_review_comments(api, job, published.id, &inline_findings)
                 .await?;
+            for finding in findings.iter().filter(|finding| finding.outside_diff) {
+                self.store.update_code_review_finding_publication(
+                    &finding.id,
+                    None,
+                    &published.html_url,
+                    None,
+                )?;
+            }
             return Ok(published.html_url);
         }
         if status.as_u16() != 422 || comments.is_empty() {
             bail!("GitHub API {status}: {}", compact_api_error(&body));
         }
 
-        // A model can name a line that is not commentable in GitHub's diff.
-        // Preserve the review instead of failing it: fold findings into the
-        // summary and retry without inline comments.
+        // The immutable diff classification should keep outside-diff anchors
+        // out of the inline payload. Preserve the review if GitHub still
+        // rejects a supposedly commentable line (for example because its
+        // server-side diff representation differs from local git).
         let mut fallback = review_body;
-        fallback.push_str("\n\n### Inline comments that GitHub could not place\n\n");
-        for finding in findings {
+        fallback.push_str("\n\n### Comments GitHub could not place inline\n\n");
+        for finding in &inline_findings {
             fallback.push_str(&format!(
                 "- `{}` line {} [{}]: {}\n",
                 finding.path,
@@ -4176,6 +4195,14 @@ impl Engine {
             )
             .await?;
         self.record_review_rate(rate);
+        for finding in findings {
+            self.store.update_code_review_finding_publication(
+                &finding.id,
+                None,
+                &published.html_url,
+                None,
+            )?;
+        }
         Ok(published.html_url)
     }
 
@@ -4925,6 +4952,26 @@ fn render_inline_finding(finding: &trouve_protocol::CodeReviewFinding) -> String
     )
 }
 
+fn render_outside_diff_findings(findings: &[&trouve_protocol::CodeReviewFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut body = format!(
+        "\n<details><summary>⚠️ Outside diff range comments ({})</summary>\n\n",
+        findings.len()
+    );
+    for finding in findings {
+        body.push_str(&format!(
+            "#### `{}` line {}\n\n{}\n\n",
+            finding.path,
+            finding.line,
+            render_inline_finding(finding)
+        ));
+    }
+    body.push_str("</details>\n");
+    body
+}
+
 fn render_review_body(
     job: &trouve_protocol::CodeReviewJob,
     summary: &str,
@@ -4955,25 +5002,27 @@ fn render_review_body(
             persona.confirmed_issue_count,
         ));
     }
-    if !findings.is_empty() {
-        body.push_str("\n### Confirmed issues\n\n");
-        for finding in findings {
-            let location = if finding.github_comment_url.is_empty() {
-                format!("`{}` line {}", finding.path, finding.line)
-            } else {
-                format!(
-                    "[`{}` line {}]({})",
-                    finding.path, finding.line, finding.github_comment_url
-                )
-            };
+    let inline_findings = findings
+        .iter()
+        .filter(|finding| !finding.outside_diff)
+        .collect::<Vec<_>>();
+    if !inline_findings.is_empty() {
+        body.push_str("\n### Inline comments\n\n");
+        for finding in inline_findings {
             body.push_str(&format!(
-                "- **{}** — {}: {}\n",
+                "- **{}** — `{}` line {}: {}\n",
                 finding.severity.to_ascii_uppercase(),
-                location,
+                finding.path,
+                finding.line,
                 finding.body
             ));
         }
     }
+    let outside_findings = findings
+        .iter()
+        .filter(|finding| finding.outside_diff)
+        .collect::<Vec<_>>();
+    body.push_str(&render_outside_diff_findings(&outside_findings));
     body.push_str(&format!(
         "\n<details><summary>Prompt for agents</summary>\n\n```text\n{}\n```\n\n</details>\n\n\
          _Reviewed by trouve._\n\n<!-- trouve-code-review summary job:{} -->",
@@ -5642,10 +5691,13 @@ fn reviewer_prompt(
          {extra}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
          You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
          {reviewer_instructions}\n\nRouting rationale:\n{routing}\n\n\
-         Review every supplied file or fragment. Inspect relevant \
-         unchanged code with read/search tools only when the supplied diff leaves a concrete \
-         ambiguity. Report only actionable problems introduced by the change. Do not ask \
-         questions and do not modify files.\n\n{execution_guidance}\n\n\
+         Review every supplied file or fragment. Inspect relevant unchanged callers, consumers, \
+         tests, and configuration with read/search tools when needed to verify the change's \
+         impact. Report only actionable problems introduced by the change. A finding may point \
+         to an unchanged line or file outside the supplied diff only when that is the strongest \
+         concrete anchor for an impact introduced by this revision; use the exact head-revision \
+         path and line with side RIGHT. Do not ask questions and do not modify files.\n\n\
+         {execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
@@ -5704,7 +5756,10 @@ fn validation_prompt(
          the diff and repository. Remove false positives, issues not introduced by this \
          revision, non-actionable style preferences, and duplicates. Merge overlapping \
          findings, correct path/side/line metadata, normalize severity to high/medium/low, \
-         and retain only findings a maintainer should act on. Exact relevant diff context is \
+         and retain only findings a maintainer should act on. Preserve an outside-diff anchor \
+         only when repository evidence shows this revision introduced the impact and the \
+         unchanged head-revision line is the clearest location; otherwise move the finding to a \
+         commentable diff line or reject it. Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
@@ -5886,15 +5941,26 @@ fn normalize_finding(
         .unwrap_or(finding.path.trim())
         .to_string();
     finding.body = finding.body.trim().chars().take(4_000).collect();
-    if finding.path.is_empty() || finding.line == 0 || finding.body.is_empty() {
+    let safe_path = !finding.path.is_empty()
+        && !Path::new(&finding.path).is_absolute()
+        && Path::new(&finding.path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if !safe_path || finding.line == 0 || finding.body.is_empty() {
         return None;
     }
     let mut left = finding.side.eq_ignore_ascii_case("LEFT");
-    if !valid.contains(&(finding.path.clone(), finding.line, left)) {
+    if valid.contains(&(finding.path.clone(), finding.line, left)) {
+        finding.outside_diff = false;
+    } else {
         if valid.contains(&(finding.path.clone(), finding.line, !left)) {
             left = !left;
+            finding.outside_diff = false;
         } else {
-            return None;
+            // GitHub cannot attach a line thread outside the patch. Keep the
+            // exact head-revision anchor for a review-body finding instead.
+            left = false;
+            finding.outside_diff = true;
         }
     }
     finding.side = if left { "LEFT" } else { "RIGHT" }.into();
@@ -6963,7 +7029,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_validation_fixes_sides_and_deduplicates_candidates() {
+    fn structural_validation_classifies_outside_diff_candidates() {
         let files = vec![ReviewDiffFile {
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
@@ -6977,6 +7043,7 @@ mod tests {
                 path: path.into(),
                 line: 3,
                 side: side.into(),
+                outside_diff: false,
                 severity: "critical".into(),
                 body: body.into(),
                 source_candidate_ids: vec![format!("candidate-{body}")],
@@ -6987,13 +7054,47 @@ mod tests {
                 candidate("b/src/lib.rs", "LEFT", "real issue"),
                 candidate("src/lib.rs", "RIGHT", "real issue"),
                 candidate("src/other.rs", "RIGHT", "not in diff"),
+                candidate("../secrets", "RIGHT", "unsafe path"),
             ],
             &files,
         );
-        assert_eq!(valid.len(), 1);
-        assert_eq!(valid[0].finding.path, "src/lib.rs");
-        assert_eq!(valid[0].finding.side, "RIGHT");
-        assert_eq!(valid[0].finding.severity, "medium");
+        assert_eq!(valid.len(), 2);
+        let inline = &valid[0].finding;
+        assert_eq!(inline.path, "src/lib.rs");
+        assert_eq!(inline.side, "RIGHT");
+        assert!(!inline.outside_diff);
+        assert_eq!(inline.severity, "medium");
+        let outside = &valid[1].finding;
+        assert_eq!(outside.path, "src/other.rs");
+        assert_eq!(outside.side, "RIGHT");
+        assert!(outside.outside_diff);
+    }
+
+    #[test]
+    fn outside_diff_findings_render_in_a_collapsible_review_section() {
+        let finding = trouve_protocol::CodeReviewFinding {
+            id: "rvf_outside".into(),
+            job_id: "rvj_test".into(),
+            path: "src/consumer.rs".into(),
+            line: 47,
+            side: "RIGHT".into(),
+            outside_diff: true,
+            severity: "high".into(),
+            body: "The changed API makes this unchanged call panic.".into(),
+            prompt_for_agents: "Update the consumer safely.".into(),
+            status: "open".into(),
+            sources: Vec::new(),
+            github_comment_id: None,
+            github_comment_url: String::new(),
+            github_thread_id: None,
+            resolved_at: None,
+        };
+
+        let body = render_outside_diff_findings(&[&finding]);
+        assert!(body.contains("Outside diff range comments (1)"));
+        assert!(body.contains("`src/consumer.rs` line 47"));
+        assert!(body.contains("trouve-code-review finding:rvf_outside"));
+        assert!(body.contains("Prompt for agents"));
     }
 
     #[test]
@@ -7007,6 +7108,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 3,
                 side: "RIGHT".into(),
+                outside_diff: false,
                 severity: "medium".into(),
                 body: format!("candidate {id}"),
                 source_candidate_ids: Vec::new(),
@@ -7023,6 +7125,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 line: 3,
                 side: "RIGHT".into(),
+                outside_diff: false,
                 severity: "medium".into(),
                 body: "accepted".into(),
                 source_candidate_ids: vec!["accepted".into()],

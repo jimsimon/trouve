@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   path TEXT NOT NULL,
   line INTEGER NOT NULL,
   side TEXT NOT NULL,
+  outside_diff INTEGER NOT NULL DEFAULT 0,
   severity TEXT NOT NULL,
   body TEXT NOT NULL,
   prompt_for_agents TEXT NOT NULL DEFAULT '',
@@ -411,6 +412,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_tasks ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_tasks ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN outside_diff INTEGER NOT NULL DEFAULT 0",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -980,6 +982,7 @@ pub struct NewCodeReviewFinding {
     pub path: String,
     pub line: u64,
     pub side: String,
+    pub outside_diff: bool,
     pub severity: String,
     pub body: String,
     pub prompt_for_agents: String,
@@ -3574,15 +3577,16 @@ impl Store {
             let finding_id = crate::new_id("rvf");
             tx.execute(
                 "INSERT INTO code_review_findings
-                        (id, job_id, path, line, side, severity, body,
+                        (id, job_id, path, line, side, outside_diff, severity, body,
                          prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10)",
                 params![
                     finding_id,
                     job_id,
                     finding.path,
                     finding.line as i64,
                     finding.side,
+                    finding.outside_diff,
                     finding.severity,
                     finding.body,
                     finding.prompt_for_agents,
@@ -3719,7 +3723,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
             let mut stmt = conn.prepare(
-                "SELECT id, job_id, path, line, side, severity, body,
+                "SELECT id, job_id, path, line, side, outside_diff, severity, body,
                         prompt_for_agents, status, github_comment_id,
                         github_comment_url, github_thread_id, resolved_at
                  FROM code_review_findings
@@ -3732,15 +3736,16 @@ impl Store {
                     path: row.get(2)?,
                     line: row.get::<_, i64>(3)? as u64,
                     side: row.get(4)?,
-                    severity: row.get(5)?,
-                    body: row.get(6)?,
-                    prompt_for_agents: row.get(7)?,
-                    status: row.get(8)?,
+                    outside_diff: row.get(5)?,
+                    severity: row.get(6)?,
+                    body: row.get(7)?,
+                    prompt_for_agents: row.get(8)?,
+                    status: row.get(9)?,
                     sources: Vec::new(),
-                    github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-                    github_comment_url: row.get(10)?,
-                    github_thread_id: row.get(11)?,
-                    resolved_at: parse_optional_datetime(row.get(12)?),
+                    github_comment_id: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                    github_comment_url: row.get(11)?,
+                    github_thread_id: row.get(12)?,
+                    resolved_at: parse_optional_datetime(row.get(13)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -6674,6 +6679,7 @@ mod tests {
                     path: "src/lib.rs".into(),
                     line: 12,
                     side: "RIGHT".into(),
+                    outside_diff: true,
                     severity: "high".into(),
                     body: "The error is ignored.".into(),
                     prompt_for_agents: "Handle the error at src/lib.rs:12.".into(),
@@ -6711,6 +6717,7 @@ mod tests {
         );
         assert_eq!(detail.personas[0].confirmed_issue_count, 1);
         assert_eq!(detail.personas[0].status, "succeeded");
+        assert!(detail.findings[0].outside_diff);
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
         assert_eq!(detail.routing_decisions, routing_decisions);
@@ -6731,6 +6738,7 @@ mod tests {
         );
         assert_eq!(overview.findings.len(), detail.findings.len());
         assert_eq!(overview.findings[0].id, detail.findings[0].id);
+        assert!(overview.findings[0].outside_diff);
         assert_eq!(overview.routing_decisions, routing_decisions);
 
         let retained_task = store
