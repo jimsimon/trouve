@@ -25,6 +25,7 @@ pub use search::{
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -33,6 +34,8 @@ use trouve_providers::ToolSpec;
 
 pub use edit_strategy::EditStrategy;
 pub use edit_strategy::for_model as edit_strategy_for_model;
+
+const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One session mutation lane that a tool may transfer to a background task.
 ///
@@ -2375,7 +2378,7 @@ impl ToolExecutor for LocalToolExecutor {
                 "fetch".into(),
                 "--force".into(),
                 "--no-tags".into(),
-                "origin".into(),
+                remote_url.clone(),
                 format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
                 format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
             ])
@@ -2388,7 +2391,10 @@ impl ToolExecutor for LocalToolExecutor {
                 ));
             }
         }
-        for sha in &request.optional_shas {
+        // Keep at most three reusable historical refs per pull request. The
+        // bounded names are overwritten by later reviews instead of pinning
+        // every force-pushed commit forever.
+        for (index, sha) in request.optional_shas.iter().take(3).enumerate() {
             let present = run(vec![
                 "cat-file".into(),
                 "-e".into(),
@@ -2397,14 +2403,17 @@ impl ToolExecutor for LocalToolExecutor {
             .await
             .is_ok();
             if !present {
-                let _ = run(vec![
+                let fetch = run(vec![
                     "fetch".into(),
                     "--force".into(),
                     "--no-tags".into(),
                     remote_url.clone(),
-                    format!("+{sha}:refs/remotes/origin/trouve-history-{sha}"),
-                ])
-                .await;
+                    format!(
+                        "+{sha}:refs/remotes/origin/trouve-history-{}-{index}",
+                        request.pull_number
+                    ),
+                ]);
+                let _ = tokio::time::timeout(REVIEW_OPTIONAL_FETCH_TIMEOUT, fetch).await;
             }
         }
         Ok(repository_path)

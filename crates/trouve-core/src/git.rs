@@ -2859,9 +2859,17 @@ pub fn diff_path_between(
     {
         bail!("invalid repository-relative diff path: {path:?}");
     }
-    git(
+    git_untrimmed(
         repo,
-        &["diff", "--end-of-options", base_ref, head_ref, "--", path],
+        &[
+            "diff",
+            "--full-index",
+            "--end-of-options",
+            base_ref,
+            head_ref,
+            "--",
+            path,
+        ],
     )
 }
 
@@ -4036,6 +4044,21 @@ mod tests {
         let error = session_diff_path(tmp.path(), &base, "a.txt").unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("selected file diff"));
+    }
+
+    #[test]
+    fn immutable_review_diff_preserves_trailing_whitespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), "one\nvalue  \n").unwrap();
+        run(tmp.path(), &["add", "a.txt"]);
+        run(tmp.path(), &["commit", "-m", "preserve whitespace"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let diff = diff_path_between(tmp.path(), &base, &head, "a.txt").unwrap();
+        assert!(diff.contains("+value  \n"));
+        assert!(diff.ends_with('\n'));
     }
 
     #[test]
