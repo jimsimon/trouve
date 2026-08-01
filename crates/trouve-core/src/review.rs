@@ -3113,12 +3113,11 @@ impl Engine {
         validate_repository(&job.repository)?;
         validate_sha(&job.base_ref)?;
         validate_sha(&job.head_sha)?;
-        validate_sha(&job.review_base_sha)?;
-        let api = self.installation_api(job.installation_id).await?;
+        validate_sha(&job.review_watermark_sha)?;
         let previous_pull_state = self
             .store
             .code_review_pull_state(&job.repository, job.pull_number)?;
-        let review_watermark_sha = job.review_base_sha.clone();
+        let review_watermark_sha = job.review_watermark_sha.clone();
         let incremental_candidate = job.scope == trouve_protocol::CodeReviewJobScope::Incremental
             && review_watermark_sha != job.base_ref;
         let optional_shas = if incremental_candidate {
@@ -3195,6 +3194,12 @@ impl Engine {
                 .map_err(|error| anyhow!(error))
                 .context("resolving the pull request merge base locally")?;
             validate_sha(&job.review_base_sha)?;
+        }
+        if !self
+            .store
+            .set_code_review_job_review_base(&job.id, &job.review_base_sha)?
+        {
+            bail!("stale: review was superseded while selecting its diff base");
         }
         let workspace = self.register_workspace(
             &repository_path.to_string_lossy(),
@@ -3294,20 +3299,25 @@ impl Engine {
             (diff_files, 0)
         };
         let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
+        let batch_digest = review_batch_digest(
+            &job.review_base_sha,
+            &job.head_sha,
+            reused_hunk_count,
+            &batches,
+        );
+        let snapshot = self
+            .store
+            .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
+        for task in snapshot.superseded_tasks {
+            self.emit_code_review_task(&job.id, task)?;
+        }
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
             record.reviewers.clone()
         };
-        let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
-        let batch_snapshot_changed = !existing_tasks.is_empty()
-            && !existing_tasks
-                .iter()
-                .all(|task| reviewer_task_matches_batch(task, &batches));
+        let batch_snapshot_changed = snapshot.changed;
         let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
-        if batch_snapshot_changed {
-            routing_decisions.clear();
-        }
         if routing_decisions.is_empty() && !reviewers.is_empty() && !batches.is_empty() {
             let semantic = if semantic_routing_enabled(&job) {
                 self.semantic_routing_for_batches(
@@ -3323,18 +3333,9 @@ impl Engine {
                 HashMap::new()
             };
             let proposed = build_routing_decisions(&job, &reviewers, &batches, &semantic);
-            routing_decisions = if batch_snapshot_changed {
-                self.store
-                    .replace_code_review_routing_decisions(&job.id, &proposed)?
-            } else {
-                self.store
-                    .save_code_review_routing_decisions(&job.id, &proposed)?
-            };
-            self.emit_code_review_routing(&job.id, routing_decisions.clone())?;
-        } else if batch_snapshot_changed {
             routing_decisions = self
                 .store
-                .replace_code_review_routing_decisions(&job.id, &[])?;
+                .save_code_review_routing_decisions(&job.id, &proposed)?;
             self.emit_code_review_routing(&job.id, routing_decisions.clone())?;
         }
         let routing_by_reviewer_batch = routing_decisions
@@ -6517,32 +6518,30 @@ fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
     chunks
 }
 
-fn reviewer_task_matches_batch(
-    task: &trouve_protocol::CodeReviewTask,
+fn review_batch_digest(
+    review_base_sha: &str,
+    head_sha: &str,
+    reused_hunk_count: usize,
     batches: &[ReviewBatch],
-) -> bool {
-    reviewer_prompt_matches_batch(&task.prompt, task.batch_index, task.batch_count, batches)
-}
-
-fn reviewer_prompt_matches_batch(
-    prompt: &str,
-    batch_index: u64,
-    batch_count: u64,
-    batches: &[ReviewBatch],
-) -> bool {
-    if batch_count as usize != batches.len() {
-        return false;
+) -> String {
+    fn add_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
     }
-    let Some(batch) = batches.get(batch_index as usize) else {
-        return false;
-    };
-    let Some((_, after_marker)) = prompt.split_once("Unified diff:\n") else {
-        return false;
-    };
-    let Some((task_diff, _)) = after_marker.rsplit_once("\n\nYou are the `") else {
-        return false;
-    };
-    task_diff == batch.diff
+
+    let mut hasher = Sha256::new();
+    add_field(&mut hasher, review_base_sha.as_bytes());
+    add_field(&mut hasher, head_sha.as_bytes());
+    hasher.update((reused_hunk_count as u64).to_le_bytes());
+    hasher.update((batches.len() as u64).to_le_bytes());
+    for batch in batches {
+        hasher.update((batch.paths.len() as u64).to_le_bytes());
+        for path in &batch.paths {
+            add_field(&mut hasher, path.as_bytes());
+        }
+        add_field(&mut hasher, batch.diff.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn reviewer_prompt(
@@ -7411,22 +7410,19 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_batch_snapshot_compares_the_exact_diff() {
+    fn reviewer_batch_digest_covers_exact_effective_content() {
         let batches = vec![ReviewBatch {
             paths: vec!["src/lib.rs".into()],
             diff: "+reviewed line  \n".into(),
         }];
-        let prompt =
-            "prefix\nUnified diff:\n+reviewed line  \n\n\nYou are the `Correctness` reviewer.";
-
-        assert!(reviewer_prompt_matches_batch(prompt, 0, 1, &batches));
-        assert!(!reviewer_prompt_matches_batch(
-            "prefix\nUnified diff:\n+different\n\nYou are the `Correctness` reviewer.",
-            0,
-            1,
-            &batches
-        ));
-        assert!(!reviewer_prompt_matches_batch(prompt, 0, 2, &batches));
+        let digest = review_batch_digest("base", "head", 0, &batches);
+        assert_eq!(digest, review_batch_digest("base", "head", 0, &batches));
+        assert_ne!(digest, review_batch_digest("base", "head", 1, &batches));
+        let changed = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+reviewed line\n".into(),
+        }];
+        assert_ne!(digest, review_batch_digest("base", "head", 0, &changed));
     }
 
     #[test]

@@ -206,6 +206,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   started_at TEXT,
   completed_at TEXT,
   review_base_sha TEXT NOT NULL DEFAULT '',
+  review_watermark_sha TEXT NOT NULL DEFAULT '',
+  review_batch_digest TEXT NOT NULL DEFAULT '',
   review_scope TEXT NOT NULL DEFAULT 'incremental',
   retry_of TEXT,
   retried_by TEXT,
@@ -384,6 +386,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_batch_digest TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_scope TEXT NOT NULL DEFAULT 'incremental'",
     "ALTER TABLE code_review_jobs ADD COLUMN retry_of TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN retried_by TEXT",
@@ -828,6 +832,12 @@ pub struct CodeReviewJobRecord {
     pub publication_accepted: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CodeReviewBatchSnapshotUpdate {
+    pub changed: bool,
+    pub superseded_tasks: Vec<trouve_protocol::CodeReviewTask>,
+}
+
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
     let reviewers: Vec<trouve_protocol::ReviewerProfile> =
         serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
@@ -851,6 +861,12 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         job_elapsed_ms(&status, created_at, started_at, completed_at);
     let base_ref: String = r.get(7)?;
     let review_base_sha: String = r.get(22)?;
+    let review_watermark_sha: String = r.get(50)?;
+    let effective_review_base_sha = if review_base_sha.is_empty() {
+        base_ref.clone()
+    } else {
+        review_base_sha
+    };
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -860,10 +876,11 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             pull_title: r.get(4)?,
             pull_url: r.get(5)?,
             head_sha: r.get(6)?,
-            review_base_sha: if review_base_sha.is_empty() {
-                base_ref.clone()
+            review_base_sha: effective_review_base_sha.clone(),
+            review_watermark_sha: if review_watermark_sha.is_empty() {
+                effective_review_base_sha
             } else {
-                review_base_sha
+                review_watermark_sha
             },
             base_ref,
             head_ref: r.get(8)?,
@@ -918,7 +935,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
-        publication_accepted: r.get(50)?,
+        publication_accepted: r.get(52)?,
     })
 }
 
@@ -930,7 +947,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level, publication_accepted";
+     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -1148,7 +1165,8 @@ fn latest_code_review_task_attempts(
     let mut latest = BTreeMap::new();
     for attempt in attempts {
         let task = &attempt.task;
-        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer {
+        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer || task.status == "superseded"
+        {
             continue;
         }
         let Some(reviewer_id) = task.reviewer_id.as_ref() else {
@@ -3171,10 +3189,11 @@ impl Store {
                      identities, config_hash, created_at, review_base_sha, review_scope,
                      retry_of, total_reviewers, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
-                     router_thinking_level, coordinator_thinking_level)
+                     router_thinking_level, coordinator_thinking_level,
+                     review_watermark_sha)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -3493,6 +3512,77 @@ impl Store {
         )? > 0)
     }
 
+    /// Bind routing and reviewer attempts to the exact effective diff batches.
+    /// A changed digest atomically clears routing and retires every task from
+    /// the obsolete snapshot so crash recovery cannot mix generations.
+    pub fn prepare_code_review_batch_snapshot(
+        &self,
+        job_id: &str,
+        digest: &str,
+    ) -> Result<CodeReviewBatchSnapshotUpdate> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (status, current_digest): (String, String) = tx.query_row(
+            "SELECT status, review_batch_digest FROM code_review_jobs WHERE id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if status != "running" {
+            anyhow::bail!("review job {job_id} is no longer running");
+        }
+        if current_digest == digest {
+            tx.commit()?;
+            return Ok(CodeReviewBatchSnapshotUpdate {
+                changed: false,
+                superseded_tasks: Vec::new(),
+            });
+        }
+
+        let artifact_count: i64 = tx.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM code_review_tasks WHERE job_id = ?1) +
+               (SELECT COUNT(*) FROM code_review_routing_decisions WHERE job_id = ?1)",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        let changed = !current_digest.is_empty() || artifact_count > 0;
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET review_batch_digest = ?2,
+                 completed_reviewers = CASE WHEN ?3 THEN 0 ELSE completed_reviewers END
+             WHERE id = ?1 AND status = 'running'",
+            params![job_id, digest, changed],
+        )?;
+        let mut superseded_tasks = Vec::new();
+        if changed {
+            let completed_at = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "DELETE FROM code_review_routing_decisions WHERE job_id = ?1",
+                [job_id],
+            )?;
+            tx.execute(
+                "UPDATE code_review_tasks
+                 SET status = 'superseded', completed_at = ?2,
+                     error = 'effective review diff changed during recovery'
+                 WHERE job_id = ?1 AND status != 'superseded'",
+                params![job_id, completed_at],
+            )?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
+                 WHERE job_id = ?1 AND status = 'superseded' AND completed_at = ?2
+                 ORDER BY created_at, rowid"
+            ))?;
+            superseded_tasks = stmt
+                .query_map(params![job_id, completed_at], row_to_code_review_task)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        tx.commit()?;
+        Ok(CodeReviewBatchSnapshotUpdate {
+            changed,
+            superseded_tasks,
+        })
+    }
+
     pub fn set_code_review_job_phase_elapsed(
         &self,
         id: &str,
@@ -3582,48 +3672,6 @@ impl Store {
         };
         tx.commit()?;
         Ok(routed)
-    }
-
-    /// Replace a routing snapshot when preparation proves that the effective
-    /// review batches changed between attempts of the same job.
-    pub fn replace_code_review_routing_decisions(
-        &self,
-        job_id: &str,
-        decisions: &[trouve_protocol::CodeReviewRoutingDecision],
-    ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let running: bool = tx.query_row(
-            "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
-            [job_id],
-            |row| row.get(0),
-        )?;
-        if !running {
-            anyhow::bail!("review job {job_id} is no longer running");
-        }
-        tx.execute(
-            "DELETE FROM code_review_routing_decisions WHERE job_id = ?1",
-            [job_id],
-        )?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO code_review_routing_decisions
-                        (job_id, batch_index, reviewer_id, reviewer_name, selected, reasons)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for decision in decisions {
-                insert.execute(params![
-                    job_id,
-                    decision.batch_index as i64,
-                    decision.reviewer_id,
-                    decision.reviewer_name,
-                    decision.selected,
-                    serde_json::to_string(&decision.reasons)?,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(decisions.to_vec())
     }
 
     pub fn create_code_review_task(
@@ -4719,6 +4767,7 @@ impl Store {
                  FROM code_review_tasks t
                  JOIN code_review_jobs j ON j.id = t.job_id
                  WHERE t.role = 'reviewer' AND t.reviewer_id IS NOT NULL
+                   AND t.status != 'superseded'
                    AND (?1 IS NULL OR j.repository = ?1)
                    AND (
                      t.status IN ('queued', 'running')
@@ -5002,14 +5051,14 @@ impl Store {
                      review_base_sha, review_scope, retry_of, total_reviewers,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
-                     coordinator_thinking_level)
+                     coordinator_thinking_level, review_watermark_sha)
              SELECT ?2, ?3, installation_id, repository, pull_number,
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
                     review_base_sha, review_scope, id, total_reviewers,
                     routing_mode, semantic_routing, included_reviewer_ids,
                     excluded_reviewer_ids, router_model, router_thinking_level,
-                    coordinator_thinking_level
+                    coordinator_thinking_level, review_watermark_sha
              FROM code_review_jobs WHERE id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
@@ -7277,6 +7326,22 @@ mod tests {
         assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
+        assert_eq!(running.job.review_watermark_sha, queued.review_base_sha);
+        let effective_base = "3333333333333333333333333333333333333333";
+        assert!(
+            store
+                .set_code_review_job_review_base(&queued.id, effective_base)
+                .unwrap()
+        );
+        let rebased = store.code_review_job(&queued.id).unwrap().unwrap().job;
+        assert_eq!(rebased.review_base_sha, effective_base);
+        assert_eq!(rebased.review_watermark_sha, queued.review_base_sha);
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
         assert_eq!(running.job.status, "running");
         assert_eq!(
             running.reviewers[0].default_thinking_level.as_deref(),
@@ -7660,6 +7725,12 @@ mod tests {
             .unwrap();
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
         let routing_decisions = vec![trouve_protocol::CodeReviewRoutingDecision {
             batch_index: 0,
             reviewer_id: "correctness".into(),
@@ -7689,19 +7760,15 @@ mod tests {
             "routing is a once-only snapshot and retries must reuse it"
         );
         assert_eq!(
-            store
-                .replace_code_review_routing_decisions(&queued.id, &replacement)
-                .unwrap(),
-            replacement,
-            "changed batch contents invalidate the old routing snapshot"
-        );
-        assert_eq!(
             store.code_review_routing_decisions(&queued.id).unwrap(),
-            replacement
+            routing_decisions
         );
-        store
-            .replace_code_review_routing_decisions(&queued.id, &routing_decisions)
-            .unwrap();
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
 
         let task = store
             .create_code_review_task(&NewCodeReviewTask {
@@ -8228,6 +8295,121 @@ mod tests {
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(detail.tasks.iter().any(|task| task.id == "rvt_z_old"));
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
+    }
+
+    #[test]
+    fn changed_batch_digest_clears_routing_and_supersedes_every_old_task() {
+        let store = Store::open_in_memory().unwrap();
+        let reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        let queued = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:changed-batches".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewers: vec![reviewer.clone()],
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
+        let routing = vec![trouve_protocol::CodeReviewRoutingDecision {
+            batch_index: 0,
+            reviewer_id: reviewer.id.clone(),
+            reviewer_name: reviewer.name.clone(),
+            selected: true,
+            reasons: Vec::new(),
+        }];
+        store
+            .save_code_review_routing_decisions(&queued.id, &routing)
+            .unwrap();
+
+        let crash_recovery = store
+            .prepare_code_review_batch_snapshot(&queued.id, "digest-b")
+            .unwrap();
+        assert!(crash_recovery.changed);
+        assert!(crash_recovery.superseded_tasks.is_empty());
+        assert!(
+            store
+                .code_review_routing_decisions(&queued.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .save_code_review_routing_decisions(&queued.id, &routing)
+            .unwrap();
+        for batch_index in [0, 3] {
+            store
+                .create_code_review_task(&NewCodeReviewTask {
+                    job_id: queued.id.clone(),
+                    role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                    reviewer_id: Some(reviewer.id.clone()),
+                    reviewer_name: reviewer.name.clone(),
+                    batch_index,
+                    batch_count: 4,
+                    model: Some("provider/default".into()),
+                    prompt: format!("batch {batch_index}"),
+                })
+                .unwrap();
+        }
+        let changed = store
+            .prepare_code_review_batch_snapshot(&queued.id, "digest-c")
+            .unwrap();
+        assert!(changed.changed);
+        assert_eq!(changed.superseded_tasks.len(), 2);
+        assert!(
+            changed
+                .superseded_tasks
+                .iter()
+                .all(|task| task.status == "superseded")
+        );
+        assert!(
+            store
+                .latest_code_review_reviewer_tasks(&queued.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 0);
+        assert!(
+            store
+                .code_review_job_detail(&queued.id)
+                .unwrap()
+                .unwrap()
+                .personas
+                .is_empty()
+        );
+        assert!(
+            store
+                .code_review_stats(trouve_protocol::CodeReviewStatsRange::All, None)
+                .unwrap()
+                .personas
+                .is_empty()
+        );
     }
 
     #[test]
