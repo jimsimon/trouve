@@ -23,6 +23,10 @@
 }
 
 * { box-sizing: border-box; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 body { margin: 0; min-width: 320px; background: var(--bg); }
 button, input, select, textarea { font: inherit; }
 button, select, input, textarea { color: var(--text); }
@@ -303,6 +307,7 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
 
 .banner { display: flex; justify-content: space-between; gap: 15px; margin: 12px 0; padding: 11px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); }
 .banner.error { border-color: #733443; background: #341c24; color: #ffbdc6; }
+.banner.warning { border-color: #705728; background: #3a2d17; color: #ffd17c; }
 .error-text { color: #ff9aaa; }
 .warning { color: #ffd17c; }
 .muted { color: var(--muted); }

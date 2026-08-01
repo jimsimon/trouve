@@ -752,8 +752,11 @@ function JobDetailPane({
   const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
   const [eventCursor, setEventCursor] = useState<number | null>(null);
   const [routingOpen, setRoutingOpen] = useState(false);
+  const [navigationStatus, setNavigationStatus] = useState("");
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
+  const jobHeadingRef = useRef<HTMLHeadingElement>(null);
+  const focusReplacementJobIdRef = useRef("");
   const taskRequestsRef = useRef(new Set<string>());
   const selectedTaskIdRef = useRef(selectedTaskId);
   const taskDetailsRef = useRef(taskDetails);
@@ -989,6 +992,12 @@ function JobDetailPane({
   }, [selectedTaskId, taskDetails, taskErrors, loadTask]);
 
   useEffect(() => {
+    if (detail?.job.id !== focusReplacementJobIdRef.current) return;
+    jobHeadingRef.current?.focus();
+    focusReplacementJobIdRef.current = "";
+  }, [detail?.job.id]);
+
+  useEffect(() => {
     setTaskDetails((current) => {
       const retained = selectedTaskId ? current[selectedTaskId] : undefined;
       const next = retained ? { [selectedTaskId]: retained } : {};
@@ -1008,8 +1017,11 @@ function JobDetailPane({
             ? await retryJob(detail.job.id)
             : await requestReview(detail.job, "full");
       onChanged();
-      if (action !== "cancel") navigate("jobs", replacement.id);
-      else await load();
+      if (action !== "cancel") {
+        focusReplacementJobIdRef.current = replacement.id;
+        setNavigationStatus(`Opened replacement review ${replacement.id}.`);
+        navigate("jobs", replacement.id);
+      } else await load();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -1024,6 +1036,10 @@ function JobDetailPane({
     try {
       const replacement = await retryPersona(detail.job.id, reviewerId);
       onChanged();
+      focusReplacementJobIdRef.current = replacement.id;
+      setNavigationStatus(
+        `Opened replacement review ${replacement.id}; all reviewer personas will run again.`,
+      );
       navigate("jobs", replacement.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -1035,6 +1051,9 @@ function JobDetailPane({
   if (!detail) {
     return (
       <aside class="panel job-detail">
+        <p class="sr-only" role="status" aria-live="polite">
+          {navigationStatus}
+        </p>
         <button class="icon-button" type="button" onClick={onClose} aria-label="Close detail">
           ×
         </button>
@@ -1199,10 +1218,13 @@ function JobDetailPane({
   };
   return (
     <aside class="panel job-detail">
+      <p class="sr-only" role="status" aria-live="polite">
+        {navigationStatus}
+      </p>
       <header class="detail-header">
         <div>
           <StatusPill status={job.status} />
-          <h2>
+          <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
           <p>{job.pull_title}</p>
@@ -1294,7 +1316,11 @@ function JobDetailPane({
         </button>
       </div>
       {error && <div class="banner error">{error}</div>}
-      {job.error && <div class="banner error">{job.error}</div>}
+      {job.error && (
+        <div class={`banner ${job.status === "succeeded" ? "warning" : "error"}`}>
+          {job.error}
+        </div>
+      )}
       <div class="link-row">
         <ExternalLink href={job.pull_url}>Open pull request ↗</ExternalLink>
         <ExternalLink href={job.review_url}>Open published review ↗</ExternalLink>
@@ -1448,11 +1474,12 @@ function JobDetailPane({
                             type="button"
                             disabled={Boolean(busy)}
                             onClick={() => void retryFailedPersona(group.persona!.reviewer_id)}
-                            aria-label={`Retry ${group.name}`}
+                            aria-label={`Retry full review after ${group.name} failed`}
+                            title="Starts a new review and reruns every selected persona"
                           >
                             {busy === `persona:${group.persona.reviewer_id}`
                               ? "Retrying…"
-                              : "Retry"}
+                              : "Retry all"}
                           </button>
                         )}
                     </div>

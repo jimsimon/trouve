@@ -186,14 +186,18 @@ be the only trigger source, or serve as a fallback when webhooks provide the
 fast path. Set `TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS` to any positive number
 of seconds and restart the server container to change the interval. Invalid and
 zero values fall back to 60 seconds. Polling uses lightweight PR metadata and
-durable deduplication. Once a base/head revision has a review job or a
-successfully published review, polling does not start another automatic pass
-for it, including after a repository policy change. An explicit dashboard
-retry, persona retry, reviewer re-request, or trusted `@trouve-ai review`
-comment may intentionally run the same revision again. Every newly started
-review snapshots the repository's current configuration, regardless of how it
-was triggered. A persona retry starts a fresh replacement job so successful
-tasks from an older settings snapshot are not mixed with current settings.
+durable deduplication. Once a base/head revision has a queued, running, failed,
+or published automatic-equivalent attempt, polling does not start another
+automatic pass for it, including after a repository policy change. Draft-only
+manual reviews and stale or cancelled attempts do not suppress the next
+automatic review. An explicit dashboard retry, persona retry, reviewer
+re-request, or trusted `@trouve-ai review` comment may intentionally run the
+same revision again. Every newly started review snapshots the repository's
+current configuration, regardless of how it was triggered. Retries retain the
+predecessor's base/head revision. The persona retry control validates the
+selected failed persona, then starts a fresh whole-job replacement so
+successful tasks from an older settings snapshot are not mixed with current
+settings. Every reviewer selected by the current policy runs again.
 
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. The complete diff is enumerated

@@ -618,14 +618,11 @@ fn manual_request_can_satisfy_automatic_review(
     trigger == "manual" && mode == CodeReviewMode::Automatic && !draft
 }
 
-fn should_skip_automatic_review(
-    trigger: &str,
-    revision_job_exists: bool,
-    last_reviewed_head_sha: &str,
-    head_sha: &str,
-) -> bool {
+fn should_skip_automatic_review(trigger: &str, revision_job_exists: bool) -> bool {
+    // The store query matches both the current base and head. The pull-state
+    // watermark is intentionally not used here because it also tracks manual
+    // reviews (including draft reviews) for incremental diff selection.
     should_terminate_duplicate_review_job(trigger, revision_job_exists)
-        || (trigger == "automatic" && last_reviewed_head_sha == head_sha)
 }
 
 fn should_terminate_duplicate_review_job(trigger: &str, prior_revision_job_exists: bool) -> bool {
@@ -688,6 +685,11 @@ struct ReviewCandidateRejection {
     candidate_id: String,
     #[serde(default)]
     reason: String,
+}
+
+struct CompletedCodeReview {
+    review_url: String,
+    publication_warning: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1505,7 +1507,7 @@ impl Engine {
                 old.job.pull_number,
                 old.job.scope,
                 "retry",
-                Some(id.to_owned()),
+                Some(&old.job),
             )
             .await?;
         let replacement = self
@@ -1587,7 +1589,7 @@ impl Engine {
         pull_number: u64,
         scope: trouve_protocol::CodeReviewJobScope,
         trigger: &str,
-        retry_of: Option<String>,
+        predecessor: Option<&trouve_protocol::CodeReviewJob>,
     ) -> Result<NewCodeReviewJob, EngineError> {
         let repository = self
             .store
@@ -1628,35 +1630,53 @@ impl Engine {
         }
         let reviewers = self.reviewers_for_repository_policy(&repository)?;
         let config_hash = Self::code_review_config_hash(&repository, &reviewers)?;
-        let pull_state = self
-            .store
-            .code_review_pull_state(&repository.repository, pull.number)?;
-        let review_base_sha = match scope {
-            trouve_protocol::CodeReviewJobScope::Full => pull.base.sha.clone(),
-            trouve_protocol::CodeReviewJobScope::Incremental => incremental_review_base_sha(
-                &pull.base.sha,
-                &pull.head.sha,
-                &pull_state.last_reviewed_head_sha,
+        let (base_ref, head_sha, head_ref, review_base_sha) = match predecessor {
+            Some(predecessor) => (
+                predecessor.base_ref.clone(),
+                predecessor.head_sha.clone(),
+                predecessor.head_ref.clone(),
+                predecessor.review_base_sha.clone(),
             ),
+            None => {
+                let pull_state = self
+                    .store
+                    .code_review_pull_state(&repository.repository, pull.number)?;
+                let review_base_sha = match scope {
+                    trouve_protocol::CodeReviewJobScope::Full => pull.base.sha.clone(),
+                    trouve_protocol::CodeReviewJobScope::Incremental => {
+                        incremental_review_base_sha(
+                            &pull.base.sha,
+                            &pull.head.sha,
+                            &pull_state.last_reviewed_head_sha,
+                        )
+                    }
+                };
+                (
+                    pull.base.sha.clone(),
+                    pull.head.sha.clone(),
+                    pull.head.name.clone(),
+                    review_base_sha,
+                )
+            }
         };
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         Ok(NewCodeReviewJob {
             dedupe_key: format!(
                 "{}#{}:{}:{}:{trigger}:{nonce}:{config_hash}",
-                repository.repository, pull.number, pull.base.sha, pull.head.sha
+                repository.repository, pull.number, base_ref, head_sha
             ),
             installation_id: repository.installation_id,
             repository: repository.repository.clone(),
             pull_number: pull.number,
             pull_title: pull.title,
             pull_url: pull.html_url,
-            head_sha: pull.head.sha,
+            head_sha,
             review_base_sha,
-            base_ref: pull.base.sha,
-            head_ref: pull.head.name,
+            base_ref,
+            head_ref,
             scope,
             trigger: trigger.into(),
-            retry_of,
+            retry_of: predecessor.map(|job| job.id.clone()),
             model: repository.model,
             coordinator_thinking_level: repository.coordinator_thinking_level,
             router_model: repository.router_model,
@@ -2524,12 +2544,7 @@ impl Engine {
                     // revision already attempted or published. Explicit
                     // reviewer requests and trusted comment commands remain
                     // eligible and have their own durable dedupe keys.
-                    if should_skip_automatic_review(
-                        requested.trigger,
-                        revision_job_exists,
-                        &pull_state.last_reviewed_head_sha,
-                        &pull.head.sha,
-                    ) {
+                    if should_skip_automatic_review(requested.trigger, revision_job_exists) {
                         continue;
                     }
                     // The first manual request for an unseen automatic head
@@ -2545,10 +2560,19 @@ impl Engine {
                     } else {
                         requested.requested_key
                     };
-                    let dedupe_key = format!(
+                    let mut dedupe_key = format!(
                         "{}#{}:{}:{}:{trigger_key}:{config_hash}",
                         repository.repository, pull.number, pull.base.sha, pull.head.sha
                     );
+                    // A stale or cancelled automatic attempt must not block a
+                    // later return to the same base/head revision, but its
+                    // durable dedupe key still occupies the unique index.
+                    if trigger_key == "automatic"
+                        && self.store.code_review_job_exists(&dedupe_key)?
+                    {
+                        dedupe_key.push(':');
+                        dedupe_key.push_str(&uuid::Uuid::new_v4().simple().to_string());
+                    }
                     let review_base_sha = incremental_review_base_sha(
                         &pull.base.sha,
                         &pull.head.sha,
@@ -2925,7 +2949,11 @@ impl Engine {
             .code_review_job_cancel_requested(&job_id)
             .unwrap_or(false);
         let (status, review_url, error) = match result {
-            Ok(Ok(url)) => ("succeeded", url, String::new()),
+            Ok(Ok(completed)) => (
+                "succeeded",
+                completed.review_url,
+                completed.publication_warning,
+            ),
             Ok(Err(error)) if cancellation_requested => {
                 ("cancelled", String::new(), error.to_string())
             }
@@ -3003,7 +3031,7 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
         review_settings: &CodeReviewSettings,
-    ) -> Result<String> {
+    ) -> Result<CompletedCodeReview> {
         let preparation_started = Instant::now();
         let mut job = record.job.clone();
         let prior_revision_job_exists = self.store.code_review_job_has_prior_revision(
@@ -3607,7 +3635,7 @@ impl Engine {
         let review_url = self
             .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
             .await?;
-        let fixed = self
+        let (fixed, publication_warnings) = self
             .resolve_fixed_review_findings(
                 &api,
                 &job,
@@ -3628,7 +3656,10 @@ impl Engine {
             CodeReviewJobPhase::Publication,
             elapsed_since_ms(publication_started),
         )?;
-        Ok(review_url)
+        Ok(CompletedCodeReview {
+            review_url,
+            publication_warning: publication_warnings.join("; "),
+        })
     }
 
     async fn run_tracked_code_review_turn(
@@ -4238,9 +4269,13 @@ impl Engine {
                 job.progress.total_reviewers,
                 job.progress.percent
             ),
-            "succeeded" => format!(
+            "succeeded" if job.error.is_empty() => format!(
                 "Review finished with {} confirmed issue(s); {} previously reported issue(s) were fixed.",
                 job.issue_count, job.fixed_issue_count
+            ),
+            "succeeded" => format!(
+                "Review finished with {} confirmed issue(s); publication warning: {}",
+                job.issue_count, job.error
             ),
             _ => {
                 if job.error.is_empty() {
@@ -4480,10 +4515,11 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         previous_findings: &[trouve_protocol::CodeReviewFinding],
         resolved_ids: &[String],
-    ) -> Result<u64> {
+    ) -> Result<(u64, Vec<String>)> {
         if resolved_ids.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
+        let mut warnings = Vec::new();
         let query = r#"
           query ReviewThreads($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
@@ -4519,18 +4555,18 @@ impl Engine {
         let (response, rate) = match response {
             Ok(response) => response,
             Err(error) => {
-                self.record_review_error(format!(
+                warnings.push(format!(
                     "loading GitHub review threads while resolving fixed findings failed: {error:#}"
                 ));
-                return Ok(0);
+                return Ok((0, warnings));
             }
         };
         self.record_review_rate(rate);
         if let Some(errors) = Self::github_graphql_errors(&response) {
-            self.record_review_error(format!(
+            warnings.push(format!(
                 "loading GitHub review threads while resolving fixed findings failed: {errors}"
             ));
-            return Ok(0);
+            return Ok((0, warnings));
         }
         let threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
             .as_array()
@@ -4586,7 +4622,7 @@ impl Engine {
                         Ok((response, rate)) => {
                             self.record_review_rate(rate);
                             if let Some(errors) = Self::github_graphql_errors(&response) {
-                                self.record_review_error(format!(
+                                warnings.push(format!(
                                     "resolving GitHub review thread {thread_id} for finding {} failed: {errors}",
                                     finding.id
                                 ));
@@ -4596,7 +4632,7 @@ impl Engine {
                             }
                         }
                         Err(error) => {
-                            self.record_review_error(format!(
+                            warnings.push(format!(
                                 "resolving GitHub review thread {thread_id} for finding {} failed: {error:#}",
                                 finding.id
                             ));
@@ -4615,7 +4651,7 @@ impl Engine {
                 fixed += 1;
             }
         }
-        Ok(fixed)
+        Ok((fixed, warnings))
     }
 
     async fn capture_published_review_comments(
@@ -4739,7 +4775,11 @@ fn render_check_details(
     }
 
     if !job.error.trim().is_empty() {
-        body.push_str("### Error\n\n```text\n");
+        if job.status == "succeeded" {
+            body.push_str("### Publication warning\n\n```text\n");
+        } else {
+            body.push_str("### Error\n\n```text\n");
+        }
         body.push_str(&safe_prompt_fence(job.error.trim()));
         body.push_str("\n```\n\n");
     }
@@ -4880,7 +4920,12 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
         ));
     }
     if !job.error.is_empty() {
-        body.push_str(&format!("**Error:** {}\n\n", job.error));
+        let label = if job.status == "succeeded" {
+            "Publication warning"
+        } else {
+            "Error"
+        };
+        body.push_str(&format!("**{label}:** {}\n\n", job.error));
     }
     body.push_str(&lifecycle_comment_marker(&job.id));
     body
@@ -6308,6 +6353,31 @@ mod tests {
     }
 
     #[test]
+    fn successful_review_keeps_publication_warnings_on_the_job() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:publication-warning");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "succeeded",
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
+                "loading GitHub review threads while resolving fixed findings failed: resource not accessible",
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        assert_eq!(detail.job.status, "succeeded");
+        assert!(detail.job.error.contains("resource not accessible"));
+        let lifecycle = render_lifecycle_comment(&detail);
+        assert!(lifecycle.contains("**Publication warning:**"));
+        assert!(!lifecycle.contains("**Error:**"));
+        let check = render_check_details(&detail, &[]);
+        assert!(check.contains("### Publication warning"));
+        assert!(!check.contains("### Error"));
+    }
+
+    #[test]
     fn check_details_show_live_personas_and_terminal_failures() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let queued = enqueue_test_review_job(&store, "acme/widgets#42:check-details");
@@ -7413,27 +7483,9 @@ mod tests {
 
     #[test]
     fn existing_revision_only_suppresses_automatic_reviews() {
-        assert!(should_skip_automatic_review(
-            "automatic",
-            true,
-            "",
-            "head-2"
-        ));
-        assert!(should_skip_automatic_review(
-            "automatic",
-            false,
-            "head-2",
-            "head-2"
-        ));
-        assert!(!should_skip_automatic_review(
-            "automatic",
-            false,
-            "head-1",
-            "head-2"
-        ));
-        assert!(!should_skip_automatic_review(
-            "manual", true, "head-2", "head-2"
-        ));
+        assert!(should_skip_automatic_review("automatic", true));
+        assert!(!should_skip_automatic_review("automatic", false));
+        assert!(!should_skip_automatic_review("manual", true));
         assert!(should_terminate_duplicate_review_job("automatic", true));
         assert!(!should_terminate_duplicate_review_job("manual", true));
         assert!(!should_terminate_duplicate_review_job("retry", true));

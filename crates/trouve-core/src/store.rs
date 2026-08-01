@@ -2945,6 +2945,11 @@ impl Store {
                 "SELECT 1 FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2
                    AND base_ref = ?3 AND head_sha = ?4
+                   AND status IN ('queued', 'running', 'succeeded', 'failed')
+                   AND (
+                     trigger IN ('automatic', 'retry')
+                     OR dedupe_key LIKE '%:automatic:%'
+                   )
                  LIMIT 1",
                 params![repository, pull_number as i64, base_ref, head_sha],
                 |_| Ok(()),
@@ -2967,6 +2972,11 @@ impl Store {
                 "SELECT 1 FROM code_review_jobs AS prior
                  WHERE prior.repository = ?2 AND prior.pull_number = ?3
                    AND prior.base_ref = ?4 AND prior.head_sha = ?5
+                   AND prior.status IN ('queued', 'running', 'succeeded', 'failed')
+                   AND (
+                     prior.trigger IN ('automatic', 'retry')
+                     OR prior.dedupe_key LIKE '%:automatic:%'
+                   )
                    AND prior.rowid < (
                      SELECT current.rowid FROM code_review_jobs AS current
                      WHERE current.id = ?1
@@ -4382,6 +4392,22 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
+        if let Some(retried_by) = old.job.retried_by.as_deref() {
+            let replacement = tx
+                .query_row(
+                    &format!(
+                        "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"
+                    ),
+                    params![retried_by],
+                    row_to_code_review_job,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("review job {id} points to missing replacement {retried_by}")
+                })?;
+            tx.commit()?;
+            return Ok(Some(replacement.job));
+        }
         if old.publication_claimed && old.job.status == "running" {
             anyhow::bail!(
                 "review publication has already started; wait for it to finish before retrying"
@@ -4449,10 +4475,14 @@ impl Store {
                 new_job.coordinator_thinking_level,
             ],
         )?;
-        tx.execute(
-            "UPDATE code_review_jobs SET retried_by = ?2 WHERE id = ?1",
+        let linked = tx.execute(
+            "UPDATE code_review_jobs SET retried_by = ?2
+             WHERE id = ?1 AND retried_by IS NULL",
             params![id, new_id],
         )?;
+        if linked == 0 {
+            anyhow::bail!("review job {id} was retried concurrently");
+        }
         let replacement = tx.query_row(
             &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
             params![new_id],
@@ -6860,38 +6890,41 @@ mod tests {
             .skip(2)
             .take(1)
             .collect::<Vec<_>>();
+        let replacement_request = NewCodeReviewJob {
+            dedupe_key: "acme/widgets#42:retry:latest-config".into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets now".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "3333333333333333333333333333333333333333".into(),
+            review_base_sha: "2222222222222222222222222222222222222222".into(),
+            base_ref: "1111111111111111111111111111111111111111".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "retry".into(),
+            retry_of: Some(queued.id.clone()),
+            model: Some("provider/latest".into()),
+            coordinator_thinking_level: Some("high".into()),
+            router_model: Some("provider/latest-router".into()),
+            router_thinking_level: Some("medium".into()),
+            prompt: "Use the latest policy".into(),
+            reviewers: latest_reviewers.clone(),
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Automatic,
+            semantic_routing: true,
+            included_reviewer_ids: vec!["performance".into()],
+            excluded_reviewer_ids: vec!["accessibility".into()],
+            config_hash: "latest-config".into(),
+        };
         let replacement = store
-            .retry_code_review_job(
-                &queued.id,
-                &NewCodeReviewJob {
-                    dedupe_key: "acme/widgets#42:retry:latest-config".into(),
-                    installation_id: 7,
-                    repository: "acme/widgets".into(),
-                    pull_number: 42,
-                    pull_title: "Ship widgets now".into(),
-                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                    head_sha: "3333333333333333333333333333333333333333".into(),
-                    review_base_sha: "2222222222222222222222222222222222222222".into(),
-                    base_ref: "1111111111111111111111111111111111111111".into(),
-                    head_ref: "ship".into(),
-                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                    trigger: "retry".into(),
-                    retry_of: Some(queued.id.clone()),
-                    model: Some("provider/latest".into()),
-                    coordinator_thinking_level: Some("high".into()),
-                    router_model: Some("provider/latest-router".into()),
-                    router_thinking_level: Some("medium".into()),
-                    prompt: "Use the latest policy".into(),
-                    reviewers: latest_reviewers.clone(),
-                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Automatic,
-                    semantic_routing: true,
-                    included_reviewer_ids: vec!["performance".into()],
-                    excluded_reviewer_ids: vec!["accessibility".into()],
-                    config_hash: "latest-config".into(),
-                },
-            )
+            .retry_code_review_job(&queued.id, &replacement_request)
             .unwrap()
             .unwrap();
+        let repeated = store
+            .retry_code_review_job(&queued.id, &replacement_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.id, replacement.id);
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
         assert_eq!(
             replacement.coordinator_thinking_level.as_deref(),
@@ -6913,6 +6946,7 @@ mod tests {
             "Use the latest policy"
         );
         let jobs = store.list_code_review_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 2, "a predecessor has only one replacement");
         assert_eq!(jobs[0].id, queued.id);
         assert_eq!(jobs[0].status, "running");
         assert_eq!(jobs[1].id, replacement.id);
@@ -7289,6 +7323,132 @@ mod tests {
         assert_eq!(
             store.list_built_in_reviewer_defaults().unwrap(),
             vec![reviewer]
+        );
+    }
+
+    #[test]
+    fn only_automatic_equivalent_attempts_suppress_a_revision() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |dedupe_key: &str, trigger: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: dedupe_key.into(),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "head-2".into(),
+                    review_base_sha: "base-2".into(),
+                    base_ref: "base-2".into(),
+                    head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                    trigger: trigger.into(),
+                    retry_of: None,
+                    model: None,
+                    coordinator_thinking_level: None,
+                    router_model: None,
+                    router_thinking_level: None,
+                    prompt: String::new(),
+                    reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
+                    config_hash: "config".into(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        let draft_manual = enqueue("acme/widgets#42:base-2:head-2:manual:draft", "manual");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'succeeded' WHERE id = ?1",
+                params![draft_manual.id],
+            )
+            .unwrap();
+        let stale_automatic = enqueue("acme/widgets#42:base-2:head-2:automatic:stale", "automatic");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![stale_automatic.id],
+            )
+            .unwrap();
+
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "draft manual and stale jobs are not automatic-equivalent attempts"
+        );
+        let automatic = enqueue(
+            "acme/widgets#42:base-2:head-2:automatic:replacement",
+            "automatic",
+        );
+        assert!(
+            !store
+                .code_review_job_has_prior_revision(
+                    &automatic.id,
+                    "acme/widgets",
+                    42,
+                    "base-2",
+                    "head-2",
+                )
+                .unwrap(),
+            "stale and manual predecessors do not terminate a new automatic job"
+        );
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-3", "head-2")
+                .unwrap(),
+            "a base advance with the same head is a distinct revision"
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![automatic.id],
+            )
+            .unwrap();
+        let ready_manual = enqueue(
+            "acme/widgets#42:base-2:head-2:automatic:manual-ready",
+            "manual",
+        );
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "a ready-state manual request carrying the automatic key is equivalent"
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'failed' WHERE id = ?1",
+                params![ready_manual.id],
+            )
+            .unwrap();
+        assert!(
+            store
+                .code_review_job_exists_for_revision("acme/widgets", 42, "base-2", "head-2")
+                .unwrap(),
+            "a failed automatic-equivalent attempt remains a durable suppression watermark"
         );
     }
 
