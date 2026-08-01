@@ -762,6 +762,7 @@ function JobDetailPane({
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [retryStatus, setRetryStatus] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [taskDetails, setTaskDetails] = useState<Record<string, ReviewTask>>({});
   const [taskLoading, setTaskLoading] = useState("");
@@ -778,6 +779,7 @@ function JobDetailPane({
   const selectedTaskIdRef = useRef(selectedTaskId);
   const taskDetailsRef = useRef(taskDetails);
   detailRef.current = detail;
+  const activityGroupButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   selectedTaskIdRef.current = selectedTaskId;
   taskDetailsRef.current = taskDetails;
   const load = useCallback(async (): Promise<JobDetail | undefined> => {
@@ -868,6 +870,8 @@ function JobDetailPane({
     setTaskErrors({});
     setEventCursor(null);
     setRoutingOpen(false);
+    setRetryStatus("");
+    activityGroupButtonRefs.current = {};
     taskRequestsRef.current.clear();
     void load();
     return () => {
@@ -1146,24 +1150,24 @@ function JobDetailPane({
   const retryFailedPersona = async (reviewerId: string): Promise<void> => {
     if (!detail) return;
     const action = `persona:${reviewerId}`;
+    const label =
+      detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ??
+      "Reviewer persona";
     setBusy(action);
+    setRetryStatus(`Retrying ${label}…`);
     try {
-      const replacement = await retryPersona(detail.job.id, reviewerId);
+      await retryPersona(detail.job.id, reviewerId);
+      activityGroupButtonRefs.current[action]?.focus();
+      setRetryStatus(`${label} retry queued.`);
       onChanged();
-      if (replacement.id === detail.job.id) {
-        setNavigationStatus(
-          "Review publication had already started; the existing review was reconciled instead of retried.",
-        );
-        await load();
-      } else {
-        focusReplacementJobIdRef.current = replacement.id;
-        setNavigationStatus(
-          `Opened replacement review ${replacement.id}; all reviewer personas will run again.`,
-        );
-        navigate("jobs", replacement.id);
-      }
+      const refreshed = await load();
+      const retriedTask = pickPreferredTask(
+        refreshed?.tasks.filter((task) => task.reviewer_id === reviewerId) ?? [],
+      );
+      setSelectedTaskId(retriedTask?.id ?? "");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+      setRetryStatus(`${label} retry failed.`);
     } finally {
       setBusy("");
     }
@@ -1172,8 +1176,11 @@ function JobDetailPane({
   const retryFailedFinalEditor = async (): Promise<void> => {
     if (!detail) return;
     setBusy("final-editor");
+    setRetryStatus("Retrying Final review editor…");
     try {
       await retryFinalEditor(detail.job.id);
+      activityGroupButtonRefs.current.coordinator?.focus();
+      setRetryStatus("Final review editor retry queued.");
       onChanged();
       const refreshed = await load();
       const retriedTask = pickPreferredTask(
@@ -1182,6 +1189,7 @@ function JobDetailPane({
       setSelectedTaskId(retriedTask?.id ?? "");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+      setRetryStatus("Final review editor retry failed.");
     } finally {
       setBusy("");
     }
@@ -1646,6 +1654,9 @@ function JobDetailPane({
           title="Review activity"
           subtitle="Select a persona and batch to inspect its metrics, retained output, and prompt"
         />
+        <p class="visually-hidden" role="status" aria-live="polite">
+          {retryStatus}
+        </p>
         {detail.tasks.length ? (
           <div class="activity-layout">
             <nav class="activity-groups" aria-label="Review personas and batches">
@@ -1661,7 +1672,13 @@ function JobDetailPane({
                 return (
                   <div class={`activity-group${active ? " active" : ""}`} key={group.id}>
                     <div class="activity-group-summary">
-                      <button type="button" onClick={() => selectPreferredTask(group.tasks)}>
+                      <button
+                        type="button"
+                        ref={(element) => {
+                          activityGroupButtonRefs.current[group.id] = element;
+                        }}
+                        onClick={() => selectPreferredTask(group.tasks)}
+                      >
                         <span>
                           <strong>{group.name}</strong>
                           <small>{group.subtitle}</small>
@@ -1669,20 +1686,20 @@ function JobDetailPane({
                         <StatusPill status={group.status} />
                       </button>
                       {retryable && (
-                          <button
-                            class="compact ghost retry-activity"
-                            type="button"
-                            disabled={Boolean(busy)}
-                            onClick={() =>
-                              void (group.persona
-                                ? retryFailedPersona(group.persona.reviewer_id)
-                                : retryFailedFinalEditor())
-                            }
-                            aria-label={`Retry ${group.name}`}
-                          >
-                            {retrying ? "Retrying…" : "Retry"}
-                          </button>
-                        )}
+                        <button
+                          class="compact ghost retry-activity"
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={() =>
+                            void (group.persona
+                              ? retryFailedPersona(group.persona.reviewer_id)
+                              : retryFailedFinalEditor())
+                          }
+                          aria-label={`Retry ${group.name}`}
+                        >
+                          {retrying ? "Retrying…" : "Retry"}
+                        </button>
+                      )}
                     </div>
                     {active && group.tasks.length > 1 && (
                       <div class="batch-tabs">

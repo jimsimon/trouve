@@ -4284,7 +4284,6 @@ impl Engine {
         if finish_recorded {
             self.retry_code_review_cleanup().await;
         }
-        let _ = self.store.cancel_active_code_review_tasks(&job_id, &error);
         let _ = self.emit_code_review_job_updated(&job_id);
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
