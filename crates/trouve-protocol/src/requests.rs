@@ -1913,8 +1913,8 @@ pub struct CodeReviewTask {
     pub batch_index: u64,
     #[serde(default)]
     pub batch_count: u64,
-    /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or
-    /// `not_applicable`.
+    /// `queued`, `running`, `succeeded`, `failed`, `cancelled`,
+    /// `not_applicable`, or `superseded`.
     pub status: String,
     /// Current stage while active; last observed stage after failure or
     /// cancellation.
@@ -2108,6 +2108,11 @@ pub struct CodeReviewJob {
     /// jobs this is normally the last successfully published head.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_base_sha: String,
+    /// Immutable commit from the last successfully published review. This is
+    /// the incremental watermark even when history rewriting makes the
+    /// effective `review_base_sha` fall back to the pull request merge base.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub review_watermark_sha: String,
     pub base_ref: String,
     pub head_ref: String,
     #[serde(default)]
