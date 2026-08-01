@@ -3584,6 +3584,48 @@ impl Store {
         Ok(routed)
     }
 
+    /// Replace a routing snapshot when preparation proves that the effective
+    /// review batches changed between attempts of the same job.
+    pub fn replace_code_review_routing_decisions(
+        &self,
+        job_id: &str,
+        decisions: &[trouve_protocol::CodeReviewRoutingDecision],
+    ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let running: bool = tx.query_row(
+            "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        if !running {
+            anyhow::bail!("review job {job_id} is no longer running");
+        }
+        tx.execute(
+            "DELETE FROM code_review_routing_decisions WHERE job_id = ?1",
+            [job_id],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO code_review_routing_decisions
+                        (job_id, batch_index, reviewer_id, reviewer_name, selected, reasons)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for decision in decisions {
+                insert.execute(params![
+                    job_id,
+                    decision.batch_index as i64,
+                    decision.reviewer_id,
+                    decision.reviewer_name,
+                    decision.selected,
+                    serde_json::to_string(&decision.reasons)?,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(decisions.to_vec())
+    }
+
     pub fn create_code_review_task(
         &self,
         task: &NewCodeReviewTask,
@@ -7646,6 +7688,20 @@ mod tests {
             routing_decisions,
             "routing is a once-only snapshot and retries must reuse it"
         );
+        assert_eq!(
+            store
+                .replace_code_review_routing_decisions(&queued.id, &replacement)
+                .unwrap(),
+            replacement,
+            "changed batch contents invalidate the old routing snapshot"
+        );
+        assert_eq!(
+            store.code_review_routing_decisions(&queued.id).unwrap(),
+            replacement
+        );
+        store
+            .replace_code_review_routing_decisions(&queued.id, &routing_decisions)
+            .unwrap();
 
         let task = store
             .create_code_review_task(&NewCodeReviewTask {
