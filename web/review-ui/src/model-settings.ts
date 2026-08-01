@@ -1,6 +1,10 @@
 export interface ModelWithOptions {
   id: string;
   options_schema?: unknown;
+  routes?: ReadonlyArray<{
+    provider_id: string;
+    provider_model: string;
+  }>;
 }
 
 export interface ThinkingOptions {
@@ -18,6 +22,27 @@ const THINKING_KEYS = [
   "effort",
   "reasoning",
 ] as const;
+
+/** Resolve either a routed model id or one of its provider-qualified pins. */
+export function modelForSelection<T extends ModelWithOptions>(
+  models: readonly T[],
+  selection?: string,
+): T | undefined {
+  if (!selection) return undefined;
+  return models.find((model) =>
+    model.id === selection || model.routes?.some(
+      (route) => `${route.provider_id}/${route.provider_model}` === selection,
+    ),
+  );
+}
+
+/** Value suitable for a neutral model picker while retaining unknown ids. */
+export function modelSelectionValue(
+  models: readonly ModelWithOptions[],
+  selection?: string,
+): string {
+  return modelForSelection(models, selection)?.id ?? selection ?? "";
+}
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

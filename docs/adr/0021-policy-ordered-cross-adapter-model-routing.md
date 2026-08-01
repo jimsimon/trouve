@@ -9,6 +9,8 @@ catalog for public models while live providers and vendor CLIs determine
 account availability. The model picker still exposed provider-qualified ids,
 which fixed a thread to one API account or vendor subscription even when
 several routes could run the same catalog-normalized model.
+This decision extends ADRs 0015, 0016, and 0020; it does not reverse or
+supersede any of them.
 
 Provider capacity is uneven and only some vendor backends report allowance
 windows. With many configured routes, blindly probing in stable order can

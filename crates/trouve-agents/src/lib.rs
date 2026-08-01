@@ -406,23 +406,7 @@ impl BackendError {
         let Self::Protocol(message) = self else {
             return false;
         };
-        let message = message.to_ascii_lowercase();
-        [
-            "429",
-            "too many requests",
-            "rate limit",
-            "rate_limit",
-            "quota exceeded",
-            "quota_exceeded",
-            "insufficient_quota",
-            "resource_exhausted",
-            "capacity exhausted",
-            "capacity_exhausted",
-            "usage limit",
-            "usage_limit",
-        ]
-        .iter()
-        .any(|signal| message.contains(signal))
+        trouve_providers::is_capacity_exhaustion_message(message)
     }
 }
 
@@ -1132,6 +1116,14 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn backend_capacity_errors_use_the_shared_classifier() {
+        assert!(BackendError::Protocol("HTTP 429".into()).is_capacity_exhausted());
+        assert!(BackendError::Protocol("quota_exceeded".into()).is_capacity_exhausted());
+        assert!(!BackendError::Protocol("HTTP 14290".into()).is_capacity_exhausted());
+        assert!(!BackendError::Io(std::io::Error::other("HTTP 429")).is_capacity_exhausted());
+    }
 
     #[tokio::test]
     async fn coalesces_delta_kinds_without_reordering_controls() {

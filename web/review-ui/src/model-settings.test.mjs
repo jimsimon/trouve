@@ -3,10 +3,28 @@ import test from "node:test";
 
 import {
   defaultThinkingSelection,
+  modelForSelection,
+  modelSelectionValue,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
 } from "./model-settings.ts";
+
+test("provider-qualified selections resolve through neutral model routes", () => {
+  const models = [{
+    id: "gpt-5.6-sol",
+    routes: [
+      { provider_id: "openai", provider_model: "gpt-5.6-sol" },
+      { provider_id: "codex", provider_model: "gpt-5.6-sol" },
+    ],
+  }];
+
+  assert.equal(modelForSelection(models, "gpt-5.6-sol"), models[0]);
+  assert.equal(modelForSelection(models, "codex/gpt-5.6-sol"), models[0]);
+  assert.equal(modelForSelection(models, "cursor/gpt-5.6-sol"), undefined);
+  assert.equal(modelSelectionValue(models, "openai/gpt-5.6-sol"), "gpt-5.6-sol");
+  assert.equal(modelSelectionValue(models, "unknown/model"), "unknown/model");
+});
 
 test("thinking options follow the model-advertised schema key", () => {
   const model = {

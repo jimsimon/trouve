@@ -1062,6 +1062,14 @@ impl Provider for CompactingProvider {
         }]
     }
 
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut models = self.models();
+        // Exercise compaction's route-specific metadata fallback: the routed
+        // catalog has no window, while the provider's static metadata does.
+        models[0].context_window = 0;
+        models
+    }
+
     async fn stream_chat(
         &self,
         _model: &str,
@@ -1131,7 +1139,7 @@ async fn compaction_summarizes_transcript_near_context_window() {
                     calls: AtomicUsize::new(0),
                 }),
             )
-            .with_default_model("scripted/tiny-model"),
+            .with_default_model("tiny-model"),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

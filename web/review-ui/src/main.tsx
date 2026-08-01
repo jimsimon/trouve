@@ -49,6 +49,8 @@ import {
 import type { CliInfo, CliInstallStatus } from "./cli";
 import {
   defaultThinkingSelection,
+  modelForSelection,
+  modelSelectionValue,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
@@ -2042,11 +2044,9 @@ function RepositoryEditor({
       return { ...current, reviewer_overrides: retained };
     });
   };
-  const effectiveCoordinatorModel = models.find((model) => model.id === draft.model);
+  const effectiveCoordinatorModel = modelForSelection(models, draft.model);
   const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
-  const effectiveRouterModel = models.find(
-    (model) => model.id === (draft.router_model || draft.model),
-  );
+  const effectiveRouterModel = modelForSelection(models, draft.router_model || draft.model);
   const routerThinking = thinkingOptions(effectiveRouterModel);
   const compatibleThinking = (
     configured: string | undefined,
@@ -2132,14 +2132,13 @@ function RepositoryEditor({
           <label>
             Coordinator and fallback model
             <select
-              value={draft.model ?? ""}
+              value={modelSelectionValue(models, draft.model)}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
-                const selectedCoordinatorModel = models.find(
-                  (candidate) => candidate.id === model,
-                );
-                const selectedRouterModel = models.find(
-                  (candidate) => candidate.id === (draft.router_model || model),
+                const selectedCoordinatorModel = modelForSelection(models, model);
+                const selectedRouterModel = modelForSelection(
+                  models,
+                  draft.router_model || model,
                 );
                 setDraft({
                   ...draft,
@@ -2156,9 +2155,9 @@ function RepositoryEditor({
                     const profile = reviewers.find(
                       (reviewer) => reviewer.id === override.reviewer_id,
                     );
-                    const selectedReviewerModel = models.find(
-                      (candidate) =>
-                        candidate.id === (override.model || profile?.model || model),
+                    const selectedReviewerModel = modelForSelection(
+                      models,
+                      override.model || profile?.model || model,
                     );
                     return {
                       ...override,
@@ -2207,12 +2206,13 @@ function RepositoryEditor({
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
-              value={draft.router_model ?? ""}
+              value={modelSelectionValue(models, draft.router_model)}
               disabled={!semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
-                const selectedRouterModel = models.find(
-                  (candidate) => candidate.id === (routerModel || draft.model),
+                const selectedRouterModel = modelForSelection(
+                  models,
+                  routerModel || draft.model,
                 );
                 setDraft({
                   ...draft,
@@ -2351,7 +2351,7 @@ function RepositoryEditor({
               );
               const effectiveModelId = override?.model || reviewer.model || draft.model;
               const reviewerThinking = thinkingOptions(
-                models.find((model) => model.id === effectiveModelId),
+                modelForSelection(models, effectiveModelId),
               );
               return (
                 <div class="persona-execution" key={reviewer.id}>
@@ -2362,12 +2362,12 @@ function RepositoryEditor({
                   <label>
                     Model
                     <select
-                      value={override?.model ?? ""}
+                      value={modelSelectionValue(models, override?.model)}
                       onChange={(event) => {
                         const model = event.currentTarget.value || undefined;
-                        const selectedModel = models.find(
-                          (candidate) =>
-                            candidate.id === (model || reviewer.model || draft.model),
+                        const selectedModel = modelForSelection(
+                          models,
+                          model || reviewer.model || draft.model,
                         );
                         updateReviewerOverride(reviewer.id, {
                           model,
@@ -2504,9 +2504,7 @@ function ReviewerEditor({
   const [message, flash] = useFlash();
   const persistedReviewer = JSON.stringify(reviewer ?? null);
   useEffect(() => setDraft(reviewer ?? empty), [persistedReviewer]);
-  const reviewerModel = models.find(
-    (model) => model.id === (draft.model || defaultModel),
-  );
+  const reviewerModel = modelForSelection(models, draft.model || defaultModel);
   const reviewerThinking = thinkingOptions(reviewerModel);
   return (
     <form
@@ -2552,7 +2550,7 @@ function ReviewerEditor({
       <label>
         Default model
         <select
-          value={draft.model ?? ""}
+          value={modelSelectionValue(models, draft.model)}
           onChange={(event) => {
             const model = event.currentTarget.value || undefined;
             setDraft({
@@ -2560,7 +2558,7 @@ function ReviewerEditor({
               model,
               default_thinking_level:
                 defaultThinkingSelection(
-                  models.find((candidate) => candidate.id === (model || defaultModel)),
+                  modelForSelection(models, model || defaultModel),
                   draft.default_thinking_level,
                 ) || undefined,
             });
@@ -3077,7 +3075,7 @@ function ReviewPersonaSettings({
     [persona?.default_thinking_level],
   );
   const effectiveModel = model || globalModel || "";
-  const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
+  const selectedModel = modelForSelection(models, effectiveModel);
   useEffect(() => {
     if (!personaInfo || !selectedModel) return;
     setThinking((current) => {
@@ -3120,13 +3118,11 @@ function ReviewPersonaSettings({
             <label>
               Default model
               <select
-                value={model}
+                value={modelSelectionValue(models, model)}
                 onChange={(event) => {
                   const next = event.currentTarget.value;
                   setModel(next);
-                  const nextModel = models.find(
-                    (candidate) => candidate.id === (next || globalModel),
-                  );
+                  const nextModel = modelForSelection(models, next || globalModel);
                   if (thinking && !thinkingSelectionIsValid(nextModel, thinking)) {
                     setThinking(defaultThinkingSelection(nextModel));
                   }
@@ -3463,7 +3459,7 @@ function ProviderSettings({
   const requiredCli = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
-  const selectedModel = models.find((model) => model.id === defaultModel);
+  const selectedModel = modelForSelection(models, defaultModel);
   const defaultThinkingOptions = thinkingOptions(selectedModel);
   return (
     <section class="panel settings-card">
@@ -3488,13 +3484,13 @@ function ProviderSettings({
         <label>
           Global default model
           <select
-            value={defaultModel}
+            value={modelSelectionValue(models, defaultModel)}
             onChange={(event) => {
               const next = event.currentTarget.value;
               setDefaultModel(next);
               setDefaultThinking(
                 defaultThinkingSelection(
-                  models.find((model) => model.id === next),
+                  modelForSelection(models, next),
                   defaultThinking,
                 ),
               );

@@ -1046,6 +1046,15 @@ impl Engine {
                     content: segment,
                 });
             }
+            for call_id in open_tools {
+                persisted.push(Event::ToolCompleted {
+                    call_id,
+                    status: ToolStatus::Aborted,
+                    result: serde_json::json!({
+                        "error": "turn cancelled during tool execution"
+                    }),
+                });
+            }
             flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
             if !text.is_empty() {
                 self.store.append_message(

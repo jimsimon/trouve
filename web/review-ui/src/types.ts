@@ -422,7 +422,7 @@ export interface Provider {
 
 export interface ProvidersResponse {
   providers: Provider[];
-  provider_order: string[];
+  provider_order?: string[];
   default_model: string;
   default_thinking_level?: string;
 }
