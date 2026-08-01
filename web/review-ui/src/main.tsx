@@ -67,6 +67,7 @@ import {
   reviewSettingsFromMinutes,
   timeoutMinutes,
 } from "./review-settings";
+import { routingReasonLabel } from "./routing-labels";
 import { jobStatusClass, safeExternalUrl } from "./security";
 import type {
   CodeReviewSettings,
@@ -195,27 +196,6 @@ function routingModeLabel(mode: Repository["routing_mode"]): string {
       return "Automatic";
     default:
       return "Manual";
-  }
-}
-
-function routingReasonLabel(
-  source: NonNullable<RoutingDecision["reasons"]>[number]["source"],
-): string {
-  switch (source) {
-    case "core":
-      return "Manual selection";
-    case "baseline":
-      return "Automatic baseline";
-    case "deterministic":
-      return "Diff signal";
-    case "semantic":
-      return "Semantic triage";
-    case "included":
-      return "Additive core";
-    case "thorough":
-      return "Legacy thorough mode";
-    default:
-      return source;
   }
 }
 
@@ -1339,7 +1319,8 @@ function JobDetailPane({
                               <ul>
                                 {(decision.reasons ?? []).map((reason, index) => (
                                   <li key={`${reason.source}:${index}`}>
-                                    <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
+                                    <b>{routingReasonLabel(reason.source, job.routing_mode)}:</b>{" "}
+                                    {reason.detail}
                                   </li>
                                 ))}
                               </ul>
@@ -1524,7 +1505,8 @@ function JobDetailPane({
                       <ul>
                         {(selectedRoutingDecision.reasons ?? []).map((reason, index) => (
                           <li key={`${reason.source}:${index}`}>
-                            <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
+                            <b>{routingReasonLabel(reason.source, job.routing_mode)}:</b>{" "}
+                            {reason.detail}
                           </li>
                         ))}
                       </ul>
@@ -2082,7 +2064,7 @@ function RepositoryEditor({
               <strong>Semantic triage</strong>
               <small>
                 Run one lightweight, tool-free routing pass per batch. It may add relevant
-                personas but cannot remove baseline, deterministic, or enabled core personas.
+                personas but cannot remove personas selected by diff signals or Additive policy.
               </small>
             </span>
           </label>

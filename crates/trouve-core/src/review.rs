@@ -3063,7 +3063,15 @@ impl Engine {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let reviewer_count = reviewers.len();
+        let catalog_reviewer_count = reviewers.len();
+        let selected_reviewer_count = selected_reviewer_count(
+            &routing_decisions,
+            if batches.is_empty() {
+                0
+            } else {
+                catalog_reviewer_count
+            },
+        );
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
         for task in existing_tasks {
@@ -3077,7 +3085,7 @@ impl Engine {
         self.store.set_code_review_job_progress(
             &job.id,
             completed_reviewers,
-            reviewer_count as u64,
+            catalog_reviewer_count as u64,
         )?;
         self.emit_code_review_progress(&job.id)?;
         let mut planned = Vec::new();
@@ -3343,11 +3351,7 @@ impl Engine {
         let coordinator_started = Instant::now();
         let parsed = if candidates.is_empty() && previous_findings.is_empty() {
             ReviewOutput {
-                summary: format!(
-                    "{} reviewer(s) examined {} changed file(s); no actionable issues were confirmed.",
-                    reviewer_count,
-                    diff_files.len()
-                ),
+                summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
                 findings: Vec::new(),
                 rejected_candidates: Vec::new(),
                 resolved_finding_ids: Vec::new(),
@@ -5310,10 +5314,12 @@ fn non_semantic_routing_reasons(
         }],
         CodeReviewRoutingMode::Additive | CodeReviewRoutingMode::Automatic => {
             let mut reasons = Vec::new();
-            if crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str()) {
+            if job.routing_mode == CodeReviewRoutingMode::Additive
+                && crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str())
+            {
                 reasons.push(CodeReviewRoutingReason {
                     source: CodeReviewRoutingSource::Baseline,
-                    detail: "part of automatic selection's correctness baseline".into(),
+                    detail: "part of Additive selection's correctness baseline".into(),
                 });
             }
             if job.routing_mode == CodeReviewRoutingMode::Additive
@@ -5362,7 +5368,8 @@ fn build_routing_decisions(
                 reasons,
             });
         }
-        if !decisions[start..].iter().any(|decision| decision.selected)
+        if job.routing_mode == CodeReviewRoutingMode::Additive
+            && !decisions[start..].iter().any(|decision| decision.selected)
             && let Some(fallback) = decisions.get_mut(start)
         {
             fallback.selected = true;
@@ -5373,6 +5380,32 @@ fn build_routing_decisions(
         }
     }
     decisions
+}
+
+fn selected_reviewer_count(
+    routing_decisions: &[CodeReviewRoutingDecision],
+    legacy_fallback: usize,
+) -> usize {
+    if routing_decisions.is_empty() {
+        return legacy_fallback;
+    }
+    routing_decisions
+        .iter()
+        .filter(|decision| decision.selected)
+        .map(|decision| decision.reviewer_id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn no_candidate_review_summary(reviewer_count: usize, changed_file_count: usize) -> String {
+    if reviewer_count == 0 {
+        return format!(
+            "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
+        );
+    }
+    format!(
+        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s); no actionable issues were confirmed."
+    )
 }
 
 fn semantic_routing_candidates<'a>(
@@ -5407,7 +5440,7 @@ fn semantic_routing_prompt(
         .join("\n");
     format!(
         "Route complete diff batch {batch_number}/{batch_count} for pull request #{number}. \
-         Baseline and deterministic reviewers have already been selected. Choose only additional \
+         Personas matched by non-semantic routing have already been selected. Choose only additional \
          personas whose focused expertise is materially relevant to a plausible defect in this \
          batch. Selection may only add coverage; returning none is expected when the existing \
          routing is sufficient.\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
@@ -7837,6 +7870,11 @@ mod tests {
                 .iter()
                 .any(|reason| reason.source == CodeReviewRoutingSource::Included)
         );
+        assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 4);
+        assert_eq!(
+            no_candidate_review_summary(4, 1),
+            "4 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
+        );
     }
 
     #[test]
@@ -7863,7 +7901,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_ignores_additive_core_personas() {
+    fn automatic_routing_has_no_baseline_or_additive_core_personas() {
         let reviewers = crate::reviewers::built_in_reviewers()
             .into_iter()
             .filter(|reviewer| ["correctness", "reliability"].contains(&reviewer.id.as_str()))
@@ -7886,13 +7924,24 @@ mod tests {
             .iter()
             .find(|decision| decision.reviewer_id == "reliability")
             .unwrap();
-        assert!(correctness.selected);
+        assert!(!correctness.selected);
         assert!(!reliability.selected);
+        assert!(decisions.iter().all(|decision| {
+            decision
+                .reasons
+                .iter()
+                .all(|reason| reason.source != CodeReviewRoutingSource::Baseline)
+        }));
         assert!(
             reliability
                 .reasons
                 .iter()
                 .all(|reason| reason.source != CodeReviewRoutingSource::Included)
+        );
+        assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 0);
+        assert_eq!(
+            no_candidate_review_summary(0, 1),
+            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
         );
     }
 
@@ -7952,7 +8001,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_keeps_a_fallback_when_no_signal_matches() {
+    fn additive_routing_keeps_a_fallback_when_no_signal_matches() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let mut job = enqueue_test_review_job(&store, "acme/widgets#42:routing-fallback");
         job.routing_mode = CodeReviewRoutingMode::Additive;
