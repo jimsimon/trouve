@@ -461,7 +461,9 @@ fn turn_stream(
         let mut turn_finished = false;
         let mut client_gone = false;
         let mut route_overloaded = false;
+        let mut route_closed = false;
         let mut overload_signal = rx.overload_signal();
+        let mut close_signal = rx.close_signal();
         let process_route = async {
             while let Some(msg) = rx.recv().await {
                 let root_message = message_belongs_to_thread(&msg, &codex_thread_id);
@@ -583,9 +585,10 @@ fn turn_stream(
                             server
                                 .clear_active_turn(&codex_thread_id, &codex_turn_id)
                                 .await;
-                            // From this point the completed turn must never be
-                            // re-registered by cancellation cleanup, even if
-                            // the consumer drops while receiving completion.
+                            // Remove the route before yielding completion. A
+                            // consumer is allowed to drop immediately after
+                            // receiving the terminal event.
+                            server.unsubscribe(&codex_thread_id, &route_tx).await;
                             cleanup.disarm();
                             turn_finished = true;
                             let status = params["turn"]["status"].as_str().unwrap_or("completed");
@@ -683,6 +686,9 @@ fn turn_stream(
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
+            _ = close_signal.wait() => {
+                route_closed = true;
+            }
             _ = process_route => {}
         }
         let _cleanup_lifecycle = if turn_finished {
@@ -708,8 +714,8 @@ fn turn_stream(
             server
                 .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
                 .await;
-        } else if !turn_finished {
-            let reason = if server.is_closed() {
+        } else if route_closed || !turn_finished {
+            let reason = if route_closed || server.is_closed() {
                 "app-server closed before turn completed"
             } else {
                 "app-server event route closed before turn completed"
@@ -918,6 +924,7 @@ const UNKNOWN_BUFFER_BUDGET: usize = 64;
 const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INTERRUPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct TurnLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -951,7 +958,10 @@ struct StartedTurnGuard {
     turn_id: Option<String>,
     route_tx: RouteSender<ServerMsg>,
     response: Option<oneshot::Receiver<Result<Value, String>>>,
+    request_id: i64,
+    write_started: Arc<std::sync::atomic::AtomicBool>,
     lifecycle: Option<TurnLifecycleGuard>,
+    startup_recovery: bool,
     armed: bool,
 }
 
@@ -961,6 +971,8 @@ impl StartedTurnGuard {
         thread_id: String,
         route_tx: RouteSender<ServerMsg>,
         response: oneshot::Receiver<Result<Value, String>>,
+        request_id: i64,
+        write_started: Arc<std::sync::atomic::AtomicBool>,
         lifecycle: TurnLifecycleGuard,
     ) -> Self {
         Self {
@@ -969,7 +981,10 @@ impl StartedTurnGuard {
             turn_id: None,
             route_tx,
             response: Some(response),
+            request_id,
+            write_started,
             lifecycle: Some(lifecycle),
+            startup_recovery: true,
             armed: true,
         }
     }
@@ -994,7 +1009,8 @@ impl StartedTurnGuard {
         self.armed = false;
     }
 
-    fn release_lifecycle(&mut self) {
+    fn finish_startup(&mut self) {
+        self.startup_recovery = false;
         self.lifecycle.take();
     }
 }
@@ -1009,6 +1025,9 @@ impl Drop for StartedTurnGuard {
         let known_turn_id = self.turn_id.clone();
         let route_tx = self.route_tx.clone();
         let response = self.response.take();
+        let request_id = self.request_id;
+        let write_started = self.write_started.clone();
+        let startup_recovery = self.startup_recovery;
         // Transfer startup serialization into cancellation cleanup. A
         // replacement cannot register before this late response is either
         // interrupted or the transport is definitively terminated.
@@ -1019,6 +1038,13 @@ impl Drop for StartedTurnGuard {
                 Some(lifecycle) => lifecycle,
                 None => server.lock_turn_lifecycle(&thread_id).await,
             };
+            if response.is_some() && !write_started.load(Ordering::Relaxed) {
+                // Cancellation while waiting for the shared stdin lock sent
+                // no bytes, so there is no vendor turn to recover.
+                server.pending.lock().await.remove(&request_id);
+                server.unsubscribe(&thread_id, &route_tx).await;
+                return;
+            }
             let recovered_turn_id = match (known_turn_id, response) {
                 (Some(turn_id), _) => Some(turn_id),
                 (None, Some(response)) => {
@@ -1029,6 +1055,7 @@ impl Drop for StartedTurnGuard {
                                 tracing::warn!(
                                     "codex: cancelled turn/start response invalid: {error}"
                                 );
+                                server.terminate_transport().await;
                                 None
                             }
                         },
@@ -1051,22 +1078,21 @@ impl Drop for StartedTurnGuard {
                 (None, None) => None,
             };
             if let Some(turn_id) = recovered_turn_id {
-                if !server.owns_route(&thread_id, &route_tx).await {
-                    tracing::warn!(
-                        "codex: cancelled startup turn {turn_id} no longer owns its route"
-                    );
-                    return;
-                }
-                // Install the retryable marker before attempting interruption.
-                // If interruption fails, the next startup must retry it before
-                // it can subscribe or send a replacement prompt.
-                if !server
-                    .register_active_turn_if_vacant(&thread_id, &turn_id)
-                    .await
-                {
-                    tracing::warn!(
-                        "codex: cancelled startup turn {turn_id} lost ownership to a replacement"
-                    );
+                if startup_recovery {
+                    // Only startup recovery may install a marker that is not
+                    // already present. Stream cleanup must never resurrect a
+                    // completed or already-interrupted turn.
+                    if !server
+                        .register_active_turn_if_vacant(&thread_id, &turn_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "codex: cancelled startup turn {turn_id} lost ownership to a replacement"
+                        );
+                        server.unsubscribe(&thread_id, &route_tx).await;
+                        return;
+                    }
+                } else if !server.active_turn_is(&thread_id, &turn_id).await {
                     server.unsubscribe(&thread_id, &route_tx).await;
                     return;
                 }
@@ -1789,7 +1815,12 @@ async fn close_transport(
     // transport while its abandoned waiters are being drained.
     closed.store(true, Ordering::Relaxed);
     pending.lock().await.clear();
-    *routing.lock().await = RoutingState::default();
+    let mut routing = routing.lock().await;
+    for route in routing.routes.values() {
+        route.tx.mark_closed();
+    }
+    *routing = RoutingState::default();
+    drop(routing);
     if let Some(active_turns) = active_turns {
         active_turns.lock().await.clear();
     }
@@ -1800,27 +1831,48 @@ async fn terminate_transport_parts(
     routing: Routing,
     active_turns: Option<ActiveTurns>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    child: Option<std::sync::Weak<std::sync::Mutex<Child>>>,
+    child: Option<Arc<std::sync::Mutex<Child>>>,
 ) {
     // The detached task owns the complete invalidation sequence, so dropping
     // a caller cannot strand waiters after `closed` becomes visible.
     closed.store(true, Ordering::Relaxed);
     let cleanup = tokio::spawn(async move {
         close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
-        if let Some(child) = child.and_then(|child| child.upgrade()) {
-            match child.lock() {
-                Ok(mut child) => {
-                    if let Err(error) = child.start_kill() {
-                        tracing::warn!("codex: failed to terminate unusable app-server: {error}");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("codex: app-server process lock is poisoned: {error}");
-                }
-            }
+        if let Some(child) = child {
+            let _ = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
         }
     });
     let _ = cleanup.await;
+}
+
+fn kill_and_reap_child(child: Arc<std::sync::Mutex<Child>>) {
+    let Ok(mut child) = child.lock() else {
+        tracing::warn!("codex: app-server process lock is poisoned");
+        return;
+    };
+    if let Err(error) = child.start_kill() {
+        tracing::warn!("codex: failed to terminate unusable app-server: {error}");
+    }
+    let deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "codex: app-server did not exit within {}s",
+                    CHILD_REAP_TIMEOUT.as_secs()
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("codex: failed to reap app-server: {error}");
+                return;
+            }
+        }
+    }
 }
 
 async fn read_stdout<R: AsyncRead + Unpin>(
@@ -1880,7 +1932,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                     routing.clone(),
                     active_turns.clone(),
                     closed.clone(),
-                    child.clone(),
+                    child.as_ref().and_then(std::sync::Weak::upgrade),
                 )
                 .await;
                 return;
@@ -1895,7 +1947,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                         routing.clone(),
                         active_turns.clone(),
                         closed.clone(),
-                        child.clone(),
+                        child.as_ref().and_then(std::sync::Weak::upgrade),
                     )
                     .await;
                     return;
@@ -1908,6 +1960,9 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     // request waiters and routed turn streams wake immediately instead of
     // remaining active forever.
     close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
+    if let Some(child) = child.and_then(|child| child.upgrade()) {
+        let _ = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
+    }
 }
 
 struct AppServer {
@@ -1985,25 +2040,23 @@ impl AppServer {
 
     fn invalidate_transport_now(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        if let Ok(mut pending) = self.pending.try_lock() {
-            pending.clear();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(terminate_transport_parts(
+                self.pending.clone(),
+                self.routing.clone(),
+                Some(self.active_turns.clone()),
+                self.closed.clone(),
+                Some(self.child.clone()),
+            ));
+            return;
         }
-        if let Ok(mut routing) = self.routing.try_lock() {
-            *routing = RoutingState::default();
-        }
-        if let Ok(mut active_turns) = self.active_turns.try_lock() {
-            active_turns.clear();
-        }
-        match self.child.try_lock() {
-            Ok(mut child) => {
-                if let Err(error) = child.start_kill() {
-                    tracing::warn!("codex: failed to invalidate app-server process: {error}");
-                }
-            }
-            Err(error) => {
-                tracing::warn!("codex: app-server process cleanup already in progress: {error}");
-            }
-        }
+
+        // Outside a runtime there is nowhere to schedule async cleanup. Block
+        // until every waiter is released and the subprocess is reaped.
+        self.pending.blocking_lock().clear();
+        *self.routing.blocking_lock() = RoutingState::default();
+        self.active_turns.blocking_lock().clear();
+        kill_and_reap_child(self.child.clone());
     }
 
     fn start_reader(&self, stdout: tokio::process::ChildStdout) {
@@ -2051,7 +2104,7 @@ impl AppServer {
                         routing.clone(),
                         Some(active_turns.clone()),
                         closed.clone(),
-                        Some(child.clone()),
+                        child.upgrade(),
                     )
                     .await;
                     break;
@@ -2136,21 +2189,27 @@ impl AppServer {
     ) -> Result<(String, StartedTurnGuard), BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        let write_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut cleanup = StartedTurnGuard::new(
             self.clone(),
             thread_id.to_string(),
             route_tx.clone(),
             rx,
+            id,
+            write_started.clone(),
             lifecycle,
         );
         self.pending.lock().await.insert(id, tx);
         if let Err(error) = self
-            .write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "turn/start",
-                "params": params,
-            }))
+            .write_tracking(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "turn/start",
+                    "params": params,
+                }),
+                Some(&write_started),
+            )
             .await
         {
             self.pending.lock().await.remove(&id);
@@ -2171,7 +2230,7 @@ impl AppServer {
         self.activate_route(thread_id, &turn_id, route_tx).await?;
         // No await may follow this release: the active marker and route are
         // now atomically visible to the next lifecycle owner.
-        cleanup.release_lifecycle();
+        cleanup.finish_startup();
         Ok((turn_id, cleanup))
     }
 
@@ -2194,13 +2253,12 @@ impl AppServer {
         }
     }
 
-    async fn owns_route(&self, thread_id: &str, expected: &RouteSender<ServerMsg>) -> bool {
-        self.routing
+    async fn active_turn_is(&self, thread_id: &str, expected_turn_id: &str) -> bool {
+        self.active_turns
             .lock()
             .await
-            .routes
             .get(thread_id)
-            .is_some_and(|route| route.tx.same_channel(expected))
+            .is_some_and(|turn_id| turn_id == expected_turn_id)
     }
 
     async fn activate_route(
@@ -2215,12 +2273,6 @@ impl AppServer {
             let (responses, response_overloaded) = routing.take_retired_responses();
             (activated, responses, response_overloaded)
         };
-        if !activated {
-            self.clear_active_turn(thread_id, turn_id).await;
-            return Err(BackendError::Protocol(
-                "turn/start route disappeared before activation".into(),
-            ));
-        }
         if response_overloaded {
             tracing::error!(
                 "codex: terminating app-server after activation response buffer overflow"
@@ -2230,7 +2282,15 @@ impl AppServer {
                 "app-server activation generated too many decline responses".into(),
             ));
         }
-        self.send_retired_responses(responses).await
+        self.send_retired_responses(responses).await?;
+        if !activated {
+            // Keep the exact active marker installed. The still-armed startup
+            // guard will interrupt it even though its route disappeared.
+            return Err(BackendError::Protocol(
+                "turn/start route disappeared before activation".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Clear an active turn only when the caller still owns that turn id.
@@ -2276,12 +2336,19 @@ impl AppServer {
         }
         match tokio::time::timeout(INTERRUPT_RESPONSE_TIMEOUT, rx).await {
             Ok(Ok(Ok(_))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(BackendError::Protocol(format!("turn/interrupt: {error}"))),
+            Ok(Ok(Err(error))) => {
+                self.terminate_transport().await;
+                Err(BackendError::Protocol(format!("turn/interrupt: {error}")))
+            }
             Ok(Err(_)) => Err(BackendError::Protocol(
                 "turn/interrupt: app-server closed before responding".into(),
             )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                // The interrupt may have been applied even though its response
+                // was lost. The transport is now ambiguous and cannot safely
+                // accept a replacement prompt.
+                self.terminate_transport().await;
                 Err(BackendError::Protocol(format!(
                     "turn/interrupt: no response within {}s",
                     INTERRUPT_RESPONSE_TIMEOUT.as_secs()
@@ -2310,12 +2377,25 @@ impl AppServer {
     }
 
     async fn write(&self, msg: Value) -> Result<(), BackendError> {
+        self.write_tracking(msg, None).await
+    }
+
+    async fn write_tracking(
+        &self,
+        msg: Value,
+        write_started: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), BackendError> {
         if self.is_closed() {
             return Err(BackendError::Protocol(
                 "app-server transport is closed".into(),
             ));
         }
         let mut stdin = self.stdin.lock().await;
+        if let Some(write_started) = write_started {
+            // No cancellation point separates acquiring exclusive stdin from
+            // publishing that the request may now be partially written.
+            write_started.store(true, Ordering::Relaxed);
+        }
         let mut line = serde_json::to_vec(&msg).expect("serializable");
         line.push(b'\n');
         let mut write_guard = TransportWriteGuard {
@@ -2353,7 +2433,7 @@ impl AppServer {
             self.routing.clone(),
             Some(self.active_turns.clone()),
             self.closed.clone(),
-            Some(Arc::downgrade(&self.child)),
+            Some(self.child.clone()),
         )
         .await;
     }
@@ -3421,6 +3501,9 @@ mod tests {
         let stub = temp.path().join("codex-late-start");
         let started_marker = std::path::PathBuf::from(format!("{}.started", stub.display()));
         let interrupt_marker = std::path::PathBuf::from(format!("{}.interrupt", stub.display()));
+        let release_marker = std::path::PathBuf::from(format!("{}.release", stub.display()));
+        let attempted_marker = std::path::PathBuf::from(format!("{}.attempted", stub.display()));
+        let acquired_marker = std::path::PathBuf::from(format!("{}.acquired", stub.display()));
         std::fs::write(
             &stub,
             r#"#!/bin/sh
@@ -3430,6 +3513,7 @@ sleep 0.05
 echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"late-turn"}}}'
 IFS= read -r interrupt
 printf '%s\n' "$interrupt" > "$0.interrupt"
+while [ ! -f "$0.release" ]; do sleep 0.01; done
 echo '{"jsonrpc":"2.0","id":2,"result":{}}'
 cat > /dev/null
 "#,
@@ -3447,21 +3531,42 @@ cat > /dev/null
             tokio::select! {
                 _ = &mut start => panic!("turn/start unexpectedly completed"),
                 _ = async {
-                    while !started_marker.exists() {
-                        tokio::task::yield_now().await;
-                    }
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !started_marker.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("stub should receive turn/start");
                 } => {}
             }
         }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !interrupt_marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup should send turn/interrupt");
+        let waiter_server = server.clone();
+        let waiter_attempted = attempted_marker.clone();
+        let waiter_acquired = acquired_marker.clone();
+        let waiter = tokio::spawn(async move {
+            std::fs::write(waiter_attempted, b"").unwrap();
+            let lifecycle = waiter_server.lock_turn_lifecycle("root").await;
+            std::fs::write(waiter_acquired, b"").unwrap();
+            lifecycle
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !attempted_marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement should attempt lifecycle acquisition");
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                server.lock_turn_lifecycle("root")
-            )
-            .await
-            .is_err(),
-            "replacement startup must wait for cancelled-start cleanup"
+            !acquired_marker.exists(),
+            "replacement must not acquire lifecycle before interrupt completes"
         );
+        std::fs::write(release_marker, b"").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let cleaned = interrupt_marker.exists()
@@ -3475,7 +3580,12 @@ cat > /dev/null
         })
         .await
         .unwrap();
-        drop(server.lock_turn_lifecycle("root").await);
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("replacement should acquire lifecycle after cleanup")
+                .unwrap(),
+        );
     }
 
     #[cfg(unix)]
@@ -3507,6 +3617,266 @@ sleep 10
         assert!(server.is_closed());
         assert!(server.routing.lock().await.routes.is_empty());
         assert!(server.active_turns.lock().await.is_empty());
+        assert!(server.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_invalid_turn_start_response_terminates_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-cancelled-invalid-start");
+        let started_marker = std::path::PathBuf::from(format!("{}.started", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r line
+: > "$0.started"
+sleep 0.05
+echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{}}}'
+sleep 10
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await.unwrap();
+        {
+            let start =
+                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
+            tokio::pin!(start);
+            tokio::select! {
+                _ = &mut start => panic!("turn/start unexpectedly completed"),
+                _ = async {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !started_marker.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("stub should receive turn/start");
+                } => {}
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let reaped = server
+                    .child
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok().flatten())
+                    .is_some();
+                if server.is_closed() && server.routing.lock().await.routes.is_empty() && reaped {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invalid recovered start should terminate transport");
+        assert!(server.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_start_before_stdin_write_preserves_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-start-before-write");
+        std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await.unwrap();
+        let stdin = server.stdin.lock().await;
+        {
+            let start =
+                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
+            tokio::pin!(start);
+            tokio::select! {
+                biased;
+                _ = &mut start => panic!("turn/start unexpectedly completed"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let cleaned = server.pending.lock().await.is_empty()
+                    && !server.routing.lock().await.routes.contains_key("root");
+                if cleaned {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pre-write cancellation should clean up promptly");
+        assert!(!server.is_closed());
+        drop(stdin);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_removes_route_before_terminal_event_is_yielded() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-completion-route-cleanup");
+        std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await.unwrap();
+        server
+            .routing
+            .lock()
+            .await
+            .activate_route("root", "root-turn", &route.tx);
+        server.register_active_turn("root", "root-turn").await;
+        let route_tx = route.tx.clone();
+        let (_response_tx, response_rx) = oneshot::channel();
+        let mut cleanup = StartedTurnGuard::new(
+            server.clone(),
+            "root".into(),
+            route.tx.clone(),
+            response_rx,
+            99,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            lifecycle,
+        );
+        cleanup.response = None;
+        cleanup.turn_id = Some("root-turn".into());
+        cleanup.finish_startup();
+        let stream = turn_stream(
+            server.clone(),
+            "root".into(),
+            "root-turn".into(),
+            route,
+            false,
+            cleanup,
+        );
+        futures::pin_mut!(stream);
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "turn/completed".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turn": { "id": "root-turn", "status": "completed" }
+                }),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::Completed { .. }))
+        ));
+        assert!(!server.routing.lock().await.routes.contains_key("root"));
+        assert!(server.active_turns.lock().await.get("root").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_guard_interrupts_exact_turn_after_route_loss() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-route-loss-cleanup");
+        let interrupt_marker = std::path::PathBuf::from(format!("{}.interrupt", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r interrupt
+printf '%s\n' "$interrupt" > "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+cat > /dev/null
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await.unwrap();
+        server.register_active_turn("root", "orphan-turn").await;
+        let (_response_tx, response_rx) = oneshot::channel();
+        let mut cleanup = StartedTurnGuard::new(
+            server.clone(),
+            "root".into(),
+            route.tx.clone(),
+            response_rx,
+            99,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            lifecycle,
+        );
+        cleanup.response = None;
+        cleanup.turn_id = Some("orphan-turn".into());
+        server
+            .routing
+            .lock()
+            .await
+            .remove_route_if_same("root", &route.tx, false);
+        drop(cleanup);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !interrupt_marker.exists()
+                || server.active_turns.lock().await.contains_key("root")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route loss must still interrupt the started vendor turn");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_start_guard_does_not_resurrect_cleared_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-post-start-cleanup");
+        let write_marker = std::path::PathBuf::from(format!("{}.write", stub.display()));
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' \"$line\" > \"$0.write\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await.unwrap();
+        let (_response_tx, response_rx) = oneshot::channel();
+        let mut cleanup = StartedTurnGuard::new(
+            server.clone(),
+            "root".into(),
+            route.tx.clone(),
+            response_rx,
+            99,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            lifecycle,
+        );
+        cleanup.response = None;
+        cleanup.turn_id = Some("completed-turn".into());
+        cleanup.finish_startup();
+        drop(cleanup);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.routing.lock().await.routes.contains_key("root") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-start cleanup should remove its route");
+        assert!(!write_marker.exists());
+        assert!(!server.active_turns.lock().await.contains_key("root"));
     }
 
     #[cfg(unix)]
@@ -3530,6 +3900,8 @@ sleep 10
                 "root".into(),
                 route.tx,
                 response_rx,
+                1,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 lifecycle,
             );
             (cleanup, server)
