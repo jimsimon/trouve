@@ -1844,6 +1844,27 @@ fn close_transport_blocking(
     active_turns.blocking_lock().clear();
 }
 
+fn close_transport_available(
+    pending: &Pending,
+    routing: &Routing,
+    active_turns: &ActiveTurns,
+    closed: &std::sync::atomic::AtomicBool,
+) {
+    closed.store(true, Ordering::Relaxed);
+    if let Ok(mut pending) = pending.try_lock() {
+        pending.clear();
+    }
+    if let Ok(mut routing) = routing.try_lock() {
+        for route in routing.routes.values() {
+            route.tx.mark_closed();
+        }
+        *routing = RoutingState::default();
+    }
+    if let Ok(mut active_turns) = active_turns.try_lock() {
+        active_turns.clear();
+    }
+}
+
 async fn terminate_transport_parts(
     pending: Pending,
     routing: Routing,
@@ -1910,15 +1931,24 @@ fn start_kill_child_now(child: &std::sync::Mutex<Child>) {
     }
 }
 
+struct ReaderTurnState {
+    active_turns: Option<ActiveTurns>,
+    turn_lifecycles: Option<TurnLifecycles>,
+}
+
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
     routing: Routing,
-    active_turns: Option<ActiveTurns>,
+    turn_state: ReaderTurnState,
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     child: Option<std::sync::Weak<std::sync::Mutex<Child>>>,
 ) {
+    let ReaderTurnState {
+        active_turns,
+        turn_lifecycles,
+    } = turn_state;
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
@@ -1967,14 +1997,27 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 routing.take_retired_responses()
             };
             if let Some((thread_id, turn_id)) = completed_turn
-                && let Some(active_turns) = active_turns.as_ref()
+                && let Some(active_turns) = active_turns.clone()
             {
-                // The process-wide reader remains authoritative even after a
-                // consumer disappears. Clear only the exact completed marker,
-                // so a concurrently registered replacement is never erased.
-                let mut active = active_turns.lock().await;
-                if active.get(&thread_id) == Some(&turn_id) {
-                    active.remove(&thread_id);
+                if let Some(turn_lifecycles) = turn_lifecycles.clone() {
+                    // Do not block the multiplexed stdout reader on a thread
+                    // lifecycle: an interrupt response for this or another
+                    // turn may be the next line. The detached cleanup shares
+                    // startup serialization but owns no process handle.
+                    tokio::spawn(async move {
+                        let _lifecycle = acquire_turn_lifecycle(&turn_lifecycles, &thread_id).await;
+                        let mut active = active_turns.lock().await;
+                        if active.get(&thread_id) == Some(&turn_id) {
+                            active.remove(&thread_id);
+                        }
+                    });
+                } else {
+                    // Unit plumbing without lifecycle state still preserves
+                    // exact-marker matching.
+                    let mut active = active_turns.lock().await;
+                    if active.get(&thread_id) == Some(&turn_id) {
+                        active.remove(&thread_id);
+                    }
                 }
             }
             if response_overloaded {
@@ -2037,6 +2080,7 @@ struct AppServer {
     child: Arc<std::sync::Mutex<Child>>,
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    transport_cleanup_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct TransportWriteGuard<'a> {
@@ -2082,6 +2126,7 @@ impl AppServer {
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transport_cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_response_writer(retired_response_rx);
         server.start_reader(stdout);
@@ -2098,16 +2143,40 @@ impl AppServer {
         // the kill signal synchronously, then move waiter release and reaping
         // to an OS thread whose lifetime is independent of Tokio.
         start_kill_child_now(&self.child);
+        if self.transport_cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Release every uncontended waiter synchronously. This remains useful
+        // even if the host cannot allocate the fallback cleanup thread.
+        close_transport_available(
+            &self.pending,
+            &self.routing,
+            &self.active_turns,
+            &self.closed,
+        );
         if tokio::runtime::Handle::try_current().is_ok() {
             let pending = self.pending.clone();
             let routing = self.routing.clone();
             let active_turns = self.active_turns.clone();
             let closed = self.closed.clone();
             let child = self.child.clone();
-            let _cleanup = std::thread::spawn(move || {
-                close_transport_blocking(&pending, &routing, &active_turns, &closed);
-                kill_and_reap_child(child);
-            });
+            if let Err(error) = std::thread::Builder::new()
+                .name("codex-transport-cleanup".into())
+                .spawn(move || {
+                    close_transport_blocking(&pending, &routing, &active_turns, &closed);
+                    kill_and_reap_child(child);
+                })
+            {
+                tracing::error!("codex: failed to start transport cleanup thread: {error}");
+                self.transport_cleanup_started
+                    .store(false, Ordering::Release);
+                close_transport_available(
+                    &self.pending,
+                    &self.routing,
+                    &self.active_turns,
+                    &self.closed,
+                );
+            }
             return;
         }
 
@@ -2132,7 +2201,10 @@ impl AppServer {
             stdout,
             pending,
             routing,
-            Some(active_turns),
+            ReaderTurnState {
+                active_turns: Some(active_turns),
+                turn_lifecycles: Some(self.turn_lifecycles.clone()),
+            },
             self.retired_response_tx.clone(),
             closed,
             Some(child),
@@ -3470,7 +3542,10 @@ mod tests {
             reader,
             pending.clone(),
             routing.clone(),
-            None,
+            ReaderTurnState {
+                active_turns: None,
+                turn_lifecycles: None,
+            },
             retired_response_tx,
             closed.clone(),
             None,
@@ -3500,18 +3575,22 @@ mod tests {
     async fn reader_clears_completed_marker_without_a_live_route_consumer() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routing: Routing = Arc::new(Mutex::new(RoutingState::default()));
-        let active_turns: ActiveTurns = Arc::new(Mutex::new(HashMap::from([(
-            "thread-1".to_string(),
-            "turn-1".to_string(),
-        )])));
+        let active_turns: ActiveTurns = Arc::new(Mutex::new(HashMap::new()));
+        let turn_lifecycles: TurnLifecycles = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let held_lifecycle = acquire_turn_lifecycle(&turn_lifecycles, "thread-1").await;
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.lock().await.insert(2, response_tx);
         let (retired_response_tx, _retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
         let (mut writer, reader) = tokio::io::duplex(512);
         let task = tokio::spawn(read_stdout(
             reader,
             pending,
             routing,
-            Some(active_turns.clone()),
+            ReaderTurnState {
+                active_turns: Some(active_turns.clone()),
+                turn_lifecycles: Some(turn_lifecycles.clone()),
+            },
             retired_response_tx,
             closed,
             None,
@@ -3520,18 +3599,103 @@ mod tests {
         writer
             .write_all(
                 br#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+{"jsonrpc":"2.0","id":2,"result":{"next":"response"}}
 "#,
             )
             .await
             .unwrap();
         writer.flush().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiting = turn_lifecycles
+                    .lock()
+                    .unwrap()
+                    .get("thread-1")
+                    .map_or(0, std::sync::Weak::strong_count)
+                    >= 3;
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion reader must wait for startup lifecycle ownership");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+                .await
+                .expect("completion cleanup must not block later transport responses")
+                .expect("stdout reader must retain the pending response sender")
+                .expect("stub response should be successful"),
+            json!({ "next": "response" })
+        );
+        active_turns
+            .lock()
+            .await
+            .insert("thread-1".into(), "turn-1".into());
+        drop(held_lifecycle);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while active_turns.lock().await.contains_key("thread-1") {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("stdout reader must clear the exact completed marker");
+        .expect("stdout reader must clear a marker registered after completion arrived");
+
+        writer.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_preserves_replacement_marker_after_stale_completion() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let routing: Routing = Arc::new(Mutex::new(RoutingState::default()));
+        let active_turns: ActiveTurns = Arc::new(Mutex::new(HashMap::from([(
+            "thread-1".to_string(),
+            "replacement-turn".to_string(),
+        )])));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (route_tx, mut route_rx) = route_channel();
+        {
+            let mut routing = routing.lock().await;
+            routing.subscribe("thread-1", route_tx.clone());
+            routing.activate_route("thread-1", "old-turn", &route_tx);
+        }
+        let (retired_response_tx, _retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let task = tokio::spawn(read_stdout(
+            reader,
+            pending,
+            routing,
+            ReaderTurnState {
+                active_turns: Some(active_turns.clone()),
+                turn_lifecycles: None,
+            },
+            retired_response_tx,
+            closed,
+            None,
+        ));
+
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"old-turn","status":"completed"}}}
+"#,
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), route_rx.recv())
+            .await
+            .expect("stale completion should be processed")
+            .expect("stale completion should reach its original route");
+        assert_eq!(
+            active_turns
+                .lock()
+                .await
+                .get("thread-1")
+                .map(String::as_str),
+            Some("replacement-turn")
+        );
 
         writer.shutdown().await.unwrap();
         task.await.unwrap();
@@ -3905,6 +4069,7 @@ sleep 10
             next.await,
             Some(Ok(BackendEvent::Completed { .. }))
         ));
+        assert!(stream.next().await.is_none());
         assert!(!server.routing.lock().await.routes.contains_key("root"));
         assert!(server.active_turns.lock().await.get("root").is_none());
     }
@@ -4062,6 +4227,7 @@ cat > /dev/null
             let (request_tx, request_rx) = oneshot::channel();
             server.pending.lock().await.insert(99, request_tx);
             server.invalidate_transport_now();
+            server.invalidate_transport_now();
             (server, close_signal, request_rx)
         });
         drop(runtime);
@@ -4076,6 +4242,7 @@ cat > /dev/null
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         ));
         assert!(server.is_closed());
+        assert!(server.transport_cleanup_started.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -4098,7 +4265,10 @@ cat > /dev/null
             reader,
             pending.clone(),
             routing.clone(),
-            None,
+            ReaderTurnState {
+                active_turns: None,
+                turn_lifecycles: None,
+            },
             retired_response_tx,
             closed.clone(),
             None,
