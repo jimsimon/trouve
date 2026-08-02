@@ -3788,6 +3788,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vacant_registration_preserves_replacement_marker() {
+        let completed_turns: CompletedTurns = Arc::new(Mutex::new(CompletedTurnState::default()));
+        let active_turns: ActiveTurns = Arc::new(Mutex::new(HashMap::from([(
+            "thread-1".to_string(),
+            "replacement-turn".to_string(),
+        )])));
+
+        assert_eq!(
+            register_active_turn_state(
+                &completed_turns,
+                &active_turns,
+                "thread-1",
+                "stale-turn",
+                true,
+            )
+            .await,
+            ActiveTurnRegistration::OwnedByReplacement
+        );
+        assert_eq!(
+            active_turns
+                .lock()
+                .await
+                .get("thread-1")
+                .map(String::as_str),
+            Some("replacement-turn")
+        );
+    }
+
+    #[tokio::test]
     async fn reader_preserves_replacement_marker_after_stale_completion() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routing: Routing = Arc::new(Mutex::new(RoutingState::default()));
