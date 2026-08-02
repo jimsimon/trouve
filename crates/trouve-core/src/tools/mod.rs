@@ -39,6 +39,7 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
+const REVIEW_HISTORY_REF_LIMIT: usize = 3;
 
 #[cfg(unix)]
 fn isolate_review_git_process(command: &mut tokio::process::Command) {
@@ -2688,7 +2689,12 @@ impl ToolExecutor for LocalToolExecutor {
         let mut history_refs = Vec::new();
         let mut history_refspecs = Vec::new();
         let mut missing_shas = Vec::new();
-        for (index, sha) in request.optional_shas.iter().take(3).enumerate() {
+        for (index, sha) in request
+            .optional_shas
+            .iter()
+            .take(REVIEW_HISTORY_REF_LIMIT)
+            .enumerate()
+        {
             let present = run(vec![
                 "cat-file".into(),
                 "-e".into(),
@@ -2737,7 +2743,7 @@ impl ToolExecutor for LocalToolExecutor {
                 .clone()
         };
         let _repository_guard = repository_lock.lock().await;
-        for index in 0..3 {
+        for index in 0..REVIEW_HISTORY_REF_LIMIT {
             let reference = format!(
                 "refs/remotes/origin/trouve-history-{}-{index}",
                 request.pull_number
