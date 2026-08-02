@@ -25,7 +25,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
@@ -309,34 +309,15 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
-        let started_turn = match server.request("turn/start", turn_params).await {
+        let (codex_turn_id, cleanup) = match server
+            .start_turn(&codex_thread_id, &route.tx, turn_params)
+            .await
+        {
             Ok(started) => started,
             Err(error) => {
-                server.unsubscribe(&codex_thread_id, &route.tx).await;
                 return Err(error);
             }
         };
-        let codex_turn_id = match turn_id_of(&started_turn) {
-            Ok(turn_id) => turn_id,
-            Err(error) => {
-                server.unsubscribe(&codex_thread_id, &route.tx).await;
-                return Err(error);
-            }
-        };
-        // From this point the vendor turn exists even if this future is
-        // cancelled while waiting for either shared state lock below.
-        let cleanup = StartedTurnGuard::new(
-            server.clone(),
-            codex_thread_id.clone(),
-            codex_turn_id.clone(),
-            route.tx.clone(),
-        );
-        server
-            .register_active_turn(&codex_thread_id, &codex_turn_id)
-            .await;
-        server
-            .activate_route(&codex_thread_id, &codex_turn_id, &route.tx)
-            .await;
 
         let stream = turn_stream(
             server.clone(),
@@ -921,10 +902,12 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type SharedStdin = Arc<Mutex<ChildStdin>>;
 type Routing = Arc<Mutex<RoutingState>>;
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
 const ROUTE_TOMBSTONE_BUDGET: usize = ROUTE_EVENT_BUDGET * 4;
+const UNKNOWN_BUFFER_BUDGET: usize = 64;
 
 struct TurnLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -955,8 +938,9 @@ impl Drop for TurnLifecycleGuard {
 struct StartedTurnGuard {
     server: Arc<AppServer>,
     thread_id: String,
-    turn_id: String,
+    turn_id: Option<String>,
     route_tx: RouteSender<ServerMsg>,
+    response: Option<oneshot::Receiver<Result<Value, String>>>,
     armed: bool,
 }
 
@@ -964,15 +948,32 @@ impl StartedTurnGuard {
     fn new(
         server: Arc<AppServer>,
         thread_id: String,
-        turn_id: String,
         route_tx: RouteSender<ServerMsg>,
+        response: oneshot::Receiver<Result<Value, String>>,
     ) -> Self {
         Self {
             server,
             thread_id,
-            turn_id,
+            turn_id: None,
             route_tx,
+            response: Some(response),
             armed: true,
+        }
+    }
+
+    async fn wait_for_response(&mut self) -> Result<Value, BackendError> {
+        let result = self
+            .response
+            .as_mut()
+            .expect("turn/start response installed")
+            .await;
+        self.response = None;
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(BackendError::Protocol(format!("turn/start: {error}"))),
+            Err(_) => Err(BackendError::Protocol(
+                "turn/start: app-server closed before responding".into(),
+            )),
         }
     }
 
@@ -988,16 +989,41 @@ impl Drop for StartedTurnGuard {
         }
         let server = self.server.clone();
         let thread_id = self.thread_id.clone();
-        let turn_id = self.turn_id.clone();
+        let known_turn_id = self.turn_id.clone();
         let route_tx = self.route_tx.clone();
+        let response = self.response.take();
         tokio::spawn(async move {
             let _lifecycle = server.lock_turn_lifecycle(&thread_id).await;
-            match server.interrupt_turn(&thread_id, &turn_id).await {
-                Ok(()) => server.clear_active_turn(&thread_id, &turn_id).await,
-                Err(error) => {
-                    tracing::warn!(
-                        "codex: failed to interrupt cancelled startup turn {turn_id}: {error}"
-                    );
+            let recovered_turn_id = match (known_turn_id, response) {
+                (Some(turn_id), _) => Some(turn_id),
+                (None, Some(response)) => match response.await {
+                    Ok(Ok(started)) => match turn_id_of(&started) {
+                        Ok(turn_id) => Some(turn_id),
+                        Err(error) => {
+                            tracing::warn!("codex: cancelled turn/start response invalid: {error}");
+                            None
+                        }
+                    },
+                    Ok(Err(error)) => {
+                        tracing::warn!("codex: cancelled turn/start failed: {error}");
+                        None
+                    }
+                    Err(_) => None,
+                },
+                (None, None) => None,
+            };
+            if let Some(turn_id) = recovered_turn_id {
+                // Install the retryable marker before attempting interruption.
+                // If interruption fails, the next startup must retry it before
+                // it can subscribe or send a replacement prompt.
+                server.register_active_turn(&thread_id, &turn_id).await;
+                match server.interrupt_turn(&thread_id, &turn_id).await {
+                    Ok(()) => server.clear_active_turn(&thread_id, &turn_id).await,
+                    Err(error) => {
+                        tracing::warn!(
+                            "codex: failed to interrupt cancelled startup turn {turn_id}: {error}"
+                        );
+                    }
                 }
             }
             server.unsubscribe(&thread_id, &route_tx).await;
@@ -1028,6 +1054,9 @@ async fn acquire_turn_lifecycle(registry: &TurnLifecycles, thread_id: &str) -> T
 
 struct ActiveRoute {
     tx: RouteSender<ServerMsg>,
+    /// Subscription generation created only after the predecessor's
+    /// interruption has completed under the per-thread lifecycle lock.
+    generation: u64,
     /// None until turn/start returns. Messages stay buffered until the route
     /// is bound to the exact turn that is allowed to announce descendants.
     turn_id: Option<String>,
@@ -1037,11 +1066,19 @@ struct ActiveRoute {
 struct RouteOwner {
     root_thread_id: String,
     root_turn_id: String,
+    root_generation: u64,
+}
+
+struct BufferedMessage {
+    message: ServerMsg,
+    /// Root subscription generation at receipt. Unknown/pre-subscription
+    /// traffic has no authenticated generation.
+    root_generation: Option<u64>,
 }
 
 #[derive(Default)]
 struct BufferedRoute {
-    messages: Vec<ServerMsg>,
+    messages: Vec<BufferedMessage>,
     request_overloaded: bool,
     announcement_overloaded: bool,
     /// Turn identities for messages lost from an inactive root route. `None`
@@ -1052,17 +1089,61 @@ struct BufferedRoute {
 
 #[derive(Default)]
 struct RoutingState {
+    next_generation: u64,
     routes: HashMap<String, ActiveRoute>,
     owners: HashMap<String, RouteOwner>,
     buffered: HashMap<String, BufferedRoute>,
+    /// Unowned thread ids are bounded separately from their per-thread event
+    /// queues so late traffic cannot create an unbounded number of buffers.
+    unknown_buffered: HashSet<String>,
+    unknown_buffer_order: VecDeque<String>,
     /// Recently retired roots and children. This prevents late events from a
     /// completed turn becoming pre-subscription buffers, while bounding state
     /// retained for the app-server process lifetime.
     failed: HashSet<String>,
     failed_order: VecDeque<String>,
+    retired_responses: Vec<Value>,
 }
 
 impl RoutingState {
+    fn reject_retired_request(&mut self, message: &ServerMsg) {
+        let ServerMsg::Request { id, method, .. } = message else {
+            return;
+        };
+        let result = if method == "mcpServer/elicitation/request" {
+            json!({ "action": "decline", "content": {} })
+        } else {
+            json!({ "decision": "decline" })
+        };
+        self.retired_responses.push(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }));
+    }
+
+    fn track_unknown_buffer(&mut self, thread_id: &str) {
+        if !self.unknown_buffered.insert(thread_id.to_string()) {
+            return;
+        }
+        self.unknown_buffer_order
+            .retain(|buffered| buffered != thread_id);
+        self.unknown_buffer_order.push_back(thread_id.to_string());
+        while self.unknown_buffer_order.len() > UNKNOWN_BUFFER_BUDGET {
+            let Some(expired) = self.unknown_buffer_order.pop_front() else {
+                break;
+            };
+            if self.unknown_buffered.remove(&expired) {
+                self.buffered.remove(&expired);
+            }
+        }
+    }
+
+    fn take_buffered(&mut self, thread_id: &str) -> Option<BufferedRoute> {
+        self.unknown_buffered.remove(thread_id);
+        self.buffered.remove(thread_id)
+    }
+
     fn is_failed(&self, thread_id: &str) -> bool {
         self.failed.contains(thread_id)
     }
@@ -1088,14 +1169,25 @@ impl RoutingState {
         self.failed.remove(thread_id);
     }
 
-    fn buffer_message(&mut self, thread_id: String, message: ServerMsg) {
+    fn buffer_message(
+        &mut self,
+        thread_id: String,
+        message: ServerMsg,
+        root_generation: Option<u64>,
+    ) {
         if thread_id.is_empty() || self.is_failed(&thread_id) {
             return;
         }
         let root_buffer = self.routes.contains_key(&thread_id);
+        if !root_buffer && !self.buffered.contains_key(&thread_id) {
+            self.track_unknown_buffer(&thread_id);
+        }
         let route = self.buffered.entry(thread_id).or_default();
         if route.messages.len() < ROUTE_EVENT_BUDGET {
-            route.messages.push(message);
+            route.messages.push(BufferedMessage {
+                message,
+                root_generation,
+            });
             return;
         }
         if matches!(&message, ServerMsg::Request { .. }) {
@@ -1103,17 +1195,20 @@ impl RoutingState {
             // ownership is learned, but requests and nested ownership
             // announcements are not. Prefer a request over an older ordinary
             // notification when the buffer is full.
-            if let Some(index) = route.messages.iter().position(|message| {
-                matches!(message, ServerMsg::Notification { .. })
-                    && (root_buffer || announced_child_threads(message).is_empty())
+            if let Some(index) = route.messages.iter().position(|buffered| {
+                matches!(buffered.message, ServerMsg::Notification { .. })
+                    && (root_buffer || announced_child_threads(&buffered.message).is_empty())
             }) {
                 let removed = route.messages.remove(index);
                 if root_buffer {
                     route
                         .root_overflowed_turns
-                        .insert(message_turn_id(&removed).map(str::to_string));
+                        .insert(message_turn_id(&removed.message).map(str::to_string));
                 }
-                route.messages.push(message);
+                route.messages.push(BufferedMessage {
+                    message,
+                    root_generation,
+                });
             } else if root_buffer {
                 route
                     .root_overflowed_turns
@@ -1127,11 +1222,14 @@ impl RoutingState {
                 .insert(message_turn_id(&message).map(str::to_string));
         } else if !announced_child_threads(&message).is_empty() {
             if let Some(index) = route.messages.iter().position(|buffered| {
-                matches!(buffered, ServerMsg::Notification { .. })
-                    && announced_child_threads(buffered).is_empty()
+                matches!(buffered.message, ServerMsg::Notification { .. })
+                    && announced_child_threads(&buffered.message).is_empty()
             }) {
                 route.messages.remove(index);
-                route.messages.push(message);
+                route.messages.push(BufferedMessage {
+                    message,
+                    root_generation,
+                });
             } else {
                 route.announcement_overloaded = true;
             }
@@ -1154,7 +1252,7 @@ impl RoutingState {
             child != root_thread_id && owner.root_thread_id != root_thread_id
         });
         for descendant in descendants {
-            self.buffered.remove(&descendant);
+            self.take_buffered(&descendant);
             if mark_failed {
                 self.mark_failed(descendant);
             }
@@ -1175,8 +1273,18 @@ impl RoutingState {
             return false;
         }
         self.routes.remove(root_thread_id);
-        self.clear_descendants(root_thread_id, route_failed);
-        self.buffered.remove(root_thread_id);
+        if route_failed {
+            self.clear_descendants(root_thread_id, true);
+        } else {
+            // Keep cleanly retired ownership until the next subscription.
+            // Late child traffic then remains attributable to the retired
+            // generation and is discarded instead of becoming an orphan
+            // buffer. `subscribe` clears these owners for collaborator reuse.
+            for descendant in self.descendant_ids(root_thread_id) {
+                self.take_buffered(&descendant);
+            }
+        }
+        self.take_buffered(root_thread_id);
         // Always retire the root so its late events cannot become a future
         // pre-subscription buffer. Descendants are retired only when routing
         // failed; clean teardown permits collaborator-id reuse next turn.
@@ -1188,39 +1296,73 @@ impl RoutingState {
     /// active root turn. Known-child notifications are inspected for nested
     /// announcements but never consume the parent's bounded event channel.
     fn route_message(&mut self, message: ServerMsg) {
-        let mut queue = VecDeque::from([message]);
+        let thread_id = message_thread_id(&message).unwrap_or("");
+        let root_generation = self
+            .routes
+            .get(thread_id)
+            .map(|route| route.generation)
+            .or_else(|| {
+                self.owners
+                    .get(thread_id)
+                    .map(|owner| owner.root_generation)
+            });
+        self.route_buffered_message(BufferedMessage {
+            message,
+            root_generation,
+        });
+    }
+
+    fn route_buffered_message(&mut self, first: BufferedMessage) {
+        let mut queue = VecDeque::from([first]);
         let mut overload_after_drain = Vec::new();
 
-        while let Some(message) = queue.pop_front() {
+        while let Some(buffered_message) = queue.pop_front() {
+            let BufferedMessage {
+                message,
+                root_generation: message_generation,
+            } = buffered_message;
             let thread_id = message_thread_id(&message).unwrap_or("").to_string();
             if thread_id.is_empty() {
                 continue;
             }
 
-            let (root_thread_id, root_turn_id, tx, child_message) =
+            let (root_thread_id, root_turn_id, root_generation, tx, child_message) =
                 if let Some(route) = self.routes.get(&thread_id) {
                     let Some(turn_id) = route.turn_id.clone() else {
-                        self.buffer_message(thread_id, message);
+                        self.buffer_message(thread_id, message, message_generation);
                         continue;
                     };
-                    (thread_id.clone(), turn_id, route.tx.clone(), false)
+                    (
+                        thread_id.clone(),
+                        turn_id,
+                        route.generation,
+                        route.tx.clone(),
+                        false,
+                    )
                 } else if let Some(owner) = self.owners.get(&thread_id).cloned() {
                     let Some(route) = self.routes.get(&owner.root_thread_id) else {
                         // Ownership is retained as a tombstone so late child
                         // messages cannot be mistaken for a future root buffer.
+                        // Explicitly decline retired requests so Codex cannot
+                        // leave the old collaborator waiting indefinitely.
+                        self.reject_retired_request(&message);
                         continue;
                     };
-                    if route.turn_id.as_deref() != Some(&owner.root_turn_id) {
+                    if route.turn_id.as_deref() != Some(&owner.root_turn_id)
+                        || route.generation != owner.root_generation
+                    {
+                        self.reject_retired_request(&message);
                         continue;
                     }
                     (
                         owner.root_thread_id,
                         owner.root_turn_id,
+                        owner.root_generation,
                         route.tx.clone(),
                         true,
                     )
                 } else {
-                    self.buffer_message(thread_id, message);
+                    self.buffer_message(thread_id, message, message_generation);
                     continue;
                 };
 
@@ -1229,25 +1371,32 @@ impl RoutingState {
                 .map(str::to_string)
                 .collect();
             if !child_message
+                && message_turn_id(&message).is_none()
+                && message_generation != Some(root_generation)
+            {
+                // A turn-less root event is trusted only when it arrived under
+                // this subscription generation. Pre-subscription traffic has
+                // no authenticated association with the active turn.
+                continue;
+            }
+            if !child_message
                 && message_turn_id(&message)
                     .is_some_and(|message_turn_id| message_turn_id != root_turn_id)
             {
                 // Reject stale root announcements before they can claim child
-                // requests for a replacement turn. Tombstone children named by
-                // that stale event so later orphan traffic cannot accumulate.
-                for child_thread_id in child_threads {
-                    if !self.owners.contains_key(&child_thread_id) {
-                        self.buffered.remove(&child_thread_id);
-                        self.mark_failed(child_thread_id);
-                    }
-                }
+                // requests for a replacement turn. Do not mutate child state by
+                // id alone: Codex may already have reused that id for the
+                // replacement generation. Unknown buffers are bounded globally.
                 continue;
             }
 
             let can_announce_children = if child_message {
                 true
             } else {
-                message_turn_id(&message).is_none_or(|turn_id| turn_id == root_turn_id)
+                match message_turn_id(&message) {
+                    Some(turn_id) => turn_id == root_turn_id,
+                    None => message_generation == Some(root_generation),
+                }
             };
             let forward = !child_message || matches!(&message, ServerMsg::Request { .. });
             if forward {
@@ -1281,10 +1430,11 @@ impl RoutingState {
                         RouteOwner {
                             root_thread_id: root_thread_id.clone(),
                             root_turn_id: root_turn_id.clone(),
+                            root_generation,
                         },
                     );
                     self.clear_failed(&child_thread_id);
-                    if let Some(buffered_route) = self.buffered.remove(&child_thread_id) {
+                    if let Some(buffered_route) = self.take_buffered(&child_thread_id) {
                         queue.extend(buffered_route.messages);
                         // Notification-only overflow is harmless for a child;
                         // those events are intentionally discarded above.
@@ -1310,8 +1460,17 @@ impl RoutingState {
         self.clear_descendants(thread_id, false);
         self.owners.remove(thread_id);
         self.clear_failed(thread_id);
-        self.routes
-            .insert(thread_id.to_string(), ActiveRoute { tx, turn_id: None });
+        self.unknown_buffered.remove(thread_id);
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.routes.insert(
+            thread_id.to_string(),
+            ActiveRoute {
+                tx,
+                generation,
+                turn_id: None,
+            },
+        );
     }
 
     fn activate_route(
@@ -1328,14 +1487,16 @@ impl RoutingState {
         }
         route.turn_id = Some(turn_id.to_string());
         let tx = route.tx.clone();
-        let buffered = self.buffered.remove(thread_id);
+        let buffered = self.take_buffered(thread_id);
         if let Some(buffered) = buffered {
-            let relevant_overflow = buffered.root_overflowed_turns.contains(&None)
+            let relevant_overflow = buffered.request_overloaded
+                || buffered.announcement_overloaded
+                || buffered.root_overflowed_turns.contains(&None)
                 || buffered
                     .root_overflowed_turns
                     .contains(&Some(turn_id.to_string()));
             for message in buffered.messages {
-                self.route_message(message);
+                self.route_buffered_message(message);
             }
             if relevant_overflow {
                 tx.mark_overloaded();
@@ -1360,6 +1521,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
     routing: Routing,
+    retired_response_tx: mpsc::UnboundedSender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
@@ -1396,7 +1558,14 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             } else {
                 ServerMsg::Notification { method, params }
             };
-            routing.lock().await.route_message(message);
+            let responses = {
+                let mut routing = routing.lock().await;
+                routing.route_message(message);
+                std::mem::take(&mut routing.retired_responses)
+            };
+            for response in responses {
+                let _ = retired_response_tx.send(response);
+            }
         }
     }
     // Dropping stdout means the app-server can never complete any
@@ -1407,7 +1576,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
 }
 
 struct AppServer {
-    stdin: Mutex<ChildStdin>,
+    stdin: SharedStdin,
     next_id: AtomicI64,
     pending: Pending,
     /// Active roots, turn-bound child ownership, and pre-subscription events
@@ -1438,11 +1607,23 @@ impl AppServer {
                 std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
                 _ => BackendError::Io(e),
             })?;
-        let stdin = child.stdin.take().expect("stdin piped");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin piped")));
         let stdout = child.stdout.take().expect("stdout piped");
+        let (retired_response_tx, mut retired_response_rx) = mpsc::unbounded_channel();
+        let response_stdin = stdin.clone();
+        tokio::spawn(async move {
+            while let Some(message) = retired_response_rx.recv().await {
+                let mut line = serde_json::to_vec(&message).expect("serializable");
+                line.push(b'\n');
+                let mut stdin = response_stdin.lock().await;
+                if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
 
         let server = Self {
-            stdin: Mutex::new(stdin),
+            stdin,
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routing: Arc::new(Mutex::new(RoutingState::default())),
@@ -1451,7 +1632,7 @@ impl AppServer {
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        server.start_reader(stdout);
+        server.start_reader(stdout, retired_response_tx);
         Ok(server)
     }
 
@@ -1459,11 +1640,21 @@ impl AppServer {
         self.closed.load(Ordering::Relaxed)
     }
 
-    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
+    fn start_reader(
+        &self,
+        stdout: tokio::process::ChildStdout,
+        retired_response_tx: mpsc::UnboundedSender<Value>,
+    ) {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let routing = self.routing.clone();
-        tokio::spawn(read_stdout(stdout, pending, routing, closed));
+        tokio::spawn(read_stdout(
+            stdout,
+            pending,
+            routing,
+            retired_response_tx,
+            closed,
+        ));
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -1508,6 +1699,40 @@ impl AppServer {
     /// Lock the complete replacement lifecycle for one Codex thread.
     async fn lock_turn_lifecycle(&self, thread_id: &str) -> TurnLifecycleGuard {
         acquire_turn_lifecycle(&self.turn_lifecycles, thread_id).await
+    }
+
+    /// Start and bind a turn under cancellation-safe ownership. The response
+    /// receiver is installed in the guard before the request is written, so a
+    /// dropped caller can recover a late turn id and interrupt it exactly.
+    async fn start_turn(
+        self: &Arc<Self>,
+        thread_id: &str,
+        route_tx: &RouteSender<ServerMsg>,
+        params: Value,
+    ) -> Result<(String, StartedTurnGuard), BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let mut cleanup =
+            StartedTurnGuard::new(self.clone(), thread_id.to_string(), route_tx.clone(), rx);
+        self.pending.lock().await.insert(id, tx);
+        if let Err(error) = self
+            .write(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "turn/start",
+                "params": params,
+            }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        let started = cleanup.wait_for_response().await?;
+        let turn_id = turn_id_of(&started)?;
+        cleanup.turn_id = Some(turn_id.clone());
+        self.register_active_turn(thread_id, &turn_id).await;
+        self.activate_route(thread_id, &turn_id, route_tx).await;
+        Ok((turn_id, cleanup))
     }
 
     /// Record the vendor turn currently running on a Codex thread.
@@ -1744,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_parent_announcement_cannot_claim_child_requests() {
+    fn stale_parent_announcement_cannot_claim_or_delete_reused_child_requests() {
         let mut routing = RoutingState::default();
         let (root_tx, mut root_rx) = route_channel();
         routing.subscribe("root", root_tx.clone());
@@ -1768,15 +1993,23 @@ mod tests {
         });
 
         assert!(!routing.owners.contains_key("stale-child"));
-        assert!(!routing.buffered.contains_key("stale-child"));
-        assert!(routing.is_failed("stale-child"));
-        routing.route_message(ServerMsg::Request {
-            id: json!(8),
-            method: "item/commandExecution/requestApproval".into(),
-            params: json!({ "threadId": "stale-child", "turnId": "child-turn" }),
-        });
-        assert!(!routing.buffered.contains_key("stale-child"));
+        assert!(routing.buffered.contains_key("stale-child"));
+        assert!(!routing.is_failed("stale-child"));
         assert!(root_rx.try_recv().is_err());
+
+        routing.route_message(spawn_notification(
+            "root",
+            "replacement-turn",
+            "stale-child",
+        ));
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Notification { .. })
+        ));
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Request { id, .. }) if id == 7
+        ));
     }
 
     #[tokio::test]
@@ -1810,6 +2043,27 @@ mod tests {
             Some(ServerMsg::Request { id, .. }) if id == 21
         ));
         assert_eq!(routing.owners["child"].root_turn_id, "root-turn");
+    }
+
+    #[test]
+    fn pre_subscription_turnless_announcement_cannot_claim_children() {
+        let mut routing = RoutingState::default();
+        routing.route_message(ServerMsg::Notification {
+            method: "item/started".into(),
+            params: json!({
+                "threadId": "root",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "receiverThreadIds": ["stale-child"]
+                }
+            }),
+        });
+        let (root_tx, mut root_rx) = route_channel();
+        routing.subscribe("root", root_tx.clone());
+        routing.activate_route("root", "root-turn", &root_tx);
+
+        assert!(!routing.owners.contains_key("stale-child"));
+        assert!(root_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1978,6 +2232,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_subscription_request_loss_fails_root_activation() {
+        let mut routing = RoutingState::default();
+        for id in 0..=ROUTE_EVENT_BUDGET {
+            routing.route_message(ServerMsg::Request {
+                id: json!(id),
+                method: "item/fileChange/requestApproval".into(),
+                params: json!({ "threadId": "root", "itemId": id.to_string() }),
+            });
+        }
+        let (root_tx, root_rx) = route_channel();
+        let mut overloaded = root_rx.overload_signal();
+        routing.subscribe("root", root_tx.clone());
+        routing.activate_route("root", "root-turn", &root_tx);
+
+        overloaded.wait().await;
+    }
+
+    #[test]
+    fn unknown_thread_buffers_are_globally_bounded() {
+        let mut routing = RoutingState::default();
+        for id in 0..=UNKNOWN_BUFFER_BUDGET {
+            routing.route_message(ServerMsg::Request {
+                id: json!(id),
+                method: "item/commandExecution/requestApproval".into(),
+                params: json!({ "threadId": format!("orphan-{id}") }),
+            });
+        }
+
+        assert_eq!(routing.unknown_buffered.len(), UNKNOWN_BUFFER_BUDGET);
+        assert_eq!(routing.unknown_buffer_order.len(), UNKNOWN_BUFFER_BUDGET);
+        assert!(!routing.buffered.contains_key("orphan-0"));
+        assert!(
+            routing
+                .buffered
+                .contains_key(&format!("orphan-{UNKNOWN_BUFFER_BUDGET}"))
+        );
+    }
+
+    #[tokio::test]
     async fn activation_learns_buffered_parent_announcements() {
         let mut routing = RoutingState::default();
         routing.route_message(spawn_notification("root", "root-turn", "child"));
@@ -2036,7 +2329,24 @@ mod tests {
         assert!(first_rx.try_recv().is_ok());
         assert!(routing.remove_route_if_same("root", &first_tx, false));
         assert!(!routing.is_failed("child"));
+        assert!(routing.owners.contains_key("child"));
+        routing.route_message(ServerMsg::Request {
+            id: json!(40),
+            method: "item/commandExecution/requestApproval".into(),
+            params: json!({ "threadId": "child", "itemId": "retired-command" }),
+        });
+        assert_eq!(routing.retired_responses.len(), 1);
+        assert_eq!(routing.retired_responses[0]["id"], 40);
+        assert_eq!(
+            routing.retired_responses[0]["result"]["decision"],
+            "decline"
+        );
+        assert!(!routing.buffered.contains_key("child"));
 
+        let (second_tx, mut second_rx) = route_channel();
+        routing.subscribe("root", second_tx.clone());
+        routing.activate_route("root", "second-turn", &second_tx);
+        assert!(!routing.owners.contains_key("child"));
         routing.route_message(ServerMsg::Request {
             id: json!(41),
             method: "item/commandExecution/requestApproval".into(),
@@ -2044,9 +2354,6 @@ mod tests {
         });
         assert!(routing.buffered.contains_key("child"));
 
-        let (second_tx, mut second_rx) = route_channel();
-        routing.subscribe("root", second_tx.clone());
-        routing.activate_route("root", "second-turn", &second_tx);
         routing.route_message(spawn_notification("root", "second-turn", "child"));
         assert!(matches!(
             second_rx.recv().await,
@@ -2186,12 +2493,14 @@ mod tests {
         pending.lock().await.insert(1, request_tx);
         let (route_tx, mut route_rx) = route_channel();
         routing.lock().await.subscribe("thread-1", route_tx);
+        let (retired_response_tx, _retired_response_rx) = mpsc::unbounded_channel();
 
         let (mut writer, reader) = tokio::io::duplex(16);
         let task = tokio::spawn(read_stdout(
             reader,
             pending.clone(),
             routing.clone(),
+            retired_response_tx,
             closed.clone(),
         ));
         writer.shutdown().await.unwrap();
@@ -2274,6 +2583,63 @@ mod tests {
         assert!(registry.lock().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_turn_start_recovers_late_id_and_interrupts_vendor_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-late-start");
+        let started_marker = std::path::PathBuf::from(format!("{}.started", stub.display()));
+        let interrupt_marker = std::path::PathBuf::from(format!("{}.interrupt", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r line
+: > "$0.started"
+sleep 0.05
+echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"late-turn"}}}'
+IFS= read -r interrupt
+printf '%s\n' "$interrupt" > "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":2,"result":{}}'
+cat > /dev/null
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let lifecycle = server.lock_turn_lifecycle("root").await;
+        let route = server.subscribe("root").await;
+        {
+            let start = server.start_turn("root", &route.tx, json!({ "threadId": "root" }));
+            tokio::pin!(start);
+            tokio::select! {
+                _ = &mut start => panic!("turn/start unexpectedly completed"),
+                _ = async {
+                    while !started_marker.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        }
+        drop(lifecycle);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let cleaned = interrupt_marker.exists()
+                    && server.active_turns.lock().await.get("root").is_none()
+                    && !server.routing.lock().await.routes.contains_key("root");
+                if cleaned {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn turn_route_burst_is_lossless_and_does_not_block_stdout_eof_cleanup() {
         let deadline = std::time::Duration::from_secs(1);
@@ -2287,12 +2653,14 @@ mod tests {
             routing.activate_route("thread-1", "turn-1", &route_tx);
         }
         drop(route_tx);
+        let (retired_response_tx, _retired_response_rx) = mpsc::unbounded_channel();
 
         let (mut writer, reader) = tokio::io::duplex(256);
         let task = tokio::spawn(read_stdout(
             reader,
             pending.clone(),
             routing.clone(),
+            retired_response_tx,
             closed.clone(),
         ));
         let event_count = ROUTE_EVENT_BUDGET;
