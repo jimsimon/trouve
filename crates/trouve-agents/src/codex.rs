@@ -973,16 +973,23 @@ async fn record_completed_turn(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveTurnRegistration {
+    Registered,
+    Completed,
+    OwnedByReplacement,
+}
+
 async fn register_active_turn_state(
     completed_turns: &CompletedTurns,
     active_turns: &ActiveTurns,
     thread_id: &str,
     turn_id: &str,
     only_if_vacant: bool,
-) -> bool {
+) -> ActiveTurnRegistration {
     let completed = completed_turns.lock().await;
     if completed.contains(thread_id, turn_id) {
-        return false;
+        return ActiveTurnRegistration::Completed;
     }
     let mut active = active_turns.lock().await;
     if only_if_vacant
@@ -990,10 +997,10 @@ async fn register_active_turn_state(
             .get(thread_id)
             .is_some_and(|active| active != turn_id)
     {
-        return false;
+        return ActiveTurnRegistration::OwnedByReplacement;
     }
     active.insert(thread_id.to_string(), turn_id.to_string());
-    true
+    ActiveTurnRegistration::Registered
 }
 
 struct TurnLifecycleGuard {
@@ -1152,15 +1159,25 @@ impl Drop for StartedTurnGuard {
                     // Only startup recovery may install a marker that is not
                     // already present. Stream cleanup must never resurrect a
                     // completed or already-interrupted turn.
-                    if !server
+                    match server
                         .register_active_turn_if_vacant(&thread_id, &turn_id)
                         .await
                     {
-                        tracing::warn!(
-                            "codex: cancelled startup turn {turn_id} lost ownership to a replacement"
-                        );
-                        server.unsubscribe(&thread_id, &route_tx).await;
-                        return;
+                        ActiveTurnRegistration::Registered => {}
+                        ActiveTurnRegistration::Completed => {
+                            tracing::debug!(
+                                "codex: cancelled startup turn {turn_id} had already completed"
+                            );
+                            server.unsubscribe(&thread_id, &route_tx).await;
+                            return;
+                        }
+                        ActiveTurnRegistration::OwnedByReplacement => {
+                            tracing::warn!(
+                                "codex: cancelled startup turn {turn_id} lost ownership to a replacement"
+                            );
+                            server.unsubscribe(&thread_id, &route_tx).await;
+                            return;
+                        }
                     }
                 } else if !server.active_turn_is(&thread_id, &turn_id).await {
                     server.unsubscribe(&thread_id, &route_tx).await;
@@ -2460,7 +2477,7 @@ impl AppServer {
 
     /// Record the vendor turn currently running on a Codex thread.
     async fn register_active_turn(&self, thread_id: &str, turn_id: &str) {
-        register_active_turn_state(
+        let _ = register_active_turn_state(
             &self.completed_turns,
             &self.active_turns,
             thread_id,
@@ -2470,7 +2487,11 @@ impl AppServer {
         .await;
     }
 
-    async fn register_active_turn_if_vacant(&self, thread_id: &str, turn_id: &str) -> bool {
+    async fn register_active_turn_if_vacant(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> ActiveTurnRegistration {
         register_active_turn_state(
             &self.completed_turns,
             &self.active_turns,
@@ -3733,25 +3754,20 @@ mod tests {
             "completion must synchronously clear the exact active marker"
         );
         assert!(
-            !register_active_turn_state(
+            register_active_turn_state(
                 &completed_turns,
                 &active_turns,
                 "thread-1",
                 "turn-1",
                 false,
             )
-            .await,
+            .await
+                == ActiveTurnRegistration::Completed,
             "a late start response must not republish a completed marker"
         );
         assert!(
-            !register_active_turn_state(
-                &completed_turns,
-                &active_turns,
-                "thread-1",
-                "turn-1",
-                true,
-            )
-            .await,
+            register_active_turn_state(&completed_turns, &active_turns, "thread-1", "turn-1", true,)
+                .await == ActiveTurnRegistration::Completed,
             "startup recovery must also reject the completed marker"
         );
         active_turns
