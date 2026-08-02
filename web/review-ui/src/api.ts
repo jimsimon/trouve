@@ -107,6 +107,11 @@ export const retryPersona = (id: string, reviewerId: string): Promise<ReviewJob>
       body: "{}",
     },
   );
+export const retryFinalEditor = (id: string): Promise<ReviewJob> =>
+  api(`/code-review/jobs/${encodeURIComponent(id)}/final-editor/retry`, {
+    method: "POST",
+    body: "{}",
+  });
 export const requestReview = (
   job: ReviewJob,
   scope: ReviewScope,
