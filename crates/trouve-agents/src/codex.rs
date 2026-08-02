@@ -947,13 +947,9 @@ impl CompletedTurnState {
         }
     }
 
-    fn take(&mut self, thread_id: &str, turn_id: &str) -> bool {
-        let key = (thread_id.to_string(), turn_id.to_string());
-        if !self.turns.remove(&key) {
-            return false;
-        }
-        self.order.retain(|completed| completed != &key);
-        true
+    fn contains(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.turns
+            .contains(&(thread_id.to_string(), turn_id.to_string()))
     }
 }
 
@@ -984,8 +980,8 @@ async fn register_active_turn_state(
     turn_id: &str,
     only_if_vacant: bool,
 ) -> bool {
-    let mut completed = completed_turns.lock().await;
-    if completed.take(thread_id, turn_id) {
+    let completed = completed_turns.lock().await;
+    if completed.contains(thread_id, turn_id) {
         return false;
     }
     let mut active = active_turns.lock().await;
@@ -3746,6 +3742,17 @@ mod tests {
             )
             .await,
             "a late start response must not republish a completed marker"
+        );
+        assert!(
+            !register_active_turn_state(
+                &completed_turns,
+                &active_turns,
+                "thread-1",
+                "turn-1",
+                true,
+            )
+            .await,
+            "startup recovery must also reject the completed marker"
         );
         active_turns
             .lock()
