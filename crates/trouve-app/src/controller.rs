@@ -801,6 +801,12 @@ pub enum UiCommand {
     /// Internal: threads were discovered for an active background session,
     /// so their streams can feed attention and unread-work badges.
     SessionThreadsLoaded(String, Result<Vec<Thread>, String>),
+    /// Folded durable state used to seed a thread before its SSE follower
+    /// resumes after the snapshot cursor.
+    ThreadViewLoaded(
+        String,
+        Result<(u64, trouve_protocol::ThreadViewSnapshot), String>,
+    ),
 }
 
 /// What a left-nav row maps back to.
@@ -2134,9 +2140,9 @@ impl Controller {
     }
 
     /// Pop a desktop notification for events the user would miss: the
-    /// window is unfocused or the thread isn't the one on screen. Followers
-    /// replay each thread's history from cursor 0, so anything but a fresh
-    /// event (by append timestamp) is skipped.
+    /// window is unfocused or the thread isn't the one on screen. Reconnect
+    /// backlogs may still contain old events after the snapshot cursor, so
+    /// anything but a fresh event (by append timestamp) is skipped.
     fn maybe_notify(&self, thread_id: &str, envelope: &EventEnvelope) {
         if !self.notify.enabled {
             return;
@@ -2689,12 +2695,18 @@ impl Controller {
         let follower_id = thread_id.clone();
         let task = tokio::spawn(async move {
             use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-            let cursor = std::sync::Arc::new(AtomicU64::new(0));
+            let snapshot = client
+                .thread_view(&thread_id)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let initial_cursor = snapshot.as_ref().map(|(cursor, _)| *cursor).unwrap_or(0);
+            let _ = tx.send(UiCommand::ThreadViewLoaded(thread_id.clone(), snapshot));
+            let cursor = std::sync::Arc::new(AtomicU64::new(initial_cursor));
             let replay = std::sync::Arc::new(std::sync::Mutex::new(ThreadReplayBuffer::default()));
             // Startup history predates this app run and is already viewed;
             // persisted envelopes after the stream has gone live are a
             // reconnect backlog and can represent unseen background work.
-            let live_seen = std::sync::Arc::new(AtomicBool::new(false));
+            let live_seen = std::sync::Arc::new(AtomicBool::new(initial_cursor > 0));
             loop {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
@@ -7262,6 +7274,50 @@ impl Controller {
                     self.open_thread_index(i, true);
                 }
             }
+            UiCommand::ThreadViewLoaded(thread_id, result) => match result {
+                Ok((cursor, snapshot)) => {
+                    if !self.followed.contains(&thread_id) {
+                        return Ok(());
+                    }
+                    let before = self
+                        .vms
+                        .get(&thread_id)
+                        .map(thread_attention)
+                        .unwrap_or_default();
+                    let todos_changed = self
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id == thread_id)
+                        .is_some_and(|thread| {
+                            if thread.todos == snapshot.todos {
+                                false
+                            } else {
+                                thread.todos = snapshot.todos.clone();
+                                true
+                            }
+                        });
+                    let mut vm = ThreadViewModel::from(snapshot);
+                    vm.cursor = cursor;
+                    let after = thread_attention(&vm);
+                    self.vms.insert(thread_id.clone(), vm);
+                    if self.update_session_attention(&thread_id, before, after) {
+                        self.push_nav();
+                    }
+                    if todos_changed {
+                        self.push_threads();
+                    }
+                    if self.current_thread_id().as_deref() == Some(&thread_id) {
+                        self.push_context();
+                        self.push_queue();
+                        self.push_todos();
+                        self.render_chat(false);
+                        self.apply_scroll_intent(false);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("loading thread view for {thread_id}: {error}");
+                }
+            },
             UiCommand::SessionThreadsLoaded(session_id, result) => match result {
                 Ok(threads) => {
                     if !self.watched_sessions.contains(&session_id) {

@@ -4343,6 +4343,14 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("thread {id}")))
     }
 
+    pub fn thread_view_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<(u64, trouve_protocol::ThreadViewSnapshot), EngineError> {
+        self.get_thread(id)?;
+        Ok(self.store.thread_view_snapshot(id)?)
+    }
+
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>, EngineError> {
         Ok(self.store.list_threads(session_id)?)
     }

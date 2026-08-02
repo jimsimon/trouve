@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.2"
+    "version": "2.3"
   },
   "paths": {
     "/v1/approvals": {
@@ -3844,6 +3844,54 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UsageSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/view": {
+      "get": {
+        "tags": [],
+        "operationId": "get_thread_view",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "x-trouve-event-cursor": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Thread event cursor for this snapshot"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadViewSnapshot"
                 }
               }
             }
@@ -8822,6 +8870,360 @@
               "$ref": "#/components/schemas/TodoItem"
             },
             "description": "Current todo snapshot for this thread. Tool-call events retain the\nhistory of how the list changed; this field is the initial-load view."
+          }
+        }
+      },
+      "ThreadToolStatus": {
+        "type": "string",
+        "enum": [
+          "awaiting_approval",
+          "running",
+          "ok",
+          "error",
+          "denied",
+          "aborted"
+        ]
+      },
+      "ThreadTurnState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "usage",
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "completed"
+                ]
+              },
+              "usage": {
+                "$ref": "#/components/schemas/Usage"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "error",
+              "state"
+            ],
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ThreadViewItem": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
+              "attachments",
+              "kind"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                }
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "user"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
+              "complete",
+              "kind"
+            ],
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "assistant"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
+              "complete",
+              "kind"
+            ],
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "thinking"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "tool",
+              "args",
+              "status",
+              "kind"
+            ],
+            "properties": {
+              "args": {},
+              "call_id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "tool_call"
+                ]
+              },
+              "result": {},
+              "status": {
+                "$ref": "#/components/schemas/ThreadToolStatus"
+              },
+              "tool": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "state",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "turn_status"
+                ]
+              },
+              "state": {
+                "$ref": "#/components/schemas/ThreadTurnState"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "request_id",
+              "questions",
+              "kind"
+            ],
+            "properties": {
+              "answers": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/QuestionAnswer"
+                }
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "questions"
+                ]
+              },
+              "questions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Question"
+                }
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "resolved": {
+                "type": "boolean",
+                "description": "True after `question.resolved`; `answers` remains absent when the\nuser skipped."
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One folded, renderable row in a thread snapshot. Raw streaming fragments\nremain in the event log; snapshots expose their current semantic form."
+      },
+      "ThreadViewSnapshot": {
+        "type": "object",
+        "description": "Folded current thread state at the cursor returned in\n`x-trouve-event-cursor`. Clients seed their view from this response and\nsubscribe to the thread event stream after that cursor.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "commands": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommandInfo"
+            }
+          },
+          "compacting": {
+            "type": "boolean"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ThreadViewItem"
+            }
+          },
+          "last_usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
+          },
+          "pending_approvals": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pending_questions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "queue": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueuedPrompt"
+            }
+          },
+          "thinking": {
+            "type": "boolean"
+          },
+          "todos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodoItem"
+            }
+          },
+          "turn_duration_ms": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "turn_models": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "turn_running": {
+            "type": "boolean"
+          },
+          "turn_started_at": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "propertyNames": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         }
       },
