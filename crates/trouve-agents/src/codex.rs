@@ -277,7 +277,7 @@ impl AgentBackend for CodexBackend {
         // disappeared. Await its interruption before starting a replacement;
         // otherwise Codex folds the new prompt into the old turn and its late
         // completion is misattributed to the replacement.
-        let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+        let lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
         server.interrupt_active_turn(&codex_thread_id).await?;
         let route = server.subscribe(&codex_thread_id).await;
 
@@ -310,7 +310,7 @@ impl AgentBackend for CodexBackend {
         }
         apply_reasoning_options(&mut turn_params, effort);
         let (codex_turn_id, cleanup) = match server
-            .start_turn(&codex_thread_id, &route.tx, turn_params)
+            .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle)
             .await
         {
             Ok(started) => started,
@@ -711,6 +711,9 @@ fn turn_stream(
                 "app-server event route closed before turn completed"
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
+            server
+                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "unroutable")
+                .await;
         }
         server.unsubscribe(&codex_thread_id, &route_tx).await;
         cleanup.disarm();
@@ -889,6 +892,7 @@ fn parse_usage(params: &Value) -> Usage {
 
 // --- JSON-RPC plumbing -----------------------------------------------------
 
+#[derive(Clone)]
 enum ServerMsg {
     Notification {
         method: String,
@@ -909,6 +913,8 @@ type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex
 const ROUTE_TOMBSTONE_BUDGET: usize = ROUTE_EVENT_BUDGET * 4;
 const UNKNOWN_BUFFER_BUDGET: usize = 64;
 const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const INTERRUPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct TurnLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -942,6 +948,7 @@ struct StartedTurnGuard {
     turn_id: Option<String>,
     route_tx: RouteSender<ServerMsg>,
     response: Option<oneshot::Receiver<Result<Value, String>>>,
+    lifecycle: Option<TurnLifecycleGuard>,
     armed: bool,
 }
 
@@ -951,6 +958,7 @@ impl StartedTurnGuard {
         thread_id: String,
         route_tx: RouteSender<ServerMsg>,
         response: oneshot::Receiver<Result<Value, String>>,
+        lifecycle: TurnLifecycleGuard,
     ) -> Self {
         Self {
             server,
@@ -958,6 +966,7 @@ impl StartedTurnGuard {
             turn_id: None,
             route_tx,
             response: Some(response),
+            lifecycle: Some(lifecycle),
             armed: true,
         }
     }
@@ -981,6 +990,10 @@ impl StartedTurnGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn release_lifecycle(&mut self) {
+        self.lifecycle.take();
+    }
 }
 
 impl Drop for StartedTurnGuard {
@@ -993,8 +1006,15 @@ impl Drop for StartedTurnGuard {
         let known_turn_id = self.turn_id.clone();
         let route_tx = self.route_tx.clone();
         let response = self.response.take();
-        tokio::spawn(async move {
-            let _lifecycle = server.lock_turn_lifecycle(&thread_id).await;
+        // Transfer startup serialization into cancellation cleanup. A
+        // replacement cannot register before this late response is either
+        // interrupted or the transport is definitively terminated.
+        let lifecycle = self.lifecycle.take();
+        let cleanup = async move {
+            let _lifecycle = match lifecycle {
+                Some(lifecycle) => lifecycle,
+                None => server.lock_turn_lifecycle(&thread_id).await,
+            };
             let recovered_turn_id = match (known_turn_id, response) {
                 (Some(turn_id), _) => Some(turn_id),
                 (None, Some(response)) => {
@@ -1019,7 +1039,7 @@ impl Drop for StartedTurnGuard {
                              its app-server transport",
                                 CANCELLED_START_RESPONSE_TIMEOUT.as_secs()
                             );
-                            close_transport(&server.pending, &server.routing, &server.closed).await;
+                            server.terminate_transport().await;
                             None
                         }
                     }
@@ -1027,10 +1047,25 @@ impl Drop for StartedTurnGuard {
                 (None, None) => None,
             };
             if let Some(turn_id) = recovered_turn_id {
+                if !server.owns_route(&thread_id, &route_tx).await {
+                    tracing::warn!(
+                        "codex: cancelled startup turn {turn_id} no longer owns its route"
+                    );
+                    return;
+                }
                 // Install the retryable marker before attempting interruption.
                 // If interruption fails, the next startup must retry it before
                 // it can subscribe or send a replacement prompt.
-                server.register_active_turn(&thread_id, &turn_id).await;
+                if !server
+                    .register_active_turn_if_vacant(&thread_id, &turn_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "codex: cancelled startup turn {turn_id} lost ownership to a replacement"
+                    );
+                    server.unsubscribe(&thread_id, &route_tx).await;
+                    return;
+                }
                 match server.interrupt_turn(&thread_id, &turn_id).await {
                     Ok(()) => server.clear_active_turn(&thread_id, &turn_id).await,
                     Err(error) => {
@@ -1041,7 +1076,17 @@ impl Drop for StartedTurnGuard {
                 }
             }
             server.unsubscribe(&thread_id, &route_tx).await;
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(cleanup);
+            }
+            Err(error) => {
+                tracing::error!(
+                    "codex: cannot clean up cancelled turn/start without a Tokio runtime: {error}"
+                );
+            }
+        }
     }
 }
 
@@ -1081,6 +1126,16 @@ struct RouteOwner {
     root_thread_id: String,
     root_turn_id: String,
     root_generation: u64,
+    /// The exact collaborator turn claimed by this announcement. Codex can
+    /// reuse a collaborator thread id, so the thread id alone is not an
+    /// ownership boundary.
+    child_turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ChildTurnKey {
+    thread_id: String,
+    turn_id: String,
 }
 
 struct BufferedMessage {
@@ -1111,12 +1166,14 @@ struct RoutingState {
     /// queues so late traffic cannot create an unbounded number of buffers.
     unknown_buffered: HashSet<String>,
     unknown_buffer_order: VecDeque<String>,
-    /// Recently retired roots and children. This prevents late events from a
-    /// completed turn becoming pre-subscription buffers, while bounding state
-    /// retained for the app-server process lifetime.
+    /// Recently retired roots. Child retirement is turn-scoped below because
+    /// Codex may reuse a collaborator thread id for a later turn.
     failed: HashSet<String>,
     failed_order: VecDeque<String>,
+    retired_children: HashSet<ChildTurnKey>,
+    retired_child_order: VecDeque<ChildTurnKey>,
     retired_responses: Vec<Value>,
+    retired_response_overloaded: bool,
 }
 
 impl RoutingState {
@@ -1129,11 +1186,22 @@ impl RoutingState {
         } else {
             json!({ "decision": "decline" })
         };
-        self.retired_responses.push(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }));
+        if self.retired_responses.len() < ROUTE_EVENT_BUDGET {
+            self.retired_responses.push(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            }));
+        } else {
+            self.retired_response_overloaded = true;
+        }
+    }
+
+    fn take_retired_responses(&mut self) -> (Vec<Value>, bool) {
+        (
+            std::mem::take(&mut self.retired_responses),
+            std::mem::take(&mut self.retired_response_overloaded),
+        )
     }
 
     fn track_unknown_buffer(&mut self, thread_id: &str) {
@@ -1145,9 +1213,17 @@ impl RoutingState {
             let Some(expired) = self.unknown_buffer_order.pop_front() else {
                 break;
             };
-            if self.unknown_buffered.remove(&expired) {
-                self.buffered.remove(&expired);
+            if self.unknown_buffered.remove(&expired)
+                && let Some(buffered) = self.buffered.remove(&expired)
+            {
+                self.reject_buffered_route(buffered);
             }
+        }
+    }
+
+    fn reject_buffered_route(&mut self, buffered: BufferedRoute) {
+        for message in buffered.messages {
+            self.reject_retired_request(&message.message);
         }
     }
 
@@ -1188,6 +1264,41 @@ impl RoutingState {
         self.failed.remove(thread_id);
     }
 
+    fn child_key(thread_id: &str, message: &ServerMsg) -> Option<ChildTurnKey> {
+        Some(ChildTurnKey {
+            thread_id: thread_id.to_string(),
+            turn_id: message_turn_id(message)?.to_string(),
+        })
+    }
+
+    fn retire_child(&mut self, thread_id: String, turn_id: String) {
+        let key = ChildTurnKey { thread_id, turn_id };
+        if !self.retired_children.insert(key.clone()) {
+            return;
+        }
+        self.retired_child_order.retain(|retired| retired != &key);
+        self.retired_child_order.push_back(key);
+        while self.retired_child_order.len() > ROUTE_TOMBSTONE_BUDGET {
+            let Some(expired) = self.retired_child_order.pop_front() else {
+                break;
+            };
+            self.retired_children.remove(&expired);
+        }
+    }
+
+    fn unretire_child(&mut self, thread_id: &str, turn_id: &str) {
+        self.retired_children.remove(&ChildTurnKey {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+        });
+    }
+
+    fn retire_owner(&mut self, thread_id: String, owner: RouteOwner) {
+        if let Some(turn_id) = owner.child_turn_id {
+            self.retire_child(thread_id, turn_id);
+        }
+    }
+
     fn buffer_message(
         &mut self,
         thread_id: String,
@@ -1195,6 +1306,7 @@ impl RoutingState {
         root_generation: Option<u64>,
     ) {
         if thread_id.is_empty() || self.is_failed(&thread_id) {
+            self.reject_retired_request(&message);
             return;
         }
         let root_buffer = self.routes.contains_key(&thread_id);
@@ -1232,8 +1344,10 @@ impl RoutingState {
                 route
                     .root_overflowed_turns
                     .insert(message_turn_id(&message).map(str::to_string));
+                self.reject_retired_request(&message);
             } else {
                 route.request_overloaded = true;
+                self.reject_retired_request(&message);
             }
         } else if root_buffer {
             route
@@ -1265,15 +1379,14 @@ impl RoutingState {
             .collect()
     }
 
-    fn clear_descendants(&mut self, root_thread_id: &str, mark_failed: bool) {
+    fn clear_descendants(&mut self, root_thread_id: &str) {
         let descendants = self.descendant_ids(root_thread_id);
-        self.owners.retain(|child, owner| {
-            child != root_thread_id && owner.root_thread_id != root_thread_id
-        });
         for descendant in descendants {
-            self.take_buffered(&descendant);
-            if mark_failed {
-                self.mark_failed(descendant);
+            if let Some(owner) = self.owners.remove(&descendant) {
+                self.retire_owner(descendant.clone(), owner);
+            }
+            if let Some(buffered) = self.take_buffered(&descendant) {
+                self.reject_buffered_route(buffered);
             }
         }
     }
@@ -1282,7 +1395,7 @@ impl RoutingState {
         &mut self,
         root_thread_id: &str,
         expected: &RouteSender<ServerMsg>,
-        route_failed: bool,
+        _route_failed: bool,
     ) -> bool {
         if !self
             .routes
@@ -1292,21 +1405,16 @@ impl RoutingState {
             return false;
         }
         self.routes.remove(root_thread_id);
-        if route_failed {
-            self.clear_descendants(root_thread_id, true);
-        } else {
-            // Keep cleanly retired ownership until the next subscription.
-            // Late child traffic then remains attributable to the retired
-            // generation and is discarded instead of becoming an orphan
-            // buffer. `subscribe` clears these owners for collaborator reuse.
-            for descendant in self.descendant_ids(root_thread_id) {
-                self.take_buffered(&descendant);
-            }
+        self.clear_descendants(root_thread_id);
+        if let Some(owner) = self.owners.remove(root_thread_id) {
+            self.retire_owner(root_thread_id.to_string(), owner);
         }
-        self.take_buffered(root_thread_id);
+        if let Some(buffered) = self.take_buffered(root_thread_id) {
+            self.reject_buffered_route(buffered);
+        }
         // Always retire the root so its late events cannot become a future
-        // pre-subscription buffer. Descendants are retired only when routing
-        // failed; clean teardown permits collaborator-id reuse next turn.
+        // pre-subscription buffer. Descendants retain only their bounded exact
+        // child-turn identities, so a reused thread id remains eligible.
         self.mark_failed(root_thread_id.to_string());
         true
     }
@@ -1316,6 +1424,13 @@ impl RoutingState {
     /// announcements but never consume the parent's bounded event channel.
     fn route_message(&mut self, message: ServerMsg) {
         let thread_id = message_thread_id(&message).unwrap_or("");
+        if Self::child_key(thread_id, &message)
+            .is_some_and(|key| self.retired_children.contains(&key))
+            && !self.routes.contains_key(thread_id)
+        {
+            self.reject_retired_request(&message);
+            return;
+        }
         let root_generation = self
             .routes
             .get(thread_id)
@@ -1358,12 +1473,41 @@ impl RoutingState {
                         route.tx.clone(),
                         false,
                     )
-                } else if let Some(owner) = self.owners.get(&thread_id).cloned() {
+                } else if let Some(mut owner) = self.owners.get(&thread_id).cloned() {
+                    let message_turn_id = message_turn_id(&message).map(str::to_string);
+                    match (&owner.child_turn_id, &message_turn_id) {
+                        (Some(owner_turn_id), Some(message_turn_id))
+                            if owner_turn_id != message_turn_id =>
+                        {
+                            if self.retired_children.contains(&ChildTurnKey {
+                                thread_id: thread_id.clone(),
+                                turn_id: message_turn_id.clone(),
+                            }) {
+                                self.reject_retired_request(&message);
+                            } else {
+                                // A different child turn may precede the
+                                // replacement parent's announcement. Keep it
+                                // separate until that announcement claims it.
+                                self.buffer_message(thread_id, message, message_generation);
+                            }
+                            continue;
+                        }
+                        (Some(_), None) => {
+                            self.reject_retired_request(&message);
+                            continue;
+                        }
+                        (None, Some(message_turn_id)) => {
+                            self.unretire_child(&thread_id, message_turn_id);
+                            owner.child_turn_id = Some(message_turn_id.clone());
+                            self.owners.insert(thread_id.clone(), owner.clone());
+                        }
+                        (None, None) => {
+                            self.reject_retired_request(&message);
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let Some(route) = self.routes.get(&owner.root_thread_id) else {
-                        // Ownership is retained as a tombstone so late child
-                        // messages cannot be mistaken for a future root buffer.
-                        // Explicitly decline retired requests so Codex cannot
-                        // leave the old collaborator waiting indefinitely.
                         self.reject_retired_request(&message);
                         continue;
                     };
@@ -1421,7 +1565,7 @@ impl RoutingState {
             };
             let forward = !child_message || matches!(&message, ServerMsg::Request { .. });
             if forward {
-                match tx.try_send(message) {
+                match tx.try_send(message.clone()) {
                     Ok(()) => {
                         self.clear_failed(&thread_id);
                         self.clear_failed(&root_thread_id);
@@ -1435,6 +1579,7 @@ impl RoutingState {
                                 RouteSendError::Overloaded => "event backlog limit exceeded",
                             }
                         );
+                        self.reject_retired_request(&message);
                         self.remove_route_if_same(&root_thread_id, &tx, true);
                         continue;
                     }
@@ -1446,16 +1591,61 @@ impl RoutingState {
                     if child_thread_id == root_thread_id {
                         continue;
                     }
+                    let buffered_route =
+                        self.take_buffered(&child_thread_id).map(|mut buffered| {
+                            let mut eligible = Vec::with_capacity(buffered.messages.len());
+                            for message in std::mem::take(&mut buffered.messages) {
+                                if message
+                                    .root_generation
+                                    .is_some_and(|generation| generation != root_generation)
+                                {
+                                    self.reject_retired_request(&message.message);
+                                } else {
+                                    eligible.push(message);
+                                }
+                            }
+                            buffered.messages = eligible;
+                            buffered
+                        });
+                    let mut candidate_turns = buffered_route
+                        .iter()
+                        .flat_map(|buffered| buffered.messages.iter())
+                        .filter_map(|buffered| message_turn_id(&buffered.message))
+                        .filter(|turn_id| {
+                            !self.retired_children.contains(&ChildTurnKey {
+                                thread_id: child_thread_id.clone(),
+                                turn_id: (*turn_id).to_string(),
+                            })
+                        })
+                        .map(str::to_string)
+                        .collect::<HashSet<_>>();
+                    let ambiguous_child_turn = candidate_turns.len() > 1;
+                    let child_turn_id = if candidate_turns.len() == 1 {
+                        candidate_turns.drain().next()
+                    } else {
+                        None
+                    };
+                    if let Some(previous) = self.owners.remove(&child_thread_id) {
+                        self.retire_owner(child_thread_id.clone(), previous);
+                    }
+                    if let Some(turn_id) = child_turn_id.as_deref() {
+                        self.unretire_child(&child_thread_id, turn_id);
+                    }
                     self.owners.insert(
                         child_thread_id.clone(),
                         RouteOwner {
                             root_thread_id: root_thread_id.clone(),
                             root_turn_id: root_turn_id.clone(),
                             root_generation,
+                            child_turn_id,
                         },
                     );
-                    self.clear_failed(&child_thread_id);
-                    if let Some(buffered_route) = self.take_buffered(&child_thread_id) {
+                    if let Some(buffered_route) = buffered_route {
+                        if ambiguous_child_turn {
+                            self.reject_buffered_route(buffered_route);
+                            overload_after_drain.push(tx.clone());
+                            continue;
+                        }
                         queue.extend(buffered_route.messages);
                         // Notification-only overflow is harmless for a child;
                         // those events are intentionally discarded above.
@@ -1478,8 +1668,10 @@ impl RoutingState {
         // A collaborator id may be reused by the replacement turn. Remove old
         // ownership and buffered traffic without tombstoning descendants so a
         // request that precedes the new announcement can still be retained.
-        self.clear_descendants(thread_id, false);
-        self.owners.remove(thread_id);
+        self.clear_descendants(thread_id);
+        if let Some(owner) = self.owners.remove(thread_id) {
+            self.retire_owner(thread_id.to_string(), owner);
+        }
         self.clear_failed(thread_id);
         self.adopt_unknown_buffer(thread_id);
         self.next_generation = self.next_generation.wrapping_add(1);
@@ -1538,12 +1730,30 @@ async fn close_transport(
     *routing.lock().await = RoutingState::default();
 }
 
+async fn terminate_transport_parts(
+    pending: &Pending,
+    routing: &Routing,
+    closed: &std::sync::atomic::AtomicBool,
+    child: Option<&Arc<Mutex<Child>>>,
+) {
+    if closed.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(child) = child
+        && let Err(error) = child.lock().await.kill().await
+    {
+        tracing::warn!("codex: failed to terminate unusable app-server: {error}");
+    }
+    close_transport(pending, routing, closed).await;
+}
+
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
     routing: Routing,
-    retired_response_tx: mpsc::UnboundedSender<Value>,
+    retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    child: Option<Arc<Mutex<Child>>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -1579,13 +1789,26 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             } else {
                 ServerMsg::Notification { method, params }
             };
-            let responses = {
+            let (responses, response_overloaded) = {
                 let mut routing = routing.lock().await;
                 routing.route_message(message);
-                std::mem::take(&mut routing.retired_responses)
+                routing.take_retired_responses()
             };
+            if response_overloaded {
+                tracing::error!(
+                    "codex: terminating app-server after retired-response buffer overflow"
+                );
+                terminate_transport_parts(&pending, &routing, &closed, child.as_ref()).await;
+                return;
+            }
             for response in responses {
-                let _ = retired_response_tx.send(response);
+                if retired_response_tx.try_send(response).is_err() {
+                    tracing::error!(
+                        "codex: terminating app-server after retired-response queue overflow"
+                    );
+                    terminate_transport_parts(&pending, &routing, &closed, child.as_ref()).await;
+                    return;
+                }
             }
         }
     }
@@ -1611,7 +1834,8 @@ struct AppServer {
     /// registration.
     turn_lifecycles: TurnLifecycles,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
-    _child: Child,
+    child: Arc<Mutex<Child>>,
+    retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1630,18 +1854,7 @@ impl AppServer {
             })?;
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin piped")));
         let stdout = child.stdout.take().expect("stdout piped");
-        let (retired_response_tx, mut retired_response_rx) = mpsc::unbounded_channel();
-        let response_stdin = stdin.clone();
-        tokio::spawn(async move {
-            while let Some(message) = retired_response_rx.recv().await {
-                let mut line = serde_json::to_vec(&message).expect("serializable");
-                line.push(b'\n');
-                let mut stdin = response_stdin.lock().await;
-                if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
-                    break;
-                }
-            }
-        });
+        let (retired_response_tx, retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let server = Self {
             stdin,
@@ -1650,10 +1863,12 @@ impl AppServer {
             routing: Arc::new(Mutex::new(RoutingState::default())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            _child: child,
+            child: Arc::new(Mutex::new(child)),
+            retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        server.start_reader(stdout, retired_response_tx);
+        server.start_response_writer(retired_response_rx);
+        server.start_reader(stdout);
         Ok(server)
     }
 
@@ -1661,21 +1876,63 @@ impl AppServer {
         self.closed.load(Ordering::Relaxed)
     }
 
-    fn start_reader(
-        &self,
-        stdout: tokio::process::ChildStdout,
-        retired_response_tx: mpsc::UnboundedSender<Value>,
-    ) {
+    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let routing = self.routing.clone();
+        let child = self.child.clone();
         tokio::spawn(read_stdout(
             stdout,
             pending,
             routing,
-            retired_response_tx,
+            self.retired_response_tx.clone(),
             closed,
+            Some(child),
         ));
+    }
+
+    fn start_response_writer(&self, mut responses: mpsc::Receiver<Value>) {
+        let stdin = self.stdin.clone();
+        let pending = self.pending.clone();
+        let routing = self.routing.clone();
+        let closed = self.closed.clone();
+        let child = self.child.clone();
+        tokio::spawn(async move {
+            while let Some(message) = responses.recv().await {
+                let mut line = serde_json::to_vec(&message).expect("serializable");
+                line.push(b'\n');
+                let write = async {
+                    let mut stdin = stdin.lock().await;
+                    stdin.write_all(&line).await?;
+                    stdin.flush().await
+                };
+                if !matches!(
+                    tokio::time::timeout(TRANSPORT_WRITE_TIMEOUT, write).await,
+                    Ok(Ok(()))
+                ) {
+                    tracing::error!(
+                        "codex: terminating app-server after retired-response write failure"
+                    );
+                    terminate_transport_parts(&pending, &routing, &closed, Some(&child)).await;
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn send_retired_responses(&self, responses: Vec<Value>) -> Result<(), BackendError> {
+        for response in responses {
+            if self.retired_response_tx.try_send(response).is_err() {
+                tracing::error!(
+                    "codex: terminating app-server after retired-response queue overflow"
+                );
+                self.terminate_transport().await;
+                return Err(BackendError::Protocol(
+                    "app-server decline-response queue exceeded its limit".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -1694,8 +1951,13 @@ impl AppServer {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await?;
+        if let Err(error) = self
+            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
         match rx.await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
@@ -1730,11 +1992,17 @@ impl AppServer {
         thread_id: &str,
         route_tx: &RouteSender<ServerMsg>,
         params: Value,
+        lifecycle: TurnLifecycleGuard,
     ) -> Result<(String, StartedTurnGuard), BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        let mut cleanup =
-            StartedTurnGuard::new(self.clone(), thread_id.to_string(), route_tx.clone(), rx);
+        let mut cleanup = StartedTurnGuard::new(
+            self.clone(),
+            thread_id.to_string(),
+            route_tx.clone(),
+            rx,
+            lifecycle,
+        );
         self.pending.lock().await.insert(id, tx);
         if let Err(error) = self
             .write(json!({
@@ -1752,7 +2020,10 @@ impl AppServer {
         let turn_id = turn_id_of(&started)?;
         cleanup.turn_id = Some(turn_id.clone());
         self.register_active_turn(thread_id, &turn_id).await;
-        self.activate_route(thread_id, &turn_id, route_tx).await;
+        self.activate_route(thread_id, &turn_id, route_tx).await?;
+        // No await may follow this release: the active marker and route are
+        // now atomically visible to the next lifecycle owner.
+        cleanup.release_lifecycle();
         Ok((turn_id, cleanup))
     }
 
@@ -1764,16 +2035,47 @@ impl AppServer {
             .insert(thread_id.to_string(), turn_id.to_string());
     }
 
+    async fn register_active_turn_if_vacant(&self, thread_id: &str, turn_id: &str) -> bool {
+        let mut active = self.active_turns.lock().await;
+        match active.get(thread_id) {
+            Some(active_turn_id) if active_turn_id != turn_id => false,
+            _ => {
+                active.insert(thread_id.to_string(), turn_id.to_string());
+                true
+            }
+        }
+    }
+
+    async fn owns_route(&self, thread_id: &str, expected: &RouteSender<ServerMsg>) -> bool {
+        self.routing
+            .lock()
+            .await
+            .routes
+            .get(thread_id)
+            .is_some_and(|route| route.tx.same_channel(expected))
+    }
+
     async fn activate_route(
         &self,
         thread_id: &str,
         turn_id: &str,
         expected: &RouteSender<ServerMsg>,
-    ) {
-        self.routing
-            .lock()
-            .await
-            .activate_route(thread_id, turn_id, expected);
+    ) -> Result<(), BackendError> {
+        let (responses, response_overloaded) = {
+            let mut routing = self.routing.lock().await;
+            routing.activate_route(thread_id, turn_id, expected);
+            routing.take_retired_responses()
+        };
+        if response_overloaded {
+            tracing::error!(
+                "codex: terminating app-server after activation response buffer overflow"
+            );
+            self.terminate_transport().await;
+            return Err(BackendError::Protocol(
+                "app-server activation generated too many decline responses".into(),
+            ));
+        }
+        self.send_retired_responses(responses).await
     }
 
     /// Clear an active turn only when the caller still owns that turn id.
@@ -1799,15 +2101,38 @@ impl AppServer {
 
     /// Ask app-server to stop one exact vendor turn.
     async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), BackendError> {
-        self.request(
-            "turn/interrupt",
-            json!({
-                "threadId": thread_id,
-                "turnId": turn_id,
-            }),
-        )
-        .await
-        .map(|_| ())
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        if let Err(error) = self
+            .write(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                },
+            }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(INTERRUPT_RESPONSE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(_))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(BackendError::Protocol(format!("turn/interrupt: {error}"))),
+            Ok(Err(_)) => Err(BackendError::Protocol(
+                "turn/interrupt: app-server closed before responding".into(),
+            )),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(BackendError::Protocol(format!(
+                    "turn/interrupt: no response within {}s",
+                    INTERRUPT_RESPONSE_TIMEOUT.as_secs()
+                )))
+            }
+        }
     }
 
     /// Best-effort cleanup when this turn still owns the active marker.
@@ -1833,8 +2158,28 @@ impl AppServer {
         let mut stdin = self.stdin.lock().await;
         let mut line = serde_json::to_vec(&msg).expect("serializable");
         line.push(b'\n');
-        stdin.write_all(&line).await.map_err(BackendError::Io)?;
-        stdin.flush().await.map_err(BackendError::Io)
+        tokio::time::timeout(TRANSPORT_WRITE_TIMEOUT, async {
+            stdin.write_all(&line).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| {
+            BackendError::Protocol(format!(
+                "app-server stdin blocked for {}s",
+                TRANSPORT_WRITE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(BackendError::Io)
+    }
+
+    async fn terminate_transport(&self) {
+        terminate_transport_parts(
+            &self.pending,
+            &self.routing,
+            &self.closed,
+            Some(&self.child),
+        )
+        .await;
     }
 
     async fn subscribe(&self, thread_id: &str) -> RouteSubscription {
@@ -2050,7 +2395,7 @@ mod tests {
         routing.route_message(ServerMsg::Request {
             id: json!(21),
             method: "item/fileChange/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "edit" }),
+            params: json!({ "threadId": "child", "turnId": "child-turn", "itemId": "edit" }),
         });
         let (root_tx, mut root_rx) = route_channel();
         routing.subscribe("root", root_tx.clone());
@@ -2155,7 +2500,7 @@ mod tests {
         routing.route_message(ServerMsg::Request {
             id: json!(9),
             method: "item/commandExecution/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "command" }),
+            params: json!({ "threadId": "child", "turnId": "child-turn", "itemId": "command" }),
         });
 
         let (root_tx, mut root_rx) = route_channel();
@@ -2194,6 +2539,7 @@ mod tests {
             method: "item/started".into(),
             params: json!({
                 "threadId": "child",
+                "turnId": "child-turn",
                 "item": {
                     "type": "subAgentActivity",
                     "agentThreadId": "grandchild"
@@ -2314,6 +2660,118 @@ mod tests {
                 .buffered
                 .contains_key(&format!("orphan-{UNKNOWN_BUFFER_BUDGET}"))
         );
+        assert_eq!(routing.retired_responses.len(), 1);
+        assert_eq!(routing.retired_responses[0]["id"], 0);
+        assert_eq!(
+            routing.retired_responses[0]["result"]["decision"],
+            "decline"
+        );
+    }
+
+    #[test]
+    fn retired_child_turn_is_declined_while_reused_child_turn_routes() {
+        let mut routing = RoutingState::default();
+        let (first_tx, mut first_rx) = route_channel();
+        routing.subscribe("root", first_tx.clone());
+        routing.activate_route("root", "first-root-turn", &first_tx);
+        routing.route_message(spawn_notification(
+            "root",
+            "first-root-turn",
+            "reused-child",
+        ));
+        assert!(first_rx.try_recv().is_ok());
+        routing.route_message(ServerMsg::Notification {
+            method: "item/agentMessage/delta".into(),
+            params: json!({
+                "threadId": "reused-child",
+                "turnId": "old-child-turn",
+                "delta": "old"
+            }),
+        });
+        assert!(routing.remove_route_if_same("root", &first_tx, false));
+
+        let (second_tx, mut second_rx) = route_channel();
+        routing.subscribe("root", second_tx.clone());
+        routing.activate_route("root", "second-root-turn", &second_tx);
+        routing.route_message(ServerMsg::Request {
+            id: json!(71),
+            method: "item/fileChange/requestApproval".into(),
+            params: json!({
+                "threadId": "reused-child",
+                "turnId": "old-child-turn"
+            }),
+        });
+        routing.route_message(ServerMsg::Request {
+            id: json!(72),
+            method: "item/fileChange/requestApproval".into(),
+            params: json!({
+                "threadId": "reused-child",
+                "turnId": "new-child-turn"
+            }),
+        });
+        routing.route_message(spawn_notification(
+            "root",
+            "second-root-turn",
+            "reused-child",
+        ));
+
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(ServerMsg::Notification { .. })
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(ServerMsg::Request { id, .. }) if id == 72
+        ));
+        assert!(second_rx.try_recv().is_err());
+        assert_eq!(routing.retired_responses.len(), 1);
+        assert_eq!(routing.retired_responses[0]["id"], 71);
+        assert_eq!(
+            routing.owners["reused-child"].child_turn_id.as_deref(),
+            Some("new-child-turn")
+        );
+    }
+
+    #[test]
+    fn retired_child_turns_and_decline_responses_are_bounded() {
+        let mut routing = RoutingState::default();
+        for sequence in 0..=ROUTE_TOMBSTONE_BUDGET {
+            routing.retire_child("child".into(), format!("turn-{sequence}"));
+        }
+        assert_eq!(routing.retired_children.len(), ROUTE_TOMBSTONE_BUDGET);
+        assert_eq!(routing.retired_child_order.len(), ROUTE_TOMBSTONE_BUDGET);
+        assert!(!routing.retired_children.contains(&ChildTurnKey {
+            thread_id: "child".into(),
+            turn_id: "turn-0".into(),
+        }));
+
+        for id in 0..=ROUTE_EVENT_BUDGET {
+            routing.reject_retired_request(&ServerMsg::Request {
+                id: json!(id),
+                method: "item/fileChange/requestApproval".into(),
+                params: json!({}),
+            });
+        }
+        assert_eq!(routing.retired_responses.len(), ROUTE_EVENT_BUDGET);
+        assert!(routing.retired_response_overloaded);
+    }
+
+    #[test]
+    fn reused_child_tombstone_keeps_exact_fifo_membership() {
+        let mut routing = RoutingState::default();
+        routing.retire_child("child".into(), "reused-turn".into());
+        routing.unretire_child("child", "reused-turn");
+        for sequence in 0..ROUTE_TOMBSTONE_BUDGET - 1 {
+            routing.retire_child("child".into(), format!("other-{sequence}"));
+        }
+        routing.retire_child("child".into(), "reused-turn".into());
+
+        assert_eq!(routing.retired_children.len(), ROUTE_TOMBSTONE_BUDGET);
+        assert_eq!(routing.retired_child_order.len(), ROUTE_TOMBSTONE_BUDGET);
+        assert!(routing.retired_children.contains(&ChildTurnKey {
+            thread_id: "child".into(),
+            turn_id: "reused-turn".into(),
+        }));
     }
 
     #[tokio::test]
@@ -2323,7 +2781,7 @@ mod tests {
         routing.route_message(ServerMsg::Request {
             id: json!(11),
             method: "item/fileChange/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "edit" }),
+            params: json!({ "threadId": "child", "turnId": "child-turn", "itemId": "edit" }),
         });
 
         let (root_tx, mut root_rx) = route_channel();
@@ -2355,14 +2813,17 @@ mod tests {
         routing.route_message(ServerMsg::Request {
             id: json!(12),
             method: "item/commandExecution/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "command" }),
+            params: json!({ "threadId": "child", "turnId": "child-turn", "itemId": "command" }),
         });
 
         assert!(!routing.routes.contains_key("root"));
         assert!(!routing.owners.contains_key("child"));
         assert!(!routing.buffered.contains_key("child"));
         assert!(routing.is_failed("root"));
-        assert!(routing.is_failed("child"));
+        assert!(routing.retired_children.contains(&ChildTurnKey {
+            thread_id: "child".into(),
+            turn_id: "child-turn".into(),
+        }));
     }
 
     #[tokio::test]
@@ -2373,13 +2834,17 @@ mod tests {
         routing.activate_route("root", "first-turn", &first_tx);
         routing.route_message(spawn_notification("root", "first-turn", "child"));
         assert!(first_rx.try_recv().is_ok());
+        routing.route_message(ServerMsg::Notification {
+            method: "item/agentMessage/delta".into(),
+            params: json!({ "threadId": "child", "turnId": "old-child-turn", "delta": "old" }),
+        });
         assert!(routing.remove_route_if_same("root", &first_tx, false));
         assert!(!routing.is_failed("child"));
-        assert!(routing.owners.contains_key("child"));
+        assert!(!routing.owners.contains_key("child"));
         routing.route_message(ServerMsg::Request {
             id: json!(40),
             method: "item/commandExecution/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "retired-command" }),
+            params: json!({ "threadId": "child", "turnId": "old-child-turn", "itemId": "retired-command" }),
         });
         assert_eq!(routing.retired_responses.len(), 1);
         assert_eq!(routing.retired_responses[0]["id"], 40);
@@ -2396,7 +2861,7 @@ mod tests {
         routing.route_message(ServerMsg::Request {
             id: json!(41),
             method: "item/commandExecution/requestApproval".into(),
-            params: json!({ "threadId": "child", "itemId": "command" }),
+            params: json!({ "threadId": "child", "turnId": "new-child-turn", "itemId": "command" }),
         });
         assert!(routing.buffered.contains_key("child"));
 
@@ -2539,7 +3004,7 @@ mod tests {
         pending.lock().await.insert(1, request_tx);
         let (route_tx, mut route_rx) = route_channel();
         routing.lock().await.subscribe("thread-1", route_tx);
-        let (retired_response_tx, _retired_response_rx) = mpsc::unbounded_channel();
+        let (retired_response_tx, _retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let (mut writer, reader) = tokio::io::duplex(16);
         let task = tokio::spawn(read_stdout(
@@ -2548,6 +3013,7 @@ mod tests {
             routing.clone(),
             retired_response_tx,
             closed.clone(),
+            None,
         ));
         writer.shutdown().await.unwrap();
         tokio::time::timeout(deadline, task)
@@ -2658,7 +3124,8 @@ cat > /dev/null
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await;
         {
-            let start = server.start_turn("root", &route.tx, json!({ "threadId": "root" }));
+            let start =
+                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
             tokio::pin!(start);
             tokio::select! {
                 _ = &mut start => panic!("turn/start unexpectedly completed"),
@@ -2669,8 +3136,15 @@ cat > /dev/null
                 } => {}
             }
         }
-        drop(lifecycle);
-
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                server.lock_turn_lifecycle("root")
+            )
+            .await
+            .is_err(),
+            "replacement startup must wait for cancelled-start cleanup"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let cleaned = interrupt_marker.exists()
@@ -2684,6 +3158,7 @@ cat > /dev/null
         })
         .await
         .unwrap();
+        drop(server.lock_turn_lifecycle("root").await);
     }
 
     #[tokio::test]
@@ -2699,7 +3174,7 @@ cat > /dev/null
             routing.activate_route("thread-1", "turn-1", &route_tx);
         }
         drop(route_tx);
-        let (retired_response_tx, _retired_response_rx) = mpsc::unbounded_channel();
+        let (retired_response_tx, _retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let (mut writer, reader) = tokio::io::duplex(256);
         let task = tokio::spawn(read_stdout(
@@ -2708,6 +3183,7 @@ cat > /dev/null
             routing.clone(),
             retired_response_tx,
             closed.clone(),
+            None,
         ));
         let event_count = ROUTE_EVENT_BUDGET;
         for sequence in 0..event_count {
