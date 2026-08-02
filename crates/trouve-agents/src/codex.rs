@@ -908,6 +908,7 @@ type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
 const ROUTE_TOMBSTONE_BUDGET: usize = ROUTE_EVENT_BUDGET * 4;
 const UNKNOWN_BUFFER_BUDGET: usize = 64;
+const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct TurnLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -996,20 +997,33 @@ impl Drop for StartedTurnGuard {
             let _lifecycle = server.lock_turn_lifecycle(&thread_id).await;
             let recovered_turn_id = match (known_turn_id, response) {
                 (Some(turn_id), _) => Some(turn_id),
-                (None, Some(response)) => match response.await {
-                    Ok(Ok(started)) => match turn_id_of(&started) {
-                        Ok(turn_id) => Some(turn_id),
-                        Err(error) => {
-                            tracing::warn!("codex: cancelled turn/start response invalid: {error}");
+                (None, Some(response)) => {
+                    match tokio::time::timeout(CANCELLED_START_RESPONSE_TIMEOUT, response).await {
+                        Ok(Ok(Ok(started))) => match turn_id_of(&started) {
+                            Ok(turn_id) => Some(turn_id),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "codex: cancelled turn/start response invalid: {error}"
+                                );
+                                None
+                            }
+                        },
+                        Ok(Ok(Err(error))) => {
+                            tracing::warn!("codex: cancelled turn/start failed: {error}");
                             None
                         }
-                    },
-                    Ok(Err(error)) => {
-                        tracing::warn!("codex: cancelled turn/start failed: {error}");
-                        None
+                        Ok(Err(_)) => None,
+                        Err(_) => {
+                            tracing::warn!(
+                                "codex: cancelled turn/start did not respond within {}s; closing \
+                             its app-server transport",
+                                CANCELLED_START_RESPONSE_TIMEOUT.as_secs()
+                            );
+                            close_transport(&server.pending, &server.routing, &server.closed).await;
+                            None
+                        }
                     }
-                    Err(_) => None,
-                },
+                }
                 (None, None) => None,
             };
             if let Some(turn_id) = recovered_turn_id {
@@ -1126,10 +1140,8 @@ impl RoutingState {
         if !self.unknown_buffered.insert(thread_id.to_string()) {
             return;
         }
-        self.unknown_buffer_order
-            .retain(|buffered| buffered != thread_id);
         self.unknown_buffer_order.push_back(thread_id.to_string());
-        while self.unknown_buffer_order.len() > UNKNOWN_BUFFER_BUDGET {
+        while self.unknown_buffered.len() > UNKNOWN_BUFFER_BUDGET {
             let Some(expired) = self.unknown_buffer_order.pop_front() else {
                 break;
             };
@@ -1139,8 +1151,15 @@ impl RoutingState {
         }
     }
 
+    fn adopt_unknown_buffer(&mut self, thread_id: &str) {
+        if self.unknown_buffered.remove(thread_id) {
+            self.unknown_buffer_order
+                .retain(|buffered| buffered != thread_id);
+        }
+    }
+
     fn take_buffered(&mut self, thread_id: &str) -> Option<BufferedRoute> {
-        self.unknown_buffered.remove(thread_id);
+        self.adopt_unknown_buffer(thread_id);
         self.buffered.remove(thread_id)
     }
 
@@ -1377,6 +1396,7 @@ impl RoutingState {
                 // A turn-less root event is trusted only when it arrived under
                 // this subscription generation. Pre-subscription traffic has
                 // no authenticated association with the active turn.
+                self.reject_retired_request(&message);
                 continue;
             }
             if !child_message
@@ -1387,6 +1407,7 @@ impl RoutingState {
                 // requests for a replacement turn. Do not mutate child state by
                 // id alone: Codex may already have reused that id for the
                 // replacement generation. Unknown buffers are bounded globally.
+                self.reject_retired_request(&message);
                 continue;
             }
 
@@ -1460,7 +1481,7 @@ impl RoutingState {
         self.clear_descendants(thread_id, false);
         self.owners.remove(thread_id);
         self.clear_failed(thread_id);
-        self.unknown_buffered.remove(thread_id);
+        self.adopt_unknown_buffer(thread_id);
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         self.routes.insert(
@@ -1935,6 +1956,17 @@ mod tests {
             method: "mcpServer/elicitation/request".into(),
             params: json!({ "threadId": "child", "turnId": "child-turn" }),
         });
+        routing.route_message(ServerMsg::Request {
+            id: json!(6),
+            method: "item/fileChange/requestApproval".into(),
+            params: json!({ "threadId": "root", "turnId": "stale-turn" }),
+        });
+        assert_eq!(routing.retired_responses.len(), 1);
+        assert_eq!(routing.retired_responses[0]["id"], 6);
+        assert_eq!(
+            routing.retired_responses[0]["result"]["decision"],
+            "decline"
+        );
         assert!(root_rx.try_recv().is_err());
         assert!(routing.buffered.contains_key("child"));
 
@@ -2058,8 +2090,22 @@ mod tests {
                 }
             }),
         });
+        assert!(routing.unknown_buffered.contains("root"));
+        assert!(
+            routing
+                .unknown_buffer_order
+                .iter()
+                .any(|thread_id| thread_id == "root")
+        );
         let (root_tx, mut root_rx) = route_channel();
         routing.subscribe("root", root_tx.clone());
+        assert!(!routing.unknown_buffered.contains("root"));
+        assert!(
+            !routing
+                .unknown_buffer_order
+                .iter()
+                .any(|thread_id| thread_id == "root")
+        );
         routing.activate_route("root", "root-turn", &root_tx);
 
         assert!(!routing.owners.contains_key("stale-child"));
