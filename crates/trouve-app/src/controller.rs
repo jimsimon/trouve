@@ -3516,7 +3516,11 @@ impl Controller {
                             .flat_map(|review| review.findings.iter())
                             .filter(|finding| finding.status == "open")
                             .map(|finding| ui::PrReviewFindingView {
-                                location: format!("{}:{}", finding.path, finding.line),
+                                location: if finding.outside_diff {
+                                    format!("outside diff · {}:{}", finding.path, finding.line)
+                                } else {
+                                    format!("{}:{}", finding.path, finding.line)
+                                },
                                 severity: finding.severity.clone(),
                                 body: finding.body.clone(),
                                 prompt: finding.prompt_for_agents.clone(),

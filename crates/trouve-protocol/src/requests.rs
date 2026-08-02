@@ -1129,8 +1129,9 @@ pub struct CodeReviewCandidateRejection {
     pub reason: String,
 }
 
-/// A confirmed issue produced by the coordinator and, when possible,
-/// published as an inline GitHub review comment.
+/// A confirmed issue produced by the coordinator. Findings on commentable
+/// diff lines are published as inline GitHub review comments; findings whose
+/// strongest anchor is unchanged code are published in the review body.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFinding {
     pub id: String,
@@ -1138,6 +1139,10 @@ pub struct CodeReviewFinding {
     pub path: String,
     pub line: u64,
     pub side: String,
+    /// The finding is anchored to a head-revision line that GitHub cannot
+    /// represent as an inline pull-request diff comment.
+    #[serde(default)]
+    pub outside_diff: bool,
     pub severity: String,
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

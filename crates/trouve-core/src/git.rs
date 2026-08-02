@@ -390,6 +390,59 @@ pub fn session_diff_path(worktree: &Path, base_ref: &str, path: &str) -> Result<
     )
 }
 
+/// Keep only anchors that identify an existing line in a tracked regular
+/// file at the immutable review head. The caller reaches this through
+/// `ToolExecutor`; keeping git and object reads here centralizes the exact
+/// repository semantics.
+pub fn valid_review_anchors(
+    worktree: &Path,
+    head_sha: &str,
+    anchors: &[crate::tools::ReviewAnchor],
+) -> Result<Vec<crate::tools::ReviewAnchor>> {
+    ensure_safe_ref(head_sha)?;
+    let tree = git_untrimmed(worktree, &["ls-tree", "-r", "-z", "--full-tree", head_sha])?;
+    let regular_blobs = tree
+        .split('\0')
+        .filter_map(|entry| {
+            let (metadata, path) = entry.split_once('\t')?;
+            let mut fields = metadata.split_whitespace();
+            let mode = fields.next()?;
+            let kind = fields.next()?;
+            let object_id = fields.next()?;
+            (kind == "blob" && matches!(mode, "100644" | "100755"))
+                .then(|| (path.to_string(), object_id.to_string()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut line_counts = std::collections::HashMap::new();
+    let mut valid = Vec::new();
+    for anchor in anchors {
+        let Some(object_id) = regular_blobs.get(&anchor.path) else {
+            continue;
+        };
+        if anchor.line == 0 {
+            continue;
+        }
+        let line_count = if let Some(count) = line_counts.get(&anchor.path) {
+            *count
+        } else {
+            let contents = git_untrimmed(worktree, &["cat-file", "blob", object_id])?;
+            let count = if contents.is_empty() {
+                0
+            } else {
+                contents.bytes().filter(|byte| *byte == b'\n').count()
+                    + usize::from(!contents.ends_with('\n'))
+            };
+            line_counts.insert(anchor.path.clone(), count);
+            count
+        };
+        if usize::try_from(anchor.line).is_ok_and(|line| line <= line_count) {
+            valid.push(anchor.clone());
+        }
+    }
+    Ok(valid)
+}
+
 /// URL of the named remote (usually "origin"), if configured.
 pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
     git(worktree, &["remote", "get-url", remote])
@@ -575,6 +628,66 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn review_anchors_resolve_regular_file_lines_at_the_immutable_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(tmp.path().join("deleted.txt"), "old\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", tmp.path().join("link.txt")).unwrap();
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "add source"]);
+        std::fs::remove_file(tmp.path().join("deleted.txt")).unwrap();
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "delete old file"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // The mutable worktree must not affect anchors for the review commit.
+        std::fs::write(tmp.path().join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        let anchors = vec![
+            crate::tools::ReviewAnchor {
+                path: "a.txt".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "src/lib.rs".into(),
+                line: 2,
+            },
+            crate::tools::ReviewAnchor {
+                path: "src/lib.rs".into(),
+                line: 3,
+            },
+            crate::tools::ReviewAnchor {
+                path: "missing.rs".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "deleted.txt".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "src".into(),
+                line: 1,
+            },
+            #[cfg(unix)]
+            crate::tools::ReviewAnchor {
+                path: "link.txt".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "a.txt".into(),
+                line: 0,
+            },
+        ];
+
+        assert_eq!(
+            valid_review_anchors(tmp.path(), &head, &anchors).unwrap(),
+            anchors[..2]
+        );
     }
 
     #[test]

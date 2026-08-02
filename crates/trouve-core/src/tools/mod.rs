@@ -145,6 +145,15 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Resolve proposed outside-diff anchors against the immutable review
+    /// head. Only tracked regular files and existing RIGHT-side lines are
+    /// returned.
+    async fn review_repository_valid_anchors(
+        &self,
+        _request: &ReviewRepositoryAnchors,
+    ) -> Result<Vec<ReviewAnchor>, String> {
+        Err("review repository anchor validation is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -164,6 +173,18 @@ pub struct ReviewRepositorySync {
 pub struct ReviewRepositoryDiff {
     pub worktree: PathBuf,
     pub base_sha: String,
+}
+
+pub struct ReviewRepositoryAnchors {
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub anchors: Vec<ReviewAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewAnchor {
+    pub path: String,
+    pub line: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +424,21 @@ impl ToolExecutor for LocalToolExecutor {
         })
         .await
         .map_err(|error| format!("review diff task failed: {error}"))?
+    }
+
+    async fn review_repository_valid_anchors(
+        &self,
+        request: &ReviewRepositoryAnchors,
+    ) -> Result<Vec<ReviewAnchor>, String> {
+        let worktree = request.worktree.clone();
+        let head_sha = request.head_sha.clone();
+        let anchors = request.anchors.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::valid_review_anchors(&worktree, &head_sha, &anchors)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review anchor validation task failed: {error}"))?
     }
 
     async fn evict_worktree(&self, worktree: &Path) {

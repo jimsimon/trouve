@@ -193,6 +193,7 @@ export interface Finding {
   path: string;
   line: number;
   side: string;
+  outside_diff?: boolean;
   severity: string;
   body: string;
   prompt_for_agents: string;

@@ -142,7 +142,10 @@ pub use requests::*;
 // maximum number of concurrently running review jobs (additive).
 // 2.2: code-review concurrency requests remain positive and unbounded on the
 // wire, while values above 32 are normalized to the response maximum of 32.
-pub const PROTOCOL_VERSION: &str = "2.2";
+// 2.3: code-review findings identify issues anchored outside the pull-request
+// diff so clients can distinguish review-body findings from inline threads
+// (additive).
+pub const PROTOCOL_VERSION: &str = "2.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

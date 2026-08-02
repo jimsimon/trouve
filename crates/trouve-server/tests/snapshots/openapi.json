@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.2"
+    "version": "2.3"
   },
   "paths": {
     "/v1/approvals": {
@@ -4559,7 +4559,7 @@
       },
       "CodeReviewFinding": {
         "type": "object",
-        "description": "A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.",
+        "description": "A confirmed issue produced by the coordinator. Findings on commentable\ndiff lines are published as inline GitHub review comments; findings whose\nstrongest anchor is unchanged code are published in the review body.",
         "required": [
           "id",
           "job_id",
@@ -4601,6 +4601,10 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "outside_diff": {
+            "type": "boolean",
+            "description": "The finding is anchored to a head-revision line that GitHub cannot\nrepresent as an inline pull-request diff comment."
           },
           "path": {
             "type": "string"
