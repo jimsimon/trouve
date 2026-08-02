@@ -6,7 +6,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,26 +15,23 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
 const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
-static NEXT_CHECKPOINT_INDEX: AtomicU64 = AtomicU64::new(0);
 
-struct TemporaryCheckpointIndex(PathBuf);
-
-impl TemporaryCheckpointIndex {
-    fn new() -> Self {
-        let sequence = NEXT_CHECKPOINT_INDEX.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "trouve-checkpoint-index-{}-{sequence}",
-            std::process::id()
-        ));
-        // A process ID may be reused after an unclean shutdown.
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
+struct TemporaryCheckpointIndex {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
 }
 
-impl Drop for TemporaryCheckpointIndex {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl TemporaryCheckpointIndex {
+    fn new() -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("trouve-checkpoint-index-")
+            .tempdir()
+            .context("creating temporary checkpoint index directory")?;
+        let path = directory.path().join("index");
+        Ok(Self {
+            path,
+            _directory: directory,
+        })
     }
 }
 
@@ -355,10 +351,10 @@ pub fn checkpoint(worktree: &Path, session_id: &str, seq: i64, message: &str) ->
     // staging choices made by the user, starting from HEAD prevents a file
     // accidentally staged by an earlier checkpoint from remaining tracked
     // after it becomes ignored.
-    let index = TemporaryCheckpointIndex::new();
-    git_with_index(worktree, &index.0, &["read-tree", &head])?;
-    git_with_index(worktree, &index.0, &["add", "-A"])?;
-    let tree = git_with_index(worktree, &index.0, &["write-tree"])?;
+    let index = TemporaryCheckpointIndex::new()?;
+    git_with_index(worktree, &index.path, &["read-tree", &head])?;
+    git_with_index(worktree, &index.path, &["add", "-A"])?;
+    let tree = git_with_index(worktree, &index.path, &["write-tree"])?;
     let commit = git_as_checkpoint_identity(
         worktree,
         &["commit-tree", &tree, "-p", &head, "-m", message],
@@ -662,19 +658,25 @@ mod tests {
     fn checkpoint_preserves_index_and_excludes_ignored_files() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
-        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("nested/target")).unwrap();
+        std::fs::write(tmp.path().join("nested/target/artifact.o"), "build output").unwrap();
         std::fs::write(tmp.path().join("a.txt"), "staged\n").unwrap();
-        run(tmp.path(), &["add", ".gitignore", "a.txt"]);
+        run(tmp.path(), &["add", "nested/target/artifact.o", "a.txt"]);
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        run(tmp.path(), &["add", ".gitignore"]);
         let staged_before = run(tmp.path(), &["diff", "--cached"]);
 
         std::fs::write(tmp.path().join("a.txt"), "worktree\n").unwrap();
-        std::fs::create_dir_all(tmp.path().join("nested/target")).unwrap();
-        std::fs::write(tmp.path().join("nested/target/artifact.o"), "build output").unwrap();
         std::fs::write(tmp.path().join("new.txt"), "included\n").unwrap();
 
         let commit = checkpoint(tmp.path(), "se_t", 0, "checkpoint").unwrap();
 
         assert_eq!(run(tmp.path(), &["diff", "--cached"]), staged_before);
+        assert!(
+            run(tmp.path(), &["ls-files", "--stage"])
+                .lines()
+                .any(|line| line.ends_with("\tnested/target/artifact.o"))
+        );
         assert_eq!(
             run(tmp.path(), &["show", &format!("{commit}:a.txt")]),
             "worktree"
