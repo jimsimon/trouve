@@ -4872,6 +4872,9 @@ impl Engine {
             .iter()
             .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
             .count();
+        if target_count == 0 {
+            return;
+        }
         let mut matched = HashSet::new();
         for page in 1..=REVIEW_COMMENT_MAX_PAGES {
             let response: Result<(Vec<PublishedReviewComment>, _)> = api
@@ -7422,6 +7425,55 @@ mod tests {
         );
         assert_eq!(request["event"], "COMMENT");
         assert_eq!(request["comments"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn published_review_comment_capture_skips_ineligible_findings() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:ineligible-capture");
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: String::new(),
+                    line: 0,
+                    side: "RIGHT".into(),
+                    severity: "low".into(),
+                    body: "General issue.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{}", listener.local_addr().unwrap()),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.capture_published_review_comments(&api, &job, 77, &findings),
+        )
+        .await
+        .expect("ineligible findings must not make a GitHub request");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[tokio::test]
