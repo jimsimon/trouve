@@ -61,7 +61,7 @@ import {
   reviewTaskSummary,
   type ReviewOutputField,
 } from "./review-output";
-import { liveModelElapsed } from "./review-progress";
+import { liveModelElapsed, receiveReviewTaskSnapshot } from "./review-progress";
 import {
   MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
@@ -770,7 +770,12 @@ function JobDetailPane({
   const load = useCallback(async (): Promise<JobDetail | undefined> => {
     const requestedJobId = jobId;
     try {
-      const next = await getJob(requestedJobId);
+      const response = await getJob(requestedJobId);
+      const receivedAt = Date.now();
+      const next = {
+        ...response,
+        tasks: response.tasks.map((task) => receiveReviewTaskSnapshot(task, receivedAt)),
+      };
       if (aliveRef.current === requestedJobId) {
         setDetail(next);
         setEventCursor((current) => current ?? next.event_cursor ?? 0);
@@ -796,7 +801,11 @@ function JobDetailPane({
         return next;
       });
       try {
-        const next = boundReviewTaskOutput(await getTask(jobId, taskId));
+        const response = await getTask(jobId, taskId);
+        const receivedAt = Date.now();
+        const next = boundReviewTaskOutput(
+          receiveReviewTaskSnapshot(response, receivedAt),
+        );
         if (
           aliveRef.current === jobId &&
           next.job_id === jobId &&
@@ -945,7 +954,9 @@ function JobDetailPane({
       ) {
         const taskId = event.task_id;
         const progress = event.progress;
-        const mergeProgress = (task: ReviewTask): ReviewTask => ({ ...task, ...progress });
+        const receivedAt = Date.now();
+        const mergeProgress = (task: ReviewTask): ReviewTask =>
+          receiveReviewTaskSnapshot({ ...task, ...progress }, receivedAt);
         setDetail((current) =>
           current
             ? {
@@ -964,7 +975,7 @@ function JobDetailPane({
           return next;
         });
       } else if (event.type === "code_review.task_updated" && event.task) {
-        const task = event.task;
+        const task = receiveReviewTaskSnapshot(event.task, Date.now());
         pendingOutput.delete(task.id);
         if (!pendingOutput.size && outputTimer !== undefined) {
           window.clearTimeout(outputTimer);

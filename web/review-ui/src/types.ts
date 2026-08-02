@@ -159,6 +159,8 @@ export interface ReviewTask {
   started_at?: string;
   model_started_at?: string | null;
   last_progress_at?: string;
+  /** Browser clock time when the current model_elapsed_ms snapshot arrived. */
+  model_elapsed_snapshot_at?: number;
   completed_at?: string;
   elapsed_ms: number;
 }

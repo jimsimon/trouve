@@ -5840,6 +5840,7 @@
           "cached_input_tokens",
           "output_tokens",
           "tool_call_count",
+          "model_started_at",
           "last_progress_at"
         ],
         "properties": {

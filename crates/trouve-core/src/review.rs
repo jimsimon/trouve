@@ -6317,6 +6317,301 @@ mod tests {
         ));
     }
 
+    struct SilentToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for SilentToolProvider {
+        fn id(&self) -> &str {
+            "provider"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![trouve_protocol::ModelInfo {
+                id: "provider/progress".into(),
+                display_name: "Progress test".into(),
+                context_window: 100_000,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({}),
+            }]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            let events = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    Ok(trouve_providers::ProviderEvent::ToolCall(
+                        trouve_providers::ToolCallRequest {
+                            id: "call_silent".into(),
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({"path": "README.md"}),
+                        },
+                    )),
+                    Ok(trouve_providers::ProviderEvent::Completed {
+                        usage: trouve_protocol::Usage::default(),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(trouve_providers::ProviderEvent::TextDelta("done".into())),
+                    Ok(trouve_providers::ProviderEvent::Completed {
+                        usage: trouve_protocol::Usage::default(),
+                    }),
+                ]
+            };
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    struct SilentToolExecutor {
+        started: Arc<Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::ToolExecutor for SilentToolExecutor {
+        async fn specs(&self, _ctx: &crate::tools::ToolCtx) -> Vec<trouve_providers::ToolSpec> {
+            vec![trouve_providers::ToolSpec {
+                name: "read_file".into(),
+                description: "Block until the progress timer fires".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }),
+            }]
+        }
+
+        fn tool_mutates(&self, name: &str) -> Option<bool> {
+            (name == "read_file").then_some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::tools::ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tools::ToolResult {
+            assert_eq!(name, "read_file");
+            self.started.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            crate::tools::ToolResult::ok(serde_json::json!({"content": "quiet"}))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_turn_persists_capacity_and_silent_tool_progress() {
+        use trouve_protocol::{CodeReviewTaskLifecycleStage, Session, Thread, Workspace};
+
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&worktree)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_progress".into(),
+            name: "progress".into(),
+            path: worktree.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_progress".into(),
+            workspace_id: workspace.id.clone(),
+            title: "progress".into(),
+            branch: "main".into(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_progress".into(),
+            session_id: session.id.clone(),
+            mode: "review".into(),
+            model: "provider/progress".into(),
+            model_options: Default::default(),
+            permission_mode: PermissionMode::Yolo,
+            created_at: Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:turn-progress");
+        store.claim_code_review_job().unwrap().unwrap();
+        let task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("reliability".into()),
+                reviewer_name: "Reliability".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some(thread.model.clone()),
+                prompt: "Review the change".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&task.id, &session.id, &thread.id, &thread.model)
+            .unwrap()
+            .unwrap();
+
+        let tool_started = Arc::new(Notify::new());
+        let tool_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let config = crate::config::Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().join("data"), &config)
+                .with_config_dir(None)
+                .with_provider(
+                    "provider",
+                    Arc::new(SilentToolProvider {
+                        calls: AtomicUsize::new(0),
+                    }),
+                )
+                .with_executor(Arc::new(SilentToolExecutor {
+                    started: tool_started.clone(),
+                    release: tool_release.clone(),
+                })),
+        );
+        let mut progress_events = store.subscribe_scope(&Scope::CodeReviewJob(queued.id.clone()));
+        let superseded = CancellationToken::new();
+        let turn = tokio::spawn({
+            let engine = engine.clone();
+            let job = queued.clone();
+            let task_id = task.id.clone();
+            let thread_id = thread.id.clone();
+            let superseded = superseded.clone();
+            async move {
+                engine
+                    .run_code_review_turn(
+                        &job,
+                        &task_id,
+                        &thread_id,
+                        ReviewTurnRequest::review("Review the change".into()),
+                        &superseded,
+                    )
+                    .await
+            }
+        });
+
+        tool_started.notified().await;
+        loop {
+            let envelope = progress_events.recv().await.unwrap();
+            if matches!(
+                envelope.event,
+                Event::CodeReviewTaskProgressUpdated {
+                    ref task_id,
+                    ref progress,
+                    ..
+                } if task_id == &task.id && progress.model_started_at.is_some()
+            ) {
+                break;
+            }
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        let stages = store
+            .events_after(&Scope::CodeReviewJob(queued.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::CodeReviewTaskProgressUpdated {
+                    task_id, progress, ..
+                } if task_id == task.id => Some(progress.lifecycle_stage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(stages.windows(2).any(|stages| {
+            stages
+                == [
+                    CodeReviewTaskLifecycleStage::WaitingForCapacity,
+                    CodeReviewTaskLifecycleStage::StartingModel,
+                ]
+        }));
+        assert!(
+            store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap()
+                .into_iter()
+                .any(|envelope| matches!(
+                    envelope.event,
+                    Event::TurnCapacityAcquired {
+                        background: true,
+                        ..
+                    }
+                ))
+        );
+        assert_eq!(
+            store
+                .code_review_task(&queued.id, &task.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_stage,
+            CodeReviewTaskLifecycleStage::StartingModel
+        );
+
+        tokio::time::advance(REVIEW_TASK_PROGRESS_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store
+                .code_review_task(&queued.id, &task.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_stage,
+            CodeReviewTaskLifecycleStage::StartingModel
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        loop {
+            let envelope = progress_events.recv().await.unwrap();
+            if matches!(
+                envelope.event,
+                Event::CodeReviewTaskProgressUpdated {
+                    ref task_id,
+                    ref progress,
+                    ..
+                } if task_id == &task.id
+                    && progress.lifecycle_stage == CodeReviewTaskLifecycleStage::RunningTool
+            ) {
+                break;
+            }
+        }
+        let persisted = store
+            .code_review_task(&queued.id, &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.lifecycle_stage,
+            CodeReviewTaskLifecycleStage::RunningTool
+        );
+        assert_eq!(persisted.tool_call_count, 1);
+
+        tool_release.add_permits(1);
+        let result = turn.await.unwrap().unwrap();
+        assert_eq!(result.output, "done");
+        assert_eq!(result.metrics.tool_call_count, 1);
+    }
+
     struct RouterThinkingProvider {
         stall: bool,
     }

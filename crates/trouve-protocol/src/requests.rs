@@ -1147,6 +1147,7 @@ pub struct CodeReviewTaskProgress {
     pub output_tokens: u64,
     pub tool_call_count: u64,
     #[serde(default)]
+    #[schema(required = true)]
     pub model_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_progress_at: chrono::DateTime<chrono::Utc>,
 }
