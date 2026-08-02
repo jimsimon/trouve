@@ -956,6 +956,64 @@ cat > /dev/null
 }
 
 #[tokio::test]
+async fn codex_adapter_routes_spawned_agent_requests_through_the_parent_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-child-request",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"root"}}}'
+IFS= read -r line # turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"root-turn"}}}'
+# Codex can multiplex a child request before its collaboration item reaches
+# the parent stream. The adapter must replay it once ownership is announced.
+echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"child","turnId":"child-turn","itemId":"child-command","command":"pwd"}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","senderThreadId":"root","receiverThreadIds":["child"]}}}'
+IFS= read -r approval
+printf '%s\n' "$approval" > "$0.approval"
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"answer","delta":"Parent finished."}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let mut saw_parent_text = false;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            BackendEvent::ApprovalNeeded {
+                call_id,
+                tool,
+                responder,
+                ..
+            } => {
+                assert_eq!(call_id, "child-command");
+                assert_eq!(tool, "commandExecution");
+                responder.send(true).unwrap();
+            }
+            BackendEvent::TextDelta(text) => saw_parent_text |= text == "Parent finished.",
+            BackendEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+
+    assert!(saw_parent_text && completed);
+    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
+    assert!(reply.contains("\"id\":100"), "{reply}");
+    assert!(reply.contains("\"decision\":\"accept\""), "{reply}");
+}
+
+#[tokio::test]
 async fn codex_adapter_sends_decline_when_user_denies_approval() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(

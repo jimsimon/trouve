@@ -16,7 +16,7 @@
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -469,8 +469,19 @@ fn turn_stream(
         let mut overload_signal = rx.overload_signal();
         let process_route = async {
             while let Some(msg) = rx.recv().await {
-                if message_turn_id(&msg).is_some_and(|turn_id| turn_id != codex_turn_id) {
+                let root_message = message_belongs_to_thread(&msg, &codex_thread_id);
+                if root_message
+                    && message_turn_id(&msg).is_some_and(|turn_id| turn_id != codex_turn_id)
+                {
                     tracing::warn!("codex: ignoring event for stale turn on {codex_thread_id}");
+                    continue;
+                }
+                // Child notifications must be consumed from app-server's
+                // multiplexed transport, but they describe a separate Codex
+                // turn and must not alter or complete the parent's transcript.
+                // Child server requests still need the parent's approval
+                // handler below or the child agent can wait forever.
+                if !root_message && matches!(msg, ServerMsg::Notification { .. }) {
                     continue;
                 }
                 match msg {
@@ -712,13 +723,43 @@ fn turn_stream(
 
 /// Extract the vendor turn identity from every documented event shape.
 fn message_turn_id(message: &ServerMsg) -> Option<&str> {
-    let params = match message {
-        ServerMsg::Notification { params, .. } | ServerMsg::Request { params, .. } => params,
-    };
+    let params = message_params(message);
     params["turnId"]
         .as_str()
         .or_else(|| params["turn"]["id"].as_str())
         .or_else(|| params["item"]["turnId"].as_str())
+}
+
+fn message_thread_id(message: &ServerMsg) -> Option<&str> {
+    let params = message_params(message);
+    params["threadId"]
+        .as_str()
+        .or_else(|| params["thread"]["id"].as_str())
+}
+
+fn message_belongs_to_thread(message: &ServerMsg, thread_id: &str) -> bool {
+    message_thread_id(message).is_none_or(|message_thread_id| message_thread_id == thread_id)
+}
+
+fn message_params(message: &ServerMsg) -> &Value {
+    match message {
+        ServerMsg::Notification { params, .. } | ServerMsg::Request { params, .. } => params,
+    }
+}
+
+/// Child Codex threads announced by collaboration items on a parent thread.
+fn announced_child_threads(message: &ServerMsg) -> Vec<&str> {
+    let item = &message_params(message)["item"];
+    match item["type"].as_str() {
+        Some("collabAgentToolCall") => item["receiverThreadIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect(),
+        Some("subAgentActivity") => item["agentThreadId"].as_str().into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -866,6 +907,8 @@ enum ServerMsg {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
+/// Spawned Codex thread id to the root thread whose active route owns it.
+type RouteOwners = Arc<Mutex<HashMap<String, String>>>;
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
 
@@ -924,6 +967,7 @@ type Buffered = Arc<Mutex<HashMap<String, BufferedRoute>>>;
 async fn close_transport(
     pending: &Pending,
     routes: &Routes,
+    route_owners: &RouteOwners,
     buffered: &Buffered,
     closed: &std::sync::atomic::AtomicBool,
 ) {
@@ -932,13 +976,153 @@ async fn close_transport(
     closed.store(true, Ordering::Relaxed);
     pending.lock().await.clear();
     routes.lock().await.clear();
+    route_owners.lock().await.clear();
     buffered.lock().await.clear();
+}
+
+fn resolved_route_owner(
+    thread_id: &str,
+    routes: &HashMap<String, RouteSender<ServerMsg>>,
+    route_owners: &HashMap<String, String>,
+) -> String {
+    if routes.contains_key(thread_id) {
+        return thread_id.to_string();
+    }
+    let mut owner = thread_id;
+    let mut seen = HashSet::new();
+    while let Some(parent) = route_owners.get(owner) {
+        if !seen.insert(owner) {
+            break;
+        }
+        owner = parent;
+        if routes.contains_key(owner) {
+            break;
+        }
+    }
+    owner.to_string()
+}
+
+/// Route one app-server message, teaching the multiplexer about child Codex
+/// threads as collaboration items announce them. A child can emit a request
+/// just before its parent announcement, so buffered child messages are folded
+/// into the root route as soon as ownership becomes known.
+async fn route_server_message(
+    message: ServerMsg,
+    routes: &Routes,
+    route_owners: &RouteOwners,
+    buffered: &Buffered,
+    failed_routes: &mut HashSet<String>,
+) {
+    let mut queue = VecDeque::from([message]);
+    let mut overload_after_drain = Vec::new();
+
+    while let Some(message) = queue.pop_front() {
+        let thread_id = message_thread_id(&message).unwrap_or("").to_string();
+        let (owner, tx) = {
+            // All routing mutations take locks in routes -> owners -> buffered
+            // order so subscription and cleanup cannot miss an in-flight event.
+            let routes_guard = routes.lock().await;
+            let owners_guard = route_owners.lock().await;
+            let owner = resolved_route_owner(&thread_id, &routes_guard, &owners_guard);
+            let tx = routes_guard.get(&owner).cloned();
+            (owner, tx)
+        };
+
+        let Some(tx) = tx else {
+            if thread_id.is_empty()
+                || failed_routes.contains(&thread_id)
+                || failed_routes.contains(&owner)
+            {
+                continue;
+            }
+            let routes_guard = routes.lock().await;
+            let owners_guard = route_owners.lock().await;
+            let current_owner = resolved_route_owner(&thread_id, &routes_guard, &owners_guard);
+            if routes_guard.contains_key(&current_owner) {
+                drop(owners_guard);
+                drop(routes_guard);
+                queue.push_front(message);
+                // The route appeared while locks were changing; retry without
+                // buffering so event order remains intact.
+                continue;
+            }
+            let mut buffered_routes = buffered.lock().await;
+            let route = buffered_routes.entry(thread_id.clone()).or_default();
+            if route.messages.len() < ROUTE_EVENT_BUDGET {
+                route.messages.push(message);
+            } else {
+                route.overloaded = true;
+                failed_routes.insert(thread_id);
+            }
+            continue;
+        };
+
+        let child_threads: Vec<String> = announced_child_threads(&message)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        match tx.try_send(message) {
+            Ok(()) => {
+                failed_routes.remove(&thread_id);
+                failed_routes.remove(&owner);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "codex: dropping {owner} event route while routing {thread_id}: {}",
+                    match error {
+                        RouteSendError::Closed => "receiver is closed",
+                        RouteSendError::Overloaded => "event backlog limit exceeded",
+                    }
+                );
+                let mut routes_guard = routes.lock().await;
+                if routes_guard
+                    .get(&owner)
+                    .is_some_and(|active| active.same_channel(&tx))
+                {
+                    routes_guard.remove(&owner);
+                }
+                failed_routes.insert(thread_id);
+                failed_routes.insert(owner);
+                continue;
+            }
+        }
+
+        if !child_threads.is_empty() {
+            let routes_guard = routes.lock().await;
+            if !routes_guard
+                .get(&owner)
+                .is_some_and(|active| active.same_channel(&tx))
+            {
+                continue;
+            }
+            let mut owners_guard = route_owners.lock().await;
+            let mut buffered_routes = buffered.lock().await;
+            for child_thread_id in child_threads {
+                if child_thread_id == owner {
+                    continue;
+                }
+                owners_guard.insert(child_thread_id.clone(), owner.clone());
+                failed_routes.remove(&child_thread_id);
+                if let Some(buffered_route) = buffered_routes.remove(&child_thread_id) {
+                    queue.extend(buffered_route.messages);
+                    if buffered_route.overloaded {
+                        overload_after_drain.push(tx.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    for tx in overload_after_drain.drain(..) {
+        tx.mark_overloaded();
+    }
 }
 
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
     routes: Routes,
+    route_owners: RouteOwners,
     buffered: Buffered,
     closed: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -968,12 +1152,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         } else if has_method {
             let method = msg["method"].as_str().unwrap_or("").to_string();
             let params = msg["params"].clone();
-            let thread_id = params["threadId"]
-                .as_str()
-                .or_else(|| params["thread"]["id"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let m = if has_id {
+            let message = if has_id {
                 ServerMsg::Request {
                     id: msg["id"].clone(),
                     method,
@@ -982,64 +1161,21 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             } else {
                 ServerMsg::Notification { method, params }
             };
-            let routes_guard = routes.lock().await;
-            match routes_guard.get(&thread_id).cloned() {
-                Some(tx) => {
-                    drop(routes_guard);
-                    match tx.try_send(m) {
-                        Ok(()) => {
-                            failed_routes.remove(&thread_id);
-                        }
-                        Err(error) => {
-                            // The stdout reader is shared by every Codex turn. A
-                            // closed or overloaded route must fail independently
-                            // rather than blocking every concurrent turn and
-                            // JSON-RPC response on this transport.
-                            tracing::warn!(
-                                "codex: dropping {thread_id} event route: {}",
-                                match error {
-                                    RouteSendError::Closed => "receiver is closed",
-                                    RouteSendError::Overloaded => "event backlog limit exceeded",
-                                }
-                            );
-                            let mut routes = routes.lock().await;
-                            if routes
-                                .get(&thread_id)
-                                .is_some_and(|active| active.same_channel(&tx))
-                            {
-                                routes.remove(&thread_id);
-                            }
-                            // Do not reinterpret later events from this failed
-                            // turn as pre-subscription events. A future route for
-                            // the same thread clears this marker on delivery.
-                            failed_routes.insert(thread_id);
-                        }
-                    }
-                }
-                // No subscriber yet: buffer for a thread id we've seen named
-                // (skip the empty catch-all) so nothing emitted between
-                // thread/start and subscribe is lost. Keep the routes lock
-                // until the buffer write completes so subscribe cannot miss a
-                // reader that already observed the route as absent.
-                None if !thread_id.is_empty() && !failed_routes.contains(&thread_id) => {
-                    let mut buffered = buffered.lock().await;
-                    let route = buffered.entry(thread_id.clone()).or_default();
-                    if route.messages.len() < ROUTE_EVENT_BUDGET {
-                        route.messages.push(m);
-                    } else {
-                        route.overloaded = true;
-                        failed_routes.insert(thread_id);
-                    }
-                }
-                None => {}
-            }
+            route_server_message(
+                message,
+                &routes,
+                &route_owners,
+                &buffered,
+                &mut failed_routes,
+            )
+            .await;
         }
     }
     // Dropping stdout means the app-server can never complete any
     // outstanding request or turn. Drop every sender it left behind so
     // request waiters and routed turn streams wake immediately instead of
     // remaining active forever.
-    close_transport(&pending, &routes, &buffered, &closed).await;
+    close_transport(&pending, &routes, &route_owners, &buffered, &closed).await;
 }
 
 struct AppServer {
@@ -1047,6 +1183,8 @@ struct AppServer {
     next_id: AtomicI64,
     pending: Pending,
     routes: Routes,
+    /// Spawned subagent threads inherit the active route of their root.
+    route_owners: RouteOwners,
     /// Thread-scoped messages that arrived before anyone subscribed to that
     /// thread — the id is only known after thread/start returns, so the
     /// app-server can emit notifications in the gap before `subscribe`.
@@ -1085,6 +1223,7 @@ impl AppServer {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            route_owners: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1103,8 +1242,16 @@ impl AppServer {
         let routes = self.routes.clone();
         let closed = self.closed.clone();
         let pending = self.pending.clone();
+        let route_owners = self.route_owners.clone();
         let buffered = self.buffered.clone();
-        tokio::spawn(read_stdout(stdout, pending, routes, buffered, closed));
+        tokio::spawn(read_stdout(
+            stdout,
+            pending,
+            routes,
+            route_owners,
+            buffered,
+            closed,
+        ));
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -1224,11 +1371,21 @@ impl AppServer {
         let (tx, rx) = route_channel();
         {
             // The reader takes these locks in the same order when it has no
-            // active route. Holding both through registration and draining
+            // active route. Holding them through registration and draining
             // keeps older buffered notifications ahead of newly routed ones.
             let mut routes = self.routes.lock().await;
+            let mut route_owners = self.route_owners.lock().await;
             let mut buffered_routes = self.buffered.lock().await;
             let buffered = buffered_routes.remove(thread_id);
+            let stale_descendants: Vec<String> = route_owners
+                .iter()
+                .filter(|(child, owner)| child.as_str() == thread_id || owner.as_str() == thread_id)
+                .map(|(child, _)| child.clone())
+                .collect();
+            route_owners.retain(|child, owner| child != thread_id && owner != thread_id);
+            for descendant in stale_descendants {
+                buffered_routes.remove(&descendant);
+            }
             routes.insert(thread_id.to_string(), tx.clone());
             if let Some(buffered) = buffered {
                 for message in buffered.messages {
@@ -1245,7 +1402,14 @@ impl AppServer {
     }
 
     async fn unsubscribe(&self, thread_id: &str, expected: &RouteSender<ServerMsg>) {
-        remove_route(&self.routes, &self.buffered, thread_id, expected).await;
+        remove_route(
+            &self.routes,
+            &self.route_owners,
+            &self.buffered,
+            thread_id,
+            expected,
+        )
+        .await;
     }
 }
 
@@ -1258,6 +1422,7 @@ struct RouteSubscription {
 /// Remove a route only when cleanup still owns the active subscription.
 async fn remove_route(
     routes: &Routes,
+    route_owners: &RouteOwners,
     buffered: &Buffered,
     thread_id: &str,
     expected: &RouteSender<ServerMsg>,
@@ -1270,11 +1435,22 @@ async fn remove_route(
         return;
     }
     routes.remove(thread_id);
+    let mut route_owners = route_owners.lock().await;
+    let descendants: Vec<String> = route_owners
+        .iter()
+        .filter(|(_, owner)| owner.as_str() == thread_id)
+        .map(|(child, _)| child.clone())
+        .collect();
+    route_owners.retain(|child, owner| child != thread_id && owner != thread_id);
     // Keep the lock order aligned with subscribe and the stdout reader.
     // Buffered events belong to the route being removed only when it is
     // still the active route; stale turn cleanup must not erase events for
     // a replacement subscription.
-    buffered.lock().await.remove(thread_id);
+    let mut buffered = buffered.lock().await;
+    buffered.remove(thread_id);
+    for descendant in descendants {
+        buffered.remove(&descendant);
+    }
 }
 
 #[cfg(test)]
@@ -1323,6 +1499,96 @@ mod tests {
             params: json!({ "threadId": "thread-1" }),
         };
         assert_eq!(message_turn_id(&thread_scoped), None);
+
+        let child_completed = ServerMsg::Notification {
+            method: "turn/completed".into(),
+            params: json!({ "threadId": "child", "turn": { "id": "child-turn" } }),
+        };
+        assert!(!message_belongs_to_thread(&child_completed, "thread-1"));
+    }
+
+    #[test]
+    fn extracts_spawned_threads_from_codex_collaboration_items() {
+        let spawn = ServerMsg::Notification {
+            method: "item/started".into(),
+            params: json!({
+                "threadId": "root",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "senderThreadId": "root",
+                    "receiverThreadIds": ["child-1", "child-2"]
+                }
+            }),
+        };
+        assert_eq!(announced_child_threads(&spawn), vec!["child-1", "child-2"]);
+
+        let activity = ServerMsg::Notification {
+            method: "item/started".into(),
+            params: json!({
+                "threadId": "root",
+                "item": { "type": "subAgentActivity", "agentThreadId": "child-3" }
+            }),
+        };
+        assert_eq!(announced_child_threads(&activity), vec!["child-3"]);
+    }
+
+    #[tokio::test]
+    async fn child_requests_follow_the_root_route_even_when_they_arrive_first() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let route_owners: RouteOwners = Arc::new(Mutex::new(HashMap::new()));
+        let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
+        let mut failed_routes = HashSet::new();
+        let (root_tx, mut root_rx) = route_channel();
+        routes.lock().await.insert("root".into(), root_tx.clone());
+
+        route_server_message(
+            ServerMsg::Request {
+                id: json!(7),
+                method: "mcpServer/elicitation/request".into(),
+                params: json!({ "threadId": "child", "turnId": "child-turn" }),
+            },
+            &routes,
+            &route_owners,
+            &buffered,
+            &mut failed_routes,
+        )
+        .await;
+        assert!(root_rx.try_recv().is_err());
+        assert!(buffered.lock().await.contains_key("child"));
+
+        route_server_message(
+            ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "receiverThreadIds": ["child"]
+                    }
+                }),
+            },
+            &routes,
+            &route_owners,
+            &buffered,
+            &mut failed_routes,
+        )
+        .await;
+
+        let ServerMsg::Notification { params, .. } = root_rx.recv().await.unwrap() else {
+            panic!("parent announcement should be delivered first");
+        };
+        assert_eq!(params["threadId"], "root");
+        let ServerMsg::Request { id, params, .. } = root_rx.recv().await.unwrap() else {
+            panic!("buffered child request should follow its parent announcement");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(params["threadId"], "child");
+        assert_eq!(route_owners.lock().await.get("child").unwrap(), "root");
+        assert!(!buffered.lock().await.contains_key("child"));
+
+        remove_route(&routes, &route_owners, &buffered, "root", &root_tx).await;
+        assert!(route_owners.lock().await.is_empty());
     }
 
     #[test]
@@ -1403,6 +1669,7 @@ mod tests {
         let deadline = std::time::Duration::from_secs(1);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let route_owners: RouteOwners = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (request_tx, request_rx) = oneshot::channel();
@@ -1415,6 +1682,7 @@ mod tests {
             reader,
             pending.clone(),
             routes.clone(),
+            route_owners.clone(),
             buffered.clone(),
             closed.clone(),
         ));
@@ -1442,6 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn stale_turn_cleanup_preserves_replacement_route() {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let route_owners: RouteOwners = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let (stale_tx, _stale_rx) = route_channel();
         let (replacement_tx, mut replacement_rx) = route_channel();
@@ -1450,7 +1719,7 @@ mod tests {
             .await
             .insert("thread-1".into(), replacement_tx.clone());
 
-        remove_route(&routes, &buffered, "thread-1", &stale_tx).await;
+        remove_route(&routes, &route_owners, &buffered, "thread-1", &stale_tx).await;
 
         let active = routes
             .lock()
@@ -1466,7 +1735,14 @@ mod tests {
             .unwrap();
         assert!(replacement_rx.recv().await.is_some());
 
-        remove_route(&routes, &buffered, "thread-1", &replacement_tx).await;
+        remove_route(
+            &routes,
+            &route_owners,
+            &buffered,
+            "thread-1",
+            &replacement_tx,
+        )
+        .await;
         assert!(routes.lock().await.is_empty());
     }
 
@@ -1502,6 +1778,7 @@ mod tests {
         let deadline = std::time::Duration::from_secs(1);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let route_owners: RouteOwners = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (route_tx, mut route_rx) = route_channel();
@@ -1512,6 +1789,7 @@ mod tests {
             reader,
             pending.clone(),
             routes.clone(),
+            route_owners.clone(),
             buffered.clone(),
             closed.clone(),
         ));
