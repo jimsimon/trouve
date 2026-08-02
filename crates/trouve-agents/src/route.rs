@@ -20,28 +20,37 @@ pub(crate) enum RouteSendError {
 pub(crate) struct RouteSender<T> {
     events: mpsc::Sender<T>,
     overloaded: watch::Sender<bool>,
+    closed: watch::Sender<bool>,
 }
 
 pub(crate) struct RouteReceiver<T> {
     events: mpsc::Receiver<T>,
     overloaded: watch::Receiver<bool>,
+    closed: watch::Receiver<bool>,
 }
 
 pub(crate) struct RouteOverload {
     overloaded: watch::Receiver<bool>,
 }
 
+pub(crate) struct RouteClosed {
+    closed: watch::Receiver<bool>,
+}
+
 pub(crate) fn route_channel<T>() -> (RouteSender<T>, RouteReceiver<T>) {
     let (events_tx, events_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
     let (overloaded_tx, overloaded_rx) = watch::channel(false);
+    let (closed_tx, closed_rx) = watch::channel(false);
     (
         RouteSender {
             events: events_tx,
             overloaded: overloaded_tx,
+            closed: closed_tx,
         },
         RouteReceiver {
             events: events_rx,
             overloaded: overloaded_rx,
+            closed: closed_rx,
         },
     )
 }
@@ -51,6 +60,7 @@ impl<T> Clone for RouteSender<T> {
         Self {
             events: self.events.clone(),
             overloaded: self.overloaded.clone(),
+            closed: self.closed.clone(),
         }
     }
 }
@@ -74,6 +84,10 @@ impl<T> RouteSender<T> {
         self.overloaded.send_replace(true);
     }
 
+    pub(crate) fn mark_closed(&self) {
+        self.closed.send_replace(true);
+    }
+
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
         self.events.same_channel(&other.events)
     }
@@ -83,6 +97,12 @@ impl<T> RouteReceiver<T> {
     pub(crate) fn overload_signal(&self) -> RouteOverload {
         RouteOverload {
             overloaded: self.overloaded.clone(),
+        }
+    }
+
+    pub(crate) fn close_signal(&self) -> RouteClosed {
+        RouteClosed {
+            closed: self.closed.clone(),
         }
     }
 
@@ -108,6 +128,24 @@ impl RouteOverload {
     }
 }
 
+impl RouteClosed {
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    pub(crate) async fn wait(&mut self) {
+        loop {
+            if *self.closed.borrow() {
+                return;
+            }
+            if self.closed.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +163,17 @@ mod tests {
         );
         overloaded.wait().await;
         assert_eq!(rx.recv().await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn retained_sender_can_explicitly_wake_receiver_on_transport_close() {
+        let (tx, rx) = route_channel::<()>();
+        let retained = tx.clone();
+        let mut closed = rx.close_signal();
+
+        tx.mark_closed();
+        closed.wait().await;
+
+        drop(retained);
     }
 }
