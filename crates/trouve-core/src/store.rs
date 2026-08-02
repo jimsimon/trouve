@@ -3682,20 +3682,30 @@ impl Store {
              WHERE job_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([job_id], |row| {
-            let payload: String = row.get(1)?;
-            let event = serde_json::from_str(&payload).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(PendingCodeReviewEvent {
-                id: row.get(0)?,
-                event,
-            })
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut pending = Vec::new();
+        let mut invalid_ids = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            match serde_json::from_str(&payload) {
+                Ok(event) => pending.push(PendingCodeReviewEvent { id, event }),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        pending_event_id = id,
+                        %error,
+                        "discarding undeserializable pending code-review event"
+                    );
+                    invalid_ids.push(id);
+                }
+            }
+        }
+        drop(stmt);
+        for id in invalid_ids {
+            conn.execute("DELETE FROM code_review_pending_events WHERE id = ?1", [id])?;
+        }
+        Ok(pending)
     }
 
     pub fn code_review_jobs_with_pending_events(&self, limit: usize) -> Result<Vec<String>> {
@@ -8561,12 +8571,36 @@ mod tests {
             .prepare_code_review_batch_snapshot(&queued.id, "digest-b")
             .unwrap();
         assert!(crash_recovery.changed);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO code_review_pending_events (job_id, payload, created_at)
+                 VALUES (?1, 'not-json', ?2)",
+                params![queued.id, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
         let pending = store.pending_code_review_events(&queued.id).unwrap();
         assert!(
             store
                 .code_review_jobs_with_pending_events(10)
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM code_review_pending_events
+                     WHERE job_id = ?1 AND payload = 'not-json'",
+                    [queued.id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
         assert!(pending.iter().any(|pending| matches!(
             &pending.event,
