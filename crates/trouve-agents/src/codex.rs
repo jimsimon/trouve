@@ -458,10 +458,10 @@ fn turn_stream(
         // Track streamed raw items so the completion fallback does not repeat
         // content already shown.
         let mut streamed_raw_reasoning = HashSet::new();
-        let mut turn_finished = false;
         let mut client_gone = false;
         let mut route_overloaded = false;
         let mut route_closed = false;
+        let mut terminal_params = None;
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
@@ -579,32 +579,10 @@ fn turn_stream(
                             }
                         }
                         "turn/completed" => {
-                            // Publish completion only after active-turn cleanup
-                            // is serialized with any replacement startup.
-                            let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
-                            server
-                                .clear_active_turn(&codex_thread_id, &codex_turn_id)
-                                .await;
-                            // Remove the route before yielding completion. A
-                            // consumer is allowed to drop immediately after
-                            // receiving the terminal event.
-                            server.unsubscribe(&codex_thread_id, &route_tx).await;
-                            cleanup.disarm();
-                            turn_finished = true;
-                            let status = params["turn"]["status"].as_str().unwrap_or("completed");
-                            if status == "failed" {
-                                let msg = params["turn"]["error"]["message"]
-                                    .as_str()
-                                    .unwrap_or("turn failed")
-                                    .to_string();
-                                let _ = tx.send(Err(BackendError::Protocol(msg))).await;
-                            } else {
-                                let _ = tx
-                                    .send(Ok(BackendEvent::Completed {
-                                        usage: usage.clone(),
-                                    }))
-                                    .await;
-                            }
+                            // Record terminal state without awaiting. Once the
+                            // event is dequeued, transport closure must not
+                            // cancel its lifecycle cleanup or publication.
+                            terminal_params = Some(params);
                             break;
                         }
                         _ => {}
@@ -691,11 +669,34 @@ fn turn_stream(
                 route_closed = true;
             }
         }
-        let _cleanup_lifecycle = if turn_finished {
-            None
-        } else {
-            Some(server.lock_turn_lifecycle(&codex_thread_id).await)
-        };
+        if let Some(params) = terminal_params {
+            // Publish completion only after active-turn cleanup is serialized
+            // with any replacement startup.
+            let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+            server
+                .clear_active_turn(&codex_thread_id, &codex_turn_id)
+                .await;
+            // Remove the route before yielding completion. A consumer is
+            // allowed to drop immediately after receiving the terminal event.
+            server.unsubscribe(&codex_thread_id, &route_tx).await;
+            cleanup.disarm();
+            let status = params["turn"]["status"].as_str().unwrap_or("completed");
+            if status == "failed" {
+                let message = params["turn"]["error"]["message"]
+                    .as_str()
+                    .unwrap_or("turn failed")
+                    .to_string();
+                let _ = tx.send(Err(BackendError::Protocol(message))).await;
+            } else {
+                let _ = tx
+                    .send(Ok(BackendEvent::Completed {
+                        usage: usage.clone(),
+                    }))
+                    .await;
+            }
+            return;
+        }
+        let _cleanup_lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
         if client_gone {
             server
                 .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
@@ -714,7 +715,7 @@ fn turn_stream(
             server
                 .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
                 .await;
-        } else if route_closed || !turn_finished {
+        } else {
             let reason = if route_closed || server.is_closed() {
                 "app-server closed before turn completed"
             } else {
@@ -1826,6 +1827,23 @@ async fn close_transport(
     }
 }
 
+fn close_transport_blocking(
+    pending: &Pending,
+    routing: &Routing,
+    active_turns: &ActiveTurns,
+    closed: &std::sync::atomic::AtomicBool,
+) {
+    closed.store(true, Ordering::Relaxed);
+    pending.blocking_lock().clear();
+    let mut routing = routing.blocking_lock();
+    for route in routing.routes.values() {
+        route.tx.mark_closed();
+    }
+    *routing = RoutingState::default();
+    drop(routing);
+    active_turns.blocking_lock().clear();
+}
+
 async fn terminate_transport_parts(
     pending: Pending,
     routing: Routing,
@@ -1926,6 +1944,14 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         } else if has_method {
             let method = msg["method"].as_str().unwrap_or("").to_string();
             let params = msg["params"].clone();
+            let completed_turn = (method == "turn/completed")
+                .then(|| {
+                    Some((
+                        params["threadId"].as_str()?.to_string(),
+                        params["turn"]["id"].as_str()?.to_string(),
+                    ))
+                })
+                .flatten();
             let message = if has_id {
                 ServerMsg::Request {
                     id: msg["id"].clone(),
@@ -1940,6 +1966,17 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 routing.route_message(message);
                 routing.take_retired_responses()
             };
+            if let Some((thread_id, turn_id)) = completed_turn
+                && let Some(active_turns) = active_turns.as_ref()
+            {
+                // The process-wide reader remains authoritative even after a
+                // consumer disappears. Clear only the exact completed marker,
+                // so a concurrently registered replacement is never erased.
+                let mut active = active_turns.lock().await;
+                if active.get(&thread_id) == Some(&turn_id) {
+                    active.remove(&thread_id);
+                }
+            }
             if response_overloaded {
                 tracing::error!(
                     "codex: terminating app-server after retired-response buffer overflow"
@@ -2057,31 +2094,31 @@ impl AppServer {
 
     fn invalidate_transport_now(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            // `TransportWriteGuard::drop` may run during runtime shutdown. Send
-            // the kill signal synchronously so process termination does not
-            // depend on the spawned drain/reap task being polled.
-            start_kill_child_now(&self.child);
-            runtime.spawn(terminate_transport_parts(
-                self.pending.clone(),
-                self.routing.clone(),
-                Some(self.active_turns.clone()),
-                self.closed.clone(),
-                Some(self.child.clone()),
-            ));
+        // `TransportWriteGuard::drop` may run during runtime shutdown. Send
+        // the kill signal synchronously, then move waiter release and reaping
+        // to an OS thread whose lifetime is independent of Tokio.
+        start_kill_child_now(&self.child);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let pending = self.pending.clone();
+            let routing = self.routing.clone();
+            let active_turns = self.active_turns.clone();
+            let closed = self.closed.clone();
+            let child = self.child.clone();
+            let _cleanup = std::thread::spawn(move || {
+                close_transport_blocking(&pending, &routing, &active_turns, &closed);
+                kill_and_reap_child(child);
+            });
             return;
         }
 
         // Outside a runtime there is nowhere to schedule async cleanup. Block
         // until every waiter is released and the subprocess is reaped.
-        self.pending.blocking_lock().clear();
-        let mut routing = self.routing.blocking_lock();
-        for route in routing.routes.values() {
-            route.tx.mark_closed();
-        }
-        *routing = RoutingState::default();
-        drop(routing);
-        self.active_turns.blocking_lock().clear();
+        close_transport_blocking(
+            &self.pending,
+            &self.routing,
+            &self.active_turns,
+            &self.closed,
+        );
         kill_and_reap_child(self.child.clone());
     }
 
@@ -3460,6 +3497,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_clears_completed_marker_without_a_live_route_consumer() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let routing: Routing = Arc::new(Mutex::new(RoutingState::default()));
+        let active_turns: ActiveTurns = Arc::new(Mutex::new(HashMap::from([(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+        )])));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (retired_response_tx, _retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let task = tokio::spawn(read_stdout(
+            reader,
+            pending,
+            routing,
+            Some(active_turns.clone()),
+            retired_response_tx,
+            closed,
+            None,
+        ));
+
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#,
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while active_turns.lock().await.contains_key("thread-1") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stdout reader must clear the exact completed marker");
+
+        writer.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_turn_cleanup_preserves_replacement_route() {
         let routing: Routing = Arc::new(Mutex::new(RoutingState::default()));
         let (stale_tx, _stale_rx) = route_channel();
@@ -3547,7 +3625,19 @@ cat > /dev/null
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let spawn_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let server = loop {
+            match AppServer::spawn(stub.to_str().unwrap()).await {
+                Ok(server) => break Arc::new(server),
+                Err(BackendError::Io(error))
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < spawn_deadline =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("failed to spawn late-start stub: {error}"),
+            }
+        };
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await.unwrap();
         {
@@ -3780,6 +3870,7 @@ sleep 10
         cleanup.response = None;
         cleanup.turn_id = Some("root-turn".into());
         cleanup.finish_startup();
+        let held_lifecycle = server.lock_turn_lifecycle("root").await;
         let stream = turn_stream(
             server.clone(),
             "root".into(),
@@ -3802,8 +3893,16 @@ sleep 10
         // completion must win over the transport-close signal.
         route_tx.mark_closed();
 
+        let next = stream.next();
+        futures::pin_mut!(next);
+        tokio::select! {
+            biased;
+            result = &mut next => panic!("terminal handling was preempted: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(held_lifecycle);
         assert!(matches!(
-            stream.next().await,
+            next.await,
             Some(Ok(BackendEvent::Completed { .. }))
         ));
         assert!(!server.routing.lock().await.routes.contains_key("root"));
@@ -3919,7 +4018,7 @@ cat > /dev/null
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (cleanup, server, mut close_signal) = runtime.block_on(async {
+        let (cleanup, server, close_signal) = runtime.block_on(async {
             let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
             let lifecycle = server.lock_turn_lifecycle("root").await;
             let route = server.subscribe("root").await.unwrap();
@@ -3942,7 +4041,41 @@ cat > /dev/null
         assert!(server.is_closed());
         assert!(server.routing.try_lock().unwrap().routes.is_empty());
         assert!(server.active_turns.try_lock().unwrap().is_empty());
-        futures::executor::block_on(close_signal.wait());
+        assert!(close_signal.is_closed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_shutdown_cannot_discard_transport_waiter_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-runtime-shutdown-cleanup");
+        std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (server, close_signal, mut request_rx) = runtime.block_on(async {
+            let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+            let route = server.subscribe("root").await.unwrap();
+            let close_signal = route.rx.close_signal();
+            let (request_tx, request_rx) = oneshot::channel();
+            server.pending.lock().await.insert(99, request_tx);
+            server.invalidate_transport_now();
+            (server, close_signal, request_rx)
+        });
+        drop(runtime);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !close_signal.is_closed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(close_signal.is_closed());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(server.is_closed());
     }
 
     #[tokio::test]

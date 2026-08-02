@@ -129,6 +129,11 @@ impl RouteOverload {
 }
 
 impl RouteClosed {
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
     pub(crate) async fn wait(&mut self) {
         loop {
             if *self.closed.borrow() {
