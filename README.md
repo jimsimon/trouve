@@ -72,6 +72,8 @@ trouve-search find-related src/auth.py 42 ./my-project
 trouve-search stats ./my-project        # index + cache-hit stats
 trouve-search savings                   # token savings report
 trouve-search clear all                 # wipe stores + savings
+trouve-search update --check            # check the stable release channel
+trouve-search update                    # verify and install the latest binary
 trouve-search                           # run as an MCP stdio server
 ```
 
@@ -89,6 +91,29 @@ case on Windows).
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+## Updates
+
+Release binaries use the shared repository version and self-update from the
+latest stable GitHub Release. By default, the desktop checks at startup,
+shows check/download/verification/installation progress before the main window,
+installs a newer verified release, and restarts into it. If the update fails,
+the startup window offers **Retry** and **Open trouve**. Disable the preflight
+with **Settings → General → Automatically download and install updates at
+startup**; the same screen retains manual check and install controls. While the
+main window is open, periodic checks never install or restart automatically. A
+detected release adds an **Update** indicator to the Settings row and waits for
+an explicit **Install and restart** click; ignoring it defers installation to
+the next normal launch.
+Long-running `trouve-server` and `trouve-search` processes verify and replace
+their on-disk binary in the background, then keep serving the current version
+until their next restart. Both CLIs also provide `update --check` and `update`.
+
+Every downloaded archive must match its exact entry in the release's
+`SHA256SUMS`; a failed check, download, extraction, or replacement leaves the
+installed binary untouched. Set `TROUVE_DISABLE_AUTO_UPDATE=1` to disable
+background checks without disabling manual updates. npm, Cargo, plugin, and
+container installations can still be updated by their package manager.
+
 ## Agent integrations
 
 There are three ways to wire trouve into a coding agent, plus the CLI as a
@@ -105,7 +130,7 @@ step-by-step instructions for every route and agent.
 | Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no | no |
 | Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | rich tool descriptions | tool descriptions | sub-agent docs |
 | Setup | one `plugin` entry in your config | managed by the plugin marketplace | copy one file | one config entry | nothing |
-| Updates | npm (`latest` or pinned) | marketplace update | re-copy the file | with the binary | with the binary |
+| Updates | self-update / npm (`latest` or pinned) | marketplace update | re-copy the file | self-update with the binary | self-update with the binary |
 
 Sharing requires unix domain sockets; on Windows each session runs its own
 server, as before.

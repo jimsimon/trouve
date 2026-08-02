@@ -12,6 +12,7 @@ anyhow.workspace = true
 axum.workspace = true
 base64 = "0.22.1"
 chrono.workspace = true
+clap.workspace = true
 futures.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -22,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 trouve-core.workspace = true
 trouve-protocol.workspace = true
+trouve-update.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 

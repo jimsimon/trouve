@@ -30,3 +30,7 @@ sequentially.
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
 | [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
+| [0021](0021-checksummed-self-updating-release-binaries.md) | Checksummed self-updating release binaries | Accepted |
+| [0022](0022-automatic-desktop-updates-at-startup.md) | Automatic desktop updates at startup | Accepted |
+| [0023](0023-pre-main-window-update-preflight.md) | Pre-main-window update preflight | Accepted |
+| [0024](0024-startup-only-automatic-desktop-installation.md) | Startup-only automatic desktop installation | Accepted |

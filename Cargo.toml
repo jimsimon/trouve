@@ -28,6 +28,7 @@ axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
+flate2 = "1"
 futures = "0.3"
 hmac = "0.12"
 hex = "0.4"
@@ -36,10 +37,13 @@ octocrab = "0.54"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "stream", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+semver = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 slint = "1.17"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.10"
+self-replace = "1.5.0"
+tar = "0.4"
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -49,6 +53,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["chrono"] }
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # Internal crates
 trouve-protocol = { path = "crates/trouve-protocol", version = "3.7.0" }
@@ -62,6 +67,7 @@ trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.
 trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.7.0" }
 trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.7.0" }
 trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.7.0" }
+trouve-update = { path = "crates/trouve-update", version = "3.7.0" }
 
 [profile.release]
 lto = "thin"

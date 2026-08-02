@@ -1826,6 +1826,20 @@ pub fn set_settings_status(ui: &Ui, text: String) {
         .upgrade_in_event_loop(move |ui| ui.set_settings_status(SharedString::from(text.as_str())));
 }
 
+pub fn set_app_update(ui: &Ui, status: String, action: String, busy: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_app_update_status(status.into());
+        ui.set_settings_app_update_action(action.into());
+        ui.set_settings_app_update_busy(busy);
+    });
+}
+
+pub fn set_app_update_available(ui: &Ui, available: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_app_update_available(available);
+    });
+}
+
 pub fn set_provider_login_prompt(ui: &Ui, provider_id: String, code_required: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_settings_login_provider_id(provider_id.into());

@@ -190,6 +190,10 @@ jobs:
       # softprops/action-gh-release uploads assets to the repository release.
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
@@ -221,6 +225,15 @@ jobs:
             fi
           ) | sort -k2 > "$checksum_file"
           mv "$checksum_file" artifacts/SHA256SUMS
+      - name: Verify self-update release contract
+        shell: bash
+        run: |
+          args=()
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            args+=(--allow-missing-search)
+          fi
+          python3 scripts/verify_release_assets.py \
+            artifacts/SHA256SUMS "$RELEASE_TAG" "${args[@]}"
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
@@ -407,8 +420,39 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish to crates.io
-        run: cargo publish --package trouve-search
+      - name: Publish crates.io packages
+        shell: bash
+        run: |
+          workspace_version="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")"
+          publish_if_missing() {
+            local crate="$1"
+            if curl --fail --silent --show-error \
+              --user-agent trouve-release-workflow \
+              "https://crates.io/api/v1/crates/${crate}/${workspace_version}" \
+              >/dev/null 2>&1; then
+              echo "${crate} ${workspace_version} is already published; skipping."
+              return
+            fi
+            cargo publish --locked --package "$crate"
+          }
+          publish_if_missing trouve-update
+
+          # trouve-search depends on the just-published support crate. Wait
+          # for crates.io's sparse index before asking Cargo to package it.
+          update_index="https://index.crates.io/tr/ou/trouve-update"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error \
+              --user-agent trouve-release-workflow "$update_index" \
+              | grep --fixed-strings "\"vers\":\"${workspace_version}\"" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "trouve-update ${workspace_version} did not reach the crates.io index" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          publish_if_missing trouve-search
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

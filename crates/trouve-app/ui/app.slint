@@ -22,6 +22,7 @@ import {
     PullRequestsScreen, PrGroupItem, PrReviewFindingItem, PrRowItem
 } from "pull-requests-screen.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
+import { StartupWindow } from "startup-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
@@ -34,6 +35,7 @@ export {
 }
 export { ThinkingItem }
 export { Theme, ThemePalette }
+export { StartupWindow }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
 export struct NavRow {
@@ -1618,6 +1620,11 @@ export component AppWindow inherits Window {
     in property <[ModeItem]> settings-mode-items;
     in property <[string]> settings-mode-model-names;
     in property <string> settings-status: "";
+    in property <string> settings-app-version: "";
+    in property <string> settings-app-update-status: "";
+    in property <string> settings-app-update-action: "";
+    in property <bool> settings-app-update-busy: false;
+    in property <bool> settings-app-update-available: false;
     in property <string> settings-login-provider-id: "";
     in property <bool> settings-login-code-required: false;
     in-out property <int> settings-preset-index: 0;
@@ -1677,11 +1684,14 @@ export component AppWindow inherits Window {
     callback cli-install(/* id */ string);
     callback cli-cancel(/* id */ string);
     callback cli-uninstall(/* id */ string);
+    callback app-update();
     callback close-settings();
 
     // General frontend behavior preferences (persisted in general.json).
     in-out property <bool> prevent-sleep-while-running: true;
     callback prevent-sleep-while-running-toggled(bool);
+    in-out property <bool> automatic-updates: true;
+    callback automatic-updates-toggled(bool);
 
     // Local (offline) models — state pushed by the controller, actions out.
     in property <[LocalModelItem]> local-models;
@@ -2363,7 +2373,12 @@ export component AppWindow inherits Window {
                     border-radius: 6px;
                     background: settings-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg;
                     settings-ta := TouchArea {
-                        clicked => { root.open-settings(); }
+                        clicked => {
+                            if root.settings-app-update-available {
+                                root.settings-section = SectionId.general;
+                            }
+                            root.open-settings();
+                        }
                     }
                     HorizontalLayout {
                         padding-left: 10px;
@@ -2384,6 +2399,22 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
+                        }
+                        if root.settings-app-update-available: Rectangle {
+                            width: Theme.fs(54px);
+                            height: Theme.fs(22px);
+                            border-radius: Theme.fs(11px);
+                            background: Theme.c.accent-bg;
+                            border-width: 1px;
+                            border-color: Theme.c.primary-border;
+                            Text {
+                                text: "Update";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(11px);
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
@@ -5654,6 +5685,10 @@ export component AppWindow inherits Window {
         mode-items: root.settings-mode-items;
         mode-model-names: root.settings-mode-model-names;
         settings-status: root.settings-status;
+        app-version: root.settings-app-version;
+        app-update-status: root.settings-app-update-status;
+        app-update-action: root.settings-app-update-action;
+        app-update-busy: root.settings-app-update-busy;
         login-provider-id: root.settings-login-provider-id;
         login-code-required: root.settings-login-code-required;
         preset-index <=> root.settings-preset-index;
@@ -5662,6 +5697,8 @@ export component AppWindow inherits Window {
         prevent-sleep-while-running-toggled(on) => {
             root.prevent-sleep-while-running-toggled(on);
         }
+        automatic-updates <=> root.automatic-updates;
+        automatic-updates-toggled(on) => { root.automatic-updates-toggled(on); }
         title-model-load-index <=> root.settings-title-model-load-index;
         title-model-resource-index <=> root.settings-title-model-resource-index;
         title-model-state: root.settings-title-model-state;
@@ -5730,6 +5767,7 @@ export component AppWindow inherits Window {
         cli-install(id) => { root.cli-install(id); }
         cli-cancel(id) => { root.cli-cancel(id); }
         cli-uninstall(id) => { root.cli-uninstall(id); }
+        app-update => { root.app-update(); }
         local-models: root.local-models;
         local-enabled: root.local-enabled;
         local-hw-line: root.local-hw-line;
