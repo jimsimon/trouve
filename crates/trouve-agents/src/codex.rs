@@ -912,6 +912,7 @@ type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routing = Arc<Mutex<RoutingState>>;
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
+const ROUTE_TOMBSTONE_BUDGET: usize = ROUTE_EVENT_BUDGET * 4;
 
 struct TurnLifecycleGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -982,12 +983,33 @@ struct RoutingState {
     routes: HashMap<String, ActiveRoute>,
     owners: HashMap<String, RouteOwner>,
     buffered: HashMap<String, BufferedRoute>,
-    failed: HashSet<String>,
+    /// Recently retired roots and children. This prevents late events from a
+    /// completed turn becoming pre-subscription buffers, while bounding state
+    /// retained for the app-server process lifetime.
+    failed: VecDeque<String>,
 }
 
 impl RoutingState {
+    fn is_failed(&self, thread_id: &str) -> bool {
+        self.failed.iter().any(|failed| failed == thread_id)
+    }
+
+    fn mark_failed(&mut self, thread_id: String) {
+        if self.is_failed(&thread_id) {
+            return;
+        }
+        self.failed.push_back(thread_id);
+        if self.failed.len() > ROUTE_TOMBSTONE_BUDGET {
+            self.failed.pop_front();
+        }
+    }
+
+    fn clear_failed(&mut self, thread_id: &str) {
+        self.failed.retain(|failed| failed != thread_id);
+    }
+
     fn buffer_message(&mut self, thread_id: String, message: ServerMsg) {
-        if thread_id.is_empty() || self.failed.contains(&thread_id) {
+        if thread_id.is_empty() || self.is_failed(&thread_id) {
             return;
         }
         let route = self.buffered.entry(thread_id).or_default();
@@ -1030,7 +1052,7 @@ impl RoutingState {
         for descendant in descendants {
             self.buffered.remove(&descendant);
             if mark_failed {
-                self.failed.insert(descendant);
+                self.mark_failed(descendant);
             }
         }
     }
@@ -1052,7 +1074,7 @@ impl RoutingState {
         self.clear_descendants(root_thread_id, mark_failed);
         self.buffered.remove(root_thread_id);
         if mark_failed {
-            self.failed.insert(root_thread_id.to_string());
+            self.mark_failed(root_thread_id.to_string());
         }
         true
     }
@@ -1119,8 +1141,8 @@ impl RoutingState {
             if forward {
                 match tx.try_send(message) {
                     Ok(()) => {
-                        self.failed.remove(&thread_id);
-                        self.failed.remove(&root_thread_id);
+                        self.clear_failed(&thread_id);
+                        self.clear_failed(&root_thread_id);
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1149,7 +1171,7 @@ impl RoutingState {
                             root_turn_id: root_turn_id.clone(),
                         },
                     );
-                    self.failed.remove(&child_thread_id);
+                    self.clear_failed(&child_thread_id);
                     if let Some(buffered_route) = self.buffered.remove(&child_thread_id) {
                         queue.extend(buffered_route.messages);
                         // Notification-only overflow is harmless for a child;
@@ -1170,7 +1192,7 @@ impl RoutingState {
     fn subscribe(&mut self, thread_id: &str, tx: RouteSender<ServerMsg>) {
         self.clear_descendants(thread_id, true);
         self.owners.remove(thread_id);
-        self.failed.remove(thread_id);
+        self.clear_failed(thread_id);
         self.routes
             .insert(thread_id.to_string(), ActiveRoute { tx, turn_id: None });
     }
@@ -1743,8 +1765,23 @@ mod tests {
         assert!(!routing.routes.contains_key("root"));
         assert!(!routing.owners.contains_key("child"));
         assert!(!routing.buffered.contains_key("child"));
-        assert!(routing.failed.contains("root"));
-        assert!(routing.failed.contains("child"));
+        assert!(routing.is_failed("root"));
+        assert!(routing.is_failed("child"));
+    }
+
+    #[test]
+    fn clean_route_teardown_keeps_tombstones_bounded() {
+        let mut routing = RoutingState::default();
+        for sequence in 0..=ROUTE_TOMBSTONE_BUDGET {
+            let thread_id = format!("root-{sequence}");
+            let (tx, _rx) = route_channel();
+            routing.subscribe(&thread_id, tx.clone());
+            assert!(routing.remove_route_if_same(&thread_id, &tx, true));
+        }
+
+        assert_eq!(routing.failed.len(), ROUTE_TOMBSTONE_BUDGET);
+        assert!(!routing.is_failed("root-0"));
+        assert!(routing.is_failed(&format!("root-{ROUTE_TOMBSTONE_BUDGET}")));
     }
 
     fn spawn_notification(root: &str, turn: &str, child: &str) -> ServerMsg {
