@@ -686,10 +686,10 @@ fn turn_stream(
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
+            _ = process_route => {}
             _ = close_signal.wait() => {
                 route_closed = true;
             }
-            _ = process_route => {}
         }
         let _cleanup_lifecycle = if turn_finished {
             None
@@ -1875,6 +1875,23 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<Child>>) {
     }
 }
 
+fn start_kill_child_now(child: &std::sync::Mutex<Child>) {
+    match child.try_lock() {
+        Ok(mut child) => {
+            if let Err(error) = child.start_kill() {
+                tracing::warn!("codex: failed to terminate unusable app-server: {error}");
+            }
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Another termination path owns the process lock and signals the
+            // child before waiting for it, so no duplicate action is needed.
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            tracing::warn!("codex: app-server process lock is poisoned");
+        }
+    }
+}
+
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
@@ -2041,6 +2058,10 @@ impl AppServer {
     fn invalidate_transport_now(&self) {
         self.closed.store(true, Ordering::Relaxed);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // `TransportWriteGuard::drop` may run during runtime shutdown. Send
+            // the kill signal synchronously so process termination does not
+            // depend on the spawned drain/reap task being polled.
+            start_kill_child_now(&self.child);
             runtime.spawn(terminate_transport_parts(
                 self.pending.clone(),
                 self.routing.clone(),
@@ -2054,7 +2075,12 @@ impl AppServer {
         // Outside a runtime there is nowhere to schedule async cleanup. Block
         // until every waiter is released and the subprocess is reaped.
         self.pending.blocking_lock().clear();
-        *self.routing.blocking_lock() = RoutingState::default();
+        let mut routing = self.routing.blocking_lock();
+        for route in routing.routes.values() {
+            route.tx.mark_closed();
+        }
+        *routing = RoutingState::default();
+        drop(routing);
         self.active_turns.blocking_lock().clear();
         kill_and_reap_child(self.child.clone());
     }
@@ -2336,10 +2362,10 @@ impl AppServer {
         }
         match tokio::time::timeout(INTERRUPT_RESPONSE_TIMEOUT, rx).await {
             Ok(Ok(Ok(_))) => Ok(()),
-            Ok(Ok(Err(error))) => {
-                self.terminate_transport().await;
-                Err(BackendError::Protocol(format!("turn/interrupt: {error}")))
-            }
+            // A well-formed application rejection leaves framing and every
+            // unrelated turn intact. Keep this turn's active marker so a
+            // replacement must retry interruption instead of merging prompts.
+            Ok(Ok(Err(error))) => Err(BackendError::Protocol(format!("turn/interrupt: {error}"))),
             Ok(Err(_)) => Err(BackendError::Protocol(
                 "turn/interrupt: app-server closed before responding".into(),
             )),
@@ -3772,6 +3798,9 @@ sleep 10
                 }),
             })
             .unwrap();
+        // EOF may be observed immediately after the terminal line. A queued
+        // completion must win over the transport-close signal.
+        route_tx.mark_closed();
 
         assert!(matches!(
             stream.next().await,
@@ -3890,10 +3919,11 @@ cat > /dev/null
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (cleanup, server) = runtime.block_on(async {
+        let (cleanup, server, mut close_signal) = runtime.block_on(async {
             let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
             let lifecycle = server.lock_turn_lifecycle("root").await;
             let route = server.subscribe("root").await.unwrap();
+            let close_signal = route.rx.close_signal();
             let (_response_tx, response_rx) = oneshot::channel();
             let cleanup = StartedTurnGuard::new(
                 server.clone(),
@@ -3904,7 +3934,7 @@ cat > /dev/null
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 lifecycle,
             );
-            (cleanup, server)
+            (cleanup, server, close_signal)
         });
         drop(runtime);
 
@@ -3912,6 +3942,7 @@ cat > /dev/null
         assert!(server.is_closed());
         assert!(server.routing.try_lock().unwrap().routes.is_empty());
         assert!(server.active_turns.try_lock().unwrap().is_empty());
+        futures::executor::block_on(close_signal.wait());
     }
 
     #[tokio::test]

@@ -1284,18 +1284,19 @@ cat > /dev/null
     assert_eq!(interrupt["method"], "turn/interrupt");
     assert_eq!(interrupt["params"]["turnId"], "turn-1");
 
-    let first_error = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let first_completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match first.next().await {
-                Some(Err(error)) => break error.to_string(),
+                Some(Ok(BackendEvent::Completed { .. })) => break true,
                 Some(Ok(_)) => {}
-                None => panic!("predecessor must report the failed transport"),
+                Some(Err(error)) => panic!("interrupt rejection killed the transport: {error}"),
+                None => break false,
             }
         }
     })
     .await
-    .expect("transport termination must wake the predecessor stream");
-    assert!(first_error.contains("app-server closed"), "{first_error}");
+    .expect("the predecessor completion must remain routable");
+    assert!(first_completed);
 }
 
 #[tokio::test]
