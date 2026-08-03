@@ -146,8 +146,10 @@ pub use requests::*;
 // open long chats without replaying retained history from cursor zero.
 // 2.4: thread-view snapshots expose bounded folded-item pages and backward
 // pagination metadata so clients never render the complete transcript eagerly.
-pub const PROTOCOL_VERSION: &str = "2.4";
+// 2.5: oversized session diffs return a stable machine-readable error code.
+pub const PROTOCOL_VERSION: &str = "2.5";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
+pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

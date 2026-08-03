@@ -3,7 +3,8 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
-use std::io::Read;
+use std::fmt;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -20,6 +21,21 @@ const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
 const MAX_SESSION_DIFF_FILES: usize = 250;
 const MAX_SESSION_DIFF_CHANGED_LINES: u64 = 20_000;
 const MAX_SESSION_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct SessionDiffTooLarge(String);
+
+impl fmt::Display for SessionDiffTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionDiffTooLarge {}
+
+fn session_diff_too_large(message: String) -> anyhow::Error {
+    SessionDiffTooLarge(message).into()
+}
 
 struct TemporaryCheckpointIndex {
     path: PathBuf,
@@ -66,6 +82,119 @@ fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn spawn_git_with_piped_output(dir: &Path, args: &[&str]) -> Result<Child> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))
+}
+
+fn finish_streamed_git(
+    dir: &Path,
+    args: &[&str],
+    mut child: Child,
+    stderr_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<()> {
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for git {args:?} in {}", dir.display()))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stderr reader panicked"))??;
+    if !status.success() {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_diff_numstat(dir: &Path, base_ref: &str) -> Result<()> {
+    let args = ["diff", "--numstat", "--end-of-options", base_ref];
+    let mut child = spawn_git_with_piped_output(dir, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut reader = BufReader::new(stdout).take(MAX_SESSION_DIFF_BYTES as u64 + 1);
+    let mut line = Vec::new();
+    let mut bytes = 0usize;
+    let mut files = 0usize;
+    let mut changed_lines = 0u64;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("reading git diff --numstat")?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read);
+        let text = String::from_utf8_lossy(&line);
+        let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
+        let added = fields.next().unwrap_or_default();
+        let deleted = fields.next().unwrap_or_default();
+        if fields.next().is_some() {
+            files = files.saturating_add(1);
+            // Binary diffs use "-" counts and normally render as one short
+            // marker, so only textual line counts contribute to the budget.
+            if let (Ok(added), Ok(deleted)) = (added.parse::<u64>(), deleted.parse::<u64>()) {
+                changed_lines = changed_lines.saturating_add(added.saturating_add(deleted));
+            }
+        }
+        if bytes > MAX_SESSION_DIFF_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(session_diff_too_large(format!(
+                "session diff metadata is too large to render (more than \
+                 {MAX_SESSION_DIFF_BYTES} bytes)"
+            )));
+        }
+        if files > MAX_SESSION_DIFF_FILES || changed_lines > MAX_SESSION_DIFF_CHANGED_LINES {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(session_diff_too_large(format!(
+                "session diff is too large to render ({files} files, \
+                 {changed_lines} changed lines; limit is {MAX_SESSION_DIFF_FILES} files or \
+                 {MAX_SESSION_DIFF_CHANGED_LINES} changed lines)"
+            )));
+        }
+    }
+    finish_streamed_git(dir, &args, child, stderr_reader)
+}
+
+fn bounded_session_diff(dir: &Path, base_ref: &str) -> Result<String> {
+    let args = ["diff", "--end-of-options", base_ref];
+    let mut child = spawn_git_with_piped_output(dir, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut bytes = Vec::with_capacity(MAX_SESSION_DIFF_BYTES.min(64 * 1024));
+    stdout
+        .take(MAX_SESSION_DIFF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("reading bounded git diff")?;
+    if bytes.len() > MAX_SESSION_DIFF_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(session_diff_too_large(format!(
+            "session diff is too large to render (more than {MAX_SESSION_DIFF_BYTES} bytes)"
+        )));
+    }
+    finish_streamed_git(dir, &args, child, stderr_reader)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
 fn git_with_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
@@ -396,41 +525,8 @@ pub fn restore(worktree: &Path, commit: &str) -> Result<()> {
 /// state (includes uncommitted changes — checkpoints live on hidden refs).
 pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
     ensure_safe_ref(base_ref)?;
-    let numstat = git_untrimmed(
-        worktree,
-        &["diff", "--numstat", "--end-of-options", base_ref],
-    )?;
-    let mut files = 0usize;
-    let mut changed_lines = 0u64;
-    for line in numstat.lines() {
-        let mut fields = line.splitn(3, '\t');
-        let added = fields.next().unwrap_or_default();
-        let deleted = fields.next().unwrap_or_default();
-        if fields.next().is_none() {
-            continue;
-        }
-        files = files.saturating_add(1);
-        // Binary diffs use "-" counts and normally render as one short
-        // marker, so only textual line counts contribute to the budget.
-        if let (Ok(added), Ok(deleted)) = (added.parse::<u64>(), deleted.parse::<u64>()) {
-            changed_lines = changed_lines.saturating_add(added.saturating_add(deleted));
-        }
-        if files > MAX_SESSION_DIFF_FILES || changed_lines > MAX_SESSION_DIFF_CHANGED_LINES {
-            bail!(
-                "session diff is too large to render ({files} files, \
-                 {changed_lines} changed lines; limit is {MAX_SESSION_DIFF_FILES} files or \
-                 {MAX_SESSION_DIFF_CHANGED_LINES} changed lines)"
-            );
-        }
-    }
-    let diff = git(worktree, &["diff", "--end-of-options", base_ref])?;
-    if diff.len() > MAX_SESSION_DIFF_BYTES {
-        bail!(
-            "session diff is too large to render ({} bytes; limit is {MAX_SESSION_DIFF_BYTES})",
-            diff.len()
-        );
-    }
-    Ok(diff)
+    validate_session_diff_numstat(worktree, base_ref)?;
+    bounded_session_diff(worktree, base_ref)
 }
 
 /// Every changed path in git's deterministic diff order. NUL framing keeps
@@ -664,6 +760,39 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), content).unwrap();
 
         let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn session_diff_rejects_too_many_changed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        for index in 0..=MAX_SESSION_DIFF_FILES {
+            std::fs::write(tmp.path().join(format!("file-{index}.txt")), "before\n").unwrap();
+        }
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "add files"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        for index in 0..=MAX_SESSION_DIFF_FILES {
+            std::fs::write(tmp.path().join(format!("file-{index}.txt")), "after\n").unwrap();
+        }
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn session_diff_rejects_too_many_rendered_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let content = format!("{}\n", "x".repeat(MAX_SESSION_DIFF_BYTES + 1));
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
     }
 

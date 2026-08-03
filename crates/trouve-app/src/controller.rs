@@ -12,13 +12,13 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use trouve_client_core::client::ProtocolClient;
+use trouve_client_core::client::{ProtocolClient, ProtocolResponseError};
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
-    UpsertProviderRequest, Workspace,
+    CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE, EventEnvelope, ModelInfo,
+    PermissionMode, Session, Thread, TodoStatus, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -50,7 +50,6 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const CHAT_WINDOW_ROWS: usize = 160;
 /// Refill history before the reader lands exactly on the first loaded row.
 const CHAT_HISTORY_REFILL_ROWS: usize = 20;
-const OVERSIZED_DIFF_MARKER: &str = "session diff is too large to render";
 /// Fold persisted thread history only after its SSE replay has gone quiet.
 ///
 /// The server sends replay in bounded pages. Flushing on a fixed timer from
@@ -3356,7 +3355,11 @@ impl Controller {
         }
         let diff = match self.client.session_diff(&session_id).await {
             Ok(diff) => diff,
-            Err(error) if format!("{error:#}").contains(OVERSIZED_DIFF_MARKER) => {
+            Err(error)
+                if error
+                    .downcast_ref::<ProtocolResponseError>()
+                    .is_some_and(|error| error.code == ERROR_CODE_SESSION_DIFF_TOO_LARGE) =>
+            {
                 self.diff_blocked_session = Some(session_id);
                 self.diff_files.clear();
                 self.diff_collapsed.clear();
