@@ -15,6 +15,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
 const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
+// The desktop diff view eagerly parses and materializes every returned row.
+// Bound all three independent growth dimensions before crossing the protocol.
+const MAX_SESSION_DIFF_FILES: usize = 250;
+const MAX_SESSION_DIFF_CHANGED_LINES: u64 = 20_000;
+const MAX_SESSION_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
 struct TemporaryCheckpointIndex {
     path: PathBuf,
@@ -391,7 +396,41 @@ pub fn restore(worktree: &Path, commit: &str) -> Result<()> {
 /// state (includes uncommitted changes — checkpoints live on hidden refs).
 pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
     ensure_safe_ref(base_ref)?;
-    git(worktree, &["diff", "--end-of-options", base_ref])
+    let numstat = git_untrimmed(
+        worktree,
+        &["diff", "--numstat", "--end-of-options", base_ref],
+    )?;
+    let mut files = 0usize;
+    let mut changed_lines = 0u64;
+    for line in numstat.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let added = fields.next().unwrap_or_default();
+        let deleted = fields.next().unwrap_or_default();
+        if fields.next().is_none() {
+            continue;
+        }
+        files = files.saturating_add(1);
+        // Binary diffs use "-" counts and normally render as one short
+        // marker, so only textual line counts contribute to the budget.
+        if let (Ok(added), Ok(deleted)) = (added.parse::<u64>(), deleted.parse::<u64>()) {
+            changed_lines = changed_lines.saturating_add(added.saturating_add(deleted));
+        }
+        if files > MAX_SESSION_DIFF_FILES || changed_lines > MAX_SESSION_DIFF_CHANGED_LINES {
+            bail!(
+                "session diff is too large to render ({files} files, \
+                 {changed_lines} changed lines; limit is {MAX_SESSION_DIFF_FILES} files or \
+                 {MAX_SESSION_DIFF_CHANGED_LINES} changed lines)"
+            );
+        }
+    }
+    let diff = git(worktree, &["diff", "--end-of-options", base_ref])?;
+    if diff.len() > MAX_SESSION_DIFF_BYTES {
+        bail!(
+            "session diff is too large to render ({} bytes; limit is {MAX_SESSION_DIFF_BYTES})",
+            diff.len()
+        );
+    }
+    Ok(diff)
 }
 
 /// Every changed path in git's deterministic diff order. NUL framing keeps
@@ -604,6 +643,9 @@ mod tests {
         std::fs::write(tmp.path().join("space name.txt"), "added\n").unwrap();
         run(tmp.path(), &["add", "-A"]);
 
+        let full = session_diff(tmp.path(), &base).unwrap();
+        assert!(full.contains("+two"));
+        assert!(full.contains("+added"));
         let files = session_diff_files(tmp.path(), &base).unwrap();
         assert_eq!(files, ["a.txt", "space name.txt"]);
         let first = session_diff_path(tmp.path(), &base, &files[0]).unwrap();
@@ -611,6 +653,18 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn session_diff_rejects_changes_too_large_for_the_ui() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let content = "changed\n".repeat(MAX_SESSION_DIFF_CHANGED_LINES as usize + 1);
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.to_string().contains("too large to render"));
     }
 
     #[test]

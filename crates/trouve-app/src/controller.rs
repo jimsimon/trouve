@@ -50,6 +50,7 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const CHAT_WINDOW_ROWS: usize = 160;
 /// Refill history before the reader lands exactly on the first loaded row.
 const CHAT_HISTORY_REFILL_ROWS: usize = 20;
+const OVERSIZED_DIFF_MARKER: &str = "session diff is too large to render";
 /// Fold persisted thread history only after its SSE replay has gone quiet.
 ///
 /// The server sends replay in bounded pages. Flushing on a fixed timer from
@@ -1125,6 +1126,8 @@ struct Controller {
     diff_files: Vec<trouve_slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
+    /// A pathological diff is not polled again until the session is reopened.
+    diff_blocked_session: Option<String>,
     /// Files tab tree: directory listings cached by worktree-relative path
     /// ("." for the root), fetched lazily as folders are expanded.
     file_children: HashMap<String, Vec<DirEntry>>,
@@ -1310,6 +1313,7 @@ pub async fn run(
         diff_files: Vec::new(),
         diff_collapsed: Vec::new(),
         diff_raw: String::new(),
+        diff_blocked_session: None,
         file_children: HashMap::new(),
         file_expanded: HashSet::new(),
         file_rows: Vec::new(),
@@ -2332,6 +2336,7 @@ impl Controller {
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
+        self.diff_blocked_session = None;
         self.threads = self.client.list_threads(&session_id).await?;
         for t in &self.threads {
             self.thread_sessions
@@ -3346,7 +3351,25 @@ impl Controller {
         let Some(session_id) = self.current_session_id() else {
             return Ok(());
         };
-        let diff = self.client.session_diff(&session_id).await?;
+        if self.diff_blocked_session.as_deref() == Some(&session_id) {
+            return Ok(());
+        }
+        let diff = match self.client.session_diff(&session_id).await {
+            Ok(diff) => diff,
+            Err(error) if format!("{error:#}").contains(OVERSIZED_DIFF_MARKER) => {
+                self.diff_blocked_session = Some(session_id);
+                self.diff_files.clear();
+                self.diff_collapsed.clear();
+                self.diff_raw.clear();
+                self.push_diff();
+                self.error(
+                    "This session's change set is too large for the Changes panel. \
+                     The chat and Files panel remain available.",
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if diff.diff == self.diff_raw {
             return Ok(());
         }
