@@ -39,6 +39,10 @@ const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REVIEW_THREAD_MAX_PAGES: usize = 10;
+const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(305);
+const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -281,6 +285,10 @@ impl CodeReviewRuntime {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         locks.insert(key, Arc::downgrade(&lock));
         lock
+    }
+
+    fn publication_lock(&self, repository: &str, pull_number: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.projection_lock(format!("publication:{repository}#{pull_number}"))
     }
 
     fn cancel_superseded(&self, job_ids: &[String]) {
@@ -635,6 +643,11 @@ struct PublishedReview {
     html_url: String,
 }
 
+struct GithubReviewBodies {
+    primary: String,
+    without_inline_comments: String,
+}
+
 #[derive(Deserialize)]
 struct PublishedIssueComment {
     id: u64,
@@ -829,6 +842,8 @@ impl GithubApi {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent("trouve-code-review")
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(GITHUB_REQUEST_TIMEOUT)
                 .build()?,
             authorization,
             base_url: base_url.into(),
@@ -2580,6 +2595,28 @@ impl Engine {
                     "processing pull request {}#{} failed: {error:#}",
                     repository.repository, pull_number
                 ));
+            } else {
+                let reconciliation = tokio::time::timeout(
+                    REVIEW_RECONCILIATION_TIMEOUT,
+                    self.reconcile_user_resolved_review_findings(
+                        &api,
+                        repository,
+                        &reviewers,
+                        &config_hash,
+                        &pull,
+                    ),
+                )
+                .await;
+                if let Err(error) = reconciliation
+                    .map_err(|_| anyhow!("review-thread reconciliation timed out"))
+                    .and_then(|result| result)
+                {
+                    had_errors = true;
+                    self.record_review_error(format!(
+                        "reconciling resolved review findings for {}#{} failed: {error:#}",
+                        repository.repository, pull_number
+                    ));
+                }
             }
         }
         // A request can race with a PR being closed. Once the complete open-PR
@@ -3537,6 +3574,11 @@ impl Engine {
         )?;
 
         let publication_started = Instant::now();
+        let publication_lock = self
+            .code_review
+            .publication_lock(&job.repository, job.pull_number);
+        let _publication_guard = publication_lock.lock().await;
+        ensure_review_current(superseded)?;
         // Reviewer and coordinator work can outlive the installation token
         // used during preparation. Rebuild the client here so the token cache
         // can refresh a token that is expired or within its five-minute
@@ -3545,11 +3587,9 @@ impl Engine {
             .installation_api(job.installation_id)
             .await
             .context("refreshing GitHub App credentials before publication")?;
+        let pull_path = format!("/repos/{}/pulls/{}", job.repository, job.pull_number);
         let (current, rate): (GithubPullRequest, _) = api
-            .get_cached(
-                &format!("/repos/{}/pulls/{}", job.repository, job.pull_number),
-                &self.code_review.rest_cache,
-            )
+            .get(&pull_path)
             .await
             .context("revalidating pull request before publication")?;
         self.record_review_rate(rate);
@@ -3560,7 +3600,7 @@ impl Engine {
             bail!("stale: pull request revision changed before the review was published");
         }
         if !self.store.claim_code_review_publication(&job.id)? {
-            bail!("stale: review was cancelled before publication");
+            bail!("stale: review was cancelled or replaced before publication");
         }
         let candidate_count = candidates.len() as u64;
         let stored_findings = parsed
@@ -3603,8 +3643,42 @@ impl Engine {
             &stored_findings,
             &candidate_rejections,
         )?;
+        ensure_review_current(superseded)?;
+        let (current, rate): (GithubPullRequest, _) = api
+            .get(&pull_path)
+            .await
+            .context("revalidating pull request before publication")?;
+        self.record_review_rate(rate);
+        if current.state != "open"
+            || current.base.sha != job.base_ref
+            || current.head.sha != job.head_sha
+        {
+            bail!("stale: pull request revision changed before the review was published");
+        }
+        ensure_review_current(superseded)?;
+        let previous_finding_ids = previous_findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        let resolved_finding_ids = parsed
+            .resolved_finding_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let has_unresolved_findings = review_has_unresolved_findings(
+            persisted.len(),
+            &previous_finding_ids,
+            &resolved_finding_ids,
+        );
         let review_url = self
-            .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
+            .publish_review(
+                &api,
+                &job,
+                &parsed.summary,
+                &prompt_for_agents,
+                &persisted,
+                has_unresolved_findings,
+            )
             .await
             .context("publishing GitHub pull request review")?;
         let fixed = self
@@ -3618,12 +3692,6 @@ impl Engine {
             .context("resolving previously reported GitHub review findings")?;
         self.store
             .set_code_review_job_fixed_issue_count(&job.id, fixed)?;
-        self.store.mark_code_review_published(
-            &job.repository,
-            job.pull_number,
-            &job.base_ref,
-            &job.head_sha,
-        )?;
         self.store.set_code_review_job_phase_elapsed(
             &job.id,
             CodeReviewJobPhase::Publication,
@@ -4094,6 +4162,7 @@ impl Engine {
         summary: &str,
         prompt_for_agents: &str,
         findings: &[trouve_protocol::CodeReviewFinding],
+        has_unresolved_findings: bool,
     ) -> Result<String> {
         let summary = if summary.trim().is_empty() {
             if findings.is_empty() {
@@ -4126,35 +4195,8 @@ impl Engine {
             "/repos/{}/pulls/{}/reviews",
             job.repository, job.pull_number
         );
-        let request = serde_json::json!({
-            "commit_id": job.head_sha,
-            "body": review_body,
-            "event": "COMMENT",
-            "comments": comments,
-        });
-        let response = api
-            .request(reqwest::Method::POST, &path)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        let rate = rate_info(response.headers());
-        let body = response.text().await?;
-        self.record_review_rate(rate);
-        if status.is_success() {
-            let published = serde_json::from_str::<PublishedReview>(&body)?;
-            self.capture_published_review_comments(api, job, published.id, findings)
-                .await?;
-            return Ok(published.html_url);
-        }
-        if status.as_u16() != 422 || comments.is_empty() {
-            bail!("GitHub API {status}: {}", compact_api_error(&body));
-        }
-
-        // A model can name a line that is not commentable in GitHub's diff.
-        // Preserve the review instead of failing it: fold findings into the
-        // summary and retry without inline comments.
-        let mut fallback = review_body;
+        let event = github_review_event(has_unresolved_findings);
+        let mut fallback = review_body.clone();
         fallback.push_str("\n\n### Inline comments that GitHub could not place\n\n");
         for finding in findings {
             fallback.push_str(&format!(
@@ -4165,18 +4207,84 @@ impl Engine {
                 finding.body
             ));
         }
-        let (published, rate): (PublishedReview, _) = api
-            .post(
+        let (published, comments_published) = self
+            .submit_github_review(
+                api,
                 &path,
-                &serde_json::json!({
-                    "commit_id": job.head_sha,
-                    "body": fallback,
-                    "event": "COMMENT",
-                }),
+                &job.head_sha,
+                GithubReviewBodies {
+                    primary: review_body,
+                    without_inline_comments: fallback,
+                },
+                event,
+                &comments,
             )
             .await?;
-        self.record_review_rate(rate);
+        self.store.record_code_review_publication(
+            &job.id,
+            &job.repository,
+            job.pull_number,
+            &job.base_ref,
+            &job.head_sha,
+            &published.html_url,
+        )?;
+        if comments_published {
+            self.capture_published_review_comments(api, job, published.id, findings)
+                .await?;
+        }
         Ok(published.html_url)
+    }
+
+    async fn submit_github_review(
+        &self,
+        api: &GithubApi,
+        path: &str,
+        commit_id: &str,
+        bodies: GithubReviewBodies,
+        requested_event: &str,
+        comments: &[serde_json::Value],
+    ) -> Result<(PublishedReview, bool)> {
+        let mut body = bodies.primary;
+        let mut event = requested_event;
+        let mut include_comments = !comments.is_empty();
+        loop {
+            let request = serde_json::json!({
+                "commit_id": commit_id,
+                "body": body,
+                "event": event,
+                "comments": if include_comments { comments } else { &[] },
+            });
+            let response = api
+                .request(reqwest::Method::POST, path)
+                .json(&request)
+                .send()
+                .await?;
+            let status = response.status();
+            let rate = rate_info(response.headers());
+            let response_body = response.text().await?;
+            self.record_review_rate(rate);
+            if status.is_success() {
+                return Ok((
+                    serde_json::from_str::<PublishedReview>(&response_body)?,
+                    include_comments,
+                ));
+            }
+            if status.as_u16() != 422 {
+                bail!("GitHub API {status}: {}", compact_api_error(&response_body));
+            }
+            if github_review_should_fallback_to_comment(event, &response_body) {
+                event = "COMMENT";
+                continue;
+            }
+            if include_comments {
+                // A model can name a line that is not commentable in GitHub's
+                // diff. Preserve the review by folding findings into its body.
+                include_comments = false;
+                body = bodies.without_inline_comments.clone();
+                continue;
+            }
+            bail!("GitHub API {status}: {}", compact_api_error(&response_body));
+        }
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -4459,6 +4567,239 @@ impl Engine {
         Ok(ids)
     }
 
+    async fn load_review_threads(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<HashMap<u64, (String, bool)>> {
+        let query = r#"
+          query ReviewThreads(
+            $owner: String!, $name: String!, $number: Int!, $after: String
+          ) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                reviewThreads(first: 100, after: $after) {
+                  nodes {
+                    id
+                    isResolved
+                    comments(first: 50) { nodes { databaseId } }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+          }
+        "#;
+        let (owner, name) = repository
+            .split_once('/')
+            .ok_or_else(|| anyhow!("invalid repository"))?;
+        let mut after: Option<String> = None;
+        let mut threads = HashMap::new();
+        for page in 0..REVIEW_THREAD_MAX_PAGES {
+            let (response, rate): (serde_json::Value, _) = api
+                .post(
+                    "/graphql",
+                    &serde_json::json!({
+                        "query": query,
+                        "variables": {
+                            "owner": owner,
+                            "name": name,
+                            "number": pull_number,
+                            "after": after,
+                        }
+                    }),
+                )
+                .await?;
+            self.record_review_rate(rate);
+            if response["errors"].is_array() {
+                bail!("GitHub GraphQL error while loading review threads");
+            }
+            threads.extend(review_threads_by_comment(&response));
+            let page_info =
+                &response["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"];
+            if !page_info["hasNextPage"].as_bool().unwrap_or(false) {
+                return Ok(threads);
+            }
+            if page + 1 == REVIEW_THREAD_MAX_PAGES {
+                bail!("GitHub review-thread pagination exceeded the page limit");
+            }
+            let cursor = page_info["endCursor"]
+                .as_str()
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or_else(|| anyhow!("GitHub review-thread page omitted its end cursor"))?;
+            if after.as_deref() == Some(cursor) {
+                bail!("GitHub review-thread pagination cursor did not advance");
+            }
+            after = Some(cursor.to_owned());
+        }
+        unreachable!("review-thread pagination always returns or errors")
+    }
+
+    async fn reconcile_user_resolved_review_findings(
+        &self,
+        api: &GithubApi,
+        repository: &CodeReviewRepository,
+        reviewers: &[ReviewerProfile],
+        config_hash: &str,
+        pull: &GithubPullRequest,
+    ) -> Result<()> {
+        let pull_state = self
+            .store
+            .code_review_pull_state(&repository.repository, pull.number)?;
+        if pull_state.last_reviewed_head_sha != pull.head.sha
+            || self.store.code_review_pull_has_active_job(
+                &repository.repository,
+                pull.number,
+                &pull.head.sha,
+            )?
+        {
+            return Ok(());
+        }
+        let initial_findings = self
+            .store
+            .reconcilable_code_review_findings(&repository.repository, pull.number)?;
+        if initial_findings.is_empty()
+            || initial_findings
+                .iter()
+                .all(|state| state.finding.github_comment_id.is_none())
+        {
+            return Ok(());
+        }
+        let thread_by_comment = self
+            .load_review_threads(api, &repository.repository, pull.number)
+            .await?;
+        let publication_lock = self
+            .code_review
+            .publication_lock(&repository.repository, pull.number);
+        let Ok(publication_guard) = publication_lock.try_lock() else {
+            return Ok(());
+        };
+        let pull_state = self
+            .store
+            .code_review_pull_state(&repository.repository, pull.number)?;
+        if pull_state.last_reviewed_head_sha != pull.head.sha
+            || self.store.code_review_pull_has_active_job(
+                &repository.repository,
+                pull.number,
+                &pull.head.sha,
+            )?
+        {
+            return Ok(());
+        }
+
+        let findings = self
+            .store
+            .reconcilable_code_review_findings(&repository.repository, pull.number)?;
+        let initial_ids = initial_findings
+            .iter()
+            .map(|state| {
+                (
+                    &state.finding.id,
+                    state.finding.github_comment_id,
+                    state.is_resolved,
+                    state.generation,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let current_ids = findings
+            .iter()
+            .map(|state| {
+                (
+                    &state.finding.id,
+                    state.finding.github_comment_id,
+                    state.is_resolved,
+                    state.generation,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if initial_ids != current_ids {
+            return Ok(());
+        }
+
+        let mut changed_jobs = HashSet::new();
+        let mut reopened = false;
+        let mut state_key = Vec::new();
+        let mut all_resolved = true;
+        for state in &findings {
+            let Some(comment_id) = state.finding.github_comment_id else {
+                all_resolved = false;
+                continue;
+            };
+            let Some((thread_id, is_resolved)) = thread_by_comment.get(&comment_id) else {
+                all_resolved = false;
+                continue;
+            };
+            let was_resolved =
+                state.is_resolved == Some(true) || state.finding.status == "dismissed";
+            reopened |= state.recheck_pending;
+            let (changed, generation) = self.store.record_code_review_thread_state(
+                &state.finding.id,
+                thread_id,
+                *is_resolved,
+            )?;
+            if changed {
+                changed_jobs.insert(state.finding.job_id.clone());
+                reopened |= was_resolved && !is_resolved;
+            }
+            all_resolved &= *is_resolved;
+            state_key.push((state.finding.id.clone(), generation, *is_resolved));
+        }
+        for job_id in &changed_jobs {
+            self.emit_code_review_updated(Some(job_id.clone()))?;
+        }
+
+        state_key.sort_unstable();
+        let state_fingerprint = serde_json::to_vec(&state_key)?;
+        let state_hash = format!("{:x}", Sha256::digest(state_fingerprint));
+        let finding_ids = state_key
+            .iter()
+            .map(|(finding_id, _, _)| finding_id.as_str())
+            .collect::<Vec<_>>();
+        let new_job = NewCodeReviewJob {
+            dedupe_key: format!(
+                "{}#{}:{}:{}:thread-recheck:{config_hash}",
+                repository.repository, pull.number, pull.base.sha, pull.head.sha
+            ),
+            installation_id: repository.installation_id,
+            repository: repository.repository.clone(),
+            pull_number: pull.number,
+            pull_title: pull.title.clone(),
+            pull_url: pull.html_url.clone(),
+            head_sha: pull.head.sha.clone(),
+            review_base_sha: pull.base.sha.clone(),
+            base_ref: pull.base.sha.clone(),
+            head_ref: pull.head.name.clone(),
+            scope: trouve_protocol::CodeReviewJobScope::Full,
+            trigger: "thread-recheck".into(),
+            retry_of: None,
+            model: repository.model.clone(),
+            coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
+            router_model: repository.router_model.clone(),
+            router_thinking_level: repository.router_thinking_level.clone(),
+            prompt: repository.prompt.clone(),
+            reviewers: reviewers.to_vec(),
+            routing_mode: repository.routing_mode,
+            semantic_routing: repository.semantic_routing,
+            included_reviewer_ids: repository.included_reviewer_ids.clone(),
+            excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
+            config_hash: config_hash.to_owned(),
+        };
+        let job = self.store.enqueue_code_review_thread_recheck(
+            &new_job,
+            &state_hash,
+            &finding_ids,
+            (!state_key.is_empty() && all_resolved) || reopened,
+            MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
+        )?;
+        drop(publication_guard);
+        if let Some(job) = job {
+            self.emit_code_review_updated(Some(job.id.clone()))?;
+            self.code_review.job_wake.notify_one();
+        }
+        Ok(())
+    }
+
     async fn resolve_fixed_review_findings(
         &self,
         api: &GithubApi,
@@ -4469,58 +4810,9 @@ impl Engine {
         if resolved_ids.is_empty() {
             return Ok(0);
         }
-        let query = r#"
-          query ReviewThreads($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                reviewThreads(first: 100) {
-                  nodes {
-                    id
-                    isResolved
-                    comments(first: 50) { nodes { databaseId } }
-                  }
-                }
-              }
-            }
-          }
-        "#;
-        let (owner, name) = job
-            .repository
-            .split_once('/')
-            .ok_or_else(|| anyhow!("invalid repository"))?;
-        let (response, rate): (serde_json::Value, _) = api
-            .post(
-                "/graphql",
-                &serde_json::json!({
-                    "query": query,
-                    "variables": {
-                        "owner": owner,
-                        "name": name,
-                        "number": job.pull_number,
-                    }
-                }),
-            )
+        let thread_by_comment = self
+            .load_review_threads(api, &job.repository, job.pull_number)
             .await?;
-        self.record_review_rate(rate);
-        if response["errors"].is_array() {
-            bail!("GitHub GraphQL error while loading review threads");
-        }
-        let threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let mut thread_by_comment = HashMap::new();
-        for thread in threads {
-            let Some(thread_id) = thread["id"].as_str() else {
-                continue;
-            };
-            let resolved = thread["isResolved"].as_bool().unwrap_or(false);
-            for comment in thread["comments"]["nodes"].as_array().into_iter().flatten() {
-                if let Some(comment_id) = comment["databaseId"].as_u64() {
-                    thread_by_comment.insert(comment_id, (thread_id.to_owned(), resolved));
-                }
-            }
-        }
         let mut fixed = 0_u64;
         for finding in previous_findings {
             if !resolved_ids.contains(&finding.id) {
@@ -4606,6 +4898,55 @@ impl Engine {
 
 fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bool>) -> bool {
     status == "failed" && finish_transition != Some(false)
+}
+
+fn github_review_event(has_findings: bool) -> &'static str {
+    if has_findings {
+        "REQUEST_CHANGES"
+    } else {
+        "APPROVE"
+    }
+}
+
+fn review_has_unresolved_findings(
+    current_finding_count: usize,
+    previous_finding_ids: &[&str],
+    resolved_finding_ids: &[&str],
+) -> bool {
+    current_finding_count > 0
+        || previous_finding_ids
+            .iter()
+            .any(|id| !resolved_finding_ids.contains(id))
+}
+
+fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
+    let body = response_body.to_ascii_lowercase();
+    body.contains("own pull request")
+        && (body.contains("approve") || body.contains("request changes"))
+}
+
+fn github_review_should_fallback_to_comment(event: &str, response_body: &str) -> bool {
+    event != "COMMENT" && github_rejected_own_pull_verdict(response_body)
+}
+
+fn review_threads_by_comment(response: &serde_json::Value) -> HashMap<u64, (String, bool)> {
+    let threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut thread_by_comment = HashMap::new();
+    for thread in threads {
+        let Some(thread_id) = thread["id"].as_str() else {
+            continue;
+        };
+        let resolved = thread["isResolved"].as_bool().unwrap_or(false);
+        for comment in thread["comments"]["nodes"].as_array().into_iter().flatten() {
+            if let Some(comment_id) = comment["databaseId"].as_u64() {
+                thread_by_comment.insert(comment_id, (thread_id.to_owned(), resolved));
+            }
+        }
+    }
+    thread_by_comment
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -6018,6 +6359,501 @@ fn merge_review_task_metrics(
 mod tests {
     use super::*;
 
+    #[test]
+    fn github_review_verdict_matches_confirmed_findings() {
+        assert_eq!(github_review_event(false), "APPROVE");
+        assert_eq!(github_review_event(true), "REQUEST_CHANGES");
+    }
+
+    #[test]
+    fn github_review_verdict_keeps_unresolved_previous_findings_open() {
+        assert!(review_has_unresolved_findings(1, &[], &[]));
+        assert!(review_has_unresolved_findings(0, &["old"], &[]));
+        assert!(!review_has_unresolved_findings(0, &["old"], &["old"]));
+    }
+
+    #[test]
+    fn own_pull_verdict_rejections_are_detected_without_hiding_line_errors() {
+        assert!(github_rejected_own_pull_verdict(
+            r#"{"message":"Can not approve your own pull request"}"#
+        ));
+        assert!(github_rejected_own_pull_verdict(
+            r#"{"message":"Can not request changes on your own pull request"}"#
+        ));
+        assert!(!github_rejected_own_pull_verdict(
+            r#"{"message":"line must be part of the diff"}"#
+        ));
+        assert!(!github_review_should_fallback_to_comment(
+            "APPROVE",
+            r#"{"message":"commit_id is not part of the pull request"}"#
+        ));
+        assert!(github_review_should_fallback_to_comment(
+            "APPROVE",
+            r#"{"message":"Can not approve your own pull request"}"#
+        ));
+    }
+
+    #[test]
+    fn newer_same_revision_job_blocks_older_publication() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let older = enqueue_test_review_job(&store, "acme/widgets#42:older");
+        let claimed = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(claimed.job.id, older.id);
+        enqueue_test_review_job(&store, "acme/widgets#42:newer");
+
+        assert!(!store.claim_code_review_publication(&older.id).unwrap());
+    }
+
+    #[test]
+    fn thread_rechecks_retry_terminal_failures_without_looping_or_exceeding_the_cap() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut request = test_review_job_request("acme/widgets#42:thread-recheck");
+        request.trigger = "thread-recheck".into();
+
+        let first = store
+            .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "", "temporary failure")
+            .unwrap();
+
+        let retry = store
+            .enqueue_code_review_thread_recheck(&request, "state-a", &[], false, 3)
+            .unwrap()
+            .unwrap();
+        assert_ne!(retry.id, first.id);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            retry.id
+        );
+        store
+            .finish_code_review_job(&retry.id, "succeeded", "review-url", "")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-b", &[], false, 3)
+                .unwrap()
+                .is_none()
+        );
+
+        let third = store
+            .enqueue_code_review_thread_recheck(&request, "state-b", &[], true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        store
+            .finish_code_review_job(&third.id, "failed", "", "another failure")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-c", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+
+        let rechecks = store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.trigger == "thread-recheck")
+            .count();
+        assert_eq!(rechecks, 3);
+    }
+
+    #[test]
+    fn failed_job_findings_are_not_reused_as_published_findings() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:failed-findings");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .save_code_review_result(
+                &job.id,
+                "Unpublished issue",
+                "Fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "This review never reached GitHub.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .open_code_review_findings("acme/widgets", 42)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .finish_code_review_job(&job.id, "failed", "", "GitHub rejected the review")
+            .unwrap();
+        assert!(
+            store
+                .open_code_review_findings("acme/widgets", 42)
+                .unwrap()
+                .is_empty()
+        );
+
+        let published_job =
+            enqueue_test_review_job(&store, "acme/widgets#42:published-then-failed");
+        store.claim_code_review_job().unwrap().unwrap();
+        let published_findings = store
+            .save_code_review_result(
+                &published_job.id,
+                "Published issue",
+                "Fix it",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/published.rs".into(),
+                    line: 9,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "This issue reached GitHub before capture failed.".into(),
+                    prompt_for_agents: "Fix the published issue.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &published_job.id,
+                "acme/widgets",
+                42,
+                &published_job.review_base_sha,
+                &published_job.head_sha,
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &published_job.id,
+                "failed",
+                "",
+                "capturing review comments failed",
+            )
+            .unwrap();
+        let open = store.open_code_review_findings("acme/widgets", 42).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, published_findings[0].id);
+    }
+
+    #[tokio::test]
+    async fn review_thread_loading_follows_graphql_pagination() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        assert!(
+            REVIEW_RECONCILIATION_TIMEOUT.as_secs()
+                > GITHUB_REQUEST_TIMEOUT.as_secs() * REVIEW_THREAD_MAX_PAGES as u64
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected_after, comment_id, thread_id, has_next, end_cursor) in [
+                ("\"after\":null", 10, "PRRT_1", true, Some("cursor-1")),
+                ("\"after\":\"cursor-1\"", 20, "PRRT_2", false, None),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(headers_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.contains(expected_after), "{request}");
+                let response_body = serde_json::json!({
+                    "data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "nodes": [{
+                            "id": thread_id,
+                            "isResolved": true,
+                            "comments": {"nodes": [{"databaseId": comment_id}]}
+                        }],
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}
+                    }}}}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let threads = engine
+            .load_review_threads(&api, "acme/widgets", 42)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(threads.get(&10), Some(&("PRRT_1".into(), true)));
+        assert_eq!(threads.get(&20), Some(&("PRRT_2".into(), true)));
+    }
+
+    #[tokio::test]
+    async fn resolved_inline_findings_on_unchanged_head_queue_full_recheck() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:resolved-approval");
+        assert!(
+            store
+                .code_review_pull_has_active_job("acme/widgets", 42, &job.head_sha)
+                .unwrap()
+        );
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One confirmed issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "Handle the missing case.".into(),
+                    prompt_for_agents: "Handle the missing case.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &findings[0].id,
+                Some(99),
+                "https://github.com/acme/widgets/pull/42#discussion_r99",
+                None,
+            )
+            .unwrap();
+        store
+            .record_code_review_publication(
+                &job.id,
+                "acme/widgets",
+                42,
+                &job.review_base_sha,
+                &job.head_sha,
+                "review-url",
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "review-url", "")
+            .unwrap();
+        assert!(
+            !store
+                .code_review_pull_has_active_job("acme/widgets", 42, &job.head_sha)
+                .unwrap()
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, status, response_body) in [true, false].map(|is_resolved| {
+                (
+                    "post /graphql http/1.1\r\n",
+                    "200 OK",
+                    serde_json::json!({
+                        "data": {"repository": {"pullRequest": {"reviewThreads": {
+                            "nodes": [{
+                                "id": "PRRT_1",
+                                "isResolved": is_resolved,
+                                "comments": {"nodes": [{"databaseId": 99}]}
+                            }],
+                            "pageInfo": {"hasNextPage": false, "endCursor": null}
+                        }}}}
+                    })
+                    .to_string(),
+                )
+            }) {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(headers_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let pull = GithubPullRequest {
+            number: 42,
+            title: "Ship widgets".into(),
+            html_url: "https://github.com/acme/widgets/pull/42".into(),
+            draft: false,
+            state: "open".into(),
+            base: GithubPullRef {
+                name: "main".into(),
+                sha: "1111111111111111111111111111111111111111".into(),
+            },
+            head: GithubPullRef {
+                name: "ship".into(),
+                sha: "2222222222222222222222222222222222222222".into(),
+            },
+            requested_reviewers: Vec::new(),
+        };
+        let repository = CodeReviewRepository {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: Vec::new(),
+            routing_mode: CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            reviewer_overrides: Vec::new(),
+        };
+
+        engine
+            .reconcile_user_resolved_review_findings(&api, &repository, &[], "config", &pull)
+            .await
+            .unwrap();
+        let first_recheck = engine
+            .store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.trigger == "thread-recheck")
+            .unwrap();
+        assert_eq!(first_recheck.status, "queued");
+        assert_eq!(
+            first_recheck.scope,
+            trouve_protocol::CodeReviewJobScope::Full
+        );
+        assert_eq!(
+            engine
+                .store
+                .claim_code_review_job()
+                .unwrap()
+                .unwrap()
+                .job
+                .id,
+            first_recheck.id
+        );
+        engine
+            .store
+            .finish_code_review_job(&first_recheck.id, "failed", "", "test failure")
+            .unwrap();
+
+        engine
+            .reconcile_user_resolved_review_findings(&api, &repository, &[], "config", &pull)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let findings = engine.store.code_review_findings(&job.id).unwrap();
+        assert_eq!(findings[0].status, "open");
+        assert_eq!(findings[0].github_thread_id.as_deref(), Some("PRRT_1"));
+        let rechecks = engine
+            .store
+            .list_code_review_jobs(10)
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.trigger == "thread-recheck")
+            .collect::<Vec<_>>();
+        assert_eq!(rechecks.len(), 2);
+        assert!(rechecks.iter().any(|job| job.status == "queued"));
+    }
+
     struct RouterThinkingProvider {
         stall: bool,
     }
@@ -6101,37 +6937,41 @@ mod tests {
         dedupe_key: &str,
     ) -> trouve_protocol::CodeReviewJob {
         store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: dedupe_key.into(),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Ship widgets".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "ship".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: Some("provider/default".into()),
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: "Review it".into(),
-                reviewers: crate::reviewers::built_in_reviewers()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                routing_mode: CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
+            .enqueue_code_review_job(&test_review_job_request(dedupe_key))
             .unwrap()
             .unwrap()
+    }
+
+    fn test_review_job_request(dedupe_key: &str) -> NewCodeReviewJob {
+        NewCodeReviewJob {
+            dedupe_key: dedupe_key.into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "2222222222222222222222222222222222222222".into(),
+            review_base_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "main".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "automatic".into(),
+            retry_of: None,
+            model: Some("provider/default".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "Review it".into(),
+            reviewers: crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .take(1)
+                .collect(),
+            routing_mode: CodeReviewRoutingMode::Manual,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
+            config_hash: "config".into(),
+        }
     }
 
     #[tokio::test]
