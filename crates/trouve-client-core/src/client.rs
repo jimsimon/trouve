@@ -4,6 +4,26 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use trouve_protocol::*;
 
+#[derive(Debug)]
+pub struct ProtocolResponseError {
+    pub path: String,
+    pub status: reqwest::StatusCode,
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProtocolResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} ({})",
+            self.path, self.message, self.status
+        )
+    }
+}
+
+impl std::error::Error for ProtocolResponseError {}
+
 #[derive(Clone)]
 pub struct ProtocolClient {
     base: String,
@@ -1208,22 +1228,31 @@ async fn decode_empty(resp: reqwest::Response, path: &str) -> Result<()> {
 }
 
 fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Error {
-    let message = serde_json::from_slice::<ErrorBody>(bytes)
-        .map(|error| error.message)
+    let (code, message) = serde_json::from_slice::<ErrorBody>(bytes)
+        .map(|error| (error.code, error.message))
         .unwrap_or_else(|_| {
             let message = String::from_utf8_lossy(bytes);
-            if message.is_empty() {
-                status.to_string()
-            } else {
-                message.into_owned()
-            }
+            (
+                String::new(),
+                if message.is_empty() {
+                    status.to_string()
+                } else {
+                    message.into_owned()
+                },
+            )
         });
-    anyhow::anyhow!("{path}: {message} ({status})")
+    ProtocolResponseError {
+        path: path.to_string(),
+        status,
+        code,
+        message,
+    }
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolClient, response_error, urlencode};
+    use super::{ProtocolClient, ProtocolResponseError, response_error, urlencode};
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
@@ -1243,6 +1272,9 @@ mod tests {
             error.to_string(),
             "/github/prs/refresh: github.com: API rate limit exceeded (400 Bad Request)"
         );
+        let response = error.downcast_ref::<ProtocolResponseError>().unwrap();
+        assert_eq!(response.code, "bad_request");
+        assert_eq!(response.message, "github.com: API rate limit exceeded");
     }
 
     #[test]

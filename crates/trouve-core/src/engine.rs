@@ -240,6 +240,8 @@ pub enum EngineError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    SessionDiffTooLarge(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -3558,10 +3560,16 @@ impl Engine {
         let session = self.get_session(session_id)?;
         let wt = PathBuf::from(&session.worktree_path);
         let base = session.base_ref.clone();
-        tokio::task::spawn_blocking(move || git::session_diff(&wt, &base))
+        let result = tokio::task::spawn_blocking(move || git::session_diff(&wt, &base))
             .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)
+            .map_err(|e| EngineError::Internal(anyhow!(e)))?;
+        match result {
+            Ok(diff) => Ok(diff),
+            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
+                Err(EngineError::SessionDiffTooLarge(error.to_string()))
+            }
+            Err(error) => Err(EngineError::Internal(error)),
+        }
     }
 
     /// List a directory inside the session worktree (IDE-style browsing).

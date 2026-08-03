@@ -12,13 +12,13 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use trouve_client_core::client::ProtocolClient;
+use trouve_client_core::client::{ProtocolClient, ProtocolResponseError};
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
-    UpsertProviderRequest, Workspace,
+    CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE, EventEnvelope, ModelInfo,
+    PROTOCOL_VERSION, PermissionMode, Session, Thread, TodoStatus, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -1125,6 +1125,8 @@ struct Controller {
     diff_files: Vec<trouve_slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
+    /// A pathological diff is not polled again until the session is reopened.
+    diff_blocked_session: Option<String>,
     /// Files tab tree: directory listings cached by worktree-relative path
     /// ("." for the root), fetched lazily as folders are expanded.
     file_children: HashMap<String, Vec<DirEntry>>,
@@ -1310,6 +1312,7 @@ pub async fn run(
         diff_files: Vec::new(),
         diff_collapsed: Vec::new(),
         diff_raw: String::new(),
+        diff_blocked_session: None,
         file_children: HashMap::new(),
         file_expanded: HashSet::new(),
         file_rows: Vec::new(),
@@ -1385,9 +1388,11 @@ async fn start_local_server() -> Result<(
 )> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
         let client = ProtocolClient::new(&url);
-        client
+        let info = client
             .info()
             .await
+            .with_context(|| format!("connecting to {url}"))?;
+        ensure_protocol_compatible(&info.protocol_version)
             .with_context(|| format!("connecting to {url}"))?;
         return Ok((client, url, None));
     }
@@ -1404,6 +1409,15 @@ async fn start_local_server() -> Result<(
             .with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
     }
     Ok((client, url, Some((info, handle))))
+}
+
+fn ensure_protocol_compatible(server_version: &str) -> Result<()> {
+    anyhow::ensure!(
+        server_version == PROTOCOL_VERSION,
+        "incompatible trouve-server protocol version {server_version}; \
+         this app requires {PROTOCOL_VERSION}"
+    );
+    Ok(())
 }
 
 /// Everything needed to relaunch the embedded server on the same address
@@ -2332,6 +2346,7 @@ impl Controller {
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
+        self.diff_blocked_session = None;
         self.threads = self.client.list_threads(&session_id).await?;
         for t in &self.threads {
             self.thread_sessions
@@ -3346,7 +3361,29 @@ impl Controller {
         let Some(session_id) = self.current_session_id() else {
             return Ok(());
         };
-        let diff = self.client.session_diff(&session_id).await?;
+        if self.diff_blocked_session.as_deref() == Some(&session_id) {
+            return Ok(());
+        }
+        let diff = match self.client.session_diff(&session_id).await {
+            Ok(diff) => diff,
+            Err(error)
+                if error
+                    .downcast_ref::<ProtocolResponseError>()
+                    .is_some_and(|error| error.code == ERROR_CODE_SESSION_DIFF_TOO_LARGE) =>
+            {
+                self.diff_blocked_session = Some(session_id);
+                self.diff_files.clear();
+                self.diff_collapsed.clear();
+                self.diff_raw.clear();
+                self.push_diff();
+                self.error(
+                    "This session's change set is too large for the Changes panel. \
+                     The chat and Files panel remain available.",
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if diff.diff == self.diff_raw {
             return Ok(());
         }
@@ -6092,12 +6129,14 @@ impl Controller {
             UiCommand::Undo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.undo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
             UiCommand::Redo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.redo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
@@ -8393,7 +8432,8 @@ mod tests {
     use super::{
         ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
         THREAD_REPLAY_IDLE_FLUSH, ThreadReplayBuffer, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
+        classify_pr, download_progress, ensure_protocol_compatible,
+        format_pr_dashboard_refresh_status, human_age, human_rate,
         invalidate_background_thread_history, is_web_url, merge_pill, model_health_view, pr_badge,
         project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
         reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
@@ -8402,9 +8442,16 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use std::collections::HashMap;
     use trouve_protocol::{
-        CheckRun, Event, EventEnvelope, GithubPrList, PrInfo, PrReview, Scope, Session,
-        SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, Event, EventEnvelope, GithubPrList, PROTOCOL_VERSION, PrInfo, PrReview, Scope,
+        Session, SubscriptionHealth, SubscriptionWindow, Workspace,
     };
+
+    #[test]
+    fn external_server_protocol_must_match_the_app() {
+        assert!(ensure_protocol_compatible(PROTOCOL_VERSION).is_ok());
+        let error = ensure_protocol_compatible("older").unwrap_err();
+        assert!(error.to_string().contains("incompatible trouve-server"));
+    }
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
