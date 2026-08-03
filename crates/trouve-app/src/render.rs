@@ -421,8 +421,20 @@ fn running_activity_label(vm: &ThreadViewModel) -> String {
 /// Turns listed in `raw_turns` render their assistant text as one plain
 /// (selectable) block instead of styled markdown. User/assistant/thinking
 /// items get a collapsible header row; keys in `collapsed` hide the body.
+#[cfg(test)]
 pub fn chat_rows(
     vm: &ThreadViewModel,
+    expanded: &HashSet<String>,
+    raw_turns: &HashSet<u64>,
+    collapsed: &HashSet<String>,
+    wizards: &HashMap<String, WizardState>,
+) -> (Vec<ChatRowData>, Vec<Option<String>>) {
+    chat_rows_at_offset(vm, 0, expanded, raw_turns, collapsed, wizards)
+}
+
+pub fn chat_rows_at_offset(
+    vm: &ThreadViewModel,
+    item_offset: u64,
     expanded: &HashSet<String>,
     raw_turns: &HashSet<u64>,
     collapsed: &HashSet<String>,
@@ -469,8 +481,8 @@ pub fn chat_rows(
     };
     // Assistant items already folded into an earlier item's card.
     let mut merged: HashSet<usize> = HashSet::new();
-    // Item indices are stable (the event fold only appends or edits in
-    // place), so they key the collapse state.
+    // Local item indices shift when an older history page is prepended. Card
+    // keys use the item's absolute folded-snapshot position instead.
     for (i, item) in vm.items.iter().enumerate() {
         match item {
             ChatItem::User {
@@ -487,7 +499,7 @@ pub fn chat_rows(
                     });
                     call_ids.push(None);
                 }
-                let key = format!("u:{i}");
+                let key = format!("u:{}", item_offset + i as u64);
                 let open = !collapsed.contains(&key);
                 let mut body = Vec::new();
                 if open {
@@ -556,7 +568,7 @@ pub fn chat_rows(
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                let key = format!("a:{i}");
+                let key = format!("a:{}", item_offset + i as u64);
                 let open = !collapsed.contains(&key);
                 let raw = raw_turns.contains(turn);
                 let done = turn_state(vm, *turn).is_some();
@@ -573,7 +585,16 @@ pub fn chat_rows(
                     ordered.sort_unstable();
                     ordered.extend(i..=end);
                     card_body_rows(
-                        &mut body, vm, &ordered, i, raw, done, collapsed, expanded, wizards,
+                        &mut body,
+                        vm,
+                        &ordered,
+                        i,
+                        item_offset,
+                        raw,
+                        done,
+                        collapsed,
+                        expanded,
+                        wizards,
                     );
                 }
                 // The turn's token/cost summary shows in the header of the
@@ -643,14 +664,23 @@ pub fn chat_rows(
                         _ => None,
                     })
                     .unwrap_or(0);
-                let key = format!("a:{i}");
+                let key = format!("a:{}", item_offset + i as u64);
                 let open = !collapsed.contains(&key);
                 let done = turn_state(vm, turn).is_some();
                 let raw = raw_turns.contains(&turn);
                 let mut body = Vec::new();
                 if open {
                     card_body_rows(
-                        &mut body, vm, &run, i, raw, done, collapsed, expanded, wizards,
+                        &mut body,
+                        vm,
+                        &run,
+                        i,
+                        item_offset,
+                        raw,
+                        done,
+                        collapsed,
+                        expanded,
+                        wizards,
                     );
                 }
                 // Orphan items mean no assistant item in this turn, so this
@@ -782,6 +812,7 @@ fn card_body_rows(
     vm: &ThreadViewModel,
     ordered: &[usize],
     anchor: usize,
+    item_offset: u64,
     raw: bool,
     done: bool,
     collapsed: &HashSet<String>,
@@ -826,7 +857,17 @@ fn card_body_rows(
             continue;
         }
         if !groupable(&segments[s]) {
-            segment_rows(body, vm, &segments[s], 0, raw, collapsed, expanded, wizards);
+            segment_rows(
+                body,
+                vm,
+                &segments[s],
+                item_offset,
+                0,
+                raw,
+                collapsed,
+                expanded,
+                wizards,
+            );
             s += 1;
             continue;
         }
@@ -838,7 +879,17 @@ fn card_body_rows(
         let run = &segments[start..s];
         if run.len() < 2 {
             for seg in run {
-                segment_rows(body, vm, seg, 0, raw, collapsed, expanded, wizards);
+                segment_rows(
+                    body,
+                    vm,
+                    seg,
+                    item_offset,
+                    0,
+                    raw,
+                    collapsed,
+                    expanded,
+                    wizards,
+                );
             }
             continue;
         }
@@ -856,7 +907,11 @@ fn card_body_rows(
             Segment::Item(j) => j,
             Segment::Text(_) => unreachable!("runs hold only items"),
         };
-        let gkey = format!("g{first}:{anchor}");
+        let gkey = format!(
+            "g{}:{}",
+            item_offset + first as u64,
+            item_offset + anchor as u64
+        );
         let toggled = collapsed.contains(&gkey);
         let g_open = needs_approval || if done { toggled } else { !toggled };
         body.push((
@@ -871,7 +926,17 @@ fn card_body_rows(
         ));
         if g_open {
             for seg in run {
-                segment_rows(body, vm, seg, 1, raw, collapsed, expanded, wizards);
+                segment_rows(
+                    body,
+                    vm,
+                    seg,
+                    item_offset,
+                    1,
+                    raw,
+                    collapsed,
+                    expanded,
+                    wizards,
+                );
             }
         }
     }
@@ -884,6 +949,7 @@ fn segment_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
     vm: &ThreadViewModel,
     segment: &Segment,
+    item_offset: u64,
     indent: i32,
     raw: bool,
     collapsed: &HashSet<String>,
@@ -898,7 +964,7 @@ fn segment_rows(
                 content,
                 complete,
             } => {
-                let key = format!("t:{j}");
+                let key = format!("t:{}", item_offset + *j as u64);
                 // The toggle set flips whichever default applies: expanded
                 // while its turn is the latest, collapsed once the next
                 // prompt is submitted (the reader has moved on).
@@ -2580,6 +2646,78 @@ mod tests {
         assert_eq!(rows[0].kind, 7);
         assert!(!rows[0].expanded);
         assert_eq!(rows[0].text, "# heading");
+    }
+
+    #[test]
+    fn collapsed_card_key_survives_history_prepend() {
+        let mut vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "first prompt".into(),
+                    attachments: Vec::new(),
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "first answer".into(),
+                    complete: true,
+                },
+                ChatItem::User {
+                    turn: 2,
+                    content: "second prompt".into(),
+                    attachments: Vec::new(),
+                },
+                ChatItem::Assistant {
+                    turn: 2,
+                    content: "second answer".into(),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let collapsed: HashSet<String> = ["a:101".to_string()].into();
+        let expanded = HashSet::new();
+        let raw = HashSet::new();
+        let wizards = HashMap::new();
+        let (before, _) = chat_rows_at_offset(&vm, 100, &expanded, &raw, &collapsed, &wizards);
+        assert!(
+            !before
+                .iter()
+                .find(|row| row.card_key == "a:101")
+                .unwrap()
+                .expanded
+        );
+        assert!(
+            before
+                .iter()
+                .find(|row| row.card_key == "a:103")
+                .unwrap()
+                .expanded
+        );
+
+        vm.items.insert(
+            0,
+            ChatItem::User {
+                turn: 0,
+                content: "older prompt".into(),
+                attachments: Vec::new(),
+            },
+        );
+        let (after, _) = chat_rows_at_offset(&vm, 99, &expanded, &raw, &collapsed, &wizards);
+        assert!(
+            !after
+                .iter()
+                .find(|row| row.card_key == "a:101")
+                .unwrap()
+                .expanded
+        );
+        assert!(
+            after
+                .iter()
+                .find(|row| row.card_key == "a:103")
+                .unwrap()
+                .expanded
+        );
     }
 
     #[test]

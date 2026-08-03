@@ -371,11 +371,20 @@ pub enum ThreadTurnState {
     Failed { error: String },
 }
 
-/// Folded current thread state at the cursor returned in
-/// `x-trouve-event-cursor`. Clients seed their view from this response and
-/// subscribe to the thread event stream after that cursor.
+/// Folded current thread state and one transcript item page at the cursor
+/// returned in `x-trouve-event-cursor`. Clients seed their view from this
+/// response and subscribe to the thread event stream after that cursor.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ThreadViewSnapshot {
+    /// Zero-based index of `items[0]` in the complete folded transcript.
+    #[serde(default)]
+    pub item_offset: u64,
+    /// Number of folded items in the complete transcript at this snapshot.
+    #[serde(default)]
+    pub total_items: u64,
+    /// Whether another page exists before `item_offset`.
+    #[serde(default)]
+    pub has_older: bool,
     pub items: Vec<ThreadViewItem>,
     #[serde(default)]
     pub pending_approvals: Vec<String>,
@@ -401,6 +410,17 @@ pub struct ThreadViewSnapshot {
     pub queue: Vec<crate::QueuedPrompt>,
     #[serde(default)]
     pub todos: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ThreadViewQuery {
+    /// Exclusive folded-item offset for backward pagination. Omit for the
+    /// newest page.
+    #[serde(default)]
+    pub before: Option<u64>,
+    /// Requested item count; the server applies a safe upper bound.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Partial thread update between turns (mode/model switching). Rejected with
