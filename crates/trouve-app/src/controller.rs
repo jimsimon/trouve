@@ -2862,10 +2862,10 @@ impl Controller {
         });
     }
 
-    fn rendered_chat_row_count(&self, thread_id: &str) -> usize {
-        let Some(vm) = self.vms.get(thread_id) else {
-            return 0;
-        };
+    fn fold_chat_rows(
+        &mut self,
+        thread_id: &str,
+    ) -> (Vec<render::ChatRowData>, Vec<Option<String>>) {
         let raw_turns: HashSet<u64> = self
             .raw_turns
             .iter()
@@ -2878,46 +2878,7 @@ impl Controller {
             .filter(|(candidate, _)| candidate == thread_id)
             .map(|(_, key)| key.clone())
             .collect();
-        render::chat_rows(
-            vm,
-            &self.expanded_tools,
-            &raw_turns,
-            &collapsed,
-            &self.wizards,
-        )
-        .0
-        .len()
-    }
-
-    /// Re-fold the current thread into chat rows. `scroll` jumps the list to
-    /// the end — wanted when content arrives or threads switch, jarring for
-    /// in-place toggles (tool details, raw view).
-    fn render_chat(&mut self, scroll: bool) {
-        let Some(thread_id) = self.current_thread_id() else {
-            self.row_call_ids.clear();
-            ui::set_chat(&self.ui, Vec::new(), String::new(), false);
-            ui::set_composer_enabled(&self.ui, false);
-            ui::set_composer_turn_running(&self.ui, false);
-            ui::set_slash_commands(&self.ui, Vec::new());
-            return;
-        };
-        // Keep the "@" mention paths roughly current while a thread is open
-        // (agents create files mid-turn); the helper self-throttles.
-        self.refresh_at_files();
-        let raw_turns: HashSet<u64> = self
-            .raw_turns
-            .iter()
-            .filter(|(t, _)| *t == thread_id)
-            .map(|(_, turn)| *turn)
-            .collect();
-        let collapsed: HashSet<String> = self
-            .collapsed_cards
-            .iter()
-            .filter(|(t, _)| *t == thread_id)
-            .map(|(_, key)| key.clone())
-            .collect();
-        let vm = self.vms.entry(thread_id.clone()).or_default();
-        ui::set_composer_turn_running(&self.ui, vm.turn_running);
+        let vm = self.vms.entry(thread_id.to_string()).or_default();
         // Wizard state tracks the thread's pending question requests: fresh
         // state when one appears, dropped once it resolves.
         for item in &vm.items {
@@ -2937,13 +2898,22 @@ impl Controller {
                 }
             }
         }
-        let (rows, call_ids) = render::chat_rows(
+        render::chat_rows(
             vm,
             &self.expanded_tools,
             &raw_turns,
             &collapsed,
             &self.wizards,
-        );
+        )
+    }
+
+    fn install_chat_rows(
+        &mut self,
+        thread_id: String,
+        rows: Vec<render::ChatRowData>,
+        call_ids: Vec<Option<String>>,
+        scroll: bool,
+    ) {
         let bookmark = self
             .resume
             .thread_scroll
@@ -2956,6 +2926,8 @@ impl Controller {
         };
         self.row_call_ids = call_ids[range.clone()].to_vec();
         let rows = rows[range].to_vec();
+        let vm = self.vms.entry(thread_id.clone()).or_default();
+        ui::set_composer_turn_running(&self.ui, vm.turn_running);
         ui::set_slash_commands(
             &self.ui,
             vm.commands
@@ -2977,6 +2949,25 @@ impl Controller {
         {
             ui::restore_chat_position(&self.ui, local_row, bookmark.offset);
         }
+    }
+
+    /// Re-fold the current thread into chat rows. `scroll` jumps the list to
+    /// the end — wanted when content arrives or threads switch, jarring for
+    /// in-place toggles (tool details, raw view).
+    fn render_chat(&mut self, scroll: bool) {
+        let Some(thread_id) = self.current_thread_id() else {
+            self.row_call_ids.clear();
+            ui::set_chat(&self.ui, Vec::new(), String::new(), false);
+            ui::set_composer_enabled(&self.ui, false);
+            ui::set_composer_turn_running(&self.ui, false);
+            ui::set_slash_commands(&self.ui, Vec::new());
+            return;
+        };
+        // Keep the "@" mention paths roughly current while a thread is open
+        // (agents create files mid-turn); the helper self-throttles.
+        self.refresh_at_files();
+        let (rows, call_ids) = self.fold_chat_rows(&thread_id);
+        self.install_chat_rows(thread_id, rows, call_ids, scroll);
     }
 
     /// Push the current thread's prompt queue to the composer's queue panel.
@@ -7433,7 +7424,7 @@ impl Controller {
                         let has_older = snapshot.has_older;
                         let is_current = self.current_thread_id().as_deref() == Some(&thread_id);
                         let old_row_count = if is_current {
-                            self.rendered_chat_row_count(&thread_id)
+                            self.fold_chat_rows(&thread_id).0.len()
                         } else {
                             0
                         };
@@ -7455,7 +7446,8 @@ impl Controller {
                         }
 
                         if is_current {
-                            let new_row_count = self.rendered_chat_row_count(&thread_id);
+                            let (rows, call_ids) = self.fold_chat_rows(&thread_id);
+                            let new_row_count = rows.len();
                             let added = new_row_count.saturating_sub(old_row_count);
                             if let Some(window) = self.chat_windows.get_mut(&thread_id) {
                                 window.total = new_row_count;
@@ -7482,7 +7474,8 @@ impl Controller {
                             if restore.is_some() {
                                 crate::winstate::save_resume(&self.resume);
                             }
-                            self.render_chat(false);
+                            self.refresh_at_files();
+                            self.install_chat_rows(thread_id.clone(), rows, call_ids, false);
                             if let Some((shifted, offset)) = restore
                                 && let Some(local_row) = self
                                     .chat_windows
