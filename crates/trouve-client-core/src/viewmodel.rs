@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use trouve_protocol::{
-    ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ToolStatus, Usage,
+    ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadToolStatus,
+    ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus, Usage,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +105,101 @@ pub struct ThreadViewModel {
     pub queue: Vec<trouve_protocol::QueuedPrompt>,
     /// Current thread todo snapshot (latest announcement wins).
     pub todos: Vec<trouve_protocol::TodoItem>,
+}
+
+impl From<ThreadViewSnapshot> for ThreadViewModel {
+    fn from(snapshot: ThreadViewSnapshot) -> Self {
+        Self {
+            items: snapshot.items.into_iter().map(ChatItem::from).collect(),
+            cursor: 0,
+            pending_approvals: snapshot.pending_approvals,
+            pending_questions: snapshot.pending_questions,
+            last_usage: snapshot.last_usage,
+            compacting: snapshot.compacting,
+            turn_running: snapshot.turn_running,
+            thinking: snapshot.thinking,
+            turn_models: snapshot.turn_models.into_iter().collect(),
+            turn_started_at: snapshot.turn_started_at.into_iter().collect(),
+            turn_duration_ms: snapshot.turn_duration_ms.into_iter().collect(),
+            commands: snapshot.commands,
+            queue: snapshot.queue,
+            todos: snapshot.todos,
+        }
+    }
+}
+
+impl From<ThreadViewItem> for ChatItem {
+    fn from(item: ThreadViewItem) -> Self {
+        match item {
+            ThreadViewItem::User {
+                turn,
+                content,
+                attachments,
+            } => Self::User {
+                turn,
+                content,
+                attachments,
+            },
+            ThreadViewItem::Assistant {
+                turn,
+                content,
+                complete,
+            } => Self::Assistant {
+                turn,
+                content,
+                complete,
+            },
+            ThreadViewItem::Thinking {
+                turn,
+                content,
+                complete,
+            } => Self::Thinking {
+                turn,
+                content,
+                complete,
+            },
+            ThreadViewItem::ToolCall {
+                call_id,
+                tool,
+                args,
+                status,
+                result,
+            } => Self::ToolCall {
+                call_id,
+                tool,
+                args,
+                status: match status {
+                    ThreadToolStatus::AwaitingApproval => ToolCallStatus::AwaitingApproval,
+                    ThreadToolStatus::Running => ToolCallStatus::Running,
+                    ThreadToolStatus::Ok => ToolCallStatus::Ok,
+                    ThreadToolStatus::Error => ToolCallStatus::Error,
+                    ThreadToolStatus::Denied => ToolCallStatus::Denied,
+                    ThreadToolStatus::Aborted => ToolCallStatus::Aborted,
+                },
+                result,
+            },
+            ThreadViewItem::TurnStatus { turn, state } => Self::TurnStatus {
+                turn,
+                state: match state {
+                    ThreadTurnState::Running => TurnState::Running,
+                    ThreadTurnState::Completed { usage } => TurnState::Completed { usage },
+                    ThreadTurnState::Failed { error } => TurnState::Failed { error },
+                },
+            },
+            ThreadViewItem::Questions {
+                request_id,
+                title,
+                questions,
+                resolved,
+                answers,
+            } => Self::Questions {
+                request_id,
+                title,
+                questions,
+                answers: resolved.then_some(answers),
+            },
+        }
+    }
 }
 
 impl ThreadViewModel {
@@ -908,5 +1004,72 @@ mod tests {
             b.apply(&env(e.clone()));
         }
         assert_eq!(a.items, b.items);
+    }
+
+    #[test]
+    fn server_projection_matches_client_event_fold() {
+        let events = vec![
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "go".into(),
+                attachments: vec![],
+            },
+            Event::AssistantThinking {
+                turn: 1,
+                text: "hmm".into(),
+            },
+            Event::AssistantDelta {
+                turn: 1,
+                text: "done".into(),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "a.txt"}),
+                requires_approval: false,
+            },
+            Event::ToolStarted {
+                call_id: "call_1".into(),
+            },
+            Event::ToolCompleted {
+                call_id: "call_1".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({"content": "a"}),
+            },
+            Event::AssistantMessage {
+                turn: 1,
+                content: "done".into(),
+            },
+            Event::TurnCompleted {
+                turn: 1,
+                usage: Usage::default(),
+                checkpoint_id: None,
+            },
+        ];
+        let mut client = ThreadViewModel::new();
+        let mut server = trouve_thread_view::ThreadProjection::default();
+        for event in events {
+            let envelope = env(event);
+            client.apply(&envelope);
+            server.apply(&envelope);
+        }
+        let mut projected = ThreadViewModel::from(server.snapshot);
+        projected.cursor = server.cursor;
+
+        assert_eq!(projected.items, client.items);
+        assert_eq!(projected.cursor, client.cursor);
+        assert_eq!(projected.pending_approvals, client.pending_approvals);
+        assert_eq!(projected.pending_questions, client.pending_questions);
+        assert_eq!(projected.last_usage, client.last_usage);
+        assert_eq!(projected.turn_running, client.turn_running);
+        assert_eq!(projected.thinking, client.thinking);
+        assert_eq!(projected.turn_models, client.turn_models);
+        assert_eq!(projected.turn_duration_ms, client.turn_duration_ms);
     }
 }

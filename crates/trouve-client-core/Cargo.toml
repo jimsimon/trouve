@@ -17,3 +17,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 trouve-protocol.workspace = true
+
+[dev-dependencies]
+trouve-thread-view.workspace = true

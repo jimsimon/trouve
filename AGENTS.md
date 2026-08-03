@@ -17,6 +17,8 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   protocol.
 - `crates/trouve-client-core` — shared client logic (protocol client, session
   state, view models) for native clients.
+- `crates/trouve-thread-view` — shared deterministic fold from thread events
+  into rebuildable protocol snapshots; no transport or UI dependencies.
 - `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
   view, markdown, terminal). No trouve-specific types in their public APIs.
 - `crates/trouve-app` — thin Slint desktop/mobile app composing the above.

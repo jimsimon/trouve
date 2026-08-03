@@ -198,6 +198,17 @@ impl ProtocolClient {
             .await
     }
 
+    pub async fn thread_view(&self, thread_id: &str) -> Result<(u64, ThreadViewSnapshot)> {
+        let path = format!("/threads/{thread_id}/view");
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, &path).await
+    }
+
     pub async fn send_message(&self, thread_id: &str, content: &str) -> Result<TurnAccepted> {
         self.send_message_with(thread_id, content, Vec::new()).await
     }

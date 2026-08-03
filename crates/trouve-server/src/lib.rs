@@ -35,7 +35,7 @@ use trouve_protocol::{
     ServerInfo, Session, SessionDiff, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
     SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
     UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
     UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
     Workspace,
@@ -101,6 +101,7 @@ impl IntoResponse for ApiError {
         create_thread,
         list_threads,
         get_thread,
+        get_thread_view,
         update_thread,
         send_message,
         get_attachment,
@@ -204,6 +205,10 @@ impl IntoResponse for ApiError {
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
+        ThreadViewSnapshot,
+        trouve_protocol::ThreadViewItem,
+        trouve_protocol::ThreadToolStatus,
+        trouve_protocol::ThreadTurnState,
         UpdateThreadRequest,
         SendMessageRequest,
         TurnAccepted,
@@ -624,6 +629,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/view", get(get_thread_view))
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
@@ -1110,6 +1116,26 @@ async fn get_thread(
     Path(id): Path<String>,
 ) -> Result<Json<Thread>, ApiError> {
     Ok(Json(engine.get_thread(&id)?))
+}
+
+#[utoipa::path(get, path = "/v1/threads/{id}/view", params(("id" = String, Path,)),
+    responses(
+        (status = 200, body = ThreadViewSnapshot,
+            headers(("x-trouve-event-cursor" = u64, description = "Thread event cursor for this snapshot"))),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_thread_view(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, snapshot) = tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id))
+        .await
+        .map_err(|error| {
+            ApiError(EngineError::Internal(anyhow::anyhow!(
+                "thread view worker failed: {error}"
+            )))
+        })??;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
 }
 
 #[utoipa::path(patch, path = "/v1/threads/{id}", params(("id" = String, Path,)),

@@ -58,6 +58,7 @@ trouve-core = { path = "crates/trouve-core", version = "3.7.0" }
 trouve-providers = { path = "crates/trouve-providers", version = "3.7.0" }
 trouve-server = { path = "crates/trouve-server", version = "3.7.0" }
 trouve-client-core = { path = "crates/trouve-client-core", version = "3.7.0" }
+trouve-thread-view = { path = "crates/trouve-thread-view", version = "3.7.0" }
 trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.7.0" }
 trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.7.0" }
 trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.7.0" }

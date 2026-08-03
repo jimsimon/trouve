@@ -142,7 +142,9 @@ pub use requests::*;
 // maximum number of concurrently running review jobs (additive).
 // 2.2: code-review concurrency requests remain positive and unbounded on the
 // wire, while values above 32 are normalized to the response maximum of 32.
-pub const PROTOCOL_VERSION: &str = "2.2";
+// 2.3: folded thread-view snapshots expose their event cursor so clients can
+// open long chats without replaying retained history from cursor zero.
+pub const PROTOCOL_VERSION: &str = "2.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;
