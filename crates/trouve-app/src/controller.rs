@@ -2878,6 +2878,10 @@ impl Controller {
             .filter(|(candidate, _)| candidate == thread_id)
             .map(|(_, key)| key.clone())
             .collect();
+        let item_offset = self
+            .thread_history
+            .get(thread_id)
+            .map_or(0, |history| history.item_offset);
         let vm = self.vms.entry(thread_id.to_string()).or_default();
         // Wizard state tracks the thread's pending question requests: fresh
         // state when one appears, dropped once it resolves.
@@ -2898,8 +2902,9 @@ impl Controller {
                 }
             }
         }
-        render::chat_rows(
+        render::chat_rows_at_offset(
             vm,
+            item_offset,
             &self.expanded_tools,
             &raw_turns,
             &collapsed,
