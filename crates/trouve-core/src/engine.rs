@@ -5144,10 +5144,13 @@ impl Engine {
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let mut mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
         let background = self.store.is_code_review_thread(&thread.id)?;
+        if background {
+            mode = modes::secure_automated_review_mode(mode);
+        }
         let turn_capacity = self
             .turn_scheduler
             .acquire(&thread.model, background)
@@ -5958,9 +5961,12 @@ impl Engine {
             .map_err(EngineError::Internal)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let mut mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        if self.store.is_code_review_thread(&thread.id)? {
+            mode = modes::secure_automated_review_mode(mode);
+        }
         let ctx = ToolCtx {
             worktree: PathBuf::from(&session.worktree_path),
             thread_id: thread.id.clone(),
