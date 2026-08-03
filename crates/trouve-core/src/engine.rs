@@ -4341,9 +4341,11 @@ impl Engine {
     pub fn thread_view_snapshot(
         &self,
         id: &str,
+        before: Option<u64>,
+        limit: usize,
     ) -> Result<(u64, trouve_protocol::ThreadViewSnapshot), EngineError> {
         self.get_thread(id)?;
-        Ok(self.store.thread_view_snapshot(id)?)
+        Ok(self.store.thread_view_snapshot(id, before, limit)?)
     }
 
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>, EngineError> {

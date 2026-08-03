@@ -1661,7 +1661,12 @@ impl Store {
     /// Raw rows are captured through one cursor while holding the connection,
     /// then decoded and folded without blocking unrelated store work. A
     /// conditional cache write cannot overwrite a newer turn-boundary refresh.
-    pub fn thread_view_snapshot(&self, thread_id: &str) -> Result<(u64, ThreadViewSnapshot)> {
+    pub fn thread_view_snapshot(
+        &self,
+        thread_id: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<(u64, ThreadViewSnapshot)> {
         let (mut projection, cache_valid, rows) = {
             let conn = self.conn.lock().unwrap();
             let cached = conn
@@ -1732,6 +1737,9 @@ impl Store {
             });
         }
         if needs_write {
+            projection.snapshot.item_offset = 0;
+            projection.snapshot.total_items = 0;
+            projection.snapshot.has_older = false;
             let state = serde_json::to_string(&projection)?;
             self.conn.lock().unwrap().execute(
                 "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
@@ -1749,7 +1757,19 @@ impl Store {
                 ],
             )?;
         }
-        Ok((projection.cursor, projection.snapshot))
+        let mut snapshot = projection.snapshot;
+        let total = snapshot.items.len();
+        let end = before
+            .and_then(|offset| usize::try_from(offset).ok())
+            .unwrap_or(total)
+            .min(total);
+        let start = end.saturating_sub(limit.max(1));
+        let items = snapshot.items.drain(start..end).collect();
+        snapshot.items = items;
+        snapshot.item_offset = start as u64;
+        snapshot.total_items = total as u64;
+        snapshot.has_older = start > 0;
+        Ok((projection.cursor, snapshot))
     }
 
     /// Read at most `limit` persisted rows in `(after, through]`.
@@ -5342,13 +5362,29 @@ mod tests {
             store.append_event(scope.clone(), event).unwrap();
         }
 
-        let (first_cursor, first) = store.thread_view_snapshot("th_view").unwrap();
+        let (first_cursor, first) = store.thread_view_snapshot("th_view", None, 256).unwrap();
         assert_eq!(first.items.len(), 3);
+        assert_eq!(first.item_offset, 0);
+        assert_eq!(first.total_items, 3);
+        assert!(!first.has_older);
         assert!(first.turn_running);
+
+        let (_, tail) = store.thread_view_snapshot("th_view", None, 2).unwrap();
+        assert_eq!(tail.item_offset, 1);
+        assert_eq!(tail.total_items, 3);
+        assert!(tail.has_older);
+        assert_eq!(tail.items, first.items[1..]);
+        let (_, older) = store
+            .thread_view_snapshot("th_view", Some(tail.item_offset), 2)
+            .unwrap();
+        assert_eq!(older.item_offset, 0);
+        assert_eq!(older.total_items, 3);
+        assert!(!older.has_older);
+        assert_eq!(older.items, first.items[..1]);
 
         store
             .append_event(
-                scope,
+                scope.clone(),
                 Event::TurnCompleted {
                     turn: 1,
                     usage: Default::default(),
@@ -5367,12 +5403,13 @@ mod tests {
             )
             .unwrap() as u64;
         assert!(cached_cursor > first_cursor);
-        let (second_cursor, second) = store.thread_view_snapshot("th_view").unwrap();
+        let (second_cursor, second) = store.thread_view_snapshot("th_view", None, 256).unwrap();
         assert!(second_cursor > first_cursor);
         assert!(!second.turn_running);
         assert_eq!(second.items.len(), 3);
         let changes_before = store.conn.lock().unwrap().total_changes();
-        let (unchanged_cursor, unchanged) = store.thread_view_snapshot("th_view").unwrap();
+        let (unchanged_cursor, unchanged) =
+            store.thread_view_snapshot("th_view", None, 256).unwrap();
         let changes_after = store.conn.lock().unwrap().total_changes();
         assert_eq!(unchanged_cursor, second_cursor);
         assert_eq!(unchanged.items, second.items);
@@ -5387,9 +5424,27 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (rebuilt_cursor, rebuilt) = store.thread_view_snapshot("th_view").unwrap();
+        let (rebuilt_cursor, rebuilt) = store.thread_view_snapshot("th_view", None, 256).unwrap();
         assert_eq!(rebuilt_cursor, second_cursor);
         assert_eq!(rebuilt.items, second.items);
+
+        for index in 0..300 {
+            store
+                .append_event(
+                    scope.clone(),
+                    Event::UserMessage {
+                        turn: 2,
+                        content: format!("historical message {index}"),
+                        attachments: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        let (_, bounded) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert_eq!(bounded.items.len(), 256);
+        assert_eq!(bounded.total_items, 303);
+        assert_eq!(bounded.item_offset, 47);
+        assert!(bounded.has_older);
     }
 
     #[test]

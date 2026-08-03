@@ -120,6 +120,14 @@ struct ChatWindow {
     following_tail: bool,
 }
 
+#[derive(Debug, Default)]
+struct ThreadHistory {
+    item_offset: u64,
+    has_older: bool,
+    loading_older: bool,
+    pending_anchor: Option<(usize, f32)>,
+}
+
 impl ChatWindow {
     fn update(&mut self, total: usize, bookmark: Option<usize>) {
         if total == 0 {
@@ -178,6 +186,12 @@ impl ChatWindow {
         (self.start..self.end)
             .contains(&absolute_row)
             .then_some(absolute_row - self.start)
+    }
+
+    fn shift_for_prepended_rows(&mut self, added: usize) {
+        self.start = self.start.saturating_add(added).min(self.total);
+        self.end = self.end.saturating_add(added).min(self.total);
+        self.following_tail = false;
     }
 
     fn prepend(&mut self) -> bool {
@@ -807,6 +821,12 @@ pub enum UiCommand {
         String,
         Result<(u64, trouve_protocol::ThreadViewSnapshot), String>,
     ),
+    /// An older folded-item page requested when the reader reaches the top
+    /// of the currently loaded transcript.
+    ThreadHistoryLoaded(
+        String,
+        Result<(u64, trouve_protocol::ThreadViewSnapshot), String>,
+    ),
 }
 
 /// What a left-nav row maps back to.
@@ -1048,6 +1068,8 @@ struct Controller {
     /// Per-thread slice of the fully rendered transcript installed in Slint.
     /// Older rows are prepended on demand as the reader approaches the top.
     chat_windows: HashMap<String, ChatWindow>,
+    /// Server-backed folded-item pagination state per followed thread.
+    thread_history: HashMap<String, ThreadHistory>,
     row_call_ids: Vec<Option<String>>,
     /// Question-wizard state per pending request id (page, selections,
     /// "Other" texts); dropped once the request resolves.
@@ -1257,6 +1279,7 @@ pub async fn run(
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         chat_windows: HashMap::new(),
+        thread_history: HashMap::new(),
         row_call_ids: Vec::new(),
         wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
@@ -2000,6 +2023,7 @@ impl Controller {
             self.update_session_attention(thread_id, before, AttentionCounts::default());
         self.vms.remove(thread_id);
         self.chat_windows.remove(thread_id);
+        self.thread_history.remove(thread_id);
         self.thread_sessions.remove(thread_id);
         attention_changed
     }
@@ -2696,7 +2720,7 @@ impl Controller {
         let task = tokio::spawn(async move {
             use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
             let snapshot = client
-                .thread_view(&thread_id)
+                .thread_view(&thread_id, None)
                 .await
                 .map_err(|error| format!("{error:#}"));
             let initial_cursor = snapshot.as_ref().map(|(cursor, _)| *cursor).unwrap_or(0);
@@ -2779,6 +2803,25 @@ impl Controller {
             }
         });
         self.follower_tasks.insert(follower_id, task);
+    }
+
+    fn load_older_thread_history(&mut self, thread_id: String, anchor: usize, offset: f32) {
+        let history = self.thread_history.entry(thread_id.clone()).or_default();
+        if !history.has_older || history.loading_older || history.item_offset == 0 {
+            return;
+        }
+        history.loading_older = true;
+        history.pending_anchor = Some((anchor, offset));
+        let before = history.item_offset;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .thread_view(&thread_id, Some(before))
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UiCommand::ThreadHistoryLoaded(thread_id, result));
+        });
     }
 
     /// Refresh the composer's "@"-mention path list for the open session, at
@@ -5122,7 +5165,7 @@ impl Controller {
                 if self.restoring_thread.as_deref() == Some(&thread_id) {
                     self.restoring_thread = None;
                 }
-                let (absolute_row, at_transcript_tail, refill) = {
+                let (absolute_row, at_transcript_tail, refill, load_older) = {
                     let Some(window) = self.chat_windows.get_mut(&thread_id) else {
                         return Ok(());
                     };
@@ -5130,9 +5173,10 @@ impl Controller {
                     let refilled = (row <= CHAT_HISTORY_REFILL_ROWS && window.prepend())
                         || (at_bottom && window.append());
                     let refill = refilled.then_some(absolute_row);
+                    let load_older = row <= CHAT_HISTORY_REFILL_ROWS && window.start == 0;
                     let at_transcript_tail = at_bottom && window.end >= window.total;
                     window.following_tail = at_transcript_tail;
-                    (absolute_row, at_transcript_tail, refill)
+                    (absolute_row, at_transcript_tail, refill, load_older)
                 };
                 let changed = if at_transcript_tail {
                     self.resume.thread_scroll.remove(&thread_id).is_some()
@@ -5162,9 +5206,12 @@ impl Controller {
                         .get(&thread_id)
                         .and_then(|window| window.local_row(anchor))
                     {
-                        self.restoring_thread = Some(thread_id);
+                        self.restoring_thread = Some(thread_id.clone());
                         ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
                     }
+                }
+                if load_older {
+                    self.load_older_thread_history(thread_id, absolute_row, offset.max(0.0));
                 }
             }
             UiCommand::SendMessage(text) => {
@@ -7279,6 +7326,14 @@ impl Controller {
                     if !self.followed.contains(&thread_id) {
                         return Ok(());
                     }
+                    self.thread_history.insert(
+                        thread_id.clone(),
+                        ThreadHistory {
+                            item_offset: snapshot.item_offset,
+                            has_older: snapshot.has_older,
+                            ..Default::default()
+                        },
+                    );
                     let before = self
                         .vms
                         .get(&thread_id)
@@ -7318,6 +7373,88 @@ impl Controller {
                     tracing::warn!("loading thread view for {thread_id}: {error}");
                 }
             },
+            UiCommand::ThreadHistoryLoaded(thread_id, result) => {
+                let (current_offset, pending_anchor) = {
+                    let history = self.thread_history.entry(thread_id.clone()).or_default();
+                    history.loading_older = false;
+                    (history.item_offset, history.pending_anchor.take())
+                };
+                match result {
+                    Ok((_cursor, snapshot)) => {
+                        if !self.followed.contains(&thread_id) {
+                            return Ok(());
+                        }
+                        let page_end = snapshot.item_offset + snapshot.items.len() as u64;
+                        if page_end != current_offset {
+                            tracing::warn!(
+                                "discarding non-contiguous thread history page for {thread_id}: \
+                                 expected end {current_offset}, got {page_end}"
+                            );
+                            return Ok(());
+                        }
+                        let item_offset = snapshot.item_offset;
+                        let has_older = snapshot.has_older;
+                        let older_items = ThreadViewModel::from(snapshot).items;
+                        if older_items.is_empty() {
+                            if let Some(history) = self.thread_history.get_mut(&thread_id) {
+                                history.has_older = false;
+                            }
+                            return Ok(());
+                        }
+                        self.vms
+                            .entry(thread_id.clone())
+                            .or_default()
+                            .items
+                            .splice(0..0, older_items);
+                        if let Some(history) = self.thread_history.get_mut(&thread_id) {
+                            history.item_offset = item_offset;
+                            history.has_older = has_older;
+                        }
+
+                        if self.current_thread_id().as_deref() == Some(&thread_id) {
+                            let old_window = self
+                                .chat_windows
+                                .get(&thread_id)
+                                .copied()
+                                .unwrap_or_default();
+                            self.render_chat(false);
+                            let new_total = self
+                                .chat_windows
+                                .get(&thread_id)
+                                .map_or(0, |window| window.total);
+                            let added = new_total.saturating_sub(old_window.total);
+                            if let Some(window) = self.chat_windows.get_mut(&thread_id) {
+                                window.shift_for_prepended_rows(added);
+                            }
+                            if let Some((anchor, offset)) = pending_anchor {
+                                let shifted = anchor.saturating_add(added);
+                                self.resume.thread_scroll.insert(
+                                    thread_id.clone(),
+                                    crate::winstate::ChatScrollBookmark {
+                                        row: shifted,
+                                        offset,
+                                    },
+                                );
+                                crate::winstate::save_resume(&self.resume);
+                                self.render_chat(false);
+                                if let Some(local_row) = self
+                                    .chat_windows
+                                    .get(&thread_id)
+                                    .and_then(|window| window.local_row(shifted))
+                                {
+                                    self.restoring_thread = Some(thread_id);
+                                    ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
+                                }
+                            } else {
+                                self.render_chat(false);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("loading older thread history for {thread_id}: {error}");
+                    }
+                }
+            }
             UiCommand::SessionThreadsLoaded(session_id, result) => match result {
                 Ok(threads) => {
                     if !self.watched_sessions.contains(&session_id) {
@@ -8750,6 +8887,19 @@ mod tests {
         assert_eq!(window.range(), 180..500);
         assert_eq!(window.local_row(340), Some(160));
         assert_eq!(window.absolute_row(160), 340);
+    }
+
+    #[test]
+    fn chat_window_preserves_anchor_when_server_page_is_prepended() {
+        let mut window = ChatWindow::default();
+        window.update(256, Some(20));
+        assert_eq!(window.range(), 0..160);
+
+        window.update(512, Some(20));
+        window.shift_for_prepended_rows(256);
+        assert_eq!(window.range(), 256..416);
+        assert_eq!(window.local_row(276), Some(20));
+        assert!(!window.following_tail);
     }
 
     #[test]

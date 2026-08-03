@@ -144,7 +144,9 @@ pub use requests::*;
 // wire, while values above 32 are normalized to the response maximum of 32.
 // 2.3: folded thread-view snapshots expose their event cursor so clients can
 // open long chats without replaying retained history from cursor zero.
-pub const PROTOCOL_VERSION: &str = "2.3";
+// 2.4: thread-view snapshots expose bounded folded-item pages and backward
+// pagination metadata so clients never render the complete transcript eagerly.
+pub const PROTOCOL_VERSION: &str = "2.4";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

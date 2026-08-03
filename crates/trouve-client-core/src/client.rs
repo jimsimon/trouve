@@ -198,8 +198,15 @@ impl ProtocolClient {
             .await
     }
 
-    pub async fn thread_view(&self, thread_id: &str) -> Result<(u64, ThreadViewSnapshot)> {
-        let path = format!("/threads/{thread_id}/view");
+    pub async fn thread_view(
+        &self,
+        thread_id: &str,
+        before: Option<u64>,
+    ) -> Result<(u64, ThreadViewSnapshot)> {
+        let mut path = format!("/threads/{thread_id}/view?limit=256");
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
         let response = self
             .http
             .get(format!("{}{path}", self.base))

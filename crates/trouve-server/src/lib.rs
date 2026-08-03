@@ -35,10 +35,10 @@ use trouve_protocol::{
     ServerInfo, Session, SessionDiff, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
     SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -205,6 +205,7 @@ impl IntoResponse for ApiError {
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
+        ThreadViewQuery,
         ThreadViewSnapshot,
         trouve_protocol::ThreadViewItem,
         trouve_protocol::ThreadToolStatus,
@@ -1118,7 +1119,12 @@ async fn get_thread(
     Ok(Json(engine.get_thread(&id)?))
 }
 
-#[utoipa::path(get, path = "/v1/threads/{id}/view", params(("id" = String, Path,)),
+#[utoipa::path(get, path = "/v1/threads/{id}/view",
+    params(
+        ("id" = String, Path,),
+        ("before" = Option<u64>, Query, description = "Exclusive folded-item offset for backward pagination"),
+        ("limit" = Option<u32>, Query, description = "Requested item count; capped by the server")
+    ),
     responses(
         (status = 200, body = ThreadViewSnapshot,
             headers(("x-trouve-event-cursor" = u64, description = "Thread event cursor for this snapshot"))),
@@ -1127,14 +1133,23 @@ async fn get_thread(
 async fn get_thread_view(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
+    Query(query): Query<ThreadViewQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (cursor, snapshot) = tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id))
-        .await
-        .map_err(|error| {
-            ApiError(EngineError::Internal(anyhow::anyhow!(
-                "thread view worker failed: {error}"
-            )))
-        })??;
+    const MAX_ITEMS: usize = 512;
+    // Omitting `limit` preserves the complete-snapshot behavior for 2.3
+    // clients. Pagination-aware clients always send an explicit bound.
+    let limit = query
+        .limit
+        .map(|limit| (limit as usize).clamp(1, MAX_ITEMS))
+        .unwrap_or(usize::MAX);
+    let (cursor, snapshot) =
+        tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id, query.before, limit))
+            .await
+            .map_err(|error| {
+                ApiError(EngineError::Internal(anyhow::anyhow!(
+                    "thread view worker failed: {error}"
+                )))
+            })??;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
 }
 

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.3"
+    "version": "2.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -3872,6 +3872,28 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Exclusive folded-item offset for backward pagination",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Requested item count; capped by the server",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
             }
           }
         ],
@@ -9127,9 +9149,32 @@
         ],
         "description": "One folded, renderable row in a thread snapshot. Raw streaming fragments\nremain in the event log; snapshots expose their current semantic form."
       },
+      "ThreadViewQuery": {
+        "type": "object",
+        "properties": {
+          "before": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exclusive folded-item offset for backward pagination. Omit for the\nnewest page.",
+            "minimum": 0
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Requested item count; the server applies a safe upper bound.",
+            "minimum": 0
+          }
+        }
+      },
       "ThreadViewSnapshot": {
         "type": "object",
-        "description": "Folded current thread state at the cursor returned in\n`x-trouve-event-cursor`. Clients seed their view from this response and\nsubscribe to the thread event stream after that cursor.",
+        "description": "Folded current thread state and one transcript item page at the cursor\nreturned in `x-trouve-event-cursor`. Clients seed their view from this\nresponse and subscribe to the thread event stream after that cursor.",
         "required": [
           "items"
         ],
@@ -9142,6 +9187,16 @@
           },
           "compacting": {
             "type": "boolean"
+          },
+          "has_older": {
+            "type": "boolean",
+            "description": "Whether another page exists before `item_offset`."
+          },
+          "item_offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Zero-based index of `items[0]` in the complete folded transcript.",
+            "minimum": 0
           },
           "items": {
             "type": "array",
@@ -9185,6 +9240,12 @@
             "items": {
               "$ref": "#/components/schemas/TodoItem"
             }
+          },
+          "total_items": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of folded items in the complete transcript at this snapshot.",
+            "minimum": 0
           },
           "turn_duration_ms": {
             "type": "object",

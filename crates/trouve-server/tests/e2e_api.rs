@@ -401,6 +401,33 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
             .any(|item| item["kind"] == "tool_call" && item["status"] == "ok")
     );
     assert_eq!(view["turn_running"], false);
+    let total_items = view["total_items"].as_u64().unwrap();
+    assert!(total_items > 1);
+    let tail: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view?limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tail["items"].as_array().unwrap().len(), 1);
+    assert_eq!(tail["item_offset"], total_items - 1);
+    assert_eq!(tail["total_items"], total_items);
+    assert_eq!(tail["has_older"], true);
+    let older: serde_json::Value = client
+        .get(format!(
+            "{base}/threads/{thread_id}/view?limit=1&before={}",
+            tail["item_offset"].as_u64().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(older["items"].as_array().unwrap().len(), 1);
+    assert_eq!(older["item_offset"], total_items - 2);
 
     // Usage accounting aggregates the turn.
     let usage: serde_json::Value = client
