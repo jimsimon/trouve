@@ -428,6 +428,15 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .unwrap();
     assert_eq!(older["items"].as_array().unwrap().len(), 1);
     assert_eq!(older["item_offset"], total_items - 2);
+    let capped: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view?limit=10000"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(capped["items"].as_array().unwrap().len() <= 512);
 
     // Usage accounting aggregates the turn.
     let usage: serde_json::Value = client

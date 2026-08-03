@@ -225,6 +225,16 @@ impl ChatWindow {
     }
 }
 
+fn invalidate_background_thread_history(
+    thread_id: &str,
+    chat_windows: &mut HashMap<String, ChatWindow>,
+    resume: &mut crate::winstate::Resume,
+) -> bool {
+    let window_removed = chat_windows.remove(thread_id).is_some();
+    let bookmark_removed = resume.thread_scroll.remove(thread_id).is_some();
+    window_removed || bookmark_removed
+}
+
 /// During global history replay, only the newest state snapshot for each
 /// GitHub host matters. Lifecycle events are edge-triggered and stale ones are
 /// intentionally discarded by the controller.
@@ -2850,6 +2860,33 @@ impl Controller {
                 Err(e) => tracing::warn!("worktree path list for @-mentions failed: {e:#}"),
             }
         });
+    }
+
+    fn rendered_chat_row_count(&self, thread_id: &str) -> usize {
+        let Some(vm) = self.vms.get(thread_id) else {
+            return 0;
+        };
+        let raw_turns: HashSet<u64> = self
+            .raw_turns
+            .iter()
+            .filter(|(candidate, _)| candidate == thread_id)
+            .map(|(_, turn)| *turn)
+            .collect();
+        let collapsed: HashSet<String> = self
+            .collapsed_cards
+            .iter()
+            .filter(|(candidate, _)| candidate == thread_id)
+            .map(|(_, key)| key.clone())
+            .collect();
+        render::chat_rows(
+            vm,
+            &self.expanded_tools,
+            &raw_turns,
+            &collapsed,
+            &self.wizards,
+        )
+        .0
+        .len()
     }
 
     /// Re-fold the current thread into chat rows. `scroll` jumps the list to
@@ -7394,6 +7431,12 @@ impl Controller {
                         }
                         let item_offset = snapshot.item_offset;
                         let has_older = snapshot.has_older;
+                        let is_current = self.current_thread_id().as_deref() == Some(&thread_id);
+                        let old_row_count = if is_current {
+                            self.rendered_chat_row_count(&thread_id)
+                        } else {
+                            0
+                        };
                         let older_items = ThreadViewModel::from(snapshot).items;
                         if older_items.is_empty() {
                             if let Some(history) = self.thread_history.get_mut(&thread_id) {
@@ -7411,22 +7454,14 @@ impl Controller {
                             history.has_older = has_older;
                         }
 
-                        if self.current_thread_id().as_deref() == Some(&thread_id) {
-                            let old_window = self
-                                .chat_windows
-                                .get(&thread_id)
-                                .copied()
-                                .unwrap_or_default();
-                            self.render_chat(false);
-                            let new_total = self
-                                .chat_windows
-                                .get(&thread_id)
-                                .map_or(0, |window| window.total);
-                            let added = new_total.saturating_sub(old_window.total);
+                        if is_current {
+                            let new_row_count = self.rendered_chat_row_count(&thread_id);
+                            let added = new_row_count.saturating_sub(old_row_count);
                             if let Some(window) = self.chat_windows.get_mut(&thread_id) {
+                                window.total = new_row_count;
                                 window.shift_for_prepended_rows(added);
                             }
-                            if let Some((anchor, offset)) = pending_anchor {
+                            let restore = if let Some((anchor, offset)) = pending_anchor {
                                 let shifted = anchor.saturating_add(added);
                                 self.resume.thread_scroll.insert(
                                     thread_id.clone(),
@@ -7435,19 +7470,34 @@ impl Controller {
                                         offset,
                                     },
                                 );
+                                Some((shifted, offset))
+                            } else if let Some(bookmark) =
+                                self.resume.thread_scroll.get_mut(&thread_id)
+                            {
+                                bookmark.row = bookmark.row.saturating_add(added);
+                                Some((bookmark.row, bookmark.offset))
+                            } else {
+                                None
+                            };
+                            if restore.is_some() {
                                 crate::winstate::save_resume(&self.resume);
-                                self.render_chat(false);
-                                if let Some(local_row) = self
+                            }
+                            self.render_chat(false);
+                            if let Some((shifted, offset)) = restore
+                                && let Some(local_row) = self
                                     .chat_windows
                                     .get(&thread_id)
                                     .and_then(|window| window.local_row(shifted))
-                                {
-                                    self.restoring_thread = Some(thread_id);
-                                    ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
-                                }
-                            } else {
-                                self.render_chat(false);
+                            {
+                                self.restoring_thread = Some(thread_id);
+                                ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
                             }
+                        } else if invalidate_background_thread_history(
+                            &thread_id,
+                            &mut self.chat_windows,
+                            &mut self.resume,
+                        ) {
+                            crate::winstate::save_resume(&self.resume);
                         }
                     }
                     Err(error) => {
@@ -8346,12 +8396,13 @@ mod tests {
         ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
         THREAD_REPLAY_IDLE_FLUSH, ThreadReplayBuffer, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        is_web_url, merge_pill, model_health_view, pr_badge, project_session_prs,
-        provider_login_requires_code, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, session_title_fallback, should_open_chat_at_tail, thinking_property,
-        wait_for_thread_replay_idle,
+        invalidate_background_thread_history, is_web_url, merge_pill, model_health_view, pr_badge,
+        project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
+        thinking_property, wait_for_thread_replay_idle,
     };
     use chrono::{Duration, TimeZone, Utc};
+    use std::collections::HashMap;
     use trouve_protocol::{
         CheckRun, Event, EventEnvelope, GithubPrList, PrInfo, PrReview, Scope, Session,
         SubscriptionHealth, SubscriptionWindow, Workspace,
@@ -8900,6 +8951,55 @@ mod tests {
         assert_eq!(window.range(), 256..416);
         assert_eq!(window.local_row(276), Some(20));
         assert!(!window.following_tail);
+    }
+
+    #[test]
+    fn thread_history_loaded_invalidates_background_thread_only() {
+        let selected = ChatWindow {
+            start: 40,
+            end: 200,
+            total: 300,
+            initialized: true,
+            following_tail: false,
+        };
+        let mut windows = HashMap::from([
+            ("selected".to_string(), selected),
+            (
+                "background".to_string(),
+                ChatWindow {
+                    start: 0,
+                    end: 160,
+                    total: 256,
+                    initialized: true,
+                    following_tail: false,
+                },
+            ),
+        ]);
+        let mut resume = crate::winstate::Resume::default();
+        resume.thread_scroll.insert(
+            "selected".into(),
+            crate::winstate::ChatScrollBookmark {
+                row: 60,
+                offset: 3.0,
+            },
+        );
+        resume.thread_scroll.insert(
+            "background".into(),
+            crate::winstate::ChatScrollBookmark {
+                row: 20,
+                offset: 4.0,
+            },
+        );
+
+        assert!(invalidate_background_thread_history(
+            "background",
+            &mut windows,
+            &mut resume,
+        ));
+        assert_eq!(windows.get("selected"), Some(&selected));
+        assert!(!windows.contains_key("background"));
+        assert_eq!(resume.thread_scroll["selected"].row, 60);
+        assert!(!resume.thread_scroll.contains_key("background"));
     }
 
     #[test]
