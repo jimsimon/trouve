@@ -6118,12 +6118,14 @@ impl Controller {
             UiCommand::Undo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.undo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
             UiCommand::Redo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.redo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
