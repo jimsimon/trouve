@@ -4081,16 +4081,11 @@ impl Engine {
         self.store.insert_session(&session)?;
 
         // Checkpoint 0: pristine state, so the first turn can be undone.
-        let commit = {
-            let wt = worktree_path.clone();
-            let sid = session_id.clone();
-            tokio::task::spawn_blocking(move || {
-                git::checkpoint(&wt, &sid, 0, "trouve: session start")
-            })
+        let commit = self
+            .executor
+            .checkpoint_worktree(&worktree_path, &session_id, 0, "trouve: session start")
             .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)?
-        };
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let checkpoint_id = new_id("cp");
         self.store.append_checkpoint(&CheckpointRow {
             id: checkpoint_id.clone(),
@@ -7337,12 +7332,12 @@ impl Engine {
             return Ok(None);
         }
         let seq = self.store.latest_checkpoint_seq(&session.id)?.unwrap_or(-1) + 1;
-        let commit = {
-            let wt = worktree.clone();
-            let sid = session.id.clone();
-            let msg = format!("trouve: turn {turn} of {}", thread.id);
-            tokio::task::spawn_blocking(move || git::checkpoint(&wt, &sid, seq, &msg)).await??
-        };
+        let message = format!("trouve: turn {turn} of {}", thread.id);
+        let commit = self
+            .executor
+            .checkpoint_worktree(&worktree, &session.id, seq, &message)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let checkpoint_id = new_id("cp");
         self.store.append_checkpoint(&CheckpointRow {
             id: checkpoint_id.clone(),

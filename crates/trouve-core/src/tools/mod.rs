@@ -127,6 +127,17 @@ pub trait ToolExecutor: Send + Sync {
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
+    /// Create an engine-owned worktree checkpoint through the same trusted
+    /// execution boundary as other Git mutations.
+    async fn checkpoint_worktree(
+        &self,
+        _worktree: &Path,
+        _session_id: &str,
+        _seq: i64,
+        _message: &str,
+    ) -> Result<String, String> {
+        Err("worktree checkpointing is unavailable in this executor".into())
+    }
     /// Prepare the trusted local mirror used by the headless review service.
     /// This is intentionally part of the executor rather than review runtime
     /// code so git/network/filesystem mutations retain one chokepoint.
@@ -287,6 +298,24 @@ impl ToolExecutor for LocalToolExecutor {
             Some(tool) => tool.run(ctx, args).await,
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
+    }
+
+    async fn checkpoint_worktree(
+        &self,
+        worktree: &Path,
+        session_id: &str,
+        seq: i64,
+        message: &str,
+    ) -> Result<String, String> {
+        let worktree = worktree.to_path_buf();
+        let session_id = session_id.to_string();
+        let message = message.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::git::checkpoint(&worktree, &session_id, seq, &message)
+        })
+        .await
+        .map_err(|error| format!("checkpoint worker failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
     }
 
     async fn sync_review_repository(
