@@ -4371,12 +4371,19 @@ impl Engine {
                 eligible_findings.push(finding);
             }
         }
-        self.store.set_code_review_findings_publication_status(
+        self.persist_publication_status_best_effort(
+            &job.id,
             &ineligible_ids,
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
-        )?;
+        );
         if comments.is_empty() {
-            self.store.release_code_review_publication_claim(&job.id)?;
+            if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "releasing empty GitHub review publication claim failed"
+                );
+            }
             return Ok(String::new());
         }
         let eligible_ids = eligible_findings
@@ -8326,6 +8333,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_review_release_failures_do_not_abort_and_recover() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("review-release.sqlite3");
+        let store = crate::store::Store::open(&database).unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:empty-release-failure");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One general issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: String::new(),
+                    line: 0,
+                    side: "RIGHT".into(),
+                    severity: "low".into(),
+                    body: "General issue.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_publication_claim_release
+                 BEFORE UPDATE OF publication_claimed ON code_review_jobs
+                 WHEN OLD.publication_claimed = 1 AND NEW.publication_claimed = 0
+                 BEGIN
+                    SELECT RAISE(FAIL, 'publication claim release blocked');
+                 END;",
+            )
+            .unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            "http://127.0.0.1:1",
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.publish_review(&api, &job, &findings).await.unwrap(),
+            ""
+        );
+        assert!(
+            engine
+                .store
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .publication_claimed
+        );
+
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_publication_claim_release;")
+            .unwrap();
+        engine.store.recover_code_review_jobs().unwrap();
+        assert!(
+            !engine
+                .store
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .publication_claimed
+        );
+    }
+
+    #[tokio::test]
     async fn publication_status_write_failures_do_not_mask_github_errors() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -8336,18 +8420,29 @@ mod tests {
         let findings = store
             .save_code_review_result(
                 &job.id,
-                "One issue.",
-                "Fix it.",
-                1,
-                &[NewCodeReviewFinding {
-                    path: "src/lib.rs".into(),
-                    line: 42,
-                    side: "RIGHT".into(),
-                    severity: "high".into(),
-                    body: "Eligible issue.".into(),
-                    prompt_for_agents: "Fix it.".into(),
-                    sources: Vec::new(),
-                }],
+                "Two issues.",
+                "Fix both.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 42,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        body: "Eligible issue.".into(),
+                        prompt_for_agents: "Fix it.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: String::new(),
+                        line: 0,
+                        side: "RIGHT".into(),
+                        severity: "low".into(),
+                        body: "General issue.".into(),
+                        prompt_for_agents: "Fix it too.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
                 &[],
             )
             .unwrap();
