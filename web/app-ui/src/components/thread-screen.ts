@@ -129,7 +129,11 @@ type VirtualChatItem = VirtualItem & (
   | { readonly kind: "unit"; readonly unitIndex: number }
   | { readonly kind: "compacting" }
   | { readonly kind: "activity"; readonly label: string }
+  | { readonly kind: "edge-spacer"; readonly edge: "start" | "end" }
 );
+
+const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
+const CHAT_END_SPACER_ID = "ephemeral:chat-end-spacer";
 
 interface ActiveComposerCompletion {
   readonly token: ComposerCompletionToken;
@@ -239,6 +243,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #resizeObserver: ResizeObserver | undefined;
   #resizeFrame: number | undefined;
   #viewportHeight = 0;
+  #programmaticScrollFrame: number | undefined;
+  #chatScrollIntent = false;
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
@@ -367,6 +373,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         globalThis.cancelAnimationFrame(this.#resizeFrame);
         this.#resizeFrame = undefined;
       }
+      this.#cancelProgrammaticScrollWindow();
       this.#virtualizer = new Virtualizer<VirtualChatItem>({
         estimatedHeight: 120,
         overscanPx: 480,
@@ -374,6 +381,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         mode: this.#accessibleHistory ? "accessible" : "virtual",
       });
       this.#viewportHeight = 0;
+      this.#chatScrollIntent = false;
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#threadProvider.setValue({ threadId: this.threadId });
@@ -430,14 +438,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     if (viewport.clientHeight !== this.#viewportHeight) {
       this.#viewportHeight = viewport.clientHeight;
-      const expected = this.#virtualizer.window().scrollTop;
-      viewport.scrollTop = expected;
-      this.#virtualizer.setViewport(expected, viewport.clientHeight);
+      const expected = this.#virtualizer.resizeViewport(viewport.clientHeight).scrollTop;
+      this.#setChatScrollTop(viewport, expected);
       this.requestUpdate();
       return;
     }
     const expected = this.#virtualizer.window().scrollTop;
-    if (Math.abs(viewport.scrollTop - expected) > 0.5) viewport.scrollTop = expected;
+    this.#setChatScrollTop(viewport, expected);
     if (typeof ResizeObserver === "undefined") return;
     this.#resizeObserver ??= new ResizeObserver((entries) => {
       const activeViewport = this.querySelector<HTMLElement>(".chat-stream");
@@ -459,7 +466,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
       }
       if (corrected) {
-        activeViewport.scrollTop = scrollTop;
+        this.#setChatScrollTop(activeViewport, scrollTop);
         this.#resizeFrame ??= globalThis.requestAnimationFrame(() => {
           this.#resizeFrame = undefined;
           if (this.isConnected) this.requestUpdate();
@@ -479,6 +486,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       globalThis.cancelAnimationFrame(this.#resizeFrame);
       this.#resizeFrame = undefined;
     }
+    this.#cancelProgrammaticScrollWindow();
     this.#copyFeedbackGeneration += 1;
     this.#usageGeneration += 1;
     this.#turnRequestGeneration += 1;
@@ -487,6 +495,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
+    this.#chatScrollIntent = false;
     super.disconnectedCallback();
   }
 
@@ -1105,6 +1114,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         estimatedHeight: 32,
       });
     }
+    if (virtualItems.length > 0) {
+      virtualItems.unshift({
+        id: CHAT_START_SPACER_ID,
+        kind: "edge-spacer",
+        edge: "start",
+        estimatedHeight: 10,
+      });
+      virtualItems.push({
+        id: CHAT_END_SPACER_ID,
+        kind: "edge-spacer",
+        edge: "end",
+        estimatedHeight: 18,
+      });
+    }
     this.#virtualizer.setMode(this.#accessibleHistory ? "accessible" : "virtual");
     this.#virtualizer.setItems(virtualItems);
     if (this.#restoredScrollThreadId !== this.threadId) {
@@ -1134,6 +1157,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-live=${window.followingTail ? "polite" : "off"}
         aria-relevant="additions text"
         aria-busy=${effectiveTurnRunning || compacting}
+        @wheel=${this.#chatScrollIntended}
+        @pointerdown=${this.#chatScrollIntended}
+        @touchstart=${this.#chatScrollIntended}
         @scroll=${this.#chatScrolled}
       >
         ${virtualItems.length === 0
@@ -1141,6 +1167,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : html`
               <div aria-hidden="true" style=${`height:${window.paddingBefore}px`}></div>
               ${repeat(window.items, ({ item }) => item.id, ({ item }) => {
+                if (item.kind === "edge-spacer") {
+                  return html`<div
+                    class=${`chat-edge-spacer ${item.edge}`}
+                    data-virtual-id=${item.id}
+                    aria-hidden="true"
+                  ></div>`;
+                }
                 if (item.kind === "compacting") {
                   return html`<div data-virtual-id=${item.id}>
                     <p class="activity-row" role="status">Compacting context…</p>
@@ -1497,24 +1530,71 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       viewport.dataset["threadId"] !== this.threadId ||
       this.#restoredScrollThreadId !== this.threadId
     ) return;
-    const renderedAtTail =
-      viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 32;
-    if (this.#virtualizer.window().followingTail && renderedAtTail) {
-      // Programmatic tail jumps can be clamped while measured row heights
-      // converge. Keep the semantic tail anchor when the DOM is visibly at
-      // its bottom; an intentional upward scroll still disables following.
-      this.#virtualizer.enableFollowTail();
-    } else {
-      this.#virtualizer.setViewport(viewport.scrollTop, viewport.clientHeight);
+    const tailGap = Math.max(
+      0,
+      viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+    );
+    const userInitiated = this.#chatScrollIntent;
+    this.#chatScrollIntent = false;
+    if (
+      this.#programmaticScrollFrame !== undefined
+      && !userInitiated
+      && this.#virtualizer.window().followingTail
+    ) {
+      // One jump can generate multiple scroll events while row measurements
+      // converge. Keep all of those events inside the correction window.
+      return;
     }
+    if (this.#virtualizer.window().followingTail && tailGap <= 1) return;
+    if (userInitiated) this.#cancelProgrammaticScrollWindow();
+    this.#virtualizer.setViewport(
+      viewport.scrollTop,
+      viewport.clientHeight,
+      { userInitiated: true },
+    );
     this.#emitChatPosition();
     this.requestUpdate();
   };
 
+  readonly #chatScrollIntended = (event: Event): void => {
+    if (event.type === "wheel") {
+      const wheel = event as WheelEvent;
+      if (wheel.deltaX === 0 && wheel.deltaY === 0) return;
+    }
+    if (event.type === "pointerdown") {
+      const target = event.target;
+      if (
+        target instanceof Element
+        && target.closest("button, a, input, textarea, select, summary") !== null
+      ) return;
+    }
+    this.#chatScrollIntent = true;
+  };
+
+  #setChatScrollTop(viewport: HTMLElement, scrollTop: number): void {
+    if (Math.abs(viewport.scrollTop - scrollTop) <= 0.5) return;
+    if (this.#programmaticScrollFrame !== undefined) {
+      globalThis.cancelAnimationFrame(this.#programmaticScrollFrame);
+    }
+    this.#programmaticScrollFrame = globalThis.requestAnimationFrame(() => {
+      this.#programmaticScrollFrame = globalThis.requestAnimationFrame(() => {
+        this.#programmaticScrollFrame = undefined;
+      });
+    });
+    viewport.scrollTop = scrollTop;
+  }
+
+  #cancelProgrammaticScrollWindow(): void {
+    if (this.#programmaticScrollFrame !== undefined) {
+      globalThis.cancelAnimationFrame(this.#programmaticScrollFrame);
+      this.#programmaticScrollFrame = undefined;
+    }
+  }
+
   readonly #followTail = (): void => {
     const correction = this.#virtualizer.enableFollowTail();
     const viewport = this.querySelector<HTMLElement>(".chat-stream");
-    if (viewport !== null) viewport.scrollTop = correction.scrollTop;
+    if (viewport !== null) this.#setChatScrollTop(viewport, correction.scrollTop);
     this.#emitChatPosition();
     this.requestUpdate();
   };

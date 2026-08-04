@@ -182,7 +182,7 @@ const installProtocolFixtures = async (
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "2.4",
+        protocol_version: "2.9",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -753,6 +753,7 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
   });
@@ -767,6 +768,21 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     "polite",
   );
   await expect(page.getByText("Virtual response 219", { exact: true })).toBeVisible();
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
+    viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
+  )).toBeLessThanOrEqual(1);
+
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -8 }));
+    viewport.scrollTop = Math.max(0, viewport.scrollTop - 8);
+    viewport.dispatchEvent(new Event("scroll"));
+  });
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
+    viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
+  )).toBeGreaterThanOrEqual(7);
 
   const historyMode = page.getByRole("button", { name: "Use full history" });
   await historyMode.focus();
@@ -840,6 +856,21 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   );
   const activeAgent = page.locator(".agent-turn-card").last();
   await expect(activeAgent.locator(".agent-activity")).toContainText("Processing…");
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
+    viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
+  )).toBeLessThanOrEqual(1);
+  expect(await page.locator("trouve-thread-screen.thread-panel").evaluate((panel) => {
+    const chat = panel.querySelector<HTMLElement>(".chat-stream")?.getBoundingClientRect();
+    const queue = panel.querySelector<HTMLElement>(".queue-panel")?.getBoundingClientRect();
+    const activity = panel.querySelector<HTMLElement>(".agent-activity")?.getBoundingClientRect();
+    if (chat === undefined || queue === undefined || activity === undefined) {
+      return ["missing chat, queue, or activity"];
+    }
+    const findings: string[] = [];
+    if (chat.bottom > queue.top + 1) findings.push("queue overlaps chat viewport");
+    if (activity.bottom > chat.bottom + 1) findings.push("activity is clipped below chat viewport");
+    return findings;
+  })).toEqual([]);
   await page.locator("trouve-app").evaluate((element) => {
     element.setAttribute("data-reduce-motion", "");
   });

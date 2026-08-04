@@ -64,6 +64,33 @@ describe("Virtualizer", () => {
     expect(virtualizer.window().scrollTop).toBe(100);
   });
 
+  it("honors an intentional near-tail scroll without snapping it back", () => {
+    const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
+    virtualizer.setViewport(0, 40);
+    virtualizer.setItems(items(10));
+    virtualizer.setViewport(152, 40, { userInitiated: true });
+    expect(virtualizer.window().scrollTop).toBe(152);
+    expect(virtualizer.window().followingTail).toBe(false);
+    virtualizer.setItems(items(11));
+    expect(virtualizer.window().scrollTop).toBe(152);
+  });
+
+  it("keeps the live tail anchored when the viewport changes height", () => {
+    const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
+    virtualizer.setViewport(0, 40);
+    virtualizer.setItems(items(10));
+    expect(virtualizer.window().scrollTop).toBe(160);
+
+    expect(virtualizer.resizeViewport(80).scrollTop).toBe(120);
+    expect(virtualizer.window().followingTail).toBe(true);
+    expect(virtualizer.resizeViewport(20).scrollTop).toBe(180);
+    expect(virtualizer.window().followingTail).toBe(true);
+
+    virtualizer.setViewport(75, 20);
+    expect(virtualizer.window().followingTail).toBe(false);
+    expect(virtualizer.resizeViewport(60).scrollTop).toBe(75);
+  });
+
   it("round-trips a stable parked-history bookmark and clears it at the tail", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
     virtualizer.setViewport(0, 40);

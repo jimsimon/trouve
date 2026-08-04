@@ -77,7 +77,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "2.4",
+        protocol_version: "2.9",
         online: true,
       },
       "GET /v1/session-summaries": {

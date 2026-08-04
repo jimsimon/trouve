@@ -119,7 +119,11 @@ export class Virtualizer<T extends VirtualItem> {
     return correction(previousScrollTop, this.#scrollTop);
   }
 
-  setViewport(scrollTop: number, viewportHeight: number): void {
+  setViewport(
+    scrollTop: number,
+    viewportHeight: number,
+    options: { readonly userInitiated?: boolean } = {},
+  ): void {
     if (!Number.isFinite(scrollTop) || scrollTop < 0) {
       throw new RangeError("scrollTop must be a non-negative finite number");
     }
@@ -130,13 +134,29 @@ export class Virtualizer<T extends VirtualItem> {
     this.#scrollTop = this.#clampScroll(scrollTop);
     if (
       this.#followingTail &&
-      this.#tailScrollTop() - this.#scrollTop > this.#tailTolerancePx
+      (options.userInitiated === true
+        || this.#tailScrollTop() - this.#scrollTop > this.#tailTolerancePx)
     ) {
       // Once the user intentionally leaves the tail, only enableFollowTail()
       // resumes it. Merely scrolling near the bottom does not steal control.
       this.#followingTail = false;
     }
     this.#anchor = this.#captureAnchor();
+  }
+
+  /** Update only the viewport size. A live-tail resize must remain anchored
+   * to the new bottom, while parked history keeps its existing top anchor. */
+  resizeViewport(viewportHeight: number): ScrollCorrection {
+    if (!Number.isFinite(viewportHeight) || viewportHeight < 0) {
+      throw new RangeError("viewportHeight must be a non-negative finite number");
+    }
+    const previousScrollTop = this.#scrollTop;
+    this.#viewportHeight = viewportHeight;
+    this.#scrollTop = this.#followingTail
+      ? this.#tailScrollTop()
+      : this.#clampScroll(this.#scrollTop);
+    this.#anchor = this.#captureAnchor();
+    return correction(previousScrollTop, this.#scrollTop);
   }
 
   enableFollowTail(): ScrollCorrection {
