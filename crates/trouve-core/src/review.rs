@@ -487,6 +487,8 @@ struct GithubPullRef {
 #[derive(Clone, Deserialize)]
 struct GithubUser {
     login: String,
+    #[serde(default, rename = "type")]
+    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -645,6 +647,10 @@ struct PublishedReview {
     html_url: String,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    commit_id: String,
+    #[serde(default)]
+    user: Option<GithubUser>,
 }
 
 #[derive(Deserialize)]
@@ -1595,6 +1601,18 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
+        let existing = self
+            .store
+            .code_review_job(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        if existing.publication_claimed {
+            self.sync_code_review_projection(&existing.job).await;
+            return self
+                .store
+                .code_review_job(id)?
+                .map(|record| record.job)
+                .ok_or_else(|| EngineError::NotFound(format!("review job {id}")));
+        }
         let replacement = self
             .store
             .retry_code_review_job(id)
@@ -4358,6 +4376,7 @@ impl Engine {
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
         )?;
         if comments.is_empty() {
+            self.store.release_code_review_publication_claim(&job.id)?;
             return Ok(String::new());
         }
         let eligible_ids = eligible_findings
@@ -4378,12 +4397,18 @@ impl Engine {
         let rate = rate_info(response.headers());
         self.record_review_rate(rate);
         if status.is_success() {
-            self.store
-                .set_code_review_findings_publication_status(
-                    &eligible_ids,
-                    trouve_protocol::CodeReviewFindingPublicationStatus::Published,
-                )
-                .context("recording accepted GitHub review publication status")?;
+            if let Err(error) = self.store.mark_code_review_publication_accepted(&job.id) {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "recording accepted GitHub review outcome failed"
+                );
+            }
+            self.persist_publication_status_best_effort(
+                &job.id,
+                &eligible_ids,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+            );
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
@@ -4392,13 +4417,26 @@ impl Engine {
                         %error,
                         "GitHub accepted the review but its response body could not be read"
                     );
-                    let published = self
-                        .find_published_review(api, job)
-                        .await
-                        .context("reconciling accepted GitHub review")?;
-                    self.capture_published_review_comments(api, job, published.id, findings)
-                        .await;
-                    return Ok(published.html_url);
+                    return match self.find_published_review(api, job).await {
+                        Ok(published) => {
+                            self.capture_published_review_comments(
+                                api,
+                                job,
+                                published.id,
+                                findings,
+                            )
+                            .await;
+                            Ok(published.html_url)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                %error,
+                                "accepted GitHub review remains pending reconciliation"
+                            );
+                            Ok(String::new())
+                        }
+                    };
                 }
             };
             let published = match serde_json::from_str::<PublishedReview>(&body) {
@@ -4409,9 +4447,17 @@ impl Engine {
                         %error,
                         "GitHub accepted the review but returned an invalid response body"
                     );
-                    self.find_published_review(api, job)
-                        .await
-                        .context("reconciling accepted GitHub review")?
+                    match self.find_published_review(api, job).await {
+                        Ok(published) => published,
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                %error,
+                                "accepted GitHub review remains pending reconciliation"
+                            );
+                            return Ok(String::new());
+                        }
+                    }
                 }
             };
             self.capture_published_review_comments(api, job, published.id, findings)
@@ -4419,6 +4465,13 @@ impl Engine {
             Ok(published.html_url)
         } else {
             let body = response.text().await;
+            if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "releasing rejected GitHub review publication claim failed"
+                );
+            }
             self.persist_publication_status_best_effort(
                 &job.id,
                 &eligible_ids,
@@ -4439,7 +4492,8 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<PublishedReview> {
         let marker = inline_review_marker(&job.id);
-        for page in 1..=REVIEW_COMMENT_MAX_PAGES {
+        let mut page = 1_u64;
+        loop {
             let (reviews, rate): (Vec<PublishedReview>, _) = api
                 .get(&format!(
                     "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
@@ -4449,16 +4503,21 @@ impl Engine {
             self.record_review_rate(rate);
             let count = reviews.len();
             if let Some(review) = reviews.into_iter().find(|review| {
-                review
-                    .body
-                    .as_deref()
-                    .is_some_and(|body| body.contains(&marker))
+                review.commit_id == job.head_sha
+                    && review.user.as_ref().is_some_and(|user| user.kind == "Bot")
+                    && review
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body.contains(&marker))
             }) {
                 return Ok(review);
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
                 break;
             }
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("GitHub review pagination exceeded its page range"))?;
         }
         bail!("accepted GitHub review could not be found by its publication marker")
     }
@@ -4484,9 +4543,75 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<()> {
         let api = self.installation_api(job.installation_id).await?;
+        let publication = self
+            .sync_code_review_publication_projection(&api, job)
+            .await;
         let lifecycle = self.sync_code_review_lifecycle_projection(&api, job).await;
         let check = self.sync_code_review_check_projection(&api, job).await;
-        combine_projection_results(lifecycle, check)
+        combine_projection_results(publication, combine_projection_results(lifecycle, check))
+    }
+
+    async fn sync_code_review_publication_projection(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        let record = self
+            .store
+            .code_review_job(&job.id)?
+            .ok_or_else(|| anyhow!("review job no longer exists"))?;
+        if !record.publication_claimed {
+            return Ok(());
+        }
+        let terminal = matches!(
+            record.job.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "stale"
+        );
+        if !record.publication_accepted && !terminal {
+            return Ok(());
+        }
+        let findings = self.store.code_review_findings(&job.id)?;
+        let eligible = findings
+            .iter()
+            .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return Ok(());
+        }
+        let has_review_url = !record.job.review_url.is_empty()
+            && record.job.review_url != record.job.lifecycle_comment_url;
+        let fully_reconciled = record.publication_accepted
+            && has_review_url
+            && eligible.iter().all(|finding| {
+                finding.github_publication_status
+                    == trouve_protocol::CodeReviewFindingPublicationStatus::Published
+                    && !finding.github_comment_url.is_empty()
+            });
+        if fully_reconciled {
+            return Ok(());
+        }
+
+        let published = self.find_published_review(api, job).await?;
+        let eligible_ids = eligible
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        if !self.store.reconcile_code_review_publication(
+            &job.id,
+            &published.html_url,
+            &eligible_ids,
+        )? {
+            bail!("review job changed before accepted publication was reconciled");
+        }
+        if !self
+            .capture_published_review_comments(api, job, published.id, &findings)
+            .await
+        {
+            bail!("accepted GitHub review comments remain pending reconciliation");
+        }
+        self.emit_code_review_job_updated(&job.id)?;
+        self.emit_code_review_updated(Some(job.id.clone()))?;
+        Ok(())
     }
 
     async fn sync_code_review_check_projection(
@@ -4864,16 +4989,16 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         review_id: u64,
         findings: &[trouve_protocol::CodeReviewFinding],
-    ) {
+    ) -> bool {
         if findings.is_empty() {
-            return;
+            return true;
         }
         let target_count = findings
             .iter()
             .filter(|finding| finding.line > 0 && !finding.path.trim().is_empty())
             .count();
         if target_count == 0 {
-            return;
+            return true;
         }
         let mut matched = HashSet::new();
         for page in 1..=REVIEW_COMMENT_MAX_PAGES {
@@ -4912,25 +5037,31 @@ impl Engine {
                 else {
                     continue;
                 };
-                matched.insert(finding.id.clone());
-                if let Err(error) = self.store.update_code_review_finding_publication(
+                match self.store.update_code_review_finding_publication(
                     &finding.id,
                     Some(comment.id),
                     &comment.html_url,
                     None,
                 ) {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        finding_id = %finding.id,
-                        %error,
-                        "recording published review comment URL failed"
-                    );
+                    Ok(true) => {
+                        matched.insert(finding.id.clone());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            finding_id = %finding.id,
+                            %error,
+                            "recording published review comment URL failed"
+                        );
+                    }
                 }
             }
             if matched.len() == target_count || count < REVIEW_COMMENT_PAGE_SIZE {
                 break;
             }
         }
+        matched.len() == target_count
     }
 }
 
@@ -7799,13 +7930,32 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let review_marker = inline_review_marker(&job.id);
+        let head_sha = job.head_sha.clone();
         let finding_marker = format!("trouve-code-review finding:{}", findings[0].id);
         let server = tokio::spawn(async move {
-            let published_reviews = serde_json::json!([{
-                "id": 77,
-                "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-77",
-                "body": review_marker,
-            }])
+            let published_reviews = serde_json::json!([
+                {
+                    "id": 75,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-75",
+                    "body": review_marker,
+                    "commit_id": head_sha,
+                    "user": {"login": "collaborator", "type": "User"},
+                },
+                {
+                    "id": 76,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-76",
+                    "body": review_marker,
+                    "commit_id": "3333333333333333333333333333333333333333",
+                    "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+                },
+                {
+                    "id": 77,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-77",
+                    "body": review_marker,
+                    "commit_id": head_sha,
+                    "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+                }
+            ])
             .to_string();
             let published_comments = serde_json::json!([{
                 "id": 101,
@@ -7902,7 +8052,10 @@ mod tests {
         let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_address = unavailable.local_addr().unwrap();
         let closed_server = tokio::spawn(async move {
-            let (stream, _) = unavailable.accept().await.unwrap();
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(1), unavailable.accept())
+                .await
+                .expect("publish_review did not issue the expected POST")
+                .unwrap();
             drop(stream);
         });
         let unavailable_api = GithubApi::with_base_url(
@@ -7922,6 +8075,159 @@ mod tests {
             engine.store.code_review_findings(&pending_job.id).unwrap()[0]
                 .github_publication_status,
             trouve_protocol::CodeReviewFindingPublicationStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_publication_is_reconciled_without_a_second_post() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:accepted-reconciliation");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "One issue.",
+                "Fix it.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "Eligible issue.".into(),
+                    prompt_for_agents: "Fix it.".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, status, body) in [
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews ",
+                    "201 Created",
+                    "{invalid-json",
+                ),
+                (
+                    "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ",
+                    "500 Internal Server Error",
+                    r#"{"message":"temporarily unavailable"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.publish_review(&api, &job, &findings).await.unwrap(),
+            ""
+        );
+        server.await.unwrap();
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.publication_claimed);
+        assert!(record.publication_accepted);
+        assert!(engine.store.retry_code_review_job(&job.id).is_err());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let marker = inline_review_marker(&job.id);
+        let finding_marker = format!("trouve-code-review finding:{}", findings[0].id);
+        let head_sha = job.head_sha.clone();
+        let server = tokio::spawn(async move {
+            let reviews = serde_json::json!([{
+                "id": 77,
+                "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-77",
+                "body": marker,
+                "commit_id": head_sha,
+                "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+            }])
+            .to_string();
+            let comments = serde_json::json!([{
+                "id": 101,
+                "html_url": "https://github.com/acme/widgets/pull/42#discussion_r101",
+                "body": finding_marker,
+            }])
+            .to_string();
+            for (expected, body) in [
+                (
+                    "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ",
+                    reviews,
+                ),
+                (
+                    "get /repos/acme/widgets/pulls/42/reviews/77/comments?per_page=100&page=1 ",
+                    comments,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .sync_code_review_publication_projection(&api, &job)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            record.job.review_url,
+            "https://github.com/acme/widgets/pull/42#pullrequestreview-77"
+        );
+        assert_eq!(
+            engine.store.code_review_findings(&job.id).unwrap()[0].github_comment_url,
+            "https://github.com/acme/widgets/pull/42#discussion_r101"
         );
     }
 
@@ -8030,18 +8336,15 @@ mod tests {
         )
         .unwrap();
 
-        let error = engine
-            .publish_review(&api, &job, &findings)
-            .await
-            .unwrap_err();
-        server.await.unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("recording accepted GitHub review publication status"),
-            "{error:#}"
+        assert_eq!(
+            engine.publish_review(&api, &job, &findings).await.unwrap(),
+            "https://github.com/review-77"
         );
-        assert!(format!("{error:#}").contains("publication status write blocked"));
+        server.await.unwrap();
+        assert_eq!(
+            engine.store.code_review_findings(&job.id).unwrap()[0].github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending
+        );
     }
 
     #[test]

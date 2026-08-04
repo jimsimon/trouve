@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -20,6 +21,8 @@ use trouve_protocol::{
 use trouve_thread_view::ThreadProjection;
 
 const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -229,7 +232,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   routing_mode TEXT NOT NULL DEFAULT 'additive',
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
-  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'
+  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
+  publication_accepted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -399,6 +403,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -483,6 +488,18 @@ fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()>
 
 fn migrate_code_review_finding_publication_status(conn: &mut Connection) -> Result<()> {
     const MIGRATION_ID: &str = "code-review-finding-publication-status-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let applied = tx
         .query_row(
@@ -808,6 +825,7 @@ pub struct CodeReviewJobRecord {
     pub summary: String,
     pub prompt_for_agents: String,
     pub publication_claimed: bool,
+    pub publication_accepted: bool,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
@@ -900,6 +918,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
+        publication_accepted: r.get(50)?,
     })
 }
 
@@ -911,7 +930,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level";
+     coordinator_thinking_level, publication_accepted";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -1716,6 +1735,7 @@ impl Store {
         }
         let mut conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
@@ -1732,6 +1752,7 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         // Match on-disk behavior so tests exercise the same constraints.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
@@ -3340,7 +3361,8 @@ impl Store {
                 "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
                  WHERE status IN ('queued', 'running') AND role = 'reviewer'
                    AND job_id IN (
-                     SELECT id FROM code_review_jobs WHERE status = 'running'
+                     SELECT id FROM code_review_jobs
+                     WHERE status = 'running' AND publication_claimed = 0
                    )
                  ORDER BY created_at, rowid"
             ))?;
@@ -3381,10 +3403,28 @@ impl Store {
         }
         tx.execute(
             "UPDATE code_review_jobs
+             SET status = CASE
+                     WHEN publication_accepted != 0 THEN 'succeeded'
+                     ELSE 'failed'
+                 END,
+                 completed_at = ?1,
+                 error = CASE
+                     WHEN publication_accepted != 0 THEN ''
+                     ELSE 'server restarted after review publication began; reconciliation required'
+                 END,
+                 check_sync_error = 'review publication requires reconciliation',
+                 projection_retry_count = 0,
+                 projection_retry_at = NULL,
+                 projection_retryable = 1
+             WHERE status = 'running' AND publication_claimed != 0",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, cancel_requested = 0,
                  publication_claimed = 0,
                  error = 'server restarted while review was running'
-             WHERE status = 'running'",
+             WHERE status = 'running' AND publication_claimed = 0",
             [],
         )?;
         tx.commit()?;
@@ -3409,7 +3449,8 @@ impl Store {
         tx.execute(
             "UPDATE code_review_jobs
              SET status = 'running', started_at = ?2, completed_at = NULL,
-                 cancel_requested = 0, publication_claimed = 0, error = ''
+                 cancel_requested = 0, publication_claimed = 0,
+                 publication_accepted = 0, error = ''
              WHERE id = ?1 AND status = 'queued'",
             params![id, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -3947,6 +3988,11 @@ impl Store {
         if old.job.status != "failed" {
             anyhow::bail!("reviewer personas can only be retried after the review job fails");
         }
+        if old.publication_claimed {
+            anyhow::bail!(
+                "review publication may already exist; reconcile it instead of retrying reviewers"
+            );
+        }
         if old.job.session_id.is_some() {
             anyhow::bail!("review session cleanup is still pending; retry shortly");
         }
@@ -4000,6 +4046,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, completed_at = NULL,
                  error = '', cancel_requested = 0, publication_claimed = 0,
+                 publication_accepted = 0,
                  completed_reviewers = MAX(completed_reviewers - 1, 0)
              WHERE id = ?1 AND status = 'failed'",
             params![id],
@@ -4874,9 +4921,9 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        if old.publication_claimed && old.job.status == "running" {
+        if old.publication_claimed {
             anyhow::bail!(
-                "review publication has already started; wait for it to finish before retrying"
+                "review publication may already exist; reconcile it instead of publishing again"
             );
         }
         if old.job.status == "queued" {
@@ -4973,6 +5020,58 @@ impl Store {
                AND cancel_requested = 0 AND publication_claimed = 0",
             params![id],
         )? > 0)
+    }
+
+    pub fn mark_code_review_publication_accepted(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_accepted = 1
+             WHERE id = ?1 AND publication_claimed != 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET publication_claimed = 0, publication_accepted = 0
+             WHERE id = ?1 AND publication_accepted = 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn reconcile_code_review_publication(
+        &self,
+        id: &str,
+        review_url: &str,
+        finding_ids: &[&str],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_publication_status = 'published'
+                 WHERE id = ?1",
+                params![finding_id],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET status = CASE
+                     WHEN status = 'failed' AND publication_accepted = 0 THEN 'succeeded'
+                     ELSE status
+                 END,
+                 error = CASE
+                     WHEN status = 'failed' AND publication_accepted = 0 THEN ''
+                     ELSE error
+                 END,
+                 review_url = ?2,
+                 publication_accepted = 1
+             WHERE id = ?1 AND publication_claimed != 0",
+            params![id, review_url],
+        )?;
+        tx.commit()?;
+        Ok(updated > 0)
     }
 
     pub fn set_code_review_job_check_run(
@@ -5813,7 +5912,7 @@ mod tests {
 
     #[test]
     fn migration_backfills_terminal_code_review_task_lifecycle_once() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(
             "INSERT INTO code_review_jobs
@@ -5839,7 +5938,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_migrations(&conn).unwrap();
+        apply_migrations(&mut conn).unwrap();
 
         let succeeded: (String, Option<String>) = conn
             .query_row(
@@ -5887,7 +5986,7 @@ mod tests {
             [],
         )
         .unwrap();
-        apply_migrations(&conn).unwrap();
+        apply_migrations(&mut conn).unwrap();
         let gated: (String, Option<String>) = conn
             .query_row(
                 "SELECT lifecycle_stage, last_progress_at
@@ -6008,8 +6107,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let mut conn = Connection::open(database).unwrap();
-                    conn.busy_timeout(std::time::Duration::from_secs(5))
-                        .unwrap();
+                    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).unwrap();
                     barrier.wait();
                     migrate_code_review_finding_publication_status(&mut conn)
                 })
@@ -6032,6 +6130,38 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn applied_publication_status_migration_does_not_take_a_write_lock() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("applied-migration.sqlite3");
+        let mut setup = Connection::open(&database).unwrap();
+        setup
+            .execute_batch(
+                "CREATE TABLE store_migrations (
+                    id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE code_review_findings (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    github_comment_url TEXT NOT NULL,
+                    github_publication_status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        migrate_code_review_finding_publication_status(&mut setup).unwrap();
+
+        let mut writer = Connection::open(&database).unwrap();
+        let _write = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let mut opener = Connection::open(&database).unwrap();
+        opener.busy_timeout(Duration::ZERO).unwrap();
+
+        migrate_code_review_finding_publication_status(&mut opener).unwrap();
     }
 
     fn publication_status(conn: &Connection, id: &str) -> String {
