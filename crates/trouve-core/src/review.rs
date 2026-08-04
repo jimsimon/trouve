@@ -4465,18 +4465,20 @@ impl Engine {
             Ok(published.html_url)
         } else {
             let body = response.text().await;
-            if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
-                tracing::warn!(
-                    job_id = %job.id,
-                    %error,
-                    "releasing rejected GitHub review publication claim failed"
+            if status.is_client_error() {
+                if let Err(error) = self.store.release_code_review_publication_claim(&job.id) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        %error,
+                        "releasing rejected GitHub review publication claim failed"
+                    );
+                }
+                self.persist_publication_status_best_effort(
+                    &job.id,
+                    &eligible_ids,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
                 );
             }
-            self.persist_publication_status_best_effort(
-                &job.id,
-                &eligible_ids,
-                trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
-            );
             let body = body.with_context(|| format!("reading GitHub API {status} response"))?;
             if status.as_u16() == 422 && review_comments_failed_to_place(&body) {
                 Ok(String::new())
@@ -4492,8 +4494,8 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<PublishedReview> {
         let marker = inline_review_marker(&job.id);
-        let mut page = 1_u64;
-        loop {
+        let bot_login = self.github_app_status()?.bot_login;
+        for page in 1..=REVIEW_COMMENT_MAX_PAGES {
             let (reviews, rate): (Vec<PublishedReview>, _) = api
                 .get(&format!(
                     "/repos/{}/pulls/{}/reviews?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
@@ -4504,7 +4506,9 @@ impl Engine {
             let count = reviews.len();
             if let Some(review) = reviews.into_iter().find(|review| {
                 review.commit_id == job.head_sha
-                    && review.user.as_ref().is_some_and(|user| user.kind == "Bot")
+                    && review.user.as_ref().is_some_and(|user| {
+                        user.kind == "Bot" && user.login.eq_ignore_ascii_case(&bot_login)
+                    })
                     && review
                         .body
                         .as_deref()
@@ -4513,13 +4517,13 @@ impl Engine {
                 return Ok(review);
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
-                break;
+                bail!("accepted GitHub review could not be found by its publication marker");
             }
-            page = page
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("GitHub review pagination exceeded its page range"))?;
         }
-        bail!("accepted GitHub review could not be found by its publication marker")
+        bail!(
+            "accepted GitHub review lookup reached the {REVIEW_COMMENT_MAX_PAGES}-page limit; \
+             publication remains pending reconciliation"
+        )
     }
 
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
@@ -4548,7 +4552,10 @@ impl Engine {
             .await;
         let lifecycle = self.sync_code_review_lifecycle_projection(&api, job).await;
         let check = self.sync_code_review_check_projection(&api, job).await;
-        combine_projection_results(publication, combine_projection_results(lifecycle, check))
+        combine_publication_projection_result(
+            publication,
+            combine_projection_results(lifecycle, check),
+        )
     }
 
     async fn sync_code_review_publication_projection(
@@ -5095,6 +5102,20 @@ fn combine_projection_results(lifecycle: Result<()>, check: Result<()>) -> Resul
         (Err(lifecycle), Err(check)) => Err(anyhow!(
             "updating GitHub review status comment failed: {lifecycle:#}; \
              updating GitHub Check Run failed: {check:#}"
+        )),
+    }
+}
+
+fn combine_publication_projection_result(
+    publication: Result<()>,
+    other_projections: Result<()>,
+) -> Result<()> {
+    match (publication, other_projections) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error).context("updating GitHub review publication failed"),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(publication), Err(other)) => Err(anyhow!(
+            "updating GitHub review publication failed: {publication:#}; {other:#}"
         )),
     }
 }
@@ -7211,6 +7232,16 @@ mod tests {
             .unwrap()
     }
 
+    fn review_app_test_config() -> crate::config::Config {
+        crate::config::Config {
+            github_review_app: Some(GithubReviewAppConfig {
+                app_id: 7,
+                slug: "trouve-ai".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_lifecycle_updates_create_one_comment_then_patch_it() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -7816,11 +7847,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_errors_record_terminal_finding_outcomes() {
+    async fn indeterminate_publication_errors_preserve_pending_outcomes() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:publication-failure");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
         let findings = store
             .save_code_review_result(
                 &job.id,
@@ -7891,7 +7924,7 @@ mod tests {
                 .find(|finding| finding.path == "src/lib.rs")
                 .unwrap()
                 .github_publication_status,
-            trouve_protocol::CodeReviewFindingPublicationStatus::Failed
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending
         );
         assert_eq!(
             stored
@@ -7901,6 +7934,9 @@ mod tests {
                 .github_publication_status,
             trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
         );
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.publication_claimed);
+        assert!(!record.publication_accepted);
     }
 
     #[tokio::test]
@@ -7935,18 +7971,25 @@ mod tests {
         let server = tokio::spawn(async move {
             let published_reviews = serde_json::json!([
                 {
-                    "id": 75,
-                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-75",
+                    "id": 74,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-74",
                     "body": review_marker,
                     "commit_id": head_sha,
                     "user": {"login": "collaborator", "type": "User"},
                 },
                 {
-                    "id": 76,
-                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-76",
+                    "id": 75,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-75",
                     "body": review_marker,
                     "commit_id": "3333333333333333333333333333333333333333",
                     "user": {"login": "trouve-ai[bot]", "type": "Bot"},
+                },
+                {
+                    "id": 76,
+                    "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-76",
+                    "body": review_marker,
+                    "commit_id": head_sha,
+                    "user": {"login": "other-review-app[bot]", "type": "Bot"},
                 },
                 {
                     "id": 77,
@@ -7999,11 +8042,7 @@ mod tests {
             }
         });
         let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            store,
-            data.path().to_path_buf(),
-            &crate::config::Config::default(),
-        );
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
         let api = GithubApi::with_base_url(
             "Bearer installation-token".into(),
             format!("http://{address}"),
@@ -8079,6 +8118,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_review_lookup_stops_at_the_page_limit() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:review-page-limit");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let page_body = serde_json::to_string(&vec![
+            serde_json::json!({
+                "id": 1,
+                "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-1"
+            });
+            REVIEW_COMMENT_PAGE_SIZE
+        ])
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for page in 1..=REVIEW_COMMENT_MAX_PAGES {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(
+                    request.starts_with(&format!(
+                        "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page={page} "
+                    )),
+                    "{request}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{page_body}",
+                    page_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let error = match engine.find_published_review(&api, &job).await {
+            Ok(_) => panic!("review lookup unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+        server.await.unwrap();
+        assert!(error.contains("10-page limit"), "{error}");
+        assert!(error.contains("publication remains pending reconciliation"));
+    }
+
+    #[tokio::test]
     async fn accepted_publication_is_reconciled_without_a_second_post() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -8138,11 +8236,7 @@ mod tests {
             }
         });
         let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            store,
-            data.path().to_path_buf(),
-            &crate::config::Config::default(),
-        );
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
         let api = GithubApi::with_base_url(
             "Bearer installation-token".into(),
             format!("http://{address}"),
@@ -8714,6 +8808,23 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+        assert!(error.contains("review status comment failed: comment unavailable"));
+        assert!(error.contains("Check Run failed: check unavailable"));
+    }
+
+    #[test]
+    fn publication_projection_errors_keep_their_source_label() {
+        let other_projections = combine_projection_results(
+            Err(anyhow!("comment unavailable")),
+            Err(anyhow!("check unavailable")),
+        );
+        let error = combine_publication_projection_result(
+            Err(anyhow!("publication unavailable")),
+            other_projections,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("review publication failed: publication unavailable"));
         assert!(error.contains("review status comment failed: comment unavailable"));
         assert!(error.contains("Check Run failed: check unavailable"));
     }

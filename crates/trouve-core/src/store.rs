@@ -3410,9 +3410,17 @@ impl Store {
                  completed_at = ?1,
                  error = CASE
                      WHEN publication_accepted != 0 THEN ''
-                     ELSE 'server restarted after review publication began; reconciliation required'
+                     ELSE 'server restarted before review publication was accepted; retry required'
                  END,
-                 check_sync_error = 'review publication requires reconciliation',
+                 publication_claimed = CASE
+                     WHEN publication_accepted != 0 THEN publication_claimed
+                     ELSE 0
+                 END,
+                 check_sync_error = CASE
+                     WHEN publication_accepted != 0
+                         THEN 'review publication requires reconciliation'
+                     ELSE ''
+                 END,
                  projection_retry_count = 0,
                  projection_retry_at = NULL,
                  projection_retryable = 1
@@ -8285,7 +8293,7 @@ mod tests {
     }
 
     #[test]
-    fn review_publication_rejects_cancellation_with_a_client_facing_reason() {
+    fn review_publication_claim_blocks_cancellation_and_recovers_for_retry() {
         let store = Store::open_in_memory().unwrap();
         let job = store
             .enqueue_code_review_job(&NewCodeReviewJob {
@@ -8321,6 +8329,29 @@ mod tests {
 
         let error = store.request_code_review_job_cancel(&job.id).unwrap_err();
         assert!(error.to_string().contains("before cancelling"));
+
+        store.recover_code_review_jobs().unwrap();
+        let recovered = store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(recovered.job.status, "failed");
+        assert!(!recovered.publication_claimed);
+        assert!(!recovered.publication_accepted);
+        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            retry.id
+        );
+        assert!(store.claim_code_review_publication(&retry.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&retry.id)
+                .unwrap()
+        );
+
+        store.recover_code_review_jobs().unwrap();
+        let accepted = store.code_review_job(&retry.id).unwrap().unwrap();
+        assert_eq!(accepted.job.status, "succeeded");
+        assert!(accepted.publication_claimed);
+        assert!(accepted.publication_accepted);
     }
 
     #[test]
