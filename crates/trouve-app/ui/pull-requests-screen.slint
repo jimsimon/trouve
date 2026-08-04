@@ -719,10 +719,9 @@ export component PullRequestsScreen inherits Rectangle {
                                                                     vertical-alignment: center;
                                                                     horizontal-stretch: 1;
                                                                 }
-                                                                Button {
+                                                                if pr.trouve-review-prompt != "": Button {
                                                                     text: "Fix all";
                                                                     primary: true;
-                                                                    enabled: pr.trouve-review-prompt != "";
                                                                     clicked => {
                                                                         root.fix-clicked(
                                                                             pr.workspace-id,

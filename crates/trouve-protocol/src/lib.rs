@@ -152,7 +152,9 @@ pub use requests::*;
 // events so in-flight and timed-out metrics remain observable (additive).
 // 2.7: task-progress snapshots always carry the nullable model-start field so
 // clients can clear a previous turn's live timing anchor (additive).
-pub const PROTOCOL_VERSION: &str = "2.7";
+// 2.8: code-review findings expose their durable GitHub inline-publication
+// outcome (additive).
+pub const PROTOCOL_VERSION: &str = "2.8";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

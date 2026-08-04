@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.7"
+    "version": "2.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -4655,6 +4655,9 @@
           "github_comment_url": {
             "type": "string"
           },
+          "github_publication_status": {
+            "$ref": "#/components/schemas/CodeReviewFindingPublicationStatus"
+          },
           "github_thread_id": {
             "type": [
               "string",
@@ -4702,6 +4705,16 @@
             "description": "`open`, `fixed`, or `dismissed`."
           }
         }
+      },
+      "CodeReviewFindingPublicationStatus": {
+        "type": "string",
+        "description": "The outcome of attempting to publish a finding as an inline GitHub comment.",
+        "enum": [
+          "pending",
+          "published",
+          "not_eligible",
+          "failed"
+        ]
       },
       "CodeReviewFindingSource": {
         "type": "object",
