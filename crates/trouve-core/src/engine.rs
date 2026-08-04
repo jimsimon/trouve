@@ -5152,9 +5152,12 @@ impl Engine {
             .turn_scheduler
             .acquire(&thread.model, background)
             .await?;
-        if background {
-            self.store
-                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?;
+        if background
+            && let Some(progress) = self
+                .store
+                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?
+        {
+            self.emit_code_review_task_progress(progress).await?;
         }
         self.store.append_event(
             scope.clone(),

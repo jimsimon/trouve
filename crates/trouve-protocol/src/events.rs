@@ -264,6 +264,14 @@ pub enum Event {
         job_id: String,
         task: Box<crate::CodeReviewTask>,
     },
+    /// A compact task lifecycle/metrics snapshot changed while the task was
+    /// running. Clients merge it into their retained task representation.
+    #[serde(rename = "code_review.task_progress_updated")]
+    CodeReviewTaskProgressUpdated {
+        job_id: String,
+        task_id: String,
+        progress: crate::CodeReviewTaskProgress,
+    },
     /// The complete, durable persona-routing matrix was selected for a job.
     #[serde(rename = "code_review.routing_updated")]
     CodeReviewRoutingUpdated {

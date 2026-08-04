@@ -1121,6 +1121,37 @@ pub enum CodeReviewOutputStream {
     Tool,
 }
 
+/// Current lifecycle stage for an active review task, or the last observed
+/// stage when a task fails or is cancelled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewTaskLifecycleStage {
+    #[default]
+    Queued,
+    WaitingForCapacity,
+    StartingModel,
+    RunningModel,
+    RunningTool,
+    RepairingOutput,
+    Completed,
+}
+
+/// Small, durable progress snapshot emitted while a review task is running.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewTaskProgress {
+    pub lifecycle_stage: CodeReviewTaskLifecycleStage,
+    pub provider_wait_ms: u64,
+    pub model_elapsed_ms: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub tool_call_count: u64,
+    #[serde(default)]
+    #[schema(required = true)]
+    pub model_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_progress_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// One durable router, reviewer, or coordinator execution. Tasks survive
 /// cleanup of their implementation sessions and threads.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1139,6 +1170,10 @@ pub struct CodeReviewTask {
     /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or
     /// `not_applicable`.
     pub status: String,
+    /// Current stage while active; last observed stage after failure or
+    /// cancellation.
+    #[serde(default)]
+    pub lifecycle_stage: CodeReviewTaskLifecycleStage,
     /// The provider-qualified model actually used by the created thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1177,6 +1212,10 @@ pub struct CodeReviewTask {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Current elapsed time for active tasks and final elapsed time for
@@ -2149,5 +2188,26 @@ mod tests {
                 serde_json::json!(canonical)
             );
         }
+    }
+
+    #[test]
+    fn code_review_task_progress_serializes_a_model_clock_reset_as_null() {
+        let progress = CodeReviewTaskProgress {
+            lifecycle_stage: CodeReviewTaskLifecycleStage::RepairingOutput,
+            provider_wait_ms: 0,
+            model_elapsed_ms: 42,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            tool_call_count: 0,
+            model_started_at: None,
+            last_progress_at: chrono::Utc::now(),
+        };
+
+        let value = serde_json::to_value(progress).unwrap();
+        assert_eq!(
+            value.get("model_started_at"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

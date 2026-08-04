@@ -48,3 +48,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 rsa = { version = "0.9.10", features = ["getrandom"] }
+tokio = { workspace = true, features = ["test-util"] }
