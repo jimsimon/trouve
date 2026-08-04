@@ -134,7 +134,8 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       prompt: repository.prompt,
       reviewer_ids: repository.reviewer_ids,
       routing_mode: repository.routing_mode,
-      semantic_routing: repository.semantic_routing,
+      semantic_routing:
+        repository.routing_mode === "automatic" ? true : repository.semantic_routing,
       included_reviewer_ids:
         repository.routing_mode === "additive" ? (repository.included_reviewer_ids ?? []) : [],
       excluded_reviewer_ids: [],

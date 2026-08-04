@@ -142,7 +142,10 @@ pub use requests::*;
 // maximum number of concurrently running review jobs (additive).
 // 2.2: code-review concurrency requests remain positive and unbounded on the
 // wire, while values above 32 are normalized to the response maximum of 32.
-pub const PROTOCOL_VERSION: &str = "2.2";
+// 3.0: Dynamic persona selection delegates solely to the semantic router;
+// Automatic always enables it, while Additive retains only its baseline and
+// configured inclusions before optional semantic additions (breaking).
+pub const PROTOCOL_VERSION: &str = "3.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

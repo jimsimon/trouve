@@ -11,7 +11,7 @@ export function routingReasonLabel(source: string, mode: RoutingMode): string {
           ? "Automatic baseline"
           : "Routing baseline";
     case "deterministic":
-      return "Diff signal";
+      return "Legacy diff signal";
     case "semantic":
       return "Semantic triage";
     case "included":
