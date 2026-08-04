@@ -38,8 +38,54 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
 const REVIEW_HISTORY_REF_LIMIT: usize = 3;
+const REVIEW_GIT_TRACE_ENV_VARS: &[&str] = &[
+    "GIT_TRACE",
+    "GIT_TRACE2",
+    "GIT_TRACE2_EVENT",
+    "GIT_TRACE2_PERF",
+    "GIT_TRACE_CURL",
+    "GIT_TRACE_CURL_NO_DATA",
+    "GIT_TRACE_PACKET",
+    "GIT_TRACE_REDACT",
+];
+
+fn harden_authenticated_review_git_command(command: &mut tokio::process::Command) {
+    for variable in REVIEW_GIT_TRACE_ENV_VARS {
+        command.env_remove(variable);
+    }
+}
+
+fn sanitize_review_fetch_stderr(stderr: &str, auth: &str) -> String {
+    stderr
+        .lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().contains("authorization:") {
+                "[redacted git authorization trace]".to_owned()
+            } else {
+                line.replace(auth, "[redacted]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn review_history_ref_name(
+    pull_number: u64,
+    job_id: &str,
+    index: usize,
+) -> std::result::Result<String, String> {
+    if job_id.is_empty()
+        || !job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!("invalid review job id for temporary ref: {job_id}"));
+    }
+    Ok(format!("trouve-history-{pull_number}-{job_id}-{index}"))
+}
 
 #[cfg(unix)]
 fn isolate_review_git_process(command: &mut tokio::process::Command) {
@@ -152,6 +198,12 @@ impl ReviewGitChildGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn take_repository_guard(&mut self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.repository_guard
+            .take()
+            .expect("review repository guard is present")
+    }
 }
 
 impl Drop for ReviewGitChildGuard {
@@ -245,17 +297,28 @@ async fn read_bounded_review_fetch_stderr(mut stderr: tokio::process::ChildStder
     String::from_utf8_lossy(&captured).trim().to_owned()
 }
 
-async fn run_optional_review_fetch(
+struct ReviewHistoryFetch {
+    sha: String,
+    history_ref: String,
+    refspec: String,
+}
+
+fn optional_review_fetch_command(
     repository_path: &Path,
     auth: &str,
-    refspecs: &[String],
-    history_refs: &[String],
-    repository_guard: tokio::sync::OwnedMutexGuard<()>,
-) -> std::result::Result<(), String> {
+    refspec: &str,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
-        .args(["fetch", "--force", "--no-tags", "origin"])
-        .args(refspecs)
+        .args([
+            "fetch",
+            "--force",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+            "origin",
+            refspec,
+        ])
         .current_dir(repository_path)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
@@ -265,53 +328,123 @@ async fn run_optional_review_fetch(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    harden_authenticated_review_git_command(&mut command);
     isolate_review_git_process(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("running optional git fetch: {error}"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "optional git fetch stderr was not captured".to_owned())?;
-    let stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-    let mut guard = ReviewGitChildGuard::new(child, repository_guard);
-    let status =
-        match tokio::time::timeout(REVIEW_OPTIONAL_FETCH_TIMEOUT, guard.child_mut().wait()).await {
-            Ok(Ok(status)) => {
-                #[cfg(unix)]
-                quiesce_review_git_process_group(guard.pid)
-                    .await
-                    .map_err(|error| format!("stopping optional git fetch helpers: {error}"))?;
-                status
-            }
-            Ok(Err(error)) => return Err(format!("waiting for optional git fetch: {error}")),
-            Err(_) => {
-                terminate_review_git_process(&mut guard)
-                    .await
-                    .map_err(|error| format!("terminating optional git fetch: {error}"))?;
-                cleanup_review_fetch_locks(repository_path, history_refs);
-                guard.disarm();
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(format!(
-                    "optional git fetch timed out after {}s{}",
-                    REVIEW_OPTIONAL_FETCH_TIMEOUT.as_secs(),
-                    if stderr.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {stderr}")
-                    }
+    command
+}
+
+/// Fetch each historical SHA independently while sharing one total timeout
+/// budget and one repository lock. A missing force-pushed commit therefore
+/// cannot roll back refs already fetched for the other history points.
+async fn run_optional_review_fetches(
+    repository_path: &Path,
+    auth: &str,
+    fetches: &[ReviewHistoryFetch],
+    repository_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Vec<(String, String)> {
+    let deadline = tokio::time::Instant::now() + REVIEW_OPTIONAL_FETCH_TIMEOUT;
+    let mut repository_guard = Some(repository_guard);
+    let mut failures = Vec::new();
+    for (index, fetch) in fetches.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            failures.push((
+                fetch.sha.clone(),
+                "optional review-history fetch budget was exhausted".into(),
+            ));
+            continue;
+        }
+        let attempts_left = u32::try_from(fetches.len() - index).unwrap_or(1);
+        let attempt_timeout = remaining / attempts_left;
+        let mut command = optional_review_fetch_command(repository_path, auth, &fetch.refspec);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                failures.push((
+                    fetch.sha.clone(),
+                    format!("running optional git fetch: {error}"),
                 ));
+                continue;
             }
         };
-    guard.disarm();
-    let stderr = stderr_task.await.unwrap_or_default();
-    if status.success() {
-        Ok(())
-    } else if stderr.is_empty() {
-        Err(format!("optional git fetch exited with {status}"))
-    } else {
-        Err(format!("optional git fetch exited with {status}: {stderr}"))
+        let mut guard = ReviewGitChildGuard::new(
+            child,
+            repository_guard
+                .take()
+                .expect("review repository guard is available"),
+        );
+        let stderr = match guard.child_mut().stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                failures.push((
+                    fetch.sha.clone(),
+                    "optional git fetch stderr was not captured".into(),
+                ));
+                return failures;
+            }
+        };
+        let stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
+        let result = match tokio::time::timeout(attempt_timeout, guard.child_mut().wait()).await {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                if let Err(error) = quiesce_review_git_process_group(guard.pid).await {
+                    Err(format!("stopping optional git fetch helpers: {error}"))
+                } else if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("optional git fetch exited with {status}"))
+                }
+                #[cfg(not(unix))]
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("optional git fetch exited with {status}"))
+                }
+            }
+            Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
+                Ok(()) => Err(format!("waiting for optional git fetch: {error}")),
+                Err(terminate_error) => {
+                    failures.push((
+                        fetch.sha.clone(),
+                        format!(
+                            "waiting for optional git fetch: {error}; terminating it: {terminate_error}"
+                        ),
+                    ));
+                    return failures;
+                }
+            },
+            Err(_) => match terminate_review_git_process(&mut guard).await {
+                Ok(()) => {
+                    cleanup_review_fetch_locks(
+                        repository_path,
+                        std::slice::from_ref(&fetch.history_ref),
+                    );
+                    Err(format!(
+                        "optional git fetch timed out after {:.1}s",
+                        attempt_timeout.as_secs_f64()
+                    ))
+                }
+                Err(error) => {
+                    failures.push((
+                        fetch.sha.clone(),
+                        format!("terminating timed-out optional git fetch: {error}"),
+                    ));
+                    return failures;
+                }
+            },
+        };
+        let stderr = sanitize_review_fetch_stderr(&stderr_task.await.unwrap_or_default(), auth);
+        guard.disarm();
+        repository_guard = Some(guard.take_repository_guard());
+        if let Err(mut error) = result {
+            if !stderr.is_empty() {
+                error.push_str(": ");
+                error.push_str(&stderr);
+            }
+            failures.push((fetch.sha.clone(), error));
+        }
     }
+    failures
 }
 
 /// One session mutation lane that a tool may transfer to a background task.
@@ -668,7 +801,7 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("review repository merge-base is unavailable in this executor".into())
     }
-    /// Drop temporary per-pull refs after rewritten-history comparison has
+    /// Drop temporary per-job refs after rewritten-history comparison has
     /// consumed the historical objects they kept reachable.
     async fn cleanup_review_repository_history(
         &self,
@@ -737,6 +870,7 @@ pub trait ToolExecutor: Send + Sync {
 pub struct ReviewRepositorySync {
     pub root: PathBuf,
     pub repository: String,
+    pub job_id: String,
     pub pull_number: u64,
     pub base_sha: String,
     pub head_sha: String,
@@ -763,6 +897,7 @@ pub struct ReviewRepositoryMergeBase {
 
 pub struct ReviewRepositoryHistoryCleanup {
     pub worktree: PathBuf,
+    pub job_id: String,
     pub pull_number: u64,
 }
 
@@ -2683,18 +2818,18 @@ impl ToolExecutor for LocalToolExecutor {
                 ));
             }
         }
-        // One optional fetch covers every missing historical commit so the
-        // repository mutex is never held across three independent network
-        // timeouts. The refs are removed as soon as comparison consumes them.
-        let mut history_refs = Vec::new();
-        let mut history_refspecs = Vec::new();
-        let mut missing_shas = Vec::new();
+        // Give every job its own temporary refs. Even when an object is
+        // already present, pin it under this job's ref so an older overlapping
+        // job cannot make it unreachable during its cleanup.
+        let mut fetches = Vec::new();
         for (index, sha) in request
             .optional_shas
             .iter()
             .take(REVIEW_HISTORY_REF_LIMIT)
             .enumerate()
         {
+            let history_ref = review_history_ref_name(request.pull_number, &request.job_id, index)?;
+            let full_history_ref = format!("refs/remotes/origin/{history_ref}");
             let present = run(vec![
                 "cat-file".into(),
                 "-e".into(),
@@ -2702,31 +2837,32 @@ impl ToolExecutor for LocalToolExecutor {
             ])
             .await
             .is_ok();
-            if !present {
-                let history_ref = format!("trouve-history-{}-{index}", request.pull_number);
-                history_refspecs.push(format!("+{sha}:refs/remotes/origin/{history_ref}"));
-                history_refs.push(history_ref);
-                missing_shas.push(sha.clone());
+            if present {
+                run(vec!["update-ref".into(), full_history_ref, sha.clone()]).await?;
+            } else {
+                fetches.push(ReviewHistoryFetch {
+                    sha: sha.clone(),
+                    history_ref,
+                    refspec: format!("+{sha}:{full_history_ref}"),
+                });
             }
         }
-        if history_refspecs.is_empty() {
+        if fetches.is_empty() {
             drop(repository_guard);
-        } else if let Err(error) = run_optional_review_fetch(
-            &repository_path,
-            &auth,
-            &history_refspecs,
-            &history_refs,
-            repository_guard,
-        )
-        .await
-        {
-            tracing::warn!(
-                repository = %request.repository,
-                pull_number = request.pull_number,
-                shas = ?missing_shas,
-                %error,
-                "optional review-history fetch failed; continuing with the full diff if reuse is unavailable"
-            );
+        } else {
+            for (sha, error) in
+                run_optional_review_fetches(&repository_path, &auth, &fetches, repository_guard)
+                    .await
+            {
+                tracing::warn!(
+                    repository = %request.repository,
+                    pull_number = request.pull_number,
+                    job_id = %request.job_id,
+                    %sha,
+                    %error,
+                    "optional review-history fetch failed; continuing with the full diff if reuse is unavailable"
+                );
+            }
         }
         Ok(repository_path)
     }
@@ -2735,6 +2871,12 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryHistoryCleanup,
     ) -> Result<(), String> {
+        let references = (0..REVIEW_HISTORY_REF_LIMIT)
+            .map(|index| {
+                review_history_ref_name(request.pull_number, &request.job_id, index)
+                    .map(|name| format!("refs/remotes/origin/{name}"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let repository_lock = {
             let mut locks = self.review_repository_locks.lock().unwrap();
             locks
@@ -2742,26 +2884,82 @@ impl ToolExecutor for LocalToolExecutor {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        let _repository_guard = repository_lock.lock().await;
-        for index in 0..REVIEW_HISTORY_REF_LIMIT {
-            let reference = format!(
-                "refs/remotes/origin/trouve-history-{}-{index}",
-                request.pull_number
-            );
-            let output = tokio::process::Command::new("git")
-                .args(["update-ref", "-d", &reference])
-                .current_dir(&request.worktree)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .kill_on_drop(true)
-                .output()
+        let repository_guard =
+            tokio::time::timeout(REVIEW_HISTORY_CLEANUP_TIMEOUT, repository_lock.lock_owned())
                 .await
-                .map_err(|error| format!("deleting temporary review ref {reference}: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "deleting temporary review ref {reference}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
+                .map_err(|_| "timed out waiting to clean temporary review refs".to_owned())?;
+
+        let mut command = tokio::process::Command::new("git");
+        command
+            .args(["update-ref", "--stdin"])
+            .current_dir(&request.worktree)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        isolate_review_git_process(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("starting temporary review ref cleanup: {error}"))?;
+        let mut guard = ReviewGitChildGuard::new(child, repository_guard);
+        let stderr = guard
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or_else(|| "temporary review ref cleanup did not capture stderr".to_owned())?;
+        let mut stdin = guard
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| "temporary review ref cleanup did not capture stdin".to_owned())?;
+        let commands = references
+            .iter()
+            .map(|reference| format!("delete {reference}\n"))
+            .collect::<String>();
+        use tokio::io::AsyncWriteExt as _;
+        stdin
+            .write_all(commands.as_bytes())
+            .await
+            .map_err(|error| format!("writing temporary review ref cleanup: {error}"))?;
+        drop(stdin);
+        let stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
+        let status = match tokio::time::timeout(
+            REVIEW_HISTORY_CLEANUP_TIMEOUT,
+            guard.child_mut().wait(),
+        )
+        .await
+        {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                quiesce_review_git_process_group(guard.pid)
+                    .await
+                    .map_err(|error| format!("stopping temporary ref cleanup helpers: {error}"))?;
+                status
             }
+            Ok(Err(error)) => {
+                terminate_review_git_process(&mut guard)
+                    .await
+                    .map_err(|terminate_error| {
+                        format!(
+                            "waiting for temporary review ref cleanup: {error}; terminating it: {terminate_error}"
+                        )
+                    })?;
+                return Err(format!("waiting for temporary review ref cleanup: {error}"));
+            }
+            Err(_) => {
+                terminate_review_git_process(&mut guard)
+                    .await
+                    .map_err(|error| {
+                        format!("terminating timed-out temporary review ref cleanup: {error}")
+                    })?;
+                return Err("temporary review ref cleanup timed out".to_owned());
+            }
+        };
+        let stderr = stderr_task.await.unwrap_or_default();
+        guard.disarm();
+        if !status.success() {
+            return Err(format!("deleting temporary review refs: {stderr}"));
         }
         Ok(())
     }
@@ -3638,24 +3836,135 @@ mod tests {
             git_dir.join("FETCH_HEAD.lock"),
             git_dir.join("packed-refs.lock"),
             git_dir.join("shallow.lock"),
-            refs.join("trouve-history-42-0.lock"),
+            refs.join("trouve-history-42-rv_test-0.lock"),
         ] {
             std::fs::write(lock, "locked").unwrap();
         }
         let unrelated = git_dir.join("index.lock");
         std::fs::write(&unrelated, "keep").unwrap();
 
-        cleanup_review_fetch_locks(dir.path(), &["trouve-history-42-0".into()]);
+        cleanup_review_fetch_locks(dir.path(), &["trouve-history-42-rv_test-0".into()]);
 
         assert!(git_dir.join("FETCH_HEAD.lock").exists());
         assert!(git_dir.join("packed-refs.lock").exists());
         assert!(git_dir.join("shallow.lock").exists());
-        assert!(!refs.join("trouve-history-42-0.lock").exists());
+        assert!(!refs.join("trouve-history-42-rv_test-0.lock").exists());
         assert!(unrelated.exists());
     }
 
+    #[test]
+    fn review_fetch_command_disables_credential_tracing_and_global_fetch_locks() {
+        let command = optional_review_fetch_command(
+            Path::new("."),
+            "secret-auth",
+            "+abc:refs/remotes/origin/trouve-history-42-rv_test-0",
+        );
+        let command = command.as_std();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--no-write-fetch-head"));
+        assert!(args.iter().any(|arg| arg == "--no-auto-maintenance"));
+        let env = command.get_envs().collect::<HashMap<_, _>>();
+        for variable in REVIEW_GIT_TRACE_ENV_VARS {
+            assert_eq!(env.get(std::ffi::OsStr::new(variable)), Some(&None));
+        }
+    }
+
+    #[test]
+    fn review_fetch_stderr_redacts_authorization_traces_and_auth_value() {
+        let stderr = "trace: Authorization: basic secret-auth\nfatal: secret-auth rejected";
+        let sanitized = sanitize_review_fetch_stderr(stderr, "secret-auth");
+        assert!(!sanitized.contains("secret-auth"));
+        assert!(!sanitized.to_ascii_lowercase().contains("authorization:"));
+        assert!(sanitized.contains("[redacted git authorization trace]"));
+    }
+
     #[tokio::test]
-    async fn review_history_cleanup_deletes_all_bounded_pull_refs() {
+    async fn optional_review_fetches_preserve_partial_success() {
+        let origin = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let git = |directory: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .output()
+                .unwrap()
+        };
+        assert!(git(origin.path(), &["init"]).status.success());
+        assert!(
+            git(origin.path(), &["config", "user.name", "Test"])
+                .status
+                .success()
+        );
+        assert!(
+            git(origin.path(), &["config", "user.email", "test@example.com"])
+                .status
+                .success()
+        );
+        std::fs::write(origin.path().join("file"), "content").unwrap();
+        assert!(git(origin.path(), &["add", "file"]).status.success());
+        assert!(
+            git(origin.path(), &["commit", "-m", "seed"])
+                .status
+                .success()
+        );
+        let valid_sha = String::from_utf8(git(origin.path(), &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(git(repository.path(), &["init"]).status.success());
+        assert!(
+            git(
+                repository.path(),
+                &["remote", "add", "origin", origin.path().to_str().unwrap()]
+            )
+            .status
+            .success()
+        );
+        let missing_sha = "ffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let missing_ref = "trouve-history-42-rv_test-0".to_owned();
+        let valid_ref = "trouve-history-42-rv_test-1".to_owned();
+        let fetches = vec![
+            ReviewHistoryFetch {
+                sha: missing_sha.clone(),
+                history_ref: missing_ref.clone(),
+                refspec: format!("+{missing_sha}:refs/remotes/origin/{missing_ref}"),
+            },
+            ReviewHistoryFetch {
+                sha: valid_sha.clone(),
+                history_ref: valid_ref.clone(),
+                refspec: format!("+{valid_sha}:refs/remotes/origin/{valid_ref}"),
+            },
+        ];
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let failures = run_optional_review_fetches(
+            repository.path(),
+            "test-auth",
+            &fetches,
+            repository_lock.lock_owned().await,
+        )
+        .await;
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, missing_sha);
+        assert_eq!(
+            String::from_utf8(
+                git(
+                    repository.path(),
+                    &["rev-parse", &format!("refs/remotes/origin/{valid_ref}")]
+                )
+                .stdout
+            )
+            .unwrap()
+            .trim(),
+            valid_sha
+        );
+    }
+
+    #[tokio::test]
+    async fn review_history_cleanup_deletes_only_the_jobs_bounded_refs() {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -3678,22 +3987,32 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
-        for index in 0..3 {
-            let reference = format!("refs/remotes/origin/trouve-history-42-{index}");
-            assert!(git(&["update-ref", &reference, &head]).status.success());
+        for job_id in ["rv_test", "rv_replacement"] {
+            for index in 0..3 {
+                let reference = format!("refs/remotes/origin/trouve-history-42-{job_id}-{index}");
+                assert!(git(&["update-ref", &reference, &head]).status.success());
+            }
         }
 
         LocalToolExecutor::default()
             .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
                 worktree: dir.path().to_path_buf(),
+                job_id: "rv_test".into(),
                 pull_number: 42,
             })
             .await
             .unwrap();
 
         for index in 0..3 {
-            let reference = format!("refs/remotes/origin/trouve-history-42-{index}");
+            let reference = format!("refs/remotes/origin/trouve-history-42-rv_test-{index}");
             assert!(!git(&["show-ref", "--verify", &reference]).status.success());
+            let replacement =
+                format!("refs/remotes/origin/trouve-history-42-rv_replacement-{index}");
+            assert!(
+                git(&["show-ref", "--verify", &replacement])
+                    .status
+                    .success()
+            );
         }
     }
 

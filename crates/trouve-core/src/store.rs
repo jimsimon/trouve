@@ -2717,6 +2717,7 @@ enum StoreMutation {
 /// One caller's event batch, in flight to the writer thread.
 struct AppendRequest {
     events: Vec<PendingEvent>,
+    code_review_outbox_ids: Vec<i64>,
     reply: AppendReply,
     queued_at: std::time::Instant,
 }
@@ -2814,12 +2815,15 @@ fn spawn_event_writer(
                 };
                 let mut event_count = first.events.len();
                 let queued_at = first.queued_at;
+                let isolate_outbox_request = !first.code_review_outbox_ids.is_empty();
                 let mut requests = vec![first];
-                while event_count < APPEND_BATCH_MAX {
+                while !isolate_outbox_request && event_count < APPEND_BATCH_MAX {
                     let Ok(request) = rx.try_recv() else {
                         break;
                     };
-                    if event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX {
+                    if !request.code_review_outbox_ids.is_empty()
+                        || event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX
+                    {
                         deferred = Some(request);
                         break;
                     }
@@ -2834,6 +2838,9 @@ fn spawn_event_writer(
                             conn,
                             requests.iter().flat_map(|request| request.events.iter()),
                             event_count,
+                            requests
+                                .iter()
+                                .flat_map(|request| request.code_review_outbox_ids.iter().copied()),
                         );
                         (inserted, std::time::Duration::ZERO, started.elapsed())
                     }
@@ -2846,6 +2853,9 @@ fn spawn_event_writer(
                             &conn,
                             requests.iter().flat_map(|request| request.events.iter()),
                             event_count,
+                            requests
+                                .iter()
+                                .flat_map(|request| request.code_review_outbox_ids.iter().copied()),
                         );
                         (inserted, connection_wait, started.elapsed())
                     }
@@ -3357,6 +3367,7 @@ fn insert_event_batch<'a>(
     conn: &Connection,
     batch: impl IntoIterator<Item = &'a PendingEvent>,
     event_count: usize,
+    code_review_outbox_ids: impl IntoIterator<Item = i64>,
 ) -> Result<InsertedEventBatch> {
     let tx = conn.unchecked_transaction()?;
     let mut source_cursors = Vec::with_capacity(event_count);
@@ -3439,6 +3450,14 @@ fn insert_event_batch<'a>(
                     ts: event.ts,
                     event: derived,
                 });
+            }
+        }
+    }
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM code_review_pending_events WHERE id = ?1")?;
+        for id in code_review_outbox_ids {
+            if stmt.execute([id])? != 1 {
+                anyhow::bail!("pending code-review event {id} was already consumed");
             }
         }
     }
@@ -3855,6 +3874,7 @@ impl Store {
         self.append_tx
             .send(AppendRequest {
                 events,
+                code_review_outbox_ids: Vec::new(),
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -3880,6 +3900,7 @@ impl Store {
         self.append_tx
             .send(AppendRequest {
                 events: serialize_events(scope, events)?,
+                code_review_outbox_ids: Vec::new(),
                 reply: AppendReply::Async(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -6771,6 +6792,37 @@ impl Store {
         Ok(pending)
     }
 
+    /// Atomically project every valid pending transition into the durable
+    /// event log and consume its outbox row. The dedicated writer publishes
+    /// the committed envelopes only after both halves of the transaction
+    /// succeed, so recovery cannot duplicate a transition with a new cursor.
+    pub async fn flush_pending_code_review_events(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = self.pending_code_review_events(job_id)?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(pending.len());
+        let mut events = Vec::with_capacity(pending.len());
+        for pending in pending {
+            ids.push(pending.id);
+            events.push(pending.event);
+        }
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        self.append_tx
+            .send(AppendRequest {
+                events: serialize_events(Scope::CodeReviewJob(job_id.to_owned()), events)?,
+                code_review_outbox_ids: ids,
+                reply: AppendReply::Async(reply),
+            })
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
     pub fn code_review_jobs_with_pending_events(&self, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -6782,14 +6834,6 @@ impl Store {
         )?;
         let rows = stmt.query_map([limit as i64], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn complete_code_review_pending_event(&self, id: i64) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM code_review_pending_events WHERE id = ?1", [id])?;
-        Ok(())
     }
 
     pub fn set_code_review_job_phase_elapsed(
@@ -13871,8 +13915,8 @@ mod tests {
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
     }
 
-    #[test]
-    fn changed_batch_digest_clears_routing_and_supersedes_every_old_task() {
+    #[tokio::test]
+    async fn changed_batch_digest_clears_routing_and_supersedes_every_old_task() {
         let store = Store::open_in_memory().unwrap();
         let reviewer = crate::reviewers::built_in_reviewers().remove(0);
         let queued = store
@@ -13972,14 +14016,21 @@ mod tests {
             pending.len(),
             "matching-digest recovery must retain undelivered transition events"
         );
-        for pending in pending {
+        assert_eq!(
             store
-                .append_event(Scope::CodeReviewJob(queued.id.clone()), pending.event)
-                .unwrap();
+                .flush_pending_code_review_events(&queued.id)
+                .await
+                .unwrap()
+                .len(),
+            pending.len()
+        );
+        assert!(
             store
-                .complete_code_review_pending_event(pending.id)
-                .unwrap();
-        }
+                .flush_pending_code_review_events(&queued.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .code_review_jobs_with_pending_events(10)
