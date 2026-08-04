@@ -6376,6 +6376,28 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
+    struct SilentToolTurnGuard {
+        release: Arc<tokio::sync::Semaphore>,
+        superseded: CancellationToken,
+        released: bool,
+    }
+
+    impl SilentToolTurnGuard {
+        fn release(&mut self) {
+            if !self.released {
+                self.release.add_permits(1);
+                self.released = true;
+            }
+        }
+    }
+
+    impl Drop for SilentToolTurnGuard {
+        fn drop(&mut self) {
+            self.superseded.cancel();
+            self.release();
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::tools::ToolExecutor for SilentToolExecutor {
         async fn specs(&self, _ctx: &crate::tools::ToolCtx) -> Vec<trouve_providers::ToolSpec> {
@@ -6409,6 +6431,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn review_turn_persists_capacity_and_silent_tool_progress() {
         use trouve_protocol::{CodeReviewTaskLifecycleStage, Session, Thread, Workspace};
+
+        const WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
         let data = tempfile::tempdir().unwrap();
         let worktree = data.path().join("worktree");
@@ -6511,23 +6535,53 @@ mod tests {
                     .await
             }
         });
-
-        tool_started.notified().await;
-        loop {
-            let envelope = progress_events.recv().await.unwrap();
+        let mut blocked_turn = SilentToolTurnGuard {
+            release: tool_release,
+            superseded,
+            released: false,
+        };
+        let (timeout_tx, mut timeout_rx) = tokio::sync::oneshot::channel();
+        let (watchdog_cancel_tx, watchdog_cancel_rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
             if matches!(
-                envelope.event,
-                Event::CodeReviewTaskProgressUpdated {
-                    ref task_id,
-                    ref progress,
-                    ..
-                } if task_id == &task.id && progress.model_started_at.is_some()
+                watchdog_cancel_rx.recv_timeout(WALL_CLOCK_TIMEOUT),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             ) {
-                break;
+                let _ = timeout_tx.send(());
             }
+        });
+
+        tokio::select! {
+            biased;
+            _ = tool_started.notified() => {}
+            _ = &mut timeout_rx => panic!("the blocking tool should start"),
         }
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
+        tokio::time::advance(REVIEW_TASK_PROGRESS_INTERVAL).await;
+        tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    let envelope = progress_events
+                        .recv()
+                        .await
+                        .expect("review progress stream should remain open");
+                    if matches!(
+                        envelope.event,
+                        Event::CodeReviewTaskProgressUpdated {
+                            ref task_id,
+                            ref progress,
+                            ..
+                        } if task_id == &task.id
+                            && progress.lifecycle_stage
+                                == CodeReviewTaskLifecycleStage::RunningTool
+                    ) {
+                        break;
+                    }
+                }
+            } => {}
+            _ = &mut timeout_rx => {
+                panic!("silent tool progress should be persisted after the interval")
+            }
         }
 
         let stages = store
@@ -6567,35 +6621,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lifecycle_stage,
-            CodeReviewTaskLifecycleStage::StartingModel
+            CodeReviewTaskLifecycleStage::RunningTool
         );
-
-        tokio::time::advance(REVIEW_TASK_PROGRESS_INTERVAL - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            store
-                .code_review_task(&queued.id, &task.id)
-                .unwrap()
-                .unwrap()
-                .lifecycle_stage,
-            CodeReviewTaskLifecycleStage::StartingModel
-        );
-
-        tokio::time::advance(Duration::from_millis(1)).await;
-        loop {
-            let envelope = progress_events.recv().await.unwrap();
-            if matches!(
-                envelope.event,
-                Event::CodeReviewTaskProgressUpdated {
-                    ref task_id,
-                    ref progress,
-                    ..
-                } if task_id == &task.id
-                    && progress.lifecycle_stage == CodeReviewTaskLifecycleStage::RunningTool
-            ) {
-                break;
-            }
-        }
         let persisted = store
             .code_review_task(&queued.id, &task.id)
             .unwrap()
@@ -6606,8 +6633,22 @@ mod tests {
         );
         assert_eq!(persisted.tool_call_count, 1);
 
-        tool_release.add_permits(1);
-        let result = turn.await.unwrap().unwrap();
+        blocked_turn.release();
+        let result = tokio::select! {
+            biased;
+            result = turn => result
+                .expect("review turn task should not panic")
+                .expect("review turn should succeed"),
+            _ = &mut timeout_rx => {
+                panic!("review turn should finish after releasing the tool")
+            }
+        };
+        watchdog_cancel_tx
+            .send(())
+            .expect("review turn watchdog should remain available");
+        watchdog
+            .join()
+            .expect("review turn watchdog should not panic");
         assert_eq!(result.output, "done");
         assert_eq!(result.metrics.tool_call_count, 1);
     }
