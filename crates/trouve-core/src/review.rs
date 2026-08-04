@@ -5897,12 +5897,12 @@ fn semantic_routing_failure_selection(
     routing_mode: CodeReviewRoutingMode,
     error: anyhow::Error,
 ) -> Result<HashMap<String, String>> {
-    if routing_mode == CodeReviewRoutingMode::Additive {
-        Ok(HashMap::new())
-    } else if routing_mode == CodeReviewRoutingMode::Automatic {
-        Err(error).context("Automatic persona selection requires successful semantic routing")
-    } else {
-        Err(error)
+    match routing_mode {
+        CodeReviewRoutingMode::Additive => Ok(HashMap::new()),
+        CodeReviewRoutingMode::Automatic => {
+            Err(error).context("Automatic persona selection requires successful semantic routing")
+        }
+        CodeReviewRoutingMode::Manual => Err(error),
     }
 }
 
