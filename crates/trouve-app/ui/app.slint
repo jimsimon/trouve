@@ -1556,7 +1556,6 @@ export component AppWindow inherits Window {
     in-out property <int> pr-dash-project-index: 0;
     in property <string> pr-dash-status: "";
     in property <string> pr-dash-refresh-status: "";
-    in property <bool> pr-dash-has-workspaces: true;
     // Set immediately before a keyboard move so the rebuilt repeater returns
     // focus to the moved group's handle.
     in-out property <string> pr-group-reorder-focus-key: "";
@@ -5583,7 +5582,6 @@ export component AppWindow inherits Window {
         status: root.pr-dash-status;
         refresh-status: root.pr-dash-refresh-status;
         configured: root.pr-configured;
-        has-workspaces: root.pr-dash-has-workspaces;
         blocked-severe: root.connectivity-severe;
         offline-warning: root.connectivity-text;
         online-notice: root.connectivity-notice;

@@ -32,6 +32,65 @@ pub struct EventEnvelope {
     pub event: Event,
 }
 
+/// Aggregate user attention required anywhere in a session. This projection
+/// prevents clients from retaining every background thread history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttention {
+    None,
+    Approval,
+    Question,
+    Both,
+}
+
+/// Aggregate execution outcome for the session inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// A fresh session-level notification edge derived from a durable thread
+/// event. Clients apply their own notification preferences and foreground
+/// suppression; this type only preserves the native event category without
+/// requiring one background SSE follower per thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNotificationKind {
+    TurnCompleted,
+    TurnFailed,
+    ApprovalRequested,
+    QuestionRequested,
+}
+
+/// Durable server projection used by desktop and PWA session lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub archived: bool,
+    pub active: bool,
+    pub attention: SessionAttention,
+    pub outcome: SessionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_thread_id: Option<ThreadId>,
+    /// Cursor of the durable source event that produced this state.
+    pub latest_cursor: u64,
+    /// Timestamp of that source event.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Atomic session-summary snapshot plus the server-scope cursor after which a
+/// client resumes the existing durable event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSummariesSnapshot {
+    pub summaries: Vec<SessionSummary>,
+    pub cursor: u64,
+}
+
 /// Permission decision for an approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -349,6 +408,35 @@ pub enum Event {
         workspace_id: WorkspaceId,
         active: bool,
     },
+    /// The server restarted while this session still had process-owned turn
+    /// state. Clients clear running/approval/question UI from the replacement
+    /// summary; those responders cannot survive the process that owned them.
+    #[serde(rename = "session.recovered")]
+    SessionRecovered {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    },
+    /// Transactionally derived aggregate state. `summary: null` is the
+    /// durable tombstone for a deleted session.
+    #[serde(rename = "session.summary_updated")]
+    SessionSummaryUpdated {
+        session_id: SessionId,
+        #[serde(default)]
+        #[schema(required = true, nullable = true)]
+        summary: Option<SessionSummary>,
+    },
+    /// Compact durable edge for notifications about inactive/background
+    /// threads. It is appended transactionally after the replacement session
+    /// summary produced by the same source event.
+    #[serde(rename = "session.notification")]
+    SessionNotification {
+        session_id: SessionId,
+        thread_id: ThreadId,
+        kind: SessionNotificationKind,
+        /// Optional native-equivalent failure excerpt or question subtitle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// A scheduled automation ran (or failed to). Clients refetch the
     /// automations list — and the sessions list when it succeeded, since a
     /// run creates a session.
@@ -446,6 +534,32 @@ mod tests {
             routing["routing_decisions"][0]["reviewer_id"],
             "concurrency"
         );
+    }
+
+    #[test]
+    fn session_summary_tombstone_serializes_explicit_null() {
+        let value = serde_json::to_value(Event::SessionSummaryUpdated {
+            session_id: "se_deleted".into(),
+            summary: None,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session.summary_updated");
+        assert!(value.get("summary").is_some());
+        assert!(value["summary"].is_null());
+    }
+
+    #[test]
+    fn session_notification_serializes_optional_detail() {
+        let value = serde_json::to_value(Event::SessionNotification {
+            session_id: "se_1".into(),
+            thread_id: "th_1".into(),
+            kind: SessionNotificationKind::TurnFailed,
+            detail: Some("provider unavailable".into()),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session.notification");
+        assert_eq!(value["kind"], "turn_failed");
+        assert_eq!(value["detail"], "provider unavailable");
     }
 
     #[test]

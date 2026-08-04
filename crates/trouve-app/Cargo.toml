@@ -12,6 +12,26 @@ publish = false
 name = "trouve"
 path = "src/main.rs"
 
+[[bin]]
+name = "trouve-web-preview"
+path = "src/web_preview.rs"
+required-features = ["web-preview"]
+
+[[bin]]
+name = "trouve-servo-preview"
+path = "src/servo_preview.rs"
+required-features = ["servo-preview"]
+
+[features]
+default = []
+# Qualification/rollback preview only. Slint remains the product default until
+# the webview, parity, accessibility, memory, and soak gates pass (ADR 0023).
+web-preview = ["dep:tao", "dep:trouve-desktop-host", "dep:wry"]
+# First-pass Servo qualification runner. This launches a pinned external
+# servoshell against the same hardened asset/protocol gateway; it is not the
+# eventual in-process desktop host adapter.
+servo-preview = ["dep:trouve-desktop-host"]
+
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
@@ -32,6 +52,7 @@ trouve-protocol.workspace = true
 # and speaks HTTP/SSE to it over loopback. Engine internals stay out of
 # reach — trouve-core is deliberately NOT a dependency (invariant 1).
 trouve-server.workspace = true
+trouve-desktop-host = { workspace = true, optional = true }
 # Plain-data helpers (diff parsing, markdown blocks, highlight segments,
 # terminal screen state + key encoding).
 trouve-slint-code-view.workspace = true
@@ -60,6 +81,11 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
+
+# Maintained system-webview candidate. Optional so ordinary offline builds and
+# Slint rollback artifacts do not acquire WebKitGTK/WebView2 requirements.
+tao = { version = "0.36.0", optional = true }
+wry = { version = "0.56.0", optional = true }
 
 [build-dependencies]
 slint-build = "1.17"

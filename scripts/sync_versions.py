@@ -36,6 +36,7 @@ DEPENDENCY_FIELDS = (
 )
 IGNORED_DIRS = {".git", ".venv", "dist", "node_modules", "reference", "target"}
 PLUGIN_DIRS = {".claude-plugin", ".codex-plugin"}
+NESTED_CARGO_WORKSPACES = (Path("crates/trouve-servo-embed-preview"),)
 
 
 class VersionSyncError(RuntimeError):
@@ -65,8 +66,22 @@ def workspace_version(root: Path = ROOT) -> str:
 def workspace_member_manifests(root: Path = ROOT) -> list[Path]:
     workspace = load_toml(root / "Cargo.toml").get("workspace", {})
     members = workspace.get("members", [])
+    excludes = workspace.get("exclude", [])
     if not isinstance(members, list):
         raise VersionSyncError("Cargo.toml workspace.members must be an array")
+    if not isinstance(excludes, list):
+        raise VersionSyncError("Cargo.toml workspace.exclude must be an array")
+
+    excluded_manifests: set[Path] = set()
+    for pattern in excludes:
+        if not isinstance(pattern, str):
+            raise VersionSyncError(
+                "Cargo.toml workspace exclude patterns must be strings"
+            )
+        for excluded in root.glob(pattern):
+            manifest = excluded / "Cargo.toml" if excluded.is_dir() else excluded
+            if manifest.is_file():
+                excluded_manifests.add(manifest.resolve())
 
     manifests: set[Path] = set()
     for pattern in members:
@@ -76,7 +91,10 @@ def workspace_member_manifests(root: Path = ROOT) -> list[Path]:
             )
         for member in root.glob(pattern):
             manifest = member / "Cargo.toml" if member.is_dir() else member
-            if manifest.is_file():
+            if (
+                manifest.is_file()
+                and manifest.resolve() not in excluded_manifests
+            ):
                 manifests.add(manifest)
     return sorted(manifests)
 
@@ -320,6 +338,203 @@ def sync_cargo_lock(root: Path, expected: str, *, check: bool) -> list[str]:
     return changes
 
 
+def _rewrite_workspace_package_version(text: str, expected: str) -> str:
+    header = re.search(r"(?m)^\[workspace\.package\]\s*$", text)
+    if header is None:
+        raise VersionSyncError("nested Cargo.toml has no [workspace.package] table")
+    next_header = re.search(r"(?m)^\[", text[header.end() :])
+    section_end = (
+        header.end() + next_header.start() if next_header is not None else len(text)
+    )
+    section = text[header.end() : section_end]
+    updated, count = re.subn(
+        r'(?m)^(\s*version\s*=\s*")[^"]+(")',
+        rf"\g<1>{expected}\g<2>",
+        section,
+        count=1,
+    )
+    if count != 1:
+        raise VersionSyncError(
+            "nested Cargo.toml [workspace.package] has no string version"
+        )
+    return f"{text[:header.end()]}{updated}{text[section_end:]}"
+
+
+def sync_nested_cargo_workspaces(
+    root: Path, expected: str, *, check: bool
+) -> list[str]:
+    """Keep isolated first-party Cargo workspaces on the root release train.
+
+    The Servo qualification crate needs its own lockfile because Servo and
+    trouve-server link incompatible libsqlite3-sys versions. It remains a
+    first-party artifact, so its nested workspace version, internal path pins,
+    local lock records, and Cargo metadata must still match the root version.
+    """
+
+    changes: list[str] = []
+    for relative in NESTED_CARGO_WORKSPACES:
+        nested_root = root / relative
+        manifest_path = nested_root / "Cargo.toml"
+        if not manifest_path.exists():
+            continue
+
+        manifest = load_toml(manifest_path)
+        workspace = manifest.get("workspace", {})
+        workspace_package = workspace.get("package", {})
+        found_version = workspace_package.get("version")
+        text = manifest_path.read_text(encoding="utf-8")
+        manifest_changed = False
+        if found_version != expected:
+            changes.append(
+                f"{manifest_path.relative_to(root)}: nested workspace version "
+                f"{found_version!r} (expected {expected!r})"
+            )
+            if not check:
+                text = _rewrite_workspace_package_version(text, expected)
+                manifest_changed = True
+
+        internal_names: set[str] = set()
+        dependencies = workspace.get("dependencies", {})
+        if not isinstance(dependencies, dict):
+            raise VersionSyncError(
+                f"{manifest_path}: [workspace.dependencies] must be a table"
+            )
+        for name, spec in dependencies.items():
+            if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
+                continue
+            package_name = spec.get("package", name)
+            if not isinstance(package_name, str):
+                raise VersionSyncError(
+                    f"{manifest_path}: workspace dependency {name!r} has an invalid package"
+                )
+            internal_names.add(package_name)
+            found = spec.get("version")
+            if found == expected:
+                continue
+            changes.append(
+                f"{manifest_path.relative_to(root)}: workspace dependency "
+                f"{name!r} is {found!r} (expected {expected!r})"
+            )
+            if not check:
+                text = _rewrite_dependency_version(text, name, expected)
+                manifest_changed = True
+
+        if manifest_changed:
+            manifest_path.write_text(text, encoding="utf-8")
+
+        package_name = manifest.get("package", {}).get("name")
+        if not isinstance(package_name, str) or not package_name:
+            raise VersionSyncError(f"{manifest_path} has no package.name field")
+        local_names = internal_names | {package_name}
+        lock_path = nested_root / "Cargo.lock"
+        if not lock_path.exists():
+            changes.append(f"{lock_path.relative_to(root)}: missing")
+            if not check:
+                result = subprocess.run(
+                    ["cargo", "generate-lockfile", "--offline"],
+                    cwd=nested_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    raise VersionSyncError(
+                        f"nested cargo generate-lockfile failed: {detail}"
+                    )
+        if not lock_path.exists():
+            continue
+
+        lock = load_toml(lock_path)
+        local_records = {
+            record.get("name"): record
+            for record in lock.get("package", [])
+            if isinstance(record, dict)
+            and record.get("source") is None
+            and record.get("name") in local_names
+        }
+        missing = sorted(local_names - local_records.keys())
+        if missing:
+            changes.append(
+                f"{lock_path.relative_to(root)}: missing local packages "
+                + ", ".join(missing)
+            )
+            if not check:
+                result = subprocess.run(
+                    ["cargo", "generate-lockfile", "--offline"],
+                    cwd=nested_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    raise VersionSyncError(
+                        f"nested cargo generate-lockfile failed while refreshing: {detail}"
+                    )
+                lock = load_toml(lock_path)
+                local_records = {
+                    record.get("name"): record
+                    for record in lock.get("package", [])
+                    if isinstance(record, dict)
+                    and record.get("source") is None
+                    and record.get("name") in local_names
+                }
+
+        lock_text = lock_path.read_text(encoding="utf-8")
+        lock_changed = False
+        for name in sorted(local_names):
+            record = local_records.get(name)
+            if record is None:
+                if check:
+                    continue
+                raise VersionSyncError(
+                    f"{lock_path} is missing local package {name!r}"
+                )
+            found = record.get("version")
+            if found == expected:
+                continue
+            changes.append(
+                f"{lock_path.relative_to(root)}: local package {name!r} is "
+                f"{found!r} (expected {expected!r})"
+            )
+            if not check:
+                lock_text = _rewrite_cargo_lock_version(lock_text, name, expected)
+                lock_changed = True
+        if lock_changed:
+            lock_path.write_text(lock_text, encoding="utf-8")
+
+        metadata = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                str(manifest_path),
+                "--no-deps",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if metadata.returncode:
+            detail = metadata.stderr.strip() or metadata.stdout.strip()
+            raise VersionSyncError(f"nested cargo metadata failed: {detail}")
+        for package in json.loads(metadata.stdout).get("packages", []):
+            if package.get("version") != expected:
+                raise VersionSyncError(
+                    f"{Path(package['manifest_path']).relative_to(root)}: cargo "
+                    f"metadata resolved {package.get('version')!r} "
+                    f"(expected {expected!r})"
+                )
+
+    return changes
+
+
 def repository_files(root: Path, filename: str) -> list[Path]:
     matches: list[Path] = []
     for current, dirs, files in os.walk(root):
@@ -525,6 +740,7 @@ def synchronize(root: Path = ROOT, *, check: bool) -> tuple[str, list[str]]:
 
     changes = sync_workspace_dependency_pins(root, expected, check=check)
     changes.extend(sync_cargo_lock(root, expected, check=check))
+    changes.extend(sync_nested_cargo_workspaces(root, expected, check=check))
     changes.extend(sync_json_artifacts(root, expected, check=check))
     metadata_errors = check_cargo_metadata(root, expected, locked=True)
     if metadata_errors:

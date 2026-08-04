@@ -3754,7 +3754,6 @@ impl Controller {
             filter_index,
             status_parts.join("\n"),
             self.pr_dashboard_refresh_status(),
-            !self.workspaces.is_empty(),
         );
     }
 
@@ -5748,9 +5747,8 @@ impl Controller {
                     .current_term_mut()
                     .and_then(|state| state.grid.url_at(row, col))
                     .filter(|url| is_web_url(url))
-                    && let Err(e) = open::that_detached(&url)
                 {
-                    self.error(&format!("could not open {url}: {e}"));
+                    crate::opener::open(&url);
                 }
             }
             UiCommand::TermMouse {

@@ -1,0 +1,72 @@
+{
+  "name": "@trouve-ai/app-ui",
+  "version": "3.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Lit desktop and PWA frontend for trouve.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/app-ui"
+  },
+  "scripts": {
+    "build": "npm run verify:validators && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit && vite build --mode desktop && node scripts/check-bundle-budget.mjs desktop",
+    "build:pwa": "npm run verify:validators && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit && vite build --mode pwa && node scripts/check-bundle-budget.mjs pwa",
+    "dev": "vite --mode desktop",
+    "format:check": "node scripts/check-source-format.mjs",
+    "generate:protocol": "openapi-typescript ../../crates/trouve-server/tests/snapshots/openapi.json -o src/generated/protocol.ts && openapi-typescript ../../crates/trouve-desktop-host/tests/snapshots/openapi.json -o src/generated/host.ts && node scripts/copy-openapi-schemas.mjs && npm run generate:validators",
+    "generate:notices": "node scripts/generate-third-party-notices.mjs",
+    "generate:sbom": "node scripts/generate-npm-sbom.mjs",
+    "generate:validators": "node scripts/generate-runtime-validators.mjs",
+    "lint": "node scripts/check-source-policy.mjs",
+    "test": "npm run verify:validators && vitest run",
+    "test:browser": "playwright test",
+    "test:browser:update": "playwright test --update-snapshots",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit",
+    "verify:build-modes": "node scripts/verify-build-modes.mjs",
+    "verify:notices": "node scripts/generate-third-party-notices.mjs --check",
+    "verify:validators": "node scripts/generate-runtime-validators.mjs --check"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@awesome.me/webawesome": "^3.11.0",
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/merge": "^6.12.2",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.7",
+    "@lezer/highlight": "^1.2.3",
+    "@lezer/javascript": "^1.5.4",
+    "@lit-labs/signals": "0.3.0",
+    "@lit/context": "^1.1.6",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "lit": "^3.3.3",
+    "openapi-fetch": "0.17.0",
+    "rehype-sanitize": "^6.0.0",
+    "rehype-stringify": "^10.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "signal-polyfill": "0.2.2",
+    "unified": "^11.0.5"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.62.1",
+    "@types/node": "^24.0.0",
+    "ajv": "8.20.0",
+    "openapi-typescript": "7.13.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

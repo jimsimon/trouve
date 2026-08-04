@@ -9,6 +9,59 @@ use trouve_protocol::{
     ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus, Usage,
 };
 
+/// Per-tool retained output budget. The projection keeps the latest valid
+/// UTF-8 suffix so replaying a long-running command cannot grow client memory
+/// without bound.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolOutputBuffer {
+    pub text: String,
+    /// True once nonempty earlier output has been discarded.
+    pub omitted: bool,
+}
+
+impl ToolOutputBuffer {
+    fn append(&mut self, chunk: &str) -> bool {
+        if chunk.is_empty() {
+            return false;
+        }
+
+        if chunk.len() >= MAX_TOOL_OUTPUT_BYTES {
+            let tail = utf8_tail(chunk, MAX_TOOL_OUTPUT_BYTES);
+            self.omitted |= !self.text.is_empty() || tail.len() < chunk.len();
+            self.text.clear();
+            self.text.push_str(tail);
+            return true;
+        }
+
+        let retained_budget = MAX_TOOL_OUTPUT_BYTES - chunk.len();
+        if self.text.len() > retained_budget {
+            self.text = utf8_tail(&self.text, retained_budget).to_owned();
+            self.omitted = true;
+        }
+        self.text.push_str(chunk);
+        true
+    }
+}
+
+/// Return the longest suffix that starts at a UTF-8 scalar boundary and fits
+/// within `max_bytes`.
+fn utf8_tail(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    if max_bytes == 0 {
+        return "";
+    }
+
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatItem {
     User {
@@ -75,6 +128,10 @@ pub enum TurnState {
 pub struct ThreadViewModel {
     pub items: Vec<ChatItem>,
     pub cursor: u64,
+    /// Bounded live output for each tool card, keyed by call id. This stays
+    /// outside `ChatItem` so existing native renderers remain source-compatible
+    /// while web and native projections share replay semantics.
+    pub tool_outputs: HashMap<String, ToolOutputBuffer>,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
@@ -112,6 +169,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
         Self {
             items: snapshot.items.into_iter().map(ChatItem::from).collect(),
             cursor: 0,
+            tool_outputs: HashMap::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage: snapshot.last_usage,
@@ -350,6 +408,9 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.finish_thinking();
+                // Call ids are expected to be unique, but resetting here makes
+                // a reused id deterministic instead of inheriting stale output.
+                self.tool_outputs.remove(call_id);
                 self.items.push(ChatItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -408,6 +469,31 @@ impl ThreadViewModel {
                         *status = ToolCallStatus::Running;
                     }
                 }
+                idx
+            }
+            Event::ToolOutput { call_id, chunk } => {
+                let idx = self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
+                );
+                let terminal = idx.is_some_and(|idx| {
+                    matches!(
+                        &self.items[idx],
+                        ChatItem::ToolCall {
+                            status: ToolCallStatus::Ok
+                                | ToolCallStatus::Error
+                                | ToolCallStatus::Denied
+                                | ToolCallStatus::Aborted,
+                            ..
+                        }
+                    )
+                });
+                if idx.is_none() || terminal || chunk.is_empty() {
+                    return None;
+                }
+                self.tool_outputs
+                    .entry(call_id.clone())
+                    .or_default()
+                    .append(chunk);
                 idx
             }
             Event::ToolCompleted {
@@ -536,6 +622,123 @@ impl ThreadViewModel {
 mod tests {
     use super::*;
     use trouve_protocol::Scope;
+
+    #[test]
+    fn shared_web_projection_fixture_matches() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/thread-turn.json")).unwrap();
+        let events: Vec<EventEnvelope> = serde_json::from_value(fixture["events"].clone()).unwrap();
+        let mut vm = ThreadViewModel::new();
+        for event in &events {
+            vm.apply(event);
+        }
+
+        let item_kinds = vm
+            .items
+            .iter()
+            .map(|item| match item {
+                ChatItem::User { .. } => "user",
+                ChatItem::Assistant { .. } => "assistant",
+                ChatItem::Thinking { .. } => "thinking",
+                ChatItem::ToolCall { .. } => "tool",
+                ChatItem::TurnStatus { .. } => "turn-status",
+                ChatItem::Questions { .. } => "questions",
+            })
+            .collect::<Vec<_>>();
+        let turn_state = vm.items.iter().find_map(|item| match item {
+            ChatItem::TurnStatus { state, .. } => Some(match state {
+                TurnState::Running => "running",
+                TurnState::Completed { .. } => "completed",
+                TurnState::Failed { .. } => "failed",
+            }),
+            _ => None,
+        });
+        let assistant_text = vm.items.iter().find_map(|item| match item {
+            ChatItem::Assistant { content, .. } => Some(content.as_str()),
+            _ => None,
+        });
+        let (thinking_text, thinking_complete) = vm
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ChatItem::Thinking {
+                    content, complete, ..
+                } => Some((content.as_str(), *complete)),
+                _ => None,
+            })
+            .unwrap();
+        let (tool_call_id, tool_status, tool_result) = vm
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ChatItem::ToolCall {
+                    call_id,
+                    status,
+                    result,
+                    ..
+                } => Some((
+                    call_id.as_str(),
+                    match status {
+                        ToolCallStatus::AwaitingApproval => "awaiting-approval",
+                        ToolCallStatus::Running => "running",
+                        ToolCallStatus::Ok => "ok",
+                        ToolCallStatus::Error => "error",
+                        ToolCallStatus::Denied => "denied",
+                        ToolCallStatus::Aborted => "aborted",
+                    },
+                    result.clone(),
+                )),
+                _ => None,
+            })
+            .unwrap();
+        let tool_output = vm.tool_outputs.get(tool_call_id).unwrap();
+        let question_resolution = vm
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ChatItem::Questions { answers, .. } => Some(match answers {
+                    None => "pending",
+                    Some(None) => "skipped",
+                    Some(Some(_)) => "answered",
+                }),
+                _ => None,
+            })
+            .unwrap();
+        let usage = vm.last_usage.as_ref().unwrap();
+        let actual = serde_json::json!({
+            "cursor": vm.cursor,
+            "turn_running": vm.turn_running,
+            "thinking": vm.thinking,
+            "pending_approvals": vm.pending_approvals,
+            "pending_questions": vm.pending_questions,
+            "item_kinds": item_kinds,
+            "turn_state": turn_state,
+            "assistant_text": assistant_text,
+            "thinking_text": thinking_text,
+            "thinking_complete": thinking_complete,
+            "tool_status": tool_status,
+            "tool_result": tool_result,
+            "tool_output": tool_output.text,
+            "tool_output_omitted": tool_output.omitted,
+            "question_resolution": question_resolution,
+            "command_names": vm.commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>(),
+            "todo_statuses": vm.todos.iter().map(|todo| match todo.status {
+                trouve_protocol::TodoStatus::Pending => "pending",
+                trouve_protocol::TodoStatus::InProgress => "in_progress",
+                trouve_protocol::TodoStatus::Completed => "completed",
+                trouve_protocol::TodoStatus::Cancelled => "cancelled",
+            }).collect::<Vec<_>>(),
+            "turn_duration_ms": vm.turn_duration_ms.get(&7),
+            "last_usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cost_usd": usage.cost_usd,
+                "context_window": usage.context_window,
+            },
+        });
+        assert_eq!(actual, fixture["expected"]);
+    }
 
     fn env(event: Event) -> EventEnvelope {
         static CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -786,6 +989,80 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_output_folds_into_a_bounded_utf8_tail() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "c1".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "cargo test"}),
+            requires_approval: false,
+        }));
+        assert_eq!(
+            vm.apply(&env(Event::ToolOutput {
+                call_id: "c1".into(),
+                chunk: "running ".into(),
+            })),
+            Some(0)
+        );
+        vm.apply(&env(Event::ToolOutput {
+            call_id: "c1".into(),
+            chunk: "tests\n".into(),
+        }));
+        assert_eq!(
+            vm.tool_outputs.get("c1"),
+            Some(&ToolOutputBuffer {
+                text: "running tests\n".into(),
+                omitted: false,
+            })
+        );
+
+        let oversized = format!("{}🙂tail", "x".repeat(MAX_TOOL_OUTPUT_BYTES));
+        vm.apply(&env(Event::ToolOutput {
+            call_id: "c1".into(),
+            chunk: oversized,
+        }));
+        let retained = vm.tool_outputs.get("c1").unwrap();
+        assert!(retained.omitted);
+        assert!(retained.text.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(retained.text.ends_with("🙂tail"));
+    }
+
+    #[test]
+    fn unknown_and_post_completion_tool_output_are_ignored() {
+        let mut vm = ThreadViewModel::new();
+        assert_eq!(
+            vm.apply(&env(Event::ToolOutput {
+                call_id: "missing".into(),
+                chunk: "ignored".into(),
+            })),
+            None
+        );
+        assert!(vm.tool_outputs.is_empty());
+
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "done".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "true"}),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::ToolCompleted {
+            call_id: "done".into(),
+            status: ToolStatus::Ok,
+            result: serde_json::Value::Null,
+        }));
+        assert_eq!(
+            vm.apply(&env(Event::ToolOutput {
+                call_id: "done".into(),
+                chunk: "too late".into(),
+            })),
+            None
+        );
+        assert!(!vm.tool_outputs.contains_key("done"));
     }
 
     #[test]

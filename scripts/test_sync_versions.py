@@ -54,6 +54,58 @@ version = "2.1.0"
             self.assertIn("trouve-stale", errors[0])
             self.assertIn("version.workspace = true", errors[0])
 
+    def test_excluded_nested_workspace_is_not_a_root_member(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write(
+                root / "Cargo.toml",
+                """[workspace]
+members = ["crates/*"]
+exclude = ["crates/trouve-isolated"]
+
+[workspace.package]
+version = "3.0.0"
+""",
+            )
+            write(
+                root / "crates/trouve-member/Cargo.toml",
+                """[package]
+name = "trouve-member"
+version.workspace = true
+""",
+            )
+            write(
+                root / "crates/trouve-isolated/Cargo.toml",
+                """[workspace]
+[workspace.package]
+version = "3.0.0"
+[package]
+name = "trouve-isolated"
+version.workspace = true
+""",
+            )
+
+            manifests = sync_versions.workspace_member_manifests(root)
+            self.assertEqual(
+                manifests, [root / "crates/trouve-member/Cargo.toml"]
+            )
+
+    def test_nested_workspace_version_rewrite_is_scoped_to_its_table(self) -> None:
+        text = """[workspace]
+members = ["."]
+
+[workspace.package]
+version = "2.1.0"
+
+[dependencies]
+example = "9.9.9"
+"""
+        rewritten = sync_versions._rewrite_workspace_package_version(
+            text, "3.0.0"
+        )
+        self.assertIn('[workspace.package]\nversion = "3.0.0"', rewritten)
+        self.assertIn('example = "9.9.9"', rewritten)
+
     def test_workspace_dependency_pins_are_checked_and_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

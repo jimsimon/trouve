@@ -1,5 +1,6 @@
-// Pull Requests: a dashboard of every open (or recently merged) PR across
-// the registered workspaces, grouped by what the user should do next.
+// Pull Requests: an account-centric dashboard of every relevant open (or
+// recently merged) PR across signed-in GitHub hosts, grouped by what the user
+// should do next.
 // Full-window screen (like settings/automations). Groups use a responsive
 // two-column grid, collapse, and
 // reorder by pointer drag or, for keyboard/assistive tech, an Up/Down
@@ -83,18 +84,21 @@ component PrIconButton inherits Rectangle {
     in property <string> icon;
     in property <string> label;
     in property <bool> active: false;
+    in property <bool> enabled: true;
     callback clicked;
 
     width: Theme.fs(26px);
     height: Theme.fs(22px);
     border-radius: 4px;
-    background: ta.has-hover ? Theme.c.hover-strong : transparent;
+    background: ta.has-hover && root.enabled ? Theme.c.hover-strong : transparent;
     border-width: fs.has-focus ? 1px : 0px;
     border-color: Theme.c.accent;
 
     fs := FocusScope {
+        enabled: root.enabled;
         accessible-role: button;
         accessible-label: root.label;
+        accessible-enabled: root.enabled;
         accessible-action-default => { root.clicked(); }
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == " ") {
@@ -105,14 +109,16 @@ component PrIconButton inherits Rectangle {
         }
     }
     ta := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { root.clicked(); }
     }
     Text {
         width: 100%;
         height: 100%;
         text: root.icon;
-        color: root.active ? Theme.c.accent
+        color: !root.enabled ? Theme.c.text-ghost
+            : root.active ? Theme.c.accent
             : ta.has-hover ? Theme.c.text-hi : Theme.c.text-soft;
         font-size: Theme.fs(13px);
         horizontal-alignment: center;
@@ -217,7 +223,7 @@ export component PullRequestsScreen inherits Rectangle {
     // each column in its own VerticalLayout lets cards follow one another
     // without inheriting the height of a taller card beside them.
     in property <[[int]]> group-columns;
-    // "All projects" + one entry per workspace.
+    // "All projects" + one entry per repository in the account feed.
     in property <[string]> project-names;
     in-out property <int> project-index: 0;
     // Error/progress line ("" = nothing to say).
@@ -226,7 +232,6 @@ export component PullRequestsScreen inherits Rectangle {
     in property <string> refresh-status: "";
     // The GitHub integration has auth (mirrors the session PR tab's gate).
     in property <bool> configured: true;
-    in property <bool> has-workspaces: true;
     in property <string> offline-warning;
     in property <string> online-notice;
     in property <bool> blocked-severe;
@@ -307,7 +312,7 @@ export component PullRequestsScreen inherits Rectangle {
                                 wrap: word-wrap;
                             }
                             Text {
-                                text: "trouve looks up each workspace's pull requests and sorts them by what needs your attention. It needs a GitHub sign-in or personal access token to do that.";
+                                text: "trouve shows pull requests you authored, reviewed, or were asked to review across repositories available to your GitHub account, organized by what needs your attention. Sign in to each GitHub host with OAuth to load them.";
                                 color: Theme.c.text-mid;
                                 font-size: Theme.fs(12px);
                                 horizontal-alignment: center;
@@ -323,14 +328,7 @@ export component PullRequestsScreen inherits Rectangle {
                             }
                         }
 
-                        if root.configured && !root.has-workspaces: Text {
-                            text: "Open a workspace first — the dashboard shows the pull requests of each workspace's repository.";
-                            color: Theme.c.warn;
-                            font-size: Theme.fs(12px);
-                            wrap: word-wrap;
-                        }
-
-                        if root.configured && root.has-workspaces: HorizontalLayout {
+                        if root.configured: HorizontalLayout {
                             spacing: 8px;
                             Text {
                                 text: "Project";
@@ -369,7 +367,7 @@ export component PullRequestsScreen inherits Rectangle {
                         }
 
                         // ---------------- groups ----------------
-                        if root.configured && root.has-workspaces:
+                        if root.configured:
                         groups-grid := GridLayout {
                             property <bool> two-columns: root.width >= 1032px;
                             spacing: 10px;
@@ -722,6 +720,7 @@ export component PullRequestsScreen inherits Rectangle {
                                                                 if pr.trouve-review-prompt != "": Button {
                                                                     text: "Fix all";
                                                                     primary: true;
+                                                                    enabled: pr.workspace-id != "" && pr.trouve-review-prompt != "";
                                                                     clicked => {
                                                                         root.fix-clicked(
                                                                             pr.workspace-id,
@@ -758,7 +757,7 @@ export component PullRequestsScreen inherits Rectangle {
                                                                         }
                                                                         Button {
                                                                             text: "Fix";
-                                                                            enabled: finding.prompt != "" && finding.status == "open";
+                                                                            enabled: pr.workspace-id != "" && finding.prompt != "" && finding.status == "open";
                                                                             clicked => {
                                                                                 root.fix-clicked(
                                                                                     pr.workspace-id,
@@ -789,6 +788,7 @@ export component PullRequestsScreen inherits Rectangle {
                                                         PrIconButton {
                                                             icon: pr.has-chat ? "💬" : "＋💬";
                                                             active: pr.has-chat;
+                                                            enabled: pr.workspace-id != "" && pr.branch != "";
                                                             label: pr.has-chat
                                                                 ? "Open the chat this pull request came from"
                                                                 : "Start a new chat for this pull request";

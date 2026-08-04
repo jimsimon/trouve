@@ -1,0 +1,1106 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "trouve desktop host bridge",
+    "description": "Typed desktop webview host and native capability boundary for trouve.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "8"
+  },
+  "paths": {
+    "/__trouve/host/v1/capabilities": {
+      "get": {
+        "tags": [],
+        "operationId": "get_capabilities",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostBootstrap"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/close-decision": {
+      "post": {
+        "tags": [],
+        "operationId": "close_decision",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/lifecycle": {
+      "get": {
+        "tags": [],
+        "operationId": "get_lifecycle",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Last consumed ephemeral host cursor",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "description": "Bounded long-poll wait, at most 25000 ms",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostLifecycleBatch"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/local-file-action": {
+      "post": {
+        "tags": [],
+        "operationId": "local_file_action",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalFileActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/native-notification": {
+      "post": {
+        "tags": [],
+        "operationId": "send_native_notification",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NativeNotificationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/open-https-url": {
+      "post": {
+        "tags": [],
+        "operationId": "open_https_url",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenHttpsUrlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/pick-directory": {
+      "post": {
+        "tags": [],
+        "operationId": "pick_directory",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickDirectoryResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/pick-files": {
+      "post": {
+        "tags": [],
+        "operationId": "pick_files",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickFilesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/preferences": {
+      "get": {
+        "tags": [],
+        "operationId": "get_preferences",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostPreferences"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "put_preferences",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostPreferences"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostPreferences"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/read-clipboard-image": {
+      "post": {
+        "tags": [],
+        "operationId": "read_clipboard_image",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadClipboardImageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/request-user-attention": {
+      "post": {
+        "tags": [],
+        "operationId": "request_user_attention",
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/sleep-inhibition": {
+      "post": {
+        "tags": [],
+        "operationId": "set_sleep_inhibition",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SleepInhibitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AppearancePreferences": {
+        "type": "object",
+        "required": [
+          "theme",
+          "font_family",
+          "font_size",
+          "reduce_motion"
+        ],
+        "properties": {
+          "font_family": {
+            "type": "string"
+          },
+          "font_size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "reduce_motion": {
+            "type": "boolean"
+          },
+          "theme": {
+            "type": "string"
+          }
+        }
+      },
+      "AttachmentPayload": {
+        "type": "object",
+        "description": "One bounded attachment ready to be staged by a composer. Native paths and\nfile handles are deliberately absent from this schema.",
+        "required": [
+          "name",
+          "mime",
+          "data",
+          "size_bytes"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Standard padded base64, bounded to the encoded 10 MiB payload limit."
+          },
+          "mime": {
+            "type": "string",
+            "description": "ASCII MIME type, bounded to 255 bytes by the host and client."
+          },
+          "name": {
+            "type": "string",
+            "description": "UTF-8 display name, bounded to 1 KiB by the host and client."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 10485760,
+            "minimum": 1
+          }
+        }
+      },
+      "ChatScrollBookmark": {
+        "type": "object",
+        "description": "Stable first-visible chat item plus its non-negative offset into the item.\nUnlike raw scroll pixels, this survives font and window-size changes.",
+        "required": [
+          "item_id",
+          "offset"
+        ],
+        "properties": {
+          "item_id": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "CloseDecision": {
+        "type": "string",
+        "enum": [
+          "cancel",
+          "quit_now",
+          "quit_when_idle"
+        ]
+      },
+      "CloseDecisionRequest": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/CloseDecision"
+          },
+          "request_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "GeneralPreferences": {
+        "type": "object",
+        "description": "General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.",
+        "properties": {
+          "prevent_sleep_while_running": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HostBootstrap": {
+        "type": "object",
+        "required": [
+          "capabilities",
+          "csrf_token"
+        ],
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/HostCapabilities"
+          },
+          "csrf_token": {
+            "type": "string",
+            "description": "Ephemeral, origin-bound credential required on every gateway mutation.\nIt is neither persisted nor forwarded to the Trouve protocol server."
+          },
+          "font_families": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Installed system UI font families available to the shared frontend.\nOlder bridge bootstraps omit this field and fall back to the platform\ndefault font.",
+            "maxItems": 4096
+          }
+        }
+      },
+      "HostCapabilities": {
+        "type": "object",
+        "description": "Capabilities are explicit so the PWA never pretends to have native access.",
+        "required": [
+          "kind",
+          "directory_picker",
+          "file_picker",
+          "clipboard_image",
+          "lifecycle_events",
+          "close_confirmation",
+          "open_local_file",
+          "reveal_local_file",
+          "open_https_url",
+          "native_notifications",
+          "web_notifications",
+          "user_attention",
+          "sleep_inhibition",
+          "window_geometry",
+          "visibility",
+          "occlusion",
+          "persistent_preferences",
+          "installable"
+        ],
+        "properties": {
+          "bridge_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "clipboard_image": {
+            "type": "boolean"
+          },
+          "close_confirmation": {
+            "type": "boolean"
+          },
+          "directory_picker": {
+            "type": "boolean"
+          },
+          "file_picker": {
+            "type": "boolean"
+          },
+          "installable": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/HostKind"
+          },
+          "lifecycle_events": {
+            "type": "boolean"
+          },
+          "native_notifications": {
+            "type": "boolean"
+          },
+          "occlusion": {
+            "type": "boolean"
+          },
+          "open_https_url": {
+            "type": "boolean"
+          },
+          "open_local_file": {
+            "type": "boolean"
+          },
+          "persistent_preferences": {
+            "type": "boolean"
+          },
+          "reveal_local_file": {
+            "type": "boolean"
+          },
+          "sleep_inhibition": {
+            "type": "boolean"
+          },
+          "user_attention": {
+            "type": "boolean"
+          },
+          "visibility": {
+            "type": "boolean"
+          },
+          "web_notifications": {
+            "type": "boolean"
+          },
+          "window_geometry": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HostKind": {
+        "type": "string",
+        "description": "Where the shared Lit application is running.",
+        "enum": [
+          "desktop",
+          "pwa",
+          "browser"
+        ]
+      },
+      "HostLifecycleBatch": {
+        "type": "object",
+        "description": "Cursor-addressed batch of ephemeral native window events plus the latest\nrecoverable state. The host retains only a bounded event tail.",
+        "required": [
+          "cursor",
+          "state",
+          "events"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostLifecycleEnvelope"
+            }
+          },
+          "state": {
+            "$ref": "#/components/schemas/HostLifecycleState"
+          }
+        }
+      },
+      "HostLifecycleEnvelope": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "event"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "event": {
+            "$ref": "#/components/schemas/HostLifecycleEvent"
+          }
+        }
+      },
+      "HostLifecycleEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "focused",
+              "type"
+            ],
+            "properties": {
+              "focused": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "focus_changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "visible",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "visibility_changed"
+                ]
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "occluded",
+              "type"
+            ],
+            "properties": {
+              "occluded": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "occlusion_changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "request_id",
+              "type"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "close_requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "notification_id",
+              "session_id",
+              "type"
+            ],
+            "properties": {
+              "notification_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "notification_activated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Ephemeral events emitted by the desktop host to its webview."
+      },
+      "HostLifecycleState": {
+        "type": "object",
+        "description": "Current frontend-visible native window state. This is ephemeral host state,\nnot agent or session state.",
+        "required": [
+          "focused",
+          "visible",
+          "occluded"
+        ],
+        "properties": {
+          "focused": {
+            "type": "boolean"
+          },
+          "occluded": {
+            "type": "boolean"
+          },
+          "pending_close": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PendingCloseRequest"
+              }
+            ]
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HostPreferences": {
+        "type": "object",
+        "description": "Nonsecret settings that the native host may persist across ephemeral ports.",
+        "required": [
+          "appearance",
+          "navigation_width",
+          "inspection_width"
+        ],
+        "properties": {
+          "appearance": {
+            "$ref": "#/components/schemas/AppearancePreferences"
+          },
+          "general": {
+            "$ref": "#/components/schemas/GeneralPreferences"
+          },
+          "geometry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WindowGeometry"
+              }
+            ]
+          },
+          "inspection_width": {
+            "type": "number",
+            "format": "float"
+          },
+          "navigation_width": {
+            "type": "number",
+            "format": "float"
+          },
+          "notifications": {
+            "$ref": "#/components/schemas/NotificationPreferences"
+          },
+          "pull_request_group_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "resume": {
+            "$ref": "#/components/schemas/ResumePreferences"
+          },
+          "workspace_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "LocalFileAction": {
+        "type": "string",
+        "enum": [
+          "open",
+          "reveal"
+        ]
+      },
+      "LocalFileActionRequest": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "relative_path",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/LocalFileAction"
+          },
+          "relative_path": {
+            "type": "string",
+            "description": "Existing worktree-relative regular file. Absolute paths and traversal\nare rejected before the protocol-backed resolver runs."
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "NativeNotificationRequest": {
+        "type": "object",
+        "required": [
+          "notification_id",
+          "title",
+          "body",
+          "sound",
+          "session_id",
+          "thread_id"
+        ],
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "notification_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "sound": {
+            "type": "boolean"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "NotificationPreferences": {
+        "type": "object",
+        "description": "Notification policy remains frontend-owned. The native host persists the\nchoices and delivers only already-gated notification requests.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "on_attention": {
+            "type": "boolean"
+          },
+          "on_fail": {
+            "type": "boolean"
+          },
+          "on_finish": {
+            "type": "boolean"
+          },
+          "sound": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OpenHttpsUrlRequest": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PendingCloseRequest": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "waiting_for_idle"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "waiting_for_idle": {
+            "type": "boolean",
+            "description": "True only after the frontend chose “quit when idle”. The host never\ndecides whether the application is idle; the protocol-backed frontend\nmust later confirm `quit_now` for this same request."
+          }
+        }
+      },
+      "PickDirectoryResponse": {
+        "type": "object",
+        "description": "A cancelled picker succeeds with `path: null`; cancellation is not a host\nerror and must not be presented as one by the frontend.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PickFilesResponse": {
+        "type": "object",
+        "description": "Cancellation succeeds with an empty attachment list.",
+        "required": [
+          "attachments"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentPayload"
+            },
+            "maxItems": 4
+          }
+        }
+      },
+      "ReadClipboardImageResponse": {
+        "type": "object",
+        "description": "Text, an empty clipboard, and unsupported clipboard content all succeed\nwith `attachment: null`, allowing ordinary browser paste to continue.",
+        "required": [
+          "attachment"
+        ],
+        "properties": {
+          "attachment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AttachmentPayload"
+              }
+            ]
+          }
+        }
+      },
+      "ResumePreferences": {
+        "type": "object",
+        "description": "Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.",
+        "properties": {
+          "selected_session_id": {
+            "type": "string"
+          },
+          "session_threads": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "thread_scroll": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ChatScrollBookmark"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SleepInhibitionRequest": {
+        "type": "object",
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          }
+        }
+      },
+      "WindowGeometry": {
+        "type": "object",
+        "required": [
+          "x",
+          "y",
+          "width",
+          "height",
+          "maximized"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "maximized": {
+            "type": "boolean"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      }
+    }
+  }
+}

@@ -45,13 +45,48 @@ session stream.
 - Resumption: clients send `Last-Event-ID: <cursor>` (or `?after=<cursor>`);
   the server replays every persisted event after that cursor, then continues
   live. Replay and live delivery are indistinguishable to the client.
-- The server never skips cursors within a scope; a gap means data loss and
-  is a bug.
+- Cursors are ordered but not dense. Rows in other scopes consume values, so
+  clients must drop duplicates and older events but must never require
+  `next_cursor == previous_cursor + 1`.
 - A client may seed itself from a server-derived snapshot carrying
   `x-trouve-event-cursor`, then subscribe after that cursor. Large folded
   transcripts are transferred as bounded newest-first pages. Snapshots are
   rebuildable projections of this log; they do not replace it as the durable
   source of truth.
+
+### Session-list bootstrap and resume
+
+Clients must not retain every background thread merely to render the session
+inbox. The server therefore maintains a durable `SessionSummary` projection
+containing session/workspace ids, archive and activity state, aggregate
+approval/question attention, the latest terminal outcome, latest thread id,
+source-event cursor, and timestamp.
+
+`GET /v1/session-summaries` returns `{summaries, cursor}` from one SQLite read
+transaction. A client replaces its normalized summary map with that snapshot,
+then opens the existing server stream at `GET /v1/events?after=<cursor>` and
+applies `session.summary_updated` replacements or tombstones. Because each
+projection mutation and its derived server event are committed in the same
+writer transaction, an update is either already represented by the snapshot
+or appears after its cursor; there is no snapshot/stream race window.
+
+Completion, failure, approval, and question source events also derive a
+compact `session.notification` edge after their replacement summary in that
+same transaction. The edge carries the exact category and source thread plus
+an optional bounded failure excerpt or question subtitle. It lets inactive
+thread notifications retain the native behavior without one SSE follower per
+thread. Notifications remain client policy: snapshot-covered history is not
+shown, replay is freshness-gated, focused visible threads are suppressed, and
+preference/sound/activation handling stays with each client.
+
+The projection's `latest_cursor` is the source event cursor, while the
+snapshot `cursor` is the latest server-scope cursor used for SSE resumption.
+They serve different purposes and clients must not interchange them. Because
+turn responders cannot survive their owning process, restart appends a durable
+`session.recovered` source event and replacement summary for each interrupted
+session. Recovery clears stale activity and approval/question attention and
+marks the interrupted outcome failed; snapshot and resumed-stream clients
+therefore converge on the same cursor-addressed transition.
 
 ## Event envelope
 
@@ -85,6 +120,8 @@ Thread scope:
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
   `tool.completed` `{call_id, status, result}`
+- `question.requested` `{turn, request_id, title?, questions}` /
+  `question.resolved` `{request_id, answers?}`
 - `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts
   changed (enqueue/edit/reorder/delete/dispatch); carries the full remaining
   queue in run order, so replaying to the tail reproduces the current queue
@@ -101,9 +138,21 @@ Session scope:
 Server scope:
 
 - `workspace.registered` `{workspace_id, path}`
-- `workspace.pull_requests_updated` `{workspace_id, pull_requests}` — full
-  dashboard snapshot for one workspace, emitted after a requested refresh
+- `github.pull_requests_updated` `{pull_requests}` — full account-centric
+  dashboard snapshot for one configured GitHub host
 - `session.created` / `session.deleted` `{session_id, workspace_id}`
+- `session.updated` `{session_id, workspace_id}` — session metadata changed
+- `thread.created` / `thread.updated` `{thread_id, session_id}`
+- `session.activity` `{session_id, workspace_id, active}` — one or more
+  threads in the session started work, or the final active thread stopped
+- `session.recovered` `{session_id, workspace_id}` — restart reconciled
+  process-owned activity and unresolved attention that cannot be resumed
+- `session.summary_updated` `{session_id, summary}` — full replacement of
+  the transactionally materialized session projection; explicit `null`
+  `summary` is the durable deletion tombstone
+- `session.notification` `{session_id, thread_id, kind, detail?}` — compact
+  notification edge for a completed/failed turn or a newly requested
+  approval/question; `detail` is a bounded failure excerpt or question title
 - `server.connectivity_changed` `{online}` — the server's internet
   reachability flipped; while offline `/v1/models` lists only models that
   run without internet, and clients gate prompt entry on that list
@@ -145,14 +194,20 @@ guarantees per-scope monotonicity; per-scope density is *not* guaranteed and
 clients must not assume consecutive cursors.
 
 Writes go through a single event-writer chokepoint. Callers may submit one
-event or an ordered same-scope batch. The writer assigns cursors, commits the
-transaction, and only then publishes envelopes to in-process subscribers and
-acknowledges the caller. A subscriber can therefore never observe an event
-that would not survive a crash. Per-turn coalescing buffers are bounded by
-count and approximate bytes and apply backpressure. Routes on a multiplexed
-vendor transport have a bounded event budget and report overload to only the
-affected turn, keeping the shared reader available to unrelated turns and
-JSON-RPC responses.
+event or an ordered same-scope batch. Session create/update/delete relational
+changes also execute in that writer transaction. For session-relevant source
+events, the same transaction updates the `session_summaries` and
+unresolved-attention projection tables and appends the derived server-scope
+`session.summary_updated` event immediately after its source. Notification-
+worthy source events append `session.notification` immediately after that
+replacement. The writer then commits and publishes every source and derived
+envelope in exact cursor order before acknowledging callers. A subscriber can
+therefore never observe an event that would not survive a crash, and summary
+state cannot diverge from its notification edge. Per-turn coalescing buffers
+are bounded by count and approximate bytes and apply backpressure. Routes on a
+multiplexed vendor transport have a bounded event budget and report overload
+to only the affected turn, keeping the shared reader available to unrelated
+turns and JSON-RPC responses.
 
 ## Retention & privacy
 

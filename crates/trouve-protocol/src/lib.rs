@@ -157,7 +157,13 @@ pub use requests::*;
 // 3.0: Dynamic persona selection delegates solely to the semantic router;
 // Automatic always enables it, while Additive retains only its baseline and
 // configured inclusions before optional semantic additions (breaking).
-pub const PROTOCOL_VERSION: &str = "3.0";
+// 3.1: transactionally derived session summaries, snapshot endpoint,
+// session.summary_updated durable server events, and session.recovered
+// restart reconciliation (additive).
+// 3.2: transactionally derived session.notification edges preserve the native
+// background completion/failure/approval/question notification category and
+// optional compact detail without per-thread background streams (additive).
+pub const PROTOCOL_VERSION: &str = "3.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

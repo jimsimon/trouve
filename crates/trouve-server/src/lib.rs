@@ -33,13 +33,13 @@ use trouve_protocol::{
     PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
     ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, ThreadViewQuery, ThreadViewSnapshot,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -98,6 +98,7 @@ impl IntoResponse for ApiError {
         generate_session_title,
         create_session,
         list_sessions,
+        session_summaries,
         get_session,
         update_session,
         delete_session,
@@ -207,6 +208,10 @@ impl IntoResponse for ApiError {
         BranchList,
         CreateSessionRequest,
         Session,
+        SessionSummariesSnapshot,
+        trouve_protocol::SessionSummary,
+        trouve_protocol::SessionAttention,
+        trouve_protocol::SessionOutcome,
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
@@ -473,6 +478,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/session-title", post(generate_session_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
+        .route("/v1/session-summaries", get(session_summaries))
         .route(
             "/v1/sessions/{id}",
             get(get_session)
@@ -1039,6 +1045,17 @@ async fn list_sessions(
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<Vec<Session>>, ApiError> {
     Ok(Json(engine.list_sessions(q.workspace_id.as_deref())?))
+}
+
+#[utoipa::path(get, path = "/v1/session-summaries",
+    responses(
+        (status = 200, body = SessionSummariesSnapshot),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn session_summaries(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<SessionSummariesSnapshot>, ApiError> {
+    Ok(Json(engine.session_summaries_snapshot()?))
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}", params(("id" = String, Path,)),

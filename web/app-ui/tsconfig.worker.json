@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "WebWorker"],
+    "types": []
+  },
+  "include": [
+    "src/build-env.d.ts",
+    "src/pwa/cache-policy.ts",
+    "src/pwa/service-worker.ts",
+    "src/workers/content-worker.ts"
+  ],
+  "exclude": []
+}

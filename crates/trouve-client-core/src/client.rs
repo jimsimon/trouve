@@ -188,6 +188,13 @@ impl ProtocolClient {
         self.get_json("/sessions").await
     }
 
+    /// Fetch the materialized session-list projection and the server event
+    /// cursor captured in the same database read transaction. Resume the
+    /// server-scope stream after this cursor to avoid snapshot/stream gaps.
+    pub async fn session_summaries(&self) -> Result<SessionSummariesSnapshot> {
+        self.get_json("/session-summaries").await
+    }
+
     pub async fn update_session(
         &self,
         session_id: &str,

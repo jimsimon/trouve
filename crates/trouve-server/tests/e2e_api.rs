@@ -850,6 +850,22 @@ async fn session_and_thread_updates_and_provider_config() {
     let session_id = session["id"].as_str().unwrap();
     assert_eq!(session["archived"], false);
 
+    // The web/PWA bootstrap projection is an atomic snapshot paired with a
+    // resume cursor after its transactionally emitted replacement event.
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let summary = &summaries["summaries"][0];
+    assert_eq!(summary["session_id"], session_id);
+    assert_eq!(summary["workspace_id"], ws_id);
+    assert_eq!(summary["archived"], false);
+    assert!(summaries["cursor"].as_u64().unwrap() > summary["latest_cursor"].as_u64().unwrap());
+
     // Rename + archive via PATCH.
     let updated: serde_json::Value = client
         .patch(format!("{base}/sessions/{session_id}"))
@@ -862,6 +878,15 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     assert_eq!(updated["title"], "Renamed");
     assert_eq!(updated["archived"], true);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summaries["summaries"][0]["archived"], true);
 
     // Thread creation succeeds even with an unconfigured model (validation
     // is deferred to send time), then PATCH switches mode/model.
@@ -1054,6 +1079,24 @@ async fn session_and_thread_updates_and_provider_config() {
             .iter()
             .any(|p| p["id"] == "openrouter")
     );
+
+    // Deletion commits its relational cleanup and durable summary tombstone
+    // together, so a following bootstrap cannot resurrect the session.
+    let response = client
+        .delete(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(summaries["summaries"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

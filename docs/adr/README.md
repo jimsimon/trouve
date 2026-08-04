@@ -14,7 +14,7 @@ sequentially.
 | [0002](0002-protocol-first-client-server-split.md) | Protocol-first client/server split (OpenAPI + SSE event log) | Accepted |
 | [0003](0003-worktree-per-session.md) | Git worktree per session; threads share the session worktree | Accepted |
 | [0004](0004-no-os-sandbox-permission-modes.md) | No OS sandbox in local mode; ToolExecutor chokepoint + permission modes | Accepted |
-| [0005](0005-split-ui-slint-native-plus-web.md) | Split UI: Slint native clients + separate web client | Accepted |
+| [0005](0005-split-ui-slint-native-plus-web.md) | Split UI: Slint native clients + separate web client | Superseded by 0023 |
 | [0006](0006-slint-royalty-free-license.md) | Slint under the Royalty-Free license | Accepted |
 | [0007](0007-shared-search-daemon.md) | Shared trouve-search MCP daemon over a unix socket | Accepted |
 | [0008](0008-embedded-server-in-desktop-app.md) | Desktop app embeds trouve-server in-process | Accepted |
@@ -32,3 +32,7 @@ sequentially.
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
 | [0021](0021-derived-thread-view-snapshots.md) | Derived thread-view snapshots | Accepted |
 | [0022](0022-bounded-thread-view-pages.md) | Bounded thread-view pages | Accepted |
+| [0023](0023-lit-web-frontend-and-webview-host.md) | Lit web frontend and gated webview host | Accepted |
+| [0024](0024-isolated-servo-embedding-qualification-workspace.md) | Isolated Servo embedding qualification workspace | Accepted |
+| [0025](0025-pin-servo-qualification-to-nightly-revision.md) | Pin Servo qualification to a nightly revision | Accepted |
+| [0026](0026-desktop-frontend-asset-sources.md) | Desktop frontend asset sources | Accepted |

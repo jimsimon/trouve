@@ -1,0 +1,1015 @@
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body {
+  background: var(--trouve-win-bg);
+  color: var(--trouve-text);
+  font: var(--trouve-font-size)/var(--trouve-line-height) var(--trouve-font-sans);
+}
+trouve-app {
+  display: block;
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  color: var(--trouve-text);
+  font: var(--trouve-font-size)/var(--trouve-line-height) var(--trouve-font-sans);
+}
+button, textarea, input, select { font: inherit; }
+button { color: inherit; }
+button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
+button:disabled, textarea:disabled, input:disabled { cursor: not-allowed; opacity: .56; }
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--trouve-navigation-width) 5px minmax(420px, 1fr) 5px var(--trouve-inspection-width);
+  grid-template-rows: minmax(0, 1fr) auto;
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  background: var(--trouve-win-bg);
+}
+.app-shell > .navigation-panel { grid-column: 1; grid-row: 1; }
+.app-shell > .navigation-splitter { grid-column: 2; grid-row: 1; }
+.app-shell > .thread-panel:not(.new-session-screen) { grid-column: 3; grid-row: 1; }
+.app-shell > .inspection-splitter { grid-column: 4; grid-row: 1; }
+.app-shell > .inspection-panel { grid-column: 5; grid-row: 1; }
+.app-shell.full-screen-route {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.full-screen-route > .navigation-panel,
+.full-screen-route > .panel-splitter,
+.full-screen-route > .inspection-panel,
+.full-screen-route > .status-bar { display: none; }
+.app-shell.full-screen-route > .thread-panel:not(.new-session-screen) {
+  display: block;
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--trouve-win-bg);
+}
+.navigation-panel, .thread-panel, .inspection-panel { min-width: 0; min-height: 0; }
+.navigation-panel { padding: 10px; background: var(--trouve-sidebar-bg); border-right: 1px solid var(--trouve-border); overflow: auto; }
+.pwa-pull-refresh { display: none; }
+.pwa-refresh-button { display: none; }
+.thread-panel { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; background: var(--trouve-panel-bg); }
+trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.inspection-panel { display: flex; flex-direction: column; background: var(--trouve-panel-bg); border-left: 1px solid var(--trouve-border); overflow: hidden; }
+.panel-splitter {
+  position: relative;
+  z-index: 2;
+  min-width: 5px;
+  cursor: col-resize;
+  touch-action: none;
+  background: var(--trouve-win-bg);
+}
+.panel-splitter::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 2px;
+  width: 1px;
+  background: var(--trouve-border);
+}
+.panel-splitter:hover::after, .panel-splitter:focus-visible::after {
+  inset-inline-start: 1px;
+  width: 3px;
+  background: var(--trouve-accent);
+}
+.panel-splitter:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: -2px; }
+.primary-links { display: grid; gap: 8px; }
+.primary-links::after { content: ""; height: 1px; margin: 4px 6px; background: var(--trouve-border); }
+.primary-links button { height: 34px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 0 10px; color: var(--trouve-text-hi); background: var(--trouve-raised-bg); text-align: start; }
+.primary-links button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.primary-links button[aria-current="page"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.primary-links button > span { width: 20px; color: var(--trouve-text-mid); font-size: 14px; text-align: center; }
+.primary-links button > .settings-link-icon { font-size: 18px; }
+.primary-links button strong { min-width: 0; overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-list-heading { height: 34px; display: flex; align-items: center; gap: 8px; }
+.workspace-list-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 15px; }
+.workspace-list-heading wa-button { flex: none; }
+.command-palette-compact { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 14px; }
+.command-palette-compact:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.workspace-group { margin-top: 8px; }
+.navigation-panel .workspace-group { position: relative; }
+.navigation-panel .workspace-group.drop-before::before,
+.navigation-panel .workspace-group.drop-after::after {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  inset-inline: 3px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--trouve-accent);
+}
+.navigation-panel .workspace-group.drop-before::before { inset-block-start: -5px; }
+.navigation-panel .workspace-group.drop-after::after { inset-block-end: -5px; }
+.workspace-row { height: 34px; display: flex; align-items: center; gap: 2px; padding: 0 4px 0 0; border-radius: var(--trouve-radius); background: var(--trouve-raised-bg); }
+.workspace-toggle { height: 34px; min-width: 0; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; flex: 1; border: 0; border-radius: var(--trouve-radius); padding: 0; color: inherit; background: transparent; text-align: start; }
+.workspace-toggle:hover { background: var(--trouve-hover-bg); }
+.workspace-toggle > span { width: 26px; color: var(--trouve-text-dim); font-size: 12px; text-align: center; }
+.workspace-group h2 { min-width: 0; margin: 0; overflow: hidden; color: var(--trouve-text); font-size: 13px; font-weight: 700; letter-spacing: 0; text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
+.navigation-panel .workspace-order-controls { display: flex; align-items: center; flex: none; }
+.navigation-panel .workspace-order-controls button { width: 21px; height: 26px; border: 0; border-radius: 4px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 11px; }
+.navigation-panel .workspace-order-controls button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.navigation-panel .workspace-order-controls button:disabled { opacity: .26; }
+.navigation-panel .workspace-grip { cursor: grab; touch-action: none; }
+.navigation-panel .workspace-grip:active { cursor: grabbing; }
+.workspace-actions-wrap { position: relative; display: block; flex: none; }
+.workspace-actions-button { width: 26px; height: 26px; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 16px; }
+.workspace-actions-button:hover, .workspace-actions-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.workspace-actions-menu { position: absolute; z-index: 12; inset-block-start: 30px; inset-inline-end: -30px; width: 180px; display: grid; gap: 1px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
+.workspace-actions-menu > strong { height: 24px; display: flex; align-items: center; padding: 0 8px; color: var(--trouve-text-dim); font-size: 11px; font-weight: 400; }
+.workspace-actions-menu > button { width: 100%; min-height: 30px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 4px; padding: 4px 8px; color: var(--trouve-text); background: transparent; font-size: 12px; text-align: start; }
+.workspace-actions-menu > button:hover { background: var(--trouve-accent-bg); }
+.workspace-actions-menu > button > span:first-child { min-width: 0; flex: 1; }
+.workspace-new-session { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 15px; }
+.workspace-new-session:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+@media (any-pointer: coarse) {
+  .navigation-panel .workspace-order-controls button,
+  .workspace-new-session { width: 32px; min-height: 32px; }
+}
+trouve-session-list { display: block; }
+.session-list { list-style: none; margin: 0; padding: 0; }
+.context-placeholder { margin: 8px 0; color: var(--trouve-text-dim); font-size: 11px; }
+.session-list-empty { margin-inline: 26px 8px; }
+.archived-session-group { margin-top: 2px; }
+.archived-session-toggle { width: 100%; min-height: 28px; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 11px; text-align: start; }
+.archived-session-toggle:hover { color: var(--trouve-text-mid); background: var(--trouve-hover-bg); }
+.archived-session-chevron { width: 26px; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
+.archived-session-list .session-copy strong { color: var(--trouve-text-mid); }
+.session-entry { position: relative; }
+.session-row-wrap { height: 52px; display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: center; border-radius: var(--trouve-radius); }
+.session-row-wrap:hover { background: var(--trouve-hover-bg); }
+.session-row-wrap.selected { background: var(--trouve-accent-bg); }
+.session-row { width: 100%; height: 52px; display: grid; grid-template-columns: 26px minmax(0,1fr); align-items: center; padding: 0; border: 0; border-radius: var(--trouve-radius); background: transparent; text-align: left; }
+.session-row:hover, .session-row.selected { background: transparent; }
+.session-copy { min-width: 0; }
+.session-copy strong, .session-copy small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.session-copy strong { color: var(--trouve-text-hi); font-size: 13px; font-weight: 400; }
+.session-copy small { margin-top: 2px; color: var(--trouve-text-dim); font-size: 11px; }
+.session-menu-button { width: 30px; min-height: 30px; overflow: hidden; border: 0; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-disabled); background: transparent; font-size: 9px; letter-spacing: -1px; }
+.session-menu-button:hover, .session-menu-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.session-entry { position: relative; }
+.session-actions { position: absolute; z-index: 8; top: 30px; right: 4px; width: 150px; display: grid; gap: 0; padding: 4px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-popup-bg); color: var(--trouve-text); box-shadow: 0 8px 22px rgba(0, 0, 0, .32); font-size: 12px; }
+.session-actions button { width: 100%; min-height: 30px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: transparent; text-align: left; }
+.session-actions button:hover { background: var(--trouve-accent-bg); }
+.session-actions .danger { color: var(--trouve-err); }
+.session-actions .danger:hover { background: var(--trouve-err-hover); }
+.session-modal { width: min(380px, calc(100vw - 32px)); max-width: none; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 0; color: var(--trouve-text); background: var(--trouve-raised-bg); font: var(--trouve-font-size)/1.35 var(--trouve-font-sans); }
+.session-modal::backdrop { background: var(--trouve-scrim); }
+.session-modal-layout { display: grid; gap: 12px; padding: 16px; }
+.session-modal-layout h2 { margin: 0; color: var(--trouve-text-hi); font-size: 15px; line-height: 1.35; }
+.session-modal-layout p { margin: 0; color: var(--trouve-text-dim); font-size: 12px; }
+.session-modal-layout input { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font: inherit; }
+.session-modal-layout footer { display: flex; justify-content: end; gap: 8px; }
+.session-modal-layout button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.session-modal-layout button.primary { border-color: var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
+.session-action-error { margin: 6px 12px; color: var(--trouve-err); font-size: 10px; }
+.status-dot { width: 7px; height: 7px; margin: 0 auto; border-radius: 50%; background: var(--trouve-text-ghost); }
+.status-dot.running { background: var(--trouve-ok); box-shadow: 0 0 0 2px var(--trouve-agent-bg); }
+.status-dot.attention { background: var(--trouve-warn); }
+.status-dot.failed { background: var(--trouve-err); }
+.status-dot.done { background: var(--trouve-text-faint); }
+.session-pr-badge { width: 26px; height: 30px; display: grid; place-items: center; margin: 0 auto; color: var(--trouve-text-mid); }
+.session-pr-badge svg { width: 18px; height: 18px; overflow: visible; }
+.session-pr-badge circle { fill: currentColor; }
+.session-pr-badge path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.session-pr-badge.ready { color: var(--trouve-ok); }
+.session-pr-badge.blocked { color: var(--trouve-warn); }
+.session-pr-badge.merged { color: var(--trouve-merged); }
+.session-pr-badge.closed { color: var(--trouve-err); }
+.thread-header { position: relative; z-index: 1; padding: 10px; border-bottom: 1px solid var(--trouve-border); background: var(--trouve-panel-bg); box-shadow: 0 1px 5px var(--trouve-scrim); }
+.thread-tabs { height: 30px; display: flex; align-items: stretch; gap: 6px; min-width: 0; overflow-x: auto; }
+.thread-tabs button { width: 145px; height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 145px; overflow: hidden; border: 0; border-radius: var(--trouve-radius); padding: 0 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; white-space: nowrap; }
+.thread-tabs button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-tabs button[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.thread-tabs button:last-child { width: 30px; flex-basis: 30px; padding: 0; font-size: 15px; }
+.thread-tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.thread-tab-provisional { border: 1px solid var(--trouve-border); border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 600; }
+.thread-todo-progress { min-width: 34px; flex: none; border-radius: 9px; padding: 2px 5px; color: var(--trouve-text-mid); background: var(--trouve-pill-bg); font-size: 10px; }
+.thread-tabs button[aria-selected="true"] .thread-todo-progress { background: var(--trouve-accent-dim); }
+.inspection-tabs { height: 38px; display: flex; align-items: end; gap: 2px; padding: 0 8px; }
+.inspection-tabs button, .thread-options button { border: 0; padding: 8px 10px 7px; color: var(--trouve-text-dim); background: transparent; }
+.inspection-tabs [aria-selected="true"] { color: var(--trouve-text-hi); border-bottom: 2px solid var(--trouve-accent); }
+.inspection-todo-switch { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; padding: 4px 8px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-raised-bg); }
+.inspection-todo-switch button { min-height: 26px; display: inline-flex; align-items: center; gap: 7px; border: 0; border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); }
+.inspection-todo-switch button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.inspection-todo-switch small { border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); }
+.thread-options { display: flex; gap: 4px; padding: 6px 10px; border-top: 1px solid var(--trouve-rule); }
+.thread-options button { padding: 3px 8px; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
+.thread-options label { min-width: 0; }
+.thread-options select { max-width: min(190px, 24vw); border: 1px solid transparent; border-radius: var(--trouve-radius-sm); padding: 3px 6px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 11px; text-overflow: ellipsis; }
+.thread-options select:hover { color: var(--trouve-text-hi); border-color: var(--trouve-border); }
+.thread-options select.permission-yolo { border-color: var(--trouve-warn); color: var(--trouve-warn); font-weight: 700; }
+.thread-options > button:last-child { margin-left: auto; white-space: nowrap; }
+.chat-stream { min-width: 0; overflow-x: hidden; overflow-y: auto; padding: 10px 10px 18px; }
+.chat-stream [data-virtual-id] { min-width: 0; max-width: 100%; }
+.turn-rule { height: 1px; margin: 8px 18px 6px 0; background: var(--trouve-rule); }
+.follow-tail { position: sticky; inset-inline-start: 50%; bottom: 8px; translate: -50% 0; min-height: 32px; padding: 5px 10px; border: 1px solid var(--trouve-border-strong); border-radius: 999px; color: var(--trouve-text-hi); background: var(--trouve-control-bg); box-shadow: 0 2px 8px var(--trouve-scrim); }
+.message { min-width: 0; max-width: 100%; margin: 0 18px 10px 0; }
+.turn-card { padding: 0; border: 0; border-radius: var(--trouve-radius); background: transparent; }
+.turn-card .message-header { min-height: 27px; display: flex; align-items: center; gap: 8px; margin: 0; padding: 2px 10px; border: 1px solid; border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; }
+.turn-card .message-header.collapsed { border-radius: var(--trouve-radius); }
+.turn-card .message-header strong { font-size: 11px; }
+.turn-card .message-header small { color: var(--trouve-text-dim); font-size: 11px; }
+.message-disclosure { min-width: 0; min-height: 23px; display: flex; flex: 1; align-items: center; gap: 7px; overflow: hidden; border: 0; padding: 0; color: inherit; background: transparent; text-align: start; }
+.message-disclosure strong, .message-disclosure small { flex: none; }
+.message-disclosure .agent-model-label { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-header.collapsed .agent-model-label { max-width: 35%; }
+.message-disclosure .turn-metadata { min-width: 0; flex: 1; overflow: hidden; text-align: end; text-overflow: ellipsis; white-space: nowrap; }
+.agent-header-spacer { min-width: 0; flex: 1; }
+.agent-collapsed-preview, .message-collapsed-preview { min-width: 0; flex: 1 !important; overflow: hidden; color: var(--trouve-text-dim) !important; text-overflow: ellipsis; white-space: nowrap; }
+.agent-collapsed-preview { min-width: 4ch; }
+.disclosure-icon { width: 10px; flex: none; color: var(--trouve-text-faint); text-align: center; }
+.message-actions { display: flex; flex: none; align-items: center; gap: 4px; }
+.message-actions button, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button, .tool-copy-action button, .tool-raw-action button { min-width: 20px; min-height: 20px; border: 0; border-radius: var(--trouve-radius-sm); padding: 1px 5px; color: var(--trouve-text-dim); background: transparent; font-size: 12px; white-space: nowrap; }
+.message-actions button:hover, .thinking-header > .copy-action:hover, .tool-copy-action button:hover, .tool-raw-action button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.message-actions button[aria-pressed="false"]:first-child { color: var(--trouve-accent); background: var(--trouve-accent-bg); }
+.message-actions button[aria-pressed="true"]:first-child { color: var(--trouve-text-disabled); background: transparent; }
+.turn-card .message-body { min-width: 0; max-width: 100%; padding: 6px 10px; border: 1px solid; border-top: 0; border-radius: 0 0 var(--trouve-radius) var(--trouve-radius); background: transparent; }
+.turn-card .message-body > p { white-space: pre-wrap; }
+.user-message .message-header { border-color: var(--trouve-user-border); background: var(--trouve-user-bg); }
+.user-message .message-body { border-color: var(--trouve-user-border); }
+.assistant-message .message-header { border-color: var(--trouve-agent-border); background: var(--trouve-agent-bg); }
+.assistant-message .message-body { border-color: var(--trouve-agent-border); }
+.assistant-message trouve-markdown-view, .user-message trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
+.assistant-raw { min-width: 0; max-width: 100%; margin: 0; overflow-x: hidden; overflow-y: auto; color: var(--trouve-code-fg); background: transparent; font: 11px/1.5 var(--trouve-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.agent-body-stream { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.agent-body-stream > * { min-width: 0; max-width: 100%; }
+.agent-text-block { min-width: 0; margin: 0; }
+.agent-body-stream > .message { margin: 0 0 0 16px; }
+.agent-body-stream > .question-card { margin-inline-start: 0; }
+.activity-group { min-width: 0; max-width: 100%; margin-inline-start: 16px; overflow: hidden; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
+.activity-group > summary { min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; color: var(--trouve-text-mid); cursor: pointer; list-style: none; }
+.activity-group > summary::-webkit-details-marker { display: none; }
+.activity-group > summary strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0 8px 8px 16px; border-top: 1px solid var(--trouve-rule); }
+.activity-group-body > .message { margin: 8px 0 0; }
+.message p { margin: 0; }
+.tool-card { min-width: 0; max-width: 100%; margin-top: 10px; overflow: hidden; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
+.tool-card summary { min-width: 0; max-width: 100%; min-height: 31px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; cursor: pointer; list-style: none; }
+.tool-card.approval-required .tool-approval-actions { margin-inline-start: auto; }
+.tool-card summary::-webkit-details-marker { display: none; }
+.tool-card summary small { color: var(--trouve-text-dim); }
+.tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-card pre { min-width: 0; max-width: 100%; margin: 0; padding: 10px; overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.5 var(--trouve-font-mono); overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
+.tool-disclosure { width: 10px; flex: none; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
+.tool-status { width: 12px; flex: none; align-self: center; color: var(--trouve-text-faint); font-size: 12px; line-height: 1; text-align: center; }
+.tool-status.running { color: var(--trouve-accent); animation: trouve-context-spin 900ms linear infinite; }
+.tool-status.ok { color: var(--trouve-ok); }
+.tool-status.error, .tool-status.denied, .tool-status.aborted { color: var(--trouve-err); }
+.tool-status.awaiting-approval { color: var(--trouve-warn); }
+.tool-raw-action { display: inline-flex; flex: none; margin-inline-start: auto; }
+.tool-copy-action { display: inline-flex; flex: none; }
+.tool-approval-actions { display: inline-flex; flex: none; align-items: center; gap: 4px; }
+.tool-approval-actions button { min-height: 24px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 2px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 11px; }
+.tool-approval-actions button.primary { border-color: var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
+.tool-subject, .tool-meta { min-width: 0; color: var(--trouve-text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-subject { flex: 1 1 auto; }
+.tool-meta { flex: 0 1 auto; }
+.tool-file-target { min-width: 0; max-width: min(44%, 320px); padding: 1px 3px; border: 0; background: transparent; color: var(--trouve-accent); font: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.tool-file-target:hover { color: var(--trouve-accent-hover); }
+.tool-file-target:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: 1px; }
+.tool-change-count { flex: none; font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tool-change-count.add { color: var(--trouve-ok); }
+.tool-change-count.delete { color: var(--trouve-err); }
+.tool-inline-diff { max-height: 320px; overflow: auto; border-block: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); font-family: var(--trouve-font-mono); font-size: 11px; line-height: 1.45; user-select: text; }
+.tool-diff-line { min-width: max-content; display: grid; grid-template-columns: 4ch 4ch 2ch minmax(24ch, 1fr); }
+.tool-diff-line.separator { color: var(--trouve-text-dim); background: var(--trouve-raised-bg); }
+.tool-diff-line.add { background: var(--trouve-diff-add-bg); color: var(--trouve-ok); }
+.tool-diff-line.delete { background: var(--trouve-diff-del-bg); color: var(--trouve-err); }
+.tool-diff-gutter { padding-inline: 4px; border-inline-end: 1px solid var(--trouve-rule); color: var(--trouve-text-faint); text-align: end; font-variant-numeric: tabular-nums; user-select: none; }
+.tool-diff-mark { text-align: center; user-select: none; }
+.tool-diff-line code { padding-inline: 5px 10px; color: inherit; white-space: pre; }
+.tool-todo-list { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; margin: 0; padding: 8px 12px; list-style: none; border-block: 1px solid var(--trouve-rule); }
+.tool-todo-list li { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 5px; color: var(--trouve-text-mid); }
+.tool-todo-list li > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.tool-todo-list .todo-completed, .tool-todo-list .todo-cancelled { color: var(--trouve-text-dim); }
+.tool-todo-list .todo-in_progress { color: var(--trouve-accent); font-weight: 600; }
+.card-utility-actions { display: flex; justify-content: flex-end; padding: 4px 8px; border-top: 1px solid var(--trouve-rule); }
+.thinking-card { border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); color: var(--trouve-text-dim); background: var(--trouve-surface); }
+.thinking-header { min-height: 31px; display: flex; align-items: center; gap: 6px; padding: 3px 9px; }
+.thinking-header .message-disclosure { color: var(--trouve-text-mid); }
+.thinking-header .message-disclosure strong { font-size: 11px; }
+.thinking-body { min-width: 0; max-width: 100%; padding: 6px 10px 8px; border-top: 1px solid var(--trouve-rule); }
+.thinking-card trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
+.card-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 8px 10px; border-top: 1px solid var(--trouve-rule); }
+.card-actions button, .screen-empty button { min-height: 30px; padding: 4px 10px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
+.card-actions button.primary { border-color: var(--trouve-accent); background: var(--trouve-accent); color: var(--trouve-accent-fg, white); }
+.approval-additive-action { position: absolute; width: 1px; height: 1px; min-height: 0 !important; margin: -1px; overflow: hidden; border: 0 !important; padding: 0 !important; clip: rect(0 0 0 0); white-space: nowrap; }
+.approval-additive-action:focus-visible { position: static; width: auto; height: 30px; min-height: 30px !important; margin: 0; overflow: visible; border: 1px solid var(--trouve-border-strong) !important; padding: 4px 10px !important; clip: auto; }
+.question-card { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; border: 0; padding: 4px; background: transparent; }
+.question-card > header { min-width: 0; max-width: 100%; min-height: 20px; display: flex; align-items: center; gap: 8px; padding: 0; border: 0; }
+.question-card > header strong { color: var(--trouve-warn); font-size: 11px; }
+.question-resolved > header strong { color: var(--trouve-text); }
+.question-card > header span { color: var(--trouve-text-dim); font-size: 11px; }
+.question-card > header strong, .question-card > header span:not(.question-header-spacer) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.question-header-spacer { flex: 1; }
+.question-skip { border: 0; padding: 2px 3px; color: var(--trouve-text-faint); background: transparent; font-size: 11px; }
+.question-skip:hover { color: var(--trouve-text-mid); }
+.question-step { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0; border: 0; outline: none; }
+.question-step h3 { min-width: 0; margin: 0; outline: none; color: var(--trouve-text-hi); font-size: 13px; overflow-wrap: anywhere; }
+.question-options { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.question-option { min-height: 34px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--trouve-card-border); border-radius: 5px; padding: 5px 10px; color: var(--trouve-text); background: var(--trouve-code-bg); text-align: start; }
+.question-option > :last-child { min-width: 0; overflow-wrap: anywhere; }
+.question-option:hover { background: var(--trouve-hover-bg); }
+.question-option.selected { border-color: var(--trouve-accent); background: var(--trouve-accent-bg); }
+.question-option-mark { color: var(--trouve-text-soft); font-size: 13px; }
+.question-option.selected .question-option-mark { color: var(--trouve-accent); }
+.question-other-input { width: 100%; min-width: 0; max-width: 100%; min-height: 54px; resize: vertical; border: 1px solid var(--trouve-card-border); border-radius: 5px; padding: 7px 9px; color: var(--trouve-text); background: var(--trouve-inset-bg); font: inherit; }
+.question-summary { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: 0; padding: 0; }
+.question-review .question-summary { padding: 0; }
+.question-summary > div { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; }
+.question-summary dt { color: var(--trouve-text-dim); font-size: 12px; }
+.question-summary dd { margin: 0; color: var(--trouve-text); font-size: 13px; }
+.question-summary dt, .question-summary dd { min-width: 0; overflow-wrap: anywhere; }
+.question-navigation { min-height: 30px; align-items: center; border: 0; padding: 0; }
+.resolved-label, .activity-row, .turn-error, .turn-cancelled, .turn-metadata-standalone { color: var(--trouve-text-dim); }
+.resolved-label { margin: 0; padding: 8px 10px; overflow-wrap: anywhere; }
+.activity-row { min-width: 0; max-width: none; margin: 0 18px 14px 0; overflow-wrap: anywhere; }
+.agent-activity { min-width: 0; min-height: 28px; display: flex; align-items: center; gap: 8px; margin: 4px 18px 10px 0; }
+.activity-dots { width: 22px; display: inline-flex; align-items: center; justify-content: space-between; }
+.activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: trouve-activity-dot 1.2s ease-in-out infinite; }
+.activity-dots i:nth-child(2) { animation-delay: 120ms; }
+.activity-dots i:nth-child(3) { animation-delay: 240ms; }
+@keyframes trouve-activity-dot {
+  0%, 65%, 100% { opacity: .35; translate: 0 0; }
+  30% { opacity: 1; translate: 0 -2px; }
+}
+[data-reduce-motion] .activity-dots i { animation: none; opacity: .7; translate: none; }
+[data-reduce-motion] .tool-status.running { animation: none; }
+.turn-error { min-width: 0; max-width: 100%; padding: 9px 11px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); color: var(--trouve-err); background: var(--trouve-err-bg); overflow-wrap: anywhere; }
+.turn-cancelled { min-width: 0; max-width: 100%; padding: 8px 10px; border-left: 2px solid var(--trouve-text-faint); overflow-wrap: anywhere; }
+.turn-cancelled strong { color: var(--trouve-text-mid); }
+.turn-metadata-standalone { padding: 4px 10px; font-size: 10px; overflow-wrap: anywhere; }
+.attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
+.attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }
+.attachment-list img { width: 64px; height: 48px; border-radius: 3px; object-fit: cover; background: var(--trouve-code-bg); }
+.attachment-icon { width: 26px; color: var(--trouve-text-faint); font-size: 17px; text-align: center; }
+.attachment-details { min-width: 0; display: grid; gap: 2px; }
+.attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-details strong { color: var(--trouve-text-mid); }
+.attachment-actions { display: flex; align-items: center; gap: 6px; }
+.attachment-actions a { color: var(--trouve-accent); text-decoration: none; }
+.attachment-actions a:hover { text-decoration: underline; }
+.composer { position: relative; margin: 0 10px 10px; border: 0; border-radius: 0; background: transparent; }
+.composer-completions { position: absolute; z-index: 5; inset-inline: -1px auto; bottom: calc(100% + 6px); width: min(480px, calc(100% + 2px)); max-height: min(300px, 40dvh); overflow: auto; padding: 6px; border: 1px solid var(--trouve-border-strong); border-radius: 8px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 8px 28px var(--trouve-scrim); }
+.composer-completion-option { width: 100%; min-height: 30px; display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: center; gap: 10px; border: 0; border-radius: 5px; padding: 5px 8px; color: var(--trouve-text-hi); background: transparent; text-align: start; }
+.composer-completion-option:hover { background: var(--trouve-hover-bg); }
+.composer-completion-option[aria-selected="true"] { background: var(--trouve-accent-bg); }
+.composer-completion-option span, .composer-completion-option small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-completion-option small { color: var(--trouve-text-dim); }
+.composer-completion-status { margin: 0; padding: 7px 8px; color: var(--trouve-text-dim); font-size: 11px; }
+.composer-completion-status.completion-error { display: flex; align-items: center; gap: 8px; color: var(--trouve-err); }
+.composer-completion-status.completion-error span { flex: 1; }
+.composer-completion-status.completion-error button { min-height: 26px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.pending-attachments { display: flex; flex-wrap: wrap; gap: 5px; margin: 0; padding: 0 0 6px; list-style: none; }
+.pending-attachments li { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 3px 4px 3px 7px; border: 1px solid var(--trouve-border); border-radius: 999px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); font-size: 10px; }
+.pending-attachments li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pending-attachments li small { flex: none; color: var(--trouve-text-dim); }
+.pending-attachments li button { flex: none; width: 22px; height: 22px; border: 0; border-radius: 50%; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.composer-entry { display: grid; grid-template-columns: minmax(0, 1fr) 76px; align-items: end; gap: 8px; }
+.composer textarea { display: block; width: 100%; min-height: 34px; max-height: 162px; resize: none; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 7px 8px; color: var(--trouve-text); background: var(--trouve-surface); line-height: 18px; outline: none; }
+.composer textarea:focus-visible { border-color: var(--trouve-selection); outline: none; }
+.composer textarea::placeholder { color: var(--trouve-text-faint); }
+.composer-quick-replies { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 2px 5px; }
+.composer-quick-replies button { min-height: 28px; border: 1px solid var(--trouve-border); border-radius: 999px; padding: 3px 10px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); font-size: 11px; }
+.composer-quick-replies button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.composer-submit { display: block; width: 76px; align-self: end; --wa-form-control-height: 34px; }
+.composer-submit::part(base) { width: 100%; min-height: 34px; }
+.composer-controls { display: flex; align-items: end; gap: 8px; min-width: 0; max-width: 100%; margin-top: 6px; overflow-x: auto; overflow-y: hidden; padding-bottom: 1px; color: var(--trouve-text-dim); font-size: 11px; }
+.composer-option { display: grid; flex: none; gap: 2px; }
+.composer-option > span { color: var(--trouve-text-faint); font-size: 10px; line-height: 1.2; }
+.composer-option select { height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; }
+.mode-option select { width: 130px; }
+.model-option select { width: 210px; }
+.model-option trouve-model-picker { width: 210px; }
+.model-picker { position: relative; display: block; width: 100%; }
+.model-picker-trigger { width: 100%; height: 30px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); text-align: start; }
+.model-picker-trigger > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-picker-popup { position: absolute; z-index: 8; inset-inline-start: 0; width: min(480px, calc(100vw - 32px)); display: grid; grid-template-rows: auto minmax(0, 280px); gap: 4px; padding: 5px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
+.placement-up .model-picker-popup { inset-block-end: calc(100% + 7px); }
+.placement-down .model-picker-popup { inset-block-start: calc(100% + 4px); }
+.model-picker-popup > input { width: 100%; height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.model-picker-options { display: block; min-height: 28px; overflow: auto; }
+.model-picker-options > button { width: 100%; min-height: 28px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 202px); align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text); background: transparent; text-align: start; }
+.model-picker-options > button:hover, .model-picker-options > button.active { background: var(--trouve-hover-bg); }
+.model-picker-options > button[aria-selected="true"] { background: var(--trouve-accent-bg); }
+.model-picker-options > button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-picker-options small { min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--trouve-text-dim); text-overflow: ellipsis; white-space: nowrap; }
+.model-picker-empty { min-height: 28px; display: flex; align-items: center; padding: 4px 7px; color: var(--trouve-text-disabled); }
+.model-health-dot { width: 7px; height: 7px; display: inline-block; flex: none; border-radius: 50%; background: var(--trouve-text-faint); }
+.model-health-dot.tone-ok { background: var(--trouve-ok); }
+.model-health-dot.tone-warning { background: var(--trouve-warn); }
+.model-health-dot.tone-error { background: var(--trouve-err); }
+.tone-warning { color: var(--trouve-warn) !important; }
+.tone-error { color: var(--trouve-err) !important; }
+.model-health-pill { position: relative; align-self: end; flex: none; }
+.model-health-pill summary { min-height: 30px; max-width: 170px; display: flex; align-items: center; gap: 6px; overflow: hidden; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text-mid); background: var(--trouve-pill-bg); cursor: pointer; list-style: none; }
+.model-health-pill summary::-webkit-details-marker { display: none; }
+.model-health-pill summary span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-health-pill.tone-ok summary { border-color: var(--trouve-agent-border); background: var(--trouve-agent-bg); }
+.model-health-pill.tone-warning summary { border-color: var(--trouve-warn); background: var(--trouve-warn-bg); }
+.model-health-pill.tone-error summary { border-color: var(--trouve-err); background: var(--trouve-err-bg); }
+.model-health-detail { position: absolute; z-index: 8; inset-inline-end: 0; inset-block-end: calc(100% + 7px); width: min(360px, calc(100vw - 32px)); margin: 0; padding: 11px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text-mid); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); font: 10px/1.45 var(--trouve-font-sans); white-space: pre-wrap; }
+.permission-option select { width: 105px; }
+.permission-control-row { display: flex; align-items: center; gap: 4px; }
+.permission-warning { width: 22px; height: 30px; display: grid; flex: none; place-items: center; border-radius: var(--trouve-radius-sm); color: var(--trouve-err); background: var(--trouve-err-bg); font-size: 13px; }
+.thinking-option select { width: 105px; }
+.context-option select { width: 86px; }
+.composer-fast-option { display: grid; align-self: auto; gap: 2px; min-height: 0; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.composer-fast-option button { width: 44px; height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); }
+.composer-fast-option button[aria-pressed="true"] { border-color: var(--trouve-accent); color: var(--trouve-accent-tint); background: var(--trouve-accent-bg); }
+.composer-controls-spacer { min-width: 0; flex: 1; }
+.composer-option select:hover { border-color: var(--trouve-border-strong); }
+.attachment-button { width: 30px; display: inline-flex; align-items: center; justify-content: center; align-self: end; gap: 3px; min-height: 30px; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; cursor: pointer; font-size: 14px; }
+.attachment-button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.attachment-button:focus-within { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
+.attachment-button.disabled { cursor: not-allowed; opacity: .56; }
+.attachment-button input { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+.history-mode { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; border: 0; padding: 0; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+.history-mode:focus-visible { z-index: 7; inset-inline-end: 46px; inset-block-end: 0; width: auto; height: 30px; overflow: visible; border-radius: var(--trouve-radius-sm); padding: 3px 7px; clip: auto; color: var(--trouve-text-hi); background: var(--trouve-control-bg); white-space: nowrap; }
+.composer-context-usage { position: relative; width: 28px; height: 30px; display: grid; flex: none; place-items: center; align-self: end; color: var(--trouve-text-dim); }
+.composer-context-usage svg { width: 24px; height: 24px; overflow: visible; rotate: -90deg; }
+.composer-context-usage circle { fill: none; stroke-width: 2.5; }
+.context-dial-track { stroke: var(--trouve-border-strong); }
+.context-dial-value { stroke: var(--trouve-accent); stroke-linecap: round; transition: stroke-dasharray 160ms ease; }
+.context-dial-glyph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-warn); font-size: 10px; font-weight: 800; }
+.context-dial-glyph.compacting { color: var(--trouve-accent); animation: trouve-context-spin 900ms linear infinite; }
+.composer-session-usage { min-height: 30px; display: inline-flex; align-items: center; flex: none; color: var(--trouve-text-faint); white-space: nowrap; }
+@keyframes trouve-context-spin { to { rotate: 360deg; } }
+.inline-error { overflow: hidden; color: var(--trouve-err); text-overflow: ellipsis; white-space: nowrap; }
+.inline-warning { overflow: hidden; color: var(--trouve-warn); text-overflow: ellipsis; white-space: nowrap; }
+.queue-panel { min-width: 0; max-height: min(36vh, 330px); margin: 0 10px 8px; overflow-x: hidden; overflow-y: auto; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 8px; background: var(--trouve-surface); }
+.queue-panel > header { position: sticky; top: -8px; z-index: 1; min-height: 30px; display: flex; align-items: center; gap: 8px; color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 11px; }
+.queue-panel > header > span { flex: 1; }
+.queue-panel > header button { min-height: 26px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.queue-panel > header button.primary { border-color: var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
+.queue-panel ol { min-width: 0; margin: 0; padding: 0; list-style: none; }
+.queue-panel li { position: relative; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.queue-panel li[data-queue-drop="before"]::before,
+.queue-panel li[data-queue-drop="after"]::after { position: absolute; z-index: 2; inset-inline: 2px; height: 2px; border-radius: 1px; background: var(--trouve-accent); content: ""; pointer-events: none; }
+.queue-panel li[data-queue-drop="before"]::before { top: -1px; }
+.queue-panel li[data-queue-drop="after"]::after { bottom: -1px; }
+.queue-row { width: 100%; min-width: 0; max-width: 100%; min-height: 24px; display: flex; align-items: center; gap: 4px; border-radius: 4px; padding-inline: 2px; }
+.queue-row:hover { background: var(--trouve-hover-bg); }
+.queue-row p { min-width: 0; flex: 1 1 0; margin: 0; overflow: hidden; color: var(--trouve-text-mid); text-overflow: ellipsis; white-space: nowrap; }
+.queue-attachment-badge { display: inline-flex; flex: none; align-items: center; color: var(--trouve-text-dim); font-size: 11px; line-height: 1; white-space: nowrap; }
+.queue-grip { width: 14px; flex: none; color: var(--trouve-text-faint); font-size: 12px; text-align: center; cursor: grab; user-select: none; }
+.queue-grip[draggable="false"] { cursor: default; opacity: .55; }
+.queue-grip:active { cursor: grabbing; }
+.queue-index { flex: none; color: var(--trouve-text-faint); font-size: 11px; }
+.queue-actions { min-width: 0; display: flex; flex: none; align-items: center; gap: 3px; }
+.queue-actions button { min-width: 22px; min-height: 22px; border: 0; border-radius: var(--trouve-radius-sm); padding: 2px 4px; color: var(--trouve-text-dim); background: transparent; }
+.queue-actions button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.queue-actions button.primary { min-width: 52px; border: 1px solid var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
+.queue-actions .danger { color: var(--trouve-err); }
+.queue-edit { min-width: 0; display: grid; gap: 4px; padding: 2px 0 5px 20px; }
+.queue-edit textarea { width: 100%; resize: vertical; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 6px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.queue-edit .queue-actions { justify-content: flex-end; }
+.queue-error { min-width: 0; margin: 4px 0 0; padding: 4px 2px; color: var(--trouve-err); font-size: 11px; overflow-wrap: anywhere; }
+.inspection-tabs { border-bottom: 1px solid var(--trouve-border); }
+.diff-card header { display: flex; gap: 10px; align-items: center; padding: 10px; border-bottom: 1px solid var(--trouve-rule); }
+.diff-card header strong { flex: 1; }
+.additions { color: var(--trouve-ok); } .deletions { color: var(--trouve-err); }
+.file-row { width: 100%; display: flex; justify-content: space-between; padding: 8px 10px; color: var(--trouve-text-mid); border: 0; border-bottom: 1px solid var(--trouve-rule); background: transparent; text-align: start; }
+.file-row.selected { background: var(--trouve-accent-bg); color: var(--trouve-text-hi); }
+.diff-file-list { margin: 0; padding: 0; list-style: none; }
+.diff-file-row { display: grid; grid-template-columns: minmax(0, 1fr) 31px; border-bottom: 1px solid var(--trouve-rule); }
+.diff-file-row.selected { background: var(--trouve-accent-bg); }
+.diff-file-row .file-row { min-width: 0; border-bottom: 0; }
+.diff-file-label { display: flex; min-width: 0; align-items: center; gap: 4px; }
+.diff-file-label > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-file-disclosure { width: 12px; flex: none; color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
+.diff-file-copy { border: 0; border-left: 1px solid var(--trouve-rule); color: var(--trouve-text-dim); background: transparent; }
+.diff-file-copy:hover, .diff-file-copy:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.diff-file-copy:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
+.diff-file-option:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
+.file-row small { color: var(--trouve-text-dim); }
+.file-tree-item { min-height: 22px; justify-content: flex-start; padding-block: 2px; padding-inline: calc(4px + var(--file-tree-indent, 0px)) 4px; font-size: 12px; }
+.file-tree-item:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
+.file-tree-label { min-width: 0; display: flex; align-items: center; gap: 4px; }
+.file-tree-label > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-disclosure { width: 12px; flex: none; color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
+.file-tree-icon { width: 17px; flex: none; font-size: 12px; text-align: center; }
+.file-tree-state { min-height: 22px; display: flex; align-items: center; gap: 7px; margin: 0; padding: 3px 6px 3px calc(20px + var(--file-tree-indent, 0px)); color: var(--trouve-text-dim); font-size: 10px; }
+.file-tree-state.root { justify-content: center; padding-inline: 10px; text-align: center; }
+.file-tree-state.error { color: var(--trouve-err); }
+.file-tree-state.error span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-state button { min-height: 23px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 2px 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 10px; }
+.diff-lines { margin: 0; padding: 10px 0; overflow: auto; background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.55 var(--trouve-font-mono); }
+.diff-lines span { display: block; padding: 0 10px; }
+.diff-lines .addition { background: var(--trouve-diff-add-bg); }
+.inspection-content { display: block; flex: 1; min-height: 0; overflow: auto; }
+.retained-terminal-panel[hidden] { display: none !important; }
+trouve-inspection-workspace:not(:defined), trouve-terminal-panel:not(:defined), trouve-session-pr-panel:not(:defined), trouve-session-mcp-panel:not(:defined) { position: relative; }
+trouve-inspection-workspace:not(:defined)::before, trouve-terminal-panel:not(:defined)::before, trouve-session-pr-panel:not(:defined)::before, trouve-session-mcp-panel:not(:defined)::before { content: "Loading inspection…"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-text-dim); }
+.inspection-content > header { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-bottom: 1px solid var(--trouve-rule); }
+.inspection-content > header strong { flex: 1; }
+.inspection-content > header small { color: var(--trouve-text-dim); }
+.todo-list { list-style: none; margin: 0; padding: 0; }
+.todo-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--trouve-rule); }
+.todo-list li small { color: var(--trouve-text-dim); text-transform: capitalize; }
+.todo-list li.completed span { color: var(--trouve-text-dim); text-decoration: line-through; }
+trouve-todo-plan-panel { display: block; min-height: 0; }
+.todo-plan-surface { display: flex; min-height: 100%; flex-direction: column; gap: 8px; padding: 10px; }
+.todo-plan-header { display: flex; align-items: center; gap: 8px; }
+.todo-plan-header strong { flex: 1; color: var(--trouve-text-hi); font-size: 13px; }
+.todo-plan-header small { color: var(--trouve-text-dim); }
+.todo-plan-list { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 0; border-radius: var(--trouve-radius); background: var(--trouve-surface); list-style: none; }
+.todo-plan-list li { display: grid; grid-template-columns: 16px minmax(0, 1fr); min-height: 34px; align-items: center; gap: 8px; padding: 7px 10px; }
+.todo-plan-icon { color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
+.todo-plan-list li.in_progress .todo-plan-icon { color: var(--trouve-accent); }
+.todo-plan-list li.completed .todo-plan-icon { color: var(--trouve-ok); }
+.todo-plan-list li.cancelled .todo-plan-icon { color: var(--trouve-text-disabled); }
+.todo-plan-content { min-width: 0; overflow-wrap: anywhere; }
+.todo-plan-list li.completed .todo-plan-content, .todo-plan-list li.cancelled .todo-plan-content { color: var(--trouve-text-disabled); }
+.todo-plan-empty { min-height: 10rem; }
+.session-mcp-surface { display: flex; min-height: 100%; flex-direction: column; gap: 6px; padding: 6px; }
+.session-mcp-surface > .screen-empty { flex: 1; min-height: 0; }
+.session-mcp-header { padding: 0; border-bottom: 0; }
+.session-mcp-header > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.session-mcp-header > span strong, .session-mcp-header > span small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-mcp-header button, .session-mcp-notice button { min-height: 26px; flex: none; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.session-mcp-description { margin: 0; color: var(--trouve-text-dim); font-size: 11px; line-height: 1.35; }
+.session-mcp-notice { display: flex; align-items: center; gap: 8px; padding: 7px 9px; color: var(--trouve-err); }
+.session-mcp-notice span { min-width: 0; flex: 1; }
+.session-mcp-list { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; margin: 0; overflow: auto; padding: 8px; border-radius: var(--trouve-radius); background: var(--trouve-surface); list-style: none; }
+.session-mcp-card { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-raised-bg); }
+.session-mcp-card > header { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session-mcp-card > header strong { min-width: 0; flex: 1; overflow: hidden; color: var(--trouve-text-hi); text-overflow: ellipsis; white-space: nowrap; }
+.session-mcp-card code, .session-mcp-card pre { margin: 0; overflow: auto; color: var(--trouve-text); background: transparent; font: 11px/1.4 var(--trouve-font-mono); white-space: pre; }
+.session-mcp-card code { display: block; padding: 0; }
+.session-mcp-card pre { padding: 0; }
+.session-mcp-card p { margin: 0; color: var(--trouve-text-dim); overflow-wrap: anywhere; }
+.session-mcp-scope { border-radius: 999px; padding: 2px 6px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; white-space: nowrap; }
+.session-mcp-card.health-disabled { opacity: .58; }
+.inspection-split { display: grid; grid-template-rows: auto minmax(70px, 28%) minmax(0, 1fr); height: 100%; min-height: 0; }
+.inspection-summary { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border-bottom: 1px solid var(--trouve-rule); }
+.inspection-summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inspection-summary button { min-width: 26px; min-height: 26px; border: 0; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
+.diff-summary { flex-wrap: wrap; padding: 6px; }
+.diff-summary .checkpoint-actions { flex: 1; }
+.checkpoint-actions { display: flex; align-items: center; gap: 5px; }
+.checkpoint-actions button { padding-inline: 7px; color: var(--trouve-text-mid); white-space: nowrap; }
+.checkpoint-actions button:disabled { cursor: not-allowed; opacity: .56; }
+.split-diff-file-picker { min-width: 90px; flex: 1; }
+.split-diff-file-picker select { width: 100%; min-height: 26px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 2px 6px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); font-size: 11px; text-overflow: ellipsis; }
+.diff-notice { flex-basis: 100%; color: var(--trouve-text-dim); font-size: 10px; }
+.diff-notice.error { color: var(--trouve-err); }
+.diff-refresh-action, .files-refresh-action, .diff-mode-additive { position: absolute; width: 1px; height: 1px; min-width: 0 !important; min-height: 0 !important; overflow: hidden; padding: 0 !important; clip: rect(0, 0, 0, 0); }
+.diff-refresh-action:focus-visible, .files-refresh-action:focus-visible, .diff-mode-additive:focus-visible { position: static; width: auto; height: 26px; min-width: 26px !important; min-height: 26px !important; overflow: visible; padding-inline: 7px !important; clip: auto; }
+.diff-inspection > .diff-empty { grid-row: 2 / 4; background: var(--trouve-surface); }
+.diff-inspection > .diff-collapsed { grid-row: 3; border-top: 0; }
+.diff-inspection > .unified-diff-list { grid-row: 2 / 4; }
+.diff-inspection > .split-diff-widget { grid-row: 2 / 4; min-height: 0; }
+.unified-diff-list { min-width: 0; min-height: 0; overflow: auto; color: var(--trouve-code-fg); background: var(--trouve-surface); }
+.unified-diff-file { min-width: max-content; }
+.unified-diff-file-header { display: flex; min-width: 100%; min-height: calc(var(--trouve-font-size) * 1.5); color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.unified-diff-file-header .diff-file-option { min-width: 0; flex: 1; display: flex; align-items: center; gap: 5px; border: 0; padding: 0 7px; color: inherit; background: transparent; font: 700 var(--trouve-font-size)/1.5 var(--trouve-font-mono); text-align: start; }
+.unified-diff-file-header .diff-file-option strong { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+.unified-diff-file-header .diff-file-option small { flex: none; color: inherit; font: inherit; }
+.unified-diff-file-header .diff-file-copy { width: calc(var(--trouve-font-size) * 2.1); flex: none; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-gutter); background: transparent; }
+.unified-diff-file-header .diff-file-copy:hover, .unified-diff-file-header .diff-file-copy:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-accent-dim); }
+.unified-diff-rows { min-width: max-content; }
+.diff-binary-state { min-height: 56px; display: grid; place-items: center; color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 11px; }
+.unified-diff-row { display: grid; grid-template-columns: 44px 44px 20px minmax(max-content, 1fr); min-width: 100%; min-height: calc(var(--trouve-font-size) * 1.5); align-items: center; color: var(--trouve-code-fg); font: var(--trouve-font-size)/1.5 var(--trouve-font-mono); }
+.unified-diff-row.add { color: var(--trouve-ok); background: var(--trouve-diff-add-bg); }
+.unified-diff-row.delete { color: var(--trouve-err); background: var(--trouve-diff-del-bg); }
+.unified-diff-row.hunk { color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
+.unified-diff-row > span { color: var(--trouve-gutter); }
+.unified-diff-row.add > .diff-mark { color: var(--trouve-ok); }
+.unified-diff-row.delete > .diff-mark { color: var(--trouve-err); }
+.unified-diff-row > .diff-old-number, .unified-diff-row > .diff-new-number { padding-right: 4px; text-align: right; }
+.unified-diff-row > .diff-mark { text-align: center; }
+.unified-diff-row > code { min-width: 0; padding-right: 8px; color: inherit; font: inherit; white-space: pre; }
+.inspection-file-list { min-height: 0; overflow: auto; border-bottom: 1px solid var(--trouve-border); }
+.inspection-widget { display: block; width: 100%; height: 100%; min-height: 0; border: 0; }
+.files-inspection { grid-template-columns: 210px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 6px; padding: 6px; }
+.files-inspection > .inspection-summary { grid-column: 2; grid-row: 1; padding: 0; border-bottom: 0; }
+.files-inspection > .inspection-summary strong { color: var(--trouve-text-dim); font-size: 12px; font-weight: 400; }
+.files-inspection > .inspection-summary button { width: 26px; height: 26px; min-width: 26px; min-height: 26px; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.files-inspection > .inspection-summary button:hover,
+.files-inspection > .inspection-summary button[aria-pressed="true"] { color: var(--trouve-accent); background: var(--trouve-hover-bg); }
+.files-inspection > .inspection-summary .file-additive-action { position: absolute; width: 1px; height: 1px; min-width: 0; min-height: 0; overflow: hidden; clip: rect(0, 0, 0, 0); }
+.files-inspection > .inspection-summary .file-additive-action:focus-visible { position: static; width: auto; height: 26px; min-width: 26px; min-height: 26px; overflow: visible; clip: auto; }
+.files-inspection > .inspection-file-list { grid-column: 1; grid-row: 1 / 3; border: 0; border-radius: var(--trouve-radius); background: var(--trouve-sidebar-bg); }
+.files-inspection > .file-view-shell,
+.files-inspection > .file-view-state { grid-column: 2; grid-row: 2; min-width: 0; min-height: 0; }
+.files-inspection.file-tree-collapsed { grid-template-columns: minmax(0, 1fr); }
+.files-inspection.file-tree-collapsed > .inspection-summary,
+.files-inspection.file-tree-collapsed > .file-view-shell,
+.files-inspection.file-tree-collapsed > .file-view-state { grid-column: 1; }
+.files-inspection.file-tree-collapsed > .inspection-file-list { display: none; }
+.file-view-shell { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.file-view-toolbar { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 30px; padding: 3px 6px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-control-bg); }
+.file-view-toolbar strong { min-width: 0; margin-right: auto; overflow: hidden; color: var(--trouve-text-mid); font: 11px var(--trouve-font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.file-view-toolbar button { min-height: 24px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 2px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.file-view-notice { grid-row: 1; margin: 0; padding: 5px 7px; color: var(--trouve-text-dim); border-bottom: 1px solid var(--trouve-rule); font-size: 10px; }
+.file-view-notice.error { color: var(--trouve-err); }
+.file-view-shell > .inspection-widget, .file-view-shell > .file-markdown-preview { grid-row: 2; }
+.file-markdown-preview { min-height: 0; overflow: auto; padding: 12px 14px; background: var(--trouve-surface); }
+.terminal-panel-content { display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr); height: 100%; min-height: 0; }
+.terminal-toolbar { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 5px 6px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-panel-bg); }
+.terminal-toolbar strong { min-width: 0; margin-right: auto; overflow: hidden; color: var(--trouve-text-mid); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-toolbar input { width: 145px; min-width: 90px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 5px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); font: 11px var(--trouve-font-sans); }
+.terminal-toolbar button { min-height: 28px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.terminal-toolbar .terminal-additive-action { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; padding: 0; clip: rect(0, 0, 0, 0); }
+.terminal-toolbar .terminal-additive-action:focus-visible { position: static; width: auto; height: auto; min-height: 28px; overflow: visible; padding: 3px 7px; clip: auto; }
+.terminal-clipboard-actions { display: inline-flex; align-items: center; gap: 5px; }
+.terminal-clipboard-actions button { min-height: 28px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.terminal-toolbar [role="status"] { max-width: 150px; overflow: hidden; color: var(--trouve-warn); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-tabs { display: flex; min-width: 0; min-height: 30px; margin: 0 6px; overflow-x: auto; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
+.terminal-tabs button { flex: none; min-height: 30px; border: 0; padding: 4px 8px; color: var(--trouve-text-dim); background: transparent; }
+.terminal-tab-item { flex: 1 0 36px; max-width: 132px; display: flex; min-width: 36px; border-radius: var(--trouve-radius-sm); }
+.terminal-tab-item.selected { background: var(--trouve-accent-bg); }
+.terminal-tab-item > [role="tab"] { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-tab-item > [role="tab"][aria-selected="true"] { color: var(--trouve-accent-tint); }
+.terminal-tabs .terminal-close { width: 27px; padding-inline: 5px; }
+.terminal-tabs button:hover { background: var(--trouve-hover-bg); }
+.terminal-notice { margin: 0; padding: 5px 8px; color: var(--trouve-err); border-bottom: 1px solid var(--trouve-rule); font-size: 10px; }
+.terminal-notice { grid-row: 4; }
+.terminal-stack { position: relative; grid-row: 5; min-height: 0; margin: 0 6px 6px; overflow: hidden; border-radius: var(--trouve-radius); }
+.terminal-stack trouve-terminal-view { height: 100%; }
+.terminal-stack trouve-terminal-view.inactive { position: absolute; inset: 0; visibility: hidden; pointer-events: none; }
+.terminal-empty { height: 100%; }
+.settings-screen { display: grid; grid-template-rows: 44px minmax(0, 1fr); width: 100%; height: 100%; min-height: 0; background: var(--trouve-win-bg); }
+.full-screen-header { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0 10px 0 16px; background: var(--trouve-panel-bg); }
+.full-screen-header strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 16px; font-weight: 700; }
+.full-screen-header button, .settings-actions button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.full-screen-header button:hover, .settings-actions button:hover:not(:disabled) { background: var(--trouve-hover-bg); }
+.settings-frame { min-width: 0; min-height: 0; display: flex; justify-content: center; overflow: hidden; }
+.settings-layout { width: 810px; max-width: 100%; min-height: 0; display: grid; grid-template-columns: 170px 640px; }
+.settings-nav { min-width: 0; overflow: auto; padding: 20px 12px 0 0; background: transparent; }
+.settings-nav button { width: 100%; height: 32px; display: block; border: 0; border-radius: 6px; padding: 0 12px; color: var(--trouve-text-mid); background: transparent; text-align: start; font-size: 13px; }
+.settings-nav button:hover { background: var(--trouve-raised-bg); }
+.settings-nav button[aria-current="page"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.settings-content { width: 640px; min-width: 0; overflow: auto; padding: 16px; }
+.settings-content > trouve-workspace-settings,
+.settings-content > trouve-provider-settings,
+.settings-content > trouve-cli-settings,
+.settings-content > trouve-local-model-settings,
+.settings-content > trouve-mode-settings,
+.settings-content > trouve-git-worktree-settings,
+.settings-content > trouve-mcp-settings,
+.settings-content > trouve-integrations-settings { display: block; width: 100%; }
+.settings-section { display: grid; align-content: start; gap: 12px; }
+.settings-section h1 { margin: 0; color: var(--trouve-text-hi); font-size: 16px; line-height: 1.35; }
+.settings-section p { margin: 0; }
+.settings-note, .settings-field p, .settings-tagline, .legal-copy { color: var(--trouve-text-soft); font-size: 11px; }
+.settings-tagline { color: var(--trouve-text-dim); font-size: 12px; }
+.capability-note { border-left: 2px solid var(--trouve-warn-border); padding-left: 8px; color: var(--trouve-text-dim); }
+.settings-check { display: flex; align-items: center; gap: 8px; color: var(--trouve-text); }
+.settings-check.compact { margin: 0; font-weight: 400; }
+.settings-check input { inline-size: 16px; block-size: 16px; flex: none; margin: 0; accent-color: var(--trouve-accent); }
+.settings-field { min-width: 0; display: grid; align-content: start; gap: 6px; flex: 1; }
+.settings-field > label { color: var(--trouve-text-mid); font-size: 12px; font-weight: 700; }
+.settings-field select, .settings-field input { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.settings-field select { text-transform: capitalize; }
+.settings-field.font-family-field select { text-transform: none; }
+.settings-field-row { display: flex; align-items: start; gap: 12px; }
+.settings-field-row .font-size-field { max-width: 120px; }
+.settings-toggle-row { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; gap: 10px; min-width: 0; color: var(--trouve-text-mid); font-size: 12px; cursor: pointer; }
+.settings-toggle-row input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.settings-toggle-row .toggle-state { grid-column: 1; grid-row: 1; height: 26px; display: grid; place-items: center; border: 1px solid var(--trouve-border); border-radius: 6px; color: var(--trouve-text-soft); background: var(--trouve-control-bg); }
+.settings-toggle-row input:checked + .toggle-state { border-color: var(--trouve-primary-border); color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.settings-toggle-row input:focus-visible + .toggle-state { outline: 2px solid var(--trouve-accent); outline-offset: 2px; }
+.nested-toggles { display: grid; gap: 12px; padding-left: 12px; }
+.settings-actions { display: flex; align-items: center; gap: 10px; min-height: 30px; }
+.settings-provider-shell { display: grid; align-content: start; gap: 12px; }
+.settings-provider-header { display: flex; align-items: center; gap: 12px; }
+.settings-provider-header h1 { min-width: 0; flex: 1; margin: 0; color: var(--trouve-text-hi); font-size: 16px; }
+.settings-provider-header button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+.settings-subnav { height: 32px; display: flex; align-items: stretch; gap: 4px; padding: 0; border-radius: 6px; background: var(--trouve-control-bg); }
+.settings-subnav button { min-width: 0; flex: 1; border: 0; border-radius: 5px; padding: 0 8px; color: var(--trouve-text-dim); background: transparent; font-size: 11px; }
+.settings-subnav button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.settings-subnav button[aria-current="page"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.capability-grid, .about-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 0; padding: 1px; background: var(--trouve-rule); }
+.capability-grid > div, .about-grid > div { min-width: 0; padding: 8px 10px; background: var(--trouve-surface); }
+.capability-grid dt, .about-grid dt { color: var(--trouve-text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.capability-grid dd, .about-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--trouve-text-hi); font-size: 11px; }
+.legal-copy { display: grid; gap: 8px; }
+.legal-copy p { margin: 0; }
+.about-slint { width: 280px; min-height: 150px; display: grid; justify-items: center; align-content: start; gap: 8px; border: 0; padding: 12px; color: var(--trouve-text); background: transparent; font: inherit; text-align: center; cursor: pointer; }
+.about-slint:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 2px; }
+.about-slint > span:last-child { width: 256px; color: var(--trouve-text); font-size: 10px; line-height: 1.35; }
+.made-with-slint-logo { width: 212px; height: 97px; display: flex; align-items: center; justify-content: center; gap: 9px; border-radius: 49px; color: var(--trouve-win-bg); background: var(--trouve-text-hi); }
+.made-with-slint-logo i { color: var(--trouve-accent); font: 700 31px/1 var(--trouve-font-mono); letter-spacing: -11px; transform: translateX(-5px); }
+.made-with-slint-logo strong { color: inherit; font-size: 17px; }
+@media (max-width: 810px) {
+  .settings-layout { width: 100%; grid-template-columns: 160px minmax(0, 1fr); }
+  .settings-content { width: auto; }
+}
+@media (max-width: 620px) {
+  .settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .settings-nav { display: flex; gap: 2px; overflow-x: auto; padding: 8px; }
+  .settings-nav button { width: auto; min-width: max-content; padding-inline: 10px; }
+  .settings-content { padding: 12px; }
+  .settings-field-row { flex-direction: column; }
+  .settings-field-row .font-size-field { width: 100%; max-width: none; }
+  .capability-grid, .about-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.app-page { place-items: center; }
+.screen-empty { display: grid; justify-items: center; align-content: center; gap: 7px; min-height: 100%; padding: 24px; color: var(--trouve-text-dim); text-align: center; }
+.screen-empty strong { color: var(--trouve-text-hi); font-size: 13px; }
+.screen-empty span { max-width: 38rem; }
+.navigation-empty { display: none; min-height: 160px; }
+.status-bar { position: relative; grid-column: 1 / -1; grid-row: 2; display: none; align-items: center; gap: 8px; min-height: 30px; padding: 0 9px; border-top: 1px solid var(--trouve-border); background: var(--trouve-sidebar-bg); color: var(--trouve-text-dim); font-size: 10px; }
+.status-bar.actionable { display: flex; }
+.online-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--trouve-ok); }
+.online-dot.offline { background: var(--trouve-err); }
+.status-spacer { flex: 1; }
+.permission-status { white-space: nowrap; }
+.permission-yolo { color: var(--trouve-warn) !important; font-weight: 700; }
+.theme-picker select { max-width: 138px; border: 0; border-radius: var(--trouve-radius-sm); padding: 2px 5px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font: inherit; text-transform: capitalize; }
+.update-action { min-height: 22px; border: 1px solid var(--trouve-accent); border-radius: var(--trouve-radius-sm); padding: 2px 7px; color: var(--trouve-text-hi); background: var(--trouve-accent-bg); font-size: inherit; }
+.new-session-open > .thread-panel:not(.new-session-screen) { visibility: hidden; }
+.new-session-screen {
+  z-index: 3;
+  grid-column: 3;
+  grid-row: 1;
+  display: block;
+  overflow: auto;
+  background: var(--trouve-win-bg);
+}
+.new-session-screen[hidden] { display: none; }
+.new-session-screen form {
+  width: 100%;
+  min-height: 100%;
+  display: grid;
+  align-content: center;
+  gap: 14px;
+  padding: 40px;
+}
+.new-session-screen header { order: 0; }
+.new-session-screen h2 { margin: 0; color: var(--trouve-text-hi); font-size: 22px; line-height: 1.2; }
+.new-session-screen header p { margin: 10px 0 0; color: var(--trouve-text-dim); font-size: 13px; }
+.new-session-screen label,
+.new-session-screen .dialog-field { min-width: 0; display: grid; gap: 6px; color: var(--trouve-text-mid); font-size: 12px; font-weight: 700; }
+.new-session-screen select,
+.new-session-screen textarea { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
+.new-session-screen textarea { height: 34px; min-height: 34px; max-height: 144px; resize: vertical; }
+.new-session-workspace { order: 1; }
+.new-session-branch { order: 2; }
+.new-session-branch-warning { order: 3; }
+.new-session-screen .dialog-checkbox { order: 4; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-weight: 400; }
+.new-session-screen .dialog-checkbox input { width: auto; min-height: auto; margin: 0; }
+.new-session-screen .dialog-option-grid { order: 5; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
+.new-session-mode { grid-column: 1; grid-row: 1; }
+.new-session-model { grid-column: 2; grid-row: 1; }
+.new-session-thinking { grid-column: 1; grid-row: 2; }
+.new-session-permission { grid-column: 2; grid-row: 2; }
+.new-session-screen .dialog-option-grid.no-thinking .new-session-permission { grid-column: 1 / -1; }
+.new-session-options-warning { order: 6; }
+.new-session-yolo-warning { order: 6; display: grid; gap: 4px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); padding: 10px; color: var(--trouve-err-soft); background: var(--trouve-err-bg); font-size: 11px; }
+.new-session-yolo-warning strong { color: var(--trouve-err); font-size: 12px; }
+.new-session-prompt { order: 7; }
+.new-session-screen .pending-attachments { order: 8; margin: 0; padding: 0; }
+.new-session-screen .new-session-attachment { order: 9; min-height: 30px; justify-self: start; padding: 3px 7px; font-weight: 400; }
+.new-session-screen .new-session-attachment input { width: 1px; height: 1px; min-height: 1px; padding: 0; }
+.new-session-error { order: 10; }
+.new-session-screen footer { order: 11; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
+.new-session-screen footer button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; background: var(--trouve-control-bg); }
+.new-session-screen footer button.primary { border-color: var(--trouve-primary-border); color: var(--trouve-on-accent); background: var(--trouve-primary-bg); }
+.new-session-screen .dialog-error { margin: 0; color: var(--trouve-err); }
+.new-session-screen .dialog-warning { margin: 0; color: var(--trouve-warn); }
+.app-dialog { width: min(440px, calc(100vw - 28px)); max-height: calc(100dvh - 28px); overflow: auto; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 0; color: var(--trouve-text); background: var(--trouve-raised-bg); box-shadow: 0 18px 55px var(--trouve-scrim); }
+.app-dialog::backdrop { background: var(--trouve-scrim); }
+.app-dialog form { display: grid; gap: 13px; padding: 16px; }
+.app-dialog header, .app-dialog footer { display: flex; align-items: center; gap: 10px; }
+.app-dialog header > div { flex: 1; min-width: 0; }
+.app-dialog h2 { margin: 0; color: var(--trouve-text-hi); font-size: 15px; }
+.app-dialog p { margin: 3px 0 0; color: var(--trouve-text-dim); font-size: 12px; }
+.app-dialog header > button { width: 30px; height: 30px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: transparent; font-size: 18px; }
+.app-dialog label, .app-dialog .dialog-field { min-width: 0; display: grid; gap: 5px; color: var(--trouve-text-hi); font-weight: 600; }
+.app-dialog input, .app-dialog select, .app-dialog textarea { width: 100%; min-height: 34px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 5px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
+.app-dialog select.permission-yolo { border-color: var(--trouve-warn); color: var(--trouve-warn); font-weight: 700; }
+.app-dialog textarea { min-height: 90px; resize: vertical; }
+.dialog-option-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.app-dialog footer { justify-content: flex-end; }
+.app-dialog footer button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; background: var(--trouve-control-bg); }
+.app-dialog footer button.primary { border-color: var(--trouve-primary-border); color: var(--trouve-on-accent); background: var(--trouve-primary-bg); }
+.dialog-error { color: var(--trouve-err) !important; }
+.dialog-warning { color: var(--trouve-warn) !important; }
+.app-dialog .dialog-checkbox { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; font-weight: 400; }
+.app-dialog .dialog-checkbox input { width: auto; min-height: auto; margin-top: 3px; }
+.app-dialog .pending-attachments { padding: 0; }
+.app-dialog .dialog-attachment { display: inline-flex; justify-self: start; width: auto; min-height: 34px; padding: 5px 8px; font-weight: 400; }
+.app-dialog .dialog-attachment input { width: 1px; min-height: 1px; padding: 0; }
+trouve-command-palette { display: contents; }
+.command-palette-dialog {
+  width: min(620px, calc(100vw - 28px));
+  max-height: min(680px, calc(100dvh - 48px));
+  margin-block-start: min(14vh, 128px);
+  overflow: hidden;
+  border: 1px solid var(--trouve-border-strong);
+  border-radius: 9px;
+  padding: 0;
+  color: var(--trouve-text);
+  background: var(--trouve-popup-bg);
+  box-shadow: 0 18px 55px var(--trouve-scrim);
+}
+.command-palette-dialog::backdrop { background: var(--trouve-scrim); }
+.command-palette-search { height: 50px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 7px 10px; border-bottom: 1px solid var(--trouve-border); background: var(--trouve-raised-bg); }
+.command-palette-search > span { color: var(--trouve-text-mid); font-size: 20px; text-align: center; }
+.command-palette-search input { width: 100%; min-width: 0; height: 34px; border: 0; padding: 4px 2px; outline: 0; color: var(--trouve-text-hi); background: transparent; font-size: 14px; }
+.command-palette-search input::placeholder { color: var(--trouve-text-faint); }
+.command-palette-search input:focus-visible { outline: 0; }
+.command-palette-search kbd, .command-palette-footer kbd { border: 1px solid var(--trouve-border); border-radius: 4px; color: var(--trouve-text-dim); background: var(--trouve-inset-bg); font: 10px/1.4 var(--trouve-font-mono); }
+.command-palette-search kbd { padding: 2px 5px; }
+.command-palette-results { max-height: min(520px, calc(100dvh - 160px)); overflow: auto; padding: 5px; }
+.command-palette-group + .command-palette-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--trouve-rule); }
+.command-palette-group h2 { margin: 0; padding: 5px 8px 3px; color: var(--trouve-text-faint); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.command-palette-option { width: 100%; min-height: 42px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 5px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
+.command-palette-option:hover { background: var(--trouve-hover-bg); }
+.command-palette-option[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+.command-palette-icon { width: 24px; color: var(--trouve-text-mid); font: 14px/1 var(--trouve-font-mono); text-align: center; }
+.command-palette-icon .status-dot { display: block; }
+.command-palette-copy { min-width: 0; }
+.command-palette-copy strong, .command-palette-copy small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.command-palette-copy strong { color: inherit; font-size: 12px; font-weight: 600; }
+.command-palette-copy small { margin-top: 1px; color: var(--trouve-text-dim); font-size: 10px; }
+.command-palette-state { padding: 2px 6px; border-radius: 999px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; white-space: nowrap; }
+.command-palette-state.running { color: var(--trouve-ok); }
+.command-palette-state.attention { color: var(--trouve-warn); }
+.command-palette-state.failed { color: var(--trouve-err); }
+.command-palette-empty { min-height: 150px; display: grid; justify-items: center; align-content: center; gap: 4px; padding: 20px; color: var(--trouve-text-dim); text-align: center; }
+.command-palette-empty strong { color: var(--trouve-text-hi); }
+.command-palette-footer { min-height: 31px; display: flex; align-items: center; gap: 12px; padding: 5px 10px; border-top: 1px solid var(--trouve-border); color: var(--trouve-text-faint); background: var(--trouve-raised-bg); font-size: 9px; }
+.command-palette-footer span { display: flex; align-items: center; gap: 3px; }
+.command-palette-footer kbd { min-width: 17px; padding: 1px 3px; text-align: center; }
+.command-palette-footer .command-palette-count { margin-inline-start: auto; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.mobile-nav { display: none; }
+
+@media (max-width: 1180px) and (min-width: 761px) {
+  .app-shell { grid-template-columns: minmax(180px, min(var(--trouve-navigation-width), 25vw)) minmax(300px, 1fr) minmax(240px, min(var(--trouve-inspection-width), 34vw)); }
+  .panel-splitter { display: none; }
+  .app-shell > .navigation-panel { grid-column: 1; }
+  .app-shell > .thread-panel:not(.new-session-screen), .app-shell > .new-session-screen { grid-column: 2; }
+  .app-shell > .inspection-panel { grid-column: 3; }
+}
+
+@media (max-width: 760px) {
+  html, body { min-width: 280px; }
+  .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+  .panel-splitter { display: none; }
+  .navigation-panel, .thread-panel, .inspection-panel { display: none; grid-column: 1; grid-row: 1; border-inline: 0; }
+  .navigation-panel { padding-top: calc(10px + env(safe-area-inset-top)); padding-inline: max(10px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right)); }
+  .mobile-pane-navigation .navigation-panel { display: block; }
+  .mobile-pane-navigation .navigation-panel { overscroll-behavior-y: contain; }
+  .new-session-screen { grid-column: 1; grid-row: 1; }
+  .new-session-screen form { align-content: start; padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
+  .new-session-screen .dialog-option-grid { grid-template-columns: minmax(0, 1fr); }
+  .new-session-mode, .new-session-model, .new-session-thinking, .new-session-permission,
+  .new-session-screen .dialog-option-grid.no-thinking .new-session-permission { grid-column: 1; grid-row: auto; }
+  .pwa-pull-refresh { height: var(--trouve-pull-refresh-distance, 0px); display: grid; place-items: end center; overflow: hidden; color: var(--trouve-text-dim); font-size: 11px; opacity: .72; }
+  .pwa-pull-refresh.armed { color: var(--trouve-accent); opacity: 1; }
+  .pwa-pull-refresh.pending { height: 28px; place-items: center; opacity: 1; }
+  .pwa-refresh-button { min-height: 34px; display: inline-flex; align-items: center; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); }
+  .navigation-empty { display: grid; }
+  .mobile-pane-thread .thread-panel { display: grid; }
+  .mobile-pane-inspection .inspection-panel { display: flex; }
+  .thread-header { padding-top: calc(10px + env(safe-area-inset-top)); padding-inline: max(10px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right)); }
+  .inspection-tabs { height: auto; min-height: calc(42px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); padding-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right)); }
+  .settings-screen { grid-template-rows: calc(44px + env(safe-area-inset-top)) minmax(0, 1fr); }
+  .full-screen-header { padding-top: env(safe-area-inset-top); padding-inline: max(16px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right)); }
+  .settings-layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .settings-nav { display: flex; border-right: 0; border-bottom: 1px solid var(--trouve-border); overflow-x: auto; }
+  .settings-nav header { display: none; }
+  .settings-nav button { width: auto; min-height: 42px; margin: 2px; white-space: nowrap; }
+  .settings-content { padding: 16px 12px max(20px, env(safe-area-inset-bottom)); }
+  .dialog-option-grid { grid-template-columns: 1fr; }
+  .command-palette-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 28px); margin-block-start: max(8px, env(safe-area-inset-top)); }
+  .command-palette-search { height: 54px; }
+  .command-palette-option { min-height: 48px; }
+  .command-palette-results { max-height: calc(100dvh - 122px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  .command-palette-footer { min-height: 36px; padding-bottom: max(5px, env(safe-area-inset-bottom)); }
+  .capability-grid, .about-grid { grid-template-columns: 1fr; }
+  .chat-stream { padding: 14px 12px 20px; }
+  .composer { margin: 0 8px max(8px, env(safe-area-inset-bottom)); }
+  .composer-quick-replies button { min-height: 38px; padding-inline: 13px; }
+  .composer-entry { grid-template-columns: minmax(0, 1fr) 70px; }
+  .composer-submit { width: 70px; }
+  .composer-option select, .history-mode { min-height: 38px; }
+  .composer-completions { width: calc(100% + 2px); max-height: min(260px, 38dvh); }
+  .composer-completion-option { min-height: 42px; }
+  .attachment-button { min-height: 38px; }
+  .message-actions button, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button { min-height: 36px; }
+  .attachment-list li { width: 100%; max-width: none; }
+  .pending-attachments li button { width: 34px; height: 34px; }
+  .queue-panel { margin-inline: 8px; max-height: min(42vh, 310px); }
+  .queue-panel li { grid-template-columns: 1fr; }
+  .queue-actions { justify-content: flex-end; }
+  .queue-actions button, .queue-panel > footer button { min-height: 38px; }
+  .thread-options { overflow-x: auto; }
+  .thread-options select { max-width: 150px; min-height: 38px; }
+  .thread-tabs { height: 42px; }
+  .thread-tabs button, .inspection-tabs button { min-height: 42px; }
+  .checkpoint-actions button { min-height: 42px; }
+  .diff-mode-additive { display: none; }
+  .files-inspection { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .files-inspection > .inspection-summary { grid-column: 1; grid-row: 1; }
+  .files-inspection > .inspection-file-list { grid-column: 1; grid-row: 2; }
+  .files-inspection:not(.file-tree-collapsed) > .file-view-shell,
+  .files-inspection:not(.file-tree-collapsed) > .file-view-state { display: none; }
+  .files-inspection.file-tree-collapsed > .file-view-shell,
+  .files-inspection.file-tree-collapsed > .file-view-state { grid-column: 1; grid-row: 2; }
+  .tool-approval-actions { position: fixed; z-index: 24; inset-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right)); bottom: calc(60px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius); padding: 8px; background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
+  .tool-approval-actions button { min-height: 46px; font-size: 13px; }
+  .tool-approval-actions .approval-additive-action:focus-visible { grid-column: 1 / -1; height: 46px; min-height: 46px !important; }
+  .terminal-toolbar { flex-wrap: wrap; }
+  .terminal-toolbar strong { flex-basis: 100%; margin-right: 0; }
+  .terminal-toolbar input { flex: 1 1 110px; width: auto; min-height: 38px; }
+  .terminal-toolbar button { min-height: 38px; }
+  .terminal-toolbar [role="status"] { flex-basis: 100%; max-width: none; white-space: normal; }
+  .terminal-tabs button { min-height: 42px; }
+  .card-actions button, .screen-empty button { min-height: 42px; }
+  .archived-session-toggle { min-height: 42px; }
+  .session-menu-button { min-height: 40px; }
+  .session-actions button { min-height: 38px; }
+  .status-bar { min-height: 52px; display: flex; padding: 3px max(6px, env(safe-area-inset-right)) max(3px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)); }
+  .status-copy, .status-bar > .online-dot, .status-bar > .status-spacer, .theme-picker { display: none; }
+  .update-action { position: absolute; inset-inline: 8px; bottom: calc(52px + env(safe-area-inset-bottom)); min-height: 40px; z-index: 3; }
+  .mobile-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
+  .mobile-nav button { min-height: 44px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
+  .mobile-nav button[aria-pressed="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  .activity-dots i, .tool-status.running { animation: none !important; }
+}
+
+trouve-app[data-reduce-motion] *, trouve-app[data-reduce-motion] *::before, trouve-app[data-reduce-motion] *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
+trouve-app[data-reduce-motion] { --trouve-chat-streaming-animation: none; }
+
+@media (forced-colors: active) {
+  * { forced-color-adjust: auto; }
+  :root, [data-theme] {
+    --trouve-win-bg: Canvas;
+    --trouve-panel-bg: Canvas;
+    --trouve-sidebar-bg: Canvas;
+    --trouve-surface: Canvas;
+    --trouve-inset-bg: Canvas;
+    --trouve-code-bg: Canvas;
+    --trouve-control-bg: ButtonFace;
+    --trouve-raised-bg: ButtonFace;
+    --trouve-popup-bg: Canvas;
+    --trouve-pill-bg: ButtonFace;
+    --trouve-hover-bg: Highlight;
+    --trouve-hover-strong: Highlight;
+    --trouve-border: ButtonBorder;
+    --trouve-border-strong: CanvasText;
+    --trouve-card-border: CanvasText;
+    --trouve-rule: CanvasText;
+    --trouve-scroll-thumb: GrayText;
+    --trouve-scroll-thumb-hover: CanvasText;
+    --trouve-scroll-thumb-active: CanvasText;
+    --trouve-scrim: Canvas;
+    --trouve-text-hi: CanvasText;
+    --trouve-text: CanvasText;
+    --trouve-text-mid: CanvasText;
+    --trouve-text-dim: CanvasText;
+    --trouve-text-soft: CanvasText;
+    --trouve-text-faint: GrayText;
+    --trouve-text-disabled: GrayText;
+    --trouve-text-ghost: GrayText;
+    --trouve-gutter: CanvasText;
+    --trouve-code-fg: CanvasText;
+    --trouve-accent: Highlight;
+    --trouve-accent-hover: Highlight;
+    --trouve-accent-tint: LinkText;
+    --trouve-text-accent-soft: LinkText;
+    --trouve-on-accent: HighlightText;
+    --trouve-primary-bg: Highlight;
+    --trouve-primary-hover: Highlight;
+    --trouve-primary-border: Highlight;
+    --trouve-selection: Highlight;
+    --trouve-accent-bg: Canvas;
+    --trouve-accent-dim: Canvas;
+    --trouve-accent-veil: Canvas;
+    --trouve-user-bg: Canvas;
+    --trouve-user-border: CanvasText;
+    --trouve-ok: CanvasText;
+    --trouve-ok-dim: CanvasText;
+    --trouve-agent-bg: Canvas;
+    --trouve-agent-border: CanvasText;
+    --trouve-diff-add-bg: Canvas;
+    --trouve-err: Mark;
+    --trouve-err-soft: Mark;
+    --trouve-err-bg: Canvas;
+    --trouve-err-hover: Canvas;
+    --trouve-diff-del-bg: Canvas;
+    --trouve-warn: CanvasText;
+    --trouve-warn-bg: Canvas;
+    --trouve-warn-border: CanvasText;
+    --trouve-merged: LinkText;
+  }
+  .panel-splitter { border-inline: 1px solid CanvasText; }
+  .status-dot, .online-dot, .tool-status { border: 1px solid CanvasText; }
+  .session-row.selected, .mobile-nav button[aria-pressed="true"], .composer-completion-option[aria-selected="true"], .command-palette-option[aria-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
+  .card-actions button.primary, .tool-approval-actions button.primary { color: HighlightText; background: Highlight; }
+  .turn-error { color: Mark; border-color: Mark; }
+}
+
+@media (prefers-contrast: more) {
+  .navigation-panel, .inspection-panel, .thread-header, .status-bar, .tool-card, .question-card, .composer { border-color: var(--trouve-text-mid); }
+}

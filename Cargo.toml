@@ -11,6 +11,12 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The pinned Servo nightly and trouve-server use incompatible libsqlite3-sys
+# link versions.
+# Keep the disposable embedding qualification harness in a nested workspace
+# with its own lockfile so the exact pinned engine can be tested without
+# changing the product server's database dependency.
+exclude = ["crates/trouve-servo-embed-preview"]
 
 [workspace.package]
 version = "3.7.0"
@@ -29,6 +35,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
 futures = "0.3"
+fontdb = "0.23.0"
 hmac = "0.12"
 hex = "0.4"
 jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
@@ -48,6 +55,7 @@ toml = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["chrono"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 # Internal crates
@@ -59,6 +67,7 @@ trouve-providers = { path = "crates/trouve-providers", version = "3.7.0" }
 trouve-server = { path = "crates/trouve-server", version = "3.7.0" }
 trouve-client-core = { path = "crates/trouve-client-core", version = "3.7.0" }
 trouve-thread-view = { path = "crates/trouve-thread-view", version = "3.7.0" }
+trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "3.7.0" }
 trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.7.0" }
 trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.7.0" }
 trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.7.0" }

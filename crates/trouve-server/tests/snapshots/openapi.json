@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.0"
+    "version": "3.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -2421,6 +2421,34 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session-summaries": {
+      "get": {
+        "tags": [],
+        "operationId": "session_summaries",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSummariesSnapshot"
+                }
+              }
+            }
+          },
+          "500": {
             "description": "",
             "content": {
               "application/json": {
@@ -7139,6 +7167,93 @@
           },
           {
             "type": "object",
+            "description": "The server restarted while this session still had process-owned turn\nstate. Clients clear running/approval/question UI from the replacement\nsummary; those responders cannot survive the process that owned them.",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.recovered"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Transactionally derived aggregate state. `summary: null` is the\ndurable tombstone for a deleted session.",
+            "required": [
+              "session_id",
+              "summary",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "summary": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SessionSummary"
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.summary_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Compact durable edge for notifications about inactive/background\nthreads. It is appended transactionally after the replacement session\nsummary produced by the same source event.",
+            "required": [
+              "session_id",
+              "thread_id",
+              "kind",
+              "type"
+            ],
+            "properties": {
+              "detail": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional native-equivalent failure excerpt or question subtitle."
+              },
+              "kind": {
+                "$ref": "#/components/schemas/SessionNotificationKind"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.notification"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.",
             "required": [
               "automation_id",
@@ -8741,6 +8856,16 @@
           }
         }
       },
+      "SessionAttention": {
+        "type": "string",
+        "description": "Aggregate user attention required anywhere in a session. This projection\nprevents clients from retaining every background thread history.",
+        "enum": [
+          "none",
+          "approval",
+          "question",
+          "both"
+        ]
+      },
       "SessionDiff": {
         "type": "object",
         "description": "The session's unified diff against its base ref.",
@@ -8750,6 +8875,102 @@
         "properties": {
           "diff": {
             "type": "string"
+          }
+        }
+      },
+      "SessionNotificationKind": {
+        "type": "string",
+        "description": "A fresh session-level notification edge derived from a durable thread\nevent. Clients apply their own notification preferences and foreground\nsuppression; this type only preserves the native event category without\nrequiring one background SSE follower per thread.",
+        "enum": [
+          "turn_completed",
+          "turn_failed",
+          "approval_requested",
+          "question_requested"
+        ]
+      },
+      "SessionOutcome": {
+        "type": "string",
+        "description": "Aggregate execution outcome for the session inbox.",
+        "enum": [
+          "idle",
+          "running",
+          "succeeded",
+          "failed"
+        ]
+      },
+      "SessionSummariesSnapshot": {
+        "type": "object",
+        "description": "Atomic session-summary snapshot plus the server-scope cursor after which a\nclient resumes the existing durable event stream.",
+        "required": [
+          "summaries",
+          "cursor"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "summaries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSummary"
+            }
+          }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "description": "Durable server projection used by desktop and PWA session lists.",
+        "required": [
+          "session_id",
+          "workspace_id",
+          "archived",
+          "active",
+          "attention",
+          "outcome",
+          "latest_cursor",
+          "updated_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "archived": {
+            "type": "boolean"
+          },
+          "attention": {
+            "$ref": "#/components/schemas/SessionAttention"
+          },
+          "latest_cursor": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cursor of the durable source event that produced this state.",
+            "minimum": 0
+          },
+          "latest_thread_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/String"
+              }
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/SessionOutcome"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp of that source event."
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
           }
         }
       },

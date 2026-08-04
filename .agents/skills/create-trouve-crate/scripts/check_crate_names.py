@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
@@ -46,12 +47,22 @@ def main() -> int:
         sys.stderr.write(result.stderr)
         return result.returncode
 
-    packages = json.loads(result.stdout)["packages"]
+    # Validate manifests directly as well as asking Cargo to validate the root
+    # workspace. The Servo embedding qualification package is intentionally an
+    # excluded nested workspace because its pinned SQLite linkage cannot share
+    # the product workspace lockfile.
+    cargo_manifests = sorted((REPOSITORY_ROOT / "crates").glob("*/Cargo.toml"))
     invalid_crates = []
-    for package in packages:
-        name = package["name"]
-        directory = Path(package["manifest_path"]).parent.name
-        if not name.startswith("trouve-") or directory != name:
+    for manifest_path in cargo_manifests:
+        with manifest_path.open("rb") as handle:
+            package = tomllib.load(handle).get("package", {})
+        name = package.get("name")
+        directory = manifest_path.parent.name
+        if (
+            not isinstance(name, str)
+            or not name.startswith("trouve-")
+            or directory != name
+        ):
             invalid_crates.append((name, directory))
 
     invalid_node_packages = []
@@ -87,7 +98,7 @@ def main() -> int:
         return 1
 
     print(
-        f"validated {len(packages)} workspace crate names and "
+        f"validated {len(cargo_manifests)} Cargo crate names and "
         f"{len(manifests)} Node package names"
     )
     return 0

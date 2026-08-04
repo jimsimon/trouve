@@ -4086,7 +4086,6 @@ impl Engine {
             active: false,
             created_at: chrono::Utc::now(),
         };
-        self.store.insert_session(&session)?;
 
         // Checkpoint 0: pristine state, so the first turn can be undone.
         let commit = self
@@ -4095,37 +4094,43 @@ impl Engine {
             .await
             .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let checkpoint_id = new_id("cp");
-        self.store.append_checkpoint(&CheckpointRow {
+        let checkpoint = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session_id.clone(),
             thread_id: None,
             turn: 0,
             seq: 0,
             commit_hash: commit.clone(),
-        })?;
+        };
 
-        self.store.append_event(
-            Scope::Server,
-            Event::SessionCreated {
-                session_id: session_id.clone(),
-                workspace_id: ws.id.clone(),
-            },
-        )?;
-        self.store.append_event(
-            Scope::Session(session_id.clone()),
-            Event::WorktreeCreated {
-                path: session.worktree_path.clone(),
-                branch,
-            },
-        )?;
-        self.store.append_event(
-            Scope::Session(session_id.clone()),
-            Event::CheckpointCreated {
-                checkpoint_id,
-                thread_id: String::new(),
-                turn: 0,
-                commit,
-            },
+        self.store.insert_session_with_lifecycle(
+            &session,
+            &checkpoint,
+            vec![
+                (
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: session_id.clone(),
+                        workspace_id: ws.id.clone(),
+                    },
+                ),
+                (
+                    Scope::Session(session_id.clone()),
+                    Event::WorktreeCreated {
+                        path: session.worktree_path.clone(),
+                        branch,
+                    },
+                ),
+                (
+                    Scope::Session(session_id.clone()),
+                    Event::CheckpointCreated {
+                        checkpoint_id,
+                        thread_id: String::new(),
+                        turn: 0,
+                        commit,
+                    },
+                ),
+            ],
         )?;
         if self.index_hooks {
             crate::tools::warm_index_in_background(worktree_path);
@@ -4140,6 +4145,12 @@ impl Engine {
             session.active = active.values().any(|s| *s == session.id);
         }
         Ok(sessions)
+    }
+
+    pub fn session_summaries_snapshot(
+        &self,
+    ) -> Result<trouve_protocol::SessionSummariesSnapshot, EngineError> {
+        Ok(self.store.session_summaries_snapshot()?)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Session, EngineError> {
@@ -4178,20 +4189,20 @@ impl Engine {
                     "session {id} is being deleted"
                 )));
             }
-            self.store
-                .update_session(id, req.title.as_deref(), req.archived)?;
-            if newly_archived {
-                self.terminals.remove_session(id);
-            } else if newly_unarchived {
-                self.terminals.reopen_session(id);
-            }
-            self.store.append_event(
-                Scope::Server,
+            self.store.update_session_with_event(
+                id,
+                req.title.as_deref(),
+                req.archived,
                 Event::SessionUpdated {
                     session_id: id.to_string(),
                     workspace_id: session.workspace_id.clone(),
                 },
             )?;
+            if newly_archived {
+                self.terminals.remove_session(id);
+            } else if newly_unarchived {
+                self.terminals.reopen_session(id);
+            }
             if self.index_hooks
                 && newly_archived
                 && let Some(ws) = self.store.workspace(&session.workspace_id)?
@@ -4238,7 +4249,13 @@ impl Engine {
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
             self.terminals.remove_session(id);
-            if let Err(error) = self.store.delete_session(id) {
+            if let Err(error) = self.store.delete_session_with_event(
+                id,
+                Event::SessionDeleted {
+                    session_id: id.to_string(),
+                    workspace_id: session.workspace_id.clone(),
+                },
+            ) {
                 // Restore terminal access when the database transaction left
                 // a live, unarchived session behind.
                 if !session.archived {
@@ -4263,15 +4280,6 @@ impl Engine {
                     tracing::warn!("failed to remove worktree for {id}: {e}");
                 }
             }
-            // Session-scoped events are deleted with the session for privacy;
-            // the persisted server event is the replayable deletion signal.
-            self.store.append_event(
-                Scope::Server,
-                Event::SessionDeleted {
-                    session_id: id.to_string(),
-                    workspace_id: session.workspace_id.clone(),
-                },
-            )?;
             if self.index_hooks {
                 crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
             }

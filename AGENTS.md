@@ -19,9 +19,16 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   state, view models) for native clients.
 - `crates/trouve-thread-view` — shared deterministic fold from thread events
   into rebuildable protocol snapshots; no transport or UI dependencies.
+- `crates/trouve-desktop-host` — app-owned static-asset gateway, typed native
+  capability boundary, and replaceable desktop webview host.
 - `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
   view, markdown, terminal). No trouve-specific types in their public APIs.
-- `crates/trouve-app` — thin Slint desktop/mobile app composing the above.
+- `crates/trouve-app` — main desktop application; retains the Slint frontend
+  during the gated Lit/webview migration.
+- `crates/trouve-servo-embed-preview` — disposable, chrome-free Servo
+  embedding qualification harness. It is an excluded nested Cargo workspace
+  with its own lockfile, not the shipping desktop host (ADR 0024).
+- `web/app-ui` — Lit application shared by the desktop webview and mobile PWA.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
   design docs (event log schema, UX screen map).
 
@@ -60,6 +67,20 @@ These are load-bearing. Do not violate them without a new ADR.
    plugin manifest, internal package pin, and release artifact uses root
    `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
    0012). Protocol and storage-format compatibility versions remain separate.
+   `crates/trouve-servo-embed-preview` is the sole Cargo-membership and
+   lockfile exception: its resolver graph is isolated because the pinned Servo
+   nightly and the product server require incompatible native SQLite link
+   versions, but its first-party version and internal pins are still
+   synchronized to the root version (ADRs 0024 and 0025).
+9. **The web host is not a second client protocol.** The desktop gateway may
+   serve assets, proxy HTTP/SSE, and expose narrowly typed native capabilities
+   such as window state, pickers, clipboard, notifications, and external-open.
+   It never carries durable agent state or arbitrary filesystem, shell, URL,
+   git, MCP, or tool operations. The desktop webview and mobile PWA obtain all
+   harness state and effects through `trouve-server` (ADR 0023). Runtime asset
+   directories and Vite proxying are explicit development/qualification
+   sources, remain loopback-only behind the same gateway origin, and are never
+   enabled by shipping product hosts (ADR 0026).
 
 ## Conventions
 
@@ -79,4 +100,5 @@ These are load-bearing. Do not violate them without a new ADR.
 - Commit style: imperative, concise subject; explain *why* in the body when
   it isn't obvious.
 - Licensing: workspace code is MIT. Slint is used under its Royalty-Free
-  license (ADR 0006); keep the AboutSlint attribution in the app.
+  license (ADR 0006); keep the AboutSlint attribution while any distributed
+  artifact links or contains Slint.
