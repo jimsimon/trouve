@@ -3811,7 +3811,13 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
     ) -> Result<HashMap<(usize, String), String>> {
-        let routing_model = router_model(job)?;
+        let routing_model = match router_model(job) {
+            Ok(model) => model,
+            Err(error) => {
+                semantic_routing_failure_selection(job.routing_mode, error)?;
+                return Ok(HashMap::new());
+            }
+        };
         let batch_count = batches.len();
         let task_concurrency = positive_concurrency_from_env(
             REVIEW_TASK_CONCURRENCY_ENV,
@@ -3860,13 +3866,24 @@ impl Engine {
                         prompt: prompt.clone(),
                     })?;
                     engine.emit_code_review_task(&job.id, task.clone())?;
-                    let thread = engine.create_thread(CreateThreadRequest {
+                    let thread = match engine.create_thread(CreateThreadRequest {
                         session_id,
                         mode: Some("review".into()),
                         model: Some(routing_model),
                         model_options: thinking_model_options(job.router_thinking_level.as_deref()),
                         permission_mode: Some(PermissionMode::Yolo),
-                    })?;
+                    }) {
+                        Ok(thread) => thread,
+                        Err(error) => {
+                            let selected = engine.finish_semantic_routing_failure(
+                                &job,
+                                batch_index,
+                                &task,
+                                error.into(),
+                            )?;
+                            return Ok((batch_index, selected));
+                        }
+                    };
                     let task = engine
                         .store
                         .start_code_review_task(
@@ -3907,29 +3924,8 @@ impl Engine {
                             if superseded.is_cancelled() {
                                 return Err(error);
                             }
-                            let automatic = job.routing_mode == CodeReviewRoutingMode::Automatic;
-                            let failure = if automatic {
-                                format!("semantic persona routing failed: {error:#}")
-                            } else {
-                                format!(
-                                    "semantic persona routing failed; Additive selections were retained: {error:#}"
-                                )
-                            };
-                            if let Some(task) = engine.store.finish_code_review_task(
-                                &task.id,
-                                "failed",
-                                "",
-                                0,
-                                &failure,
-                            )? {
-                                engine.emit_code_review_task(&job.id, task)?;
-                            }
-                            engine.record_review_error(format!(
-                                "semantic routing for review {} batch {} failed: {error:#}",
-                                job.id,
-                                batch_index + 1
-                            ));
-                            semantic_routing_failure_selection(job.routing_mode, error)
+                            engine
+                                .finish_semantic_routing_failure(&job, batch_index, &task, error)
                                 .map(|selected| (batch_index, selected))
                         }
                     }
@@ -3948,6 +3944,32 @@ impl Engine {
             }
         }
         Ok(routed)
+    }
+
+    fn finish_semantic_routing_failure(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        batch_index: usize,
+        task: &trouve_protocol::CodeReviewTask,
+        error: anyhow::Error,
+    ) -> Result<HashMap<String, String>> {
+        let failure = if job.routing_mode == CodeReviewRoutingMode::Additive {
+            format!("semantic persona routing failed; Additive selections were retained: {error:#}")
+        } else {
+            format!("semantic persona routing failed: {error:#}")
+        };
+        if let Some(task) = self
+            .store
+            .finish_code_review_task(&task.id, "failed", "", 0, &failure)?
+        {
+            self.emit_code_review_task(&job.id, task)?;
+        }
+        self.record_review_error(format!(
+            "semantic routing for review {} batch {} failed: {error:#}",
+            job.id,
+            batch_index + 1
+        ));
+        semantic_routing_failure_selection(job.routing_mode, error)
     }
 
     async fn run_code_review_turn(
@@ -5191,10 +5213,12 @@ fn semantic_routing_failure_selection(
     routing_mode: CodeReviewRoutingMode,
     error: anyhow::Error,
 ) -> Result<HashMap<String, String>> {
-    if routing_mode == CodeReviewRoutingMode::Automatic {
+    if routing_mode == CodeReviewRoutingMode::Additive {
+        Ok(HashMap::new())
+    } else if routing_mode == CodeReviewRoutingMode::Automatic {
         Err(error).context("Automatic persona selection requires successful semantic routing")
     } else {
-        Ok(HashMap::new())
+        Err(error)
     }
 }
 
@@ -7912,6 +7936,13 @@ mod tests {
                 .contains("Automatic persona selection requires successful semantic routing")
         );
         assert!(format!("{error:#}").contains("router unavailable"));
+
+        let error = semantic_routing_failure_selection(
+            CodeReviewRoutingMode::Manual,
+            anyhow!("router unavailable"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "router unavailable");
     }
 
     #[test]
@@ -7952,6 +7983,58 @@ mod tests {
                     .iter()
                     .any(|reason| reason.source == CodeReviewRoutingSource::Included)
         }));
+    }
+
+    #[tokio::test]
+    async fn additive_router_setup_failure_marks_task_failed_and_continues() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:additive-router-setup");
+        store.claim_code_review_job().unwrap().unwrap();
+        job.routing_mode = CodeReviewRoutingMode::Additive;
+        job.semantic_routing = true;
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| reviewer.id == "performance")
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+fn changed() {}\n".into(),
+        }];
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        ));
+
+        let routed = engine
+            .semantic_routing_for_batches(
+                &job,
+                "missing-session",
+                &reviewers,
+                &batches,
+                &CancellationToken::new(),
+                &Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await
+            .unwrap();
+
+        assert!(routed.is_empty());
+        let tasks = store.code_review_tasks(&job.id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "failed");
+        assert!(tasks[0].error.contains("missing-session"));
+        assert!(tasks[0].error.contains("Additive selections were retained"));
+        assert!(
+            store
+                .events_after(&Scope::CodeReviewJob(job.id.clone()), 0)
+                .unwrap()
+                .into_iter()
+                .any(|envelope| matches!(
+                    envelope.event,
+                    Event::CodeReviewTaskUpdated { task, .. } if task.status == "failed"
+                ))
+        );
     }
 
     #[test]
