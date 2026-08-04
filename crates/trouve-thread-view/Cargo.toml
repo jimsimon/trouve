@@ -1,0 +1,13 @@
+[package]
+name = "trouve-thread-view"
+version.workspace = true
+edition.workspace = true
+description = "Shared event-folding projection for trouve thread views."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+trouve-protocol.workspace = true

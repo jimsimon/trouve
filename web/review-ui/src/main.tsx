@@ -2075,7 +2075,9 @@ function RepositoryEditor({
               <small>
                 {draft.routing_mode === "automatic"
                   ? "Required in Automatic mode and solely decides which personas run for each batch."
-                  : "Run one lightweight, tool-free routing pass per batch. In Additive mode it may add relevant personas but cannot remove baseline or enabled core personas."}
+                  : draft.routing_mode === "additive"
+                    ? "Run one lightweight, tool-free routing pass per batch. It may add relevant personas but cannot remove baseline or enabled core personas."
+                    : "Semantic triage is off in Manual mode; only the checked personas run."}
               </small>
             </span>
           </label>

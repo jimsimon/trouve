@@ -30,3 +30,5 @@ sequentially.
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
 | [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
+| [0021](0021-derived-thread-view-snapshots.md) | Derived thread-view snapshots | Accepted |
+| [0022](0022-bounded-thread-view-pages.md) | Bounded thread-view pages | Accepted |

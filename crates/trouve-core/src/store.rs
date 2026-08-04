@@ -14,9 +14,12 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, Workspace,
+    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, ThreadViewSnapshot,
+    Workspace,
 };
+use trouve_thread_view::ThreadProjection;
 
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -111,6 +114,12 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
+CREATE TABLE IF NOT EXISTS thread_view_cache (
+  thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+  cursor INTEGER NOT NULL,
+  schema_version INTEGER NOT NULL,
+  state TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS spawned_threads (
   child_thread_id TEXT PRIMARY KEY REFERENCES threads(id),
   parent_thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -1407,6 +1416,7 @@ fn insert_event_batch<'a>(
 ) -> Result<Vec<u64>> {
     let tx = conn.transaction()?;
     let mut cursors = Vec::with_capacity(event_count);
+    let mut thread_events = Vec::new();
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
@@ -1414,11 +1424,110 @@ fn insert_event_batch<'a>(
         for event in batch {
             let (kind, id) = scope_cols(&event.scope);
             stmt.execute(params![kind, id, event.ts.to_rfc3339(), event.payload])?;
-            cursors.push(tx.last_insert_rowid() as u64);
+            let cursor = tx.last_insert_rowid() as u64;
+            cursors.push(cursor);
+            if let Scope::Thread(thread_id) = &event.scope {
+                thread_events.push((
+                    thread_id.clone(),
+                    EventEnvelope {
+                        cursor,
+                        scope: event.scope.clone(),
+                        ts: event.ts,
+                        event: event.event.clone(),
+                    },
+                ));
+            }
         }
     }
+    update_thread_view_caches(&tx, &thread_events)?;
     tx.commit()?;
     Ok(cursors)
+}
+
+fn update_thread_view_caches(
+    tx: &rusqlite::Transaction<'_>,
+    events: &[(String, EventEnvelope)],
+) -> Result<()> {
+    // Rewriting a full folded transcript for every streamed delta would
+    // amplify writes quadratically. Refresh an existing cache once at a turn
+    // boundary instead; a snapshot request incrementally catches up an active
+    // turn when necessary.
+    let mut through_by_thread = HashMap::<String, u64>::new();
+    for (thread_id, envelope) in events {
+        if matches!(
+            envelope.event,
+            Event::TurnCompleted { .. } | Event::TurnFailed { .. } | Event::TurnCancelled { .. }
+        ) {
+            through_by_thread.insert(thread_id.clone(), envelope.cursor);
+        }
+    }
+    for (thread_id, through) in through_by_thread {
+        let cached = tx
+            .query_row(
+                "SELECT schema_version, state FROM thread_view_cache WHERE thread_id = ?1",
+                params![&thread_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some(mut projection) = cached.and_then(|(version, state)| {
+            (version == THREAD_VIEW_SCHEMA_VERSION)
+                .then(|| serde_json::from_str::<ThreadProjection>(&state).ok())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let mut stmt = tx.prepare_cached(
+            "SELECT cursor, ts, payload FROM events
+             WHERE scope_kind = 'thread' AND scope_id = ?1
+               AND cursor > ?2 AND cursor <= ?3
+             ORDER BY cursor",
+        )?;
+        let rows = stmt.query_map(
+            params![&thread_id, projection.cursor as i64, through as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (cursor, ts, payload) = row?;
+            let event = match serde_json::from_str(&payload) {
+                Ok(event) => event,
+                Err(_) if is_retired_event(&payload) => {
+                    projection.cursor = cursor;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping undeserializable event {cursor} while updating thread view: {error}"
+                    );
+                    projection.cursor = cursor;
+                    continue;
+                }
+            };
+            projection.apply(&EventEnvelope {
+                cursor,
+                scope: Scope::Thread(thread_id.clone()),
+                ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                event,
+            });
+        }
+        tx.execute(
+            "UPDATE thread_view_cache
+             SET cursor = ?2, schema_version = ?3, state = ?4
+             WHERE thread_id = ?1",
+            params![
+                thread_id,
+                projection.cursor as i64,
+                THREAD_VIEW_SCHEMA_VERSION,
+                serde_json::to_string(&projection)?
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn serialize_events(scope: Scope, events: Vec<Event>) -> Result<Vec<PendingEvent>> {
@@ -1545,6 +1654,122 @@ impl Store {
             |row| row.get::<_, Option<i64>>(0),
         )?;
         Ok(cursor.unwrap_or(0) as u64)
+    }
+
+    /// Fold a thread's durable events into a cached current-state snapshot.
+    ///
+    /// Raw rows are captured through one cursor while holding the connection,
+    /// then decoded and folded without blocking unrelated store work. A
+    /// conditional cache write cannot overwrite a newer turn-boundary refresh.
+    pub fn thread_view_snapshot(
+        &self,
+        thread_id: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<(u64, ThreadViewSnapshot)> {
+        let (mut projection, cache_valid, rows) = {
+            let conn = self.conn.lock().unwrap();
+            let cached = conn
+                .query_row(
+                    "SELECT schema_version, state FROM thread_view_cache WHERE thread_id = ?1",
+                    params![thread_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let mut cache_valid = false;
+            let projection: ThreadProjection = cached
+                .and_then(|(version, state)| {
+                    (version == THREAD_VIEW_SCHEMA_VERSION)
+                        .then(|| serde_json::from_str(&state).ok())
+                        .flatten()
+                })
+                .inspect(|_| cache_valid = true)
+                .unwrap_or_default();
+            let through = conn.query_row(
+                "SELECT MAX(cursor) FROM events WHERE scope_kind = 'thread' AND scope_id = ?1",
+                params![thread_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+            let through = through.unwrap_or(0) as u64;
+            let mut stmt = conn.prepare_cached(
+                "SELECT cursor, ts, payload FROM events
+                 WHERE scope_kind = 'thread' AND scope_id = ?1
+                   AND cursor > ?2 AND cursor <= ?3
+                 ORDER BY cursor",
+            )?;
+            let rows = stmt.query_map(
+                params![thread_id, projection.cursor as i64, through as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            (
+                projection,
+                cache_valid,
+                rows.collect::<rusqlite::Result<Vec<_>>>()?,
+            )
+        };
+        let needs_write = !cache_valid || !rows.is_empty();
+        for (cursor, ts, payload) in rows {
+            let event = match serde_json::from_str(&payload) {
+                Ok(event) => event,
+                Err(_) if is_retired_event(&payload) => {
+                    projection.cursor = cursor;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping undeserializable event {cursor} while folding thread view: {error}"
+                    );
+                    projection.cursor = cursor;
+                    continue;
+                }
+            };
+            projection.apply(&EventEnvelope {
+                cursor,
+                scope: Scope::Thread(thread_id.to_string()),
+                ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                event,
+            });
+        }
+        if needs_write {
+            projection.snapshot.item_offset = 0;
+            projection.snapshot.total_items = 0;
+            projection.snapshot.has_older = false;
+            let state = serde_json::to_string(&projection)?;
+            self.conn.lock().unwrap().execute(
+                "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                   cursor = excluded.cursor,
+                   schema_version = excluded.schema_version,
+                   state = excluded.state
+                 WHERE thread_view_cache.cursor <= excluded.cursor",
+                params![
+                    thread_id,
+                    projection.cursor as i64,
+                    THREAD_VIEW_SCHEMA_VERSION,
+                    state
+                ],
+            )?;
+        }
+        let mut snapshot = projection.snapshot;
+        let total = snapshot.items.len();
+        let end = before
+            .and_then(|offset| usize::try_from(offset).ok())
+            .unwrap_or(total)
+            .min(total);
+        let start = end.saturating_sub(limit.max(1));
+        let items = snapshot.items.drain(start..end).collect();
+        snapshot.items = items;
+        snapshot.item_offset = start as u64;
+        snapshot.total_items = total as u64;
+        snapshot.has_older = start > 0;
+        Ok((projection.cursor, snapshot))
     }
 
     /// Read at most `limit` persisted rows in `(after, through]`.
@@ -5104,6 +5329,123 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 mod tests {
     use super::*;
     use trouve_protocol::Event;
+
+    #[test]
+    fn thread_view_snapshot_rebuilds_and_advances_with_event_appends() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_view");
+        let scope = Scope::Thread("th_view".into());
+        for event in [
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "hello".into(),
+                attachments: Vec::new(),
+            },
+            Event::AssistantDelta {
+                turn: 1,
+                text: "wor".into(),
+            },
+            Event::AssistantDelta {
+                turn: 1,
+                text: "ld".into(),
+            },
+            Event::AssistantMessage {
+                turn: 1,
+                content: "world".into(),
+            },
+        ] {
+            store.append_event(scope.clone(), event).unwrap();
+        }
+
+        let (first_cursor, first) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert_eq!(first.items.len(), 3);
+        assert_eq!(first.item_offset, 0);
+        assert_eq!(first.total_items, 3);
+        assert!(!first.has_older);
+        assert!(first.turn_running);
+
+        let (_, tail) = store.thread_view_snapshot("th_view", None, 2).unwrap();
+        assert_eq!(tail.item_offset, 1);
+        assert_eq!(tail.total_items, 3);
+        assert!(tail.has_older);
+        assert_eq!(tail.items, first.items[1..]);
+        let (_, older) = store
+            .thread_view_snapshot("th_view", Some(tail.item_offset), 2)
+            .unwrap();
+        assert_eq!(older.item_offset, 0);
+        assert_eq!(older.total_items, 3);
+        assert!(!older.has_older);
+        assert_eq!(older.items, first.items[..1]);
+
+        store
+            .append_event(
+                scope.clone(),
+                Event::TurnCompleted {
+                    turn: 1,
+                    usage: Default::default(),
+                    checkpoint_id: None,
+                },
+            )
+            .unwrap();
+        let cached_cursor = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor FROM thread_view_cache WHERE thread_id = 'th_view'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        assert!(cached_cursor > first_cursor);
+        let (second_cursor, second) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert!(second_cursor > first_cursor);
+        assert!(!second.turn_running);
+        assert_eq!(second.items.len(), 3);
+        let changes_before = store.conn.lock().unwrap().total_changes();
+        let (unchanged_cursor, unchanged) =
+            store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let changes_after = store.conn.lock().unwrap().total_changes();
+        assert_eq!(unchanged_cursor, second_cursor);
+        assert_eq!(unchanged.items, second.items);
+        assert_eq!(changes_after, changes_before);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM thread_view_cache WHERE thread_id = 'th_view'",
+                [],
+            )
+            .unwrap();
+        let (rebuilt_cursor, rebuilt) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert_eq!(rebuilt_cursor, second_cursor);
+        assert_eq!(rebuilt.items, second.items);
+
+        for index in 0..300 {
+            store
+                .append_event(
+                    scope.clone(),
+                    Event::UserMessage {
+                        turn: 2,
+                        content: format!("historical message {index}"),
+                        attachments: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        let (_, bounded) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert_eq!(bounded.items.len(), 256);
+        assert_eq!(bounded.total_items, 303);
+        assert_eq!(bounded.item_offset, 47);
+        assert!(bounded.has_older);
+    }
 
     #[test]
     fn code_review_task_summary_columns_preserve_full_row_shape() {

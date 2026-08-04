@@ -12,13 +12,13 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use trouve_client_core::client::ProtocolClient;
+use trouve_client_core::client::{ProtocolClient, ProtocolResponseError};
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
-    UpsertProviderRequest, Workspace,
+    CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE, EventEnvelope, ModelInfo,
+    PROTOCOL_VERSION, PermissionMode, Session, Thread, TodoStatus, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -50,6 +50,61 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const CHAT_WINDOW_ROWS: usize = 160;
 /// Refill history before the reader lands exactly on the first loaded row.
 const CHAT_HISTORY_REFILL_ROWS: usize = 20;
+/// Fold persisted thread history only after its SSE replay has gone quiet.
+///
+/// The server sends replay in bounded pages. Flushing on a fixed timer from
+/// the first envelope makes a long transcript repaint page by page, so its
+/// bounded window still appears to stream from the beginning. Treat this as
+/// an idle debounce instead: every arriving replay envelope restarts the
+/// quiet period and the controller receives one completed backlog batch.
+const THREAD_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Default)]
+struct ThreadReplayBuffer {
+    envelopes: Vec<EventEnvelope>,
+    generation: u64,
+    flush_scheduled: bool,
+}
+
+impl ThreadReplayBuffer {
+    fn push(&mut self, envelope: EventEnvelope) -> bool {
+        self.envelopes.push(envelope);
+        self.generation = self.generation.wrapping_add(1);
+        if self.flush_scheduled {
+            false
+        } else {
+            self.flush_scheduled = true;
+            true
+        }
+    }
+
+    fn take(&mut self) -> Vec<EventEnvelope> {
+        std::mem::take(&mut self.envelopes)
+    }
+
+    fn take_if_generation(&mut self, observed: u64) -> Option<Vec<EventEnvelope>> {
+        let batch = self.take();
+        if self.generation != observed {
+            self.envelopes = batch;
+            None
+        } else {
+            self.flush_scheduled = false;
+            Some(batch)
+        }
+    }
+}
+
+async fn wait_for_thread_replay_idle(replay: &std::sync::Mutex<ThreadReplayBuffer>) -> u64 {
+    let mut observed = replay.lock().unwrap().generation;
+    loop {
+        tokio::time::sleep(THREAD_REPLAY_IDLE_FLUSH).await;
+        let current = replay.lock().unwrap().generation;
+        if current == observed {
+            return observed;
+        }
+        observed = current;
+    }
+}
 
 /// The absolute rendered-row interval currently installed in the chat list.
 ///
@@ -63,6 +118,14 @@ struct ChatWindow {
     total: usize,
     initialized: bool,
     following_tail: bool,
+}
+
+#[derive(Debug, Default)]
+struct ThreadHistory {
+    item_offset: u64,
+    has_older: bool,
+    loading_older: bool,
+    pending_anchor: Option<(usize, f32)>,
 }
 
 impl ChatWindow {
@@ -125,6 +188,12 @@ impl ChatWindow {
             .then_some(absolute_row - self.start)
     }
 
+    fn shift_for_prepended_rows(&mut self, added: usize) {
+        self.start = self.start.saturating_add(added).min(self.total);
+        self.end = self.end.saturating_add(added).min(self.total);
+        self.following_tail = false;
+    }
+
     fn prepend(&mut self) -> bool {
         let next = self.start.saturating_sub(CHAT_WINDOW_ROWS);
         if next == self.start {
@@ -154,6 +223,16 @@ impl ChatWindow {
         self.following_tail = true;
         changed
     }
+}
+
+fn invalidate_background_thread_history(
+    thread_id: &str,
+    chat_windows: &mut HashMap<String, ChatWindow>,
+    resume: &mut crate::winstate::Resume,
+) -> bool {
+    let window_removed = chat_windows.remove(thread_id).is_some();
+    let bookmark_removed = resume.thread_scroll.remove(thread_id).is_some();
+    window_removed || bookmark_removed
 }
 
 /// During global history replay, only the newest state snapshot for each
@@ -746,6 +825,18 @@ pub enum UiCommand {
     /// Internal: threads were discovered for an active background session,
     /// so their streams can feed attention and unread-work badges.
     SessionThreadsLoaded(String, Result<Vec<Thread>, String>),
+    /// Folded durable state used to seed a thread before its SSE follower
+    /// resumes after the snapshot cursor.
+    ThreadViewLoaded(
+        String,
+        Result<(u64, trouve_protocol::ThreadViewSnapshot), String>,
+    ),
+    /// An older folded-item page requested when the reader reaches the top
+    /// of the currently loaded transcript.
+    ThreadHistoryLoaded(
+        String,
+        Result<(u64, trouve_protocol::ThreadViewSnapshot), String>,
+    ),
 }
 
 /// What a left-nav row maps back to.
@@ -987,6 +1078,8 @@ struct Controller {
     /// Per-thread slice of the fully rendered transcript installed in Slint.
     /// Older rows are prepended on demand as the reader approaches the top.
     chat_windows: HashMap<String, ChatWindow>,
+    /// Server-backed folded-item pagination state per followed thread.
+    thread_history: HashMap<String, ThreadHistory>,
     row_call_ids: Vec<Option<String>>,
     /// Question-wizard state per pending request id (page, selections,
     /// "Other" texts); dropped once the request resolves.
@@ -1032,6 +1125,8 @@ struct Controller {
     diff_files: Vec<trouve_slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
+    /// A pathological diff is not polled again until the session is reopened.
+    diff_blocked_session: Option<String>,
     /// Files tab tree: directory listings cached by worktree-relative path
     /// ("." for the root), fetched lazily as folders are expanded.
     file_children: HashMap<String, Vec<DirEntry>>,
@@ -1196,6 +1291,7 @@ pub async fn run(
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         chat_windows: HashMap::new(),
+        thread_history: HashMap::new(),
         row_call_ids: Vec::new(),
         wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
@@ -1216,6 +1312,7 @@ pub async fn run(
         diff_files: Vec::new(),
         diff_collapsed: Vec::new(),
         diff_raw: String::new(),
+        diff_blocked_session: None,
         file_children: HashMap::new(),
         file_expanded: HashSet::new(),
         file_rows: Vec::new(),
@@ -1291,9 +1388,11 @@ async fn start_local_server() -> Result<(
 )> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
         let client = ProtocolClient::new(&url);
-        client
+        let info = client
             .info()
             .await
+            .with_context(|| format!("connecting to {url}"))?;
+        ensure_protocol_compatible(&info.protocol_version)
             .with_context(|| format!("connecting to {url}"))?;
         return Ok((client, url, None));
     }
@@ -1310,6 +1409,15 @@ async fn start_local_server() -> Result<(
             .with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
     }
     Ok((client, url, Some((info, handle))))
+}
+
+fn ensure_protocol_compatible(server_version: &str) -> Result<()> {
+    anyhow::ensure!(
+        server_version == PROTOCOL_VERSION,
+        "incompatible trouve-server protocol version {server_version}; \
+         this app requires {PROTOCOL_VERSION}"
+    );
+    Ok(())
 }
 
 /// Everything needed to relaunch the embedded server on the same address
@@ -1939,6 +2047,7 @@ impl Controller {
             self.update_session_attention(thread_id, before, AttentionCounts::default());
         self.vms.remove(thread_id);
         self.chat_windows.remove(thread_id);
+        self.thread_history.remove(thread_id);
         self.thread_sessions.remove(thread_id);
         attention_changed
     }
@@ -2079,9 +2188,9 @@ impl Controller {
     }
 
     /// Pop a desktop notification for events the user would miss: the
-    /// window is unfocused or the thread isn't the one on screen. Followers
-    /// replay each thread's history from cursor 0, so anything but a fresh
-    /// event (by append timestamp) is skipped.
+    /// window is unfocused or the thread isn't the one on screen. Reconnect
+    /// backlogs may still contain old events after the snapshot cursor, so
+    /// anything but a fresh event (by append timestamp) is skipped.
     fn maybe_notify(&self, thread_id: &str, envelope: &EventEnvelope) {
         if !self.notify.enabled {
             return;
@@ -2237,6 +2346,7 @@ impl Controller {
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
+        self.diff_blocked_session = None;
         self.threads = self.client.list_threads(&session_id).await?;
         for t in &self.threads {
             self.thread_sessions
@@ -2634,18 +2744,22 @@ impl Controller {
         let follower_id = thread_id.clone();
         let task = tokio::spawn(async move {
             use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-            let cursor = std::sync::Arc::new(AtomicU64::new(0));
-            let replay = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let replay_flush_scheduled = std::sync::Arc::new(AtomicBool::new(false));
+            let snapshot = client
+                .thread_view(&thread_id, None)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let initial_cursor = snapshot.as_ref().map(|(cursor, _)| *cursor).unwrap_or(0);
+            let _ = tx.send(UiCommand::ThreadViewLoaded(thread_id.clone(), snapshot));
+            let cursor = std::sync::Arc::new(AtomicU64::new(initial_cursor));
+            let replay = std::sync::Arc::new(std::sync::Mutex::new(ThreadReplayBuffer::default()));
             // Startup history predates this app run and is already viewed;
             // persisted envelopes after the stream has gone live are a
             // reconnect backlog and can represent unseen background work.
-            let live_seen = std::sync::Arc::new(AtomicBool::new(false));
+            let live_seen = std::sync::Arc::new(AtomicBool::new(initial_cursor > 0));
             loop {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
                 let replay = replay.clone();
-                let flush_scheduled = replay_flush_scheduled.clone();
                 let live_seen = live_seen.clone();
                 let event_tx = tx.clone();
                 let after = cursor.load(Ordering::Relaxed);
@@ -2656,32 +2770,39 @@ impl Controller {
                             .elapsed()
                             .is_ok_and(|age| age > std::time::Duration::from_secs(2));
                         if persisted_replay {
-                            replay.lock().unwrap().push(envelope);
-                            if !flush_scheduled.swap(true, Ordering::AcqRel) {
+                            if replay.lock().unwrap().push(envelope) {
                                 let replay = replay.clone();
-                                let flush_scheduled = flush_scheduled.clone();
+                                let live_seen = live_seen.clone();
                                 let event_tx = event_tx.clone();
                                 let id = id.clone();
-                                let mark_unread = live_seen.load(Ordering::Relaxed);
                                 tokio::spawn(async move {
-                                    // Let the local replay producer fill the
-                                    // batch before handing it to the
-                                    // controller's unbounded command queue.
-                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                                    flush_scheduled.store(false, Ordering::Release);
-                                    let batch = std::mem::take(&mut *replay.lock().unwrap());
-                                    if !batch.is_empty() {
-                                        let _ = event_tx.send(UiCommand::Events(
-                                            id,
-                                            batch,
-                                            mark_unread,
-                                        ));
+                                    // Do not repaint a long transcript once
+                                    // per server replay page. Wait until no
+                                    // persisted envelope has arrived for a
+                                    // complete quiet period, then install
+                                    // the bounded transcript tail once.
+                                    loop {
+                                        let observed = wait_for_thread_replay_idle(&replay).await;
+                                        let Some(batch) =
+                                            replay.lock().unwrap().take_if_generation(observed)
+                                        else {
+                                            continue;
+                                        };
+                                        if !batch.is_empty() {
+                                            let mark_unread = live_seen.load(Ordering::Relaxed);
+                                            let _ = event_tx.send(UiCommand::Events(
+                                                id,
+                                                batch,
+                                                mark_unread,
+                                            ));
+                                        }
+                                        break;
                                     }
                                 });
                             }
                         } else {
                             let mark_unread = live_seen.load(Ordering::Relaxed);
-                            let batch = std::mem::take(&mut *replay.lock().unwrap());
+                            let batch = replay.lock().unwrap().take();
                             if !batch.is_empty() {
                                 let _ = event_tx.send(UiCommand::Events(
                                     id.clone(),
@@ -2707,6 +2828,25 @@ impl Controller {
             }
         });
         self.follower_tasks.insert(follower_id, task);
+    }
+
+    fn load_older_thread_history(&mut self, thread_id: String, anchor: usize, offset: f32) {
+        let history = self.thread_history.entry(thread_id.clone()).or_default();
+        if !history.has_older || history.loading_older || history.item_offset == 0 {
+            return;
+        }
+        history.loading_older = true;
+        history.pending_anchor = Some((anchor, offset));
+        let before = history.item_offset;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .thread_view(&thread_id, Some(before))
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UiCommand::ThreadHistoryLoaded(thread_id, result));
+        });
     }
 
     /// Refresh the composer's "@"-mention path list for the open session, at
@@ -2737,35 +2877,27 @@ impl Controller {
         });
     }
 
-    /// Re-fold the current thread into chat rows. `scroll` jumps the list to
-    /// the end — wanted when content arrives or threads switch, jarring for
-    /// in-place toggles (tool details, raw view).
-    fn render_chat(&mut self, scroll: bool) {
-        let Some(thread_id) = self.current_thread_id() else {
-            self.row_call_ids.clear();
-            ui::set_chat(&self.ui, Vec::new(), String::new(), false);
-            ui::set_composer_enabled(&self.ui, false);
-            ui::set_composer_turn_running(&self.ui, false);
-            ui::set_slash_commands(&self.ui, Vec::new());
-            return;
-        };
-        // Keep the "@" mention paths roughly current while a thread is open
-        // (agents create files mid-turn); the helper self-throttles.
-        self.refresh_at_files();
+    fn fold_chat_rows(
+        &mut self,
+        thread_id: &str,
+    ) -> (Vec<render::ChatRowData>, Vec<Option<String>>) {
         let raw_turns: HashSet<u64> = self
             .raw_turns
             .iter()
-            .filter(|(t, _)| *t == thread_id)
+            .filter(|(candidate, _)| candidate == thread_id)
             .map(|(_, turn)| *turn)
             .collect();
         let collapsed: HashSet<String> = self
             .collapsed_cards
             .iter()
-            .filter(|(t, _)| *t == thread_id)
+            .filter(|(candidate, _)| candidate == thread_id)
             .map(|(_, key)| key.clone())
             .collect();
-        let vm = self.vms.entry(thread_id.clone()).or_default();
-        ui::set_composer_turn_running(&self.ui, vm.turn_running);
+        let item_offset = self
+            .thread_history
+            .get(thread_id)
+            .map_or(0, |history| history.item_offset);
+        let vm = self.vms.entry(thread_id.to_string()).or_default();
         // Wizard state tracks the thread's pending question requests: fresh
         // state when one appears, dropped once it resolves.
         for item in &vm.items {
@@ -2785,13 +2917,23 @@ impl Controller {
                 }
             }
         }
-        let (rows, call_ids) = render::chat_rows(
+        render::chat_rows_at_offset(
             vm,
+            item_offset,
             &self.expanded_tools,
             &raw_turns,
             &collapsed,
             &self.wizards,
-        );
+        )
+    }
+
+    fn install_chat_rows(
+        &mut self,
+        thread_id: String,
+        rows: Vec<render::ChatRowData>,
+        call_ids: Vec<Option<String>>,
+        scroll: bool,
+    ) {
         let bookmark = self
             .resume
             .thread_scroll
@@ -2804,6 +2946,8 @@ impl Controller {
         };
         self.row_call_ids = call_ids[range.clone()].to_vec();
         let rows = rows[range].to_vec();
+        let vm = self.vms.entry(thread_id.clone()).or_default();
+        ui::set_composer_turn_running(&self.ui, vm.turn_running);
         ui::set_slash_commands(
             &self.ui,
             vm.commands
@@ -2825,6 +2969,25 @@ impl Controller {
         {
             ui::restore_chat_position(&self.ui, local_row, bookmark.offset);
         }
+    }
+
+    /// Re-fold the current thread into chat rows. `scroll` jumps the list to
+    /// the end — wanted when content arrives or threads switch, jarring for
+    /// in-place toggles (tool details, raw view).
+    fn render_chat(&mut self, scroll: bool) {
+        let Some(thread_id) = self.current_thread_id() else {
+            self.row_call_ids.clear();
+            ui::set_chat(&self.ui, Vec::new(), String::new(), false);
+            ui::set_composer_enabled(&self.ui, false);
+            ui::set_composer_turn_running(&self.ui, false);
+            ui::set_slash_commands(&self.ui, Vec::new());
+            return;
+        };
+        // Keep the "@" mention paths roughly current while a thread is open
+        // (agents create files mid-turn); the helper self-throttles.
+        self.refresh_at_files();
+        let (rows, call_ids) = self.fold_chat_rows(&thread_id);
+        self.install_chat_rows(thread_id, rows, call_ids, scroll);
     }
 
     /// Push the current thread's prompt queue to the composer's queue panel.
@@ -3198,7 +3361,29 @@ impl Controller {
         let Some(session_id) = self.current_session_id() else {
             return Ok(());
         };
-        let diff = self.client.session_diff(&session_id).await?;
+        if self.diff_blocked_session.as_deref() == Some(&session_id) {
+            return Ok(());
+        }
+        let diff = match self.client.session_diff(&session_id).await {
+            Ok(diff) => diff,
+            Err(error)
+                if error
+                    .downcast_ref::<ProtocolResponseError>()
+                    .is_some_and(|error| error.code == ERROR_CODE_SESSION_DIFF_TOO_LARGE) =>
+            {
+                self.diff_blocked_session = Some(session_id);
+                self.diff_files.clear();
+                self.diff_collapsed.clear();
+                self.diff_raw.clear();
+                self.push_diff();
+                self.error(
+                    "This session's change set is too large for the Changes panel. \
+                     The chat and Files panel remain available.",
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if diff.diff == self.diff_raw {
             return Ok(());
         }
@@ -5050,7 +5235,7 @@ impl Controller {
                 if self.restoring_thread.as_deref() == Some(&thread_id) {
                     self.restoring_thread = None;
                 }
-                let (absolute_row, at_transcript_tail, refill) = {
+                let (absolute_row, at_transcript_tail, refill, load_older) = {
                     let Some(window) = self.chat_windows.get_mut(&thread_id) else {
                         return Ok(());
                     };
@@ -5058,9 +5243,10 @@ impl Controller {
                     let refilled = (row <= CHAT_HISTORY_REFILL_ROWS && window.prepend())
                         || (at_bottom && window.append());
                     let refill = refilled.then_some(absolute_row);
+                    let load_older = row <= CHAT_HISTORY_REFILL_ROWS && window.start == 0;
                     let at_transcript_tail = at_bottom && window.end >= window.total;
                     window.following_tail = at_transcript_tail;
-                    (absolute_row, at_transcript_tail, refill)
+                    (absolute_row, at_transcript_tail, refill, load_older)
                 };
                 let changed = if at_transcript_tail {
                     self.resume.thread_scroll.remove(&thread_id).is_some()
@@ -5090,9 +5276,12 @@ impl Controller {
                         .get(&thread_id)
                         .and_then(|window| window.local_row(anchor))
                     {
-                        self.restoring_thread = Some(thread_id);
+                        self.restoring_thread = Some(thread_id.clone());
                         ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
                     }
+                }
+                if load_older {
+                    self.load_older_thread_history(thread_id, absolute_row, offset.max(0.0));
                 }
             }
             UiCommand::SendMessage(text) => {
@@ -5940,12 +6129,14 @@ impl Controller {
             UiCommand::Undo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.undo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
             UiCommand::Redo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.redo(&session_id).await?;
+                    self.diff_blocked_session = None;
                     self.refresh_diff().await?;
                 }
             }
@@ -7202,6 +7393,155 @@ impl Controller {
                     self.open_thread_index(i, true);
                 }
             }
+            UiCommand::ThreadViewLoaded(thread_id, result) => match result {
+                Ok((cursor, snapshot)) => {
+                    if !self.followed.contains(&thread_id) {
+                        return Ok(());
+                    }
+                    self.thread_history.insert(
+                        thread_id.clone(),
+                        ThreadHistory {
+                            item_offset: snapshot.item_offset,
+                            has_older: snapshot.has_older,
+                            ..Default::default()
+                        },
+                    );
+                    let before = self
+                        .vms
+                        .get(&thread_id)
+                        .map(thread_attention)
+                        .unwrap_or_default();
+                    let todos_changed = self
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id == thread_id)
+                        .is_some_and(|thread| {
+                            if thread.todos == snapshot.todos {
+                                false
+                            } else {
+                                thread.todos = snapshot.todos.clone();
+                                true
+                            }
+                        });
+                    let mut vm = ThreadViewModel::from(snapshot);
+                    vm.cursor = cursor;
+                    let after = thread_attention(&vm);
+                    self.vms.insert(thread_id.clone(), vm);
+                    if self.update_session_attention(&thread_id, before, after) {
+                        self.push_nav();
+                    }
+                    if todos_changed {
+                        self.push_threads();
+                    }
+                    if self.current_thread_id().as_deref() == Some(&thread_id) {
+                        self.push_context();
+                        self.push_queue();
+                        self.push_todos();
+                        self.render_chat(false);
+                        self.apply_scroll_intent(false);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("loading thread view for {thread_id}: {error}");
+                }
+            },
+            UiCommand::ThreadHistoryLoaded(thread_id, result) => {
+                let (current_offset, pending_anchor) = {
+                    let history = self.thread_history.entry(thread_id.clone()).or_default();
+                    history.loading_older = false;
+                    (history.item_offset, history.pending_anchor.take())
+                };
+                match result {
+                    Ok((_cursor, snapshot)) => {
+                        if !self.followed.contains(&thread_id) {
+                            return Ok(());
+                        }
+                        let page_end = snapshot.item_offset + snapshot.items.len() as u64;
+                        if page_end != current_offset {
+                            tracing::warn!(
+                                "discarding non-contiguous thread history page for {thread_id}: \
+                                 expected end {current_offset}, got {page_end}"
+                            );
+                            return Ok(());
+                        }
+                        let item_offset = snapshot.item_offset;
+                        let has_older = snapshot.has_older;
+                        let is_current = self.current_thread_id().as_deref() == Some(&thread_id);
+                        let old_row_count = if is_current {
+                            self.fold_chat_rows(&thread_id).0.len()
+                        } else {
+                            0
+                        };
+                        let older_items = ThreadViewModel::from(snapshot).items;
+                        if older_items.is_empty() {
+                            if let Some(history) = self.thread_history.get_mut(&thread_id) {
+                                history.has_older = false;
+                            }
+                            return Ok(());
+                        }
+                        self.vms
+                            .entry(thread_id.clone())
+                            .or_default()
+                            .items
+                            .splice(0..0, older_items);
+                        if let Some(history) = self.thread_history.get_mut(&thread_id) {
+                            history.item_offset = item_offset;
+                            history.has_older = has_older;
+                        }
+
+                        if is_current {
+                            let (rows, call_ids) = self.fold_chat_rows(&thread_id);
+                            let new_row_count = rows.len();
+                            let added = new_row_count.saturating_sub(old_row_count);
+                            if let Some(window) = self.chat_windows.get_mut(&thread_id) {
+                                window.total = new_row_count;
+                                window.shift_for_prepended_rows(added);
+                            }
+                            let restore = if let Some((anchor, offset)) = pending_anchor {
+                                let shifted = anchor.saturating_add(added);
+                                self.resume.thread_scroll.insert(
+                                    thread_id.clone(),
+                                    crate::winstate::ChatScrollBookmark {
+                                        row: shifted,
+                                        offset,
+                                    },
+                                );
+                                Some((shifted, offset))
+                            } else if let Some(bookmark) =
+                                self.resume.thread_scroll.get_mut(&thread_id)
+                            {
+                                bookmark.row = bookmark.row.saturating_add(added);
+                                Some((bookmark.row, bookmark.offset))
+                            } else {
+                                None
+                            };
+                            if restore.is_some() {
+                                crate::winstate::save_resume(&self.resume);
+                            }
+                            self.refresh_at_files();
+                            self.install_chat_rows(thread_id.clone(), rows, call_ids, false);
+                            if let Some((shifted, offset)) = restore
+                                && let Some(local_row) = self
+                                    .chat_windows
+                                    .get(&thread_id)
+                                    .and_then(|window| window.local_row(shifted))
+                            {
+                                self.restoring_thread = Some(thread_id);
+                                ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
+                            }
+                        } else if invalidate_background_thread_history(
+                            &thread_id,
+                            &mut self.chat_windows,
+                            &mut self.resume,
+                        ) {
+                            crate::winstate::save_resume(&self.resume);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("loading older thread history for {thread_id}: {error}");
+                    }
+                }
+            }
             UiCommand::SessionThreadsLoaded(session_id, result) => match result {
                 Ok(threads) => {
                     if !self.watched_sessions.contains(&session_id) {
@@ -8091,17 +8431,27 @@ fn session_title_fallback(prompt: &str) -> String {
 mod tests {
     use super::{
         ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
-        approval_pill, attention_badge, check_pill, classify_pr, download_progress,
-        format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
-        model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
-        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title_fallback,
-        should_open_chat_at_tail, thinking_property,
+        THREAD_REPLAY_IDLE_FLUSH, ThreadReplayBuffer, approval_pill, attention_badge, check_pill,
+        classify_pr, download_progress, ensure_protocol_compatible,
+        format_pr_dashboard_refresh_status, human_age, human_rate,
+        invalidate_background_thread_history, is_web_url, merge_pill, model_health_view, pr_badge,
+        project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
+        thinking_property, wait_for_thread_replay_idle,
     };
     use chrono::{Duration, TimeZone, Utc};
+    use std::collections::HashMap;
     use trouve_protocol::{
-        CheckRun, Event, EventEnvelope, GithubPrList, PrInfo, PrReview, Scope, Session,
-        SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, Event, EventEnvelope, GithubPrList, PROTOCOL_VERSION, PrInfo, PrReview, Scope,
+        Session, SubscriptionHealth, SubscriptionWindow, Workspace,
     };
+
+    #[test]
+    fn external_server_protocol_must_match_the_app() {
+        assert!(ensure_protocol_compatible(PROTOCOL_VERSION).is_ok());
+        let error = ensure_protocol_compatible("older").unwrap_err();
+        assert!(error.to_string().contains("incompatible trouve-server"));
+    }
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
@@ -8636,6 +8986,68 @@ mod tests {
     }
 
     #[test]
+    fn chat_window_preserves_anchor_when_server_page_is_prepended() {
+        let mut window = ChatWindow::default();
+        window.update(256, Some(20));
+        assert_eq!(window.range(), 0..160);
+
+        window.update(512, Some(20));
+        window.shift_for_prepended_rows(256);
+        assert_eq!(window.range(), 256..416);
+        assert_eq!(window.local_row(276), Some(20));
+        assert!(!window.following_tail);
+    }
+
+    #[test]
+    fn thread_history_loaded_invalidates_background_thread_only() {
+        let selected = ChatWindow {
+            start: 40,
+            end: 200,
+            total: 300,
+            initialized: true,
+            following_tail: false,
+        };
+        let mut windows = HashMap::from([
+            ("selected".to_string(), selected),
+            (
+                "background".to_string(),
+                ChatWindow {
+                    start: 0,
+                    end: 160,
+                    total: 256,
+                    initialized: true,
+                    following_tail: false,
+                },
+            ),
+        ]);
+        let mut resume = crate::winstate::Resume::default();
+        resume.thread_scroll.insert(
+            "selected".into(),
+            crate::winstate::ChatScrollBookmark {
+                row: 60,
+                offset: 3.0,
+            },
+        );
+        resume.thread_scroll.insert(
+            "background".into(),
+            crate::winstate::ChatScrollBookmark {
+                row: 20,
+                offset: 4.0,
+            },
+        );
+
+        assert!(invalidate_background_thread_history(
+            "background",
+            &mut windows,
+            &mut resume,
+        ));
+        assert_eq!(windows.get("selected"), Some(&selected));
+        assert!(!windows.contains_key("background"));
+        assert_eq!(resume.thread_scroll["selected"].row, 60);
+        assert!(!resume.thread_scroll.contains_key("background"));
+    }
+
+    #[test]
     fn chat_window_restores_absolute_bookmark_without_rendering_tail() {
         let mut window = ChatWindow::default();
         window.update(2_000, Some(410));
@@ -8659,6 +9071,48 @@ mod tests {
         assert!(window.initialized);
         assert_eq!(window.range(), 390..500);
         assert_eq!(window.local_row(410), Some(20));
+    }
+
+    #[tokio::test]
+    async fn thread_replay_flush_waits_for_a_complete_quiet_period() {
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(ThreadReplayBuffer {
+            generation: 1,
+            flush_scheduled: true,
+            ..ThreadReplayBuffer::default()
+        }));
+        let waiting_on = replay.clone();
+        let mut wait = tokio::spawn(async move { wait_for_thread_replay_idle(&waiting_on).await });
+        tokio::task::yield_now().await;
+
+        tokio::time::sleep(THREAD_REPLAY_IDLE_FLUSH / 2).await;
+        replay.lock().unwrap().generation += 1;
+
+        assert!(
+            tokio::time::timeout(THREAD_REPLAY_IDLE_FLUSH * 3 / 4, &mut wait)
+                .await
+                .is_err(),
+            "a new replay envelope must restart the idle wait"
+        );
+        tokio::time::timeout(THREAD_REPLAY_IDLE_FLUSH * 2, wait)
+            .await
+            .expect("replay wait should finish after a quiet period")
+            .expect("replay wait task should not panic");
+    }
+
+    #[test]
+    fn thread_replay_flush_rearms_when_data_arrives_after_idle_check() {
+        let mut replay = ThreadReplayBuffer {
+            envelopes: vec![github_snapshot(1, "github.com")],
+            generation: 2,
+            flush_scheduled: true,
+        };
+
+        assert!(replay.take_if_generation(1).is_none());
+        assert_eq!(replay.envelopes.len(), 1);
+        assert!(replay.flush_scheduled);
+
+        assert_eq!(replay.take_if_generation(2).unwrap().len(), 1);
+        assert!(!replay.flush_scheduled);
     }
 
     #[test]

@@ -146,11 +146,17 @@ Each repository has one of three persona-selection strategies:
 - **Automatic** makes semantic triage mandatory and lets it select from the
   complete persona catalog for each batch, with no preselected personas.
 
-Additive and Automatic support repository overrides. **Always run** forces a
-persona into every Additive batch. Custom reviewer profiles are reusable across
-repositories and contain a name, focused prompt, and optional model override.
-Additive can select a custom persona through semantic triage or **Always run**;
-Automatic can select it through semantic triage.
+Both Additive and Automatic honor repository-specific model, thinking, and
+prompt overrides for any persona that runs. **Always run** and the repository's
+included persona list force a persona into every Additive batch. Automatic
+ignores **Always run** and both included and excluded persona lists: the lists
+are cleared when Automatic is saved, so semantic triage remains the sole
+selector. Custom reviewer profiles are reusable across repositories and contain
+a name, focused prompt, and optional model override. Additive can select a
+custom persona through semantic triage or **Always run**; Automatic can select
+it only through semantic triage. Automatic has no fixed baseline, though the
+correctness, security, and testing personas remain available in its complete
+semantic-routing catalog.
 
 New repositories start in Additive with semantic triage enabled. During upgrade,
 a repository that still exactly matches either historical built-in default set

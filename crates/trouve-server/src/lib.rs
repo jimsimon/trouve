@@ -25,16 +25,17 @@ use trouve_protocol::{
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody,
-    FileContent, GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings,
-    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
-    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
-    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
-    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
-    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
-    ServerInfo, Session, SessionDiff, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
+    EVENT_CURSOR_HEADER, ErrorBody, FileContent, GenerateSessionTitleRequest,
+    GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus, GithubIntegration, GithubPrList,
+    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
+    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
+    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
+    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, ThreadViewQuery, ThreadViewSnapshot,
     TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
     UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
     UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
@@ -67,6 +68,10 @@ impl IntoResponse for ApiError {
             EngineError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             EngineError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             EngineError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            EngineError::SessionDiffTooLarge(_) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ERROR_CODE_SESSION_DIFF_TOO_LARGE,
+            ),
             EngineError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         let body = ErrorBody {
@@ -101,6 +106,7 @@ impl IntoResponse for ApiError {
         create_thread,
         list_threads,
         get_thread,
+        get_thread_view,
         update_thread,
         send_message,
         get_attachment,
@@ -204,6 +210,11 @@ impl IntoResponse for ApiError {
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
+        ThreadViewQuery,
+        ThreadViewSnapshot,
+        trouve_protocol::ThreadViewItem,
+        trouve_protocol::ThreadToolStatus,
+        trouve_protocol::ThreadTurnState,
         UpdateThreadRequest,
         SendMessageRequest,
         TurnAccepted,
@@ -624,6 +635,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/view", get(get_thread_view))
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
@@ -1110,6 +1122,40 @@ async fn get_thread(
     Path(id): Path<String>,
 ) -> Result<Json<Thread>, ApiError> {
     Ok(Json(engine.get_thread(&id)?))
+}
+
+#[utoipa::path(get, path = "/v1/threads/{id}/view",
+    params(
+        ("id" = String, Path,),
+        ("before" = Option<u64>, Query, description = "Exclusive folded-item offset for backward pagination"),
+        ("limit" = Option<u32>, Query, description = "Requested item count; capped by the server")
+    ),
+    responses(
+        (status = 200, body = ThreadViewSnapshot,
+            headers(("x-trouve-event-cursor" = u64, description = "Thread event cursor for this snapshot"))),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_thread_view(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(query): Query<ThreadViewQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    const MAX_ITEMS: usize = 512;
+    // Omitting `limit` preserves the complete-snapshot behavior for 2.3
+    // clients. Pagination-aware clients always send an explicit bound.
+    let limit = query
+        .limit
+        .map(|limit| (limit as usize).clamp(1, MAX_ITEMS))
+        .unwrap_or(usize::MAX);
+    let (cursor, snapshot) =
+        tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id, query.before, limit))
+            .await
+            .map_err(|error| {
+                ApiError(EngineError::Internal(anyhow::anyhow!(
+                    "thread view worker failed: {error}"
+                )))
+            })??;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
 }
 
 #[utoipa::path(patch, path = "/v1/threads/{id}", params(("id" = String, Path,)),

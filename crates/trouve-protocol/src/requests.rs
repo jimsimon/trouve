@@ -306,6 +306,123 @@ pub struct Thread {
     pub todos: Vec<TodoItem>,
 }
 
+/// One folded, renderable row in a thread snapshot. Raw streaming fragments
+/// remain in the event log; snapshots expose their current semantic form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThreadViewItem {
+    User {
+        turn: u64,
+        content: String,
+        attachments: Vec<Attachment>,
+    },
+    Assistant {
+        turn: u64,
+        content: String,
+        complete: bool,
+    },
+    Thinking {
+        turn: u64,
+        content: String,
+        complete: bool,
+    },
+    ToolCall {
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+        status: ThreadToolStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+    },
+    TurnStatus {
+        turn: u64,
+        state: ThreadTurnState,
+    },
+    Questions {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        questions: Vec<crate::Question>,
+        /// True after `question.resolved`; `answers` remains absent when the
+        /// user skipped.
+        #[serde(default)]
+        resolved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<crate::QuestionAnswer>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadToolStatus {
+    AwaitingApproval,
+    Running,
+    Ok,
+    Error,
+    Denied,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadTurnState {
+    Running,
+    Completed { usage: crate::Usage },
+    Failed { error: String },
+}
+
+/// Folded current thread state and one transcript item page at the cursor
+/// returned in `x-trouve-event-cursor`. Clients seed their view from this
+/// response and subscribe to the thread event stream after that cursor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ThreadViewSnapshot {
+    /// Zero-based index of `items[0]` in the complete folded transcript.
+    #[serde(default)]
+    pub item_offset: u64,
+    /// Number of folded items in the complete transcript at this snapshot.
+    #[serde(default)]
+    pub total_items: u64,
+    /// Whether another page exists before `item_offset`.
+    #[serde(default)]
+    pub has_older: bool,
+    pub items: Vec<ThreadViewItem>,
+    #[serde(default)]
+    pub pending_approvals: Vec<String>,
+    #[serde(default)]
+    pub pending_questions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<crate::Usage>,
+    #[serde(default)]
+    pub compacting: bool,
+    #[serde(default)]
+    pub turn_running: bool,
+    #[serde(default)]
+    pub thinking: bool,
+    #[serde(default)]
+    pub turn_models: std::collections::BTreeMap<u64, String>,
+    #[serde(default)]
+    pub turn_started_at: std::collections::BTreeMap<u64, chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub turn_duration_ms: std::collections::BTreeMap<u64, u64>,
+    #[serde(default)]
+    pub commands: Vec<crate::CommandInfo>,
+    #[serde(default)]
+    pub queue: Vec<crate::QueuedPrompt>,
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ThreadViewQuery {
+    /// Exclusive folded-item offset for backward pagination. Omit for the
+    /// newest page.
+    #[serde(default)]
+    pub before: Option<u64>,
+    /// Requested item count; the server applies a safe upper bound.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// Partial thread update between turns (mode/model switching). Rejected with
 /// a conflict while a turn is running. Omitted fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -928,7 +1045,7 @@ pub struct UpdateCodeReviewRepositoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<CodeReviewRoutingMode>,
     /// Omitted by older clients to preserve the current/default semantic
-    /// routing choice. Ignored as `false` when `routing_mode` is Automatic.
+    /// routing choice. Forced to `true` when `routing_mode` is Automatic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_routing: Option<bool>,
     /// Omitted by older clients to preserve existing forced inclusions.
@@ -2002,6 +2119,21 @@ mod tests {
             request.title_model_resource_policy,
             TitleModelResourcePolicy::CpuRamOnly
         );
+    }
+
+    #[test]
+    fn thread_view_preserves_skipped_question_resolution() {
+        let item = ThreadViewItem::Questions {
+            request_id: "q1".into(),
+            title: None,
+            questions: Vec::new(),
+            resolved: true,
+            answers: None,
+        };
+
+        let round_trip: ThreadViewItem =
+            serde_json::from_value(serde_json::to_value(&item).unwrap()).unwrap();
+        assert_eq!(round_trip, item);
     }
 
     #[test]

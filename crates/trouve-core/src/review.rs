@@ -3817,20 +3817,21 @@ impl Engine {
             REVIEW_TASK_CONCURRENCY_ENV,
             DEFAULT_REVIEW_TASK_CONCURRENCY,
         );
+        let candidates = semantic_routing_candidates(job, reviewers)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
         let work = batches
             .iter()
             .enumerate()
-            .filter_map(|(batch_index, batch)| {
-                let candidates = semantic_routing_candidates(job, reviewers)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if candidates.is_empty() {
-                    return None;
-                }
+            .map(|(batch_index, batch)| {
+                let candidates = candidates.clone();
                 let prompt =
                     semantic_routing_prompt(job, batch, batch_index, batch_count, &candidates);
-                Some((batch_index, candidates, prompt))
+                (batch_index, candidates, prompt)
             })
             .collect::<Vec<_>>();
         let engine = Arc::clone(self);
@@ -3928,13 +3929,8 @@ impl Engine {
                                 job.id,
                                 batch_index + 1
                             ));
-                            if automatic {
-                                Err(error).context(
-                                    "Automatic persona selection requires successful semantic routing",
-                                )
-                            } else {
-                                Ok((batch_index, HashMap::new()))
-                            }
+                            semantic_routing_failure_selection(job.routing_mode, error)
+                                .map(|selected| (batch_index, selected))
                         }
                     }
                 }
@@ -5189,6 +5185,17 @@ fn non_semantic_routing_reasons(
 fn semantic_routing_enabled(job: &trouve_protocol::CodeReviewJob) -> bool {
     job.routing_mode == CodeReviewRoutingMode::Automatic
         || (job.routing_mode == CodeReviewRoutingMode::Additive && job.semantic_routing)
+}
+
+fn semantic_routing_failure_selection(
+    routing_mode: CodeReviewRoutingMode,
+    error: anyhow::Error,
+) -> Result<HashMap<String, String>> {
+    if routing_mode == CodeReviewRoutingMode::Automatic {
+        Err(error).context("Automatic persona selection requires successful semantic routing")
+    } else {
+        Ok(HashMap::new())
+    }
 }
 
 fn build_routing_decisions(
@@ -7889,6 +7896,62 @@ mod tests {
         assert!(semantic_routing_enabled(&job));
         job.routing_mode = CodeReviewRoutingMode::Manual;
         assert!(!semantic_routing_enabled(&job));
+    }
+
+    #[test]
+    fn automatic_semantic_routing_failure_is_fatal() {
+        let error = semantic_routing_failure_selection(
+            CodeReviewRoutingMode::Automatic,
+            anyhow!("router unavailable"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Automatic persona selection requires successful semantic routing")
+        );
+        assert!(format!("{error:#}").contains("router unavailable"));
+    }
+
+    #[test]
+    fn additive_semantic_routing_failure_retains_non_semantic_selections() {
+        let semantic = semantic_routing_failure_selection(
+            CodeReviewRoutingMode::Additive,
+            anyhow!("router unavailable"),
+        )
+        .unwrap();
+        assert!(semantic.is_empty());
+
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| ["correctness", "reliability"].contains(&reviewer.id.as_str()))
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+fn changed() {}\n".into(),
+        }];
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:additive-router-failure");
+        job.routing_mode = CodeReviewRoutingMode::Additive;
+        job.included_reviewer_ids = vec!["reliability".into()];
+
+        let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
+        assert!(decisions.iter().all(|decision| decision.selected));
+        assert!(decisions.iter().any(|decision| {
+            decision.reviewer_id == "correctness"
+                && decision
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.source == CodeReviewRoutingSource::Baseline)
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.reviewer_id == "reliability"
+                && decision
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.source == CodeReviewRoutingSource::Included)
+        }));
     }
 
     #[test]

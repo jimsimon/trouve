@@ -47,6 +47,11 @@ session stream.
   live. Replay and live delivery are indistinguishable to the client.
 - The server never skips cursors within a scope; a gap means data loss and
   is a bug.
+- A client may seed itself from a server-derived snapshot carrying
+  `x-trouve-event-cursor`, then subscribe after that cursor. Large folded
+  transcripts are transferred as bounded newest-first pages. Snapshots are
+  rebuildable projections of this log; they do not replace it as the durable
+  source of truth.
 
 ## Event envelope
 

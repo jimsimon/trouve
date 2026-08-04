@@ -3,7 +3,8 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
-use std::io::Read;
+use std::fmt;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -15,6 +16,45 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
 const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
+// The desktop diff view eagerly parses and materializes every returned row.
+// Bound all three independent growth dimensions before crossing the protocol.
+const MAX_SESSION_DIFF_FILES: usize = 250;
+const MAX_SESSION_DIFF_CHANGED_LINES: u64 = 20_000;
+const MAX_SESSION_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct SessionDiffTooLarge(String);
+
+impl fmt::Display for SessionDiffTooLarge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionDiffTooLarge {}
+
+fn session_diff_too_large(message: String) -> anyhow::Error {
+    SessionDiffTooLarge(message).into()
+}
+
+struct TemporaryCheckpointIndex {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl TemporaryCheckpointIndex {
+    fn new() -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("trouve-checkpoint-index-")
+            .tempdir()
+            .context("creating temporary checkpoint index directory")?;
+        let path = directory.path().join("index");
+        Ok(Self {
+            path,
+            _directory: directory,
+        })
+    }
+}
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -42,6 +82,130 @@ fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn spawn_git_with_piped_output(dir: &Path, args: &[&str]) -> Result<Child> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))
+}
+
+fn finish_streamed_git(
+    dir: &Path,
+    args: &[&str],
+    mut child: Child,
+    stderr_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<()> {
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for git {args:?} in {}", dir.display()))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stderr reader panicked"))??;
+    if !status.success() {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_diff_numstat(dir: &Path, base_ref: &str) -> Result<()> {
+    let args = ["diff", "--numstat", "--end-of-options", base_ref];
+    let mut child = spawn_git_with_piped_output(dir, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut reader = BufReader::new(stdout).take(MAX_SESSION_DIFF_BYTES as u64 + 1);
+    let mut line = Vec::new();
+    let mut bytes = 0usize;
+    let mut files = 0usize;
+    let mut changed_lines = 0u64;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("reading git diff --numstat")?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read);
+        let text = String::from_utf8_lossy(&line);
+        let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
+        let added = fields.next().unwrap_or_default();
+        let deleted = fields.next().unwrap_or_default();
+        if fields.next().is_some() {
+            files = files.saturating_add(1);
+            // Binary diffs use "-" counts and normally render as one short
+            // marker, so only textual line counts contribute to the budget.
+            if let (Ok(added), Ok(deleted)) = (added.parse::<u64>(), deleted.parse::<u64>()) {
+                changed_lines = changed_lines.saturating_add(added.saturating_add(deleted));
+            }
+        }
+        if bytes > MAX_SESSION_DIFF_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(session_diff_too_large(format!(
+                "session diff metadata is too large to render (more than \
+                 {MAX_SESSION_DIFF_BYTES} bytes)"
+            )));
+        }
+        if files > MAX_SESSION_DIFF_FILES || changed_lines > MAX_SESSION_DIFF_CHANGED_LINES {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(session_diff_too_large(format!(
+                "session diff is too large to render ({files} files, \
+                 {changed_lines} changed lines; limit is {MAX_SESSION_DIFF_FILES} files or \
+                 {MAX_SESSION_DIFF_CHANGED_LINES} changed lines)"
+            )));
+        }
+    }
+    finish_streamed_git(dir, &args, child, stderr_reader)
+}
+
+fn bounded_session_diff(dir: &Path, base_ref: &str) -> Result<String> {
+    let args = ["diff", "--end-of-options", base_ref];
+    let mut child = spawn_git_with_piped_output(dir, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut bytes = Vec::with_capacity(MAX_SESSION_DIFF_BYTES.min(64 * 1024));
+    stdout
+        .take(MAX_SESSION_DIFF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("reading bounded git diff")?;
+    if bytes.len() > MAX_SESSION_DIFF_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(session_diff_too_large(format!(
+            "session diff is too large to render (more than {MAX_SESSION_DIFF_BYTES} bytes)"
+        )));
+    }
+    finish_streamed_git(dir, &args, child, stderr_reader)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+fn git_with_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
+    git_result(dir, args, out.status, out.stdout, out.stderr)
 }
 
 fn git_as_checkpoint_identity(dir: &Path, args: &[&str]) -> Result<String> {
@@ -316,9 +480,15 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
 /// Snapshot the worktree as a commit on a hidden ref, without touching the
 /// session branch. Returns the commit hash.
 pub fn checkpoint(worktree: &Path, session_id: &str, seq: i64, message: &str) -> Result<String> {
-    git(worktree, &["add", "-A"])?;
-    let tree = git(worktree, &["write-tree"])?;
     let head = git(worktree, &["rev-parse", "HEAD"])?;
+    // Build the snapshot in a disposable index. Besides preserving any
+    // staging choices made by the user, starting from HEAD prevents a file
+    // accidentally staged by an earlier checkpoint from remaining tracked
+    // after it becomes ignored.
+    let index = TemporaryCheckpointIndex::new()?;
+    git_with_index(worktree, &index.path, &["read-tree", &head])?;
+    git_with_index(worktree, &index.path, &["add", "-A"])?;
+    let tree = git_with_index(worktree, &index.path, &["write-tree"])?;
     let commit = git_as_checkpoint_identity(
         worktree,
         &["commit-tree", &tree, "-p", &head, "-m", message],
@@ -355,7 +525,8 @@ pub fn restore(worktree: &Path, commit: &str) -> Result<()> {
 /// state (includes uncommitted changes — checkpoints live on hidden refs).
 pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
     ensure_safe_ref(base_ref)?;
-    git(worktree, &["diff", "--end-of-options", base_ref])
+    validate_session_diff_numstat(worktree, base_ref)?;
+    bounded_session_diff(worktree, base_ref)
 }
 
 /// Every changed path in git's deterministic diff order. NUL framing keeps
@@ -568,6 +739,9 @@ mod tests {
         std::fs::write(tmp.path().join("space name.txt"), "added\n").unwrap();
         run(tmp.path(), &["add", "-A"]);
 
+        let full = session_diff(tmp.path(), &base).unwrap();
+        assert!(full.contains("+two"));
+        assert!(full.contains("+added"));
         let files = session_diff_files(tmp.path(), &base).unwrap();
         assert_eq!(files, ["a.txt", "space name.txt"]);
         let first = session_diff_path(tmp.path(), &base, &files[0]).unwrap();
@@ -575,6 +749,51 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn session_diff_rejects_changes_too_large_for_the_ui() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let content = "changed\n".repeat(MAX_SESSION_DIFF_CHANGED_LINES as usize + 1);
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn session_diff_rejects_too_many_changed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        for index in 0..=MAX_SESSION_DIFF_FILES {
+            std::fs::write(tmp.path().join(format!("file-{index}.txt")), "before\n").unwrap();
+        }
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "add files"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        for index in 0..=MAX_SESSION_DIFF_FILES {
+            std::fs::write(tmp.path().join(format!("file-{index}.txt")), "after\n").unwrap();
+        }
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn session_diff_rejects_too_many_rendered_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let content = format!("{}\n", "x".repeat(MAX_SESSION_DIFF_BYTES + 1));
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+
+        let error = session_diff(tmp.path(), &base).unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("too large to render"));
     }
 
     #[test]
@@ -616,6 +835,44 @@ mod tests {
 
         remove_worktree(&repo, &wt).unwrap();
         assert!(!wt.exists());
+    }
+
+    #[test]
+    fn checkpoint_preserves_index_and_excludes_ignored_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("nested/target")).unwrap();
+        std::fs::write(tmp.path().join("nested/target/artifact.o"), "build output").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "staged\n").unwrap();
+        run(tmp.path(), &["add", "nested/target/artifact.o", "a.txt"]);
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        run(tmp.path(), &["add", ".gitignore"]);
+        let staged_before = run(tmp.path(), &["diff", "--cached"]);
+
+        std::fs::write(tmp.path().join("a.txt"), "worktree\n").unwrap();
+        std::fs::write(tmp.path().join("new.txt"), "included\n").unwrap();
+
+        let commit = checkpoint(tmp.path(), "se_t", 0, "checkpoint").unwrap();
+
+        assert_eq!(run(tmp.path(), &["diff", "--cached"]), staged_before);
+        assert!(
+            run(tmp.path(), &["ls-files", "--stage"])
+                .lines()
+                .any(|line| line.ends_with("\tnested/target/artifact.o"))
+        );
+        assert_eq!(
+            run(tmp.path(), &["show", &format!("{commit}:a.txt")]),
+            "worktree"
+        );
+        assert_eq!(
+            run(tmp.path(), &["show", &format!("{commit}:new.txt")]),
+            "included"
+        );
+        assert!(
+            run(tmp.path(), &["ls-tree", "-r", "--name-only", &commit])
+                .lines()
+                .all(|path| path != "nested/target/artifact.o")
+        );
     }
 
     #[test]

@@ -9297,6 +9297,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "trouve-protocol",
+ "trouve-thread-view",
 ]
 
 [[package]]
@@ -9336,6 +9337,7 @@ dependencies = [
  "trouve-protocol",
  "trouve-providers",
  "trouve-search",
+ "trouve-thread-view",
  "uuid",
 ]
 
@@ -9514,6 +9516,15 @@ dependencies = [
  "slint",
  "slint-build",
  "vt100",
+]
+
+[[package]]
+name = "trouve-thread-view"
+version = "3.7.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "trouve-protocol",
 ]
 
 [[package]]
