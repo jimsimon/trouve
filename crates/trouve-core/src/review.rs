@@ -1219,16 +1219,12 @@ impl Engine {
         Ok(())
     }
 
-    fn flush_pending_code_review_events(&self, job_id: &str) -> Result<(), EngineError> {
-        for pending in self.store.pending_code_review_events(job_id)? {
-            self.store
-                .append_event(Scope::CodeReviewJob(job_id.to_owned()), pending.event)?;
-            self.store.complete_code_review_pending_event(pending.id)?;
-        }
+    async fn flush_pending_code_review_events(&self, job_id: &str) -> Result<(), EngineError> {
+        self.store.flush_pending_code_review_events(job_id).await?;
         Ok(())
     }
 
-    fn retry_code_review_event_outbox(&self) {
+    async fn retry_code_review_event_outbox(&self) {
         let job_ids = match self.store.code_review_jobs_with_pending_events(100) {
             Ok(job_ids) => job_ids,
             Err(error) => {
@@ -1239,7 +1235,7 @@ impl Engine {
             }
         };
         for job_id in job_ids {
-            if let Err(error) = self.flush_pending_code_review_events(&job_id) {
+            if let Err(error) = self.flush_pending_code_review_events(&job_id).await {
                 tracing::warn!(
                     job_id = %job_id,
                     %error,
@@ -2955,7 +2951,7 @@ impl Engine {
             let mut running_jobs = tokio::task::JoinSet::new();
             loop {
                 worker_engine.retry_code_review_cleanup().await;
-                worker_engine.retry_code_review_event_outbox();
+                worker_engine.retry_code_review_event_outbox().await;
                 let job_concurrency = worker_engine.effective_code_review_job_concurrency();
                 let mut claim_failed = false;
                 while running_jobs.len() < job_concurrency {
@@ -3050,6 +3046,7 @@ impl Engine {
                         .data_dir
                         .join("review-repositories")
                         .join(&record.job.repository),
+                    job_id: job_id.clone(),
                     pull_number: record.job.pull_number,
                 })
                 .await
@@ -3193,6 +3190,7 @@ impl Engine {
             .sync_review_repository(&ReviewRepositorySync {
                 root: self.data_dir.join("review-repositories"),
                 repository: job.repository.clone(),
+                job_id: job.id.clone(),
                 pull_number: job.pull_number,
                 base_sha: job.base_ref.clone(),
                 head_sha: job.head_sha.clone(),
@@ -3368,23 +3366,6 @@ impl Engine {
         } else {
             (diff_files, 0)
         };
-        if incremental_candidate
-            && let Err(error) = self
-                .executor
-                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
-                    worktree: repository_path.clone(),
-                    pull_number: job.pull_number,
-                })
-                .await
-        {
-            tracing::warn!(
-                job_id = %job.id,
-                repository = %job.repository,
-                pull_number = job.pull_number,
-                %error,
-                "could not delete temporary review-history refs"
-            );
-        }
         let batches = build_effective_review_batches(&diff_files, reused_hunk_count);
         let batch_digest = review_batch_digest(
             &job.review_base_sha,
@@ -3395,7 +3376,7 @@ impl Engine {
         let snapshot = self
             .store
             .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
-        self.flush_pending_code_review_events(&job.id)?;
+        self.flush_pending_code_review_events(&job.id).await?;
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
@@ -3578,7 +3559,7 @@ impl Engine {
                 &prompt_replaced_task_ids,
                 catalog_reviewer_count as u64,
             )?;
-            self.flush_pending_code_review_events(&job.id)?;
+            self.flush_pending_code_review_events(&job.id).await?;
             completed
         };
         self.store.set_code_review_job_progress(
