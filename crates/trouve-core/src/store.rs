@@ -9,9 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, ThreadViewSnapshot,
@@ -20,6 +21,8 @@ use trouve_protocol::{
 use trouve_thread_view::ThreadProjection;
 
 const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -229,7 +232,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   routing_mode TEXT NOT NULL DEFAULT 'additive',
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
-  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'
+  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
+  publication_accepted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -243,6 +247,7 @@ CREATE TABLE IF NOT EXISTS code_review_tasks (
   batch_index INTEGER NOT NULL DEFAULT 0,
   batch_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'queued',
+  lifecycle_stage TEXT NOT NULL DEFAULT 'queued',
   model TEXT,
   session_id TEXT,
   thread_id TEXT,
@@ -261,6 +266,8 @@ CREATE TABLE IF NOT EXISTS code_review_tasks (
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   started_at TEXT,
+  model_started_at TEXT,
+  last_progress_at TEXT,
   completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS code_review_tasks_job
@@ -288,6 +295,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   status TEXT NOT NULL DEFAULT 'open',
   github_comment_id INTEGER,
   github_comment_url TEXT NOT NULL DEFAULT '',
+  github_publication_status TEXT NOT NULL DEFAULT 'pending',
   github_thread_id TEXT,
   resolved_at TEXT,
   created_at TEXT NOT NULL
@@ -395,6 +403,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -420,12 +429,16 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_tasks ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_tasks ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN lifecycle_stage TEXT NOT NULL DEFAULT 'queued'",
+    "ALTER TABLE code_review_tasks ADD COLUMN model_started_at TEXT",
+    "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
+    "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
 ];
 
-fn apply_migrations(conn: &Connection) -> Result<()> {
+fn apply_migrations(conn: &mut Connection) -> Result<()> {
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -434,8 +447,87 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             }
         }
     }
+    backfill_terminal_code_review_task_lifecycle(conn)?;
+    migrate_code_review_finding_publication_status(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    Ok(())
+}
+
+/// Lifecycle columns were added after code-review tasks were already durable.
+/// Repair terminal rows created by older builds without disturbing failed or
+/// cancelled tasks, whose last active stage remains useful diagnostic state.
+fn backfill_terminal_code_review_task_lifecycle(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-terminal-task-lifecycle-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE code_review_tasks
+         SET lifecycle_stage = 'completed',
+             last_progress_at = COALESCE(last_progress_at, completed_at, started_at, created_at)
+         WHERE status IN ('succeeded', 'not_applicable')
+           AND (lifecycle_stage != 'completed' OR last_progress_at IS NULL)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn migrate_code_review_finding_publication_status(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-finding-publication-status-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        "UPDATE code_review_findings
+         SET github_publication_status = 'published'
+         WHERE github_comment_url != '' AND github_publication_status = 'pending';
+         UPDATE code_review_findings
+         SET github_publication_status = 'not_eligible'
+         WHERE github_publication_status = 'pending'
+           AND (trim(path) = '' OR line <= 0);",
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -627,6 +719,22 @@ fn elapsed_ms(
         .max(0) as u64
 }
 
+fn finalize_code_review_model_elapsed(
+    recorded_model_elapsed_ms: i64,
+    model_started_at: Option<String>,
+    last_progress_at: Option<String>,
+    finished: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    let recorded = recorded_model_elapsed_ms.max(0) as u64;
+    let Some(started) = parse_optional_datetime(model_started_at) else {
+        return recorded;
+    };
+    let progress_anchor = parse_optional_datetime(last_progress_at)
+        .filter(|progress| *progress >= started)
+        .unwrap_or(started);
+    recorded.saturating_add(elapsed_ms(progress_anchor, finished))
+}
+
 fn job_elapsed_ms(
     status: &str,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -717,6 +825,7 @@ pub struct CodeReviewJobRecord {
     pub summary: String,
     pub prompt_for_agents: String,
     pub publication_claimed: bool,
+    pub publication_accepted: bool,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
@@ -809,6 +918,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
+        publication_accepted: r.get(50)?,
     })
 }
 
@@ -820,7 +930,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level";
+     coordinator_thinking_level, publication_accepted";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -841,6 +951,13 @@ pub struct CodeReviewTaskMetrics {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub tool_call_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeReviewModelTiming {
+    Preserve,
+    Reset,
+    Started,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -867,12 +984,44 @@ fn code_review_task_role_from(value: &str) -> trouve_protocol::CodeReviewTaskRol
     }
 }
 
+fn code_review_task_lifecycle_stage_str(
+    stage: trouve_protocol::CodeReviewTaskLifecycleStage,
+) -> &'static str {
+    use trouve_protocol::CodeReviewTaskLifecycleStage;
+    match stage {
+        CodeReviewTaskLifecycleStage::Queued => "queued",
+        CodeReviewTaskLifecycleStage::WaitingForCapacity => "waiting_for_capacity",
+        CodeReviewTaskLifecycleStage::StartingModel => "starting_model",
+        CodeReviewTaskLifecycleStage::RunningModel => "running_model",
+        CodeReviewTaskLifecycleStage::RunningTool => "running_tool",
+        CodeReviewTaskLifecycleStage::RepairingOutput => "repairing_output",
+        CodeReviewTaskLifecycleStage::Completed => "completed",
+    }
+}
+
+fn code_review_task_lifecycle_stage_from(
+    value: &str,
+) -> trouve_protocol::CodeReviewTaskLifecycleStage {
+    use trouve_protocol::CodeReviewTaskLifecycleStage;
+    match value {
+        "waiting_for_capacity" => CodeReviewTaskLifecycleStage::WaitingForCapacity,
+        "starting_model" => CodeReviewTaskLifecycleStage::StartingModel,
+        "running_model" => CodeReviewTaskLifecycleStage::RunningModel,
+        "running_tool" => CodeReviewTaskLifecycleStage::RunningTool,
+        "repairing_output" => CodeReviewTaskLifecycleStage::RepairingOutput,
+        "completed" => CodeReviewTaskLifecycleStage::Completed,
+        _ => CodeReviewTaskLifecycleStage::Queued,
+    }
+}
+
 fn row_to_code_review_task(
     r: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<trouve_protocol::CodeReviewTask> {
-    let created_at = parse_datetime(r.get(24)?);
-    let started_at = parse_optional_datetime(r.get(25)?);
-    let completed_at = parse_optional_datetime(r.get(26)?);
+    let created_at = parse_datetime(r.get(25)?);
+    let started_at = parse_optional_datetime(r.get(26)?);
+    let model_started_at = parse_optional_datetime(r.get(27)?);
+    let last_progress_at = parse_optional_datetime(r.get(28)?);
+    let completed_at = parse_optional_datetime(r.get(29)?);
     let elapsed = started_at
         .map(|started| elapsed_ms(started, completed_at.unwrap_or_else(chrono::Utc::now)))
         .unwrap_or(0);
@@ -885,34 +1034,68 @@ fn row_to_code_review_task(
         batch_index: r.get::<_, i64>(5)? as u64,
         batch_count: r.get::<_, i64>(6)? as u64,
         status: r.get(7)?,
-        model: r.get(8)?,
-        session_id: r.get(9)?,
-        thread_id: r.get(10)?,
-        prompt: r.get(11)?,
-        output: r.get(12)?,
-        thinking: r.get(13)?,
-        tool_output: r.get(14)?,
-        candidate_issue_count: r.get::<_, i64>(15)? as u64,
-        confirmed_issue_count: r.get::<_, i64>(16)? as u64,
-        provider_wait_ms: r.get::<_, i64>(17)? as u64,
-        model_elapsed_ms: r.get::<_, i64>(18)? as u64,
-        input_tokens: r.get::<_, i64>(19)? as u64,
-        cached_input_tokens: r.get::<_, i64>(20)? as u64,
-        output_tokens: r.get::<_, i64>(21)? as u64,
-        tool_call_count: r.get::<_, i64>(22)? as u64,
-        error: r.get(23)?,
+        lifecycle_stage: code_review_task_lifecycle_stage_from(&r.get::<_, String>(8)?),
+        model: r.get(9)?,
+        session_id: r.get(10)?,
+        thread_id: r.get(11)?,
+        prompt: r.get(12)?,
+        output: r.get(13)?,
+        thinking: r.get(14)?,
+        tool_output: r.get(15)?,
+        candidate_issue_count: r.get::<_, i64>(16)? as u64,
+        confirmed_issue_count: r.get::<_, i64>(17)? as u64,
+        provider_wait_ms: r.get::<_, i64>(18)? as u64,
+        model_elapsed_ms: r.get::<_, i64>(19)? as u64,
+        input_tokens: r.get::<_, i64>(20)? as u64,
+        cached_input_tokens: r.get::<_, i64>(21)? as u64,
+        output_tokens: r.get::<_, i64>(22)? as u64,
+        tool_call_count: r.get::<_, i64>(23)? as u64,
+        error: r.get(24)?,
         created_at,
         started_at,
+        model_started_at,
+        last_progress_at,
         completed_at,
         elapsed_ms: elapsed,
     })
 }
 
 const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_name, batch_index, \
-     batch_count, status, model, session_id, thread_id, prompt, output, thinking, tool_output, \
+     batch_count, status, lifecycle_stage, model, session_id, thread_id, prompt, output, thinking, tool_output, \
      candidate_issue_count, confirmed_issue_count, provider_wait_ms, model_elapsed_ms, input_tokens, \
-     cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
+     cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, model_started_at, \
+     last_progress_at, completed_at";
+const CODE_REVIEW_TASK_PROGRESS_COLUMNS: &str = "job_id, id, lifecycle_stage, provider_wait_ms, \
+     model_elapsed_ms, input_tokens, cached_input_tokens, output_tokens, tool_call_count, \
+     model_started_at, last_progress_at";
 const CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN: &str = "task_insertion_order";
+
+#[derive(Debug, Clone)]
+pub struct CodeReviewTaskProgressRecord {
+    pub job_id: String,
+    pub task_id: String,
+    pub progress: trouve_protocol::CodeReviewTaskProgress,
+}
+
+fn row_to_code_review_task_progress(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CodeReviewTaskProgressRecord> {
+    Ok(CodeReviewTaskProgressRecord {
+        job_id: r.get(0)?,
+        task_id: r.get(1)?,
+        progress: trouve_protocol::CodeReviewTaskProgress {
+            lifecycle_stage: code_review_task_lifecycle_stage_from(&r.get::<_, String>(2)?),
+            provider_wait_ms: r.get::<_, i64>(3)? as u64,
+            model_elapsed_ms: r.get::<_, i64>(4)? as u64,
+            input_tokens: r.get::<_, i64>(5)? as u64,
+            cached_input_tokens: r.get::<_, i64>(6)? as u64,
+            output_tokens: r.get::<_, i64>(7)? as u64,
+            tool_call_count: r.get::<_, i64>(8)? as u64,
+            model_started_at: parse_optional_datetime(r.get(9)?),
+            last_progress_at: parse_datetime(r.get(10)?),
+        },
+    })
+}
 
 /// Same wire shape as a full task, but without the potentially large retained
 /// prompt/transcript fields. Deriving this projection from the full column list
@@ -1550,12 +1733,13 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        apply_migrations(&conn)?;
+        apply_migrations(&mut conn)?;
         // Claims belong to dispatcher tasks in this process. After a crash
         // there is no worker to own them, so make the prompts visible and
         // explicitly dispatchable again instead of losing them.
@@ -1567,11 +1751,12 @@ impl Store {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         // Match on-disk behavior so tests exercise the same constraints.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        apply_migrations(&conn)?;
+        apply_migrations(&mut conn)?;
         conn.execute(
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
@@ -3176,7 +3361,8 @@ impl Store {
                 "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
                  WHERE status IN ('queued', 'running') AND role = 'reviewer'
                    AND job_id IN (
-                     SELECT id FROM code_review_jobs WHERE status = 'running'
+                     SELECT id FROM code_review_jobs
+                     WHERE status = 'running' AND publication_claimed = 0
                    )
                  ORDER BY created_at, rowid"
             ))?;
@@ -3186,7 +3372,8 @@ impl Store {
         tx.execute(
             "UPDATE code_review_tasks
              SET status = 'failed', completed_at = ?1,
-                 error = 'server restarted while task was running'
+                 error = 'server restarted while task was running',
+                 model_started_at = NULL
              WHERE status IN ('queued', 'running')
                AND job_id IN (SELECT id FROM code_review_jobs WHERE status = 'running')",
             params![now],
@@ -3216,10 +3403,36 @@ impl Store {
         }
         tx.execute(
             "UPDATE code_review_jobs
+             SET status = CASE
+                     WHEN publication_accepted != 0 THEN 'succeeded'
+                     ELSE 'failed'
+                 END,
+                 completed_at = ?1,
+                 error = CASE
+                     WHEN publication_accepted != 0 THEN ''
+                     ELSE 'server restarted before review publication was accepted; retry required'
+                 END,
+                 publication_claimed = CASE
+                     WHEN publication_accepted != 0 THEN publication_claimed
+                     ELSE 0
+                 END,
+                 check_sync_error = CASE
+                     WHEN publication_accepted != 0
+                         THEN 'review publication requires reconciliation'
+                     ELSE ''
+                 END,
+                 projection_retry_count = 0,
+                 projection_retry_at = NULL,
+                 projection_retryable = 1
+             WHERE status = 'running' AND publication_claimed != 0",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, cancel_requested = 0,
                  publication_claimed = 0,
                  error = 'server restarted while review was running'
-             WHERE status = 'running'",
+             WHERE status = 'running' AND publication_claimed = 0",
             [],
         )?;
         tx.commit()?;
@@ -3244,7 +3457,8 @@ impl Store {
         tx.execute(
             "UPDATE code_review_jobs
              SET status = 'running', started_at = ?2, completed_at = NULL,
-                 cancel_requested = 0, publication_claimed = 0, error = ''
+                 cancel_requested = 0, publication_claimed = 0,
+                 publication_accepted = 0, error = ''
              WHERE id = ?1 AND status = 'queued'",
             params![id, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -3380,8 +3594,8 @@ impl Store {
         let inserted = conn.execute(
             "INSERT INTO code_review_tasks
                     (id, job_id, role, reviewer_id, reviewer_name, batch_index,
-                     batch_count, status, model, prompt, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10
+                     batch_count, status, model, prompt, created_at, last_progress_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10, ?10
              WHERE EXISTS (
                SELECT 1 FROM code_review_jobs WHERE id = ?2 AND status = 'running'
              )",
@@ -3420,18 +3634,14 @@ impl Store {
         model: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET status = 'running', session_id = ?2, thread_id = ?3,
-                 model = ?4, started_at = ?5, error = ''
+                 model = ?4, started_at = ?5, error = '',
+                 lifecycle_stage = 'waiting_for_capacity', last_progress_at = ?5
              WHERE id = ?1 AND status = 'queued'",
-            params![
-                id,
-                session_id,
-                thread_id,
-                model,
-                chrono::Utc::now().to_rfc3339()
-            ],
+            params![id, session_id, thread_id, model, now],
         )?;
         if updated == 0 {
             return Ok(None);
@@ -3449,11 +3659,13 @@ impl Store {
         reason: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
         let updated = conn.execute(
             "UPDATE code_review_tasks
-             SET status = 'not_applicable', completed_at = ?2, error = ?3
+             SET status = 'not_applicable', completed_at = ?2, error = ?3,
+                 lifecycle_stage = 'completed', last_progress_at = ?2
              WHERE id = ?1 AND status = 'queued'",
-            params![id, chrono::Utc::now().to_rfc3339(), reason],
+            params![id, now, reason],
         )?;
         if updated == 0 {
             return Ok(None);
@@ -3480,25 +3692,54 @@ impl Store {
         &self,
         thread_id: &str,
         provider_wait_ms: u64,
-    ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE code_review_tasks SET provider_wait_ms = ?2
+    ) -> Result<Option<CodeReviewTaskProgressRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = conn.execute(
+            "UPDATE code_review_tasks
+             SET provider_wait_ms = provider_wait_ms + ?2,
+                 lifecycle_stage = CASE
+                   WHEN lifecycle_stage = 'waiting_for_capacity' THEN 'starting_model'
+                   ELSE lifecycle_stage
+                 END,
+                 last_progress_at = ?3
              WHERE thread_id = ?1 AND status = 'running'",
-            params![thread_id, provider_wait_ms as i64],
+            params![thread_id, provider_wait_ms as i64, now],
         )?;
-        Ok(())
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(conn.query_row(
+            &format!(
+                "SELECT {CODE_REVIEW_TASK_PROGRESS_COLUMNS}
+                 FROM code_review_tasks WHERE thread_id = ?1 AND status = 'running'"
+            ),
+            params![thread_id],
+            row_to_code_review_task_progress,
+        )?))
     }
 
-    pub fn set_code_review_task_metrics(
+    pub fn set_code_review_task_progress(
         &self,
         id: &str,
+        lifecycle_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
         metrics: &CodeReviewTaskMetrics,
-    ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        model_timing: CodeReviewModelTiming,
+    ) -> Result<Option<CodeReviewTaskProgressRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let (replace_model_started_at, model_started_at) = match model_timing {
+            CodeReviewModelTiming::Preserve => (false, None),
+            CodeReviewModelTiming::Reset => (true, None),
+            CodeReviewModelTiming::Started => (true, Some(now.as_str())),
+        };
+        let updated = conn.execute(
             "UPDATE code_review_tasks
              SET model_elapsed_ms = ?2, input_tokens = ?3,
                  cached_input_tokens = ?4, output_tokens = ?5,
-                 tool_call_count = ?6
+                 tool_call_count = ?6, lifecycle_stage = ?7,
+                 model_started_at = CASE WHEN ?8 THEN ?9 ELSE model_started_at END,
+                 last_progress_at = ?10
              WHERE id = ?1 AND status = 'running'",
             params![
                 id,
@@ -3507,9 +3748,23 @@ impl Store {
                 metrics.cached_input_tokens as i64,
                 metrics.output_tokens as i64,
                 metrics.tool_call_count as i64,
+                code_review_task_lifecycle_stage_str(lifecycle_stage),
+                replace_model_started_at,
+                model_started_at,
+                now,
             ],
         )?;
-        Ok(())
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(conn.query_row(
+            &format!(
+                "SELECT {CODE_REVIEW_TASK_PROGRESS_COLUMNS}
+                 FROM code_review_tasks WHERE id = ?1"
+            ),
+            params![id],
+            row_to_code_review_task_progress,
+        )?))
     }
 
     pub fn append_code_review_task_output(
@@ -3539,11 +3794,54 @@ impl Store {
         error: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now();
+        let current = conn
+            .query_row(
+                "SELECT model_started_at, model_elapsed_ms, lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((model_started_at, recorded_model_elapsed_ms, current_stage, last_progress_at)) =
+            current
+        else {
+            return Ok(None);
+        };
+        let model_elapsed_ms = if matches!(status, "failed" | "cancelled") {
+            finalize_code_review_model_elapsed(
+                recorded_model_elapsed_ms,
+                model_started_at,
+                last_progress_at,
+                now,
+            )
+        } else {
+            recorded_model_elapsed_ms.max(0) as u64
+        };
+        let completed = matches!(status, "succeeded" | "not_applicable");
+        let lifecycle_stage = if completed {
+            code_review_task_lifecycle_stage_str(
+                trouve_protocol::CodeReviewTaskLifecycleStage::Completed,
+            )
+        } else {
+            current_stage.as_str()
+        };
+        let now = now.to_rfc3339();
+        let terminal_progress_at = completed.then_some(now.as_str());
         let updated = conn.execute(
             "UPDATE code_review_tasks
              SET status = ?2,
                  output = CASE WHEN ?3 = '' THEN output ELSE ?3 END,
-                 candidate_issue_count = ?4, error = ?5, completed_at = ?6
+                 candidate_issue_count = ?4, error = ?5, completed_at = ?6,
+                 model_elapsed_ms = ?7, lifecycle_stage = ?8,
+                 last_progress_at = COALESCE(?9, last_progress_at)
              WHERE id = ?1 AND status IN ('queued', 'running')",
             params![
                 id,
@@ -3551,7 +3849,10 @@ impl Store {
                 output,
                 candidate_issue_count as i64,
                 error,
-                chrono::Utc::now().to_rfc3339()
+                now,
+                model_elapsed_ms as i64,
+                lifecycle_stage,
+                terminal_progress_at,
             ],
         )?;
         if updated == 0 {
@@ -3695,6 +3996,11 @@ impl Store {
         if old.job.status != "failed" {
             anyhow::bail!("reviewer personas can only be retried after the review job fails");
         }
+        if old.publication_claimed {
+            anyhow::bail!(
+                "review publication may already exist; reconcile it instead of retrying reviewers"
+            );
+        }
         if old.job.session_id.is_some() {
             anyhow::bail!("review session cleanup is still pending; retry shortly");
         }
@@ -3748,6 +4054,7 @@ impl Store {
             "UPDATE code_review_jobs
              SET status = 'queued', started_at = NULL, completed_at = NULL,
                  error = '', cancel_requested = 0, publication_claimed = 0,
+                 publication_accepted = 0,
                  completed_reviewers = MAX(completed_reviewers - 1, 0)
              WHERE id = ?1 AND status = 'failed'",
             params![id],
@@ -3917,6 +4224,7 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
              SET github_comment_id = ?2, github_comment_url = ?3,
+                 github_publication_status = 'published',
                  github_thread_id = COALESCE(?4, github_thread_id)
              WHERE id = ?1",
             params![
@@ -3926,6 +4234,41 @@ impl Store {
                 thread_id
             ],
         )? > 0)
+    }
+
+    pub fn set_code_review_finding_publication_status(
+        &self,
+        id: &str,
+        status: trouve_protocol::CodeReviewFindingPublicationStatus,
+    ) -> Result<bool> {
+        Ok(self.set_code_review_findings_publication_status(&[id], status)? > 0)
+    }
+
+    pub fn set_code_review_findings_publication_status(
+        &self,
+        ids: &[&str],
+        status: trouve_protocol::CodeReviewFindingPublicationStatus,
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let status = match status {
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending => "pending",
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published => "published",
+            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible => "not_eligible",
+            trouve_protocol::CodeReviewFindingPublicationStatus::Failed => "failed",
+        };
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut updated = 0;
+        for id in ids {
+            updated += tx.execute(
+                "UPDATE code_review_findings SET github_publication_status = ?2 WHERE id = ?1",
+                params![id, status],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
@@ -3946,7 +4289,8 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, job_id, path, line, side, severity, body,
                         prompt_for_agents, status, github_comment_id,
-                        github_comment_url, github_thread_id, resolved_at
+                        github_comment_url, github_publication_status,
+                        github_thread_id, resolved_at
                  FROM code_review_findings
                  WHERE job_id = ?1 ORDER BY path, line, id",
             )?;
@@ -3964,8 +4308,18 @@ impl Store {
                     sources: Vec::new(),
                     github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                     github_comment_url: row.get(10)?,
-                    github_thread_id: row.get(11)?,
-                    resolved_at: parse_optional_datetime(row.get(12)?),
+                    github_publication_status: match row.get::<_, String>(11)?.as_str() {
+                        "published" => {
+                            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+                        }
+                        "not_eligible" => {
+                            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
+                        }
+                        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
+                    },
+                    github_thread_id: row.get(12)?,
+                    resolved_at: parse_optional_datetime(row.get(13)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -4484,7 +4838,14 @@ impl Store {
         error: &str,
     ) -> Result<bool> {
         let updated = self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
+            "UPDATE code_review_jobs
+             SET status = ?2,
+                 review_url = CASE
+                     WHEN ?3 != '' THEN ?3
+                     WHEN lifecycle_comment_url != '' THEN lifecycle_comment_url
+                     ELSE review_url
+                 END,
+                 error = ?4,
                     completed_at = ?5
              WHERE id = ?1 AND status = 'running'",
             params![
@@ -4568,9 +4929,9 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        if old.publication_claimed && old.job.status == "running" {
+        if old.publication_claimed {
             anyhow::bail!(
-                "review publication has already started; wait for it to finish before retrying"
+                "review publication may already exist; reconcile it instead of publishing again"
             );
         }
         if old.job.status == "queued" {
@@ -4638,11 +4999,24 @@ impl Store {
     }
 
     pub fn cancel_active_code_review_tasks(&self, job_id: &str, error: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_tasks
-             SET status = 'cancelled', completed_at = ?2, error = ?3
+             SET status = 'cancelled', completed_at = ?2, error = ?3,
+                 model_elapsed_ms = CASE
+                   WHEN model_started_at IS NULL THEN model_elapsed_ms
+                   ELSE model_elapsed_ms + MAX(
+                     0,
+                     CAST(
+                       (julianday(?2) - MAX(
+                         julianday(model_started_at),
+                         julianday(COALESCE(last_progress_at, model_started_at))
+                       )) * 86400000 AS INTEGER
+                     )
+                   )
+                 END
              WHERE job_id = ?1 AND status IN ('queued', 'running')",
-            params![job_id, chrono::Utc::now().to_rfc3339(), error],
+            params![job_id, now, error],
         )?;
         Ok(())
     }
@@ -4654,6 +5028,58 @@ impl Store {
                AND cancel_requested = 0 AND publication_claimed = 0",
             params![id],
         )? > 0)
+    }
+
+    pub fn mark_code_review_publication_accepted(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_accepted = 1
+             WHERE id = ?1 AND publication_claimed != 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET publication_claimed = 0, publication_accepted = 0
+             WHERE id = ?1 AND publication_accepted = 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn reconcile_code_review_publication(
+        &self,
+        id: &str,
+        review_url: &str,
+        finding_ids: &[&str],
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_publication_status = 'published'
+                 WHERE id = ?1",
+                params![finding_id],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET status = CASE
+                     WHEN status = 'failed' AND publication_accepted = 0 THEN 'succeeded'
+                     ELSE status
+                 END,
+                 error = CASE
+                     WHEN status = 'failed' AND publication_accepted = 0 THEN ''
+                     ELSE error
+                 END,
+                 review_url = ?2,
+                 publication_accepted = 1
+             WHERE id = ?1 AND publication_claimed != 0",
+            params![id, review_url],
+        )?;
+        tx.commit()?;
+        Ok(updated > 0)
     }
 
     pub fn set_code_review_job_check_run(
@@ -4724,7 +5150,18 @@ impl Store {
 
     pub fn set_code_review_job_lifecycle_comment_url(&self, id: &str, url: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET lifecycle_comment_url = ?2 WHERE id = ?1",
+            "UPDATE code_review_jobs
+             SET lifecycle_comment_url = ?2,
+                 review_url = CASE
+                     WHEN status IN ('succeeded', 'failed', 'cancelled', 'stale')
+                          AND (review_url = '' OR review_url = lifecycle_comment_url) THEN ?2
+                     ELSE review_url
+                 END
+             WHERE id = ?1
+               AND (lifecycle_comment_url != ?2
+                    OR (status IN ('succeeded', 'failed', 'cancelled', 'stale')
+                        AND (review_url = ''
+                             OR (review_url = lifecycle_comment_url AND review_url != ?2))))",
             params![id, url],
         )? > 0)
     }
@@ -5462,13 +5899,13 @@ mod tests {
     #[test]
     fn migration_removes_redundant_routing_decisions_index() {
         let store = Store::open_in_memory().unwrap();
-        let conn = store.conn.lock().unwrap();
+        let mut conn = store.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE INDEX code_review_routing_decisions_job
              ON code_review_routing_decisions (job_id, batch_index, reviewer_id)",
         )
         .unwrap();
-        apply_migrations(&conn).unwrap();
+        apply_migrations(&mut conn).unwrap();
         let redundant_indexes = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -5479,6 +5916,269 @@ mod tests {
             .unwrap();
 
         assert_eq!(redundant_indexes, 0);
+    }
+
+    #[test]
+    fn migration_backfills_terminal_code_review_task_lifecycle_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_review_jobs
+                    (id, dedupe_key, installation_id, repository, pull_number, pull_title,
+                     pull_url, head_sha, base_ref, head_ref, trigger, status, created_at)
+             VALUES ('job', 'migration-job', 7, 'acme/widgets', 42, 'Widgets',
+                     'https://github.com/acme/widgets/pull/42', 'head', 'main', 'ship',
+                     'automatic', 'succeeded', '2026-01-01T00:00:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at, started_at,
+                     completed_at)
+             VALUES ('succeeded', 'job', 'reviewer', 'succeeded', 'queued',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z',
+                     '2026-01-01T00:02:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at, started_at)
+             VALUES ('not-applicable', 'job', 'reviewer', 'not_applicable', 'queued',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+             INSERT INTO code_review_tasks
+                    (id, job_id, role, status, lifecycle_stage, created_at)
+             VALUES ('failed', 'job', 'reviewer', 'failed', 'queued',
+                     '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        apply_migrations(&mut conn).unwrap();
+
+        let succeeded: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'succeeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(succeeded.0, "completed");
+        assert_eq!(succeeded.1.as_deref(), Some("2026-01-01T00:02:00Z"));
+        let not_applicable: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'not-applicable'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_applicable.0, "completed");
+        assert_eq!(not_applicable.1.as_deref(), Some("2026-01-01T00:01:00Z"));
+        let failed: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'failed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(failed, ("queued".into(), None));
+
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-terminal-task-lifecycle-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
+        conn.execute(
+            "UPDATE code_review_tasks
+             SET lifecycle_stage = 'queued', last_progress_at = NULL
+             WHERE id = 'succeeded'",
+            [],
+        )
+        .unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let gated: (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle_stage, last_progress_at
+                 FROM code_review_tasks WHERE id = 'succeeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(gated, ("queued".into(), None));
+    }
+
+    #[test]
+    fn failed_model_elapsed_adds_only_time_since_the_last_persisted_snapshot() {
+        let finished = "2026-01-01T00:00:20Z".parse().unwrap();
+        assert_eq!(
+            finalize_code_review_model_elapsed(
+                5_000,
+                Some("2026-01-01T00:00:00Z".into()),
+                Some("2026-01-01T00:00:10Z".into()),
+                finished,
+            ),
+            15_000
+        );
+    }
+
+    #[test]
+    fn migration_backfills_legacy_finding_publication_outcomes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE code_review_findings (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                github_comment_url TEXT NOT NULL,
+                github_publication_status TEXT NOT NULL
+             );
+             INSERT INTO code_review_findings VALUES
+                ('published', 'src/lib.rs', 10, 'https://github.com/comment', 'pending'),
+                ('empty-path', '', 10, '', 'pending'),
+                ('zero-line', 'src/lib.rs', 0, '', 'pending'),
+                ('eligible', 'src/lib.rs', 10, '', 'pending');",
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "CREATE TRIGGER reject_publication_migration_marker
+             BEFORE INSERT ON store_migrations
+             WHEN NEW.id = 'code-review-finding-publication-status-v1'
+             BEGIN
+                SELECT RAISE(FAIL, 'migration marker write blocked');
+             END;",
+        )
+        .unwrap();
+        assert!(migrate_code_review_finding_publication_status(&mut conn).is_err());
+        assert_eq!(publication_status(&conn, "published"), "pending");
+        assert_eq!(publication_status(&conn, "empty-path"), "pending");
+        conn.execute_batch("DROP TRIGGER reject_publication_migration_marker")
+            .unwrap();
+
+        migrate_code_review_finding_publication_status(&mut conn).unwrap();
+
+        assert_eq!(publication_status(&conn, "published"), "published");
+        assert_eq!(publication_status(&conn, "empty-path"), "not_eligible");
+        assert_eq!(publication_status(&conn, "zero-line"), "not_eligible");
+        assert_eq!(publication_status(&conn, "eligible"), "pending");
+
+        conn.execute(
+            "UPDATE code_review_findings SET github_publication_status = 'pending'
+             WHERE id = 'empty-path'",
+            [],
+        )
+        .unwrap();
+        migrate_code_review_finding_publication_status(&mut conn).unwrap();
+        assert_eq!(publication_status(&conn, "empty-path"), "pending");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-finding-publication-status-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn publication_status_migration_serializes_concurrent_openers() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("concurrent-migration.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE code_review_findings (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                github_comment_url TEXT NOT NULL,
+                github_publication_status TEXT NOT NULL
+             );
+             INSERT INTO code_review_findings VALUES
+                ('published', 'src/lib.rs', 10, 'https://github.com/comment', 'pending');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let openers = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = Connection::open(database).unwrap();
+                    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).unwrap();
+                    barrier.wait();
+                    migrate_code_review_finding_publication_status(&mut conn)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for opener in openers {
+            opener.join().unwrap().unwrap();
+        }
+
+        let conn = Connection::open(database).unwrap();
+        assert_eq!(publication_status(&conn, "published"), "published");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-finding-publication-status-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn applied_publication_status_migration_does_not_take_a_write_lock() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("applied-migration.sqlite3");
+        let mut setup = Connection::open(&database).unwrap();
+        setup
+            .execute_batch(
+                "CREATE TABLE store_migrations (
+                    id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE code_review_findings (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    github_comment_url TEXT NOT NULL,
+                    github_publication_status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        migrate_code_review_finding_publication_status(&mut setup).unwrap();
+
+        let mut writer = Connection::open(&database).unwrap();
+        let _write = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let mut opener = Connection::open(&database).unwrap();
+        opener.busy_timeout(Duration::ZERO).unwrap();
+
+        migrate_code_review_finding_publication_status(&mut opener).unwrap();
+    }
+
+    fn publication_status(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT github_publication_status FROM code_review_findings WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -6959,10 +7659,89 @@ mod tests {
                 prompt: "Find defects".into(),
             })
             .unwrap();
-        store
+        assert_eq!(
+            task.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::Queued
+        );
+        assert!(task.last_progress_at.is_some());
+        let started_task = store
             .start_code_review_task(&task.id, "se_review", "th_review", "provider/model")
             .unwrap()
             .unwrap();
+        assert_eq!(
+            started_task.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::WaitingForCapacity
+        );
+        let capacity = store
+            .set_code_review_task_provider_wait("th_review", 17)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capacity.progress.provider_wait_ms, 17);
+        assert_eq!(
+            capacity.progress.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::StartingModel
+        );
+        let progress = store
+            .set_code_review_task_progress(
+                &task.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RunningTool,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 23,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 12,
+                    tool_call_count: 2,
+                },
+                CodeReviewModelTiming::Started,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(progress.progress.model_started_at.is_some());
+        assert_eq!(progress.progress.model_elapsed_ms, 23);
+        assert_eq!(progress.progress.tool_call_count, 2);
+        let repair = store
+            .set_code_review_task_progress(
+                &task.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 23,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 12,
+                    tool_call_count: 2,
+                },
+                CodeReviewModelTiming::Reset,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(repair.progress.model_started_at.is_none());
+        let repair_capacity = store
+            .set_code_review_task_provider_wait("th_review", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair_capacity.progress.provider_wait_ms, 22);
+        assert_eq!(
+            repair_capacity.progress.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let repair_started = store
+            .set_code_review_task_progress(
+                &task.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 23,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 12,
+                    tool_call_count: 2,
+                },
+                CodeReviewModelTiming::Started,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(repair_started.progress.model_started_at.is_some());
+        assert!(repair_started.progress.model_started_at > progress.progress.model_started_at);
         assert!(
             store
                 .append_code_review_task_output(
@@ -6972,10 +7751,17 @@ mod tests {
                 )
                 .unwrap()
         );
-        store
+        let finished_task = store
             .finish_code_review_task(&task.id, "succeeded", "", 1, "")
             .unwrap()
             .unwrap();
+        assert_eq!(
+            finished_task.lifecycle_stage,
+            trouve_protocol::CodeReviewTaskLifecycleStage::Completed
+        );
+        assert_eq!(finished_task.provider_wait_ms, 22);
+        assert_eq!(finished_task.model_elapsed_ms, 23);
+        assert_eq!(finished_task.tool_call_count, 2);
         let partial = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         assert_eq!(partial.personas[0].status, "queued");
         assert_eq!(partial.personas[0].completed_batches, 1);
@@ -7255,10 +8041,30 @@ mod tests {
                 .unwrap()
                 .unwrap();
             store
+                .set_code_review_task_progress(
+                    &task.id,
+                    trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel,
+                    &CodeReviewTaskMetrics {
+                        model_elapsed_ms: 11 + batch_index,
+                        ..CodeReviewTaskMetrics::default()
+                    },
+                    CodeReviewModelTiming::Started,
+                )
+                .unwrap()
+                .unwrap();
+            let finished = store
                 .finish_code_review_task(&task.id, status, output, 0, error)
                 .unwrap()
                 .unwrap();
-            task
+            if matches!(status, "failed" | "cancelled") {
+                assert_eq!(
+                    finished.lifecycle_stage,
+                    trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel
+                );
+                assert!(finished.model_started_at.is_some());
+                assert!(finished.model_elapsed_ms >= 11 + batch_index);
+            }
+            finished
         };
         let failed = finish_batch(0, "failed", "", "provider unavailable");
         let cancelled = finish_batch(1, "cancelled", "", "review timed out");
@@ -7435,6 +8241,32 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        store
+            .set_code_review_task_progress(
+                &interrupted.id,
+                trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel,
+                &CodeReviewTaskMetrics {
+                    model_elapsed_ms: 1_200,
+                    ..CodeReviewTaskMetrics::default()
+                },
+                CodeReviewModelTiming::Started,
+            )
+            .unwrap()
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_tasks
+                 SET model_started_at = ?2, last_progress_at = ?3
+                 WHERE id = ?1",
+                params![
+                    interrupted.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+                    (chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
 
         store.recover_code_review_jobs().unwrap();
 
@@ -7443,15 +8275,14 @@ mod tests {
         assert_eq!(detail.tasks.len(), 3);
         assert_eq!(detail.personas[0].status, "queued");
         assert_eq!(detail.personas[0].completed_batches, 1);
-        assert_eq!(
-            detail
-                .tasks
-                .iter()
-                .find(|task| task.id == interrupted.id)
-                .unwrap()
-                .status,
-            "failed"
-        );
+        let interrupted = detail
+            .tasks
+            .iter()
+            .find(|task| task.id == interrupted.id)
+            .unwrap();
+        assert_eq!(interrupted.status, "failed");
+        assert_eq!(interrupted.model_elapsed_ms, 1_200);
+        assert!(interrupted.model_started_at.is_none());
         let retry = detail
             .tasks
             .iter()
@@ -7462,7 +8293,7 @@ mod tests {
     }
 
     #[test]
-    fn review_publication_rejects_cancellation_with_a_client_facing_reason() {
+    fn review_publication_claim_blocks_cancellation_and_recovers_for_retry() {
         let store = Store::open_in_memory().unwrap();
         let job = store
             .enqueue_code_review_job(&NewCodeReviewJob {
@@ -7498,6 +8329,29 @@ mod tests {
 
         let error = store.request_code_review_job_cancel(&job.id).unwrap_err();
         assert!(error.to_string().contains("before cancelling"));
+
+        store.recover_code_review_jobs().unwrap();
+        let recovered = store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(recovered.job.status, "failed");
+        assert!(!recovered.publication_claimed);
+        assert!(!recovered.publication_accepted);
+        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            retry.id
+        );
+        assert!(store.claim_code_review_publication(&retry.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&retry.id)
+                .unwrap()
+        );
+
+        store.recover_code_review_jobs().unwrap();
+        let accepted = store.code_review_job(&retry.id).unwrap().unwrap();
+        assert_eq!(accepted.job.status, "succeeded");
+        assert!(accepted.publication_claimed);
+        assert!(accepted.publication_accepted);
     }
 
     #[test]

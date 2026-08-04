@@ -763,7 +763,7 @@ IFS= read -r line # session/new, then exit without responding
 }
 
 #[tokio::test]
-async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
+async fn cursor_adapter_routes_all_permissions_through_agent_mode_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
@@ -815,23 +815,30 @@ async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
     );
     let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
+    let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
+    assert!(mode.contains("\"value\":\"agent\""), "{mode}");
 
-    // Read-only turns run in cursor's plan mode (fresh process: the shared
-    // ACP child is per-backend, so use a new backend instance).
-    let tmp2 = tempfile::tempdir().unwrap();
-    let stub2 = cursor_acp_stub(tmp2.path());
-    let backend2 = CursorBackend::new("cursor", Some(stub2.clone()), None);
-    let mut stream2 = start_turn(&backend2, || {
-        turn(tmp2.path().to_path_buf(), None, BackendPermission::ReadOnly)
-    })
-    .await;
-    while let Some(ev) = stream2.next().await {
-        if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
-            let _ = responder.send(false);
+    // Read-only and approval-gated turns also run in Cursor's agent mode.
+    // Use fresh backends because the ACP child is pooled per worktree.
+    for permission in [BackendPermission::ReadOnly, BackendPermission::Ask] {
+        let permission_worktree = tempfile::tempdir().unwrap();
+        let permission_stub = cursor_acp_stub(permission_worktree.path());
+        let permission_backend = CursorBackend::new("cursor", Some(permission_stub.clone()), None);
+        let mut permission_stream = start_turn(&permission_backend, || {
+            turn(permission_worktree.path().to_path_buf(), None, permission)
+        })
+        .await;
+        while let Some(event) = permission_stream.next().await {
+            if let BackendEvent::ApprovalNeeded { responder, .. } = event.unwrap() {
+                let _ = responder.send(false);
+            }
         }
+        let mode = std::fs::read_to_string(format!("{permission_stub}.mode")).unwrap();
+        assert!(
+            mode.contains("\"value\":\"agent\""),
+            "{permission:?}: {mode}"
+        );
     }
-    let mode = std::fs::read_to_string(format!("{stub2}.mode")).unwrap();
-    assert!(mode.contains("\"value\":\"plan\""), "{mode}");
 }
 
 #[tokio::test]

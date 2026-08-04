@@ -61,6 +61,7 @@ import {
   reviewTaskSummary,
   type ReviewOutputField,
 } from "./review-output";
+import { liveModelElapsed, mergeReviewTaskSnapshot } from "./review-progress";
 import {
   MAX_PARALLEL_REVIEWS,
   TIMEOUT_MINUTES_INPUT_MIN,
@@ -88,6 +89,7 @@ import type {
   ReviewJob,
   RoutingDecision,
   ReviewTask,
+  ReviewTaskProgress,
   ReviewStats,
   ReviewerOverride,
   ReviewerProfile,
@@ -144,6 +146,31 @@ function liveElapsed(
   if (status !== "running" || !startedAt) return baseline;
   const liveAge = Math.max(0, now - new Date(startedAt).getTime());
   return Math.max(baseline, liveAge);
+}
+
+function taskLifecycleLabel(stage: ReviewTask["lifecycle_stage"]): string {
+  switch (stage) {
+    case "waiting_for_capacity":
+      return "Waiting for capacity";
+    case "starting_model":
+      return "Starting model";
+    case "running_model":
+      return "Running model";
+    case "running_tool":
+      return "Running tool";
+    case "repairing_output":
+      return "Repairing output";
+    case "completed":
+      return "Completed";
+    default:
+      return "Queued";
+  }
+}
+
+function isReviewTaskProgress(
+  progress: EventEnvelope["progress"],
+): progress is ReviewTaskProgress {
+  return Boolean(progress && "lifecycle_stage" in progress);
 }
 
 function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
@@ -735,16 +762,36 @@ function JobDetailPane({
   const [routingOpen, setRoutingOpen] = useState(false);
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
+  const detailRef = useRef(detail);
   const taskRequestsRef = useRef(new Set<string>());
   const selectedTaskIdRef = useRef(selectedTaskId);
   const taskDetailsRef = useRef(taskDetails);
+  detailRef.current = detail;
   selectedTaskIdRef.current = selectedTaskId;
   taskDetailsRef.current = taskDetails;
   const load = useCallback(async (): Promise<JobDetail | undefined> => {
     const requestedJobId = jobId;
     try {
-      const next = await getJob(requestedJobId);
+      const response = await getJob(requestedJobId);
+      const receivedAt = Date.now();
+      const currentTaskList = detailRef.current?.tasks ?? [];
+      const currentTasks = new Map<string, ReviewTask>(
+        currentTaskList.map(
+          (task): [string, ReviewTask] => [task.id, task],
+        ),
+      );
+      const responseTaskIds = new Set(response.tasks.map((task) => task.id));
+      const next = {
+        ...response,
+        tasks: [
+          ...response.tasks.map((task) =>
+            mergeReviewTaskSnapshot(currentTasks.get(task.id), task, receivedAt),
+          ),
+          ...currentTaskList.filter((task) => !responseTaskIds.has(task.id)),
+        ],
+      };
       if (aliveRef.current === requestedJobId) {
+        detailRef.current = next;
         setDetail(next);
         setEventCursor((current) => current ?? next.event_cursor ?? 0);
         setError("");
@@ -769,7 +816,14 @@ function JobDetailPane({
         return next;
       });
       try {
-        const next = boundReviewTaskOutput(await getTask(jobId, taskId));
+        const response = await getTask(jobId, taskId);
+        const receivedAt = Date.now();
+        const currentTask =
+          taskDetailsRef.current[taskId] ??
+          detailRef.current?.tasks.find((task) => task.id === taskId);
+        const next = boundReviewTaskOutput(
+          mergeReviewTaskSnapshot(currentTask, response, receivedAt),
+        );
         if (
           aliveRef.current === jobId &&
           next.job_id === jobId &&
@@ -793,6 +847,7 @@ function JobDetailPane({
   );
   useEffect(() => {
     aliveRef.current = jobId;
+    detailRef.current = null;
     setDetail(null);
     setSelectedTaskId("");
     selectedTaskIdRef.current = "";
@@ -908,21 +963,63 @@ function JobDetailPane({
         event.type === "code_review.routing_updated" &&
         event.routing_decisions
       ) {
-        setDetail((current) =>
-          current ? { ...current, routing_decisions: event.routing_decisions } : current,
-        );
+        setDetail((current) => {
+          const next = current
+            ? { ...current, routing_decisions: event.routing_decisions }
+            : current;
+          detailRef.current = next;
+          return next;
+        });
+      } else if (
+        event.type === "code_review.task_progress_updated" &&
+        event.task_id &&
+        isReviewTaskProgress(event.progress)
+      ) {
+        const taskId = event.task_id;
+        const progress = event.progress;
+        const receivedAt = Date.now();
+        const mergeProgress = (task: ReviewTask): ReviewTask =>
+          mergeReviewTaskSnapshot(task, { ...task, ...progress }, receivedAt);
+        setDetail((current) => {
+          const next = current
+            ? {
+                ...current,
+                tasks: current.tasks.map((task) =>
+                  task.id === taskId ? mergeProgress(task) : task,
+                ),
+              }
+            : current;
+          detailRef.current = next;
+          return next;
+        });
+        setTaskDetails((current) => {
+          const task = current[taskId];
+          if (!task) return current;
+          const next = { ...current, [taskId]: mergeProgress(task) };
+          taskDetailsRef.current = next;
+          return next;
+        });
       } else if (event.type === "code_review.task_updated" && event.task) {
-        const task = event.task;
-        pendingOutput.delete(task.id);
+        const receivedAt = Date.now();
+        const incomingTask = event.task;
+        pendingOutput.delete(incomingTask.id);
         if (!pendingOutput.size && outputTimer !== undefined) {
           window.clearTimeout(outputTimer);
           outputTimer = undefined;
         }
-        const summary = reviewTaskSummary(task);
         setDetail((current) => {
           if (!current) return current;
+          const currentTask = current.tasks.find(
+            (task) => task.id === incomingTask.id,
+          );
+          const task = mergeReviewTaskSnapshot(
+            currentTask,
+            incomingTask,
+            receivedAt,
+          );
+          const summary = reviewTaskSummary(task);
           const exists = current.tasks.some((currentTask) => currentTask.id === task.id);
-          return {
+          const next = {
             ...current,
             tasks: exists
               ? current.tasks.map((currentTask) =>
@@ -930,12 +1027,24 @@ function JobDetailPane({
                 )
               : [...current.tasks, summary],
           };
+          detailRef.current = next;
+          return next;
         });
-        if (task.id === selectedTaskIdRef.current) {
+        if (incomingTask.id === selectedTaskIdRef.current) {
           if (document.visibilityState === "visible") {
-            const details = { [task.id]: boundReviewTaskOutput(task) };
-            taskDetailsRef.current = details;
-            setTaskDetails(details);
+            setTaskDetails((current) => {
+              const currentTask =
+                current[incomingTask.id] ??
+                detailRef.current?.tasks.find(
+                  (task) => task.id === incomingTask.id,
+                );
+              const task = boundReviewTaskOutput(
+                mergeReviewTaskSnapshot(currentTask, incomingTask, receivedAt),
+              );
+              const details = { [task.id]: task };
+              taskDetailsRef.current = details;
+              return details;
+            });
           } else {
             missedHiddenOutput = true;
           }
@@ -1354,7 +1463,9 @@ function JobDetailPane({
               {candidateRejections.length} rejected · {job.fixed_issue_count} fixed
             </p>
           </div>
-          <CopyButton text={detail.prompt_for_agents} label="Copy fix-all prompt" />
+          {detail.prompt_for_agents && (
+            <CopyButton text={detail.prompt_for_agents} label="Copy fix-all prompt" />
+          )}
         </div>
         {detail.summary && <p class="summary">{detail.summary}</p>}
         {detail.findings.map((finding) => (
@@ -1524,12 +1635,18 @@ function JobDetailPane({
                 )}
                 <dl class="task-facts">
                   <div>
+                    <dt>Lifecycle</dt>
+                    <dd aria-live="polite">
+                      {taskLifecycleLabel(selectedTask.lifecycle_stage)}
+                    </dd>
+                  </div>
+                  <div>
                     <dt>Capacity wait</dt>
                     <dd>{duration(selectedTask.provider_wait_ms)}</dd>
                   </div>
                   <div>
                     <dt>Model/tools</dt>
-                    <dd>{duration(selectedTask.model_elapsed_ms)}</dd>
+                    <dd>{duration(liveModelElapsed(selectedTask, now))}</dd>
                   </div>
                   <div>
                     <dt>Tokens</dt>
@@ -1545,6 +1662,10 @@ function JobDetailPane({
                   <div>
                     <dt>Tool calls</dt>
                     <dd>{selectedTask.tool_call_count}</dd>
+                  </div>
+                  <div>
+                    <dt>Last progress</dt>
+                    <dd>{formatDate(selectedTask.last_progress_at)}</dd>
                   </div>
                   <div>
                     <dt>Candidates / confirmed</dt>

@@ -147,6 +147,13 @@ pub use requests::*;
 // 2.4: thread-view snapshots expose bounded folded-item pages and backward
 // pagination metadata so clients never render the complete transcript eagerly.
 // 2.5: oversized session diffs return a stable machine-readable error code.
+// 2.6: code-review tasks expose their durable current/last lifecycle stage,
+// model start and last-progress timestamps, and incremental task-progress
+// events so in-flight and timed-out metrics remain observable (additive).
+// 2.7: task-progress snapshots always carry the nullable model-start field so
+// clients can clear a previous turn's live timing anchor (additive).
+// 2.8: code-review findings expose their durable GitHub inline-publication
+// outcome (additive).
 // 3.0: Dynamic persona selection delegates solely to the semantic router;
 // Automatic always enables it, while Additive retains only its baseline and
 // configured inclusions before optional semantic additions (breaking).

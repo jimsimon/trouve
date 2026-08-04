@@ -352,10 +352,13 @@ impl AgentBackend for CursorBackend {
         let (route, prompt_rx) = {
             let _config = server.config_lock.lock().await;
 
+            // Keep Cursor in agent mode even for read-only turns. Cursor's
+            // plan mode can stall before producing ACP events; trouve's
+            // approval gate remains the authority that rejects mutations.
             let mode = match turn.permission {
-                // Cursor's plan mode is its read-only posture.
-                BackendPermission::ReadOnly => "plan",
-                BackendPermission::Ask | BackendPermission::Yolo => "agent",
+                BackendPermission::ReadOnly | BackendPermission::Ask | BackendPermission::Yolo => {
+                    "agent"
+                }
             };
             if let Err(e) = server.set_config_option(&session_id, "mode", mode).await {
                 tracing::warn!("cursor set mode {mode} failed: {e}");
