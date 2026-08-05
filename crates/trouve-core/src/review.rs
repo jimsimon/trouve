@@ -10463,6 +10463,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_router_setup_failure_marks_task_failed_and_aborts() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:automatic-router-setup");
+        store.claim_code_review_job().unwrap().unwrap();
+        job.routing_mode = CodeReviewRoutingMode::Automatic;
+        job.semantic_routing = true;
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| reviewer.id == "performance")
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["src/lib.rs".into()],
+            diff: "+fn changed() {}\n".into(),
+        }];
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        ));
+
+        let error = engine
+            .semantic_routing_for_batches(
+                &job,
+                "missing-session",
+                &reviewers,
+                &batches,
+                &CancellationToken::new(),
+                &Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Automatic persona selection requires successful semantic routing")
+        );
+        let tasks = store.code_review_tasks(&job.id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "failed");
+        assert!(tasks[0].error.contains("missing-session"));
+    }
+
     #[test]
     fn semantic_routing_accepts_only_known_additive_candidates() {
         let reviewers = crate::reviewers::built_in_reviewers();
