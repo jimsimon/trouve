@@ -768,6 +768,22 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
 
   await expect(page.getByText("Virtual response 219", { exact: true })).toBeVisible();
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
+  const scrollbarPresentation = await page.locator(".chat-stream").evaluate((viewport) => {
+    const style = getComputedStyle(viewport);
+    const webkitScrollbar = getComputedStyle(viewport, "::-webkit-scrollbar");
+    return {
+      color: style.scrollbarColor,
+      gutter: style.scrollbarGutter,
+      overflowY: style.overflowY,
+      width: style.scrollbarWidth,
+      webkitWidth: webkitScrollbar.width,
+    };
+  });
+  expect(scrollbarPresentation.gutter).toContain("stable");
+  expect(scrollbarPresentation.overflowY).toBe("scroll");
+  expect(scrollbarPresentation.width).toBe("thin");
+  expect(scrollbarPresentation.color).not.toBe("auto");
+  expect(scrollbarPresentation.webkitWidth).toBe("10px");
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
