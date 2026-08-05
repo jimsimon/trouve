@@ -768,36 +768,28 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
 
   await expect(page.getByText("Virtual response 219", { exact: true })).toBeVisible();
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
-  const conversationScrollbar = page.getByRole("scrollbar", {
-    name: "Conversation position",
-  });
-  await expect(conversationScrollbar).toBeVisible();
-  await expect(conversationScrollbar).toHaveAttribute("aria-disabled", "false");
-  const scrollbarPresentation = await page.locator(".chat-stream").evaluate((viewport) => {
+  const scrollGeometry = await page.locator(".chat-stream").evaluate((viewport) => {
     const style = getComputedStyle(viewport);
-    const webkitScrollbar = getComputedStyle(viewport, "::-webkit-scrollbar");
-    const customThumb = getComputedStyle(
-      viewport.parentElement!.querySelector<HTMLElement>(".chat-scrollbar-thumb")!,
-    );
+    const canvas = viewport.querySelector<HTMLElement>(".chat-virtual-canvas");
+    if (canvas === null) throw new Error("missing virtual scroll canvas");
     return {
-      customThumbColor: customThumb.backgroundColor,
+      canvasHeight: canvas.getBoundingClientRect().height,
+      canvasPosition: getComputedStyle(canvas).position,
+      clientHeight: viewport.clientHeight,
       overflowY: style.overflowY,
-      width: style.scrollbarWidth,
-      webkitWidth: webkitScrollbar.width,
+      scrollHeight: viewport.scrollHeight,
     };
   });
-  expect(scrollbarPresentation.overflowY).toBe("scroll");
-  expect(scrollbarPresentation.width).toBe("none");
-  expect(scrollbarPresentation.webkitWidth).toBe("0px");
-  expect(scrollbarPresentation.customThumbColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(scrollGeometry.overflowY).toBe("auto");
+  expect(scrollGeometry.canvasPosition).toBe("relative");
+  expect(scrollGeometry.canvasHeight).toBeGreaterThan(scrollGeometry.clientHeight);
+  expect(scrollGeometry.scrollHeight).toBeGreaterThan(scrollGeometry.clientHeight);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
   });
-  await expect(conversationScrollbar).toBeVisible();
-  await expect(conversationScrollbar).toHaveAttribute("aria-valuenow", "0");
   await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
     "aria-live",
     "off",
@@ -860,9 +852,23 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   if (viewportBounds === null) throw new Error("missing chat viewport bounds");
   await page.locator(".chat-stream").evaluate((viewport) => {
     const samples: number[] = [viewport.scrollTop];
-    (globalThis as typeof globalThis & { __trouveScrollSamples?: number[] })
-      .__trouveScrollSamples = samples;
-    viewport.addEventListener("scroll", () => samples.push(viewport.scrollTop));
+    const ranges: Array<{ readonly clientHeight: number; readonly scrollHeight: number }> = [{
+      clientHeight: viewport.clientHeight,
+      scrollHeight: viewport.scrollHeight,
+    }];
+    const diagnostics = globalThis as typeof globalThis & {
+      __trouveScrollRanges?: typeof ranges;
+      __trouveScrollSamples?: number[];
+    };
+    diagnostics.__trouveScrollRanges = ranges;
+    diagnostics.__trouveScrollSamples = samples;
+    viewport.addEventListener("scroll", () => {
+      samples.push(viewport.scrollTop);
+      ranges.push({
+        clientHeight: viewport.clientHeight,
+        scrollHeight: viewport.scrollHeight,
+      });
+    });
   });
   await page.mouse.move(
     viewportBounds.x + viewportBounds.width / 2,
@@ -870,11 +876,27 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   );
   await page.mouse.wheel(0, -4_000);
   await page.waitForTimeout(350);
-  const upwardScrollSamples = await page.evaluate(() =>
-    (globalThis as typeof globalThis & { __trouveScrollSamples?: number[] })
-      .__trouveScrollSamples ?? []
-  );
+  const fastScrollDiagnostics = await page.evaluate(() => {
+    const diagnostics = globalThis as typeof globalThis & {
+      __trouveScrollRanges?: Array<{
+        readonly clientHeight: number;
+        readonly scrollHeight: number;
+      }>;
+      __trouveScrollSamples?: number[];
+    };
+    return {
+      ranges: diagnostics.__trouveScrollRanges ?? [],
+      samples: diagnostics.__trouveScrollSamples ?? [],
+    };
+  });
+  const upwardScrollSamples = fastScrollDiagnostics.samples;
   expect(upwardScrollSamples.length).toBeGreaterThan(1);
+  expect(
+    fastScrollDiagnostics.ranges.every(
+      ({ clientHeight, scrollHeight }) => scrollHeight > clientHeight,
+    ),
+    "the native scrollbar must retain an overflowing scroll range",
+  ).toBe(true);
   expect(upwardScrollSamples.at(-1)).toBeLessThan(upwardScrollSamples[0] ?? 0);
   const downwardCorrections = upwardScrollSamples.slice(1).map(
     (sample, index) => sample - (upwardScrollSamples[index] ?? sample),
