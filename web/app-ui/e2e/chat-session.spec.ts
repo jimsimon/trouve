@@ -420,9 +420,68 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
   await replayHistory(page);
 
   await expect(page.locator(".user-message trouve-markdown-view strong")).toHaveText("migration");
+  const userBody = page.locator(".user-body-stream").first();
+  await expect(userBody).toHaveCSS("padding", "8px 16px 10px");
+  const userProseInset = await userBody.evaluate((body) => {
+    const bodyBounds = body.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    const contentLeft = bodyBounds.left
+      + Number.parseFloat(bodyStyle.borderLeftWidth)
+      + Number.parseFloat(bodyStyle.paddingLeft);
+    const paragraph = body
+      .querySelector<HTMLElement>("trouve-markdown-view")
+      ?.shadowRoot?.querySelector<HTMLElement>("p")
+      ?.getBoundingClientRect();
+    return paragraph === undefined ? Number.NaN : paragraph.left - contentLeft;
+  });
+  expect(Math.abs(userProseInset - 10)).toBeLessThanOrEqual(1);
   const activityGroup = page.locator(".activity-group");
   await expect(activityGroup.getByText("Edited 1 file, read 1 file", { exact: true })).toBeVisible();
   await expect(activityGroup.locator(".activity-group-body")).toHaveCount(0);
+  await expect(page.locator(".agent-text-block > trouve-markdown-view").first())
+    .toContainText("I'll update it.");
+  const agentBodyGeometry = await activityGroup.evaluate((group) => {
+    const body = group.closest<HTMLElement>(".agent-body-stream");
+    if (body === null) throw new Error("missing agent body");
+    const bodyBounds = body.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    const contentLeft = bodyBounds.left
+      + Number.parseFloat(bodyStyle.borderLeftWidth)
+      + Number.parseFloat(bodyStyle.paddingLeft);
+    const contentRight = bodyBounds.right
+      - Number.parseFloat(bodyStyle.borderRightWidth)
+      - Number.parseFloat(bodyStyle.paddingRight);
+    const surfaces = [...body.children]
+      .filter((child) => child.matches(".activity-group, .tool-card, .thinking-card, .question-card"))
+      .map((child) => {
+        const bounds = child.getBoundingClientRect();
+        return {
+          left: bounds.left - contentLeft,
+          right: contentRight - bounds.right,
+        };
+      });
+    const paragraph = body
+      .querySelector<HTMLElement>(".agent-text-block > trouve-markdown-view")
+      ?.shadowRoot?.querySelector<HTMLElement>("p")
+      ?.getBoundingClientRect();
+    return {
+      padding: [
+        bodyStyle.paddingTop,
+        bodyStyle.paddingRight,
+        bodyStyle.paddingBottom,
+        bodyStyle.paddingLeft,
+      ],
+      proseInset: paragraph === undefined ? Number.NaN : paragraph.left - contentLeft,
+      surfaces,
+    };
+  });
+  expect(agentBodyGeometry.padding).toEqual(["8px", "16px", "10px", "16px"]);
+  expect(Math.abs(agentBodyGeometry.proseInset - 10)).toBeLessThanOrEqual(1);
+  expect(agentBodyGeometry.surfaces.length).toBeGreaterThan(0);
+  for (const inset of agentBodyGeometry.surfaces) {
+    expect(Math.abs(inset.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(inset.right)).toBeLessThanOrEqual(1);
+  }
 
   await activityGroup.locator(":scope > summary").click();
   await expect(activityGroup.locator(".tool-card")).toHaveCount(2);
@@ -1037,6 +1096,16 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
   ]);
 
   await expect(page.locator('[data-question-request-id="question_layout"]')).toBeVisible();
+  const attachmentInset = await page.locator(".user-body-stream").last().evaluate((body) => {
+    const bodyBounds = body.getBoundingClientRect();
+    const bodyStyle = getComputedStyle(body);
+    const contentLeft = bodyBounds.left
+      + Number.parseFloat(bodyStyle.borderLeftWidth)
+      + Number.parseFloat(bodyStyle.paddingLeft);
+    const attachments = body.querySelector<HTMLElement>(".attachment-list")?.getBoundingClientRect();
+    return attachments === undefined ? Number.NaN : attachments.left - contentLeft;
+  });
+  expect(Math.abs(attachmentInset - 10)).toBeLessThanOrEqual(1);
   for (const callId of [
     "call_layout_command",
     "call_layout_todos",

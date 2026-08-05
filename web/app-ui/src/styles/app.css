@@ -267,13 +267,15 @@ trouve-session-list { display: block; }
 .assistant-message .message-body { border-color: var(--trouve-agent-border); }
 .assistant-message trouve-markdown-view, .user-message trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
 .assistant-raw { min-width: 0; max-width: 100%; margin: 0; overflow-x: hidden; overflow-y: auto; color: var(--trouve-code-fg); background: transparent; font: 11px/1.5 var(--trouve-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
-.agent-body-stream { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
-.agent-body-stream > * { min-width: 0; max-width: 100%; }
+.turn-body-stream { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.turn-card .turn-body-stream { padding: 8px 16px 10px; }
+.turn-body-stream > * { min-width: 0; max-width: 100%; }
 .agent-text-block { min-width: 0; margin: 0; }
-.agent-body-stream > .message { margin: 0 0 0 16px; }
+.turn-body-stream > .assistant-raw { padding-inline: 10px; }
+.user-body-stream > .attachment-list { margin: 0 10px; }
+.agent-body-stream > .message { width: 100%; margin: 0; }
 .agent-body-stream > .question-card { margin-inline-start: 0; }
-.agent-body-stream > .activity-group:first-child { margin-block-start: 2px; }
-.activity-group { min-width: 0; max-width: 100%; margin-inline-start: 16px; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
+.activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
 .activity-group > summary { min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); color: var(--trouve-text-mid); background: var(--trouve-surface); cursor: pointer; list-style: none; }
 .activity-group > summary::-webkit-details-marker { display: none; }
 .activity-group > summary strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }

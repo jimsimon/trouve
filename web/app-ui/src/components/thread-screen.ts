@@ -1432,7 +1432,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           </div>
         </header>
         ${open
-          ? html`<div class="message-body agent-body-stream">
+          ? html`<div class="message-body turn-body-stream agent-body-stream">
               ${this.#renderAgentBody(unit, raw, turnModels, turnDurationMs, presentation)}
               ${activityLabel === undefined
                 ? nothing
@@ -1473,6 +1473,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           rows.push(raw
             ? html`<pre class="assistant-raw agent-text-block">${content}</pre>`
             : html`<div class="agent-text-block"><trouve-markdown-view
+                class="turn-markdown"
                 .content=${content}
                 .streaming=${stretch.some((part) => !part.complete)}
               ></trouve-markdown-view></div>`);
@@ -1959,10 +1960,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             </header>
             ${open
               ? html`
-                  <div class="message-body">
+                  <div class="message-body turn-body-stream user-body-stream">
                     ${item.content === ""
                       ? nothing
-                      : html`<trouve-markdown-view .content=${item.content}></trouve-markdown-view>`}
+                      : html`<trouve-markdown-view
+                          class="turn-markdown"
+                          .content=${item.content}
+                        ></trouve-markdown-view>`}
                     ${this.#renderAttachments(item.attachments)}
                   </div>
                 `
@@ -2015,11 +2019,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             </header>
             ${open
               ? html`
-                  <div class="message-body">
+                  <div class="message-body turn-body-stream">
                     ${raw
                       ? html`<pre class="assistant-raw">${item.content}</pre>`
                       : html`
                           <trouve-markdown-view
+                            class="turn-markdown"
                             .content=${item.content}
                             .streaming=${!item.complete}
                           ></trouve-markdown-view>

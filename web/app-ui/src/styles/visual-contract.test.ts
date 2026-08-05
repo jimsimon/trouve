@@ -25,6 +25,7 @@ describe("Slint/Lit visual contract", () => {
   const shell = read("../app/trouve-app.ts");
   const sessionList = read("../components/session-list.ts");
   const thread = read("../components/thread-screen.ts");
+  const markdown = read("../components/markdown-view.ts");
   const newThread = read("../components/new-thread-setup.ts");
   const settings = read("../components/settings-screen.ts");
   const automations = read("../components/automations-screen.ts");
@@ -270,10 +271,19 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toContain(".assistant-message .message-header");
     expect(app).toContain(".thread-todo-progress");
     expect(app).toMatch(
-      /\.agent-body-stream \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s,
+      /\.turn-body-stream \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s,
     );
     expect(app).toMatch(
-      /\.agent-body-stream > \.activity-group:first-child \{[^}]*margin-block-start:\s*2px/s,
+      /\.turn-card \.turn-body-stream \{[^}]*padding:\s*8px 16px 10px/s,
+    );
+    expect(app).toMatch(
+      /\.user-body-stream > \.attachment-list \{[^}]*margin:\s*0 10px/s,
+    );
+    expect(app).toMatch(
+      /\.agent-body-stream > \.message \{[^}]*width:\s*100%[^}]*margin:\s*0/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group \{[^}]*width:\s*100%[^}]*margin:\s*0/s,
     );
     expect(app).toMatch(
       /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*4px/s,
@@ -306,6 +316,12 @@ describe("Slint/Lit visual contract", () => {
     expect(thread).toContain('class="composer-option mode-option"');
     expect(thread).toContain('class="composer-option model-option"');
     expect(thread).toContain('class="composer-option permission-option"');
+    expect(thread).toContain('class="message-body turn-body-stream user-body-stream"');
+    expect(thread).toContain('class="message-body turn-body-stream agent-body-stream"');
+    expect(thread).toContain('class="turn-markdown"');
+    expect(markdown).toMatch(
+      /:host\(\.turn-markdown\) :where\([^}]*\) \{[^}]*margin-inline:\s*10px/s,
+    );
     expect(thread).toContain('thread.spawned === true ? "⑂ "');
     expect(thread).toContain('event.key !== "Enter" || event.shiftKey');
     expect(app).toMatch(
