@@ -35,6 +35,21 @@ describe("Virtualizer", () => {
     expect(virtualizer.window().items[0]?.item.id).toBe("item-4");
   });
 
+  it("updates row geometry when the anchored item changes without moving scroll", () => {
+    const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 100 });
+    virtualizer.setViewport(0, 40);
+    virtualizer.setItems(items(6));
+    virtualizer.setViewport(45, 40);
+
+    const changed = virtualizer.measure("item-2", 50);
+    expect(changed.delta).toBe(0);
+    expect(changed.scrollTop).toBe(45);
+    expect(virtualizer.window().totalHeight).toBe(150);
+    expect(
+      virtualizer.window().items.find(({ item }) => item.id === "item-3")?.start,
+    ).toBe(90);
+  });
+
   it("preserves a stable visible anchor when items are prepended", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
     virtualizer.setViewport(0, 40);

@@ -13,10 +13,17 @@ const numberFrom = (source: string, expression: RegExp, label: string): number =
 
 describe("Slint/Lit visual contract", () => {
   const slint = read("../../../../crates/trouve-app/ui/app.slint");
+  const settingsSlint = read(
+    "../../../../crates/trouve-app/ui/settings-window.slint",
+  );
+  const slintActivitySpinner = read(
+    "../../../../crates/trouve-app/ui/assets/activity-spinner.svg",
+  );
   const tokens = read("./tokens.css");
   const themes = read("./themes.generated.css");
   const app = read("./app.css");
   const shell = read("../app/trouve-app.ts");
+  const sessionList = read("../components/session-list.ts");
   const thread = read("../components/thread-screen.ts");
   const newThread = read("../components/new-thread-setup.ts");
   const settings = read("../components/settings-screen.ts");
@@ -251,6 +258,14 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toMatch(
       /\.thread-panel \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*overflow:\s*hidden/s,
     );
+    expect(app).toMatch(
+      /\.chat-stream \{[^}]*padding-inline:\s*10px/s,
+    );
+    expect(app).toMatch(/\.message \{[^}]*margin:\s*0 0 10px/s);
+    expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*8px 0 6px/s);
+    expect(app).toMatch(
+      /\.agent-activity \{[^}]*margin:\s*4px 0 10px/s,
+    );
     expect(app).toContain(".user-message .message-header");
     expect(app).toContain(".assistant-message .message-header");
     expect(app).toContain(".thread-todo-progress");
@@ -258,7 +273,10 @@ describe("Slint/Lit visual contract", () => {
       /\.agent-body-stream \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s,
     );
     expect(app).toMatch(
-      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s,
+      /\.agent-body-stream > \.activity-group:first-child \{[^}]*margin-block-start:\s*2px/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*4px/s,
     );
     expect(app).toMatch(
       /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
@@ -280,6 +298,9 @@ describe("Slint/Lit visual contract", () => {
       /\.activity-group \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
     );
     expect(app).toMatch(
+      /\.activity-group > summary \{[^}]*border:\s*1px solid var\(--trouve-card-border\)[^}]*border-radius:\s*var\(--trouve-radius\)[^}]*color:\s*var\(--trouve-text-mid\)[^}]*background:\s*var\(--trouve-surface\)/s,
+    );
+    expect(app).toMatch(
       /\.activity-group-body \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
     );
     expect(thread).toContain('class="composer-option mode-option"');
@@ -289,6 +310,57 @@ describe("Slint/Lit visual contract", () => {
     expect(thread).toContain('event.key !== "Enter" || event.shiftKey');
     expect(app).toMatch(
       /@media \(max-width: 760px\)[\s\S]*\.thread-tabs \{[^}]*height:\s*42px/,
+    );
+  });
+
+  it("matches Slint's running-tool activity spinner", () => {
+    const spinnerPath = /d="([^"]+)"/.exec(slintActivitySpinner)?.[1];
+    expect(spinnerPath).toBe("M12 3a9 9 0 1 1-9 9");
+    expect(slintActivitySpinner).toContain('stroke-linecap="round"');
+    expect(slintActivitySpinner).toContain('stroke-width="3"');
+    expect(slint).toContain("360deg * (mod(root.animation-time, 900ms) / 900ms)");
+    expect(thread).toContain(`d="${spinnerPath}"`);
+    expect(thread).toContain('class="tool-running-static">◌</span>');
+    expect(app).toMatch(
+      /\.tool-status\.running \{[^}]*height:\s*12px[^}]*color:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-context-spin 900ms linear infinite/s,
+    );
+    expect(app).toMatch(
+      /\.tool-running-spinner \{[^}]*width:\s*12px[^}]*height:\s*12px[^}]*fill:\s*none[^}]*stroke:\s*currentColor[^}]*stroke-linecap:\s*round[^}]*stroke-width:\s*3/s,
+    );
+    expect(app).toMatch(
+      /\[data-reduce-motion\] \.tool-status\.running \{[^}]*color:\s*var\(--trouve-text-dim\)[^}]*animation:\s*none/s,
+    );
+    expect(app).toContain("[data-reduce-motion] .tool-running-spinner { display: none; }");
+    expect(app).toContain("[data-reduce-motion] .tool-running-static { display: inline; }");
+  });
+
+  it("matches Slint's session-list status precedence and indicators", () => {
+    expect(slint).toContain("attention, error, unread, busy, PR");
+    expect(slint).toContain('icon: row.attention-kind == 2 ? "?" : "!"');
+    expect(slint).toContain('icon: "×"');
+    expect(slint).toContain('icon: "●"');
+    expect(slint).toContain("width: 10px");
+    expect(slint).toContain("height: 10px");
+    expect(slint).toContain("background: Theme.c.accent");
+    expect(slint).toContain("mod(root.activity-animation-time, 1.6s) / 1.6s");
+    expect(sessionList).toContain('kind: "approval", glyph: "!"');
+    expect(sessionList).toContain('kind: "question", glyph: "?"');
+    expect(sessionList).toContain('kind: "error", glyph: "×"');
+    expect(sessionList).toContain('kind: "unread", glyph: "●"');
+    expect(sessionList).toContain('kind: "busy", glyph: ""');
+    expect(sessionList).toContain('kind: "none", glyph: ""');
+    expect(sessionList).toContain('class="session-pr-badge ${pullRequestBadge.tone}"');
+    expect(app).toMatch(
+      /\.session-indicator\.approval,[^}]*color:\s*var\(--trouve-warn\)[^}]*font-size:\s*16px/s,
+    );
+    expect(app).toMatch(
+      /\.session-indicator\.error \{[^}]*color:\s*var\(--trouve-err\)[^}]*font-size:\s*18px/s,
+    );
+    expect(app).toMatch(
+      /\.session-indicator\.unread \{[^}]*color:\s*var\(--trouve-accent\)[^}]*font-size:\s*11px/s,
+    );
+    expect(app).toMatch(
+      /\.session-indicator\.busy::before \{[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-session-busy-pulse 1\.6s linear infinite/s,
     );
   });
 
@@ -353,8 +425,13 @@ describe("Slint/Lit visual contract", () => {
       /\.permission-option > span\.permission-yolo \{[^}]*color:\s*var\(--trouve-err\)/s,
     );
     expect(app).toMatch(
-      /\.permission-option select\.permission-yolo \{[^}]*border-color:\s*var\(--trouve-err\)[^}]*color:\s*var\(--trouve-err\)/s,
+      /\.permission-option select\.permission-yolo:not\(:disabled\)[^{]*\{[^}]*border-color:\s*var\(--trouve-err\)[^}]*color:\s*var\(--trouve-err\)/s,
     );
+    expect(app).toMatch(
+      /\.permission-option select\.permission-yolo:disabled \{[^}]*border-color:\s*var\(--trouve-border\)[^}]*color:\s*var\(--trouve-text-disabled\)[^}]*font-weight:\s*400/s,
+    );
+    expect(app).toContain(".composer-option select:hover:not(:disabled)");
+    expect(app).not.toContain(".composer-option select:hover {");
   });
 
   it("keeps compact Slint settings labels, meters, copy, and form alignment", () => {
@@ -371,5 +448,39 @@ describe("Slint/Lit visual contract", () => {
     expect(providerSettings).toContain('class="health-meter"');
     expect(providerSettings).not.toContain("<progress max=\"100\" .value=");
     expect(providerSettings).not.toContain("${health.status}</span>");
+  });
+
+  it("keeps Slint's session-naming choices and reactive explanations", () => {
+    for (const label of [
+      "Adaptive (Recommended)",
+      "Keep Ready",
+      "Load When Needed",
+      "Rules Only",
+      "GPU, CPU, & RAM",
+      "GPU Only",
+      "CPU & RAM Only",
+    ]) {
+      expect(settingsSlint).toContain(`"${label}"`);
+      expect(managementSettings).toContain(`label: "${label}"`);
+    }
+    for (const description of [
+      "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed.",
+      "Loads the naming model at startup and keeps it in memory for the fastest new-session creation.",
+      "Loads the naming model when a session is created, then releases it after a short idle period.",
+      "Uses fast built-in heuristics and never loads the optional naming model.",
+      "Uses GPU, CPU, and RAM when no local coding model is active; otherwise uses CPU and RAM only.",
+      "Lets llama.cpp use available GPU memory and spill remaining work to CPU and system RAM.",
+      "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
+      "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
+    ]) {
+      expect(settingsSlint).toContain(`"${description}"`);
+      expect(managementSettings).toContain(`"${description}"`);
+    }
+    expect(managementSettings).toContain("this.#draftLoadBehavior = behaviorSelect.value");
+    expect(managementSettings).toContain("this.#draftResourcePolicy = resourceSelect.value");
+    expect(managementSettings).toContain("const behavior = this.#draftLoadBehavior ??");
+    expect(managementSettings).toContain("const resources = this.#draftResourcePolicy ??");
+    expect(managementSettings).toContain("form.requestSubmit()");
+    expect(managementSettings).toContain("current?.title_model_resource_policy ?? \"adaptive\"");
   });
 });

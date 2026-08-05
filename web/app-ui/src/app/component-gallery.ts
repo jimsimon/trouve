@@ -46,11 +46,11 @@ export class TrouveComponentGallery extends LitElement {
           <div>
             <p class="gallery-label">Session navigation</p>
             <button class="session-row selected">
-              <span class="status-dot running" aria-hidden="true"></span>
+              <span class="session-indicator busy" aria-hidden="true"></span>
               <span class="session-copy"><strong>Preserve existing UX</strong><small>trouve/web-frontend</small></span>
             </button>
             <button class="session-row">
-              <span class="status-dot attention" aria-hidden="true"></span>
+              <span class="session-indicator approval" aria-hidden="true">!</span>
               <span class="session-copy"><strong>Approval needed</strong><small>trouve/protocol</small></span>
             </button>
           </div>

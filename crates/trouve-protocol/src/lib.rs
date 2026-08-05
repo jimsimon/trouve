@@ -163,7 +163,9 @@ pub use requests::*;
 // 3.2: transactionally derived session.notification edges preserve the native
 // background completion/failure/approval/question notification category and
 // optional compact detail without per-thread background streams (additive).
-pub const PROTOCOL_VERSION: &str = "3.2";
+// 3.3: folded tool-call items expose server-measured execution duration so
+// clients do not depend on incomplete provider result metadata (additive).
+pub const PROTOCOL_VERSION: &str = "3.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

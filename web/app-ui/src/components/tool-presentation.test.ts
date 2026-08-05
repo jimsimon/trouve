@@ -104,6 +104,11 @@ describe("Slint-equivalent tool presentation", () => {
       .toBe("exit 3 · 1m 05s");
     expect(toolExecutionMetadata({ metadata: { exitCode: 0 } }, 812))
       .toBe("exit 0 · 812ms");
+    expect(toolExecutionMetadata({ exit_code: 0, duration_ms: 0 }, 50))
+      .toBe("exit 0 · 50ms");
+    expect(toolExecutionMetadata({ exit_code: 0, duration_ms: 0 }))
+      .toBe("exit 0");
+    expect(toolExecutionMetadata({}, 0)).toBe("<1ms");
     expect(toolExecutionMetadata({ code: 404 })).toBe("");
     expect(toolExecutionMetadata(null)).toBe("");
   });

@@ -333,6 +333,11 @@ pub enum ThreadViewItem {
         status: ThreadToolStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<serde_json::Value>,
+        /// Wall-clock execution time derived from the durable tool event
+        /// timestamps. This remains available when a provider omits timing
+        /// metadata or reports a zero-valued placeholder in its result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnStatus {
         turn: u64,

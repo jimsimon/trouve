@@ -15,6 +15,45 @@ import {
 
 let nextArchivedListId = 0;
 
+type SessionIndicatorKind =
+  | "approval"
+  | "question"
+  | "both"
+  | "error"
+  | "unread"
+  | "busy"
+  | "none";
+
+interface SessionIndicatorPresentation {
+  readonly kind: SessionIndicatorKind;
+  readonly glyph: string;
+  readonly tooltip: string;
+}
+
+const sessionIndicatorPresentation = (
+  session: SessionListItem,
+): SessionIndicatorPresentation => {
+  if (session.attention === "approval") {
+    return { kind: "approval", glyph: "!", tooltip: "Approval pending" };
+  }
+  if (session.attention === "question") {
+    return { kind: "question", glyph: "?", tooltip: "Question awaiting an answer" };
+  }
+  if (session.attention === "both") {
+    return { kind: "both", glyph: "!", tooltip: "Approval and question need attention" };
+  }
+  if (session.unread && session.outcome === "failed") {
+    return { kind: "error", glyph: "×", tooltip: "Turn ended with an error" };
+  }
+  if (session.unread && session.outcome === "succeeded") {
+    return { kind: "unread", glyph: "●", tooltip: "Unviewed work" };
+  }
+  if (session.active || session.outcome === "running") {
+    return { kind: "busy", glyph: "", tooltip: "" };
+  }
+  return { kind: "none", glyph: "", tooltip: "" };
+};
+
 /** A first real context consumer: gallery tests can provide an isolated store,
  * while application screens share the stable provider at the shell boundary. */
 export class TrouveSessionList extends withSignalTracking(LitElement) {
@@ -181,9 +220,10 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const pullRequestBadge = sessionPullRequestBadge(
       store?.sessionPullRequests(session.id) ?? [],
     );
-    // Slint gives attention/error/running/unread state priority over PR state.
-    // The web summary does not carry its local unread bit, so retain the done
-    // marker on unselected sessions and show the PR once it is viewed.
+    const indicator = sessionIndicatorPresentation(session);
+    // Slint gives attention/error/unread/busy state priority over PR state.
+    // Opening a session clears its client-local unread marker; permit the PR
+    // handoff during the selected row's intervening render as well.
     const showPullRequestBadge = pullRequestBadge !== undefined && (
       session.state === "idle" || (session.state === "done" && selected)
     );
@@ -202,7 +242,11 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         title=${pullRequestBadge.tooltip}
                         aria-label=${pullRequestBadge.tooltip.replaceAll("\n", ". ")}
                       ><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="3" r="2"></circle><circle cx="4" cy="13" r="2"></circle><circle cx="12" cy="5" r="2"></circle><path d="M4 5v6M6 11c3.25 0 4-1.5 4-4"></path></svg></span>`
-                    : html`<span class="status-dot ${session.state}" aria-hidden="true"></span>`}
+                    : html`<span
+                        class="session-indicator ${indicator.kind}"
+                        title=${indicator.tooltip === "" ? nothing : indicator.tooltip}
+                        aria-hidden="true"
+                      >${indicator.glyph}</span>`}
                   <span class="session-copy">
                     <strong>${session.title}</strong>
                     <small>${session.branch}${session.archived ? " · Archived" : ""}</small>

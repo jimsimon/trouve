@@ -236,6 +236,7 @@ export class ThreadViewModel {
             : item.status,
           result: item.result,
           output: emptyToolOutput(),
+          ...(item.duration_ms == null ? {} : { durationMs: item.duration_ms }),
         };
       case "turn_status": {
         let state: TurnState;

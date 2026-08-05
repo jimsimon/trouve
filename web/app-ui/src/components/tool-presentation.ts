@@ -28,8 +28,9 @@ export interface ToolPresentation {
   readonly todos: readonly ToolTodoRow[];
 }
 
-/** Compact execution facts shown beside the tool title. Event timing is the
- * fallback because providers use several result-field spellings. */
+/** Compact execution facts shown beside the tool title. A positive provider
+ * duration is authoritative; zero is commonly a provider placeholder, so a
+ * server/event measurement supplies the fallback. */
 export const toolExecutionMetadata = (
   resultValue: unknown,
   measuredDurationMs?: number,
@@ -47,17 +48,27 @@ export const toolExecutionMetadata = (
     return undefined;
   };
   const exitCode = firstNumber(["exit_code", "exitCode"]);
-  const durationMs = firstNumber([
+  const reportedDurationMs = firstNumber([
     "duration_ms",
     "durationMs",
     "elapsed_ms",
     "elapsedMs",
-  ]) ?? measuredDurationMs;
+  ]);
+  const validMeasuredDurationMs = measuredDurationMs !== undefined
+    && Number.isFinite(measuredDurationMs)
+    && measuredDurationMs >= 0
+    ? measuredDurationMs
+    : undefined;
+  const durationMs = reportedDurationMs !== undefined && reportedDurationMs > 0
+    ? reportedDurationMs
+    : validMeasuredDurationMs;
   const parts: string[] = [];
   if (exitCode !== undefined) parts.push(`exit ${exitCode}`);
   if (durationMs !== undefined && Number.isFinite(durationMs)) {
     const milliseconds = Math.max(0, Math.floor(durationMs));
-    if (milliseconds < 1_000) {
+    if (milliseconds === 0) {
+      parts.push("<1ms");
+    } else if (milliseconds < 1_000) {
       parts.push(`${milliseconds}ms`);
     } else {
       const seconds = Math.floor(milliseconds / 1_000);

@@ -13,6 +13,11 @@ use trouve_protocol::{
 pub struct ThreadProjection {
     pub cursor: u64,
     pub snapshot: ThreadViewSnapshot,
+    /// Execution anchors are projection state rather than protocol state.
+    /// They are serialized with the cache so a command that spans a cache
+    /// refresh still receives an accurate duration when it completes.
+    #[serde(default)]
+    tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -126,8 +131,15 @@ impl ThreadProjection {
                         ThreadToolStatus::Running
                     },
                     result: None,
+                    duration_ms: None,
                 });
                 self.indexes.tools.insert(call_id.clone(), idx);
+                if !requires_approval {
+                    // ToolRequested is the best fallback for backends that do
+                    // not emit a distinct ToolStarted event. A later start
+                    // replaces this anchor.
+                    self.tool_started_at.insert(call_id.clone(), envelope.ts);
+                }
             }
             Event::ApprovalRequested { call_id, .. } => {
                 if !self.snapshot.pending_approvals.contains(call_id) {
@@ -148,6 +160,7 @@ impl ThreadProjection {
                 }
             }
             Event::ToolStarted { call_id } => {
+                let mut started = false;
                 if let Some(ThreadViewItem::ToolCall { status, .. }) = self.tool_mut(call_id) {
                     let terminal = matches!(
                         *status,
@@ -158,7 +171,11 @@ impl ThreadProjection {
                     );
                     if !terminal && *status != ThreadToolStatus::AwaitingApproval {
                         *status = ThreadToolStatus::Running;
+                        started = true;
                     }
+                }
+                if started {
+                    self.tool_started_at.insert(call_id.clone(), envelope.ts);
                 }
             }
             Event::ToolCompleted {
@@ -166,9 +183,14 @@ impl ThreadProjection {
                 status,
                 result,
             } => {
+                let measured_duration_ms = self
+                    .tool_started_at
+                    .remove(call_id)
+                    .map(|started| (envelope.ts - started).num_milliseconds().max(0) as u64);
                 if let Some(ThreadViewItem::ToolCall {
                     status: current,
                     result: current_result,
+                    duration_ms,
                     ..
                 }) = self.tool_mut(call_id)
                 {
@@ -181,6 +203,9 @@ impl ThreadProjection {
                         };
                     }
                     *current_result = Some(result.clone());
+                    if measured_duration_ms.is_some() {
+                        *duration_ms = measured_duration_ms;
+                    }
                 }
                 self.snapshot.pending_approvals.retain(|id| id != call_id);
             }
@@ -320,5 +345,104 @@ impl ThreadProjection {
                 ThreadViewItem::User { .. } | ThreadViewItem::Assistant { .. } => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trouve_protocol::Scope;
+
+    fn envelope(cursor: u64, elapsed_ms: i64, event: Event) -> EventEnvelope {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        EventEnvelope {
+            cursor,
+            scope: Scope::Thread("thread".into()),
+            ts: start + chrono::Duration::milliseconds(elapsed_ms),
+            event,
+        }
+    }
+
+    fn measured_duration(projection: &ThreadProjection) -> Option<u64> {
+        match &projection.snapshot.items[0] {
+            ThreadViewItem::ToolCall { duration_ms, .. } => *duration_ms,
+            item => panic!("expected tool call, got {item:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_duration_uses_started_and_completed_event_timestamps() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "command".into(),
+                tool: "commandExecution".into(),
+                args: serde_json::json!({}),
+                requires_approval: true,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            5_000,
+            Event::ApprovalResolved {
+                call_id: "command".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            6_000,
+            Event::ToolStarted {
+                call_id: "command".into(),
+            },
+        ));
+
+        // Exercise the same serialization boundary used by the durable
+        // thread-view cache while this command is still running.
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        projection.apply(&envelope(
+            4,
+            6_050,
+            Event::ToolCompleted {
+                call_id: "command".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({ "exit_code": 0, "duration_ms": 0 }),
+            },
+        ));
+
+        assert_eq!(measured_duration(&projection), Some(50));
+    }
+
+    #[test]
+    fn requested_timestamp_is_fallback_when_started_event_is_absent() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            100,
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "command".into(),
+                tool: "commandExecution".into(),
+                args: serde_json::json!({}),
+                requires_approval: false,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            127,
+            Event::ToolCompleted {
+                call_id: "command".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({ "exit_code": 0 }),
+            },
+        ));
+
+        assert_eq!(measured_duration(&projection), Some(27));
     }
 }

@@ -222,6 +222,7 @@ impl From<ThreadViewItem> for ChatItem {
                 args,
                 status,
                 result,
+                duration_ms: _,
             } => Self::ToolCall {
                 call_id,
                 tool,

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.2"
+    "version": "3.3"
   },
   "paths": {
     "/v1/approvals": {
@@ -9416,6 +9416,15 @@
               "args": {},
               "call_id": {
                 "type": "string"
+              },
+              "duration_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Wall-clock execution time derived from the durable tool event\ntimestamps. This remains available when a provider omits timing\nmetadata or reports a zero-valued placeholder in its result.",
+                "minimum": 0
               },
               "kind": {
                 "type": "string",

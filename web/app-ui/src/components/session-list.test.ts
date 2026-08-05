@@ -23,10 +23,30 @@ describe("session list component contract", () => {
     expect(styles).toContain("var(--trouve-text-mid)");
   });
 
-  it("does not expose session state through the colored dot alone", () => {
-    expect(component).toContain('class="status-dot ${session.state}" aria-hidden="true"');
+  it("does not expose session state through its visual indicator alone", () => {
+    expect(component).toContain('class="session-indicator ${indicator.kind}"');
+    expect(component).not.toContain('class="status-dot ${session.state}"');
     expect(component).toContain('class="session-status-text visually-hidden"');
     expect(component).toContain("Status: ${sessionStatusText(session)}");
+  });
+
+  it("uses Slint's attention, error, unread, busy, and idle presentations", () => {
+    expect(component).toContain('kind: "approval", glyph: "!"');
+    expect(component).toContain('kind: "question", glyph: "?"');
+    expect(component).toContain('kind: "both", glyph: "!"');
+    expect(component).toContain('kind: "error", glyph: "×"');
+    expect(component).toContain('kind: "unread", glyph: "●"');
+    expect(component).toContain('kind: "busy", glyph: ""');
+    expect(component).toContain('kind: "none", glyph: ""');
+    expect(component).toContain('session.unread && session.outcome === "failed"');
+    expect(component).toContain('session.unread && session.outcome === "succeeded"');
+    expect(component).toContain('session.active || session.outcome === "running"');
+    expect(styles).toMatch(
+      /\.session-indicator\.busy::before \{[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-session-busy-pulse 1\.6s linear infinite/s,
+    );
+    expect(styles).toContain(
+      "[data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }",
+    );
   });
 
   it("preserves row actions and returns a deleted selection to shell recovery", () => {

@@ -393,12 +393,15 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
             .iter()
             .any(|item| item["kind"] == "assistant" && item["content"] == "Writing the file.")
     );
+    let folded_tool = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        .expect("completed tool call in folded view");
     assert!(
-        view["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        folded_tool["duration_ms"].is_u64(),
+        "folded tool calls retain server-measured execution time"
     );
     assert_eq!(view["turn_running"], false);
     let total_items = view["total_items"].as_u64().unwrap();

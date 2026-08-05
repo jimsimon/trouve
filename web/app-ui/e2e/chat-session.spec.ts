@@ -388,9 +388,27 @@ const horizontalOverflowFindings = async (
     return findings;
   });
 
+const transcriptComposerGap = async (page: Page): Promise<number> =>
+  page.locator("trouve-thread-screen.thread-panel").evaluate((panel) => {
+    const composer = panel.querySelector<HTMLElement>(".composer")?.getBoundingClientRect();
+    const rows = panel.querySelectorAll<HTMLElement>(
+      ".chat-stream [data-virtual-id]:not(.chat-edge-spacer)",
+    );
+    const tail = rows.item(rows.length - 1)?.getBoundingClientRect();
+    if (composer === undefined || tail === undefined) return Number.NaN;
+    return Math.round(composer.top - tail.bottom);
+  });
+
+const VIRTUAL_DISCLOSURE_GEOMETRY_TEST =
+  "resizing an anchored disclosure never overlaps adjacent virtual rows";
+
 test.beforeEach(async ({ page }, testInfo) => {
+  const ownsWebKitGeometryRegression =
+    testInfo.project.name === "desktop-webkit"
+    && testInfo.title === VIRTUAL_DISCLOSURE_GEOMETRY_TEST;
   test.skip(
-    !["desktop-chromium", "mobile-chromium"].includes(testInfo.project.name),
+    !["desktop-chromium", "mobile-chromium"].includes(testInfo.project.name)
+      && !ownsWebKitGeometryRegression,
     "Chromium desktop and mobile own the stateful chat DOM fixture",
   );
   await installEventStream(page);
@@ -408,6 +426,37 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
 
   await activityGroup.locator(":scope > summary").click();
   await expect(activityGroup.locator(".tool-card")).toHaveCount(2);
+  const groupedHeaderStyle = await activityGroup.locator(":scope > summary").evaluate(
+    (summary) => {
+      const style = getComputedStyle(summary);
+      return {
+        backgroundColor: style.backgroundColor,
+        borderColor: style.borderColor,
+      };
+    },
+  );
+  const toolCardStyle = await activityGroup.locator(".tool-card").first().evaluate(
+    (card) => {
+      const style = getComputedStyle(card);
+      return {
+        backgroundColor: style.backgroundColor,
+        borderColor: style.borderColor,
+      };
+    },
+  );
+  const groupedBodyBackground = await activityGroup.locator(".activity-group-body").evaluate(
+    (body) => getComputedStyle(body).backgroundColor,
+  );
+  const groupedToolGap = await activityGroup.locator(".tool-card").evaluateAll((cards) => {
+    const first = cards[0]?.getBoundingClientRect();
+    const second = cards[1]?.getBoundingClientRect();
+    return first === undefined || second === undefined
+      ? Number.NaN
+      : Math.round(second.top - first.bottom);
+  });
+  expect(groupedHeaderStyle).toEqual(toolCardStyle);
+  expect(groupedBodyBackground).toBe("rgba(0, 0, 0, 0)");
+  expect(groupedToolGap).toBe(12);
   await expect(page.getByLabel("Live tool output")).toHaveCount(0);
 
   const editCard = page.locator('.tool-card[data-call-id="call_edit"]');
@@ -447,6 +496,389 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
   expect(result.violations.filter(({ impact }) =>
     impact === "serious" || impact === "critical"
   )).toEqual([]);
+});
+
+test("running activity groups retain explicit disclosure state as tools arrive", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Run several commands",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "call_group_1",
+      tool: "Bash",
+      args: { command: "first" },
+      requires_approval: false,
+    }),
+    threadEvent(19, { type: "tool.started", call_id: "call_group_1" }),
+    threadEvent(20, {
+      type: "tool.completed",
+      call_id: "call_group_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(21, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "call_group_2",
+      tool: "Bash",
+      args: { command: "second" },
+      requires_approval: false,
+    }),
+    threadEvent(22, { type: "tool.started", call_id: "call_group_2" }),
+  ]);
+
+  const group = page.locator(".activity-group").last();
+  await expect(group).toBeVisible();
+  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+
+  await group.locator(":scope > summary").click();
+  await expect(group.locator(".tool-card")).toHaveCount(2);
+  await emitBatch(page, [
+    threadEvent(23, {
+      type: "tool.completed",
+      call_id: "call_group_2",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(24, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "call_group_3",
+      tool: "Bash",
+      args: { command: "third" },
+      requires_approval: false,
+    }),
+    threadEvent(25, { type: "tool.started", call_id: "call_group_3" }),
+  ]);
+  await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".tool-card")).toHaveCount(3);
+
+  await group.locator(":scope > summary").click();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await emitBatch(page, [
+    threadEvent(26, {
+      type: "tool.completed",
+      call_id: "call_group_3",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(27, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "call_group_4",
+      tool: "Bash",
+      args: { command: "fourth" },
+      requires_approval: false,
+    }),
+    threadEvent(28, { type: "tool.started", call_id: "call_group_4" }),
+  ]);
+  await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+});
+
+test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    !["desktop-chromium", "desktop-webkit"].includes(testInfo.project.name),
+    "Desktop Chromium and WebKit own the frame-level virtual-row geometry regression",
+  );
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Fill the history before the disclosure",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "assistant.message",
+      turn: 8,
+      content: Array.from(
+        { length: 30 },
+        (_, index) => `Earlier response paragraph ${index}: preserve its virtual height.`,
+      ).join("\n\n"),
+    }),
+    threadEvent(19, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 2, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+    threadEvent(20, {
+      type: "turn.started",
+      turn: 9,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(21, {
+      type: "user.message",
+      turn: 9,
+      content: "Run the grouped commands",
+      attachments: [],
+    }),
+    threadEvent(22, {
+      type: "tool.requested",
+      turn: 9,
+      call_id: "call_anchor_1",
+      tool: "Bash",
+      args: { command: "first" },
+      requires_approval: false,
+    }),
+    threadEvent(23, { type: "tool.started", call_id: "call_anchor_1" }),
+    threadEvent(24, {
+      type: "tool.completed",
+      call_id: "call_anchor_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(25, {
+      type: "tool.requested",
+      turn: 9,
+      call_id: "call_anchor_2",
+      tool: "Bash",
+      args: { command: "second" },
+      requires_approval: false,
+    }),
+    threadEvent(26, { type: "tool.started", call_id: "call_anchor_2" }),
+    threadEvent(27, {
+      type: "tool.completed",
+      call_id: "call_anchor_2",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(28, {
+      type: "turn.completed",
+      turn: 9,
+      usage: { input_tokens: 2, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+    threadEvent(29, {
+      type: "turn.started",
+      turn: 10,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(30, {
+      type: "user.message",
+      turn: 10,
+      content: "Keep content after the disclosure",
+      attachments: [],
+    }),
+    threadEvent(31, {
+      type: "assistant.message",
+      turn: 10,
+      content: Array.from(
+        { length: 20 },
+        (_, index) => `Later response paragraph ${index}: remain below the resized row.`,
+      ).join("\n\n"),
+    }),
+    threadEvent(32, {
+      type: "turn.completed",
+      turn: 10,
+      usage: { input_tokens: 2, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const group = page.locator(".activity-group").last();
+  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
+  const seams = await group.locator(":scope > summary").evaluate(async (summary) => {
+    const viewport = summary.closest("trouve-thread-screen")
+      ?.querySelector<HTMLElement>(".chat-stream");
+    const row = summary.closest<HTMLElement>("[data-virtual-id]");
+    if (viewport === undefined || viewport === null || row === null) {
+      throw new Error("missing virtual disclosure geometry");
+    }
+    const rowStart = Number.parseFloat(row.style.insetBlockStart || "0");
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -12 }));
+    viewport.scrollTop = Math.max(0, rowStart + 12);
+    viewport.dispatchEvent(new Event("scroll"));
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+
+    const clickAndMeasureSeams = async (): Promise<readonly number[]> => {
+      const liveSummary = row.querySelector<HTMLElement>(".activity-group > summary");
+      if (liveSummary === null) throw new Error("missing live disclosure summary");
+      liveSummary.click();
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => globalThis.setTimeout(resolve, 0));
+      });
+      const bounds = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+        .map((element) => element.getBoundingClientRect())
+        .filter(({ height }) => height > 0)
+        .sort((left, right) => left.top - right.top);
+      return bounds.slice(1).map(
+        ({ top }, index) => top - (bounds[index]?.bottom ?? top),
+      );
+    };
+
+    return {
+      expanded: await clickAndMeasureSeams(),
+      collapsed: await clickAndMeasureSeams(),
+    };
+  });
+  for (const seam of [...seams.expanded, ...seams.collapsed]) {
+    expect(Math.abs(seam)).toBeLessThanOrEqual(1);
+  }
+});
+
+test("collapsing the bottom tool keeps the live tail stable", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Run a verbose command",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "assistant.message",
+      turn: 8,
+      content: Array.from(
+        { length: 48 },
+        (_, index) => `Preceding response line ${index}: keep the closed tool below the fold.`,
+      ).join("\n\n"),
+    }),
+    threadEvent(19, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "call_tail",
+      tool: "Bash",
+      args: { command: "verbose-command" },
+      requires_approval: false,
+    }),
+    threadEvent(20, { type: "tool.started", call_id: "call_tail" }),
+    threadEvent(21, {
+      type: "tool.output",
+      call_id: "call_tail",
+      chunk: Array.from(
+        { length: 48 },
+        (_, index) => `Verbose output line ${index}: dynamic tail measurement.`,
+      ).join("\n"),
+    }),
+    threadEvent(22, {
+      type: "tool.completed",
+      call_id: "call_tail",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(23, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 2, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const card = page.locator('[data-call-id="call_tail"]');
+  const summary = card.locator(":scope > summary");
+  await expect(summary).toBeVisible();
+  await expect.poll(() => transcriptComposerGap(page)).toBe(8);
+
+  await summary.click();
+  await expect(card.getByLabel("Live tool output")).toBeVisible();
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  expect(await transcriptComposerGap(page)).toBe(8);
+
+  await summary.click();
+  await expect(card.getByLabel("Live tool output")).toHaveCount(0);
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  expect(await transcriptComposerGap(page)).toBe(8);
+
+  const collapsedGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
+    canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
+      ?.getBoundingClientRect().height ?? 0,
+    scrollTop: viewport.scrollTop,
+  }));
+  const expectedParkedTop = await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -64 }));
+    const target = Math.max(0, viewport.scrollTop - 64);
+    viewport.scrollTop = target;
+    viewport.dispatchEvent(new Event("scroll"));
+    return target;
+  });
+  await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
+    "aria-live",
+    "off",
+  );
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  const parkedGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
+    canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
+      ?.getBoundingClientRect().height ?? 0,
+    scrollTop: viewport.scrollTop,
+  }));
+  expect(parkedGeometry.canvasHeight).toBe(collapsedGeometry.canvasHeight);
+  expect(Math.abs(parkedGeometry.scrollTop - expectedParkedTop)).toBeLessThanOrEqual(1);
+  await page.getByRole("button", { name: "Jump to latest" }).click();
+  await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
+    "aria-live",
+    "polite",
+  );
+  await expect.poll(() => transcriptComposerGap(page)).toBe(8);
+
+  const repinnedGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
+    canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
+      ?.getBoundingClientRect().height ?? 0,
+    scrollTop: viewport.scrollTop,
+  }));
+  await page.getByRole("textbox", { name: "Message", exact: true }).fill("Keep the tail still");
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  expect(await transcriptComposerGap(page)).toBe(8);
+  const afterTypingGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
+    canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
+      ?.getBoundingClientRect().height ?? 0,
+    scrollTop: viewport.scrollTop,
+  }));
+  expect(afterTypingGeometry.canvasHeight).toBe(repinnedGeometry.canvasHeight);
+  expect(Math.abs(afterTypingGeometry.scrollTop - repinnedGeometry.scrollTop)).toBeLessThanOrEqual(1);
+  await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
+    "aria-live",
+    "polite",
+  );
+  await expect(page.getByRole("button", { name: "Jump to latest" })).toHaveCount(0);
 });
 
 test("chat surfaces contain pathological content from narrow to wide layouts", async ({
@@ -785,6 +1217,10 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   expect(scrollGeometry.canvasHeight).toBeGreaterThan(scrollGeometry.clientHeight);
   expect(scrollGeometry.scrollHeight).toBeGreaterThan(scrollGeometry.clientHeight);
 
+  await expect.poll(() => transcriptComposerGap(page), {
+    message: "the transcript tail should use Slint's 8px composer separation",
+  }).toBe(8);
+
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
     viewport.scrollTop = 0;
@@ -804,6 +1240,9 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
+  await expect.poll(() => transcriptComposerGap(page), {
+    message: "jumping to the tail should preserve Slint's 8px composer separation",
+  }).toBe(8);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -8 }));

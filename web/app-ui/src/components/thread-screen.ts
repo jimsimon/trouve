@@ -131,11 +131,10 @@ type VirtualChatItem = VirtualItem & (
   | { readonly kind: "compacting" }
   | { readonly kind: "activity"; readonly label: string }
   | { readonly kind: "history" }
-  | { readonly kind: "edge-spacer"; readonly edge: "start" | "end" }
+  | { readonly kind: "edge-spacer"; readonly edge: "start" }
 );
 
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
-const CHAT_END_SPACER_ID = "ephemeral:chat-end-spacer";
 const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
 const CHAT_TAIL_EPSILON_PX = 2;
 const CHAT_POSITION_SETTLE_MS = 140;
@@ -147,11 +146,17 @@ const sameVirtualRenderWindow = (
   right: VirtualWindow<VirtualChatItem>,
 ): boolean =>
   left.followingTail === right.followingTail
+  && left.totalHeight === right.totalHeight
   && left.paddingBefore === right.paddingBefore
   && left.paddingAfter === right.paddingAfter
   && left.items.length === right.items.length
   && left.items.every(
-    ({ item }, index) => item.id === right.items[index]?.item.id,
+    ({ item, start, height }, index) => {
+      const candidate = right.items[index];
+      return item.id === candidate?.item.id
+        && start === candidate.start
+        && height === candidate.height;
+    },
   );
 
 interface ActiveComposerCompletion {
@@ -500,7 +505,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const before = this.#virtualizer.window();
       const followingTail = before.followingTail;
       let measured = false;
-      let corrected = false;
+      let scrollCorrected = false;
       let scrollTop = activeViewport.scrollTop;
       for (const entry of entries) {
         const element = entry.target as HTMLElement;
@@ -510,7 +515,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         try {
           const correction = this.#virtualizer.measure(id, entry.contentRect.height);
           if (correction.delta !== 0) {
-            corrected = true;
+            scrollCorrected = true;
             // A ResizeObserver delivery can lag behind another native scroll
             // frame. Apply parked-history corrections relative to the live DOM
             // position instead of writing the virtualizer's now-stale absolute
@@ -523,19 +528,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           // A row may have unmounted between delivery and measurement.
         }
       }
-      if (followingTail && measured) {
-        // A remounted cached child can expand back to its already-known
-        // measurement. The virtual model then reports no delta even though
-        // the DOM's scroll range grew, so live-tail pinning must follow every
-        // observed layout delivery rather than only new measurements.
-        this.#setChatScrollTop(
-          activeViewport,
-          this.#transcriptTailScrollTop(activeViewport),
-        );
-        if (!sameVirtualRenderWindow(before, this.#virtualizer.window())) {
-          this.#scheduleScrollRender();
-        }
-      } else if (corrected) {
+      let expectedScrollTop: number | undefined;
+      if (!followingTail && scrollCorrected) {
         if (Date.now() < this.#scrollCorrectionResumeAt) {
           // Keep the native viewport authoritative while wheel/touch momentum
           // is active. Measurements still improve future windows, but must
@@ -547,12 +541,29 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           );
         } else {
           this.#virtualizer.setViewport(scrollTop, activeViewport.clientHeight);
-          scrollTop = this.#virtualizer.window().scrollTop;
-          this.#setChatScrollTop(activeViewport, scrollTop);
+          expectedScrollTop = this.#virtualizer.window().scrollTop;
         }
-        if (!sameVirtualRenderWindow(before, this.#virtualizer.window())) {
-          this.#scheduleScrollRender();
-        }
+      }
+      const after = this.#virtualizer.window();
+      if (!sameVirtualRenderWindow(before, after)) {
+        // A measured row can change height without changing scrollTop when it
+        // is the parked anchor or sits below it. Reposition the already-
+        // mounted absolute rows before paint; waiting for the next virtual
+        // render would briefly draw the resized row over its successor.
+        this.#syncMountedVirtualGeometry(activeViewport, after);
+        this.#scheduleScrollRender();
+      }
+      if (followingTail && measured) {
+        // A remounted cached child can expand back to its already-known
+        // measurement. The virtual model then reports no delta even though
+        // the DOM's scroll range grew, so live-tail pinning must follow every
+        // observed layout delivery rather than only new measurements.
+        this.#setChatScrollTop(
+          activeViewport,
+          this.#transcriptTailScrollTop(activeViewport),
+        );
+      } else if (expectedScrollTop !== undefined) {
+        this.#setChatScrollTop(activeViewport, expectedScrollTop);
       }
     });
     const mountedRows = new Set(
@@ -1216,17 +1227,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
     }
     if (virtualItems.length > 0) {
+      // Keep the transcript tail flush with the virtual canvas. The queue and
+      // composer own Slint's 8px separation outside the scrollport; a virtual
+      // end spacer would duplicate that gap and move every tail-pin target.
       virtualItems.unshift({
         id: CHAT_START_SPACER_ID,
         kind: "edge-spacer",
         edge: "start",
         estimatedHeight: 10,
-      });
-      virtualItems.push({
-        id: CHAT_END_SPACER_ID,
-        kind: "edge-spacer",
-        edge: "end",
-        estimatedHeight: 18,
       });
     }
     this.#virtualizer.setMode(this.#accessibleHistory ? "accessible" : "virtual");
@@ -1515,16 +1523,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const needsApproval = items.some(
       (item) => item.kind === "tool" && item.status === "awaiting-approval",
     );
-    const state = presentation.turnStates.get(unit.turn);
-    const done = state !== undefined && state.kind !== "running";
-    const open = needsApproval || (this.#messageDisclosure.get(key) ?? !done);
+    const open = needsApproval || (this.#messageDisclosure.get(key) ?? false);
     return html`
       <details
         class="activity-group"
         .open=${open}
-        @toggle=${(event: Event) => this.#activityGroupChanged(event, key, needsApproval)}
       >
-        <summary>
+        <summary
+          @click=${(event: Event) =>
+            this.#toggleActivityGroup(event, key, open, needsApproval)}
+        >
           <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
           <strong>${activityGroupSummary(items)}</strong>
         </summary>
@@ -1542,15 +1550,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
-  #activityGroupChanged(event: Event, key: string, forcedOpen: boolean): void {
-    const details = event.currentTarget as HTMLDetailsElement;
-    if (forcedOpen && !details.open) {
-      details.open = true;
-      return;
-    }
-    if (this.#messageDisclosure.get(key) === details.open) return;
-    this.#messageDisclosure.set(key, details.open);
-    this.requestUpdate();
+  #toggleActivityGroup(
+    event: Event,
+    key: string,
+    open: boolean,
+    forcedOpen: boolean,
+  ): void {
+    event.preventDefault();
+    if (forcedOpen) return;
+    this.#messageDisclosure.set(key, !open);
+    this.#requestDisclosureUpdate();
   }
 
   #renderQueue(
@@ -1745,6 +1754,22 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
     });
     viewport.scrollTop = scrollTop;
+  }
+
+  #syncMountedVirtualGeometry(
+    viewport: HTMLElement,
+    virtualWindow: VirtualWindow<VirtualChatItem>,
+  ): void {
+    const canvas = viewport.querySelector<HTMLElement>(".chat-virtual-canvas");
+    if (canvas !== null) canvas.style.height = `${virtualWindow.totalHeight}px`;
+    const starts = new Map(
+      virtualWindow.items.map(({ item, start }) => [item.id, start] as const),
+    );
+    for (const row of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
+      const id = row.dataset["virtualId"];
+      const start = id === undefined ? undefined : starts.get(id);
+      if (start !== undefined) row.style.setProperty("inset-block-start", `${start}px`);
+    }
   }
 
   #transcriptTailScrollTop(viewport: HTMLElement): number {
@@ -2061,14 +2086,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             class=${`message tool-card ${approvalRequired ? "approval-required" : ""}`}
             data-call-id=${item.callId}
             ?open=${toolOpen}
-            @toggle=${(event: Event) =>
-              this.#toolDisclosureChanged(event, item.callId, approvalRequired)}
             @keydown=${(event: KeyboardEvent) =>
               this.#approvalShortcut(event, item.callId)}
           >
-            <summary>
+            <summary
+              @click=${(event: Event) =>
+                this.#toggleToolDisclosure(event, item.callId, approvalRequired)}
+            >
               <span class="tool-disclosure" aria-hidden="true">${toolOpen ? "▾" : "▸"}</span>
-              <span class="tool-status ${item.status}" aria-hidden="true">${toolStatusGlyph(item.status)}</span>
+              <span class="tool-status ${item.status}" aria-hidden="true">
+                ${item.status === "running"
+                  ? html`
+                      <svg class="tool-running-spinner" viewBox="0 0 24 24">
+                        <path d="M12 3a9 9 0 1 1-9 9"></path>
+                      </svg>
+                      <span class="tool-running-static">◌</span>
+                    `
+                  : toolStatusGlyph(item.status)}
+              </span>
               <strong>${toolPresentation.title}</strong>
               ${toolPresentation.subject === ""
                 ? nothing
@@ -2405,19 +2440,30 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #toggleMessageDisclosure(itemId: string, defaultOpen: boolean): void {
     const open = this.#messageDisclosure.get(itemId) ?? defaultOpen;
     this.#messageDisclosure.set(itemId, !open);
-    this.requestUpdate();
+    this.#requestDisclosureUpdate();
   }
 
   #toggleRawAssistant(turn: number): void {
     if (this.#rawAssistantTurns.has(turn)) this.#rawAssistantTurns.delete(turn);
     else this.#rawAssistantTurns.add(turn);
-    this.requestUpdate();
+    this.#requestDisclosureUpdate();
   }
 
   #toggleRawTool(callId: string): void {
     if (this.#rawToolCalls.has(callId)) this.#rawToolCalls.delete(callId);
     else this.#rawToolCalls.add(callId);
+    this.#requestDisclosureUpdate();
+  }
+
+  #requestDisclosureUpdate(): void {
+    const preserveTail = this.#virtualizer.window().followingTail;
     this.requestUpdate();
+    if (!preserveTail) return;
+    // A disclosure changes its box before ResizeObserver reports the new
+    // virtual-row height. Guard layout-generated scroll events and converge
+    // on the real tail while Lit and the virtual canvas apply the measurement.
+    this.#scrollCorrectionResumeAt = 0;
+    this.#scheduleTailConvergence();
   }
 
   async #copyText(key: string, value: string): Promise<void> {
@@ -3663,19 +3709,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     void this.#resolveApproval(callId, decision);
   }
 
-  #toolDisclosureChanged(
+  #toggleToolDisclosure(
     event: Event,
     callId: string,
     approvalRequired: boolean,
   ): void {
-    const details = event.currentTarget as HTMLDetailsElement;
-    if (approvalRequired && !details.open) {
-      details.open = true;
-      return;
-    }
-    if (this.#toolDisclosure.get(callId) === details.open) return;
-    this.#toolDisclosure.set(callId, details.open);
-    this.requestUpdate();
+    // Own the disclosure state instead of letting <details> mutate first.
+    // That lets live-tail convergence start before the row changes height.
+    event.preventDefault();
+    if (approvalRequired) return;
+    const open = this.#toolDisclosure.get(callId) ?? false;
+    this.#toolDisclosure.set(callId, !open);
+    this.#requestDisclosureUpdate();
   }
 
   async #resolveApproval(

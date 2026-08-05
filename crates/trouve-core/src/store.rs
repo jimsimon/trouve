@@ -21,9 +21,12 @@ use trouve_protocol::{
 };
 use trouve_thread_view::ThreadProjection;
 
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Version 2 retains server-measured per-tool execution durations. Treat the
+// projection as a rebuildable cache so existing databases are upgraded by
+// folding their durable event history again, without a storage migration.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,

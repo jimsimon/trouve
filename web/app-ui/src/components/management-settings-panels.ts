@@ -121,23 +121,84 @@ const panelStyles = css`
 const genericFailure = (action: string): string =>
   `${action} failed. Check server connectivity and configuration, then retry.`;
 
+type TitleModelLoadBehavior =
+  ProtocolGitWorktreeSettings["title_model_load_behavior"];
+type TitleModelResourcePolicy = NonNullable<
+  ProtocolGitWorktreeSettings["title_model_resource_policy"]
+>;
+
+interface TitleModelOption<T extends string> {
+  readonly value: T;
+  readonly label: string;
+  readonly description: string;
+}
+
+const TITLE_MODEL_LOAD_OPTIONS = [
+  {
+    value: "auto",
+    label: "Adaptive (Recommended)",
+    description: "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed.",
+  },
+  {
+    value: "always",
+    label: "Keep Ready",
+    description: "Loads the naming model at startup and keeps it in memory for the fastest new-session creation.",
+  },
+  {
+    value: "on_demand",
+    label: "Load When Needed",
+    description: "Loads the naming model when a session is created, then releases it after a short idle period.",
+  },
+  {
+    value: "off",
+    label: "Rules Only",
+    description: "Uses fast built-in heuristics and never loads the optional naming model.",
+  },
+] as const satisfies readonly TitleModelOption<TitleModelLoadBehavior>[];
+
+const TITLE_MODEL_RESOURCE_OPTIONS = [
+  {
+    value: "adaptive",
+    label: "Adaptive (Recommended)",
+    description: "Uses GPU, CPU, and RAM when no local coding model is active; otherwise uses CPU and RAM only.",
+  },
+  {
+    value: "gpu_cpu_ram",
+    label: "GPU, CPU, & RAM",
+    description: "Lets llama.cpp use available GPU memory and spill remaining work to CPU and system RAM.",
+  },
+  {
+    value: "gpu_only",
+    label: "GPU Only",
+    description: "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
+  },
+  {
+    value: "cpu_ram_only",
+    label: "CPU & RAM Only",
+    description: "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
+  },
+] as const satisfies readonly TitleModelOption<TitleModelResourcePolicy>[];
+
+const isTitleModelLoadBehavior = (value: unknown): value is TitleModelLoadBehavior =>
+  typeof value === "string" &&
+  TITLE_MODEL_LOAD_OPTIONS.some((option) => option.value === value);
+
+const isTitleModelResourcePolicy = (value: unknown): value is TitleModelResourcePolicy =>
+  typeof value === "string" &&
+  TITLE_MODEL_RESOURCE_OPTIONS.some((option) => option.value === value);
+
+const titleModelOptionDescription = <T extends string>(
+  options: readonly TitleModelOption<T>[],
+  value: T,
+): string => options.find((option) => option.value === value)?.description ?? "";
+
 const titleModelLoadDescription = (
-  value: ProtocolGitWorktreeSettings["title_model_load_behavior"],
-): string => {
-  if (value === "always") return "Load at server startup and keep the naming model resident.";
-  if (value === "on_demand") return "Load for naming requests, then release it after an idle period.";
-  if (value === "off") return "Never load the model; use the built-in naming heuristics.";
-  return "Keep the model ready when memory allows; otherwise load it for each naming request.";
-};
+  value: TitleModelLoadBehavior,
+): string => titleModelOptionDescription(TITLE_MODEL_LOAD_OPTIONS, value);
 
 const titleModelResourceDescription = (
-  value: NonNullable<ProtocolGitWorktreeSettings["title_model_resource_policy"]>,
-): string => {
-  if (value === "gpu_cpu_ram") return "Allow llama.cpp to place the model across GPU, CPU, and system RAM.";
-  if (value === "gpu_only") return "Require all model layers to fit on a detected GPU.";
-  if (value === "cpu_ram_only") return "Keep all naming-model computation off the GPU.";
-  return "Use GPU acceleration when it will not contend with a local coding model; otherwise use CPU and RAM.";
-};
+  value: TitleModelResourcePolicy,
+): string => titleModelOptionDescription(TITLE_MODEL_RESOURCE_OPTIONS, value);
 
 const isSafeHttps = (value: string): boolean => {
   try {
@@ -184,6 +245,8 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
   #busy = false;
   #message = "";
   #error = false;
+  #draftLoadBehavior: TitleModelLoadBehavior | undefined;
+  #draftResourcePolicy: TitleModelResourcePolicy | undefined;
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -201,6 +264,7 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
       const snapshot = await protocol.gitWorktreeSettingsSnapshot();
       this.#store.value?.replaceGitWorktreeSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
+      this.#clearDraft();
       this.#message = "";
     } catch {
       this.#message = genericFailure("Loading settings");
@@ -215,30 +279,74 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     event.preventDefault();
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || this.#busy) return;
+    const current = this.#currentSettings();
     const data = new FormData(event.currentTarget as HTMLFormElement);
-    const behavior = String(data.get("load_behavior"));
-    const resources = String(data.get("resource_policy"));
-    if (!["auto", "always", "on_demand", "off"].includes(behavior)) return;
-    if (!["adaptive", "gpu_cpu_ram", "gpu_only", "cpu_ram_only"].includes(resources)) return;
+    const submittedBehavior = data.get("load_behavior");
+    const submittedResources = data.get("resource_policy");
+    const behavior = this.#draftLoadBehavior ?? (
+      isTitleModelLoadBehavior(submittedBehavior)
+        ? submittedBehavior
+        : current?.title_model_load_behavior ?? "auto"
+    );
+    // The resource picker is disabled in Rules Only mode, so FormData omits
+    // it. Preserve the selected resource policy for switching the model back
+    // on instead of silently discarding the submit.
+    const resources = this.#draftResourcePolicy ?? (
+      isTitleModelResourcePolicy(submittedResources)
+        ? submittedResources
+        : current?.title_model_resource_policy ?? "adaptive"
+    );
     this.#busy = true;
     this.#message = "Saving…";
     this.#error = false;
     this.requestUpdate();
     try {
       const snapshot = await protocol.setGitWorktreeSettingsSnapshot({
-        title_model_load_behavior: behavior as ProtocolGitWorktreeSettings["title_model_load_behavior"],
-        title_model_resource_policy: resources as NonNullable<ProtocolGitWorktreeSettings["title_model_resource_policy"]>,
+        title_model_load_behavior: behavior,
+        title_model_resource_policy: resources,
       });
       this.#store.value?.replaceGitWorktreeSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
+      this.#clearDraft();
       this.#message = "Git and worktree settings saved.";
     } catch {
+      this.#clearDraft();
       this.#message = genericFailure("Saving settings");
       this.#error = true;
     } finally {
       this.#busy = false;
       this.requestUpdate();
     }
+  }
+
+  #currentSettings(): ProtocolGitWorktreeSettings | undefined {
+    return this.#store.value === undefined
+      ? this.#settings
+      : readSignal(this.#store.value.gitWorktreeSettings)?.settings ?? this.#settings;
+  }
+
+  #selectionChanged(event: Event): void {
+    const form = (event.currentTarget as HTMLSelectElement).form;
+    const behaviorSelect = form?.elements.namedItem("load_behavior");
+    const resourceSelect = form?.elements.namedItem("resource_policy");
+    if (
+      form === null ||
+      !(behaviorSelect instanceof HTMLSelectElement) ||
+      !(resourceSelect instanceof HTMLSelectElement) ||
+      !isTitleModelLoadBehavior(behaviorSelect.value) ||
+      !isTitleModelResourcePolicy(resourceSelect.value)
+    ) return;
+    // Keep both selections locally while the auto-save is in flight. This
+    // makes the selected option and its explanation update in the same frame.
+    this.#draftLoadBehavior = behaviorSelect.value;
+    this.#draftResourcePolicy = resourceSelect.value;
+    this.requestUpdate();
+    form.requestSubmit();
+  }
+
+  #clearDraft(): void {
+    this.#draftLoadBehavior = undefined;
+    this.#draftResourcePolicy = undefined;
   }
 
   async #install(cancel: boolean): Promise<void> {
@@ -261,26 +369,26 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
   }
 
   override render() {
-    const settings = this.#store.value === undefined
-      ? this.#settings
-      : readSignal(this.#store.value.gitWorktreeSettings)?.settings ?? this.#settings;
+    const settings = this.#currentSettings();
     const model = settings?.title_model;
     const total = model?.install_total ?? 0;
     const value = model?.install_bytes ?? 0;
-    const behavior = settings?.title_model_load_behavior ?? "auto";
-    const resources = settings?.title_model_resource_policy ?? "adaptive";
+    const behavior = this.#draftLoadBehavior ??
+      settings?.title_model_load_behavior ?? "auto";
+    const resources = this.#draftResourcePolicy ??
+      settings?.title_model_resource_policy ?? "adaptive";
     return html`
       <div class="stack">
         <h2>Git &amp; Worktrees</h2>
         <p class="meta">Session names become branch names too, so trouve derives a concise title before creating the session worktree.</p>
         <form class="card naming-card" @submit=${(event: SubmitEvent) => void this.#save(event)}>
           <h3>Session naming</h3>
-          <label><span class="visually-hidden">Load behavior</span><select name="load_behavior" .value=${behavior} ?disabled=${this.#busy} @change=${(event: Event) => (event.currentTarget as HTMLSelectElement).form?.requestSubmit()}>
-              <option value="auto">Automatic</option><option value="always">Always loaded</option><option value="on_demand">On demand</option><option value="off">Off · use heuristics</option>
+          <label><span class="visually-hidden">Load behavior</span><select name="load_behavior" .value=${behavior} ?disabled=${this.#busy} @change=${this.#selectionChanged}>
+              ${TITLE_MODEL_LOAD_OPTIONS.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
             </select></label>
           <p class="meta">${titleModelLoadDescription(behavior)}</p>
-          <label><span>Compute resources</span><select name="resource_policy" .value=${resources} ?disabled=${this.#busy || behavior === "off"} @change=${(event: Event) => (event.currentTarget as HTMLSelectElement).form?.requestSubmit()}>
-              <option value="adaptive">Adaptive</option><option value="gpu_cpu_ram">GPU + CPU/RAM</option><option value="gpu_only">GPU only</option><option value="cpu_ram_only">CPU/RAM only</option>
+          <label><span>Compute resources</span><select name="resource_policy" .value=${resources} ?disabled=${this.#busy || behavior === "off"} @change=${this.#selectionChanged}>
+              ${TITLE_MODEL_RESOURCE_OPTIONS.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
             </select></label>
           <p class="meta">${titleModelResourceDescription(resources)}</p>
           <p class="meta">The optional model is about 640 MB to download. Changing compute resources restarts it when it is kept ready.</p>

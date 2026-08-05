@@ -103,6 +103,7 @@ describe("ThreadViewModel", () => {
           tool: "shell",
           args: { command: "cargo test" },
           status: "awaiting_approval",
+          duration_ms: 50,
         },
       ],
       pending_approvals: ["call_snapshot"],
@@ -128,7 +129,12 @@ describe("ThreadViewModel", () => {
     expect(view.items).toMatchObject([
       { id: "snapshot:40", kind: "turn-status", state: { kind: "completed" } },
       { id: "snapshot:41", kind: "assistant", content: "Final folded answer" },
-      { id: "snapshot:42", kind: "tool", status: "awaiting-approval" },
+      {
+        id: "snapshot:42",
+        kind: "tool",
+        status: "awaiting-approval",
+        durationMs: 50,
+      },
     ]);
     expect(view.turnModels.get(7)).toBe("openai/gpt-5.6");
     expect(view.turnDurationMs.get(7)).toBe(4_000);

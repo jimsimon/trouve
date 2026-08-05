@@ -3437,6 +3437,13 @@ export interface components {
         } | {
             args: unknown;
             call_id: string;
+            /**
+             * Format: int64
+             * @description Wall-clock execution time derived from the durable tool event
+             *     timestamps. This remains available when a provider omits timing
+             *     metadata or reports a zero-valued placeholder in its result.
+             */
+            duration_ms?: number | null;
             /** @enum {string} */
             kind: "tool_call";
             result?: unknown;
