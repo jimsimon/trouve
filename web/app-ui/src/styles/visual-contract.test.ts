@@ -23,6 +23,9 @@ describe("Slint/Lit visual contract", () => {
   const automations = read("../components/automations-screen.ts");
   const pullRequests = read("../components/pull-requests-dashboard.ts");
   const review = read("../components/code-review-dashboard.ts");
+  const providerSettings = read("../components/provider-settings.ts");
+  const managementSettings = read("../components/management-settings-panels.ts");
+  const cliSettings = read("../components/cli-settings.ts");
   const main = read("../main.ts");
   const gallery = read("../gallery.ts");
 
@@ -272,6 +275,13 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toMatch(
       /\.composer textarea \{[^}]*min-height:\s*34px[^}]*max-height:\s*162px/s,
     );
+    expect(app).toMatch(/\.composer \{[^}]*margin:\s*8px 10px 10px/s);
+    expect(app).toMatch(
+      /\.activity-group \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-body \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
+    );
     expect(thread).toContain('class="composer-option mode-option"');
     expect(thread).toContain('class="composer-option model-option"');
     expect(thread).toContain('class="composer-option permission-option"');
@@ -335,11 +345,31 @@ describe("Slint/Lit visual contract", () => {
     expect(tokens).toContain("--wa-color-shadow: var(--trouve-scrim)");
   });
 
-  it("keeps permission state visible and full access warning-colored", () => {
+  it("keeps permission state visible and full access error-colored", () => {
     expect(shell).toContain("permission-status");
     expect(shell).toContain('activeThread.permission_mode === "yolo"');
     expect(thread).toContain('thread.permission_mode === "yolo"');
-    expect(app).toContain(".permission-yolo");
-    expect(app).toContain("color: var(--trouve-warn)");
+    expect(app).toMatch(
+      /\.permission-option > span\.permission-yolo \{[^}]*color:\s*var\(--trouve-err\)/s,
+    );
+    expect(app).toMatch(
+      /\.permission-option select\.permission-yolo \{[^}]*border-color:\s*var\(--trouve-err\)[^}]*color:\s*var\(--trouve-err\)/s,
+    );
+  });
+
+  it("keeps compact Slint settings labels, meters, copy, and form alignment", () => {
+    expect(cliSettings).toContain(">Uninstall</button>");
+    expect(cliSettings).not.toContain(">Remove managed</button>");
+    expect(managementSettings).toMatch(
+      /\.meta \{[^}]*font-size:\s*var\(--trouve-settings-info-font-size, 11px\)/s,
+    );
+    expect(managementSettings).toContain('class="integration-add-fields"');
+    expect(managementSettings).toMatch(
+      /\.integration-add-fields \{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\) auto[^}]*align-items:\s*end/s,
+    );
+    expect(providerSettings).toContain("subscriptionUsageTone(percent)");
+    expect(providerSettings).toContain('class="health-meter"');
+    expect(providerSettings).not.toContain("<progress max=\"100\" .value=");
+    expect(providerSettings).not.toContain("${health.status}</span>");
   });
 });

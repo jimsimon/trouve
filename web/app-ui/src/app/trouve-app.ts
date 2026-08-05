@@ -762,6 +762,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   #applyAppearanceToElement(preferences: AppearancePreferences): void {
     this.style.setProperty("--trouve-font-size", `${preferences.fontSize}px`);
+    this.style.setProperty(
+      "--trouve-settings-info-font-size",
+      `${preferences.fontSize * (11 / 13)}px`,
+    );
     if (preferences.fontFamily === "") {
       this.style.removeProperty("--trouve-font-sans");
     } else {

@@ -795,6 +795,22 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeGreaterThanOrEqual(7);
+  await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
+    "aria-live",
+    "off",
+  );
+  await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 1_000 }));
+    viewport.scrollTop = viewport.scrollHeight;
+    viewport.dispatchEvent(new Event("scroll"));
+  });
+  await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
+    "aria-live",
+    "polite",
+  );
+  await expect(page.getByRole("button", { name: "Jump to latest" })).toHaveCount(0);
 
   const historyMode = page.getByRole("button", { name: "Use full history" });
   await historyMode.focus();

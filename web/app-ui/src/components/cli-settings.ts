@@ -315,7 +315,7 @@ export class TrouveCliSettings extends LitElement {
             ? html`<button type="button" ?disabled=${this.#busyId !== ""} @click=${() => void this.#cancel(cli)}>${this.#busyId === cli.id ? "Cancelling…" : "Cancel install"}</button>`
             : html`<button class="primary" type="button" ?disabled=${this.#busyId !== ""} @click=${() => void this.#install(cli)}>${this.#busyId === cli.id ? "Starting…" : cliPrimaryActionLabel(cli)}</button>`}
           ${cli.source === "managed" && !pending
-            ? html`<button class="danger" type="button" ?disabled=${this.#busyId !== ""} @click=${() => this.#requestUninstall(cli.id)}>Remove managed</button>`
+            ? html`<button class="danger" type="button" ?disabled=${this.#busyId !== ""} @click=${() => this.#requestUninstall(cli.id)}>Uninstall</button>`
             : nothing}
         </div>
 
@@ -341,11 +341,11 @@ export class TrouveCliSettings extends LitElement {
                 aria-labelledby=${confirmTitleId}
                 aria-describedby=${confirmDescriptionId}
               >
-                <h3 id=${confirmTitleId}>Remove trouve's managed ${cli.display_name}?</h3>
+                <h3 id=${confirmTitleId}>Uninstall trouve's managed ${cli.display_name}?</h3>
                 <p id=${confirmDescriptionId}>Only the managed copy is removed. A system PATH installation, if present, is never deleted and may become active again.</p>
                 <div class="actions">
                   <button type="button" @click=${this.#dismissUninstall}>Back</button>
-                  <button class="danger" type="button" @click=${() => void this.#uninstall(cli)}>Confirm remove</button>
+                  <button class="danger" type="button" @click=${() => void this.#uninstall(cli)}>Confirm uninstall</button>
                 </div>
               </div>
             `

@@ -60,7 +60,7 @@ const panelStyles = css`
   .row > .grow { flex: 1 1 12rem; min-width: 0; }
   .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .mcp-command-grid { grid-template-columns: 160px minmax(0, 1fr); }
-  .meta { color: var(--trouve-muted); font-size: 0.82rem; overflow-wrap: anywhere; }
+  .meta { color: var(--trouve-muted); font-size: var(--trouve-settings-info-font-size, 11px); overflow-wrap: anywhere; }
   .status { min-height: 1.4em; color: var(--trouve-muted); }
   .status.error, .health-error { color: var(--trouve-err); }
   .health-ok { color: var(--trouve-ok); }
@@ -88,6 +88,13 @@ const panelStyles = css`
   .mcp-actions { display: flex; gap: 5px; }
   .mcp-form { border: 0; padding: 14px; }
   .integration-host, .integration-add { border: 0; padding: 14px; }
+  .integration-add-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+    align-items: end;
+    gap: 8px;
+  }
+  .integration-add-fields > button { align-self: end; }
   .integration-status { color: var(--trouve-muted); font-size: 12px; }
   .integration-status.connected { color: var(--trouve-ok); }
   input[type="hidden"] { display: none; }
@@ -105,6 +112,8 @@ const panelStyles = css`
   }
   @media (max-width: 620px) {
     .grid { grid-template-columns: 1fr; }
+    .integration-add-fields { grid-template-columns: 1fr; }
+    .integration-add-fields > button { width: 100%; }
     .row > button { flex: 1 1 auto; }
   }
 `;
@@ -738,8 +747,11 @@ export class TrouveIntegrationsSettings extends LitElement {
         <form class="card integration-add" @submit=${(event: SubmitEvent) => void this.#addHost(event)}>
           <h3>Add GitHub Enterprise host</h3>
           <p class="meta">Each self-hosted GitHub Enterprise Server instance uses its own OAuth app. Enable device flow on that app, then enter its public client id here.</p>
-          <div class="grid"><label><span>Hostname</span><input required name="host" inputmode="url" placeholder="github.example.com" /></label><label><span>OAuth app client ID</span><input required name="client_id" autocomplete="off" /></label></div>
-          <div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>Add</button></div>
+          <div class="integration-add-fields">
+            <label><span>Hostname</span><input required name="host" inputmode="url" placeholder="github.example.com" /></label>
+            <label><span>OAuth app client ID</span><input required name="client_id" autocomplete="off" /></label>
+            <button class="primary" type="submit" ?disabled=${this.#busy}>Add</button>
+          </div>
         </form>
       </div>
     `;

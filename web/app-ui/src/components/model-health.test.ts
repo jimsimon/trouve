@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  boundedSubscriptionUsage,
   filteredModelIndices,
   modelHealthPresentation,
+  subscriptionUsageTone,
 } from "./model-health.js";
 
 describe("model health presentation", () => {
@@ -40,6 +42,16 @@ describe("model health presentation", () => {
       credits: "",
       note: "subscription usage needs a login",
     })).toMatchObject({ summary: "login required", tone: "error" });
+  });
+
+  it("uses Slint's healthy, warning, and exhausted meter thresholds", () => {
+    expect(subscriptionUsageTone(0)).toBe("ok");
+    expect(subscriptionUsageTone(69)).toBe("ok");
+    expect(subscriptionUsageTone(70)).toBe("warning");
+    expect(subscriptionUsageTone(89)).toBe("warning");
+    expect(subscriptionUsageTone(90)).toBe("error");
+    expect(boundedSubscriptionUsage(-20)).toBe(0);
+    expect(boundedSubscriptionUsage(120)).toBe(100);
   });
 
   it("ranks prefix, contained, and subsequence model matches with a DOM bound", () => {

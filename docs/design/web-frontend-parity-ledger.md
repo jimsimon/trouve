@@ -233,6 +233,15 @@ ordinary web-widget chrome may vary, but the Slint density, layout,
 information hierarchy, semantic colors, action order, and core workflows
 remain the contract.
 
+The 2026-08-04 follow-up parity pass also aligns the transcript's composer
+separation, transparent grouped-activity container, disabled turn controls,
+full-access error treatment, and Slint-style tail-follow recovery: reaching
+the rendered bottom manually now dismisses “Jump to latest” and resumes live
+following even while virtual row measurements are converging. It also aligns
+subscription meter thresholds and labels, the Vendor CLI uninstall action,
+the informational type scale in Git & Worktrees, Integrations, and Appearance,
+and the GitHub Enterprise add-form baseline.
+
 The same pass closes the initial responsive implementation gaps: Files is a
 tree-to-viewer flow on narrow screens, approvals become a large-target bottom
 sheet above mobile navigation, pull-request group ordering has explicit touch

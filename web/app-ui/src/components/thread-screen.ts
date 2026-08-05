@@ -1601,7 +1601,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#virtualizer.setViewport(
       viewport.scrollTop,
       viewport.clientHeight,
-      { userInitiated: true },
+      { userInitiated: true, atTail: tailGap <= 1 },
     );
     if (viewport.scrollTop <= Math.max(320, viewport.clientHeight)) {
       void this.#loadOlderHistory(false);

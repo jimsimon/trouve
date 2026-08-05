@@ -50,18 +50,28 @@ describe("Virtualizer", () => {
     expect(virtualizer.window().items[0]?.item.id).toBe("item-3");
   });
 
-  it("requires explicit follow-tail re-enable after the user scrolls away", () => {
+  it("parks history after scrolling away and resumes following at the exact tail", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
     virtualizer.setViewport(0, 40);
     virtualizer.setItems(items(4));
     expect(virtualizer.window().scrollTop).toBe(40);
-    virtualizer.setViewport(0, 40);
+    virtualizer.setViewport(0, 40, { userInitiated: true });
     expect(virtualizer.window().followingTail).toBe(false);
     virtualizer.setItems(items(6));
     expect(virtualizer.window().scrollTop).toBe(0);
-    expect(virtualizer.enableFollowTail().scrollTop).toBe(80);
+
+    virtualizer.setViewport(80, 40, { userInitiated: true });
+    expect(virtualizer.window().followingTail).toBe(true);
     virtualizer.setItems(items(7));
     expect(virtualizer.window().scrollTop).toBe(100);
+  });
+
+  it("trusts the rendered viewport when measured and estimated tails differ", () => {
+    const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
+    virtualizer.setViewport(0, 40);
+    virtualizer.setItems(items(6));
+    virtualizer.setViewport(62, 40, { userInitiated: true, atTail: true });
+    expect(virtualizer.window().followingTail).toBe(true);
   });
 
   it("honors an intentional near-tail scroll without snapping it back", () => {

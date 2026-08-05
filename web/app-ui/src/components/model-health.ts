@@ -11,6 +11,17 @@ export interface ModelHealthPresentation {
   readonly tone: ModelHealthTone;
 }
 
+export const boundedSubscriptionUsage = (usedPercent: number): number =>
+  Math.max(0, Math.min(100, usedPercent));
+
+export const subscriptionUsageTone = (usedPercent: number): Exclude<
+  ModelHealthTone,
+  "neutral"
+> => {
+  const percent = boundedSubscriptionUsage(usedPercent);
+  return percent >= 90 ? "error" : percent >= 70 ? "warning" : "ok";
+};
+
 const displayPlan = (plan: string): string =>
   plan === "" ? "" : `${plan[0]?.toLocaleUpperCase() ?? ""}${plan.slice(1)}`;
 
@@ -30,9 +41,9 @@ export const modelHealthPresentation = (
 
   if (health.status === "ok") {
     if (constrained !== undefined) {
-      const percent = Math.max(0, Math.min(100, constrained.used_percent));
+      const percent = boundedSubscriptionUsage(constrained.used_percent);
       summary = `${plan === "" ? "" : `${plan} · `}${percent}% used`;
-      tone = percent >= 90 ? "error" : percent >= 70 ? "warning" : "ok";
+      tone = subscriptionUsageTone(percent);
     } else if (plan !== "") {
       summary = plan;
       tone = "ok";
@@ -61,7 +72,7 @@ export const modelHealthPresentation = (
       : [
           "",
           ...health.windows.map((window) => {
-            const percent = Math.max(0, Math.min(100, window.used_percent));
+            const percent = boundedSubscriptionUsage(window.used_percent);
             return `${window.label}: ${percent}% used${window.resets === "" ? "" : ` · ${window.resets}`}`;
           }),
         ]),

@@ -14,6 +14,10 @@ import type {
   ProtocolUpsertProviderRequest,
 } from "../services/protocol-client.js";
 import "./cli-settings.js";
+import {
+  boundedSubscriptionUsage,
+  subscriptionUsageTone,
+} from "./model-health.js";
 
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
@@ -286,7 +290,13 @@ export class TrouveProviderSettings extends LitElement {
     .subscription-health > h3 { font-size: 16px; }
     .subscription-health > p { font-size: 11px; }
     .subscription-health .card-list { gap: 12px; margin: 0; }
-    .health-row { grid-template-columns: minmax(0, 1fr) auto; padding: 12px; border-radius: var(--trouve-radius); background: var(--trouve-surface); }
+    .health-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px; border-radius: var(--trouve-radius); background: var(--trouve-surface); }
+    .health-heading { min-width: 0; display: flex; align-items: center; gap: 8px; }
+    .health-heading > strong { min-width: 0; flex: 1; overflow-wrap: anywhere; color: var(--trouve-text-hi); font-size: 13px; }
+    .health-meta { display: flex; align-items: center; gap: 8px; }
+    .health-plan { color: var(--trouve-accent); }
+    .health-note { color: var(--trouve-text-dim); font-size: 11px; overflow-wrap: anywhere; }
+    .health-note.warning { color: var(--trouve-warn); }
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     label { display: grid; gap: 4px; min-width: 0; color: var(--trouve-text-hi); font-weight: 600; }
     label small { font-weight: 400; }
@@ -325,9 +335,17 @@ export class TrouveProviderSettings extends LitElement {
     .status-pill.ready { color: var(--trouve-ok); }
     .status-pill.warning { color: var(--trouve-warn); }
     .status-pill.failed { color: var(--trouve-err); }
-    .health-windows { display: grid; gap: 5px; grid-column: 1 / -1; }
-    .health-window { display: grid; grid-template-columns: minmax(90px, auto) 1fr auto; align-items: center; gap: 8px; }
-    progress { width: 100%; accent-color: var(--trouve-accent); }
+    .health-windows { display: grid; gap: 8px; }
+    .health-window { min-width: 0; display: grid; gap: 3px; }
+    .health-window-copy { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--trouve-text-mid); font-size: 11px; }
+    .health-window-copy > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+    .health-window-copy > small { flex: none; color: var(--trouve-text-mid); }
+    .health-window-copy > small.tone-error { color: var(--trouve-err); }
+    .health-meter { height: 6px; overflow: hidden; border-radius: 3px; background: var(--trouve-control-bg); }
+    .health-meter-fill { display: block; min-width: 0; height: 100%; border-radius: 3px; background: var(--trouve-ok); }
+    .health-meter-fill.nonzero { min-width: 6px; }
+    .health-meter-fill.tone-warning { background: var(--trouve-warn); }
+    .health-meter-fill.tone-error { background: var(--trouve-err); }
     .login-card { border-color: var(--trouve-accent); background: var(--trouve-accent-veil); }
     .login-code { margin-top: 8px; color: var(--trouve-text-hi); }
     .login-code code { user-select: all; font-family: var(--trouve-font-mono); }
@@ -341,8 +359,7 @@ export class TrouveProviderSettings extends LitElement {
       .actions { justify-content: stretch; }
       .actions button { flex: 1 1 auto; min-height: 44px; }
       input, select, form > button { min-height: 44px; }
-      .health-window { grid-template-columns: 1fr auto; }
-      .health-window progress { grid-column: 1 / -1; grid-row: 2; }
+      .health-heading { align-items: start; flex-direction: column; }
     }
   `;
 
@@ -694,27 +711,45 @@ export class TrouveProviderSettings extends LitElement {
   }
 
   #renderHealth(health: ProtocolSubscriptionHealth) {
-    const ok = health.status === "ok";
     return html`
-      <article class="health-row">
-        <div class="provider-copy">
+      <article class="health-row" aria-label=${`${health.provider_id} subscription health`}>
+        <div class="health-heading">
           <strong>${health.provider_id}</strong>
-          <small>${ok
-            ? [health.plan, health.credits].filter(Boolean).join(" · ") || "Usage available"
-            : health.status === "unsupported"
-              ? "This provider does not expose subscription usage."
-              : "Usage is unavailable. Check provider sign-in."}</small>
+          <div class="health-meta">
+            ${health.plan === "" ? nothing : html`<small class="health-plan">${health.plan} plan</small>`}
+            ${health.credits === "" ? nothing : html`<small>${health.credits}</small>`}
+          </div>
         </div>
-        <span class=${`status-pill ${ok ? "ready" : health.status === "unsupported" ? "" : "warning"}`}>${health.status}</span>
+        ${health.status === "ok" || health.note === ""
+          ? nothing
+          : html`<p class=${`health-note ${health.status === "unavailable" ? "warning" : ""}`}>${health.note}</p>`}
         ${health.windows.length === 0 ? nothing : html`
           <div class="health-windows">
-            ${health.windows.map((window) => html`
-              <div class="health-window">
-                <span>${window.label}</span>
-                <progress max="100" .value=${Math.max(0, Math.min(100, window.used_percent))} aria-label=${`${window.label} used`}></progress>
-                <small>${window.used_percent}%${window.resets ? ` · ${window.resets}` : ""}</small>
-              </div>
-            `)}
+            ${health.windows.map((window) => {
+              const percent = boundedSubscriptionUsage(window.used_percent);
+              const tone = subscriptionUsageTone(percent);
+              return html`
+                <div class="health-window">
+                  <div class="health-window-copy">
+                    <span>${window.label}</span>
+                    <small class=${tone === "error" ? "tone-error" : ""}>${percent}% used${window.resets ? ` · ${window.resets}` : ""}</small>
+                  </div>
+                  <div
+                    class="health-meter"
+                    role="progressbar"
+                    aria-label=${`${window.label}: ${percent}% used`}
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow=${String(percent)}
+                  >
+                    <span
+                      class=${`health-meter-fill tone-${tone} ${percent > 0 ? "nonzero" : ""}`}
+                      style=${`width:${percent}%`}
+                    ></span>
+                  </div>
+                </div>
+              `;
+            })}
           </div>
         `}
       </article>

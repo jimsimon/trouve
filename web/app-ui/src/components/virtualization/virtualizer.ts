@@ -122,7 +122,10 @@ export class Virtualizer<T extends VirtualItem> {
   setViewport(
     scrollTop: number,
     viewportHeight: number,
-    options: { readonly userInitiated?: boolean } = {},
+    options: {
+      readonly userInitiated?: boolean;
+      readonly atTail?: boolean;
+    } = {},
   ): void {
     if (!Number.isFinite(scrollTop) || scrollTop < 0) {
       throw new RangeError("scrollTop must be a non-negative finite number");
@@ -132,13 +135,16 @@ export class Virtualizer<T extends VirtualItem> {
     }
     this.#viewportHeight = viewportHeight;
     this.#scrollTop = this.#clampScroll(scrollTop);
-    if (
-      this.#followingTail &&
-      (options.userInitiated === true
-        || this.#tailScrollTop() - this.#scrollTop > this.#tailTolerancePx)
-    ) {
-      // Once the user intentionally leaves the tail, only enableFollowTail()
-      // resumes it. Merely scrolling near the bottom does not steal control.
+    const tailGap = this.#tailScrollTop() - this.#scrollTop;
+    if (options.userInitiated === true) {
+      // Match the retained desktop behavior: a deliberate scroll away parks
+      // history, while reaching the actual bottom resumes live-tail pinning.
+      // Keep the rejoin tolerance tight so a merely near-tail reader is not
+      // pulled away from the position they chose.
+      // The rendered DOM is authoritative when it is available because live
+      // row measurements can briefly differ from the virtual height model.
+      this.#followingTail = options.atTail ?? tailGap <= 1;
+    } else if (this.#followingTail && tailGap > this.#tailTolerancePx) {
       this.#followingTail = false;
     }
     this.#anchor = this.#captureAnchor();

@@ -14,7 +14,7 @@ trouve-app {
 button, textarea, input, select { font: inherit; }
 button { color: inherit; }
 button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
-button:disabled, textarea:disabled, input:disabled { cursor: not-allowed; opacity: .56; }
+button:disabled, textarea:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 
 .app-shell {
   display: grid;
@@ -197,7 +197,7 @@ trouve-session-list { display: block; }
 .thread-options label { min-width: 0; }
 .thread-options select { max-width: min(190px, 24vw); border: 1px solid transparent; border-radius: var(--trouve-radius-sm); padding: 3px 6px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 11px; text-overflow: ellipsis; }
 .thread-options select:hover { color: var(--trouve-text-hi); border-color: var(--trouve-border); }
-.thread-options select.permission-yolo { border-color: var(--trouve-warn); color: var(--trouve-warn); font-weight: 700; }
+.thread-options select.permission-yolo { border-color: var(--trouve-err); color: var(--trouve-err); font-weight: 700; }
 .thread-options > button:last-child { margin-left: auto; white-space: nowrap; }
 .chat-stream {
   min-width: 0;
@@ -249,11 +249,11 @@ trouve-session-list { display: block; }
 .agent-text-block { min-width: 0; margin: 0; }
 .agent-body-stream > .message { margin: 0 0 0 16px; }
 .agent-body-stream > .question-card { margin-inline-start: 0; }
-.activity-group { min-width: 0; max-width: 100%; margin-inline-start: 16px; overflow: hidden; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
+.activity-group { min-width: 0; max-width: 100%; margin-inline-start: 16px; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
 .activity-group > summary { min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; color: var(--trouve-text-mid); cursor: pointer; list-style: none; }
 .activity-group > summary::-webkit-details-marker { display: none; }
 .activity-group > summary strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0 8px 8px 16px; border-top: 1px solid var(--trouve-rule); }
+.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0 8px 8px 16px; border: 0; background: transparent; }
 .activity-group-body > .message { margin: 8px 0 0; }
 .message p { margin: 0; }
 .tool-card { min-width: 0; max-width: 100%; margin-top: 10px; overflow: hidden; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
@@ -362,7 +362,7 @@ trouve-session-list { display: block; }
 .attachment-actions { display: flex; align-items: center; gap: 6px; }
 .attachment-actions a { color: var(--trouve-accent); text-decoration: none; }
 .attachment-actions a:hover { text-decoration: underline; }
-.composer { position: relative; margin: 0 10px 10px; border: 0; border-radius: 0; background: transparent; }
+.composer { position: relative; margin: 8px 10px 10px; border: 0; border-radius: 0; background: transparent; }
 .composer-completions { position: absolute; z-index: 5; inset-inline: -1px auto; bottom: calc(100% + 6px); width: min(480px, calc(100% + 2px)); max-height: min(300px, 40dvh); overflow: auto; padding: 6px; border: 1px solid var(--trouve-border-strong); border-radius: 8px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 8px 28px var(--trouve-scrim); }
 .composer-completion-option { width: 100%; min-height: 30px; display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: center; gap: 10px; border: 0; border-radius: 5px; padding: 5px 8px; color: var(--trouve-text-hi); background: transparent; text-align: start; }
 .composer-completion-option:hover { background: var(--trouve-hover-bg); }
@@ -391,6 +391,7 @@ trouve-session-list { display: block; }
 .composer-option { display: grid; flex: none; gap: 2px; }
 .composer-option > span { color: var(--trouve-text-faint); font-size: 10px; line-height: 1.2; }
 .composer-option select { height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; }
+.composer-option select:disabled { color: var(--trouve-text-disabled); -webkit-text-fill-color: var(--trouve-text-disabled); }
 .mode-option select { width: 130px; }
 .model-option select { width: 210px; }
 .model-option trouve-model-picker { width: 210px; }
@@ -423,6 +424,8 @@ trouve-session-list { display: block; }
 .model-health-pill.tone-error summary { border-color: var(--trouve-err); background: var(--trouve-err-bg); }
 .model-health-detail { position: absolute; z-index: 8; inset-inline-end: 0; inset-block-end: calc(100% + 7px); width: min(360px, calc(100vw - 32px)); margin: 0; padding: 11px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text-mid); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); font: 10px/1.45 var(--trouve-font-sans); white-space: pre-wrap; }
 .permission-option select { width: 105px; }
+.permission-option > span.permission-yolo { color: var(--trouve-err) !important; }
+.permission-option select.permission-yolo { border-color: var(--trouve-err); color: var(--trouve-err); -webkit-text-fill-color: var(--trouve-err); font-weight: 700; }
 .permission-control-row { display: flex; align-items: center; gap: 4px; }
 .permission-warning { width: 22px; height: 30px; display: grid; flex: none; place-items: center; border-radius: var(--trouve-radius-sm); color: var(--trouve-err); background: var(--trouve-err-bg); font-size: 13px; }
 .thinking-option select { width: 105px; }
@@ -450,7 +453,7 @@ trouve-session-list { display: block; }
 @keyframes trouve-context-spin { to { rotate: 360deg; } }
 .inline-error { overflow: hidden; color: var(--trouve-err); text-overflow: ellipsis; white-space: nowrap; }
 .inline-warning { overflow: hidden; color: var(--trouve-warn); text-overflow: ellipsis; white-space: nowrap; }
-.queue-panel { min-width: 0; max-height: min(36vh, 330px); margin: 0 10px 8px; overflow-x: hidden; overflow-y: auto; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 8px; background: var(--trouve-surface); }
+.queue-panel { min-width: 0; max-height: min(36vh, 330px); margin: 8px 10px 0; overflow-x: hidden; overflow-y: auto; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 8px; background: var(--trouve-surface); }
 .queue-panel > header { position: sticky; top: -8px; z-index: 1; min-height: 30px; display: flex; align-items: center; gap: 8px; color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 11px; }
 .queue-panel > header > span { flex: 1; }
 .queue-panel > header button { min-height: 26px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
@@ -666,7 +669,7 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .settings-section { display: grid; align-content: start; gap: 12px; }
 .settings-section h1 { margin: 0; color: var(--trouve-text-hi); font-size: 16px; line-height: 1.35; }
 .settings-section p { margin: 0; }
-.settings-note, .settings-field p, .settings-tagline, .legal-copy { color: var(--trouve-text-soft); font-size: 11px; }
+.settings-note, .settings-field p, .settings-tagline, .legal-copy { color: var(--trouve-text-soft); font-size: var(--trouve-settings-info-font-size, 11px); }
 .settings-tagline { color: var(--trouve-text-dim); font-size: 12px; }
 .capability-note { border-left: 2px solid var(--trouve-warn-border); padding-left: 8px; color: var(--trouve-text-dim); }
 .settings-check { display: flex; align-items: center; gap: 8px; color: var(--trouve-text); }
@@ -730,7 +733,7 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .online-dot.offline { background: var(--trouve-err); }
 .status-spacer { flex: 1; }
 .permission-status { white-space: nowrap; }
-.permission-yolo { color: var(--trouve-warn) !important; font-weight: 700; }
+.permission-yolo { color: var(--trouve-err) !important; font-weight: 700; }
 .theme-picker select { max-width: 138px; border: 0; border-radius: var(--trouve-radius-sm); padding: 2px 5px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font: inherit; text-transform: capitalize; }
 .update-action { min-height: 22px; border: 1px solid var(--trouve-accent); border-radius: var(--trouve-radius-sm); padding: 2px 7px; color: var(--trouve-text-hi); background: var(--trouve-accent-bg); font-size: inherit; }
 .new-session-open > .thread-panel:not(.new-session-screen) { visibility: hidden; }
@@ -793,7 +796,7 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .app-dialog header > button { width: 30px; height: 30px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: transparent; font-size: 18px; }
 .app-dialog label, .app-dialog .dialog-field { min-width: 0; display: grid; gap: 5px; color: var(--trouve-text-hi); font-weight: 600; }
 .app-dialog input, .app-dialog select, .app-dialog textarea { width: 100%; min-height: 34px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 5px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
-.app-dialog select.permission-yolo { border-color: var(--trouve-warn); color: var(--trouve-warn); font-weight: 700; }
+.app-dialog select.permission-yolo { border-color: var(--trouve-err); color: var(--trouve-err); font-weight: 700; }
 .app-dialog textarea { min-height: 90px; resize: vertical; }
 .dialog-option-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .app-dialog footer { justify-content: flex-end; }
@@ -899,7 +902,7 @@ trouve-command-palette { display: contents; }
   .chat-stream { padding-inline: 12px; }
   .chat-edge-spacer.start { height: 14px; }
   .chat-edge-spacer.end { height: 20px; }
-  .composer { margin: 0 8px max(8px, env(safe-area-inset-bottom)); }
+  .composer { margin: 8px 8px max(8px, env(safe-area-inset-bottom)); }
   .composer-quick-replies button { min-height: 38px; padding-inline: 13px; }
   .composer-entry { grid-template-columns: minmax(0, 1fr) 70px; }
   .composer-submit { width: 70px; }
