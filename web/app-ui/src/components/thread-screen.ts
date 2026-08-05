@@ -121,6 +121,7 @@ import type {
 import {
   Virtualizer,
   type VirtualItem,
+  type VirtualWindow,
 } from "./virtualization/virtualizer.js";
 import "./new-thread-setup.js";
 import "./model-picker.js";
@@ -137,6 +138,19 @@ const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
 const CHAT_END_SPACER_ID = "ephemeral:chat-end-spacer";
 const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
 const CHAT_TAIL_EPSILON_PX = 2;
+const CHAT_POSITION_SETTLE_MS = 140;
+
+const sameVirtualRenderWindow = (
+  left: VirtualWindow<VirtualChatItem>,
+  right: VirtualWindow<VirtualChatItem>,
+): boolean =>
+  left.followingTail === right.followingTail
+  && left.paddingBefore === right.paddingBefore
+  && left.paddingAfter === right.paddingAfter
+  && left.items.length === right.items.length
+  && left.items.every(
+    ({ item }, index) => item.id === right.items[index]?.item.id,
+  );
 
 interface ActiveComposerCompletion {
   readonly token: ComposerCompletionToken;
@@ -253,6 +267,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #resizeFrame: number | undefined;
   #viewportHeight = 0;
   #programmaticScrollFrame: number | undefined;
+  #scrollRenderFrame: number | undefined;
+  #chatPositionTimer: ReturnType<typeof setTimeout> | undefined;
+  #followTailControlHeight = 0;
   #chatScrollIntent = false;
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
@@ -387,6 +404,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.#resizeFrame = undefined;
       }
       this.#cancelProgrammaticScrollWindow();
+      this.#cancelScheduledScrollRender();
+      this.#cancelScheduledChatPosition();
       this.#virtualizer = new Virtualizer<VirtualChatItem>({
         estimatedHeight: 120,
         overscanPx: 480,
@@ -394,6 +413,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         mode: this.#accessibleHistory ? "accessible" : "virtual",
       });
       this.#viewportHeight = 0;
+      this.#followTailControlHeight = 0;
       this.#chatScrollIntent = false;
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
@@ -436,6 +456,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   protected override updated(): void {
+    this.#cancelScheduledScrollRender();
     void this.#ensureThreadOptions();
     this.#refreshSubscriptionHealthAfterTurn();
     void this.#ensureSessionUsage();
@@ -447,8 +468,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const viewport = this.querySelector<HTMLElement>(".chat-stream");
     if (viewport === null) {
       this.#resizeObserver?.disconnect();
+      this.#followTailControlHeight = 0;
       return;
     }
+    this.#followTailControlHeight = viewport
+      .querySelector<HTMLElement>(".follow-tail")
+      ?.offsetHeight ?? 0;
     if (viewport.clientHeight !== this.#viewportHeight) {
       this.#viewportHeight = viewport.clientHeight;
       const expected = this.#virtualizer.resizeViewport(viewport.clientHeight).scrollTop;
@@ -500,6 +525,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#resizeFrame = undefined;
     }
     this.#cancelProgrammaticScrollWindow();
+    this.#cancelScheduledScrollRender();
+    this.#cancelScheduledChatPosition();
     this.#copyFeedbackGeneration += 1;
     this.#usageGeneration += 1;
     this.#turnRequestGeneration += 1;
@@ -1195,6 +1222,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         @pointerdown=${this.#chatScrollIntended}
         @touchstart=${this.#chatScrollIntended}
         @scroll=${this.#chatScrolled}
+        @scrollend=${this.#chatScrollEnded}
       >
         ${virtualItems.length === 0
           ? nothing
@@ -1582,17 +1610,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       viewport.dataset["threadId"] !== this.threadId ||
       this.#restoredScrollThreadId !== this.threadId
     ) return;
+    const before = this.#virtualizer.window();
     // The sticky jump control is an overlay visually, but WebKit retains its
-    // border-box in normal flow and includes it in scrollHeight. Exclude that
-    // non-transcript height or the thumb can reach the transcript tail while
-    // still appearing one control-height away from the DOM tail.
-    const endControlHeight = viewport
-      .querySelector<HTMLElement>(".follow-tail")
-      ?.getBoundingClientRect().height ?? 0;
+    // border-box in normal flow and includes it in scrollHeight. Its height is
+    // cached after rendering so this hot path never forces synchronous layout.
     const tailGap = Math.max(
       0,
       viewport.scrollHeight
-        - endControlHeight
+        - this.#followTailControlHeight
         - viewport.clientHeight
         - viewport.scrollTop,
     );
@@ -1602,24 +1627,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (
       this.#programmaticScrollFrame !== undefined
       && !userInitiated
-      && this.#virtualizer.window().followingTail
     ) {
-      // One jump can generate multiple scroll events while row measurements
-      // converge. Keep all of those events inside the correction window.
+      // Row measurement and tail corrections already updated the virtualizer.
+      // Ignore their resulting DOM events instead of treating them as another
+      // user scroll and starting a render/persistence loop.
       return;
     }
-    if (this.#virtualizer.window().followingTail && atTail) return;
+    if (before.followingTail && atTail) return;
     if (userInitiated) this.#cancelProgrammaticScrollWindow();
     this.#virtualizer.setViewport(
       viewport.scrollTop,
       viewport.clientHeight,
       { userInitiated: true, atTail },
     );
+    const after = this.#virtualizer.window();
     if (viewport.scrollTop <= Math.max(320, viewport.clientHeight)) {
       void this.#loadOlderHistory(false);
     }
-    this.#emitChatPosition();
-    this.requestUpdate();
+    if (!before.followingTail && after.followingTail) {
+      this.#cancelScheduledChatPosition();
+      this.#emitChatPosition();
+    } else {
+      this.#scheduleChatPosition();
+    }
+    if (!sameVirtualRenderWindow(before, after)) this.#scheduleScrollRender();
+  };
+
+  readonly #chatScrollEnded = (): void => {
+    this.#flushScheduledChatPosition();
   };
 
   readonly #chatScrollIntended = (event: Event): void => {
@@ -1657,7 +1692,44 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
+  #scheduleScrollRender(): void {
+    this.#scrollRenderFrame ??= globalThis.requestAnimationFrame(() => {
+      this.#scrollRenderFrame = undefined;
+      if (this.isConnected) this.requestUpdate();
+    });
+  }
+
+  #cancelScheduledScrollRender(): void {
+    if (this.#scrollRenderFrame === undefined) return;
+    globalThis.cancelAnimationFrame(this.#scrollRenderFrame);
+    this.#scrollRenderFrame = undefined;
+  }
+
+  #scheduleChatPosition(): void {
+    if (this.#chatPositionTimer !== undefined) {
+      clearTimeout(this.#chatPositionTimer);
+    }
+    this.#chatPositionTimer = setTimeout(() => {
+      this.#chatPositionTimer = undefined;
+      if (this.isConnected) this.#emitChatPosition();
+    }, CHAT_POSITION_SETTLE_MS);
+  }
+
+  #flushScheduledChatPosition(): void {
+    if (this.#chatPositionTimer === undefined) return;
+    clearTimeout(this.#chatPositionTimer);
+    this.#chatPositionTimer = undefined;
+    this.#emitChatPosition();
+  }
+
+  #cancelScheduledChatPosition(): void {
+    if (this.#chatPositionTimer === undefined) return;
+    clearTimeout(this.#chatPositionTimer);
+    this.#chatPositionTimer = undefined;
+  }
+
   readonly #followTail = (): void => {
+    this.#cancelScheduledChatPosition();
     const correction = this.#virtualizer.enableFollowTail();
     const viewport = this.querySelector<HTMLElement>(".chat-stream");
     if (viewport !== null) this.#setChatScrollTop(viewport, correction.scrollTop);

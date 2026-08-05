@@ -801,6 +801,32 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   );
   await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
 
+  const scrollRenderRequests = await page.locator("trouve-thread-screen").evaluate(
+    async (element) => {
+      const screen = element as HTMLElement & { requestUpdate: () => void };
+      const viewport = screen.querySelector<HTMLElement>(".chat-stream");
+      if (viewport === null) throw new Error("missing chat viewport");
+      const requestUpdate = screen.requestUpdate.bind(screen);
+      let requests = 0;
+      screen.requestUpdate = () => {
+        requests += 1;
+        requestUpdate();
+      };
+      try {
+        for (let index = 0; index < 12; index += 1) {
+          viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
+          viewport.scrollTop = Math.max(0, viewport.scrollTop - 1);
+          viewport.dispatchEvent(new Event("scroll"));
+        }
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        return requests;
+      } finally {
+        screen.requestUpdate = requestUpdate;
+      }
+    },
+  );
+  expect(scrollRenderRequests, "small scroll events should not force full transcript renders").toBeLessThanOrEqual(2);
+
   await page.locator(".chat-stream").evaluate((viewport) => {
     const jump = viewport.querySelector<HTMLElement>(".follow-tail");
     if (jump === null) throw new Error("missing jump-to-latest control");
