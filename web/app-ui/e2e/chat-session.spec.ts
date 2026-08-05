@@ -802,8 +802,17 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
 
   await page.locator(".chat-stream").evaluate((viewport) => {
+    const jump = viewport.querySelector<HTMLElement>(".follow-tail");
+    if (jump === null) throw new Error("missing jump-to-latest control");
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 1_000 }));
-    viewport.scrollTop = viewport.scrollHeight;
+    // WebKit includes the sticky control in scrollHeight even though it is
+    // visually overlaid. Stop at the transcript tail, not after the control.
+    viewport.scrollTop = Math.max(
+      0,
+      viewport.scrollHeight
+        - viewport.clientHeight
+        - jump.getBoundingClientRect().height,
+    );
     viewport.dispatchEvent(new Event("scroll"));
   });
   await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(

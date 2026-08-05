@@ -136,6 +136,7 @@ type VirtualChatItem = VirtualItem & (
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
 const CHAT_END_SPACER_ID = "ephemeral:chat-end-spacer";
 const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
+const CHAT_TAIL_EPSILON_PX = 2;
 
 interface ActiveComposerCompletion {
   readonly token: ComposerCompletionToken;
@@ -1581,10 +1582,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       viewport.dataset["threadId"] !== this.threadId ||
       this.#restoredScrollThreadId !== this.threadId
     ) return;
+    // The sticky jump control is an overlay visually, but WebKit retains its
+    // border-box in normal flow and includes it in scrollHeight. Exclude that
+    // non-transcript height or the thumb can reach the transcript tail while
+    // still appearing one control-height away from the DOM tail.
+    const endControlHeight = viewport
+      .querySelector<HTMLElement>(".follow-tail")
+      ?.getBoundingClientRect().height ?? 0;
     const tailGap = Math.max(
       0,
-      viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+      viewport.scrollHeight
+        - endControlHeight
+        - viewport.clientHeight
+        - viewport.scrollTop,
     );
+    const atTail = tailGap <= CHAT_TAIL_EPSILON_PX;
     const userInitiated = this.#chatScrollIntent;
     this.#chatScrollIntent = false;
     if (
@@ -1596,12 +1608,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       // converge. Keep all of those events inside the correction window.
       return;
     }
-    if (this.#virtualizer.window().followingTail && tailGap <= 1) return;
+    if (this.#virtualizer.window().followingTail && atTail) return;
     if (userInitiated) this.#cancelProgrammaticScrollWindow();
     this.#virtualizer.setViewport(
       viewport.scrollTop,
       viewport.clientHeight,
-      { userInitiated: true, atTail: tailGap <= 1 },
+      { userInitiated: true, atTail },
     );
     if (viewport.scrollTop <= Math.max(320, viewport.clientHeight)) {
       void this.#loadOlderHistory(false);
