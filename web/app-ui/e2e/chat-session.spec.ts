@@ -768,28 +768,36 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
 
   await expect(page.getByText("Virtual response 219", { exact: true })).toBeVisible();
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
+  const conversationScrollbar = page.getByRole("scrollbar", {
+    name: "Conversation position",
+  });
+  await expect(conversationScrollbar).toBeVisible();
+  await expect(conversationScrollbar).toHaveAttribute("aria-disabled", "false");
   const scrollbarPresentation = await page.locator(".chat-stream").evaluate((viewport) => {
     const style = getComputedStyle(viewport);
     const webkitScrollbar = getComputedStyle(viewport, "::-webkit-scrollbar");
+    const customThumb = getComputedStyle(
+      viewport.parentElement!.querySelector<HTMLElement>(".chat-scrollbar-thumb")!,
+    );
     return {
-      color: style.scrollbarColor,
-      gutter: style.scrollbarGutter,
+      customThumbColor: customThumb.backgroundColor,
       overflowY: style.overflowY,
       width: style.scrollbarWidth,
       webkitWidth: webkitScrollbar.width,
     };
   });
-  expect(scrollbarPresentation.gutter).toContain("stable");
   expect(scrollbarPresentation.overflowY).toBe("scroll");
-  expect(scrollbarPresentation.width).toBe("thin");
-  expect(scrollbarPresentation.color).not.toBe("auto");
-  expect(scrollbarPresentation.webkitWidth).toBe("10px");
+  expect(scrollbarPresentation.width).toBe("none");
+  expect(scrollbarPresentation.webkitWidth).toBe("0px");
+  expect(scrollbarPresentation.customThumbColor).not.toBe("rgba(0, 0, 0, 0)");
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
   });
+  await expect(conversationScrollbar).toBeVisible();
+  await expect(conversationScrollbar).toHaveAttribute("aria-valuenow", "0");
   await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
     "aria-live",
     "off",

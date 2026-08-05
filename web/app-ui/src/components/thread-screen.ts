@@ -141,6 +141,8 @@ const CHAT_TAIL_EPSILON_PX = 2;
 const CHAT_POSITION_SETTLE_MS = 140;
 const CHAT_SCROLL_CORRECTION_SETTLE_MS = 240;
 const CHAT_TAIL_CONVERGENCE_FRAMES = 3;
+const CHAT_SCROLLBAR_INSET_PX = 3;
+const CHAT_SCROLLBAR_MIN_THUMB_PX = 32;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -161,6 +163,12 @@ interface ActiveComposerCompletion {
   readonly searching: boolean;
   readonly unavailable: boolean;
   readonly emptyMessage: string;
+}
+
+interface ChatScrollbarDrag {
+  readonly pointerId: number;
+  readonly pointerStartY: number;
+  readonly scrollTopStart: number;
 }
 
 const PATH_REFRESH_INTERVAL_MS = 5_000;
@@ -271,6 +279,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #programmaticScrollFrame: number | undefined;
   #tailConvergenceFrame: number | undefined;
   #scrollRenderFrame: number | undefined;
+  #chatScrollbarFrame: number | undefined;
+  #chatScrollbarDrag: ChatScrollbarDrag | undefined;
   #chatPositionTimer: ReturnType<typeof setTimeout> | undefined;
   #scrollCorrectionResumeAt = 0;
   #followTailControlHeight = 0;
@@ -407,7 +417,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#cancelProgrammaticScrollWindow();
       this.#cancelTailConvergence();
       this.#cancelScheduledScrollRender();
+      this.#cancelScheduledChatScrollbar();
       this.#cancelScheduledChatPosition();
+      this.#chatScrollbarDrag = undefined;
       this.#virtualizer = new Virtualizer<VirtualChatItem>({
         estimatedHeight: 120,
         overscanPx: 1_200,
@@ -478,6 +490,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#followTailControlHeight = viewport
       .querySelector<HTMLElement>(".follow-tail")
       ?.offsetHeight ?? 0;
+    this.#syncChatScrollbar(viewport);
     if (viewport.clientHeight !== this.#viewportHeight) {
       this.#viewportHeight = viewport.clientHeight;
       const correction = this.#virtualizer.resizeViewport(viewport.clientHeight);
@@ -554,6 +567,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           this.#scheduleScrollRender();
         }
       }
+      this.#scheduleChatScrollbar(activeViewport);
     });
     const mountedRows = new Set(
       this.querySelectorAll<HTMLElement>("[data-virtual-id]"),
@@ -577,7 +591,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#cancelProgrammaticScrollWindow();
     this.#cancelTailConvergence();
     this.#cancelScheduledScrollRender();
+    this.#cancelScheduledChatScrollbar();
     this.#cancelScheduledChatPosition();
+    this.#chatScrollbarDrag = undefined;
     this.#scrollCorrectionResumeAt = 0;
     this.#copyFeedbackGeneration += 1;
     this.#usageGeneration += 1;
@@ -1262,76 +1278,97 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     const window = this.#virtualizer.window();
     return html`
-      <div
-        class="chat-stream"
-        data-thread-id=${this.threadId}
-        role="log"
-        aria-label="Conversation"
-        aria-live=${window.followingTail ? "polite" : "off"}
-        aria-relevant="additions text"
-        aria-busy=${effectiveTurnRunning || compacting}
-        @wheel=${this.#chatScrollIntended}
-        @pointerdown=${this.#chatScrollIntended}
-        @touchstart=${this.#chatScrollIntended}
-        @scroll=${this.#chatScrolled}
-        @scrollend=${this.#chatScrollEnded}
-      >
-        ${virtualItems.length === 0
-          ? nothing
-          : html`
-              <div aria-hidden="true" style=${`height:${window.paddingBefore}px`}></div>
-              ${repeat(window.items, ({ item }) => item.id, ({ item }) => {
-                if (item.kind === "edge-spacer") {
-                  return html`<div
-                    class=${`chat-edge-spacer ${item.edge}`}
-                    data-virtual-id=${item.id}
-                    aria-hidden="true"
-                  ></div>`;
-                }
-                if (item.kind === "compacting") {
-                  return html`<div data-virtual-id=${item.id}>
-                    <p class="activity-row" role="status">Compacting context…</p>
-                  </div>`;
-                }
-                if (item.kind === "activity") {
-                  return html`<div data-virtual-id=${item.id}>
-                    ${this.#renderActivityRow(item.label)}
-                  </div>`;
-                }
-                if (item.kind === "history") {
-                  return html`<div
-                    class="chat-history-loader"
-                    data-virtual-id=${item.id}
-                    role="status"
-                  >
-                    ${this.#historyLoading
-                      ? html`<span>Loading earlier messages…</span>`
-                      : html`
-                          <button type="button" @click=${() => this.#loadOlderHistory(false)}>
-                            Load earlier messages
-                          </button>
-                          ${this.#historyError === ""
-                            ? nothing
-                            : html`<span class="error-text">${this.#historyError}</span>`}
-                        `}
-                  </div>`;
-                }
-                const unit = layout.units[item.unitIndex];
-                return unit === undefined
-                  ? nothing
-                  : html`<div data-virtual-id=${item.id}>${this.#renderUnit(
-                      unit,
-                      turnModels,
-                      turnDurationMs,
-                      presentation,
-                      unit.id === nestedActivityUnitId ? activityLabel : undefined,
-                    )}</div>`;
-              })}
-              <div aria-hidden="true" style=${`height:${window.paddingAfter}px`}></div>
-            `}
-        ${!window.followingTail && virtualItems.length > 0
-          ? html`<button class="follow-tail" type="button" @click=${this.#followTail}>Jump to latest</button>`
-          : nothing}
+      <div class="chat-scroll-shell">
+        <div
+          id="chat-transcript"
+          class="chat-stream"
+          data-thread-id=${this.threadId}
+          role="log"
+          aria-label="Conversation"
+          aria-live=${window.followingTail ? "polite" : "off"}
+          aria-relevant="additions text"
+          aria-busy=${effectiveTurnRunning || compacting}
+          @wheel=${this.#chatScrollIntended}
+          @pointerdown=${this.#chatScrollIntended}
+          @touchstart=${this.#chatScrollIntended}
+          @scroll=${this.#chatScrolled}
+          @scrollend=${this.#chatScrollEnded}
+        >
+          ${virtualItems.length === 0
+            ? nothing
+            : html`
+                <div aria-hidden="true" style=${`height:${window.paddingBefore}px`}></div>
+                ${repeat(window.items, ({ item }) => item.id, ({ item }) => {
+                  if (item.kind === "edge-spacer") {
+                    return html`<div
+                      class=${`chat-edge-spacer ${item.edge}`}
+                      data-virtual-id=${item.id}
+                      aria-hidden="true"
+                    ></div>`;
+                  }
+                  if (item.kind === "compacting") {
+                    return html`<div data-virtual-id=${item.id}>
+                      <p class="activity-row" role="status">Compacting context…</p>
+                    </div>`;
+                  }
+                  if (item.kind === "activity") {
+                    return html`<div data-virtual-id=${item.id}>
+                      ${this.#renderActivityRow(item.label)}
+                    </div>`;
+                  }
+                  if (item.kind === "history") {
+                    return html`<div
+                      class="chat-history-loader"
+                      data-virtual-id=${item.id}
+                      role="status"
+                    >
+                      ${this.#historyLoading
+                        ? html`<span>Loading earlier messages…</span>`
+                        : html`
+                            <button type="button" @click=${() => this.#loadOlderHistory(false)}>
+                              Load earlier messages
+                            </button>
+                            ${this.#historyError === ""
+                              ? nothing
+                              : html`<span class="error-text">${this.#historyError}</span>`}
+                          `}
+                    </div>`;
+                  }
+                  const unit = layout.units[item.unitIndex];
+                  return unit === undefined
+                    ? nothing
+                    : html`<div data-virtual-id=${item.id}>${this.#renderUnit(
+                        unit,
+                        turnModels,
+                        turnDurationMs,
+                        presentation,
+                        unit.id === nestedActivityUnitId ? activityLabel : undefined,
+                      )}</div>`;
+                })}
+                <div aria-hidden="true" style=${`height:${window.paddingAfter}px`}></div>
+              `}
+          ${!window.followingTail && virtualItems.length > 0
+            ? html`<button class="follow-tail" type="button" @click=${this.#followTail}>Jump to latest</button>`
+            : nothing}
+        </div>
+        <div
+          class="chat-scrollbar"
+          role="scrollbar"
+          aria-label="Conversation position"
+          aria-controls="chat-transcript"
+          aria-orientation="vertical"
+          aria-valuemin="0"
+          aria-valuemax="0"
+          aria-valuenow="0"
+          aria-disabled="true"
+          tabindex="-1"
+          @keydown=${this.#chatScrollbarKeydown}
+          @pointerdown=${this.#chatScrollbarPointerDown}
+          @pointermove=${this.#chatScrollbarPointerMove}
+          @pointerup=${this.#chatScrollbarPointerEnd}
+          @pointercancel=${this.#chatScrollbarPointerEnd}
+          @lostpointercapture=${this.#chatScrollbarPointerEnd}
+        ><span class="chat-scrollbar-thumb"></span></div>
       </div>
     `;
   }
@@ -1656,12 +1693,182 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  #chatScrollbarMetrics(viewport: HTMLElement) {
+    const maxScrollTop = this.#transcriptTailScrollTop(viewport);
+    const trackHeight = Math.max(
+      0,
+      viewport.clientHeight - CHAT_SCROLLBAR_INSET_PX * 2,
+    );
+    const contentHeight = viewport.clientHeight + maxScrollTop;
+    const proportionalHeight = contentHeight <= 0
+      ? trackHeight
+      : trackHeight * viewport.clientHeight / contentHeight;
+    const thumbHeight = Math.min(
+      trackHeight,
+      Math.max(CHAT_SCROLLBAR_MIN_THUMB_PX, proportionalHeight),
+    );
+    return {
+      maxScrollTop,
+      thumbHeight,
+      thumbTravel: Math.max(0, trackHeight - thumbHeight),
+    };
+  }
+
+  #syncChatScrollbar(viewport: HTMLElement): void {
+    const scrollbar = this.querySelector<HTMLElement>(".chat-scrollbar");
+    const thumb = scrollbar?.querySelector<HTMLElement>(".chat-scrollbar-thumb");
+    if (scrollbar === null || scrollbar === undefined || thumb === null || thumb === undefined) {
+      return;
+    }
+    const metrics = this.#chatScrollbarMetrics(viewport);
+    const scrollable = metrics.maxScrollTop > CHAT_TAIL_EPSILON_PX
+      && metrics.thumbTravel > 0;
+    const scrollTop = Math.min(
+      metrics.maxScrollTop,
+      Math.max(0, viewport.scrollTop),
+    );
+    const thumbTop = scrollable
+      ? metrics.thumbTravel * scrollTop / metrics.maxScrollTop
+      : 0;
+    thumb.style.height = `${metrics.thumbHeight}px`;
+    thumb.style.transform = `translate3d(0, ${thumbTop}px, 0)`;
+    scrollbar.toggleAttribute("data-scrollable", scrollable);
+    scrollbar.tabIndex = scrollable ? 0 : -1;
+    scrollbar.setAttribute("aria-disabled", scrollable ? "false" : "true");
+    scrollbar.setAttribute("aria-valuemax", String(Math.round(metrics.maxScrollTop)));
+    scrollbar.setAttribute("aria-valuenow", String(Math.round(scrollTop)));
+    scrollbar.setAttribute(
+      "aria-valuetext",
+      !scrollable
+        ? "No scrolling needed"
+        : metrics.maxScrollTop - scrollTop <= CHAT_TAIL_EPSILON_PX
+          ? "Latest messages"
+          : `${Math.round(scrollTop / metrics.maxScrollTop * 100)}% through conversation`,
+    );
+  }
+
+  #scheduleChatScrollbar(viewport: HTMLElement): void {
+    this.#chatScrollbarFrame ??= globalThis.requestAnimationFrame(() => {
+      this.#chatScrollbarFrame = undefined;
+      if (
+        this.isConnected
+        && viewport.isConnected
+        && viewport.dataset["threadId"] === this.threadId
+      ) {
+        this.#syncChatScrollbar(viewport);
+      }
+    });
+  }
+
+  #cancelScheduledChatScrollbar(): void {
+    if (this.#chatScrollbarFrame === undefined) return;
+    globalThis.cancelAnimationFrame(this.#chatScrollbarFrame);
+    this.#chatScrollbarFrame = undefined;
+  }
+
+  #scrollChatFromScrollbar(viewport: HTMLElement, scrollTop: number): void {
+    const next = Math.min(
+      this.#transcriptTailScrollTop(viewport),
+      Math.max(0, scrollTop),
+    );
+    if (Math.abs(viewport.scrollTop - next) <= 0.5) {
+      this.#syncChatScrollbar(viewport);
+      return;
+    }
+    this.#chatScrollIntent = true;
+    this.#cancelProgrammaticScrollWindow();
+    this.#cancelTailConvergence();
+    viewport.scrollTop = next;
+    this.#scheduleChatScrollbar(viewport);
+  }
+
+  readonly #chatScrollbarPointerDown = (event: PointerEvent): void => {
+    if (!event.isPrimary || event.button !== 0) return;
+    const scrollbar = event.currentTarget as HTMLElement;
+    const viewport = this.querySelector<HTMLElement>(".chat-stream");
+    if (viewport === null || !scrollbar.hasAttribute("data-scrollable")) return;
+    const metrics = this.#chatScrollbarMetrics(viewport);
+    if (metrics.maxScrollTop <= 0 || metrics.thumbTravel <= 0) return;
+    const target = event.target;
+    const pressedThumb = target instanceof Element
+      && target.closest(".chat-scrollbar-thumb") !== null;
+    if (!pressedThumb) {
+      const track = scrollbar.getBoundingClientRect();
+      const thumbTop = Math.min(
+        metrics.thumbTravel,
+        Math.max(0, event.clientY - track.top - metrics.thumbHeight / 2),
+      );
+      this.#scrollChatFromScrollbar(
+        viewport,
+        metrics.maxScrollTop * thumbTop / metrics.thumbTravel,
+      );
+    }
+    this.#chatScrollbarDrag = {
+      pointerId: event.pointerId,
+      pointerStartY: event.clientY,
+      scrollTopStart: viewport.scrollTop,
+    };
+    scrollbar.toggleAttribute("data-dragging", true);
+    scrollbar.focus({ preventScroll: true });
+    scrollbar.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  };
+
+  readonly #chatScrollbarPointerMove = (event: PointerEvent): void => {
+    const drag = this.#chatScrollbarDrag;
+    if (drag === undefined || event.pointerId !== drag.pointerId) return;
+    const viewport = this.querySelector<HTMLElement>(".chat-stream");
+    if (viewport === null) return;
+    const metrics = this.#chatScrollbarMetrics(viewport);
+    if (metrics.maxScrollTop <= 0 || metrics.thumbTravel <= 0) return;
+    this.#scrollChatFromScrollbar(
+      viewport,
+      drag.scrollTopStart
+        + (event.clientY - drag.pointerStartY)
+          * metrics.maxScrollTop / metrics.thumbTravel,
+    );
+    event.preventDefault();
+  };
+
+  readonly #chatScrollbarPointerEnd = (event: PointerEvent): void => {
+    const drag = this.#chatScrollbarDrag;
+    if (drag === undefined || event.pointerId !== drag.pointerId) return;
+    this.#chatScrollbarDrag = undefined;
+    const scrollbar = event.currentTarget as HTMLElement;
+    scrollbar.removeAttribute("data-dragging");
+    if (scrollbar.hasPointerCapture?.(event.pointerId)) {
+      scrollbar.releasePointerCapture?.(event.pointerId);
+    }
+  };
+
+  readonly #chatScrollbarKeydown = (event: KeyboardEvent): void => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const viewport = this.querySelector<HTMLElement>(".chat-stream");
+    if (viewport === null) return;
+    const maxScrollTop = this.#transcriptTailScrollTop(viewport);
+    const page = Math.max(40, viewport.clientHeight * 0.9);
+    let next: number;
+    switch (event.key) {
+      case "ArrowUp": next = viewport.scrollTop - 40; break;
+      case "ArrowDown": next = viewport.scrollTop + 40; break;
+      case "PageUp": next = viewport.scrollTop - page; break;
+      case "PageDown": next = viewport.scrollTop + page; break;
+      case "Home": next = 0; break;
+      case "End": next = maxScrollTop; break;
+      case " ": next = viewport.scrollTop + (event.shiftKey ? -page : page); break;
+      default: return;
+    }
+    event.preventDefault();
+    this.#scrollChatFromScrollbar(viewport, next);
+  };
+
   readonly #chatScrolled = (event: Event): void => {
     const viewport = event.currentTarget as HTMLElement;
     if (
       viewport.dataset["threadId"] !== this.threadId ||
       this.#restoredScrollThreadId !== this.threadId
     ) return;
+    this.#scheduleChatScrollbar(viewport);
     const before = this.#virtualizer.window();
     // The sticky jump control is an overlay visually, but WebKit retains its
     // border-box in normal flow and includes it in scrollHeight. Its height is
