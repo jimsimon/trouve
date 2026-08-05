@@ -132,8 +132,13 @@ describe("retained Rust/Slint frontend source parity", () => {
     const nativeEvents = new Set(
       [...rust.matchAll(/^\s+Event::([A-Za-z0-9_]+)/gmu)].map((match) => match[1]!),
     );
+    const applyStart = typescript.indexOf("  apply(envelope:");
+    const applyEnd = typescript.indexOf("\n  private appendItem", applyStart);
+    expect(applyStart).toBeGreaterThanOrEqual(0);
+    expect(applyEnd).toBeGreaterThan(applyStart);
+    const applySource = typescript.slice(applyStart, applyEnd);
     const webEvents = new Set(
-      [...typescript.matchAll(/^\s+case "([a-z0-9._-]+)"/gmu)].map((match) => match[1]!),
+      [...applySource.matchAll(/^\s+case "([a-z0-9._-]+)"/gmu)].map((match) => match[1]!),
     );
 
     expect([...nativeEvents].sort()).toEqual(Object.keys(rustEventToWire).sort());

@@ -7,6 +7,7 @@ import type {
   ProtocolServerInfo,
   ProtocolSessionSummary,
   ProtocolThread,
+  ProtocolThreadViewSnapshot,
   ProtocolTodoItem,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
@@ -393,6 +394,42 @@ export class AppStore {
     }
     this.#threadViews.set(threadId, view);
     return view;
+  }
+
+  /** Atomically install the server-folded transcript tail at its SSE cursor. */
+  replaceThreadViewSnapshot(
+    threadId: string,
+    cursor: number,
+    snapshot: ProtocolThreadViewSnapshot,
+  ): boolean {
+    const current = this.#threadViews.get(threadId);
+    if (current !== undefined && current.cursor > cursor) return false;
+    this.#threadViews.delete(threadId);
+    while (this.#threadViews.size >= this.#maxThreadViews) {
+      const oldest = this.#threadViews.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#threadViews.delete(oldest);
+    }
+    const view = ThreadViewModel.fromSnapshot(cursor, snapshot);
+    this.#threadViews.set(threadId, view);
+
+    const todos = view.todos.map((todo) => ({ ...todo }));
+    this.#threadTodoEvents.set(threadId, todos);
+    const thread = this.#threads.get(threadId);
+    if (thread !== undefined) this.#threads.set(threadId, { ...thread, todos });
+    this.#touch();
+    return true;
+  }
+
+  /** Prepend one contiguous folded page while retaining newer live state. */
+  prependThreadViewSnapshot(
+    threadId: string,
+    snapshot: ProtocolThreadViewSnapshot,
+  ): boolean {
+    const view = this.threadView(threadId);
+    if (!view.prependSnapshot(snapshot)) return false;
+    this.#touch();
+    return true;
   }
 
   applyThreadEvent(threadId: string, envelope: ProtocolEventEnvelope): boolean {

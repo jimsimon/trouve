@@ -109,6 +109,41 @@ describe("ProtocolClient", () => {
     );
   });
 
+  it("loads a bounded folded thread view with its exact stream cursor", async () => {
+    const requests: Request[] = [];
+    const snapshot = {
+      item_offset: 256,
+      total_items: 512,
+      has_older: true,
+      items: [{
+        kind: "assistant",
+        turn: 7,
+        content: "Already folded",
+        complete: true,
+      }],
+      turn_models: { "7": "openai/gpt-5.6" },
+      turn_started_at: { "7": "2026-08-01T12:00:00Z" },
+      turn_duration_ms: { "7": 2_500 },
+    };
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(snapshot, {
+          headers: { "x-trouve-event-cursor": "91" },
+        });
+      }),
+    });
+
+    await expect(client.threadView("th/folded", 512)).resolves.toEqual({
+      cursor: 91,
+      value: snapshot,
+    });
+    const url = new URL(requests[0]!.url);
+    expect(url.pathname).toBe("/v1/threads/th%2Ffolded/view");
+    expect(url.searchParams.get("limit")).toBe("256");
+    expect(url.searchParams.get("before")).toBe("512");
+  });
+
   it("loads encoded session mention paths and rejects malformed path lists", async () => {
     const requests: Request[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {

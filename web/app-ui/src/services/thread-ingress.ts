@@ -2,15 +2,21 @@ import type { AppStore } from "../state/app-store.js";
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 import type { CursorEventStream, SafeStreamDiagnostic } from "./cursor-event-stream.js";
 import type {
+  ProtocolCursorSnapshot,
   ProtocolEventEnvelope,
   ProtocolIngressEvent,
   ProtocolThread,
+  ProtocolThreadViewSnapshot,
 } from "./protocol-client.js";
 
 type ThreadStream = CursorEventStream<ProtocolIngressEvent>;
 
 export interface ThreadProtocol {
   threads(sessionId: string): Promise<readonly ProtocolThread[]>;
+  threadView(
+    threadId: string,
+    before?: number,
+  ): Promise<ProtocolCursorSnapshot<ProtocolThreadViewSnapshot>>;
   threadEvents(
     threadId: string,
     options: {
@@ -200,6 +206,13 @@ export class ThreadIngress {
     // Reconnect from the retained cursor so the active stream and generation
     // always agree.
     this.#closeStream();
+    const snapshot = await this.#client.threadView(threadId);
+    if (generation !== this.#generation) return;
+    this.#store.replaceThreadViewSnapshot(
+      threadId,
+      snapshot.cursor,
+      snapshot.value,
+    );
     const view = this.#store.threadView(threadId);
     const replayBatcher = new ThreadReplayBatcher(
       (events) => {

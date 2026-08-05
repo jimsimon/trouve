@@ -70,6 +70,21 @@ const generateModule = ({ document, schemaId, validatorNamespace, validators, su
 const protocolSchemaId = "urn:trouve:protocol-openapi";
 const protocolDocument = readJson("src/generated/protocol-openapi.json");
 const protocolSchemas = asRecord(asRecord(protocolDocument.components)?.schemas);
+
+// JSON object keys are always strings. utoipa currently describes the keys of
+// Rust maps keyed by u64 as integer-valued `propertyNames`, which rejects the
+// wire representation (for example `{ "7": "openai/gpt-5.6" }`). Normalize
+// those three thread-snapshot maps only in the runtime validator until the
+// upstream schema generator can express numeric string keys directly.
+const threadViewSnapshot = asRecord(protocolSchemas?.ThreadViewSnapshot);
+const threadViewProperties = asRecord(threadViewSnapshot?.properties);
+for (const name of ["turn_models", "turn_started_at", "turn_duration_ms"]) {
+  const property = asRecord(threadViewProperties?.[name]);
+  const propertyNames = asRecord(property?.propertyNames);
+  if (propertyNames?.type === "integer") {
+    property.propertyNames = { type: "string", pattern: "^(0|[1-9][0-9]*)$" };
+  }
+}
 const eventEnvelope = asRecord(protocolSchemas?.EventEnvelope);
 const eventEnvelopeAllOf = eventEnvelope?.allOf;
 const eventEnvelopeFields = Array.isArray(eventEnvelopeAllOf)
@@ -176,6 +191,19 @@ const protocolSource = generateModule({
   )});\n`,
 });
 
+// Thread snapshots are loaded only when a conversation route opens. Keep the
+// comparatively rich folded-item validator in its own lazy bundle so adding
+// snapshot validation does not inflate the application entry chunk.
+const threadViewSchemaId = "urn:trouve:thread-view-openapi";
+const threadViewSource = generateModule({
+  document: protocolDocument,
+  schemaId: threadViewSchemaId,
+  validatorNamespace: "thread-view",
+  validators: {
+    threadView: componentRef(threadViewSchemaId, "ThreadViewSnapshot"),
+  },
+});
+
 const hostSchemaId = "urn:trouve:desktop-host-openapi";
 const hostDocument = readJson("src/generated/host-openapi.json");
 const hostSource = generateModule({
@@ -194,6 +222,7 @@ const hostSource = generateModule({
 
 const outputs = [
   ["src/generated/protocol-validators.ts", protocolSource],
+  ["src/generated/thread-view-validator.ts", threadViewSource],
   ["src/generated/host-validators.ts", hostSource],
 ];
 

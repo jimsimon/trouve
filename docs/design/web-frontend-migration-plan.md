@@ -812,10 +812,14 @@ trouve-protocol/server/client tests, and regenerate OpenAPI deliberately:
 
 ### Active history and terminal
 
-Initially retain active-thread snapshot/replay plus SSE. Add paginated history
-only if benchmarks require it. Pagination must end on safe turn/card
-boundaries, return a through_cursor, start SSE strictly after it, and never
-split tool/approval/question sequences.
+Active threads now bootstrap from the newest bounded folded-view page and open
+SSE strictly after the exact cursor returned with that page. Older folded
+items load backward in contiguous 256-item pages as the reader approaches the
+top; prepends retain stable absolute identities and preserve the reader's
+anchor. The explicit accessibility mode incrementally loads every remaining
+page before exposing the complete nonvirtual history. The durable event log
+remains authoritative, and reconnect replay begins only after the installed
+snapshot/live cursor.
 
 Terminal creation/input/resize/close remain HTTP; bytes remain dedicated
 ephemeral SSE; every terminal keeps independent parser/grid/offset state;

@@ -129,11 +129,13 @@ type VirtualChatItem = VirtualItem & (
   | { readonly kind: "unit"; readonly unitIndex: number }
   | { readonly kind: "compacting" }
   | { readonly kind: "activity"; readonly label: string }
+  | { readonly kind: "history" }
   | { readonly kind: "edge-spacer"; readonly edge: "start" | "end" }
 );
 
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
 const CHAT_END_SPACER_ID = "ephemeral:chat-end-spacer";
+const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
 
 interface ActiveComposerCompletion {
   readonly token: ComposerCompletionToken;
@@ -235,6 +237,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #newThreadBusy = false;
   #newThreadError = "";
   #accessibleHistory = false;
+  #historyLoading = false;
+  #historyError = "";
+  #historyGeneration = 0;
+  #pendingHistoryPrepend:
+    | { readonly scrollTop: number; readonly totalHeight: number }
+    | undefined;
   #virtualizer = new Virtualizer<VirtualChatItem>({
     estimatedHeight: 120,
     overscanPx: 480,
@@ -362,6 +370,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#turnRequestGeneration += 1;
       this.#attachmentGeneration += 1;
       this.#threadInteractionGeneration += 1;
+      this.#historyGeneration += 1;
+      this.#historyLoading = false;
+      this.#historyError = "";
+      this.#pendingHistoryPrepend = undefined;
       this.#requestPending = false;
       this.#requestError = "";
       this.#threadSettingsPending = false;
@@ -646,6 +658,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         view?.turnModels ?? new Map<number, string>(),
         view?.turnDurationMs ?? new Map<number, number>(),
         turnControls.activityLabel,
+        view?.hasOlder ?? false,
       )}
 
       ${this.#renderQueue(
@@ -1059,6 +1072,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     activityOverride: string | undefined,
+    hasOlder: boolean,
   ) {
     this.#syncQuestionWizards(items);
     const presentation = indexChatPresentation(items);
@@ -1114,6 +1128,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         estimatedHeight: 32,
       });
     }
+    if (hasOlder || this.#historyLoading || this.#historyError !== "") {
+      virtualItems.unshift({
+        id: CHAT_HISTORY_LOADER_ID,
+        kind: "history",
+        estimatedHeight: this.#historyError === "" ? 38 : 58,
+      });
+    }
     if (virtualItems.length > 0) {
       virtualItems.unshift({
         id: CHAT_START_SPACER_ID,
@@ -1130,6 +1151,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     this.#virtualizer.setMode(this.#accessibleHistory ? "accessible" : "virtual");
     this.#virtualizer.setItems(virtualItems);
+    if (this.#pendingHistoryPrepend !== undefined) {
+      const before = this.#pendingHistoryPrepend;
+      this.#pendingHistoryPrepend = undefined;
+      const addedHeight = Math.max(
+        0,
+        this.#virtualizer.window().totalHeight - before.totalHeight,
+      );
+      this.#virtualizer.setViewport(
+        before.scrollTop + addedHeight,
+        this.#viewportHeight,
+      );
+    }
     if (this.#restoredScrollThreadId !== this.threadId) {
       const bookmark = this.scrollBookmark;
       if (bookmark === undefined) {
@@ -1182,6 +1215,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 if (item.kind === "activity") {
                   return html`<div data-virtual-id=${item.id}>
                     ${this.#renderActivityRow(item.label)}
+                  </div>`;
+                }
+                if (item.kind === "history") {
+                  return html`<div
+                    class="chat-history-loader"
+                    data-virtual-id=${item.id}
+                    role="status"
+                  >
+                    ${this.#historyLoading
+                      ? html`<span>Loading earlier messages…</span>`
+                      : html`
+                          <button type="button" @click=${() => this.#loadOlderHistory(false)}>
+                            Load earlier messages
+                          </button>
+                          ${this.#historyError === ""
+                            ? nothing
+                            : html`<span class="error-text">${this.#historyError}</span>`}
+                        `}
                   </div>`;
                 }
                 const unit = layout.units[item.unitIndex];
@@ -1552,6 +1603,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       viewport.clientHeight,
       { userInitiated: true },
     );
+    if (viewport.scrollTop <= Math.max(320, viewport.clientHeight)) {
+      void this.#loadOlderHistory(false);
+    }
     this.#emitChatPosition();
     this.requestUpdate();
   };
@@ -1612,9 +1666,51 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }));
   }
 
+  async #loadOlderHistory(loadAll: boolean): Promise<void> {
+    if (this.#historyLoading || this.threadId === "") return;
+    const store = this.#store.value;
+    const services = this.#services.value;
+    if (store === undefined || services === undefined) return;
+    const threadId = this.threadId;
+    const generation = this.#historyGeneration;
+    const initialView = store.threadView(threadId);
+    if (!initialView.hasOlder || initialView.itemOffset === 0) return;
+
+    this.#historyLoading = true;
+    this.#historyError = "";
+    this.requestUpdate();
+    try {
+      do {
+        const view = store.threadView(threadId);
+        if (!view.hasOlder || view.itemOffset === 0) break;
+        const page = await services.protocol.threadView(threadId, view.itemOffset);
+        if (generation !== this.#historyGeneration || threadId !== this.threadId) return;
+        const virtualWindow = this.#virtualizer.window();
+        this.#pendingHistoryPrepend = {
+          scrollTop: virtualWindow.scrollTop,
+          totalHeight: virtualWindow.totalHeight,
+        };
+        if (!store.prependThreadViewSnapshot(threadId, page.value)) {
+          this.#pendingHistoryPrepend = undefined;
+          throw new Error("non-contiguous thread history page");
+        }
+      } while (loadAll);
+    } catch {
+      if (generation === this.#historyGeneration && threadId === this.threadId) {
+        this.#historyError = "Earlier messages could not be loaded.";
+      }
+    } finally {
+      if (generation === this.#historyGeneration && threadId === this.threadId) {
+        this.#historyLoading = false;
+        this.requestUpdate();
+      }
+    }
+  }
+
   readonly #toggleAccessibleHistory = (): void => {
     this.#accessibleHistory = !this.#accessibleHistory;
     this.#virtualizer.setMode(this.#accessibleHistory ? "accessible" : "virtual");
+    if (this.#accessibleHistory) void this.#loadOlderHistory(true);
     this.requestUpdate();
   };
 

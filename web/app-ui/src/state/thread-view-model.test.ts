@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import type { ProtocolEventEnvelope } from "../services/protocol-client.js";
+import type {
+  ProtocolEventEnvelope,
+  ProtocolThreadViewSnapshot,
+} from "../services/protocol-client.js";
 import { ThreadViewModel, type TodoItem } from "./thread-view-model.js";
 
 const envelope = (
@@ -72,6 +75,99 @@ describe("ThreadViewModel", () => {
               context_window: vm.lastUsage.context_window ?? null,
             },
     }).toEqual(fixture.expected);
+  });
+
+  it("installs a folded snapshot without replaying its historical deltas", () => {
+    const snapshot: ProtocolThreadViewSnapshot = {
+      item_offset: 40,
+      total_items: 43,
+      has_older: true,
+      items: [
+        {
+          kind: "turn_status",
+          turn: 7,
+          state: {
+            state: "completed",
+            usage: { input_tokens: 20, output_tokens: 5 },
+          },
+        },
+        {
+          kind: "assistant",
+          turn: 7,
+          content: "Final folded answer",
+          complete: true,
+        },
+        {
+          kind: "tool_call",
+          call_id: "call_snapshot",
+          tool: "shell",
+          args: { command: "cargo test" },
+          status: "awaiting_approval",
+        },
+      ],
+      pending_approvals: ["call_snapshot"],
+      last_usage: { input_tokens: 20, output_tokens: 5 },
+      turn_models: { "7": "openai/gpt-5.6" },
+      turn_started_at: { "7": "2026-08-01T12:00:00Z" },
+      turn_duration_ms: { "7": 4_000 },
+      commands: [{ name: "review", description: "Review changes" }],
+      todos: [{ id: "done", content: "Fold history", status: "completed" }],
+    };
+
+    const view = ThreadViewModel.fromSnapshot(91, snapshot);
+
+    expect(view).toMatchObject({
+      cursor: 91,
+      itemOffset: 40,
+      totalItems: 43,
+      hasOlder: true,
+      snapshotLoaded: true,
+      lastUsageCursor: 91,
+      turnRunning: false,
+    });
+    expect(view.items).toMatchObject([
+      { id: "snapshot:40", kind: "turn-status", state: { kind: "completed" } },
+      { id: "snapshot:41", kind: "assistant", content: "Final folded answer" },
+      { id: "snapshot:42", kind: "tool", status: "awaiting-approval" },
+    ]);
+    expect(view.turnModels.get(7)).toBe("openai/gpt-5.6");
+    expect(view.turnDurationMs.get(7)).toBe(4_000);
+  });
+
+  it("prepends only a contiguous folded page and keeps absolute item ids stable", () => {
+    const newest: ProtocolThreadViewSnapshot = {
+      item_offset: 2,
+      total_items: 4,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 2, content: "new", attachments: [] },
+        { kind: "assistant", turn: 2, content: "answer", complete: true },
+      ],
+    };
+    const view = ThreadViewModel.fromSnapshot(20, newest);
+    const newestIds = view.items.map(({ id }) => id);
+
+    expect(view.prependSnapshot({
+      item_offset: 0,
+      total_items: 4,
+      has_older: false,
+      items: [
+        { kind: "user", turn: 1, content: "old", attachments: [] },
+        { kind: "assistant", turn: 1, content: "earlier", complete: true },
+      ],
+    })).toBe(true);
+    expect(view.itemOffset).toBe(0);
+    expect(view.hasOlder).toBe(false);
+    expect(view.items.map(({ id }) => id)).toEqual([
+      "snapshot:0",
+      "snapshot:1",
+      ...newestIds,
+    ]);
+
+    expect(view.prependSnapshot({
+      item_offset: 8,
+      items: [{ kind: "user", turn: 9, content: "gap", attachments: [] }],
+    })).toBe(false);
   });
 
   it("folds a streamed turn into stable user, assistant, and terminal status items", () => {

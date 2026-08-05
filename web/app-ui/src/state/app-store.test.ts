@@ -4,6 +4,7 @@ import type {
   ProtocolEventEnvelope,
   ProtocolPrInfo,
   ProtocolThread,
+  ProtocolThreadViewSnapshot,
 } from "../services/protocol-client.js";
 import { readSignal } from "./reactivity.js";
 import { AppStore } from "./app-store.js";
@@ -388,6 +389,60 @@ describe("AppStore", () => {
     store.threadView("th_third");
     expect(store.threadView("th_first")).toBe(first);
     expect(store.threadView("th_second")).not.toBe(second);
+  });
+
+  it("atomically replaces replay state with a folded tail and prepends older pages", () => {
+    const store = new AppStore();
+    store.upsertThread(thread("th_1", [
+      { id: "stale", content: "Stale", status: "pending" },
+    ]));
+    store.applyThreadEvent("th_1", {
+      cursor: 1,
+      scope: { thread: "th_1" },
+      ts: "2026-08-01T12:00:00Z",
+      type: "user.message",
+      turn: 1,
+      content: "Replay-built",
+      attachments: [],
+    });
+    const snapshot: ProtocolThreadViewSnapshot = {
+      item_offset: 2,
+      total_items: 3,
+      has_older: true,
+      items: [{
+        kind: "assistant",
+        turn: 2,
+        content: "Folded tail",
+        complete: true,
+      }],
+      todos: [{ id: "current", content: "Current", status: "in_progress" }],
+    };
+
+    expect(store.replaceThreadViewSnapshot("th_1", 50, snapshot)).toBe(true);
+    expect(store.threadView("th_1").items).toMatchObject([
+      { kind: "assistant", content: "Folded tail" },
+    ]);
+    expect(store.thread("th_1")?.todos).toMatchObject([
+      { id: "current", status: "in_progress" },
+    ]);
+    expect(store.prependThreadViewSnapshot("th_1", {
+      item_offset: 0,
+      total_items: 3,
+      has_older: false,
+      items: [
+        { kind: "user", turn: 1, content: "Earlier", attachments: [] },
+        { kind: "assistant", turn: 1, content: "Earlier answer", complete: true },
+      ],
+    })).toBe(true);
+    expect(store.threadView("th_1")).toMatchObject({
+      cursor: 50,
+      itemOffset: 0,
+      hasOlder: false,
+    });
+    expect(store.threadView("th_1").items).toHaveLength(3);
+
+    expect(store.replaceThreadViewSnapshot("th_1", 49, { items: [] })).toBe(false);
+    expect(store.threadView("th_1").cursor).toBe(50);
   });
 
   it("seeds new thread projections from the initial todo snapshot", () => {

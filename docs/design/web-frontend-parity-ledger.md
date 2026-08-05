@@ -441,6 +441,11 @@ desktop-device, mobile-PWA, or performance evidence is recorded.
   bookmark fallback, and an accessible nonvirtual history mode. Its chat log
   announces additions only while following the tail so scrolling parked
   history does not repeatedly announce remounted rows.
+- Fresh clients install the server's newest 256-item folded thread snapshot
+  and start SSE after that response's exact event cursor instead of replaying
+  from zero. Approaching the top lazily prepends contiguous older folded pages;
+  absolute item identities plus height correction keep the reader anchored,
+  while accessible full-history mode loads the remaining pages explicitly.
 - User, Agent, thinking, grouped activity, and individual tool disclosures
   remove their collapsed bodies from the DOM. Thinking and historical work
   use the same disclosure defaults and collapsed previews as the retained

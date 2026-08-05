@@ -1,5 +1,8 @@
 import type { components as ProtocolComponents } from "../generated/protocol.js";
-import type { ProtocolEventEnvelope } from "../services/protocol-client.js";
+import type {
+  ProtocolEventEnvelope,
+  ProtocolThreadViewSnapshot,
+} from "../services/protocol-client.js";
 import {
   appendBoundedToolOutput,
   emptyToolOutput,
@@ -13,6 +16,7 @@ type QuestionAnswer = ProtocolComponents["schemas"]["QuestionAnswer"];
 export type QueuedPrompt = ProtocolComponents["schemas"]["QueuedPrompt"];
 export type TodoItem = ProtocolComponents["schemas"]["TodoItem"];
 type Usage = ProtocolComponents["schemas"]["Usage"];
+type ThreadViewItem = ProtocolThreadViewSnapshot["items"][number];
 
 export type ToolCallStatus =
   | "awaiting-approval"
@@ -84,6 +88,17 @@ const terminalToolStatus = (status: ToolCallStatus): boolean =>
   status === "denied" ||
   status === "aborted";
 
+const replaceNumericMap = <T>(
+  target: Map<number, T>,
+  source: Readonly<Record<string, T>> | undefined,
+): void => {
+  target.clear();
+  for (const [rawKey, value] of Object.entries(source ?? {})) {
+    const key = Number(rawKey);
+    if (Number.isSafeInteger(key) && key >= 0) target.set(key, value);
+  }
+};
+
 /** Replay-equivalent projection of one thread's durable event stream.
  * This mirrors trouve-client-core's ThreadViewModel without sharing Rust
  * process state across the protocol boundary. */
@@ -96,6 +111,12 @@ export class ThreadViewModel {
   readonly turnDurationMs = new Map<number, number>();
 
   cursor = 0;
+  /** Absolute folded-item position of `items[0]`. */
+  itemOffset = 0;
+  /** Complete folded-item count at the latest snapshot/live event. */
+  totalItems = 0;
+  hasOlder = false;
+  snapshotLoaded = false;
   lastUsage: Usage | undefined;
   lastUsageCursor = 0;
   compacting = false;
@@ -104,6 +125,144 @@ export class ThreadViewModel {
   commands: readonly CommandInfo[] = [];
   queue: readonly QueuedPrompt[] = [];
   todos: readonly TodoItem[] = [];
+
+  static fromSnapshot(
+    cursor: number,
+    snapshot: ProtocolThreadViewSnapshot,
+  ): ThreadViewModel {
+    const view = new ThreadViewModel();
+    view.replaceSnapshot(cursor, snapshot);
+    return view;
+  }
+
+  /** Replace replay-built state with the server's current folded tail. */
+  replaceSnapshot(cursor: number, snapshot: ProtocolThreadViewSnapshot): void {
+    const itemOffset = snapshot.item_offset ?? 0;
+    this.items.splice(
+      0,
+      this.items.length,
+      ...snapshot.items.map((item, index) =>
+        this.#snapshotItem(item, itemOffset + index)),
+    );
+    this.pendingApprovals.splice(
+      0,
+      this.pendingApprovals.length,
+      ...(snapshot.pending_approvals ?? []),
+    );
+    this.pendingQuestions.splice(
+      0,
+      this.pendingQuestions.length,
+      ...(snapshot.pending_questions ?? []),
+    );
+    replaceNumericMap(this.turnModels, snapshot.turn_models);
+    replaceNumericMap(this.turnStartedAt, snapshot.turn_started_at);
+    replaceNumericMap(this.turnDurationMs, snapshot.turn_duration_ms);
+    this.cursor = cursor;
+    this.itemOffset = itemOffset;
+    this.totalItems = Math.max(
+      snapshot.total_items ?? 0,
+      itemOffset + snapshot.items.length,
+    );
+    this.hasOlder = snapshot.has_older ?? itemOffset > 0;
+    this.snapshotLoaded = true;
+    this.lastUsage = snapshot.last_usage ?? undefined;
+    this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
+    this.compacting = snapshot.compacting ?? false;
+    this.turnRunning = snapshot.turn_running ?? false;
+    this.thinking = snapshot.thinking ?? false;
+    this.commands = [...(snapshot.commands ?? [])];
+    this.queue = [...(snapshot.queue ?? [])];
+    this.replaceTodos(snapshot.todos ?? []);
+  }
+
+  /** Prepend one contiguous folded history page without replacing live state. */
+  prependSnapshot(snapshot: ProtocolThreadViewSnapshot): boolean {
+    const itemOffset = snapshot.item_offset ?? 0;
+    const pageEnd = itemOffset + snapshot.items.length;
+    if (pageEnd !== this.itemOffset) return false;
+    if (snapshot.items.length === 0) {
+      this.hasOlder = false;
+      return true;
+    }
+    const olderItems = snapshot.items.map((item, index) =>
+      this.#snapshotItem(item, itemOffset + index));
+    this.items.splice(0, 0, ...olderItems);
+    this.itemOffset = itemOffset;
+    this.totalItems = Math.max(
+      this.totalItems,
+      snapshot.total_items ?? 0,
+      pageEnd,
+    );
+    this.hasOlder = snapshot.has_older ?? itemOffset > 0;
+    return true;
+  }
+
+  #snapshotItem(item: ThreadViewItem, absoluteIndex: number): ThreadChatItem {
+    const id = `snapshot:${absoluteIndex}`;
+    switch (item.kind) {
+      case "user":
+        return {
+          id,
+          kind: "user",
+          turn: item.turn,
+          content: item.content,
+          attachments: item.attachments,
+        };
+      case "assistant":
+        return {
+          id,
+          kind: "assistant",
+          turn: item.turn,
+          content: item.content,
+          complete: item.complete,
+        };
+      case "thinking":
+        return {
+          id,
+          kind: "thinking",
+          turn: item.turn,
+          content: item.content,
+          complete: item.complete,
+        };
+      case "tool_call":
+        return {
+          id,
+          kind: "tool",
+          callId: item.call_id,
+          tool: item.tool,
+          args: item.args,
+          status: item.status === "awaiting_approval"
+            ? "awaiting-approval"
+            : item.status,
+          result: item.result,
+          output: emptyToolOutput(),
+        };
+      case "turn_status": {
+        let state: TurnState;
+        switch (item.state.state) {
+          case "running":
+            state = { kind: "running" };
+            break;
+          case "completed":
+            state = { kind: "completed", usage: item.state.usage };
+            break;
+          case "failed":
+            state = { kind: "failed", error: item.state.error };
+            break;
+        }
+        return { id, kind: "turn-status", turn: item.turn, state };
+      }
+      case "questions":
+        return {
+          id,
+          kind: "questions",
+          requestId: item.request_id,
+          title: item.title ?? undefined,
+          questions: item.questions,
+          answers: item.resolved === true ? item.answers ?? null : undefined,
+        };
+    }
+  }
 
   replaceQueue(prompts: readonly QueuedPrompt[]): void {
     this.queue = prompts;
@@ -120,7 +279,7 @@ export class ThreadViewModel {
         this.turnRunning = true;
         this.turnModels.set(envelope.turn, envelope.model);
         this.turnStartedAt.set(envelope.turn, envelope.ts);
-        this.items.push({
+        this.appendItem({
           id: `turn:${envelope.turn}`,
           kind: "turn-status",
           turn: envelope.turn,
@@ -143,7 +302,7 @@ export class ThreadViewModel {
         this.compacting = false;
         return true;
       case "user.message":
-        this.items.push({
+        this.appendItem({
           id: `user:${envelope.turn}`,
           kind: "user",
           turn: envelope.turn,
@@ -156,7 +315,7 @@ export class ThreadViewModel {
         const current = this.findTrailingOpen("thinking", envelope.turn);
         if (current?.kind === "thinking") current.content += envelope.text;
         else {
-          this.items.push({
+          this.appendItem({
             id: this.nextItemId(`thinking:${envelope.turn}`),
             kind: "thinking",
             turn: envelope.turn,
@@ -171,7 +330,7 @@ export class ThreadViewModel {
         const current = this.findTrailingOpen("assistant", envelope.turn);
         if (current?.kind === "assistant") current.content += envelope.text;
         else {
-          this.items.push({
+          this.appendItem({
             id: this.nextItemId(`assistant:${envelope.turn}`),
             kind: "assistant",
             turn: envelope.turn,
@@ -188,7 +347,7 @@ export class ThreadViewModel {
           current.content = envelope.content;
           current.complete = true;
         } else {
-          this.items.push({
+          this.appendItem({
             id: this.nextItemId(`assistant:${envelope.turn}`),
             kind: "assistant",
             turn: envelope.turn,
@@ -200,7 +359,7 @@ export class ThreadViewModel {
       }
       case "tool.requested":
         this.finishThinking();
-        this.items.push({
+        this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",
           callId: envelope.call_id,
@@ -271,7 +430,7 @@ export class ThreadViewModel {
         if (!this.pendingQuestions.includes(envelope.request_id)) {
           this.pendingQuestions.push(envelope.request_id);
         }
-        this.items.push({
+        this.appendItem({
           id: `questions:${envelope.request_id}`,
           kind: "questions",
           requestId: envelope.request_id,
@@ -319,6 +478,11 @@ export class ThreadViewModel {
       default:
         return false;
     }
+  }
+
+  private appendItem(item: ThreadChatItem): void {
+    this.items.push(item);
+    this.totalItems += 1;
   }
 
   #findLast(predicate: (item: ThreadChatItem) => boolean): ThreadChatItem | undefined {

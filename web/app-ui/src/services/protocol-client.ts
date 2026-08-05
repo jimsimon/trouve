@@ -48,6 +48,8 @@ export type ProtocolSetDefaultPermissionModeRequest =
   ProtocolComponents["schemas"]["SetDefaultPermissionModeRequest"];
 export type ProtocolModelInfo = ProtocolComponents["schemas"]["ModelInfo"];
 export type ProtocolThread = ProtocolComponents["schemas"]["Thread"];
+export type ProtocolThreadViewSnapshot =
+  ProtocolComponents["schemas"]["ThreadViewSnapshot"];
 export type ProtocolTodoItem = ProtocolComponents["schemas"]["TodoItem"];
 export type ProtocolCreateThreadRequest =
   ProtocolComponents["schemas"]["CreateThreadRequest"];
@@ -233,6 +235,7 @@ const validateResponse = async <T>(
     | "ModelInfo[]"
     | "Thread"
     | "Thread[]"
+    | "ThreadViewSnapshot"
     | "QueuedPrompt[]"
     | "TurnAccepted"
     | "UsageSummary"
@@ -1329,6 +1332,23 @@ export class ProtocolClient {
       "Thread[]",
       result.data,
       (loaded) => loaded.threads,
+    );
+  }
+
+  /** Seed a thread from its bounded folded tail before following live SSE.
+   * The response cursor is the exact snapshot/stream handoff boundary. */
+  async threadView(
+    threadId: string,
+    before?: number,
+  ): Promise<ProtocolCursorSnapshot<ProtocolThreadViewSnapshot>> {
+    const { threadView } = await import("../generated/thread-view-validator.js");
+    const query = new URLSearchParams({ limit: "256" });
+    if (before !== undefined) query.set("before", String(before));
+    return this.#validatedCursorJson(
+      `/v1/threads/${encodeURIComponent(threadId)}/view?${query.toString()}`,
+      "thread view",
+      "ThreadViewSnapshot",
+      () => threadView,
     );
   }
 

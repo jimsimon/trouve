@@ -11,6 +11,7 @@ import {
 import type {
   ProtocolEventEnvelope,
   ProtocolIngressEvent,
+  ProtocolThreadViewSnapshot,
 } from "./protocol-client.js";
 
 const thread = (id: string, sessionId = "se_1") => ({
@@ -22,10 +23,22 @@ const thread = (id: string, sessionId = "se_1") => ({
   created_at: `2026-08-01T12:00:0${id.endsWith("2") ? "2" : "1"}Z`,
 });
 
+const viewSnapshot = (
+  cursor = 0,
+  items: ProtocolThreadViewSnapshot["items"] = [],
+) => ({
+  cursor,
+  value: {
+    item_offset: 0,
+    total_items: items.length,
+    has_older: false,
+    items,
+  },
+});
+
 describe("ThreadIngress", () => {
-  it("selects the requested thread, starts at its retained cursor, and folds events", async () => {
+  it("seeds the requested thread from its folded snapshot before folding live events", async () => {
     const store = new AppStore();
-    store.threadView("th_2").cursor = 11;
     let receivedOptions:
       | Parameters<ThreadProtocol["threadEvents"]>[1]
       | undefined;
@@ -33,6 +46,12 @@ describe("ThreadIngress", () => {
     const close = vi.fn();
     const protocol: ThreadProtocol = {
       threads: vi.fn(async () => [thread("th_1"), thread("th_2")]),
+      threadView: vi.fn(async () => viewSnapshot(11, [{
+        kind: "user",
+        turn: 1,
+        content: "snapshot",
+        attachments: [],
+      }])),
       threadEvents: vi.fn(async (_threadId, options) => {
         receivedOptions = options;
         return { start, close } as unknown as CursorEventStream<ProtocolIngressEvent>;
@@ -43,6 +62,7 @@ describe("ThreadIngress", () => {
     });
 
     await expect(ingress.openSession("se_1", "th_2")).resolves.toBe("th_2");
+    expect(protocol.threadView).toHaveBeenCalledWith("th_2");
     expect(receivedOptions?.after).toBe(11);
     expect(start).toHaveBeenCalledOnce();
 
@@ -60,6 +80,7 @@ describe("ThreadIngress", () => {
       },
     });
     expect(store.threadView("th_2").items).toMatchObject([
+      { kind: "user", content: "snapshot" },
       { kind: "user", content: "hello" },
     ]);
   });
@@ -73,6 +94,7 @@ describe("ThreadIngress", () => {
           ? [thread("th_1"), thread("th_2")]
           : [thread("th_3", "se_2")],
       ),
+      threadView: vi.fn(async () => viewSnapshot()),
       threadEvents: vi.fn(async () => {
         const close = vi.fn();
         closes.push(close);
@@ -93,12 +115,71 @@ describe("ThreadIngress", () => {
     expect(closes[1]).toHaveBeenCalledOnce();
   });
 
+  it("discards a delayed snapshot after navigation changes generation", async () => {
+    const store = new AppStore();
+    let resolveFirst:
+      | ((snapshot: ReturnType<typeof viewSnapshot>) => void)
+      | undefined;
+    const firstSnapshot = new Promise<ReturnType<typeof viewSnapshot>>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async (sessionId) => [
+        thread(sessionId === "se_1" ? "th_1" : "th_2", sessionId),
+      ]),
+      threadView: vi.fn(async (threadId) =>
+        threadId === "th_1" ? firstSnapshot : viewSnapshot(20)),
+      threadEvents: vi.fn(async () => ({
+        start: vi.fn(),
+        close: vi.fn(),
+      }) as unknown as CursorEventStream<ProtocolIngressEvent>),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+
+    const firstOpen = ingress.openSession("se_1", "th_1");
+    await vi.waitFor(() => expect(protocol.threadView).toHaveBeenCalledWith("th_1"));
+    await expect(ingress.openSession("se_2", "th_2")).resolves.toBe("th_2");
+    resolveFirst?.(viewSnapshot(10, [{
+      kind: "user",
+      turn: 1,
+      content: "stale",
+      attachments: [],
+    }]));
+    await expect(firstOpen).resolves.toBeUndefined();
+
+    expect(protocol.threadEvents).toHaveBeenCalledOnce();
+    expect(protocol.threadEvents).toHaveBeenCalledWith(
+      "th_2",
+      expect.objectContaining({ after: 20 }),
+    );
+    expect(store.threadView("th_1").items).toEqual([]);
+  });
+
+  it("does not fall back to cursor-zero replay when snapshot loading fails", async () => {
+    const store = new AppStore();
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => {
+        throw new Error("snapshot unavailable");
+      }),
+      threadEvents: vi.fn(),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+
+    await expect(ingress.openSession("se_1", "th_1")).rejects.toThrow(
+      "snapshot unavailable",
+    );
+    expect(protocol.threadEvents).not.toHaveBeenCalled();
+    expect(ingress.state.get()).toBe("error");
+  });
+
   it("reconnects when the same thread is opened again so events use the current generation", async () => {
     const store = new AppStore();
     const eventHandlers: Array<(event: ProtocolIngressEvent) => void> = [];
     const closes: ReturnType<typeof vi.fn>[] = [];
     const protocol: ThreadProtocol = {
       threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => viewSnapshot()),
       threadEvents: vi.fn(async (_threadId, options) => {
         eventHandlers.push(options.onEvent);
         const close = vi.fn();
@@ -164,6 +245,7 @@ describe("ThreadIngress", () => {
     const close = vi.fn();
     const protocol: ThreadProtocol = {
       threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => viewSnapshot()),
       threadEvents: vi.fn(async () => ({
         start: vi.fn(),
         reconnectNow,

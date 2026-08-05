@@ -177,6 +177,18 @@ const installProtocolFixtures = async (
       await route.fulfill({ status: 204 });
       return;
     }
+    if (key === "GET /v1/threads/th_fixture/view") {
+      await route.fulfill({
+        headers: { "x-trouve-event-cursor": "0" },
+        json: {
+          item_offset: 0,
+          total_items: 0,
+          has_older: false,
+          items: [],
+        },
+      });
+      return;
+    }
 
     const responses: Record<string, unknown> = {
       "GET /v1/info": {
