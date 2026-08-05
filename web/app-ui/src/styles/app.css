@@ -203,6 +203,7 @@ trouve-session-list { display: block; }
   min-width: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  overflow-anchor: none;
   padding-inline: 10px;
 }
 .chat-stream [data-virtual-id] {

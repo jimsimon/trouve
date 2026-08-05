@@ -2,6 +2,7 @@ import { css, html, LitElement, type PropertyValues } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 
 import {
+  cachedMarkdownOffThread,
   renderMarkdownOffThread,
 } from "../services/content-worker-client.js";
 import { safeMarkdownHref } from "../services/markdown-renderer.js";
@@ -23,6 +24,7 @@ export class TrouveMarkdownView extends LitElement {
     css`
       :host { min-width: 0; max-width: 100%; display: block; color: var(--trouve-text); overflow-wrap: anywhere; }
       :host > div { min-width: 0; max-width: 100%; }
+      .pending-content { visibility: hidden; white-space: pre-wrap; }
       :host([streaming])::after { content: ""; display: inline-block; width: .55em; height: 1em; margin-left: .18em; vertical-align: -.14em; background: var(--trouve-accent); animation: var(--trouve-chat-streaming-animation, pulse 1s steps(2, end) infinite); }
       :where(p, ul, ol, blockquote, pre, table) { margin: 0 0 .75em; }
       :where(p, ul, ol, blockquote, pre, table):last-child { margin-bottom: 0; }
@@ -69,6 +71,14 @@ export class TrouveMarkdownView extends LitElement {
 
   async #process(content: string, streaming: boolean): Promise<void> {
     const generation = ++this.#generation;
+    const cached = streaming ? undefined : cachedMarkdownOffThread(content);
+    if (cached !== undefined) {
+      this.#processedContent = content;
+      this.#stableSourceLength = content.length;
+      this.#stableRendered = cached;
+      this.#rendered = cached;
+      return;
+    }
     const stableLength = streaming ? stableMarkdownPrefixLength(content) : content.length;
     const appendOnly = streaming &&
       content.startsWith(this.#processedContent) &&
@@ -126,7 +136,9 @@ export class TrouveMarkdownView extends LitElement {
   };
 
   override render() {
-    return html`<div @click=${this.#activateLink}>${unsafeHTML(this.#rendered)}</div>`;
+    return html`<div @click=${this.#activateLink}>${this.#rendered === "" && this.content !== ""
+      ? html`<div class="pending-content" aria-hidden="true">${this.content}</div>`
+      : unsafeHTML(this.#rendered)}</div>`;
   }
 }
 

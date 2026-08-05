@@ -749,7 +749,12 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
       threadEvent(cursor++, {
         type: "assistant.message",
         turn,
-        content: `Virtual response ${turn}`,
+        content: turn % 7 === 0
+          ? `Virtual response ${turn}\n\n${Array.from(
+            { length: 18 },
+            (_, line) => `Uneven virtual row ${turn}.${line}: dynamic height measurement coverage.`,
+          ).join("\n")}`
+          : `Virtual response ${turn}`,
       }),
       threadEvent(cursor++, {
         type: "turn.completed",
@@ -826,6 +831,34 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     },
   );
   expect(scrollRenderRequests, "small scroll events should not force full transcript renders").toBeLessThanOrEqual(2);
+
+  const viewportBounds = await page.locator(".chat-stream").boundingBox();
+  if (viewportBounds === null) throw new Error("missing chat viewport bounds");
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    const samples: number[] = [viewport.scrollTop];
+    (globalThis as typeof globalThis & { __trouveScrollSamples?: number[] })
+      .__trouveScrollSamples = samples;
+    viewport.addEventListener("scroll", () => samples.push(viewport.scrollTop));
+  });
+  await page.mouse.move(
+    viewportBounds.x + viewportBounds.width / 2,
+    viewportBounds.y + viewportBounds.height / 2,
+  );
+  await page.mouse.wheel(0, -4_000);
+  await page.waitForTimeout(350);
+  const upwardScrollSamples = await page.evaluate(() =>
+    (globalThis as typeof globalThis & { __trouveScrollSamples?: number[] })
+      .__trouveScrollSamples ?? []
+  );
+  expect(upwardScrollSamples.length).toBeGreaterThan(1);
+  expect(upwardScrollSamples.at(-1)).toBeLessThan(upwardScrollSamples[0] ?? 0);
+  const downwardCorrections = upwardScrollSamples.slice(1).map(
+    (sample, index) => sample - (upwardScrollSamples[index] ?? sample),
+  ).filter((delta) => delta > 1);
+  expect(
+    downwardCorrections,
+    `fast upward scrolling reversed direction: ${upwardScrollSamples.join(", ")}`,
+  ).toEqual([]);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     const jump = viewport.querySelector<HTMLElement>(".follow-tail");

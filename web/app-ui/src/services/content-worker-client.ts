@@ -11,6 +11,13 @@ import type {
 } from "../workers/content-worker-protocol.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+const MAX_MARKDOWN_CACHE_ENTRIES = 256;
+const MAX_MARKDOWN_CACHE_UNITS = 4 * 1024 * 1024;
+
+interface CachedMarkdown {
+  readonly rendered: string;
+  readonly units: number;
+}
 
 interface PendingRequest<T = unknown> {
   readonly resolve: (value: T) => void;
@@ -140,12 +147,71 @@ class ContentWorkerClient {
 }
 
 const contentWorker = new ContentWorkerClient();
+const markdownCache = new Map<string, CachedMarkdown>();
+const pendingMarkdown = new Map<string, Promise<string>>();
+let markdownCacheUnits = 0;
+let markdownCacheGeneration = 0;
 
-export const renderMarkdownOffThread = (source: string): Promise<string> =>
-  contentWorker.request(
+const cachedMarkdown = (source: string): string | undefined => {
+  const cached = markdownCache.get(source);
+  if (cached === undefined) return undefined;
+  markdownCache.delete(source);
+  markdownCache.set(source, cached);
+  return cached.rendered;
+};
+
+const retainMarkdown = (source: string, rendered: string): void => {
+  const units = source.length + rendered.length;
+  if (units > MAX_MARKDOWN_CACHE_UNITS) return;
+  const previous = markdownCache.get(source);
+  if (previous !== undefined) markdownCacheUnits -= previous.units;
+  markdownCache.delete(source);
+  markdownCache.set(source, { rendered, units });
+  markdownCacheUnits += units;
+  while (
+    markdownCache.size > MAX_MARKDOWN_CACHE_ENTRIES
+    || markdownCacheUnits > MAX_MARKDOWN_CACHE_UNITS
+  ) {
+    const oldest = markdownCache.entries().next().value as
+      | [string, CachedMarkdown]
+      | undefined;
+    if (oldest === undefined) break;
+    markdownCache.delete(oldest[0]);
+    markdownCacheUnits -= oldest[1].units;
+  }
+};
+
+const clearMarkdownCache = (): void => {
+  markdownCacheGeneration += 1;
+  markdownCache.clear();
+  pendingMarkdown.clear();
+  markdownCacheUnits = 0;
+};
+
+export const cachedMarkdownOffThread = (source: string): string | undefined =>
+  cachedMarkdown(source);
+
+export const renderMarkdownOffThread = (source: string): Promise<string> => {
+  const cached = cachedMarkdown(source);
+  if (cached !== undefined) return Promise.resolve(cached);
+  const pending = pendingMarkdown.get(source);
+  if (pending !== undefined) return pending;
+  const generation = markdownCacheGeneration;
+  const request = contentWorker.request(
     (id) => ({ id, type: "markdown", source }),
     async () => (await import("./markdown-renderer.js")).renderMarkdownDirect(source),
   );
+  const requested = request.then((rendered) => {
+    if (pendingMarkdown.get(source) === requested) pendingMarkdown.delete(source);
+    if (generation === markdownCacheGeneration) retainMarkdown(source, rendered);
+    return rendered;
+  }, (error: unknown) => {
+    if (pendingMarkdown.get(source) === requested) pendingMarkdown.delete(source);
+    throw error;
+  });
+  pendingMarkdown.set(source, requested);
+  return requested;
+};
 
 export const prepareUnifiedDiffOffThread = (
   source: string,
@@ -187,7 +253,10 @@ export const highlightSourceOffThread = (
   );
 
 export const activeContentWorkerCount = (): number => contentWorker.activeCount();
-export const disposeContentWorker = (): void => contentWorker.dispose();
+export const disposeContentWorker = (): void => {
+  contentWorker.dispose();
+  clearMarkdownCache();
+};
 export const setContentWorkerIdleTimeoutForTests = (timeoutMs: number): void => {
   contentWorker.setIdleTimeoutForTests(timeoutMs);
 };

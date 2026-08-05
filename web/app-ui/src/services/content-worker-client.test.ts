@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   activeContentWorkerCount,
+  cachedMarkdownOffThread,
   disposeContentWorker,
   filterCommandPaletteItemsOffThread,
   prepareUnifiedDiffOffThread,
@@ -45,6 +46,7 @@ describe("lazy content worker", () => {
 
   it("starts on demand and terminates after the configured idle period", async () => {
     let terminated = 0;
+    let posted = 0;
     class FakeWorker {
       readonly #listeners = new Map<string, ((event: MessageEvent<unknown>) => void)[]>();
 
@@ -56,6 +58,7 @@ describe("lazy content worker", () => {
       }
 
       postMessage(request: { readonly id: number }): void {
+        posted += 1;
         queueMicrotask(() => {
           const event = { data: { id: request.id, ok: true, value: "<p>worker</p>" } } as MessageEvent;
           for (const listener of this.#listeners.get("message") ?? []) listener(event);
@@ -69,7 +72,15 @@ describe("lazy content worker", () => {
     vi.stubGlobal("Worker", FakeWorker);
     setContentWorkerIdleTimeoutForTests(0);
 
+    const first = renderMarkdownOffThread("worker");
+    const duplicate = renderMarkdownOffThread("worker");
+    await expect(Promise.all([first, duplicate])).resolves.toEqual([
+      "<p>worker</p>",
+      "<p>worker</p>",
+    ]);
+    expect(cachedMarkdownOffThread("worker")).toBe("<p>worker</p>");
     await expect(renderMarkdownOffThread("worker")).resolves.toBe("<p>worker</p>");
+    expect(posted).toBe(1);
     expect(activeContentWorkerCount()).toBe(1);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(activeContentWorkerCount()).toBe(0);
