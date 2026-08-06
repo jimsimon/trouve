@@ -5466,7 +5466,7 @@ impl Engine {
 
             for call in tool_calls {
                 let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
+                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel, false)
                     .await?;
                 self.store.append_message(
                     &thread.id,
@@ -5698,8 +5698,19 @@ impl Engine {
     ) -> Result<String, EngineError> {
         let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self.store.last_turn(thread_id)?;
+        // The vendor's stream announces this call before executing it, and
+        // that announcement already created a tool card. Reuse its call id
+        // so execution attaches to the vendor's card instead of recording a
+        // second identical one; the vendor's own tool_result completes the
+        // same card in place afterwards. ask_question keeps a fresh id — it
+        // draws no card, and its id doubles as the question request id.
+        let vendor_call_id = (name != "ask_question")
+            .then(|| self.open_bridged_card(thread_id, turn, name, arguments))
+            .flatten();
+        let vendor_announced = vendor_call_id.is_some();
+        let call_id = vendor_call_id.unwrap_or_else(|| new_id("call"));
         let call = trouve_providers::ToolCallRequest {
-            id: new_id("call"),
+            id: call_id,
             name: name.to_string(),
             arguments: arguments.clone(),
         };
@@ -5717,7 +5728,16 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         let (content, _images) = self
-            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
+            .handle_tool_call(
+                &session,
+                &thread,
+                turn,
+                &mode,
+                &ctx,
+                &call,
+                &cancel,
+                vendor_announced,
+            )
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
@@ -5841,6 +5861,22 @@ impl Engine {
             .find(|(_, a)| strip(a) == *args)
             .or(open.last())
             .map(|(id, _)| id.clone())
+    }
+
+    /// See [`open_bridged_card_in`]: the vendor tool card a bridged
+    /// `tools/call` should attach to instead of drawing its own.
+    fn open_bridged_card(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        let events = self
+            .store
+            .events_after(&Scope::Thread(thread_id.to_string()), 0)
+            .ok()?;
+        open_bridged_card_in(events.iter().map(|env| &env.event), turn, name, arguments)
     }
 
     /// Whether a `tool.requested` card already exists for this call in the
@@ -6708,6 +6744,7 @@ impl Engine {
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
         cancel: &tokio_util::sync::CancellationToken,
+        vendor_announced: bool,
     ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
@@ -6742,16 +6779,20 @@ impl Engine {
             call.name.as_str(),
             "spawn_thread" | "spawn_session" | "spawn_output" | "search_transcript"
         ) {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: call.name.clone(),
-                    args: call.arguments.clone(),
-                    requires_approval: false,
-                },
-            )?;
+            // A bridged call attaching to the vendor's announced card must
+            // not draw a second one.
+            if !self.tool_card_exists(&thread.id, turn, &call_id) {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ToolRequested {
+                        turn,
+                        call_id: call_id.clone(),
+                        tool: call.name.clone(),
+                        args: call.arguments.clone(),
+                        requires_approval: false,
+                    },
+                )?;
+            }
             let outcome = if call.name == "search_transcript" {
                 self.handle_search_transcript(session, thread, &call.arguments)
             } else {
@@ -6767,14 +6808,16 @@ impl Engine {
             } else {
                 ToolStatus::Ok
             };
-            self.store.append_event(
-                scope,
-                Event::ToolCompleted {
-                    call_id,
-                    status,
-                    result: result.clone(),
-                },
-            )?;
+            if !vendor_announced {
+                self.store.append_event(
+                    scope,
+                    Event::ToolCompleted {
+                        call_id,
+                        status,
+                        result: result.clone(),
+                    },
+                )?;
+            }
             return Ok((result.to_string(), Vec::new()));
         }
 
@@ -6800,29 +6843,36 @@ impl Engine {
         // UI diff can number its gutter. Stored/executed args stay pristine.
         let mut display_args = call.arguments.clone();
         annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolRequested {
-                turn,
-                call_id: call_id.clone(),
-                tool: call.name.clone(),
-                args: display_args,
-                requires_approval: decision == Gate::NeedsApproval,
-            },
-        )?;
+        // A bridged call attaching to the vendor's announced card must not
+        // draw a second one; ApprovalRequested below still flips the
+        // existing card to awaiting-approval when the gate asks.
+        if !self.tool_card_exists(&thread.id, turn, &call_id) {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolRequested {
+                    turn,
+                    call_id: call_id.clone(),
+                    tool: call.name.clone(),
+                    args: display_args,
+                    requires_approval: decision == Gate::NeedsApproval,
+                },
+            )?;
+        }
 
         let decision = match decision {
             Gate::Deny => {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ToolCompleted {
-                        call_id: call_id.clone(),
-                        status: ToolStatus::Denied,
-                        result: serde_json::json!({
-                            "error": "tool not permitted in this mode"
-                        }),
-                    },
-                )?;
+                if !vendor_announced {
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::ToolCompleted {
+                            call_id: call_id.clone(),
+                            status: ToolStatus::Denied,
+                            result: serde_json::json!({
+                                "error": "tool not permitted in this mode"
+                            }),
+                        },
+                    )?;
+                }
                 return Ok((
                     "Tool call denied: not permitted in this mode.".into(),
                     Vec::new(),
@@ -6863,23 +6913,27 @@ impl Engine {
         };
 
         if decision == ApprovalDecision::Deny {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolCompleted {
-                    call_id: call_id.clone(),
-                    status: ToolStatus::Denied,
-                    result: serde_json::json!({"error": "denied by user"}),
-                },
-            )?;
+            if !vendor_announced {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ToolCompleted {
+                        call_id: call_id.clone(),
+                        status: ToolStatus::Denied,
+                        result: serde_json::json!({"error": "denied by user"}),
+                    },
+                )?;
+            }
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolStarted {
-                call_id: call_id.clone(),
-            },
-        )?;
+        if !vendor_announced {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolStarted {
+                    call_id: call_id.clone(),
+                },
+            )?;
+        }
         let mut outcome = self
             .executor
             .execute(ctx, &call.name, &call.arguments)
@@ -6910,14 +6964,16 @@ impl Engine {
             numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
             self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolCompleted {
-                call_id,
-                status: outcome.status,
-                result: outcome.result.clone(),
-            },
-        )?;
+        if !vendor_announced {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolCompleted {
+                    call_id,
+                    status: outcome.status,
+                    result: outcome.result.clone(),
+                },
+            )?;
+        }
         if let Some(todos) = todos {
             self.store
                 .append_event(scope, Event::TodosUpdated { todos })?;
@@ -7882,6 +7938,58 @@ fn pr_evidence_from_events(
     evidence
 }
 
+/// The newest still-open tool card in this turn announcing the bridged call
+/// `name(arguments)`. Vendors announce trouve's bridged tools under their
+/// own MCP naming — Claude as `mcp__trouve__<name>` with the raw arguments,
+/// Codex as an `mcpToolCall` item carrying the real call in its
+/// `tool`/`arguments` fields — so match on the base name and exact
+/// arguments. `None` when the announcement hasn't been processed yet (the
+/// bridge request can race the vendor's stream).
+fn open_bridged_card_in<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    turn: u64,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let mut open: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            Event::ToolRequested {
+                turn: t,
+                call_id,
+                tool,
+                args,
+                ..
+            } if *t == turn => {
+                let (tool, args) = if tool == "mcpToolCall" {
+                    if args.get("server").and_then(serde_json::Value::as_str) != Some("trouve") {
+                        continue;
+                    }
+                    (
+                        args.get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        args.get("arguments").unwrap_or(args),
+                    )
+                } else {
+                    let Some(tool) = tool.strip_prefix("mcp__trouve__") else {
+                        continue;
+                    };
+                    (tool, args)
+                };
+                if tool == name && args == arguments {
+                    open.push(call_id.clone());
+                }
+            }
+            Event::ToolCompleted { call_id, .. } => {
+                open.retain(|id| id != call_id);
+            }
+            _ => {}
+        }
+    }
+    open.pop()
+}
+
 /// Make a stored transcript safe to send to a provider. A crash or restart
 /// between persisting an assistant message with `tool_calls` and persisting
 /// its results (tool execution can take minutes; approval waits are
@@ -8803,6 +8911,97 @@ mod tests {
     }
 
     #[test]
+    fn bridged_call_attaches_to_vendor_card() {
+        let args = serde_json::json!({"query": "status indicator"});
+        // Claude announces trouve's bridged search under its MCP-mangled
+        // name; the bridge then executes plain `search` with the same args.
+        let claude = vec![Event::ToolRequested {
+            turn: 3,
+            call_id: "toolu_1".into(),
+            tool: "mcp__trouve__search".into(),
+            args: args.clone(),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(claude.iter(), 3, "search", &args),
+            Some("toolu_1".into())
+        );
+        // Wrong turn or different args: no attach, fall back to a fresh id.
+        assert_eq!(
+            open_bridged_card_in(claude.iter(), 2, "search", &args),
+            None
+        );
+        assert_eq!(
+            open_bridged_card_in(
+                claude.iter(),
+                3,
+                "search",
+                &serde_json::json!({"query": "other"})
+            ),
+            None
+        );
+        // An already-completed card is closed; nothing to attach to.
+        let mut closed = claude.clone();
+        closed.push(Event::ToolCompleted {
+            call_id: "toolu_1".into(),
+            status: ToolStatus::Ok,
+            result: serde_json::Value::Null,
+        });
+        assert_eq!(
+            open_bridged_card_in(closed.iter(), 3, "search", &args),
+            None
+        );
+        // Codex wraps MCP calls in an `mcpToolCall` item carrying the real
+        // tool and arguments.
+        let codex = [Event::ToolRequested {
+            turn: 1,
+            call_id: "item_7".into(),
+            tool: "mcpToolCall".into(),
+            args: serde_json::json!({
+                "id": "item_7",
+                "type": "mcpToolCall",
+                "server": "trouve",
+                "tool": "search",
+                "arguments": args,
+            }),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(codex.iter(), 1, "search", &args),
+            Some("item_7".into())
+        );
+
+        let other_claude_server = [Event::ToolRequested {
+            turn: 3,
+            call_id: "toolu_other".into(),
+            tool: "mcp__other__search".into(),
+            args: args.clone(),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(other_claude_server.iter(), 3, "search", &args),
+            None
+        );
+        let other_codex_server = [Event::ToolRequested {
+            turn: 1,
+            call_id: "item_other".into(),
+            tool: "mcpToolCall".into(),
+            args: serde_json::json!({
+                "id": "item_other",
+                "type": "mcpToolCall",
+                "server": "other",
+                "tool": "search",
+                "arguments": args,
+            }),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(other_codex_server.iter(), 1, "search", &args),
+            None
+        );
+    }
+
+    #[test]
     fn collects_provider_neutral_pr_evidence() {
         let remote_commit = "9f2c6d8b18c86d48ca2c3f58191f9f5277b9269a";
         let branch_args = serde_json::json!({
@@ -9177,6 +9376,7 @@ mod tests {
                 &ctx,
                 &call,
                 &tokio_util::sync::CancellationToken::new(),
+                false,
             )
             .await
             .unwrap();
@@ -9195,6 +9395,32 @@ mod tests {
             Event::TodosUpdated { todos }
                 if todos.len() == 1 && todos[0].id == "one"
         )));
+
+        let mut bridged_call = call.clone();
+        bridged_call.id = "call_bridged".into();
+        engine
+            .handle_tool_call(
+                &session,
+                &thread,
+                1,
+                &modes::fallback_mode(),
+                &ctx,
+                &bridged_call,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(!events.iter().any(|env| {
+            matches!(
+                &env.event,
+                Event::ToolStarted { call_id } | Event::ToolCompleted { call_id, .. }
+                    if call_id == "call_bridged"
+            )
+        }));
 
         // Vendor-native TodoWrite completions can be an acknowledgement
         // rather than the updated list. Fall back to the paired start args,
