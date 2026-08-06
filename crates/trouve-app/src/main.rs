@@ -644,22 +644,21 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // Ctrl/Cmd+V in the composer: if the clipboard holds an image
-        // (a screenshot, usually), stage it as an attachment and swallow
-        // the paste; otherwise let the TextInput paste text as normal.
-        // Checked synchronously on the UI thread — clipboard reads are
-        // local IPC and small relative to a keystroke.
+        // Ctrl/Cmd+V in the composer: stage images and oversized text as
+        // attachments. Keeping a very large string out of Slint's multiline
+        // TextInput avoids blocking the UI thread while it wraps and lays out
+        // the entire paste.
         let tx = tx.clone();
-        window.on_paste_image_attempted(move || match clipboard_image_png() {
-            Some(bytes) => {
+        window.on_paste_attachment_attempted(move || match clipboard_attachment() {
+            Some(attachment) => {
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let _ = tx.send(UiCommand::AddAttachment {
-                    name: format!("pasted-{stamp}.png"),
-                    mime: "image/png".into(),
-                    bytes,
+                    name: format!("pasted-{stamp}.{}", attachment.extension),
+                    mime: attachment.mime.into(),
+                    bytes: attachment.bytes,
                 });
                 true
             }
@@ -1612,13 +1611,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 trait ClipboardReader {
-    fn has_text(&mut self) -> bool;
+    fn text(&mut self) -> Option<String>;
     fn image(&mut self) -> Option<arboard::ImageData<'static>>;
 }
 
 impl ClipboardReader for arboard::Clipboard {
-    fn has_text(&mut self) -> bool {
-        self.get_text().is_ok()
+    fn text(&mut self) -> Option<String> {
+        self.get_text().ok()
     }
 
     fn image(&mut self) -> Option<arboard::ImageData<'static>> {
@@ -1626,18 +1625,33 @@ impl ClipboardReader for arboard::Clipboard {
     }
 }
 
-/// The clipboard's image as PNG bytes, or `None` when text is available, it
-/// holds no image, or the clipboard isn't reachable. Text takes precedence
-/// because rich clipboard sources can advertise both representations and an
-/// image attachment must never swallow an ordinary text paste.
-fn clipboard_image_png() -> Option<Vec<u8>> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard_image_png_from(&mut clipboard)
+const LARGE_PASTE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClipboardAttachment {
+    extension: &'static str,
+    mime: &'static str,
+    bytes: Vec<u8>,
 }
 
-fn clipboard_image_png_from(clipboard: &mut impl ClipboardReader) -> Option<Vec<u8>> {
-    if clipboard.has_text() {
-        return None;
+/// Return clipboard content that should be staged as a prompt attachment.
+///
+/// Small text stays on the widget's normal paste path. Large text becomes a
+/// file so the UI does not synchronously shape and wrap an unbounded input.
+/// Text takes precedence over an image representation because rich clipboard
+/// sources commonly advertise both.
+fn clipboard_attachment() -> Option<ClipboardAttachment> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard_attachment_from(&mut clipboard)
+}
+
+fn clipboard_attachment_from(clipboard: &mut impl ClipboardReader) -> Option<ClipboardAttachment> {
+    if let Some(text) = clipboard.text() {
+        return (text.len() >= LARGE_PASTE_BYTES).then(|| ClipboardAttachment {
+            extension: "txt",
+            mime: "text/plain; charset=utf-8",
+            bytes: text.into_bytes(),
+        });
     }
     let image = clipboard.image()?;
     let mut out = Vec::new();
@@ -1648,7 +1662,11 @@ fn clipboard_image_png_from(clipboard: &mut impl ClipboardReader) -> Option<Vec<
         let mut writer = encoder.write_header().ok()?;
         writer.write_image_data(&image.bytes).ok()?;
     }
-    Some(out)
+    Some(ClipboardAttachment {
+        extension: "png",
+        mime: "image/png",
+        bytes: out,
+    })
 }
 
 const WORKSPACE_DRAG_PREFIX: &str = "trouve-workspace:";
@@ -1683,20 +1701,20 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        ClipboardReader, ProviderConfigFieldItem, at_token, chat_file_link,
-        clipboard_image_png_from, pr_group_drag_id, pr_group_drag_payload, provider_fields_valid,
+        ClipboardReader, LARGE_PASTE_BYTES, ProviderConfigFieldItem, at_token, chat_file_link,
+        clipboard_attachment_from, pr_group_drag_id, pr_group_drag_payload, provider_fields_valid,
         workspace_drag_id, workspace_drag_payload,
     };
 
     struct TestClipboard {
-        text: bool,
+        text: Option<String>,
         image: Option<arboard::ImageData<'static>>,
         image_reads: usize,
     }
 
     impl ClipboardReader for TestClipboard {
-        fn has_text(&mut self) -> bool {
-            self.text
+        fn text(&mut self) -> Option<String> {
+            self.text.take()
         }
 
         fn image(&mut self) -> Option<arboard::ImageData<'static>> {
@@ -1740,7 +1758,7 @@ mod tests {
     #[test]
     fn clipboard_text_takes_precedence_over_an_image_representation() {
         let mut clipboard = TestClipboard {
-            text: true,
+            text: Some("ordinary paste".into()),
             image: Some(arboard::ImageData {
                 width: 1,
                 height: 1,
@@ -1749,14 +1767,30 @@ mod tests {
             image_reads: 0,
         };
 
-        assert_eq!(clipboard_image_png_from(&mut clipboard), None);
+        assert_eq!(clipboard_attachment_from(&mut clipboard), None);
+        assert_eq!(clipboard.image_reads, 0);
+    }
+
+    #[test]
+    fn large_clipboard_text_becomes_a_plain_text_attachment() {
+        let text = "x".repeat(LARGE_PASTE_BYTES);
+        let mut clipboard = TestClipboard {
+            text: Some(text.clone()),
+            image: None,
+            image_reads: 0,
+        };
+
+        let attachment = clipboard_attachment_from(&mut clipboard).unwrap();
+        assert_eq!(attachment.extension, "txt");
+        assert_eq!(attachment.mime, "text/plain; charset=utf-8");
+        assert_eq!(attachment.bytes, text.into_bytes());
         assert_eq!(clipboard.image_reads, 0);
     }
 
     #[test]
     fn image_only_clipboard_content_is_encoded_as_png() {
         let mut clipboard = TestClipboard {
-            text: false,
+            text: None,
             image: Some(arboard::ImageData {
                 width: 1,
                 height: 1,
@@ -1765,8 +1799,10 @@ mod tests {
             image_reads: 0,
         };
 
-        let png = clipboard_image_png_from(&mut clipboard).unwrap();
-        let decoder = png::Decoder::new(std::io::Cursor::new(png));
+        let attachment = clipboard_attachment_from(&mut clipboard).unwrap();
+        assert_eq!(attachment.extension, "png");
+        assert_eq!(attachment.mime, "image/png");
+        let decoder = png::Decoder::new(std::io::Cursor::new(attachment.bytes));
         let mut reader = decoder.read_info().unwrap();
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut pixels).unwrap();
