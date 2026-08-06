@@ -1750,6 +1750,45 @@ export component AppWindow inherits Window {
     in-out property <bool> todos-expanded: false;
 
     in property <[ChatRow]> chat-rows;
+    // In-transcript find state. Rust computes literal matches against the
+    // rendered rows; Slint owns match-case, navigation, and focus.
+    in-out property <bool> chat-find-open: false;
+    in-out property <string> chat-find-query: "";
+    // Off by default: transcript search is case-insensitive unless the user
+    // enables the conventional "Aa" match-case option.
+    in-out property <bool> chat-find-case-sensitive: false;
+    in property <[int]> chat-find-matches;
+    in-out property <int> chat-find-active: -1;
+    private property <int> chat-find-focus-generation: 0;
+    out property <int> chat-find-active-row:
+        root.chat-find-active >= 0
+            && root.chat-find-active < root.chat-find-matches.length
+        ? root.chat-find-matches[root.chat-find-active] : -1;
+    callback chat-find-changed(string);
+    public function open-chat-find() {
+        if (root.center-screen == 0) {
+            root.chat-find-open = true;
+            root.chat-find-changed(root.chat-find-query);
+            root.chat-find-focus-generation += 1;
+        }
+    }
+    public function close-chat-find() {
+        root.chat-find-open = false;
+        root.chat-restoring = false;
+    }
+    public function reveal-chat-find-result() {
+        if (root.chat-find-active-row >= 0) {
+            root.restore-chat-position(root.chat-find-active-row, 0px);
+        }
+    }
+    public function step-chat-find(delta: int) {
+        if (root.chat-find-matches.length > 0) {
+            root.chat-find-active = mod(
+                root.chat-find-active + delta + root.chat-find-matches.length,
+                root.chat-find-matches.length);
+            root.reveal-chat-find-result();
+        }
+    }
     callback approval-resolved(/* row index */ int, /* approved */ bool);
     // Question wizard (kind 10): option toggles (index == options.length is
     // the "Other" choice), free-form text edits, and page navigation.
@@ -2943,12 +2982,40 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Thread tabs.
-                HorizontalLayout {
-                    spacing: 6px;
+                // Thread tabs wrap within the space to the left of the Find
+                // action. Find owns a fixed right-edge slot, so tabs can
+                // neither overlap it nor push it out of alignment.
+                tab-strip := Rectangle {
+                    property <length> tab-width: 145px;
+                    property <length> item-height: Theme.fs(30px);
+                    property <length> item-gap: 6px;
+                    property <length> find-slot-width: 42px;
+                    property <length> tab-region-width:
+                        max(self.tab-width, self.width - self.find-slot-width);
+                    property <int> tab-columns: max(1, floor(
+                        (self.tab-region-width + self.item-gap)
+                            / (self.tab-width + self.item-gap)));
+                    property <int> tab-item-count: root.threads.length + 1;
+                    property <int> tab-rows: max(1, floor(
+                        (self.tab-item-count + self.tab-columns - 1)
+                            / self.tab-columns));
+                    height: self.tab-rows * self.item-height
+                        + (self.tab-rows - 1) * self.item-gap;
+
+                    function tab-x(index: int) -> length {
+                        return mod(index, self.tab-columns)
+                            * (self.tab-width + self.item-gap);
+                    }
+                    function tab-y(index: int) -> length {
+                        return floor(index / self.tab-columns)
+                            * (self.item-height + self.item-gap);
+                    }
+
                     for thread[idx] in root.threads: Rectangle {
-                        width: 145px;
-                        height: Theme.fs(30px);
+                        x: tab-strip.tab-x(idx);
+                        y: tab-strip.tab-y(idx);
+                        width: tab-strip.tab-width;
+                        height: tab-strip.item-height;
                         background: idx == root.current-thread ? Theme.c.accent-bg : Theme.c.control-bg;
                         border-radius: 6px;
                         TouchArea {
@@ -2984,8 +3051,10 @@ export component AppWindow inherits Window {
                         }
                     }
                     IconButton {
+                        x: tab-strip.tab-x(root.threads.length);
+                        y: tab-strip.tab-y(root.threads.length);
                         width: 30px;
-                        height: Theme.fs(30px);
+                        height: tab-strip.item-height;
                         border-radius: 6px;
                         icon: "+";
                         icon-size: Theme.fs(15px);
@@ -2994,7 +3063,119 @@ export component AppWindow inherits Window {
                         enabled: root.threads.length > 0 || root.composer-enabled;
                         clicked => { root.new-thread(); }
                     }
-                    Rectangle { horizontal-stretch: 1; }
+                    IconButton {
+                        x: parent.width - self.width;
+                        y: 0;
+                        width: 30px;
+                        height: tab-strip.item-height;
+                        border-radius: 6px;
+                        icon: "⌕";
+                        icon-size: Theme.fs(15px);
+                        idle-bg: Theme.c.control-bg;
+                        tip: "Find in chat (Ctrl/Cmd+F)";
+                        accessibility-label: "Find in chat";
+                        enabled: root.center-screen == 0;
+                        clicked => { root.open-chat-find(); }
+                    }
+                }
+
+                // Browser-style transcript find. The native Ctrl/Cmd+F
+                // handler opens this bar and focuses/selects the query.
+                if root.chat-find-open && root.center-screen == 0: Rectangle {
+                    height: Theme.fs(30px);
+                    background: Theme.c.raised-bg;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.c.border;
+
+                    find-scope := FocusScope {
+                        capture-key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.close-chat-find();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        HorizontalLayout {
+                            padding-left: 5px;
+                            padding-right: 4px;
+                            spacing: 5px;
+                            chat-find-input := LineEdit {
+                                min-width: 120px;
+                                horizontal-stretch: 1;
+                                height: Theme.fs(24px);
+                                font-size: Theme.fs(12px);
+                                placeholder-text: "Find in chat…";
+                                accessible-label: "Find in chat";
+                                private property <int> focus-generation:
+                                    root.chat-find-focus-generation;
+                                text <=> root.chat-find-query;
+                                init => {
+                                    self.focus();
+                                    self.select-all();
+                                }
+                                changed focus-generation => {
+                                    self.focus();
+                                    self.select-all();
+                                }
+                                edited => {
+                                    root.chat-find-changed(self.text);
+                                }
+                                accepted => {
+                                    root.step-chat-find(1);
+                                }
+                            }
+                            CheckBox {
+                                width: 45px;
+                                text: "Aa";
+                                accessible-label: "Match case";
+                                checked <=> root.chat-find-case-sensitive;
+                                toggled => {
+                                    root.chat-find-changed(root.chat-find-query);
+                                }
+                            }
+                            Text {
+                                min-width: 60px;
+                                text: root.chat-find-query == "" ? ""
+                                    : root.chat-find-matches.length == 0 ? "No matches"
+                                    : (root.chat-find-active + 1) + " of "
+                                        + root.chat-find-matches.length;
+                                color: root.chat-find-matches.length == 0
+                                    && root.chat-find-query != ""
+                                    ? Theme.c.warn : Theme.c.text-dim;
+                                font-size: Theme.fs(11px);
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                            IconButton {
+                                width: 24px;
+                                height: Theme.fs(24px);
+                                icon: "↑";
+                                tip: "Previous match";
+                                accessibility-label: "Previous chat match";
+                                enabled: root.chat-find-matches.length > 0;
+                                clicked => { root.step-chat-find(-1); }
+                            }
+                            IconButton {
+                                width: 24px;
+                                height: Theme.fs(24px);
+                                icon: "↓";
+                                tip: "Next match";
+                                accessibility-label: "Next chat match";
+                                enabled: root.chat-find-matches.length > 0;
+                                clicked => { root.step-chat-find(1); }
+                            }
+                            IconButton {
+                                width: 24px;
+                                height: Theme.fs(24px);
+                                icon: "✕";
+                                tip: "Close find";
+                                accessibility-label: "Close chat find";
+                                clicked => { root.close-chat-find(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
                 }
                     }
                     // Hairline under the header keeps the boundary visible
@@ -3865,6 +4046,15 @@ export component AppWindow inherits Window {
                                 }
                             }
                             }
+                        }
+                        if root.chat-find-open
+                                && root.chat-find-active-row == idx: Rectangle {
+                            x: 0;
+                            y: 1px;
+                            width: 3px;
+                            height: parent.height - 2px;
+                            border-radius: 1.5px;
+                            background: Theme.c.accent;
                         }
                     }
                 }

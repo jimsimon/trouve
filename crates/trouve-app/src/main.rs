@@ -137,7 +137,7 @@ fn enable_skia_partial_rendering() {
 /// Track focus for notifications and occlusion for animation scheduling.
 /// Visible windows stay display-paced even without keyboard focus; an
 /// occluded/minimized window should not wake the renderer at all.
-fn install_window_activity_tracking(
+fn install_window_event_handling(
     window: &AppWindow,
     focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
@@ -148,7 +148,27 @@ fn install_window_activity_tracking(
     let mut has_focus = false;
     let mut occluded = false;
     let mut reported_focus = false;
+    let mut modifiers = winit::keyboard::ModifiersState::empty();
     window.window().on_winit_window_event(move |_, event| {
+        if let winit::event::WindowEvent::ModifiersChanged(next) = event {
+            modifiers = next.state();
+        }
+        if let winit::event::WindowEvent::KeyboardInput { event, .. } = event
+            && event.state == winit::event::ElementState::Pressed
+            && !event.repeat
+            && (modifiers.control_key() || modifiers.super_key())
+            && matches!(
+                &event.logical_key,
+                winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("f")
+            )
+            && let Some(window) = weak.upgrade()
+            && window.get_center_screen() == 0
+            && window.get_right_tab() != 4
+        {
+            window.invoke_open_chat_find();
+            return EventResult::PreventDefault;
+        }
+
         let state_changed = match event {
             winit::event::WindowEvent::Focused(next) => {
                 has_focus = *next;
@@ -225,7 +245,7 @@ fn main() -> anyhow::Result<()> {
     // false so a launch that never gains focus (or a locked screen) doesn't
     // suppress notifications.
     let window_focused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    install_window_activity_tracking(&window, window_focused.clone(), tx.clone());
+    install_window_event_handling(&window, window_focused.clone(), tx.clone());
 
     // --- appearance: restore, populate the pickers, wire the callbacks ------
     // All handled here on the UI thread (palette swaps are direct property
@@ -443,6 +463,14 @@ fn main() -> anyhow::Result<()> {
             let models: Vec<String> = window.get_models().iter().map(|s| s.to_string()).collect();
             let matches = fuzzy_match_indices(&models, &query);
             window.set_model_filter_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
+        });
+    }
+    {
+        // Chat find is exact substring search, matching familiar browser/editor
+        // semantics. The transcript cache is already on this UI thread.
+        let weak = window.as_weak();
+        window.on_chat_find_changed(move |_| {
+            ui::refresh_chat_find(&weak.unwrap());
         });
     }
     {
