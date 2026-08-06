@@ -37,6 +37,7 @@ pub use edit_strategy::EditStrategy;
 pub use edit_strategy::for_model as edit_strategy_for_model;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const REVIEW_PRIMARY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
@@ -85,6 +86,31 @@ fn review_history_ref_name(
         return Err(format!("invalid review job id for temporary ref: {job_id}"));
     }
     Ok(format!("trouve-history-{pull_number}-{job_id}-{index}"))
+}
+
+fn review_repository_identity(repository_path: &Path) -> std::result::Result<PathBuf, String> {
+    if repository_path.exists() {
+        return repository_path.canonicalize().map_err(|error| {
+            format!(
+                "resolving review repository {}: {error}",
+                repository_path.display()
+            )
+        });
+    }
+    let parent = repository_path
+        .parent()
+        .ok_or_else(|| "invalid review repository path".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "resolving review repository parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    let name = repository_path
+        .file_name()
+        .ok_or_else(|| "invalid review repository path".to_owned())?;
+    Ok(parent.join(name))
 }
 
 #[cfg(unix)]
@@ -354,6 +380,90 @@ fn optional_review_fetch_command(
     harden_authenticated_review_git_command(&mut command);
     isolate_review_git_process(&mut command);
     command
+}
+
+fn authenticated_review_git_command(
+    repository_path: &Path,
+    auth: &str,
+    args: &[String],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(repository_path)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    harden_authenticated_review_git_command(&mut command);
+    command
+}
+
+async fn run_managed_authenticated_review_git_command(
+    mut command: tokio::process::Command,
+    auth: &str,
+    timeout: Duration,
+    repository_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    isolate_review_git_process(&mut command);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("running git: {error}"))?;
+    let mut guard = ReviewGitChildGuard::new(child, repository_guard);
+    let stderr = guard
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or_else(|| "git did not capture stderr".to_owned())?;
+    let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
+    let result = match tokio::time::timeout(timeout, guard.child_mut().wait()).await {
+        Ok(Ok(status)) => {
+            #[cfg(unix)]
+            if let Err(error) = quiesce_review_git_process_group(guard.pid).await {
+                Err(format!("stopping git fetch helpers: {error}"))
+            } else {
+                Ok(status)
+            }
+            #[cfg(not(unix))]
+            Ok(status)
+        }
+        Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
+            Ok(()) => Err(format!("running git: {error}")),
+            Err(terminate_error) => Err(format!(
+                "running git: {error}; terminating it: {terminate_error}"
+            )),
+        },
+        Err(_) => match terminate_review_git_process(&mut guard).await {
+            Ok(()) => Err(format!(
+                "git fetch timed out after {:.1}s",
+                timeout.as_secs_f64()
+            )),
+            Err(error) => Err(format!("terminating timed-out git fetch: {error}")),
+        },
+    };
+    let stderr =
+        finish_review_fetch_stderr(&mut guard, &mut stderr_task, REVIEW_FETCH_TERMINATION_GRACE)
+            .await
+            .map(|stderr| sanitize_review_fetch_stderr(&stderr, auth))?;
+    let result = match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(stderr),
+        Err(mut error) => {
+            if !stderr.is_empty() {
+                error.push_str(": ");
+                error.push_str(&stderr);
+            }
+            Err(error)
+        }
+    };
+    guard.disarm();
+    let repository_guard = guard.take_repository_guard();
+    result.map(|()| repository_guard)
 }
 
 /// Fetch each historical SHA independently while sharing one total timeout
@@ -2724,9 +2834,10 @@ impl ToolExecutor for LocalToolExecutor {
             .root
             .canonicalize()
             .map_err(|error| format!("resolving review root: {error}"))?;
-        let repository_path = managed_root.join(owner).join(repository);
+        let repository_path =
+            review_repository_identity(&managed_root.join(owner).join(repository))?;
         let repository_lock = self.review_repository_lock(&repository_path);
-        let repository_guard = repository_lock.lock_owned().await;
+        let mut repository_guard = repository_lock.lock_owned().await;
         let parent = repository_path
             .parent()
             .ok_or_else(|| "invalid review repository path".to_string())?;
@@ -2744,14 +2855,6 @@ impl ToolExecutor for LocalToolExecutor {
         {
             return Err("review repository parent must not be a symlink".into());
         }
-        let repository_lock = self.review_repository_lock(&repository_path);
-        let _repository_guard = tokio::select! {
-            biased;
-            _ = request.cancel.cancelled() => {
-                return Err("review repository sync cancelled".into());
-            }
-            guard = repository_lock.lock_owned() => guard,
-        };
         match std::fs::symlink_metadata(&repository_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -2844,14 +2947,21 @@ impl ToolExecutor for LocalToolExecutor {
         .is_ok();
         if !base_present || !head_present {
             let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
-            run(vec![
+            let fetch_args = vec![
                 "fetch".into(),
                 "--force".into(),
                 "--no-tags".into(),
                 remote_url.clone(),
                 format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
                 format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
-            ])
+            ];
+            let command = authenticated_review_git_command(&repository_path, &auth, &fetch_args);
+            repository_guard = run_managed_authenticated_review_git_command(
+                command,
+                &auth,
+                REVIEW_PRIMARY_FETCH_TIMEOUT,
+                repository_guard,
+            )
             .await?;
             let actual = run(vec!["rev-parse".into(), pull_ref]).await?;
             if actual != request.head_sha {
@@ -2925,6 +3035,7 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryHistoryCleanup,
     ) -> Result<(), String> {
+        let repository_path = review_repository_identity(&request.worktree)?;
         let references = (0..REVIEW_HISTORY_REF_LIMIT)
             .map(|index| {
                 review_history_ref_name(request.pull_number, &request.job_id, index)
@@ -2934,7 +3045,7 @@ impl ToolExecutor for LocalToolExecutor {
         let repository_lock = {
             let mut locks = self.review_repository_locks.lock().unwrap();
             locks
-                .entry(request.worktree.clone())
+                .entry(repository_path.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
@@ -2946,7 +3057,7 @@ impl ToolExecutor for LocalToolExecutor {
         let mut command = tokio::process::Command::new("git");
         command
             .args(["update-ref", "--stdin"])
-            .current_dir(&request.worktree)
+            .current_dir(&repository_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -3957,6 +4068,18 @@ mod tests {
         assert!(sanitized.contains("[redacted git authorization trace]"));
     }
 
+    #[test]
+    fn review_repository_identity_normalizes_equivalent_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let direct = root.path().join("owner/repository");
+        let lexical = root.path().join("owner/../owner/repository");
+
+        assert_eq!(
+            review_repository_identity(&direct).unwrap(),
+            review_repository_identity(&lexical).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn optional_review_fetches_preserve_partial_success() {
         let origin = tempfile::tempdir().unwrap();
@@ -4160,6 +4283,31 @@ mod tests {
         guard.disarm();
 
         assert!(!review_git_process_group_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_authenticated_git_command_times_out_before_releasing_repository() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 & wait");
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let error = run_managed_authenticated_review_git_command(
+            command,
+            "test-auth",
+            Duration::from_millis(50),
+            repository_lock.clone().lock_owned().await,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("git fetch timed out"));
+        tokio::time::timeout(
+            REVIEW_FETCH_TERMINATION_GRACE * 2,
+            repository_lock.lock_owned(),
+        )
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
