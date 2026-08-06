@@ -8,6 +8,11 @@ use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, T
 use trouve_protocol::QuestionAnswer;
 use trouve_slint_markdown::{BlockKind, parse_blocks};
 
+/// (start byte, end byte, URL) in a rendered markdown block.
+pub type ChatLinkData = (i32, i32, String);
+/// (styled markdown, rendered text, links, alignment) for one table cell.
+pub type ChatTableCellData = (String, String, Vec<ChatLinkData>, i32);
+
 /// Mirrors the `ChatRow` struct in `app.slint`.
 /// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status (failures),
 /// 4 thinking sub-card (nested in the agent card like tool calls),
@@ -27,10 +32,16 @@ pub struct ChatRowData {
     /// Syntax-highlighted code-fence lines, computed on the controller
     /// thread so the Slint event loop only maps plain segment data.
     pub code_lines: Vec<Vec<(String, u32)>>,
-    /// Table cells as (inline-markdown, alignment) pairs. Alignment is
-    /// 0 default, 1 left, 2 center, 3 right.
-    pub table_rows: Vec<Vec<(String, i32)>>,
+    /// Table cells as (inline-markdown, rendered plain text, links,
+    /// alignment) tuples. Link ranges are UTF-8 byte offsets in the plain
+    /// text. Alignment is 0 default, 1 left, 2 center, 3 right.
+    pub table_rows: Vec<Vec<ChatTableCellData>>,
     pub text: String,
+    /// Plain text as it appears in the rendered markdown block. A transparent
+    /// read-only text layer uses this for native selection and clipboard copy.
+    pub plain_text: String,
+    /// Clickable link ranges in `plain_text`, as UTF-8 byte offsets.
+    pub links: Vec<ChatLinkData>,
     /// Markdown source for inline styling (bold/italic/code/links) of
     /// non-code markdown blocks; the UI thread parses it into a Slint
     /// `StyledText`. Empty for rows rendered as plain text.
@@ -1311,11 +1322,34 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
                         } else {
                             cell.text.clone()
                         };
-                        (tint_code_spans(&markdown), cell.alignment.as_int())
+                        let rendered = render_inline(&cell.text);
+                        (
+                            tint_code_spans(&markdown),
+                            rendered.text,
+                            rendered.links,
+                            cell.alignment.as_int(),
+                        )
                     })
                     .collect()
             })
             .collect();
+        let mut rendered = render_inline(&block.text);
+        match block.kind {
+            BlockKind::Bullet => rendered.prepend("•  "),
+            BlockKind::Numbered => {
+                let marker_len = block
+                    .text
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count()
+                    .saturating_add(1);
+                let (marker, item) = block.text.split_at(marker_len.min(block.text.len()));
+                rendered = render_inline(item.trim_start());
+                rendered.prepend(&format!("{marker} "));
+            }
+            BlockKind::Table => rendered = RenderedInline::default(),
+            _ => {}
+        }
         // Inline code spans get a distinct color; code fences are
         // excluded (empty styled_md).
         let styled_md = tint_code_spans(&styled_md);
@@ -1328,6 +1362,8 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
                 code_lines,
                 table_rows,
                 text: block.text,
+                plain_text: rendered.text,
+                links: rendered.links,
                 styled_md,
                 ..Default::default()
             },
@@ -1876,27 +1912,103 @@ fn turn_state(vm: &ThreadViewModel, turn: u64) -> Option<&TurnState> {
 /// header copy button: block structure kept, inline markers (emphasis,
 /// code-span backticks) stripped, bullets rendered as they display.
 fn plain_text(md: &str) -> String {
-    let strip = |s: &str| s.replace("**", "").replace('`', "");
     parse_blocks(md)
         .iter()
         .map(|b| match b.kind {
             BlockKind::Code => b.text.clone(),
-            BlockKind::Bullet => format!("{}•  {}", "  ".repeat(b.indent as usize), strip(&b.text)),
+            BlockKind::Bullet => format!(
+                "{}•  {}",
+                "  ".repeat(b.indent as usize),
+                inline_plain_text(&b.text)
+            ),
+            BlockKind::Numbered => {
+                let marker_len = b
+                    .text
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count()
+                    .saturating_add(1);
+                let (marker, item) = b.text.split_at(marker_len.min(b.text.len()));
+                format!(
+                    "{}{marker} {}",
+                    "  ".repeat(b.indent as usize),
+                    inline_plain_text(item.trim_start())
+                )
+            }
             BlockKind::Table => b
                 .table_rows
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|cell| strip(&cell.text))
+                        .map(|cell| inline_plain_text(&cell.text))
                         .collect::<Vec<_>>()
                         .join(" | ")
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            _ => strip(&b.text),
+            _ => inline_plain_text(&b.text),
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract the text Slint's markdown renderer displays for one inline-markup
+/// fragment. Keeping this beside the styled source gives the UI a plain
+/// selection target without exposing markdown punctuation to the clipboard.
+fn inline_plain_text(markdown: &str) -> String {
+    render_inline(markdown).text
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RenderedInline {
+    text: String,
+    links: Vec<(i32, i32, String)>,
+}
+
+impl RenderedInline {
+    fn prepend(&mut self, prefix: &str) {
+        self.text.insert_str(0, prefix);
+        let shift = prefix.len() as i32;
+        for (start, end, _) in &mut self.links {
+            *start += shift;
+            *end += shift;
+        }
+    }
+}
+
+fn render_inline(markdown: &str) -> RenderedInline {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let mut rendered = RenderedInline::default();
+    let mut open_links = Vec::new();
+    let parser = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH);
+    for event in parser {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                open_links.push((rendered.text.len() as i32, dest_url.into_string()));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((start, url)) = open_links.pop() {
+                    rendered
+                        .links
+                        .push((start, rendered.text.len() as i32, url));
+                }
+            }
+            Event::Text(value)
+            | Event::Code(value)
+            | Event::InlineMath(value)
+            | Event::DisplayMath(value)
+            | Event::FootnoteReference(value) => rendered.text.push_str(&value),
+            Event::SoftBreak | Event::HardBreak => rendered.text.push('\n'),
+            Event::TaskListMarker(checked) => {
+                rendered
+                    .text
+                    .push_str(if checked { "[x] " } else { "[ ] " });
+            }
+            _ => {}
+        }
+    }
+    rendered
 }
 
 /// Full turn-header meta: the token/cost summary plus how long the turn
@@ -2098,9 +2210,16 @@ mod tests {
         let rows = markdown_rows("| Name | Result |\n| :--- | ---: |\n| build | `passing` |");
         let table = rows.iter().find(|row| row.md_kind == 7).unwrap();
         assert_eq!(table.table_rows.len(), 2);
-        assert_eq!(table.table_rows[0][0], ("**Name**".into(), 1));
-        assert_eq!(table.table_rows[0][1], ("**Result**".into(), 3));
+        assert_eq!(
+            table.table_rows[0][0],
+            ("**Name**".into(), "Name".into(), Vec::new(), 1)
+        );
+        assert_eq!(
+            table.table_rows[0][1],
+            ("**Result**".into(), "Result".into(), Vec::new(), 3)
+        );
         assert!(table.table_rows[1][1].0.contains("<font color="));
+        assert_eq!(table.table_rows[1][1].1, "passing");
         assert_eq!(
             table.text,
             "| Name | Result |\n| :--- | ---: |\n| build | `passing` |"
@@ -2115,6 +2234,38 @@ mod tests {
             plain_text(markdown),
             "Name | Result\nbuild | passing\ntest | ok"
         );
+    }
+
+    #[test]
+    fn rendered_plain_text_strips_inline_markup_and_keeps_link_labels() {
+        assert_eq!(
+            inline_plain_text(
+                "Use **bold**, *italic*, `code`, and [the docs](https://example.com)."
+            ),
+            "Use bold, italic, code, and the docs."
+        );
+    }
+
+    #[test]
+    fn rendered_inline_text_tracks_link_ranges_for_clicks() {
+        assert_eq!(
+            render_inline("Use [the docs](https://example.com) now"),
+            RenderedInline {
+                text: "Use the docs now".into(),
+                links: vec![(4, 12, "https://example.com".into())],
+            }
+        );
+        let bullet = markdown_rows("- See [docs](https://example.com)");
+        assert_eq!(bullet[0].links, vec![(9, 13, "https://example.com".into())]);
+    }
+
+    #[test]
+    fn markdown_rows_carry_the_text_visible_in_each_rendered_block() {
+        let rows =
+            markdown_rows("# **Heading**\n\n- [the docs](https://example.com)\n\n1. `first`");
+        assert_eq!(rows[0].plain_text, "Heading");
+        assert_eq!(rows[1].plain_text, "•  the docs");
+        assert_eq!(rows[2].plain_text, "1. first");
     }
 
     #[test]

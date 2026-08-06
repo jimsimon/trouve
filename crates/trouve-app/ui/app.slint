@@ -119,8 +119,19 @@ export struct QPair {
     answer: string,
 }
 
+export struct ChatLink {
+    // UTF-8 byte offsets in the rendered plain text.
+    start: int,
+    end: int,
+    url: string,
+}
+
 export struct ChatTableCell {
     text: styled-text,
+    // The rendered value without markdown punctuation, used by the
+    // transparent selection layer.
+    plain-text: string,
+    links: [ChatLink],
     // 0 default, 1 left, 2 center, 3 right.
     alignment: int,
 }
@@ -138,6 +149,10 @@ export struct ChatRow {
     // Language tag for code fences ("rust"; empty when untagged).
     md-lang: string,
     text: string,
+    // The block's rendered text without markdown punctuation. A transparent
+    // read-only TextInput uses this for native selection and clipboard copy.
+    plain-text: string,
+    links: [ChatLink],
     // For kind 1, non-code blocks: `text` with inline markup resolved
     // (bold/italic/inline code/links), built via StyledText::from_markdown.
     styled: styled-text,
@@ -777,8 +792,7 @@ component CopyButton inherits Rectangle {
 
 // Raw TextInput does not include the editing menu that Slint's LineEdit and
 // TextEdit widgets provide. Keep the raw input behavior while adding the same
-// platform context menu (native on Windows/macOS, Slint-rendered fallback on
-// platforms without a native popup-menu backend).
+// platform context menu.
 component ContextTextInput {
     in-out property <string> text <=> input.text;
     in property <string> font-family <=> input.font-family;
@@ -850,6 +864,154 @@ component ContextTextInput {
     }
 }
 
+// Slint's StyledText renders rich spans and links but does not expose text
+// selection. Keep it as the visual layer and place a transparent read-only
+// TextInput over the same rendered string. The input supplies native drag
+// selection, primary selection, and Ctrl/Cmd+C; only its selection colors
+// are visible.
+component SelectableStyledText inherits Rectangle {
+    in property <styled-text> styled-text;
+    in property <string> plain-text;
+    in property <[ChatLink]> links;
+    in property <brush> foreground;
+    in property <color> link-color;
+    in property <length> font-size;
+    in property <int> font-weight: 400;
+    in property <TextHorizontalAlignment> horizontal-alignment: left;
+    in property <color> selection-background;
+    in property <color> selection-foreground;
+    callback link-clicked(string);
+    property <bool> keyboard-input: false;
+    property <int> link-offset: -1;
+    property <int> link-seq: 0;
+    property <int> handled-link-seq: -1;
+
+    height: max(rich.preferred-height, selector.preferred-height);
+
+    // TextInput consumes pointer input before StyledText can report link
+    // clicks. Recreate that behavior from its cursor byte offset after a
+    // short click-vs-drag delay: a drag has distinct anchor/cursor offsets,
+    // while an ordinary click remains collapsed.
+    link-click-timer := Timer {
+        interval: 250ms;
+        triggered => {
+            if (selector.has-focus && !root.keyboard-input
+                    && selector.cursor-position-byte-offset
+                        == selector.anchor-position-byte-offset) {
+                root.link-offset = selector.cursor-position-byte-offset;
+                root.link-seq += 1;
+            }
+        }
+    }
+    keyboard-reset-timer := Timer {
+        interval: 250ms;
+        triggered => { root.keyboard-input = false; }
+    }
+
+    for link in root.links: Rectangle {
+        property <int> observed-link-seq: root.link-seq;
+        changed observed-link-seq => {
+            // Cursor offsets are caret positions, so the trailing edge of
+            // the last glyph is the link's end offset. The handled guard
+            // makes adjacent links deterministic at their shared boundary.
+            if (root.handled-link-seq != root.link-seq
+                    && root.link-offset >= link.start && root.link-offset <= link.end) {
+                root.handled-link-seq = root.link-seq;
+                root.link-clicked(link.url);
+            }
+        }
+    }
+
+    rich := StyledText {
+        width: root.width;
+        height: root.height;
+        text: root.styled-text;
+        default-color: root.foreground;
+        link-color: root.link-color;
+        default-font-size: root.font-size;
+        horizontal-alignment: root.horizontal-alignment;
+        link-clicked(url) => { root.link-clicked(url); }
+    }
+
+    selector := TextInput {
+        width: root.width;
+        height: root.height;
+        text: root.plain-text;
+        read-only: true;
+        single-line: false;
+        wrap: word-wrap;
+        color: #00000000;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        horizontal-alignment: root.horizontal-alignment;
+        selection-background-color: root.selection-background;
+        selection-foreground-color: root.selection-foreground;
+        text-cursor-width: 0px;
+        changed cursor-position-byte-offset => {
+            if (self.has-focus && !root.keyboard-input) {
+                link-click-timer.stop();
+                link-click-timer.start();
+            }
+        }
+        key-pressed(event) => {
+            root.keyboard-input = true;
+            link-click-timer.stop();
+            keyboard-reset-timer.stop();
+            keyboard-reset-timer.start();
+            return reject;
+        }
+    }
+}
+
+// Selection proxy for syntax-highlighted fenced code. Monospace layout keeps
+// the transparent input's glyph positions aligned with the colored segments.
+component SelectableCodeText inherits Rectangle {
+    in property <[[TextSegment]]> lines;
+    in property <string> plain-text;
+    in property <length> font-size;
+    in property <length> line-height;
+    in property <color> foreground;
+    in property <color> selection-background;
+    in property <color> selection-foreground;
+
+    height: max(root.lines.length * root.line-height, selector.preferred-height);
+    clip: true;
+
+    VerticalLayout {
+        for line in root.lines: Rectangle {
+            height: root.line-height;
+            clip: true;
+            HorizontalLayout {
+                alignment: start;
+                for seg in line: Text {
+                    text: seg.text;
+                    // Plain-text fallback segments carry black; use the
+                    // default code foreground instead.
+                    color: seg.color == #000000 ? root.foreground : seg.color;
+                    font-family: "monospace";
+                    font-size: root.font-size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    selector := TextInput {
+        width: root.width;
+        height: root.height;
+        text: root.plain-text;
+        read-only: true;
+        single-line: false;
+        wrap: no-wrap;
+        color: #00000000;
+        font-family: "monospace";
+        font-size: root.font-size;
+        selection-background-color: root.selection-background;
+        selection-foreground-color: root.selection-foreground;
+        text-cursor-width: 0px;
+    }
+}
+
 // Shared table grid for chat markdown and rendered file previews. Callers
 // supply the text tint; grid structure and surface colors stay identical.
 component TableGrid inherits Rectangle {
@@ -877,13 +1039,18 @@ component TableGrid inherits Rectangle {
                 VerticalLayout {
                     padding: 6px;
 
-                    StyledText {
-                        text: cell.text;
-                        default-color: root.default-color;
+                    SelectableStyledText {
+                        styled-text: cell.text;
+                        plain-text: cell.plain-text;
+                        links: cell.links;
+                        foreground: root.default-color;
                         link-color: Theme.c.accent;
-                        default-font-size: Theme.fs(13px);
+                        font-size: Theme.fs(13px);
+                        font-weight: table-row-index == 0 ? 700 : 400;
                         horizontal-alignment: cell.alignment == 3 ? right
                             : cell.alignment == 2 ? center : left;
+                        selection-background: Theme.c.selection;
+                        selection-foreground: Theme.c.text-hi;
                         link-clicked(url) => { root.link-clicked(url); }
                     }
                 }
@@ -3327,12 +3494,10 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // User message: selectable body under its card
-                            // header.
                             // Markdown block: code fences render as
                             // selectable monospace text under a header
-                            // (language label + copy); everything else
-                            // renders inline markup through StyledText.
+                            // (language label + copy); everything else keeps
+                            // its rich styling over a native selection layer.
                             if row.kind == 1 && row.md-kind == 5: HorizontalLayout {
                                 spacing: 6px;
                                 Text {
@@ -3344,28 +3509,17 @@ export component AppWindow inherits Window {
                                 }
                                 CopyButton { payload: row.text; tip: "Copy code"; }
                             }
-                            // Syntax-highlighted code lines. Fixed line
-                            // height keeps the block's size deterministic
-                            // (empty lines would otherwise collapse).
-                            if row.kind == 1 && row.md-kind == 5: VerticalLayout {
-                                for line in row.code-lines: Rectangle {
-                                    height: Theme.fs(19px);
-                                    clip: true;
-                                    HorizontalLayout {
-                                        alignment: start;
-                                        for seg in line: Text {
-                                            text: seg.text;
-                                            // Plain-text fallback segments
-                                            // carry black; use the default
-                                            // code foreground instead.
-                                            color: seg.color == #000000
-                                                ? Theme.c.code-fg : seg.color;
-                                            font-family: "monospace";
-                                            font-size: Theme.fs(13px);
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                }
+                            // Syntax-highlighted code with a transparent
+                            // monospace selection layer over the colored
+                            // segments.
+                            if row.kind == 1 && row.md-kind == 5: SelectableCodeText {
+                                lines: row.code-lines;
+                                plain-text: row.plain-text;
+                                font-size: Theme.fs(13px);
+                                line-height: Theme.fs(19px);
+                                foreground: Theme.c.code-fg;
+                                selection-background: Theme.c.selection;
+                                selection-foreground: Theme.c.text-hi;
                             }
                             if row.kind == 1 && row.md-kind == 7: TableGrid {
                                 rows: row.table-rows;
@@ -3373,16 +3527,21 @@ export component AppWindow inherits Window {
                                     : row.tone == 2 ? Theme.c.text-dim : Theme.c.text;
                                 link-clicked(url) => { root.open-link(url); }
                             }
-                            if row.kind == 1 && row.md-kind != 5 && row.md-kind != 7: StyledText {
-                                text: row.styled;
-                                default-color: row.tone == 1 ? Theme.c.text-accent-soft
+                            if row.kind == 1 && row.md-kind != 5 && row.md-kind != 7: SelectableStyledText {
+                                styled-text: row.styled;
+                                plain-text: row.plain-text;
+                                links: row.links;
+                                foreground: row.tone == 1 ? Theme.c.text-accent-soft
                                     : row.tone == 2 ? Theme.c.text-dim
                                     : Theme.c.text;
                                 link-color: Theme.c.accent;
-                                default-font-size: Theme.fs(row.md-kind == 1 ? 22px
+                                font-size: Theme.fs(row.md-kind == 1 ? 22px
                                     : row.md-kind == 2 ? 19px
                                     : row.md-kind == 3 ? 16px
                                     : 14px);
+                                font-weight: row.md-kind >= 1 && row.md-kind <= 3 ? 700 : 400;
+                                selection-background: Theme.c.selection;
+                                selection-foreground: Theme.c.text-hi;
                                 link-clicked(url) => { root.open-link(url); }
                             }
 
@@ -4939,22 +5098,14 @@ export component AppWindow inherits Window {
                                                 tip: "Copy code";
                                             }
                                         }
-                                        VerticalLayout {
-                                            for line in row.code-lines: Rectangle {
-                                                height: Theme.fs(19px);
-                                                clip: true;
-                                                HorizontalLayout {
-                                                    alignment: start;
-                                                    for seg in line: Text {
-                                                        text: seg.text;
-                                                        color: seg.color == #000000
-                                                            ? Theme.c.code-fg : seg.color;
-                                                        font-family: "monospace";
-                                                        font-size: Theme.fs(13px);
-                                                        vertical-alignment: center;
-                                                    }
-                                                }
-                                            }
+                                        SelectableCodeText {
+                                            lines: row.code-lines;
+                                            plain-text: row.plain-text;
+                                            font-size: Theme.fs(13px);
+                                            line-height: Theme.fs(19px);
+                                            foreground: Theme.c.code-fg;
+                                            selection-background: Theme.c.selection;
+                                            selection-foreground: Theme.c.text-hi;
                                         }
                                     }
                                 }
@@ -4963,14 +5114,19 @@ export component AppWindow inherits Window {
                                     default-color: Theme.c.text;
                                     link-clicked(url) => { root.open-link(url); }
                                 }
-                                if row.md-kind != 5 && row.md-kind != 7: StyledText {
-                                    text: row.styled;
-                                    default-color: Theme.c.text;
+                                if row.md-kind != 5 && row.md-kind != 7: SelectableStyledText {
+                                    styled-text: row.styled;
+                                    plain-text: row.plain-text;
+                                    links: row.links;
+                                    foreground: Theme.c.text;
                                     link-color: Theme.c.accent;
-                                    default-font-size: Theme.fs(row.md-kind == 1 ? 22px
+                                    font-size: Theme.fs(row.md-kind == 1 ? 22px
                                         : row.md-kind == 2 ? 19px
                                         : row.md-kind == 3 ? 16px
                                         : 14px);
+                                    font-weight: row.md-kind >= 1 && row.md-kind <= 3 ? 700 : 400;
+                                    selection-background: Theme.c.selection;
+                                    selection-foreground: Theme.c.text-hi;
                                     link-clicked(url) => { root.open-link(url); }
                                 }
                             }
