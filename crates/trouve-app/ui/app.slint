@@ -3661,23 +3661,32 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // Activity: pulsing dots + label while the agent
-                            // works ("Processing…"/"Thinking…"); nests at the
-                            // bottom of the streaming Agent card when open.
-                            if row.kind == 5: HorizontalLayout {
-                                spacing: 8px;
-                                PulseDots {
-                                    // Reduce motion: dots rest as static marks.
-                                    animate: !Theme.reduce-motion;
-                                    animation-time: root.activity-animation-time;
+                            // Activity: pulsing dots, a phase-aware label, and
+                            // optional detail while the agent works. Nests at
+                            // the bottom of the streaming Agent card when open.
+                            if row.kind == 5: VerticalLayout {
+                                spacing: row.detail == "" ? 0px : 2px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    PulseDots {
+                                        // Reduce motion: dots rest as static marks.
+                                        animate: !Theme.reduce-motion;
+                                        animation-time: root.activity-animation-time;
+                                    }
+                                    Text {
+                                        text: row.text;
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(13px);
+                                        vertical-alignment: center;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
-                                Text {
-                                    text: row.text;
-                                    color: Theme.c.text-dim;
-                                    font-size: Theme.fs(13px);
-                                    vertical-alignment: center;
+                                if row.detail != "": Text {
+                                    text: row.detail;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
                                 }
-                                Rectangle { horizontal-stretch: 1; }
                             }
 
                             // Question wizard: the agent's questions,
