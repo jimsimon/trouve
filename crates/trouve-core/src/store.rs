@@ -298,8 +298,14 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   github_publication_status TEXT NOT NULL DEFAULT 'pending',
   github_thread_id TEXT,
   resolved_at TEXT,
+  collapse_pending INTEGER NOT NULL DEFAULT 0,
+  collapse_attempts INTEGER NOT NULL DEFAULT 0,
+  collapse_next_attempt_at TEXT,
   created_at TEXT NOT NULL
 );
+-- The partial index on collapse_pending lives in MIGRATIONS only: SCHEMA
+-- runs before migrations, so an index here would reference a column that
+-- databases predating collapse_pending do not have yet and abort open.
 CREATE INDEX IF NOT EXISTS code_review_findings_job
   ON code_review_findings (job_id, status);
 CREATE INDEX IF NOT EXISTS code_review_findings_open_pr
@@ -436,6 +442,11 @@ const MIGRATIONS: &[&str] = &[
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
+    "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
+       ON code_review_findings (collapse_pending) WHERE collapse_pending = 1",
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
@@ -449,8 +460,56 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     }
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
+    backfill_code_review_collapse_pending(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    Ok(())
+}
+
+/// Arms the durable thread-collapse queue for findings closed before
+/// `collapse_pending` existed: without this, historical conversations with a
+/// published comment would stay uncollapsed forever. The backfill and its
+/// marker commit atomically, so a failure leaves the marker absent and the
+/// backfill retries on the next boot, while previously cleared collapses are
+/// never re-armed once the marker is recorded.
+fn backfill_code_review_collapse_pending(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-collapse-pending-backfill-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    tx.execute(
+        "UPDATE code_review_findings SET collapse_pending = 1
+         WHERE status != 'open' AND github_comment_id IS NOT NULL",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -689,6 +748,17 @@ fn code_review_routing_mode_str(value: trouve_protocol::CodeReviewRoutingMode) -
 
 fn parse_datetime(value: String) -> chrono::DateTime<chrono::Utc> {
     value.parse().unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn code_review_publication_status(
+    value: &str,
+) -> trouve_protocol::CodeReviewFindingPublicationStatus {
+    match value {
+        "published" => trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+        "not_eligible" => trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
+    }
 }
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -4214,6 +4284,12 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Records a finding's published comment coordinates. A comment landing
+    /// on an already-closed row re-arms its collapse: a concurrent round may
+    /// have closed the finding from a snapshot taken before publication, and
+    /// without re-arming that thread would never be collapsed. The arming
+    /// transition (0 → 1) also resets retry metadata, so a freshly armed
+    /// collapse never inherits backoff from an earlier, unrelated deferral.
     pub fn update_code_review_finding_publication(
         &self,
         id: &str,
@@ -4225,7 +4301,23 @@ impl Store {
             "UPDATE code_review_findings
              SET github_comment_id = ?2, github_comment_url = ?3,
                  github_publication_status = 'published',
-                 github_thread_id = COALESCE(?4, github_thread_id)
+                 github_thread_id = CASE
+                     WHEN ?4 IS NOT NULL THEN ?4
+                     WHEN github_comment_id IS ?2 THEN github_thread_id
+                     ELSE NULL
+                 END,
+                 collapse_attempts = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN 0
+                     ELSE collapse_attempts
+                 END,
+                 collapse_next_attempt_at = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN NULL
+                     ELSE collapse_next_attempt_at
+                 END,
+                 collapse_pending = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL THEN 1
+                     ELSE collapse_pending
+                 END
              WHERE id = ?1",
             params![
                 id,
@@ -4271,13 +4363,185 @@ impl Store {
         Ok(updated)
     }
 
+    /// Closes an open finding and, in the same committed write, arms its
+    /// thread collapse when the row currently has a published comment. The
+    /// row's own github_comment_id decides — not a caller snapshot, which
+    /// may predate the comment's publication by a concurrent round. Arming
+    /// resets retry metadata: an open row cannot carry meaningful backoff.
     pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
-             SET status = ?2, resolved_at = ?3
+             SET status = ?2, resolved_at = ?3,
+                 collapse_attempts = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 0
+                     ELSE collapse_attempts
+                 END,
+                 collapse_next_attempt_at = CASE
+                     WHEN github_comment_id IS NOT NULL THEN NULL
+                     ELSE collapse_next_attempt_at
+                 END,
+                 collapse_pending = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 1
+                     ELSE 0
+                 END
              WHERE id = ?1 AND status = 'open'",
             params![id, status, chrono::Utc::now().to_rfc3339()],
         )? > 0)
+    }
+
+    /// Marks a finding's thread collapse as done; retry state resets with
+    /// it. The clear only applies while the row still carries
+    /// `expected_comment_id`: if concurrent publication re-armed the row
+    /// with a different comment after the caller's snapshot, the newly armed
+    /// work survives instead of being wiped by a stale pass.
+    pub fn clear_code_review_thread_collapse(
+        &self,
+        id: &str,
+        expected_comment_id: Option<u64>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL
+             WHERE id = ?1 AND github_comment_id IS ?2",
+            params![id, expected_comment_id.map(|value| value as i64)],
+        )?;
+        Ok(())
+    }
+
+    /// Caches (or resets, with `None`) a finding's GitHub thread id without
+    /// touching its comment coordinates or collapse state, guarded on the
+    /// comment the caller matched the thread against — so a stale pass can
+    /// never overwrite a newer comment id published concurrently.
+    pub fn cache_code_review_thread_id(
+        &self,
+        id: &str,
+        expected_comment_id: u64,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET github_thread_id = ?3
+             WHERE id = ?1 AND github_comment_id = ?2",
+            params![id, expected_comment_id as i64, thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reschedules a pending collapse for the next retry tick without
+    /// counting a failure: used when the group budget ran out before the
+    /// finding was attempted, so healthy tail findings do not accumulate
+    /// exponential backoff they never earned.
+    pub fn requeue_code_review_thread_collapse(&self, id: &str) -> Result<()> {
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(60);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET collapse_next_attempt_at = ?2
+             WHERE id = ?1",
+            params![id, next_attempt.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Pushes a pending collapse's next attempt out with bounded exponential
+    /// backoff (one minute doubling up to one hour), so a persistently
+    /// failing finding cannot consume API quota on every retry pass.
+    pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let attempts: i64 = tx
+            .query_row(
+                "SELECT collapse_attempts FROM code_review_findings WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        tx.execute(
+            "UPDATE code_review_findings
+             SET collapse_attempts = collapse_attempts + 1,
+                 collapse_next_attempt_at = ?2
+             WHERE id = ?1",
+            params![id, next_attempt.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fixed findings whose GitHub review thread has not been confirmed
+    /// collapsed and whose backoff window has elapsed, with the owning job's
+    /// coordinates so a caller can build an installation client and retry
+    /// the collapse. `limit` bounds each retry pass, and `excluded_ids`
+    /// (typically the in-flight claims) are filtered out before the limit is
+    /// applied so a batch never fills up with unactionable rows.
+    pub fn pending_code_review_thread_collapses(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+        excluded_ids: &[String],
+    ) -> Result<Vec<(u64, String, u64, trouve_protocol::CodeReviewFinding)>> {
+        let conn = self.conn.lock().unwrap();
+        let exclusion = if excluded_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "AND f.id NOT IN ({})",
+                vec!["?"; excluded_ids.len()].join(", ")
+            )
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT j.installation_id, j.repository, j.pull_number,
+                    f.id, f.job_id, f.path, f.line, f.side, f.severity, f.body,
+                    f.prompt_for_agents, f.status, f.github_comment_id,
+                    f.github_comment_url, f.github_publication_status,
+                    f.github_thread_id, f.resolved_at
+             FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE f.collapse_pending = 1
+               AND (f.collapse_next_attempt_at IS NULL OR f.collapse_next_attempt_at <= ?)
+               {exclusion}
+             ORDER BY f.collapse_next_attempt_at IS NOT NULL,
+                      f.collapse_next_attempt_at,
+                      j.repository, j.pull_number, f.id
+             LIMIT ?"
+        ))?;
+        let mut query_params: Vec<rusqlite::types::Value> = vec![now.to_rfc3339().into()];
+        query_params.extend(
+            excluded_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::from(id.clone())),
+        );
+        query_params.push((limit as i64).into());
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(query_params), |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    trouve_protocol::CodeReviewFinding {
+                        id: row.get(3)?,
+                        job_id: row.get(4)?,
+                        path: row.get(5)?,
+                        line: row.get::<_, i64>(6)? as u64,
+                        side: row.get(7)?,
+                        severity: row.get(8)?,
+                        body: row.get(9)?,
+                        prompt_for_agents: row.get(10)?,
+                        status: row.get(11)?,
+                        sources: Vec::new(),
+                        github_comment_id: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+                        github_comment_url: row.get(13)?,
+                        github_publication_status: code_review_publication_status(
+                            &row.get::<_, String>(14)?,
+                        ),
+                        github_thread_id: row.get(15)?,
+                        resolved_at: parse_optional_datetime(row.get(16)?),
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn code_review_findings(
@@ -4308,16 +4572,9 @@ impl Store {
                     sources: Vec::new(),
                     github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                     github_comment_url: row.get(10)?,
-                    github_publication_status: match row.get::<_, String>(11)?.as_str() {
-                        "published" => {
-                            trouve_protocol::CodeReviewFindingPublicationStatus::Published
-                        }
-                        "not_eligible" => {
-                            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
-                        }
-                        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
-                        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
-                    },
+                    github_publication_status: code_review_publication_status(
+                        &row.get::<_, String>(11)?,
+                    ),
                     github_thread_id: row.get(12)?,
                     resolved_at: parse_optional_datetime(row.get(13)?),
                 })
@@ -7357,6 +7614,272 @@ mod tests {
                 trigger_key: "manual:comment:200".into(),
             }]
         );
+    }
+
+    #[test]
+    fn migrations_upgrade_findings_tables_that_predate_collapse_columns() {
+        // A database created before collapse_pending existed: SCHEMA's
+        // CREATE TABLE IF NOT EXISTS will not touch it, so every collapse
+        // column and the partial index must arrive via MIGRATIONS — and the
+        // index must not appear in SCHEMA, where it would run before the
+        // column exists and abort open.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_review_findings (
+               id TEXT PRIMARY KEY,
+               job_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               line INTEGER NOT NULL,
+               side TEXT NOT NULL,
+               severity TEXT NOT NULL,
+               body TEXT NOT NULL,
+               prompt_for_agents TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT 'open',
+               github_comment_id INTEGER,
+               github_comment_url TEXT NOT NULL DEFAULT '',
+               github_thread_id TEXT,
+               resolved_at TEXT,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO code_review_findings
+                    (id, job_id, path, line, side, severity, body, status,
+                     github_comment_id, created_at)
+             VALUES ('rvf-historic', 'job', 'src/lib.rs', 3, 'RIGHT', 'medium',
+                     'closed with a published comment', 'fixed', 9001, '2026-01-01'),
+                    ('rvf-commentless', 'job', 'src/lib.rs', 4, 'RIGHT', 'medium',
+                     'closed without a comment', 'fixed', NULL, '2026-01-01'),
+                    ('rvf-open', 'job', 'src/lib.rs', 5, 'RIGHT', 'medium',
+                     'still open', 'open', 9002, '2026-01-01');",
+        )
+        .unwrap();
+        assert!(!SCHEMA.contains("code_review_findings_collapse_pending"));
+
+        conn.execute_batch(SCHEMA).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'code_review_findings_collapse_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        // The one-time backfill arms only historical closed findings that
+        // have a published comment; open or comment-less rows stay unarmed.
+        fn armed(conn: &Connection, id: &str) -> i64 {
+            conn.query_row(
+                "SELECT collapse_pending FROM code_review_findings WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(armed(&conn, "rvf-historic"), 1);
+        assert_eq!(armed(&conn, "rvf-commentless"), 0);
+        assert_eq!(armed(&conn, "rvf-open"), 0);
+
+        // Re-running migrations (a later boot) must not re-arm cleared rows:
+        // the backfill commits atomically with its store_migrations marker
+        // and is skipped once the marker exists.
+        conn.execute(
+            "UPDATE code_review_findings SET collapse_pending = 0 WHERE id = 'rvf-historic'",
+            [],
+        )
+        .unwrap();
+        apply_migrations(&mut conn).unwrap();
+        assert_eq!(armed(&conn, "rvf-historic"), 0);
+    }
+
+    #[test]
+    fn collapse_arming_follows_the_row_not_the_snapshot() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let id = findings[0].id.clone();
+        let due = chrono::Utc::now() + chrono::Duration::hours(2);
+
+        // Closed before any comment was published: nothing to collapse yet.
+        assert!(store.resolve_code_review_finding(&id, "fixed").unwrap());
+        assert!(
+            store
+                .pending_code_review_thread_collapses(due, 16, &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        // Stale backoff accrued while the row had nothing to collapse (e.g.
+        // a cleanup pass deferring on a listing failure) must not delay a
+        // freshly armed collapse.
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id).unwrap();
+
+        // A comment published by a concurrent round after the close re-arms
+        // the collapse with reset retry metadata: due immediately, not after
+        // the inherited delay.
+        store
+            .update_code_review_finding_publication(&id, Some(9001), "https://example", None)
+            .unwrap();
+        let pending = store
+            .pending_code_review_thread_collapses(chrono::Utc::now(), 16, &[])
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].3.id, id);
+
+        // A clear guarded on a stale comment id is a no-op: the re-armed
+        // work survives a pass that snapshotted the row before publication.
+        store.clear_code_review_thread_collapse(&id, None).unwrap();
+        assert_eq!(
+            store
+                .pending_code_review_thread_collapses(due, 16, &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .clear_code_review_thread_collapse(&id, Some(9001))
+            .unwrap();
+        assert!(
+            store
+                .pending_code_review_thread_collapses(due, 16, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn collapse_backoff_doubles_from_one_minute_and_caps_at_one_hour() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let id = findings[0].id.clone();
+        store
+            .update_code_review_finding_publication(&id, Some(9001), "https://example", None)
+            .unwrap();
+        assert!(store.resolve_code_review_finding(&id, "fixed").unwrap());
+
+        let next_attempt = |store: &Store| -> chrono::DateTime<chrono::Utc> {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT collapse_next_attempt_at FROM code_review_findings WHERE id = ?1",
+                    params![&id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+
+        // First failure: due in one minute — not before, not much after.
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        let first = next_attempt(&store);
+        let elapsed = first - chrono::Utc::now();
+        assert!(elapsed > chrono::Duration::seconds(55), "{elapsed}");
+        assert!(elapsed <= chrono::Duration::seconds(61), "{elapsed}");
+
+        // The delay doubles per failure and stops growing at one hour.
+        for _ in 0..6 {
+            store.defer_code_review_thread_collapse(&id).unwrap();
+        }
+        let capped = next_attempt(&store);
+        let elapsed = capped - chrono::Utc::now();
+        assert!(elapsed > chrono::Duration::minutes(59), "{elapsed}");
+        assert!(elapsed <= chrono::Duration::minutes(61), "{elapsed}");
+
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        let still_capped = next_attempt(&store) - chrono::Utc::now();
+        assert!(
+            still_capped <= chrono::Duration::minutes(61),
+            "{still_capped}"
+        );
+
+        // A requeue reschedules for the next tick without counting a
+        // failure: the attempt count is untouched, so a later real failure
+        // resumes the capped backoff instead of restarting from one minute.
+        store.requeue_code_review_thread_collapse(&id).unwrap();
+        let requeued = next_attempt(&store) - chrono::Utc::now();
+        assert!(requeued > chrono::Duration::seconds(55), "{requeued}");
+        assert!(requeued <= chrono::Duration::seconds(61), "{requeued}");
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        let after_requeue = next_attempt(&store) - chrono::Utc::now();
+        assert!(
+            after_requeue > chrono::Duration::minutes(59),
+            "{after_requeue}"
+        );
+    }
+
+    fn enqueue_backoff_test_job(store: &Store) -> trouve_protocol::CodeReviewJob {
+        store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:backoff".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "Review it".into(),
+                reviewers: crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .take(1)
+                    .collect(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
