@@ -64,6 +64,12 @@ export struct NavRow {
     attention-tooltip: string,
     // Workspace headers: this workspace shows its archived sessions.
     show-archived: bool,
+    // Workspace-list organization preferences (copied onto headers so each
+    // virtual-list delegate's popup reflects the shared controller state).
+    show-branches: bool,
+    show-status: bool,
+    status-filter: int,
+    pr-filter: int,
 }
 
 export struct ThreadTabItem {
@@ -1449,6 +1455,53 @@ component PulseDots inherits Rectangle {
     }
 }
 
+// Compact row shared by the workspace-list menu and its submenus.
+component WorkspaceMenuRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> checked: false;
+    in property <bool> submenu: false;
+    in property <bool> danger: false;
+    callback activated;
+
+    height: Theme.fs(30px);
+    border-radius: 5px;
+    background: ta.has-hover ? (root.danger ? Theme.c.err-hover : Theme.c.hover-bg) : transparent;
+    ta := TouchArea {
+        clicked => { root.activated(); }
+    }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 8px;
+        Text {
+            text: root.label;
+            color: root.danger ? Theme.c.err : Theme.c.text;
+            font-size: Theme.fs(12px);
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if root.value != "": Text {
+            text: root.value;
+            color: Theme.c.text-soft;
+            font-size: Theme.fs(12px);
+            vertical-alignment: center;
+        }
+        if root.checked: Text {
+            text: "✓";
+            color: Theme.c.text;
+            font-size: Theme.fs(12px);
+            vertical-alignment: center;
+        }
+        if root.submenu: Text {
+            text: "›";
+            color: Theme.c.text-soft;
+            font-size: Theme.fs(16px);
+            vertical-alignment: center;
+        }
+    }
+}
+
 component SplitterHandle inherits Rectangle {
     in-out property <length> value;
     in property <int> direction: 1;
@@ -1535,9 +1588,20 @@ export component AppWindow inherits Window {
     callback session-renamed(/* nav row */ int, /* new title */ string);
     callback session-archived(/* nav row */ int, /* archived */ bool);
     callback session-deleted(/* nav row */ int);
-    // Session-list filters (controller owns the state).
-    // Per-workspace: the row is the workspace header the funnel lives on.
+    // Session-list organization and filters (controller owns and persists
+    // the shared state).
+    in property <int> workspace-list-grouping: 0;
+    in property <int> workspace-list-ordering: 0;
+    in property <bool> workspace-list-show-branches: true;
+    in property <bool> workspace-list-show-status: true;
+    callback workspace-list-option-picked(
+        /* 0 grouping, 1 ordering */ int, /* option */ int);
+    callback workspace-list-show-toggled(/* 0 branches, 1 status */ int);
+    callback workspace-list-filter-toggled(
+        /* nav row */ int, /* 1 status, 2 PR */ int, /* option */ int);
     callback archived-filter-toggled(/* nav row */ int);
+    callback collapse-workspace(/* nav row */ int);
+    callback mark-workspace-read(/* nav row */ int);
 
     // Rename/delete modal state (UI-local; -1 = closed).
     in-out property <int> rename-row: -1;
@@ -2399,18 +2463,194 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalLayout {
-                    Text {
-                        text: "Workspaces";
-                        color: Theme.c.text-hi;
-                        font-size: Theme.fs(15px);
-                        font-weight: 700;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
+                Rectangle {
+                    height: Theme.fs(34px);
+
+                    workspace-grouping-menu := PopupWindow {
+                        x: parent.width - 4px;
+                        y: 32px;
+                        width: 210px;
+                        height: 4 * Theme.fs(30px) + 8px;
+                        Rectangle {
+                            background: Theme.c.popup-bg;
+                            border-radius: 7px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            VerticalLayout {
+                                padding: 4px;
+                                WorkspaceMenuRow {
+                                    label: "Repository";
+                                    checked: root.workspace-list-grouping == 0;
+                                    activated => {
+                                        root.workspace-list-option-picked(0, 0);
+                                        workspace-grouping-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Workspace";
+                                    checked: root.workspace-list-grouping == 1;
+                                    activated => {
+                                        root.workspace-list-option-picked(0, 1);
+                                        workspace-grouping-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Updated";
+                                    checked: root.workspace-list-grouping == 2;
+                                    activated => {
+                                        root.workspace-list-option-picked(0, 2);
+                                        workspace-grouping-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Status";
+                                    checked: root.workspace-list-grouping == 3;
+                                    activated => {
+                                        root.workspace-list-option-picked(0, 3);
+                                        workspace-grouping-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                            }
+                        }
                     }
-                    Button {
-                        text: "+ Open";
-                        clicked => { root.open-workspace(); }
+
+                    workspace-ordering-menu := PopupWindow {
+                        x: parent.width - 4px;
+                        y: 62px;
+                        width: 210px;
+                        height: 3 * Theme.fs(30px) + 8px;
+                        Rectangle {
+                            background: Theme.c.popup-bg;
+                            border-radius: 7px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            VerticalLayout {
+                                padding: 4px;
+                                WorkspaceMenuRow {
+                                    label: "Updated";
+                                    checked: root.workspace-list-ordering == 0;
+                                    activated => {
+                                        root.workspace-list-option-picked(1, 0);
+                                        workspace-ordering-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Status";
+                                    checked: root.workspace-list-ordering == 1;
+                                    activated => {
+                                        root.workspace-list-option-picked(1, 1);
+                                        workspace-ordering-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Created";
+                                    checked: root.workspace-list-ordering == 2;
+                                    activated => {
+                                        root.workspace-list-option-picked(1, 2);
+                                        workspace-ordering-menu.close();
+                                        workspace-list-menu.close();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    workspace-show-menu := PopupWindow {
+                        x: parent.width - 4px;
+                        y: 92px;
+                        width: 210px;
+                        height: 2 * Theme.fs(30px) + 8px;
+                        Rectangle {
+                            background: Theme.c.popup-bg;
+                            border-radius: 7px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            VerticalLayout {
+                                padding: 4px;
+                                WorkspaceMenuRow {
+                                    label: "Branch names";
+                                    checked: root.workspace-list-show-branches;
+                                    activated => { root.workspace-list-show-toggled(0); }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Status indicators";
+                                    checked: root.workspace-list-show-status;
+                                    activated => { root.workspace-list-show-toggled(1); }
+                                }
+                            }
+                        }
+                    }
+
+                    workspace-list-menu := PopupWindow {
+                        x: parent.width - 224px;
+                        y: 32px;
+                        width: 224px;
+                        height: 3 * Theme.fs(30px) + 8px;
+                        Rectangle {
+                            background: Theme.c.popup-bg;
+                            border-radius: 7px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            VerticalLayout {
+                                padding: 4px;
+                                WorkspaceMenuRow {
+                                    label: "Grouping";
+                                    value: root.workspace-list-grouping == 0 ? "Repository"
+                                        : root.workspace-list-grouping == 1 ? "Workspace"
+                                        : root.workspace-list-grouping == 2 ? "Updated"
+                                        : "Status";
+                                    submenu: true;
+                                    activated => { workspace-grouping-menu.show(); }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Ordering";
+                                    value: root.workspace-list-ordering == 0 ? "Updated"
+                                        : root.workspace-list-ordering == 1 ? "Status" : "Created";
+                                    submenu: true;
+                                    activated => { workspace-ordering-menu.show(); }
+                                }
+                                WorkspaceMenuRow {
+                                    label: "Show";
+                                    submenu: true;
+                                    activated => { workspace-show-menu.show(); }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        Text {
+                            text: "Workspaces";
+                            color: Theme.c.text-hi;
+                            font-size: Theme.fs(15px);
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        IconButton {
+                            width: 28px;
+                            height: 28px;
+                            icon: "⋯";
+                            icon-size: Theme.fs(16px);
+                            tip: "Workspace list options";
+                            accessibility-label: "Workspace list options";
+                            clicked => { workspace-list-menu.show(); }
+                        }
+                        IconButton {
+                            width: 28px;
+                            height: 28px;
+                            icon: "+";
+                            icon-size: Theme.fs(16px);
+                            tip: "Open workspace";
+                            accessibility-label: "Open workspace";
+                            clicked => { root.open-workspace(); }
+                        }
                     }
                 }
 
@@ -2435,7 +2675,9 @@ export component AppWindow inherits Window {
                         // Match the chat pane's right-side gutter so the
                         // scrollbar never covers trailing row controls.
                         width: parent.width - 18px;
-                        height: Theme.fs(row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px);
+                        height: Theme.fs(row.kind == 1
+                            ? (row.show-branches ? 52px : 36px)
+                            : row.kind == 0 ? 34px : 30px);
                         background: row.kind == 0
                             ? (row-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg)
                             : row.kind == 1 && row.selected ? Theme.c.accent-bg : transparent;
@@ -2536,71 +2778,165 @@ export component AppWindow inherits Window {
                             clicked => { root.nav-row-clicked(idx); }
                         }
 
-                        // Workspace actions menu.
-                        filter-menu := PopupWindow {
-                            x: parent.width - 190px;
-                            y: 32px;
-                            width: 180px;
-                            height: Theme.fs(24px) + Theme.fs(60px) + 16px;
+                        status-menu := PopupWindow {
+                            x: parent.width - 4px;
+                            y: 57px;
+                            width: 210px;
+                            height: 5 * Theme.fs(30px) + 8px;
                             Rectangle {
                                 background: Theme.c.popup-bg;
-                                border-radius: 6px;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: Theme.c.border;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    WorkspaceMenuRow {
+                                        label: "Needs Attention";
+                                        checked: Math.mod(row.status-filter, 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 1, 0); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Unread";
+                                        checked: Math.mod(Math.floor(row.status-filter / 2), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 1, 1); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Working";
+                                        checked: Math.mod(Math.floor(row.status-filter / 4), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 1, 2); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Draft";
+                                        checked: Math.mod(Math.floor(row.status-filter / 8), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 1, 3); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Done";
+                                        checked: Math.mod(Math.floor(row.status-filter / 16), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 1, 4); }
+                                    }
+                                }
+                            }
+                        }
+
+                        pr-filter-menu := PopupWindow {
+                            x: parent.width - 4px;
+                            y: 87px;
+                            width: 210px;
+                            height: 5 * Theme.fs(30px) + 8px;
+                            Rectangle {
+                                background: Theme.c.popup-bg;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: Theme.c.border;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    WorkspaceMenuRow {
+                                        label: "PR Draft";
+                                        checked: Math.mod(row.pr-filter, 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 2, 0); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "PR Open";
+                                        checked: Math.mod(Math.floor(row.pr-filter / 2), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 2, 1); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "PR Merged";
+                                        checked: Math.mod(Math.floor(row.pr-filter / 4), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 2, 2); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "PR Closed";
+                                        checked: Math.mod(Math.floor(row.pr-filter / 8), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 2, 3); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "No PR";
+                                        checked: Math.mod(Math.floor(row.pr-filter / 16), 2) == 1;
+                                        activated => { root.workspace-list-filter-toggled(idx, 2, 4); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Named-workspace filters and actions. Shared
+                        // organization controls live in the header menu.
+                        filter-menu := PopupWindow {
+                            x: parent.width - 234px;
+                            y: 32px;
+                            width: 224px;
+                            height: 230px;
+                            Rectangle {
+                                background: Theme.c.popup-bg;
+                                border-radius: 7px;
                                 border-width: 1px;
                                 border-color: Theme.c.border;
                                 VerticalLayout {
                                     padding: 4px;
                                     Rectangle {
-                                        height: 24px;
+                                        height: 21px;
                                         Text {
-                                            x: 8px;
-                                            text: "Workspace";
+                                            x: 9px;
+                                            text: "Filters";
                                             color: Theme.c.text-soft;
                                             font-size: Theme.fs(11px);
                                             vertical-alignment: center;
                                         }
                                     }
+                                    WorkspaceMenuRow {
+                                        label: "Status";
+                                        submenu: true;
+                                        activated => { status-menu.show(); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "PR";
+                                        submenu: true;
+                                        activated => { pr-filter-menu.show(); }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Archived";
+                                        checked: row.show-archived;
+                                        activated => { root.archived-filter-toggled(idx); }
+                                    }
                                     Rectangle {
-                                        height: Theme.fs(30px);
-                                        background: archived-filter-ta.has-hover
-                                            ? Theme.c.accent-bg : transparent;
-                                        border-radius: 4px;
-                                        archived-filter-ta := TouchArea {
-                                            clicked => {
-                                                root.archived-filter-toggled(idx);
-                                            }
+                                        height: 9px;
+                                        Rectangle {
+                                            y: 4px;
+                                            width: parent.width;
+                                            height: 1px;
+                                            background: Theme.c.border;
                                         }
-                                        HorizontalLayout {
-                                            padding-left: 8px;
-                                            padding-right: 8px;
-                                            Text {
-                                                text: "Archived";
-                                                color: Theme.c.text;
-                                                font-size: Theme.fs(12px);
-                                                vertical-alignment: center;
-                                                horizontal-stretch: 1;
-                                            }
-                                            if row.show-archived: Text {
-                                                text: "✓";
-                                                color: Theme.c.text;
-                                                font-size: Theme.fs(12px);
-                                                vertical-alignment: center;
-                                            }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Collapse All";
+                                        activated => {
+                                            root.collapse-workspace(idx);
+                                            filter-menu.close();
+                                        }
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Mark All as Read";
+                                        activated => {
+                                            root.mark-workspace-read(idx);
+                                            filter-menu.close();
                                         }
                                     }
                                     Rectangle {
-                                        height: Theme.fs(30px);
-                                        background: close-workspace-ta.has-hover
-                                            ? Theme.c.accent-bg : transparent;
-                                        border-radius: 4px;
-                                        close-workspace-ta := TouchArea {
-                                            clicked => { root.workspace-closed(idx); }
+                                        height: 9px;
+                                        Rectangle {
+                                            y: 4px;
+                                            width: parent.width;
+                                            height: 1px;
+                                            background: Theme.c.border;
                                         }
-                                        Text {
-                                            x: 8px;
-                                            text: "Close workspace";
-                                            color: Theme.c.text;
-                                            font-size: Theme.fs(12px);
-                                            vertical-alignment: center;
+                                    }
+                                    WorkspaceMenuRow {
+                                        label: "Close workspace";
+                                        danger: true;
+                                        activated => {
+                                            root.workspace-closed(idx);
+                                            filter-menu.close();
                                         }
                                     }
                                 }
@@ -2749,7 +3085,8 @@ export component AppWindow inherits Window {
                             // the status precedence from most actionable to
                             // informational: attention, error, unread, busy, PR.
                             status-slot := Rectangle {
-                                width: 26px;
+                                width: row.show-status ? 26px : 0px;
+                                visible: row.show-status;
                                 if row.attention-kind != 0: IconButton {
                                     width: 26px;
                                     height: 30px;
@@ -2825,7 +3162,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             VerticalLayout {
-                                padding-top: 8px;
+                                padding-top: row.show-branches ? 8px : 0px;
                                 spacing: 2px;
                                 horizontal-stretch: 1;
                                 Text {
@@ -2834,7 +3171,7 @@ export component AppWindow inherits Window {
                                     font-size: Theme.fs(13px);
                                     overflow: elide;
                                 }
-                                Text {
+                                if row.show-branches: Text {
                                     text: row.subtitle;
                                     color: Theme.c.text-soft;
                                     font-size: Theme.fs(11px);

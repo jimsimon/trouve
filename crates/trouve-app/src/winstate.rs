@@ -105,6 +105,50 @@ pub struct Resume {
     pub thread_scroll: HashMap<String, ChatScrollBookmark>,
 }
 
+/// Cursor-style organization controls for the workspace/session sidebar.
+/// These are frontend preferences: every client can arrange and display the
+/// same protocol sessions independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceListPrefs {
+    /// 0 repository, 1 workspace, 2 updated, 3 status.
+    pub grouping: u8,
+    /// 0 updated, 1 status, 2 created.
+    pub ordering: u8,
+    pub show_branches: bool,
+    pub show_status: bool,
+}
+
+/// Filters owned by one named workspace's overflow menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceFilterPrefs {
+    /// Needs attention, unread, working, draft, done.
+    pub status_filter: u8,
+    /// Draft, open, merged, closed, no PR.
+    pub pr_filter: u8,
+}
+
+impl Default for WorkspaceListPrefs {
+    fn default() -> Self {
+        Self {
+            grouping: 0,
+            ordering: 0,
+            show_branches: true,
+            show_status: true,
+        }
+    }
+}
+
+impl Default for WorkspaceFilterPrefs {
+    fn default() -> Self {
+        Self {
+            status_filter: 0b1_1111,
+            pr_filter: 0b1_1111,
+        }
+    }
+}
+
 /// Appearance preferences: theme id, base font size/family, reduce motion.
 /// Client-side like the window geometry — themes restyle this frontend, not
 /// the protocol.
@@ -276,6 +320,44 @@ pub fn save_workspace_order(order: &[String]) {
     write_json(config_path("workspace-order.json"), &order);
 }
 
+pub fn load_workspace_list_prefs() -> WorkspaceListPrefs {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("workspace-list.json")?).ok()?;
+        serde_json::from_str::<WorkspaceListPrefs>(&text).ok()
+    };
+    let mut prefs = read().unwrap_or_default();
+    // Treat out-of-range values in a hand-edited or future-version file as
+    // the stable defaults instead of leaving the menu without a selection.
+    if prefs.grouping > 3 {
+        prefs.grouping = 0;
+    }
+    if prefs.ordering > 2 {
+        prefs.ordering = 0;
+    }
+    prefs
+}
+
+pub fn save_workspace_list_prefs(prefs: &WorkspaceListPrefs) {
+    write_json(config_path("workspace-list.json"), prefs);
+}
+
+pub fn load_workspace_filters() -> HashMap<String, WorkspaceFilterPrefs> {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("workspace-filters.json")?).ok()?;
+        serde_json::from_str::<HashMap<String, WorkspaceFilterPrefs>>(&text).ok()
+    };
+    let mut filters = read().unwrap_or_default();
+    for prefs in filters.values_mut() {
+        prefs.status_filter &= 0b1_1111;
+        prefs.pr_filter &= 0b1_1111;
+    }
+    filters
+}
+
+pub fn save_workspace_filters(filters: &HashMap<String, WorkspaceFilterPrefs>) {
+    write_json(config_path("workspace-filters.json"), filters);
+}
+
 /// Display order of the PR dashboard's groups (group keys), a frontend
 /// preference like the workspace sidebar order.
 pub fn load_pr_group_order() -> Vec<String> {
@@ -321,6 +403,18 @@ mod tests {
         assert!(General::default().prevent_sleep_while_running);
         let restored: General = serde_json::from_str("{}").unwrap();
         assert!(restored.prevent_sleep_while_running);
+    }
+
+    #[test]
+    fn workspace_list_and_filter_preferences_have_expected_defaults() {
+        let prefs = WorkspaceListPrefs::default();
+        assert_eq!(prefs.grouping, 0);
+        assert_eq!(prefs.ordering, 0);
+        assert!(prefs.show_branches);
+        assert!(prefs.show_status);
+        let filters = WorkspaceFilterPrefs::default();
+        assert_eq!(filters.status_filter, 0b1_1111);
+        assert_eq!(filters.pr_filter, 0b1_1111);
     }
 
     #[test]
