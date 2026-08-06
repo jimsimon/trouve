@@ -247,9 +247,11 @@ struct RunningReview {
     cancel: CancellationToken,
 }
 
-/// RAII claim over finding ids in the shared collapse in-flight set;
-/// dropping it — including when a collapse pass future is cancelled —
-/// releases the ids so no finding can be locked out permanently.
+/// Review threads keyed by comment id — each value is the thread id and
+/// whether it is already resolved — plus whether the listing reached the
+/// final page.
+type ReviewThreadListing = (HashMap<u64, (String, bool)>, bool);
+
 /// How one finding fared inside a collapse pass: `Completed` means its
 /// pending flag was settled (thread collapsed or provably absent), while
 /// `NotReached` means the group budget or an incomplete listing prevented an
@@ -259,6 +261,9 @@ enum CollapseOutcome {
     NotReached,
 }
 
+/// RAII claim over finding ids in the shared collapse in-flight set;
+/// dropping it — including when a collapse pass future is cancelled —
+/// releases the ids so no finding can be locked out permanently.
 struct CollapseClaim<'a> {
     in_flight: &'a Mutex<HashSet<String>>,
     findings: Vec<trouve_protocol::CodeReviewFinding>,
@@ -3853,7 +3858,7 @@ impl Engine {
                     pull_number = cleanup_job.pull_number,
                     error = format!("{error:#}"),
                     "failed to collapse review threads for fixed findings; \
-                     reconciliation will retry"
+                     the collapse-retry task will retry"
                 );
             }
         });
@@ -5139,41 +5144,66 @@ impl Engine {
         findings: &[trouve_protocol::CodeReviewFinding],
         deadline: Instant,
     ) -> Result<()> {
-        let targets = findings
-            .iter()
-            .filter_map(|finding| finding.github_comment_id)
-            .collect::<HashSet<_>>();
-        let (thread_by_comment, listing_complete) = match self
-            .load_review_threads(api, repository, pull_number, &targets, deadline)
-            .await
-        {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                for finding in findings {
-                    self.defer_thread_collapse_logged(finding);
-                }
-                return Err(error);
-            }
-        };
+        // Findings with a comment-guarded cached thread id skip the listing
+        // entirely and go first: a retry after a failed mutation costs one
+        // request, not a re-walk of the PR's thread pages. The listing is
+        // loaded lazily, only if an uncached finding is actually reached.
+        let (cached, uncached): (Vec<_>, Vec<_>) = findings.iter().partition(|finding| {
+            finding.github_comment_id.is_some() && finding.github_thread_id.is_some()
+        });
+        let ordered = cached
+            .into_iter()
+            .chain(uncached)
+            .collect::<Vec<&trouve_protocol::CodeReviewFinding>>();
+        let mut listing: Option<ReviewThreadListing> = None;
         let mut first_error = None;
-        for (index, finding) in findings.iter().enumerate() {
+        for (index, finding) in ordered.iter().enumerate() {
             if Instant::now() >= deadline {
-                for remaining in &findings[index..] {
+                for remaining in &ordered[index..] {
                     self.requeue_thread_collapse_logged(remaining);
                 }
                 tracing::warn!(
                     repository,
                     pull_number,
                     reached = index,
-                    total = findings.len(),
+                    total = ordered.len(),
                     "group budget was exhausted; the unattempted remainder was requeued"
                 );
                 break;
             }
-            match self
-                .collapse_finding_thread(api, &thread_by_comment, listing_complete, finding)
-                .await
-            {
+            let has_cached_thread =
+                finding.github_comment_id.is_some() && finding.github_thread_id.is_some();
+            let outcome = if has_cached_thread {
+                self.collapse_cached_thread(api, finding)
+                    .await
+                    .map(|()| CollapseOutcome::Completed)
+            } else {
+                if listing.is_none() {
+                    let targets = ordered[index..]
+                        .iter()
+                        .filter(|finding| finding.github_thread_id.is_none())
+                        .filter_map(|finding| finding.github_comment_id)
+                        .collect::<HashSet<_>>();
+                    match self
+                        .load_review_threads(api, repository, pull_number, &targets, deadline)
+                        .await
+                    {
+                        Ok(loaded) => listing = Some(loaded),
+                        Err(error) => {
+                            for remaining in &ordered[index..] {
+                                self.defer_thread_collapse_logged(remaining);
+                            }
+                            first_error.get_or_insert(error);
+                            break;
+                        }
+                    }
+                }
+                let (thread_by_comment, listing_complete) =
+                    listing.as_ref().expect("listing was just loaded");
+                self.collapse_finding_thread(api, thread_by_comment, *listing_complete, finding)
+                    .await
+            };
+            match outcome {
                 Ok(CollapseOutcome::Completed) => {}
                 Ok(CollapseOutcome::NotReached) => {
                     self.requeue_thread_collapse_logged(finding);
@@ -5194,6 +5224,48 @@ impl Engine {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Collapses a finding through its cached thread id without any listing.
+    /// The cache was written under a comment-id guard, so it always belongs
+    /// to the finding's current comment; on a failure the cache is reset
+    /// (same guard) so the next attempt falls back to the listing instead of
+    /// hammering a possibly stale id. The mutation is idempotent on an
+    /// already-resolved thread.
+    async fn collapse_cached_thread(
+        &self,
+        api: &GithubApi,
+        finding: &trouve_protocol::CodeReviewFinding,
+    ) -> Result<()> {
+        let (Some(comment_id), Some(thread_id)) = (
+            finding.github_comment_id,
+            finding.github_thread_id.as_deref(),
+        ) else {
+            bail!("finding has no cached review thread");
+        };
+        let collapsed = tokio::time::timeout(
+            REVIEW_THREAD_REQUEST_TIMEOUT,
+            self.collapse_review_thread(api, thread_id),
+        )
+        .await
+        .context("collapsing a review thread timed out")
+        .and_then(|outcome| outcome);
+        if let Err(error) = collapsed {
+            if let Err(reset_error) =
+                self.store
+                    .cache_code_review_thread_id(&finding.id, comment_id, None)
+            {
+                tracing::warn!(
+                    finding_id = finding.id,
+                    error = format!("{reset_error:#}"),
+                    "failed to reset a cached review thread id"
+                );
+            }
+            return Err(error);
+        }
+        self.store
+            .clear_code_review_thread_collapse(&finding.id, Some(comment_id))?;
+        Ok(())
     }
 
     /// Defers a finding's collapse retry, logging rather than propagating a
@@ -5243,8 +5315,11 @@ impl Engine {
         };
         match thread_by_comment.get(&comment_id).cloned() {
             Some((thread_id, already_resolved)) => {
-                self.store
-                    .cache_code_review_thread_id(&finding.id, comment_id, &thread_id)?;
+                self.store.cache_code_review_thread_id(
+                    &finding.id,
+                    comment_id,
+                    Some(&thread_id),
+                )?;
                 if !already_resolved {
                     tokio::time::timeout(
                         REVIEW_THREAD_REQUEST_TIMEOUT,
@@ -5286,7 +5361,15 @@ impl Engine {
         ) {
             Ok(pending) => pending,
             Err(error) => {
-                self.record_review_error(format!("loading pending thread collapses: {error:#}"));
+                // Collapse health lives in structured logs and the durable
+                // pending rows, not the shared review-error slot: an
+                // unrelated reconcile pass clears that slot, which would
+                // make a persistent collapse failure flicker out of health
+                // state between retries.
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "loading pending thread collapses failed; retrying next tick"
+                );
                 return;
             }
         };
@@ -5392,7 +5475,7 @@ impl Engine {
         pull_number: u64,
         targets: &HashSet<u64>,
         deadline: Instant,
-    ) -> Result<(HashMap<u64, (String, bool)>, bool)> {
+    ) -> Result<ReviewThreadListing> {
         let query = r#"
           query ReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             repository(owner: $owner, name: $name) {
@@ -6871,16 +6954,19 @@ fn coordinator_validated_themes(
     findings: &[ReviewFinding],
     previous_finding_ids: &HashSet<&str>,
 ) -> Vec<ReviewTheme> {
-    let finding_by_candidate: HashMap<&str, usize> = findings
-        .iter()
-        .enumerate()
-        .flat_map(|(index, finding)| {
-            finding
-                .source_candidate_ids
-                .iter()
-                .map(move |id| (id.as_str(), index))
-        })
-        .collect();
+    // A candidate id may support several retained findings (the editor can
+    // split one candidate's evidence across findings), so each maps to every
+    // finding index it contributes to — a single-index map would undercount
+    // a theme's span and discard it.
+    let mut finding_by_candidate: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, finding) in findings.iter().enumerate() {
+        for id in &finding.source_candidate_ids {
+            finding_by_candidate
+                .entry(id.as_str())
+                .or_default()
+                .push(index);
+        }
+    }
     themes
         .into_iter()
         .filter_map(|mut theme| {
@@ -6900,7 +6986,7 @@ fn coordinator_validated_themes(
             let spanned = theme
                 .source_candidate_ids
                 .iter()
-                .map(|id| finding_by_candidate[id.as_str()])
+                .flat_map(|id| finding_by_candidate[id.as_str()].iter().copied())
                 .collect::<HashSet<_>>();
             (!spanned.is_empty() && spanned.len() + theme.previous_finding_ids.len() >= 2)
                 .then_some(theme)
@@ -9722,6 +9808,32 @@ mod tests {
         );
         assert_eq!(cross_round.len(), 1);
         assert_eq!(cross_round[0].previous_finding_ids, vec!["rvf-1"]);
+
+        // One candidate id may support several retained findings; a theme
+        // naming only that candidate still spans two findings and survives.
+        let shared_candidate = coordinator_validated_themes(
+            vec![theme(&["c-shared"], &[])],
+            &[
+                ReviewFinding {
+                    path: "src/a.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "first symptom".into(),
+                    source_candidate_ids: vec!["c-shared".into()],
+                },
+                ReviewFinding {
+                    path: "src/b.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    body: "second symptom".into(),
+                    source_candidate_ids: vec!["c-shared".into()],
+                },
+            ],
+            &previous,
+        );
+        assert_eq!(shared_candidate.len(), 1);
     }
 
     #[test]

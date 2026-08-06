@@ -442,7 +442,15 @@ const MIGRATIONS: &[&str] = &[
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
+    // The backfill shares a batch with the column addition so it runs
+    // exactly once: on every later boot the batch aborts at the tolerated
+    // "duplicate column" error before reaching the UPDATE, so previously
+    // cleared collapses are never re-armed. Historical closed findings with
+    // a published comment enter the durable retry queue instead of leaving
+    // their conversations unresolved forever.
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0;
+     UPDATE code_review_findings SET collapse_pending = 1
+      WHERE status != 'open' AND github_comment_id IS NOT NULL",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
@@ -700,6 +708,17 @@ fn code_review_routing_mode_str(value: trouve_protocol::CodeReviewRoutingMode) -
 
 fn parse_datetime(value: String) -> chrono::DateTime<chrono::Utc> {
     value.parse().unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn code_review_publication_status(
+    value: &str,
+) -> trouve_protocol::CodeReviewFindingPublicationStatus {
+    match value {
+        "published" => trouve_protocol::CodeReviewFindingPublicationStatus::Published,
+        "not_eligible" => trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible,
+        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
+    }
 }
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -4242,7 +4261,11 @@ impl Store {
             "UPDATE code_review_findings
              SET github_comment_id = ?2, github_comment_url = ?3,
                  github_publication_status = 'published',
-                 github_thread_id = COALESCE(?4, github_thread_id),
+                 github_thread_id = CASE
+                     WHEN ?4 IS NOT NULL THEN ?4
+                     WHEN github_comment_id IS ?2 THEN github_thread_id
+                     ELSE NULL
+                 END,
                  collapse_attempts = CASE
                      WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN 0
                      ELSE collapse_attempts
@@ -4345,15 +4368,15 @@ impl Store {
         Ok(())
     }
 
-    /// Caches a finding's GitHub thread id without touching its comment
-    /// coordinates or collapse state, guarded on the comment the caller
-    /// matched the thread against — so a stale pass can never overwrite a
-    /// newer comment id published concurrently.
+    /// Caches (or resets, with `None`) a finding's GitHub thread id without
+    /// touching its comment coordinates or collapse state, guarded on the
+    /// comment the caller matched the thread against — so a stale pass can
+    /// never overwrite a newer comment id published concurrently.
     pub fn cache_code_review_thread_id(
         &self,
         id: &str,
         expected_comment_id: u64,
-        thread_id: &str,
+        thread_id: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
@@ -4438,7 +4461,9 @@ impl Store {
              WHERE f.collapse_pending = 1
                AND (f.collapse_next_attempt_at IS NULL OR f.collapse_next_attempt_at <= ?)
                {exclusion}
-             ORDER BY j.repository, j.pull_number, f.id
+             ORDER BY f.collapse_next_attempt_at IS NOT NULL,
+                      f.collapse_next_attempt_at,
+                      j.repository, j.pull_number, f.id
              LIMIT ?"
         ))?;
         let mut query_params: Vec<rusqlite::types::Value> = vec![now.to_rfc3339().into()];
@@ -4467,16 +4492,9 @@ impl Store {
                         sources: Vec::new(),
                         github_comment_id: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
                         github_comment_url: row.get(13)?,
-                        github_publication_status: match row.get::<_, String>(14)?.as_str() {
-                            "published" => {
-                                trouve_protocol::CodeReviewFindingPublicationStatus::Published
-                            }
-                            "not_eligible" => {
-                                trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
-                            }
-                            "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
-                            _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
-                        },
+                        github_publication_status: code_review_publication_status(
+                            &row.get::<_, String>(14)?,
+                        ),
                         github_thread_id: row.get(15)?,
                         resolved_at: parse_optional_datetime(row.get(16)?),
                     },
@@ -4514,16 +4532,9 @@ impl Store {
                     sources: Vec::new(),
                     github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                     github_comment_url: row.get(10)?,
-                    github_publication_status: match row.get::<_, String>(11)?.as_str() {
-                        "published" => {
-                            trouve_protocol::CodeReviewFindingPublicationStatus::Published
-                        }
-                        "not_eligible" => {
-                            trouve_protocol::CodeReviewFindingPublicationStatus::NotEligible
-                        }
-                        "failed" => trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
-                        _ => trouve_protocol::CodeReviewFindingPublicationStatus::Pending,
-                    },
+                    github_publication_status: code_review_publication_status(
+                        &row.get::<_, String>(11)?,
+                    ),
                     github_thread_id: row.get(12)?,
                     resolved_at: parse_optional_datetime(row.get(13)?),
                 })
@@ -7589,7 +7600,16 @@ mod tests {
                github_thread_id TEXT,
                resolved_at TEXT,
                created_at TEXT NOT NULL
-             );",
+             );
+             INSERT INTO code_review_findings
+                    (id, job_id, path, line, side, severity, body, status,
+                     github_comment_id, created_at)
+             VALUES ('rvf-historic', 'job', 'src/lib.rs', 3, 'RIGHT', 'medium',
+                     'closed with a published comment', 'fixed', 9001, '2026-01-01'),
+                    ('rvf-commentless', 'job', 'src/lib.rs', 4, 'RIGHT', 'medium',
+                     'closed without a comment', 'fixed', NULL, '2026-01-01'),
+                    ('rvf-open', 'job', 'src/lib.rs', 5, 'RIGHT', 'medium',
+                     'still open', 'open', 9002, '2026-01-01');",
         )
         .unwrap();
         assert!(!SCHEMA.contains("code_review_findings_collapse_pending"));
@@ -7606,11 +7626,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexed, 1);
+
+        // The one-time backfill arms only historical closed findings that
+        // have a published comment; open or comment-less rows stay unarmed.
+        fn armed(conn: &Connection, id: &str) -> i64 {
+            conn.query_row(
+                "SELECT collapse_pending FROM code_review_findings WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(armed(&conn, "rvf-historic"), 1);
+        assert_eq!(armed(&conn, "rvf-commentless"), 0);
+        assert_eq!(armed(&conn, "rvf-open"), 0);
+
+        // Re-running migrations (a later boot) must not re-arm cleared rows:
+        // the backfill shares its batch with the column addition, which now
+        // fails as a duplicate before the UPDATE runs.
         conn.execute(
-            "UPDATE code_review_findings SET collapse_pending = 1, collapse_attempts = 0",
+            "UPDATE code_review_findings SET collapse_pending = 0 WHERE id = 'rvf-historic'",
             [],
         )
         .unwrap();
+        apply_migrations(&mut conn).unwrap();
+        assert_eq!(armed(&conn, "rvf-historic"), 0);
     }
 
     #[test]
