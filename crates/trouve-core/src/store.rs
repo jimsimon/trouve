@@ -206,6 +206,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   started_at TEXT,
   completed_at TEXT,
   review_base_sha TEXT NOT NULL DEFAULT '',
+  review_watermark_sha TEXT NOT NULL DEFAULT '',
+  review_batch_digest TEXT NOT NULL DEFAULT '',
   review_scope TEXT NOT NULL DEFAULT 'incremental',
   retry_of TEXT,
   retried_by TEXT,
@@ -283,6 +285,14 @@ CREATE TABLE IF NOT EXISTS code_review_routing_decisions (
   reasons TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (job_id, batch_index, reviewer_id)
 );
+CREATE TABLE IF NOT EXISTS code_review_pending_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_pending_events_job
+  ON code_review_pending_events (job_id, id);
 CREATE TABLE IF NOT EXISTS code_review_findings (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -390,6 +400,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_batch_digest TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_scope TEXT NOT NULL DEFAULT 'incremental'",
     "ALTER TABLE code_review_jobs ADD COLUMN retry_of TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN retried_by TEXT",
@@ -898,6 +910,17 @@ pub struct CodeReviewJobRecord {
     pub publication_accepted: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CodeReviewBatchSnapshotUpdate {
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCodeReviewEvent {
+    pub id: i64,
+    pub event: Event,
+}
+
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
     let reviewers: Vec<trouve_protocol::ReviewerProfile> =
         serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
@@ -921,6 +944,12 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         job_elapsed_ms(&status, created_at, started_at, completed_at);
     let base_ref: String = r.get(7)?;
     let review_base_sha: String = r.get(22)?;
+    let review_watermark_sha: String = r.get(50)?;
+    let effective_review_base_sha = if review_base_sha.is_empty() {
+        base_ref.clone()
+    } else {
+        review_base_sha
+    };
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -930,10 +959,11 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             pull_title: r.get(4)?,
             pull_url: r.get(5)?,
             head_sha: r.get(6)?,
-            review_base_sha: if review_base_sha.is_empty() {
-                base_ref.clone()
+            review_base_sha: effective_review_base_sha.clone(),
+            review_watermark_sha: if review_watermark_sha.is_empty() {
+                effective_review_base_sha
             } else {
-                review_base_sha
+                review_watermark_sha
             },
             base_ref,
             head_ref: r.get(8)?,
@@ -988,7 +1018,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
-        publication_accepted: r.get(50)?,
+        publication_accepted: r.get(52)?,
     })
 }
 
@@ -1000,7 +1030,7 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level, publication_accepted";
+     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -1218,7 +1248,8 @@ fn latest_code_review_task_attempts(
     let mut latest = BTreeMap::new();
     for attempt in attempts {
         let task = &attempt.task;
-        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer {
+        if task.role != trouve_protocol::CodeReviewTaskRole::Reviewer || task.status == "superseded"
+        {
             continue;
         }
         let Some(reviewer_id) = task.reviewer_id.as_ref() else {
@@ -1235,6 +1266,44 @@ fn latest_code_review_task_attempts(
         }
     }
     latest.into_values().collect()
+}
+
+fn completed_code_review_persona_count(attempts: &[CodeReviewTaskAttempt]) -> u64 {
+    let mut grouped: BTreeMap<String, Vec<&trouve_protocol::CodeReviewTask>> = BTreeMap::new();
+    for attempt in latest_code_review_task_attempts(attempts) {
+        let task = &attempt.task;
+        if let Some(reviewer_id) = task.reviewer_id.as_ref() {
+            grouped.entry(reviewer_id.clone()).or_default().push(task);
+        }
+    }
+    grouped
+        .into_values()
+        .filter(|tasks| {
+            tasks.iter().all(|task| {
+                matches!(
+                    task.status.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "not_applicable"
+                )
+            }) && tasks.len() as u64 >= tasks.iter().map(|task| task.batch_count).max().unwrap_or(0)
+        })
+        .count() as u64
+}
+
+fn enqueue_code_review_pending_event(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    event: &Event,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO code_review_pending_events (job_id, payload, created_at)
+         VALUES (?1, ?2, ?3)",
+        params![
+            job_id,
+            serde_json::to_string(event)?,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1485,6 +1554,7 @@ struct PendingEvent {
 /// One caller's event batch, in flight to the writer thread.
 struct AppendRequest {
     events: Vec<PendingEvent>,
+    code_review_outbox_ids: Vec<i64>,
     reply: AppendReply,
 }
 
@@ -1571,12 +1641,15 @@ fn spawn_event_writer(
                     },
                 };
                 let mut event_count = first.events.len();
+                let isolate_outbox_request = !first.code_review_outbox_ids.is_empty();
                 let mut requests = vec![first];
-                while event_count < APPEND_BATCH_MAX {
+                while !isolate_outbox_request && event_count < APPEND_BATCH_MAX {
                     let Ok(request) = rx.try_recv() else {
                         break;
                     };
-                    if event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX {
+                    if !request.code_review_outbox_ids.is_empty()
+                        || event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX
+                    {
                         deferred = Some(request);
                         break;
                     }
@@ -1592,6 +1665,9 @@ fn spawn_event_writer(
                         &mut conn,
                         requests.iter().flat_map(|request| request.events.iter()),
                         event_count,
+                        requests
+                            .iter()
+                            .flat_map(|request| request.code_review_outbox_ids.iter().copied()),
                     );
                     (inserted, wait, started.elapsed())
                 };
@@ -1666,6 +1742,7 @@ fn insert_event_batch<'a>(
     conn: &mut Connection,
     batch: impl IntoIterator<Item = &'a PendingEvent>,
     event_count: usize,
+    code_review_outbox_ids: impl IntoIterator<Item = i64>,
 ) -> Result<Vec<u64>> {
     let tx = conn.transaction()?;
     let mut cursors = Vec::with_capacity(event_count);
@@ -1689,6 +1766,14 @@ fn insert_event_batch<'a>(
                         event: event.event.clone(),
                     },
                 ));
+            }
+        }
+    }
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM code_review_pending_events WHERE id = ?1")?;
+        for id in code_review_outbox_ids {
+            if stmt.execute([id])? != 1 {
+                anyhow::bail!("pending code-review event {id} was already consumed");
             }
         }
     }
@@ -1866,6 +1951,7 @@ impl Store {
         self.append_tx
             .send(AppendRequest {
                 events: serialize_events(scope, vec![event])?,
+                code_review_outbox_ids: Vec::new(),
                 reply: AppendReply::Sync(reply),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
@@ -1891,6 +1977,7 @@ impl Store {
         self.append_tx
             .send(AppendRequest {
                 events: serialize_events(scope, events)?,
+                code_review_outbox_ids: Vec::new(),
                 reply: AppendReply::Async(reply),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
@@ -3241,10 +3328,11 @@ impl Store {
                      identities, config_hash, created_at, review_base_sha, review_scope,
                      retry_of, total_reviewers, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
-                     router_thinking_level, coordinator_thinking_level)
+                     router_thinking_level, coordinator_thinking_level,
+                     review_watermark_sha)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -3561,6 +3649,195 @@ impl Store {
              WHERE id = ?1 AND status = 'running'",
             params![id, review_base_sha],
         )? > 0)
+    }
+
+    /// Bind routing and reviewer attempts to the exact effective diff batches.
+    /// A changed digest atomically clears routing and retires every task from
+    /// the obsolete snapshot so crash recovery cannot mix generations.
+    pub fn prepare_code_review_batch_snapshot(
+        &self,
+        job_id: &str,
+        digest: &str,
+    ) -> Result<CodeReviewBatchSnapshotUpdate> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (status, current_digest): (String, String) = tx.query_row(
+            "SELECT status, review_batch_digest FROM code_review_jobs WHERE id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if status != "running" {
+            anyhow::bail!("stale: review job {job_id} is no longer running");
+        }
+        if current_digest == digest {
+            tx.commit()?;
+            return Ok(CodeReviewBatchSnapshotUpdate { changed: false });
+        }
+
+        let artifact_count: i64 = tx.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM code_review_tasks WHERE job_id = ?1) +
+               (SELECT COUNT(*) FROM code_review_routing_decisions WHERE job_id = ?1)",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        let changed = !current_digest.is_empty() || artifact_count > 0;
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET review_batch_digest = ?2,
+                 completed_reviewers = CASE WHEN ?3 THEN 0 ELSE completed_reviewers END
+             WHERE id = ?1 AND status = 'running'",
+            params![job_id, digest, changed],
+        )?;
+        if changed {
+            let completed_at = chrono::Utc::now().to_rfc3339();
+            let task_ids = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM code_review_tasks
+                     WHERE job_id = ?1 AND status != 'superseded'
+                     ORDER BY created_at, rowid",
+                )?;
+                stmt.query_map([job_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.execute(
+                "DELETE FROM code_review_routing_decisions WHERE job_id = ?1",
+                [job_id],
+            )?;
+            tx.execute(
+                "UPDATE code_review_tasks
+                 SET status = 'superseded',
+                     completed_at = COALESCE(completed_at, ?2),
+                     error = CASE
+                       WHEN status IN ('succeeded', 'failed', 'cancelled', 'not_applicable')
+                         THEN error
+                       ELSE 'effective review diff changed during recovery'
+                     END
+                 WHERE job_id = ?1 AND status != 'superseded'",
+                params![job_id, completed_at],
+            )?;
+            for task_id in task_ids {
+                let task = tx.query_row(
+                    &format!(
+                        "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"
+                    ),
+                    [task_id],
+                    row_to_code_review_task,
+                )?;
+                enqueue_code_review_pending_event(
+                    &tx,
+                    job_id,
+                    &Event::CodeReviewTaskUpdated {
+                        job_id: job_id.to_owned(),
+                        task: Box::new(task),
+                    },
+                )?;
+            }
+            enqueue_code_review_pending_event(
+                &tx,
+                job_id,
+                &Event::CodeReviewRoutingUpdated {
+                    job_id: job_id.to_owned(),
+                    routing_decisions: Vec::new(),
+                },
+            )?;
+            let total_reviewers = tx.query_row(
+                "SELECT total_reviewers FROM code_review_jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+            enqueue_code_review_pending_event(
+                &tx,
+                job_id,
+                &Event::CodeReviewProgressUpdated {
+                    job_id: job_id.to_owned(),
+                    progress: trouve_protocol::CodeReviewProgress {
+                        completed_reviewers: 0,
+                        total_reviewers,
+                        percent: 0,
+                    },
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(CodeReviewBatchSnapshotUpdate { changed })
+    }
+
+    pub fn pending_code_review_events(&self, job_id: &str) -> Result<Vec<PendingCodeReviewEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, payload FROM code_review_pending_events
+             WHERE job_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([job_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut pending = Vec::new();
+        let mut invalid_ids = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            match serde_json::from_str(&payload) {
+                Ok(event) => pending.push(PendingCodeReviewEvent { id, event }),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        pending_event_id = id,
+                        %error,
+                        "discarding undeserializable pending code-review event"
+                    );
+                    invalid_ids.push(id);
+                }
+            }
+        }
+        drop(stmt);
+        for id in invalid_ids {
+            conn.execute("DELETE FROM code_review_pending_events WHERE id = ?1", [id])?;
+        }
+        Ok(pending)
+    }
+
+    /// Atomically project every valid pending transition into the durable
+    /// event log and consume its outbox row. The dedicated writer publishes
+    /// the committed envelopes only after both halves of the transaction
+    /// succeed, so recovery cannot duplicate a transition with a new cursor.
+    pub async fn flush_pending_code_review_events(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = self.pending_code_review_events(job_id)?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(pending.len());
+        let mut events = Vec::with_capacity(pending.len());
+        for pending in pending {
+            ids.push(pending.id);
+            events.push(pending.event);
+        }
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        self.append_tx
+            .send(AppendRequest {
+                events: serialize_events(Scope::CodeReviewJob(job_id.to_owned()), events)?,
+                code_review_outbox_ids: ids,
+                reply: AppendReply::Async(reply),
+            })
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
+    pub fn code_review_jobs_with_pending_events(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pending.job_id
+             FROM code_review_pending_events pending
+             JOIN code_review_jobs jobs ON jobs.id = pending.job_id
+             WHERE jobs.status != 'running'
+             GROUP BY pending.job_id ORDER BY MIN(pending.id) LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn set_code_review_job_phase_elapsed(
@@ -4018,25 +4295,98 @@ impl Store {
 
     pub fn completed_code_review_personas(&self, job_id: &str) -> Result<u64> {
         let attempts = self.code_review_task_attempts(job_id)?;
-        let mut grouped: BTreeMap<String, Vec<&trouve_protocol::CodeReviewTask>> = BTreeMap::new();
-        for attempt in latest_code_review_task_attempts(&attempts) {
-            let task = &attempt.task;
-            if let Some(reviewer_id) = task.reviewer_id.as_ref() {
-                grouped.entry(reviewer_id.clone()).or_default().push(task);
+        Ok(completed_code_review_persona_count(&attempts))
+    }
+
+    /// Retire reviewer attempts whose fully rendered prompt no longer
+    /// matches, and update progress in the same transaction so clients never
+    /// observe the old completion count with replacement tasks pending.
+    pub fn supersede_code_review_tasks_for_prompt_change(
+        &self,
+        job_id: &str,
+        task_ids: &[String],
+        total_reviewers: u64,
+    ) -> Result<u64> {
+        if task_ids.is_empty() {
+            return self.completed_code_review_personas(job_id);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let running: bool = tx.query_row(
+            "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        if !running {
+            anyhow::bail!("stale: review job {job_id} is no longer running");
+        }
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        for task_id in task_ids {
+            let updated = tx.execute(
+                "UPDATE code_review_tasks
+                 SET status = 'superseded',
+                     completed_at = COALESCE(completed_at, ?3),
+                     error = CASE
+                       WHEN status IN ('succeeded', 'failed', 'cancelled', 'not_applicable')
+                         THEN error
+                       ELSE 'reviewer prompt changed during recovery'
+                     END
+                 WHERE id = ?1 AND job_id = ?2 AND status != 'superseded'",
+                params![task_id, job_id, completed_at],
+            )?;
+            if updated > 0 {
+                let task = tx.query_row(
+                    &format!(
+                        "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"
+                    ),
+                    [task_id],
+                    row_to_code_review_task,
+                )?;
+                enqueue_code_review_pending_event(
+                    &tx,
+                    job_id,
+                    &Event::CodeReviewTaskUpdated {
+                        job_id: job_id.to_owned(),
+                        task: Box::new(task),
+                    },
+                )?;
             }
         }
-        Ok(grouped
-            .into_values()
-            .filter(|tasks| {
-                tasks.iter().all(|task| {
-                    matches!(
-                        task.status.as_str(),
-                        "succeeded" | "failed" | "cancelled" | "not_applicable"
-                    )
-                }) && tasks.len() as u64
-                    >= tasks.iter().map(|task| task.batch_count).max().unwrap_or(0)
-            })
-            .count() as u64)
+        let attempts = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {CODE_REVIEW_TASK_COLUMNS},
+                        rowid AS {CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN}
+                 FROM code_review_tasks WHERE job_id = ?1 ORDER BY rowid"
+            ))?;
+            stmt.query_map([job_id], row_to_code_review_task_attempt)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let completed_reviewers = completed_code_review_persona_count(&attempts);
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET completed_reviewers = ?2, total_reviewers = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![job_id, completed_reviewers as i64, total_reviewers as i64],
+        )?;
+        let percent = completed_reviewers
+            .saturating_mul(100)
+            .checked_div(total_reviewers)
+            .map(|value| value.min(100) as u8)
+            .unwrap_or(0);
+        enqueue_code_review_pending_event(
+            &tx,
+            job_id,
+            &Event::CodeReviewProgressUpdated {
+                job_id: job_id.to_owned(),
+                progress: trouve_protocol::CodeReviewProgress {
+                    completed_reviewers,
+                    total_reviewers,
+                    percent,
+                },
+            },
+        )?;
+        tx.commit()?;
+        Ok(completed_reviewers)
     }
 
     /// Requeue only failed or cancelled batches belonging to one reviewer
@@ -4934,6 +5284,7 @@ impl Store {
                  FROM code_review_tasks t
                  JOIN code_review_jobs j ON j.id = t.job_id
                  WHERE t.role = 'reviewer' AND t.reviewer_id IS NOT NULL
+                   AND t.status != 'superseded'
                    AND (?1 IS NULL OR j.repository = ?1)
                    AND (
                      t.status IN ('queued', 'running')
@@ -5217,14 +5568,14 @@ impl Store {
                      review_base_sha, review_scope, retry_of, total_reviewers,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
-                     coordinator_thinking_level)
+                     coordinator_thinking_level, review_watermark_sha)
              SELECT ?2, ?3, installation_id, repository, pull_number,
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
                     review_base_sha, review_scope, id, total_reviewers,
                     routing_mode, semantic_routing, included_reviewer_ids,
                     excluded_reviewer_ids, router_model, router_thinking_level,
-                    coordinator_thinking_level
+                    coordinator_thinking_level, review_watermark_sha
              FROM code_review_jobs WHERE id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
@@ -7492,6 +7843,22 @@ mod tests {
         assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
+        assert_eq!(running.job.review_watermark_sha, queued.review_base_sha);
+        let effective_base = "3333333333333333333333333333333333333333";
+        assert!(
+            store
+                .set_code_review_job_review_base(&queued.id, effective_base)
+                .unwrap()
+        );
+        let rebased = store.code_review_job(&queued.id).unwrap().unwrap().job;
+        assert_eq!(rebased.review_base_sha, effective_base);
+        assert_eq!(rebased.review_watermark_sha, queued.review_base_sha);
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
         assert_eq!(running.job.status, "running");
         assert_eq!(
             running.reviewers[0].default_thinking_level.as_deref(),
@@ -8141,6 +8508,12 @@ mod tests {
             .unwrap();
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
         let routing_decisions = vec![trouve_protocol::CodeReviewRoutingDecision {
             batch_index: 0,
             reviewer_id: "correctness".into(),
@@ -8168,6 +8541,16 @@ mod tests {
                 .unwrap(),
             routing_decisions,
             "routing is a once-only snapshot and retries must reuse it"
+        );
+        assert_eq!(
+            store.code_review_routing_decisions(&queued.id).unwrap(),
+            routing_decisions
+        );
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
         );
 
         let task = store
@@ -8695,6 +9078,301 @@ mod tests {
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(detail.tasks.iter().any(|task| task.id == "rvt_z_old"));
         assert!(detail.tasks.iter().any(|task| task.id == cancelled.id));
+    }
+
+    #[tokio::test]
+    async fn changed_batch_digest_clears_routing_and_supersedes_every_old_task() {
+        let store = Store::open_in_memory().unwrap();
+        let reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        let queued = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:changed-batches".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewers: vec![reviewer.clone()],
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
+                .unwrap()
+                .changed
+        );
+        let routing = vec![trouve_protocol::CodeReviewRoutingDecision {
+            batch_index: 0,
+            reviewer_id: reviewer.id.clone(),
+            reviewer_name: reviewer.name.clone(),
+            selected: true,
+            reasons: Vec::new(),
+        }];
+        store
+            .save_code_review_routing_decisions(&queued.id, &routing)
+            .unwrap();
+
+        let crash_recovery = store
+            .prepare_code_review_batch_snapshot(&queued.id, "digest-b")
+            .unwrap();
+        assert!(crash_recovery.changed);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO code_review_pending_events (job_id, payload, created_at)
+                 VALUES (?1, 'not-json', ?2)",
+                params![queued.id, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let pending = store.pending_code_review_events(&queued.id).unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_pending_events(10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM code_review_pending_events
+                     WHERE job_id = ?1 AND payload = 'not-json'",
+                    [queued.id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(pending.iter().any(|pending| matches!(
+            &pending.event,
+            Event::CodeReviewRoutingUpdated { routing_decisions, .. } if routing_decisions.is_empty()
+        )));
+        assert!(
+            !store
+                .prepare_code_review_batch_snapshot(&queued.id, "digest-b")
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            store.pending_code_review_events(&queued.id).unwrap().len(),
+            pending.len(),
+            "matching-digest recovery must retain undelivered transition events"
+        );
+        assert_eq!(
+            store
+                .flush_pending_code_review_events(&queued.id)
+                .await
+                .unwrap()
+                .len(),
+            pending.len()
+        );
+        assert!(
+            store
+                .flush_pending_code_review_events(&queued.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .code_review_jobs_with_pending_events(10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .events_after(&Scope::CodeReviewJob(queued.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(
+                    &envelope.event,
+                    Event::CodeReviewRoutingUpdated { routing_decisions, .. }
+                        if routing_decisions.is_empty()
+                ))
+        );
+        assert!(
+            store
+                .code_review_routing_decisions(&queued.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .save_code_review_routing_decisions(&queued.id, &routing)
+            .unwrap();
+        let tasks = [0, 3]
+            .into_iter()
+            .map(|batch_index| {
+                store
+                    .create_code_review_task(&NewCodeReviewTask {
+                        job_id: queued.id.clone(),
+                        role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                        reviewer_id: Some(reviewer.id.clone()),
+                        reviewer_name: reviewer.name.clone(),
+                        batch_index,
+                        batch_count: 4,
+                        model: Some("provider/default".into()),
+                        prompt: format!("batch {batch_index}"),
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store
+            .start_code_review_task(&tasks[0].id, "session", "thread", "provider/default")
+            .unwrap()
+            .unwrap();
+        let failed = store
+            .finish_code_review_task(&tasks[0].id, "failed", "", 0, "original failure")
+            .unwrap()
+            .unwrap();
+        let changed = store
+            .prepare_code_review_batch_snapshot(&queued.id, "digest-c")
+            .unwrap();
+        assert!(changed.changed);
+        let pending = store.pending_code_review_events(&queued.id).unwrap();
+        let superseded_tasks = pending
+            .iter()
+            .filter_map(|pending| match &pending.event {
+                Event::CodeReviewTaskUpdated { task, .. } => Some(task.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(superseded_tasks.len(), 2);
+        assert!(
+            superseded_tasks
+                .iter()
+                .all(|task| task.status == "superseded")
+        );
+        let retained_failure = superseded_tasks
+            .iter()
+            .find(|task| task.id == failed.id)
+            .unwrap();
+        assert_eq!(retained_failure.error, "original failure");
+        assert_eq!(retained_failure.completed_at, failed.completed_at);
+        assert!(
+            store
+                .latest_code_review_reviewer_tasks(&queued.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 0);
+        assert!(
+            store
+                .code_review_job_detail(&queued.id)
+                .unwrap()
+                .unwrap()
+                .personas
+                .is_empty()
+        );
+        assert!(
+            store
+                .code_review_stats(trouve_protocol::CodeReviewStatsRange::All, None)
+                .unwrap()
+                .personas
+                .is_empty()
+        );
+
+        let prompt_task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some(reviewer.id.clone()),
+                reviewer_name: reviewer.name.clone(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/default".into()),
+                prompt: "old prompt".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &prompt_task.id,
+                "session",
+                "prompt-thread",
+                "provider/default",
+            )
+            .unwrap()
+            .unwrap();
+        let prompt_task = store
+            .finish_code_review_task(&prompt_task.id, "succeeded", "old output", 0, "")
+            .unwrap()
+            .unwrap();
+        store
+            .set_code_review_job_progress(&queued.id, 1, 1)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .supersede_code_review_tasks_for_prompt_change(
+                    &queued.id,
+                    std::slice::from_ref(&prompt_task.id),
+                    1,
+                )
+                .unwrap(),
+            0
+        );
+        let retired = store
+            .code_review_task(&queued.id, &prompt_task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.status, "superseded");
+        assert_eq!(retired.completed_at, prompt_task.completed_at);
+        assert_eq!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .progress
+                .completed_reviewers,
+            0
+        );
+        let pending = store.pending_code_review_events(&queued.id).unwrap();
+        assert!(pending.iter().any(|pending| matches!(
+            &pending.event,
+            Event::CodeReviewTaskUpdated { task, .. } if task.id == prompt_task.id
+        )));
+        assert!(pending.iter().any(|pending| matches!(
+            &pending.event,
+            Event::CodeReviewProgressUpdated { progress, .. }
+                if progress.completed_reviewers == 0
+        )));
+        assert!(
+            store
+                .finish_code_review_job(&queued.id, "failed", "", "test complete")
+                .unwrap()
+        );
+        assert_eq!(
+            store.code_review_jobs_with_pending_events(10).unwrap(),
+            vec![queued.id.clone()]
+        );
+        let stale = store
+            .prepare_code_review_batch_snapshot(&queued.id, "digest-d")
+            .unwrap_err();
+        assert!(stale.to_string().starts_with("stale:"));
     }
 
     #[test]
