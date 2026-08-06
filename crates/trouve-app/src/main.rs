@@ -134,6 +134,45 @@ fn enable_skia_partial_rendering() {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+const BACKGROUND_NICE_INCREMENT: i32 = 5;
+
+#[cfg(any(target_os = "linux", test))]
+fn background_nice_value(current: i32) -> i32 {
+    current.saturating_add(BACKGROUND_NICE_INCREMENT).min(19)
+}
+
+/// Give the Slint event loop more scheduler weight than the embedded server
+/// and agent workloads it launches.
+///
+/// Linux tracks niceness per thread. A new thread and process inherit the
+/// calling thread's value, so doing this immediately before Tokio is built
+/// covers its worker pool as well as shell jobs and local-model sidecars,
+/// without lowering the UI thread itself. This is best-effort: restricted
+/// environments can reject `setpriority`, in which case the app keeps its
+/// previous scheduling behavior.
+#[cfg(target_os = "linux")]
+fn deprioritize_background_runtime() {
+    // SAFETY: getpriority/setpriority operate on the calling Linux thread
+    // when `who` is zero and do not retain any Rust pointers.
+    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let target = background_nice_value(current);
+    if target == current {
+        return;
+    }
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } == 0 {
+        tracing::debug!(current, target, "lowered background runtime CPU priority");
+    } else {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not lower background runtime CPU priority"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn deprioritize_background_runtime() {}
+
 /// Track focus for notifications and occlusion for animation scheduling.
 /// Visible windows stay display-paced even without keyboard focus; an
 /// occluded/minimized window should not wake the renderer at all.
@@ -1539,6 +1578,7 @@ fn main() -> anyhow::Result<()> {
     let focused = window_focused.clone();
     let deferred_quit = quit_when_idle.clone();
     std::thread::spawn(move || {
+        deprioritize_background_runtime();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1683,7 +1723,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        ClipboardReader, ProviderConfigFieldItem, at_token, chat_file_link,
+        ClipboardReader, ProviderConfigFieldItem, at_token, background_nice_value, chat_file_link,
         clipboard_image_png_from, pr_group_drag_id, pr_group_drag_payload, provider_fields_valid,
         workspace_drag_id, workspace_drag_payload,
     };
@@ -1735,6 +1775,14 @@ mod tests {
         assert!(provider_fields_valid(
             vec![provider_field(true, "", true)].into_iter()
         ));
+    }
+
+    #[test]
+    fn background_niceness_yields_without_exceeding_linux_limit() {
+        assert_eq!(background_nice_value(0), 5);
+        assert_eq!(background_nice_value(10), 15);
+        assert_eq!(background_nice_value(18), 19);
+        assert_eq!(background_nice_value(19), 19);
     }
 
     #[test]
