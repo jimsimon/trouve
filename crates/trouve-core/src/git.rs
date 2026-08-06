@@ -856,6 +856,8 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+    }
+
     #[test]
     fn immutable_review_diff_supports_rewritten_commit_ranges() {
         let tmp = tempfile::tempdir().unwrap();
