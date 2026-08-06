@@ -1028,7 +1028,7 @@ impl ToolExecutor for LocalToolExecutor {
             .await
             .map_err(|error| format!("writing temporary review ref cleanup: {error}"))?;
         drop(stdin);
-        let stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
+        let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
         let status = match tokio::time::timeout(
             REVIEW_HISTORY_CLEANUP_TIMEOUT,
             guard.child_mut().wait(),
@@ -1061,7 +1061,29 @@ impl ToolExecutor for LocalToolExecutor {
                 return Err("temporary review ref cleanup timed out".to_owned());
             }
         };
-        let stderr = stderr_task.await.unwrap_or_default();
+        let stderr = match finish_review_fetch_stderr(
+            &mut guard,
+            &mut stderr_task,
+            REVIEW_FETCH_TERMINATION_GRACE,
+        )
+        .await
+        {
+            Ok(stderr) => stderr,
+            Err(error) if status.success() => {
+                tracing::warn!(
+                    %error,
+                    "could not finish temporary review ref cleanup stderr collection"
+                );
+                drop(guard);
+                return Ok(());
+            }
+            Err(error) => {
+                drop(guard);
+                return Err(format!(
+                    "deleting temporary review refs: stderr unavailable: {error}"
+                ));
+            }
+        };
         guard.disarm();
         if !status.success() {
             return Err(format!("deleting temporary review refs: {stderr}"));
@@ -1384,8 +1406,9 @@ mod tests {
             .trim()
             .to_owned();
         for job_id in ["rv_test", "rv_replacement"] {
-            for index in 0..3 {
-                let reference = format!("refs/remotes/origin/trouve-history-42-{job_id}-{index}");
+            for index in 0..REVIEW_HISTORY_REF_LIMIT {
+                let name = review_history_ref_name(42, job_id, index).unwrap();
+                let reference = format!("refs/remotes/origin/{name}");
                 assert!(git(&["update-ref", &reference, &head]).status.success());
             }
         }
@@ -1399,11 +1422,16 @@ mod tests {
             .await
             .unwrap();
 
-        for index in 0..3 {
-            let reference = format!("refs/remotes/origin/trouve-history-42-rv_test-{index}");
+        for index in 0..REVIEW_HISTORY_REF_LIMIT {
+            let reference = format!(
+                "refs/remotes/origin/{}",
+                review_history_ref_name(42, "rv_test", index).unwrap()
+            );
             assert!(!git(&["show-ref", "--verify", &reference]).status.success());
-            let replacement =
-                format!("refs/remotes/origin/trouve-history-42-rv_replacement-{index}");
+            let replacement = format!(
+                "refs/remotes/origin/{}",
+                review_history_ref_name(42, "rv_replacement", index).unwrap()
+            );
             assert!(
                 git(&["show-ref", "--verify", &replacement])
                     .status
