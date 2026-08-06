@@ -442,15 +442,7 @@ const MIGRATIONS: &[&str] = &[
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
-    // The backfill shares a batch with the column addition so it runs
-    // exactly once: on every later boot the batch aborts at the tolerated
-    // "duplicate column" error before reaching the UPDATE, so previously
-    // cleared collapses are never re-armed. Historical closed findings with
-    // a published comment enter the durable retry queue instead of leaving
-    // their conversations unresolved forever.
-    "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0;
-     UPDATE code_review_findings SET collapse_pending = 1
-      WHERE status != 'open' AND github_comment_id IS NOT NULL",
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_pending INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_next_attempt_at TEXT",
     "CREATE INDEX IF NOT EXISTS code_review_findings_collapse_pending
@@ -468,8 +460,56 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     }
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
+    backfill_code_review_collapse_pending(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    Ok(())
+}
+
+/// Arms the durable thread-collapse queue for findings closed before
+/// `collapse_pending` existed: without this, historical conversations with a
+/// published comment would stay uncollapsed forever. The backfill and its
+/// marker commit atomically, so a failure leaves the marker absent and the
+/// backfill retries on the next boot, while previously cleared collapses are
+/// never re-armed once the marker is recorded.
+fn backfill_code_review_collapse_pending(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-collapse-pending-backfill-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    tx.execute(
+        "UPDATE code_review_findings SET collapse_pending = 1
+         WHERE status != 'open' AND github_comment_id IS NOT NULL",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -7642,8 +7682,8 @@ mod tests {
         assert_eq!(armed(&conn, "rvf-open"), 0);
 
         // Re-running migrations (a later boot) must not re-arm cleared rows:
-        // the backfill shares its batch with the column addition, which now
-        // fails as a duplicate before the UPDATE runs.
+        // the backfill commits atomically with its store_migrations marker
+        // and is skipped once the marker exists.
         conn.execute(
             "UPDATE code_review_findings SET collapse_pending = 0 WHERE id = 'rvf-historic'",
             [],
