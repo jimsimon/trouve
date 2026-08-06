@@ -135,29 +135,33 @@ built-in reviewers for correctness, security, reliability, performance,
 concurrency, API compatibility, data integrity, testing, maintainability,
 dependencies, accessibility, and operations.
 
-Each repository has one of three persona-routing strategies:
+Each repository has one of three persona-selection strategies:
 
-- **Core** runs exactly the manually checked personas on every diff batch. Use
-  it when a repository needs a small, fixed reviewer set.
-- **Auto** always runs the correctness, security, and testing baseline, then
-  adds focused personas whose deterministic path/content signals match each
-  diff batch. Optional semantic triage makes one lightweight, tool-free model
-  pass per batch and may add more personas; it can never remove a baseline or
-  deterministic selection. This is the default.
-- **Thorough** runs the complete reviewer catalog on every batch. It provides
-  maximum coverage at the highest model usage and latency.
+- **Manual** runs exactly the checked personas on every diff batch. Use it when
+  a repository needs a small, fixed reviewer set.
+- **Additive** always runs the correctness, security, and testing baseline plus
+  explicitly enabled core personas. Optional semantic triage makes one
+  lightweight, tool-free model pass per batch and may add more personas; it
+  can never remove a baseline or enabled core persona. This is the default.
+- **Automatic** makes semantic triage mandatory and lets it select from the
+  complete persona catalog for each batch, with no preselected personas.
 
-Auto and Thorough support repository overrides. **Always run** forces a
-persona into every Auto batch, while **Never run** excludes it from both Auto
-and Thorough. The controls are mutually exclusive. Custom reviewer profiles are
-reusable across repositories and contain a name, focused prompt, and optional
-model override. Auto can select a custom persona through semantic triage, or it
-can be forced with **Always run**; Thorough includes it automatically.
+Both Additive and Automatic honor repository-specific model, thinking, and
+prompt overrides for any persona that runs. **Always run** and the repository's
+included persona list force a persona into every Additive batch. Automatic
+ignores **Always run** and both included and excluded persona lists: the lists
+are cleared when Automatic is saved, so semantic triage remains the sole
+selector. Custom reviewer profiles are reusable across repositories and contain
+a name, focused prompt, and optional model override. Additive can select a
+custom persona through semantic triage or **Always run**; Automatic can select
+it only through semantic triage. Automatic has no fixed baseline, though the
+correctness, security, and testing personas remain available in its complete
+semantic-routing catalog.
 
-New repositories start in Auto with semantic triage enabled. During upgrade,
+New repositories start in Additive with semantic triage enabled. During upgrade,
 a repository that still exactly matches either historical built-in default set
-is migrated to Auto once. Customized reviewer sets remain Core, and a later
-explicit switch back to Core is preserved.
+is migrated to Additive once. Customized reviewer sets remain Manual, and a
+later explicit switch back to Manual is preserved.
 
 An enabled repository must select an explicit review model. The coordinator
 and every reviewer without a profile or repository override use that model;
@@ -191,22 +195,23 @@ generation.
 
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. The complete diff is enumerated
-by changed path and divided into bounded per-file batches. Core and Thorough
-send every selected reviewer every batch. Auto records a decision for every
-persona/batch candidate and dispatches only the selected combinations in the
-built-in read-only review mode, including files beyond the model-facing
+by changed path and divided into bounded per-file batches. Manual sends every
+selected reviewer every batch. Additive and Automatic record a decision for
+every persona/batch candidate and dispatch only the selected combinations in
+the built-in read-only review mode, including files beyond the model-facing
 aggregate diff limit. Reviewer profiles, review/router models, router thinking
-level, routing mode, include/exclude controls, and every typed routing reason
-are snapshotted durably with the job after repository overrides are applied.
+level, routing mode, inclusion controls, and every typed routing reason are
+snapshotted durably with the job after repository overrides are applied.
 The dashboard exposes both the router task output and the complete
 selected/skipped decision matrix, which is also published on the job's
 persisted event stream.
 
-If semantic triage is disabled or its model response fails validation, Auto
-continues with its baseline and deterministic choices. Semantic output is
-restricted to the offered persona IDs, requires a concrete reason, and is
-additive only. A once-persisted routing snapshot is reused by interrupted-job
-recovery and persona retries.
+If semantic triage is disabled or its model response fails validation,
+Additive continues with its baseline and enabled core personas. Automatic
+requires semantic triage and fails the review if routing fails. Semantic output
+is restricted to the offered persona IDs and requires a concrete reason. A
+once-persisted routing snapshot is reused by interrupted-job recovery and
+persona retries.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes

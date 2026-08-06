@@ -154,7 +154,10 @@ pub use requests::*;
 // clients can clear a previous turn's live timing anchor (additive).
 // 2.8: code-review findings expose their durable GitHub inline-publication
 // outcome (additive).
-pub const PROTOCOL_VERSION: &str = "2.8";
+// 3.0: Dynamic persona selection delegates solely to the semantic router;
+// Automatic always enables it, while Additive retains only its baseline and
+// configured inclusions before optional semantic additions (breaking).
+pub const PROTOCOL_VERSION: &str = "3.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

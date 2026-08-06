@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.8"
+    "version": "3.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -4942,7 +4942,8 @@
             "$ref": "#/components/schemas/CodeReviewJobScope"
           },
           "semantic_routing": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."
           },
           "session_id": {
             "type": [
@@ -5363,7 +5364,7 @@
           },
           "semantic_routing": {
             "type": "boolean",
-            "description": "Whether Additive or Automatic mode may run one tool-free semantic\nrouter pass per diff batch. Semantic choices can only add personas."
+            "description": "Whether Additive mode may run one tool-free semantic router pass per\ndiff batch. Automatic mode always runs it as the sole selector."
           }
         }
       },
@@ -9642,7 +9643,7 @@
               "boolean",
               "null"
             ],
-            "description": "Omitted by older clients to preserve the current/default semantic\nrouting choice."
+            "description": "Omitted by older clients to preserve the current/default semantic\nrouting choice. Forced to `true` when `routing_mode` is Automatic."
           }
         }
       },

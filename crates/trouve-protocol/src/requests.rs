@@ -942,13 +942,13 @@ pub enum CodeReviewRoutingMode {
     /// Run exactly the repository's manually selected `reviewer_ids`.
     #[serde(alias = "core")]
     Manual,
-    /// Always run `included_reviewer_ids`, then add relevant personas through
-    /// deterministic and semantic routing.
+    /// Always run the baseline and `included_reviewer_ids`, then optionally
+    /// add relevant personas through semantic routing.
     #[default]
     #[serde(alias = "auto")]
     Additive,
-    /// Select every persona through deterministic and semantic routing, with
-    /// no manually selected core set.
+    /// Let the semantic router select from the complete persona catalog, with
+    /// no baseline or manually selected core set.
     #[serde(alias = "thorough")]
     Automatic,
 }
@@ -1007,8 +1007,8 @@ pub struct CodeReviewRepository {
     /// Automatic consider the complete reviewer catalog.
     #[serde(default)]
     pub routing_mode: CodeReviewRoutingMode,
-    /// Whether Additive or Automatic mode may run one tool-free semantic
-    /// router pass per diff batch. Semantic choices can only add personas.
+    /// Whether Additive mode may run one tool-free semantic router pass per
+    /// diff batch. Automatic mode always runs it as the sole selector.
     #[serde(default)]
     pub semantic_routing: bool,
     /// Personas that Additive mode always runs.
@@ -1045,7 +1045,7 @@ pub struct UpdateCodeReviewRepositoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<CodeReviewRoutingMode>,
     /// Omitted by older clients to preserve the current/default semantic
-    /// routing choice.
+    /// routing choice. Forced to `true` when `routing_mode` is Automatic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_routing: Option<bool>,
     /// Omitted by older clients to preserve existing forced inclusions.
@@ -1090,6 +1090,7 @@ pub enum CodeReviewTaskRole {
 pub enum CodeReviewRoutingSource {
     Core,
     Baseline,
+    /// Retained for decoding routing snapshots created before protocol 3.0.
     Deterministic,
     Semantic,
     Included,
@@ -1375,6 +1376,8 @@ pub struct CodeReviewJob {
     pub reviewer_ids: Vec<String>,
     #[serde(default)]
     pub routing_mode: CodeReviewRoutingMode,
+    /// Snapshotted Additive semantic-routing choice. Automatic jobs route
+    /// semantically regardless of a legacy `false` value.
     #[serde(default)]
     pub semantic_routing: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -1317,7 +1317,13 @@ function JobDetailPane({
         </div>
         <div>
           <dt>Semantic triage</dt>
-          <dd>{job.routing_mode !== "manual" && job.semantic_routing ? "Enabled" : "Off"}</dd>
+          <dd>
+            {job.routing_mode === "automatic"
+              ? "Required"
+              : job.routing_mode === "additive" && job.semantic_routing
+                ? "Enabled"
+                : "Off"}
+          </dd>
         </div>
         <div>
           <dt>Router model</dt>
@@ -1623,7 +1629,7 @@ function JobDetailPane({
                         ))}
                       </ul>
                     ) : (
-                      <p>No baseline, deterministic, semantic, or repository include matched.</p>
+                      <p>No baseline, semantic, or repository inclusion matched.</p>
                     )}
                   </div>
                 )}
@@ -2021,8 +2027,8 @@ function RepositoryEditor({
               {draft.routing_mode === "manual"
                 ? "Runs exactly the personas enabled below; semantic routing is disabled."
                 : draft.routing_mode === "additive"
-                  ? "Always runs the enabled core personas, then adds personas using diff signals and semantic triage."
-                  : "Selects personas using diff signals and semantic triage, with no manually enabled core personas."}
+                  ? "Always runs the baseline and enabled core personas, then optionally adds personas using semantic triage."
+                  : "Lets semantic triage select personas from the complete catalog."}
             </small>
           </label>
           <label>
@@ -2171,13 +2177,16 @@ function RepositoryEditor({
           <legend>Persona selection</legend>
           <label
             class={`checkbox semantic-routing ${
-              draft.routing_mode === "manual" ? "field-disabled" : ""
+              draft.routing_mode !== "additive" ? "field-disabled" : ""
             }`}
           >
             <input
               type="checkbox"
-              checked={draft.routing_mode !== "manual" && draft.semantic_routing}
-              disabled={draft.routing_mode === "manual"}
+              checked={
+                draft.routing_mode === "automatic" ||
+                (draft.routing_mode === "additive" && draft.semantic_routing)
+              }
+              disabled={draft.routing_mode !== "additive"}
               onChange={(event) =>
                 setDraft({ ...draft, semantic_routing: event.currentTarget.checked })
               }
@@ -2185,8 +2194,11 @@ function RepositoryEditor({
             <span>
               <strong>Semantic triage</strong>
               <small>
-                Run one lightweight, tool-free routing pass per batch. It may add relevant
-                personas but cannot remove personas selected by diff signals or Additive policy.
+                {draft.routing_mode === "automatic"
+                  ? "Required in Automatic mode and solely decides which personas run for each batch."
+                  : draft.routing_mode === "additive"
+                    ? "Run one lightweight, tool-free routing pass per batch. It may add relevant personas but cannot remove baseline or enabled core personas."
+                    : "Semantic triage is off in Manual mode; only the checked personas run."}
               </small>
             </span>
           </label>

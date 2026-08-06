@@ -12,3 +12,7 @@ test("baseline routing labels follow the durable job mode", () => {
 test("unknown routing sources remain visible", () => {
   assert.equal(routingReasonLabel("future-router", "automatic"), "future-router");
 });
+
+test("historical deterministic routing remains recognizable", () => {
+  assert.equal(routingReasonLabel("deterministic", "additive"), "Legacy diff signal");
+});
