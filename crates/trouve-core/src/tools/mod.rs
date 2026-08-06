@@ -444,7 +444,14 @@ async fn run_managed_authenticated_review_git_command(
             .map(|stderr| sanitize_review_fetch_stderr(&stderr, auth))?;
     let result = match result {
         Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err(stderr),
+        Ok(status) => {
+            let mut error = format!("git exited with {status}");
+            if !stderr.is_empty() {
+                error.push_str(": ");
+                error.push_str(&stderr);
+            }
+            Err(error)
+        }
         Err(mut error) => {
             if !stderr.is_empty() {
                 error.push_str(": ");
@@ -1601,6 +1608,25 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_authenticated_git_command_reports_nonzero_status_without_stderr() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exit 7");
+        let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let error = run_managed_authenticated_review_git_command(
+            command,
+            "test-auth",
+            Duration::from_secs(1),
+            repository_lock.lock_owned().await,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("git exited with exit status: 7"));
     }
 
     #[cfg(unix)]
