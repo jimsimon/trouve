@@ -2,8 +2,19 @@
 //! Hosted and self-hosted deployments run this; the desktop app embeds the
 //! same [`trouve_server::bind_local`] stack in-process (ADR 0008).
 
+fn version_requested() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if version_requested() {
+        println!("trouve-server {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

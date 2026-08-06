@@ -319,6 +319,7 @@ component SubscriptionMeter inherits VerticalLayout {
 export component SettingsScreen inherits Rectangle {
     background: Theme.c.win-bg;
 
+    in property <string> app-version;
     in property <[ProviderItem]> providers;
     in property <[ProviderItem]> subscription-providers;
     in property <[ProviderItem]> api-providers;
@@ -2654,7 +2655,7 @@ export component SettingsScreen inherits Rectangle {
 
                         // ---------------- about ----------------
                         if root.section == SectionId.about: VerticalLayout {
-                            spacing: 12px;
+                            spacing: 16px;
 
                             Text {
                                 text: "About";
@@ -2663,11 +2664,138 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
                             Text {
-                                text: "trouve — a protocol-first AI coding harness.";
-                                color: Theme.c.text-dim;
-                                font-size: Theme.fs(12px);
+                                text: "Application details and user interface attribution.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
                             }
-                            AboutSlint { }
+
+                            Rectangle {
+                                height: product-info.preferred-height + 32px;
+                                background: Theme.c.panel-bg;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.c.border;
+
+                                product-info := VerticalLayout {
+                                    padding: 16px;
+                                    spacing: 14px;
+
+                                    HorizontalLayout {
+                                        spacing: 14px;
+                                        alignment: center;
+
+                                        Rectangle {
+                                            width: Theme.fs(58px);
+                                            height: Theme.fs(58px);
+                                            border-radius: 13px;
+                                            background: Theme.c.accent-bg;
+
+                                            Image {
+                                                x: Theme.fs(8px);
+                                                y: Theme.fs(8px);
+                                                width: parent.width - Theme.fs(16px);
+                                                height: parent.height - Theme.fs(16px);
+                                                source: @image-url("assets/trouve.png");
+                                                image-fit: contain;
+                                                accessible-role: image;
+                                                accessible-label: "Trouve application icon";
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            spacing: 3px;
+                                            alignment: center;
+                                            horizontal-stretch: 1;
+
+                                            Text {
+                                                text: "trouve";
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(21px);
+                                                font-weight: 700;
+                                            }
+                                            Text {
+                                                text: "A protocol-first AI coding harness";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(12px);
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        height: 1px;
+                                        background: Theme.c.border;
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        alignment: center;
+
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+
+                                            Text {
+                                                text: "Version";
+                                                color: Theme.c.text-mid;
+                                                font-size: Theme.fs(12px);
+                                                font-weight: 700;
+                                            }
+                                            Text {
+                                                text: "Current application release";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(11px);
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: version-text.preferred-width + 20px;
+                                            height: Theme.fs(28px);
+                                            border-radius: 6px;
+                                            background: Theme.c.control-bg;
+                                            border-width: 1px;
+                                            border-color: Theme.c.border;
+
+                                            version-text := Text {
+                                                text: root.app-version;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(12px);
+                                                font-weight: 700;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: framework-info.preferred-height + 32px;
+                                background: Theme.c.panel-bg;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.c.border;
+
+                                framework-info := VerticalLayout {
+                                    padding: 16px;
+                                    spacing: 12px;
+
+                                    Text {
+                                        text: "User interface framework";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: "Trouve's desktop interface is built with Slint.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    AboutSlint { }
+                                }
+                            }
                         }
                     }
                 }
