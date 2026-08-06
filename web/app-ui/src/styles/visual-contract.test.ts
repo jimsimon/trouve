@@ -262,6 +262,13 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toMatch(
       /\.chat-stream \{[^}]*padding-inline:\s*10px/s,
     );
+    expect(app).toMatch(
+      /\.chat-stream \{[^}]*overflow-y:\s*scroll[^}]*scrollbar-gutter:\s*stable[^}]*scrollbar-width:\s*thin/s,
+    );
+    expect(app).toMatch(
+      /\.chat-scroll-indicator \{[^}]*background:\s*var\(--trouve-scroll-thumb\)[^}]*pointer-events:\s*none/s,
+    );
+    expect(app).toMatch(/\.chat-scroll-indicator\[data-scrollable\] \{[^}]*opacity:\s*1/s);
     expect(app).toMatch(/\.message \{[^}]*margin:\s*0 0 10px/s);
     expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*8px 0 6px/s);
     expect(app).toMatch(

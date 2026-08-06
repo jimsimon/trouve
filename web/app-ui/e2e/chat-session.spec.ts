@@ -5,6 +5,15 @@ interface FixtureEvent extends Record<string, unknown> {
   readonly cursor: number;
 }
 
+interface ThreadViewFixture {
+  readonly cursor?: number;
+  readonly snapshot: Record<string, unknown>;
+}
+
+type ThreadViewFixtureLoader = (
+  before: number | undefined,
+) => ThreadViewFixture | Promise<ThreadViewFixture>;
+
 const threadEvent = (
   cursor: number,
   event: Record<string, unknown>,
@@ -154,6 +163,7 @@ const installProtocolFixtures = async (
   page: Page,
   sentMessages: Array<Record<string, unknown>>,
   messageDelayMs = 0,
+  threadViewFixture?: ThreadViewFixtureLoader,
 ): Promise<void> => {
   let messageCount = 0;
   await page.route("**/v1/**", async (route) => {
@@ -178,14 +188,23 @@ const installProtocolFixtures = async (
       return;
     }
     if (key === "GET /v1/threads/th_fixture/view") {
+      const beforeValue = url.searchParams.get("before");
+      const fixture = threadViewFixture === undefined
+        ? {
+            cursor: 0,
+            snapshot: {
+              item_offset: 0,
+              total_items: 0,
+              has_older: false,
+              items: [],
+            },
+          }
+        : await threadViewFixture(
+            beforeValue === null ? undefined : Number(beforeValue),
+          );
       await route.fulfill({
-        headers: { "x-trouve-event-cursor": "0" },
-        json: {
-          item_offset: 0,
-          total_items: 0,
-          has_older: false,
-          items: [],
-        },
+        headers: { "x-trouve-event-cursor": String(fixture.cursor ?? 0) },
+        json: fixture.snapshot,
       });
       return;
     }
@@ -224,6 +243,7 @@ const installProtocolFixtures = async (
         session_id: "se_1",
         mode: "code",
         model: "test/model",
+        model_options: { reasoning_effort: "max", context: "1m" },
         permission_mode: "ask",
         created_at: "2026-08-04T08:00:00Z",
       }],
@@ -239,7 +259,21 @@ const installProtocolFixtures = async (
         display_name: "Test Model",
         context_window: 128_000,
         supports_tools: true,
-        options_schema: { type: "object", properties: {} },
+        options_schema: {
+          type: "object",
+          properties: {
+            reasoning_effort: {
+              type: "string",
+              enum: ["none", "low", "medium", "high", "xhigh", "max"],
+              default: "medium",
+            },
+            context: {
+              type: "string",
+              enum: ["300k", "1m"],
+              default: "300k",
+            },
+          },
+        },
       }],
       "GET /v1/modes": [{
         id: "code",
@@ -419,6 +453,9 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
   await page.goto("/");
   await replayHistory(page);
 
+  await expect(page.locator('select[aria-label="Thinking level"]')).toHaveValue("max");
+  await expect(page.locator('select[aria-label="Thinking level"] option:checked')).toHaveText("Max");
+  await expect(page.locator('select[aria-label="Context size"]')).toHaveValue("1m");
   await expect(page.locator(".user-message trouve-markdown-view strong")).toHaveText("migration");
   const userBody = page.locator(".user-body-stream").first();
   await expect(userBody).toHaveCSS("padding", "8px 16px 10px");
@@ -1269,19 +1306,50 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
 
   await expect(page.getByText("Virtual response 219", { exact: true })).toBeVisible();
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
+  await expect(page.locator(".chat-scroll-indicator")).toHaveAttribute("data-scrollable", "");
   const scrollGeometry = await page.locator(".chat-stream").evaluate((viewport) => {
     const style = getComputedStyle(viewport);
+    const webkitScrollbar = getComputedStyle(viewport, "::-webkit-scrollbar");
+    const webkitThumb = getComputedStyle(viewport, "::-webkit-scrollbar-thumb");
     const canvas = viewport.querySelector<HTMLElement>(".chat-virtual-canvas");
+    const indicator = viewport.parentElement?.querySelector<HTMLElement>(
+      ".chat-scroll-indicator",
+    );
     if (canvas === null) throw new Error("missing virtual scroll canvas");
+    if (indicator === null || indicator === undefined) {
+      throw new Error("missing passive scroll indicator");
+    }
+    const indicatorStyle = getComputedStyle(indicator);
     return {
       canvasHeight: canvas.getBoundingClientRect().height,
       canvasPosition: getComputedStyle(canvas).position,
       clientHeight: viewport.clientHeight,
+      indicatorBackground: indicatorStyle.backgroundColor,
+      indicatorHeight: indicator.getBoundingClientRect().height,
+      indicatorOpacity: indicatorStyle.opacity,
+      indicatorPointerEvents: indicatorStyle.pointerEvents,
+      indicatorWidth: indicator.getBoundingClientRect().width,
       overflowY: style.overflowY,
+      paddingLeft: style.paddingLeft,
+      paddingRight: style.paddingRight,
       scrollHeight: viewport.scrollHeight,
+      scrollbarGutter: style.scrollbarGutter,
+      scrollbarWidth: style.scrollbarWidth,
+      webkitScrollbarWidth: webkitScrollbar.width,
+      webkitThumbColor: webkitThumb.backgroundColor,
     };
   });
-  expect(scrollGeometry.overflowY).toBe("auto");
+  expect(scrollGeometry.overflowY).toBe("scroll");
+  expect(scrollGeometry.paddingLeft).toBe(scrollGeometry.paddingRight);
+  expect(scrollGeometry.scrollbarGutter).toBe("stable");
+  expect(scrollGeometry.scrollbarWidth).toBe("thin");
+  expect(scrollGeometry.webkitScrollbarWidth).toBe("10px");
+  expect(scrollGeometry.webkitThumbColor).toBe("rgba(0, 0, 0, 0)");
+  expect(scrollGeometry.indicatorBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(scrollGeometry.indicatorHeight).toBeGreaterThanOrEqual(32);
+  expect(scrollGeometry.indicatorOpacity).toBe("1");
+  expect(scrollGeometry.indicatorPointerEvents).toBe("none");
+  expect(scrollGeometry.indicatorWidth).toBe(6);
   expect(scrollGeometry.canvasPosition).toBe("relative");
   expect(scrollGeometry.canvasHeight).toBeGreaterThan(scrollGeometry.clientHeight);
   expect(scrollGeometry.scrollHeight).toBeGreaterThan(scrollGeometry.clientHeight);
@@ -1299,6 +1367,28 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     "aria-live",
     "off",
   );
+  await expect.poll(() => page.locator(".chat-scroll-indicator").evaluate((indicator) => {
+    const shell = indicator.parentElement;
+    if (shell === null) return Number.NaN;
+    return Math.round(
+      indicator.getBoundingClientRect().top - shell.getBoundingClientRect().top,
+    );
+  })).toBe(3);
+  const wheelScrollBounds = await page.locator(".chat-stream").boundingBox();
+  if (wheelScrollBounds === null) throw new Error("missing chat scroll bounds");
+  await page.mouse.move(
+    wheelScrollBounds.x + wheelScrollBounds.width / 2,
+    wheelScrollBounds.y + wheelScrollBounds.height / 2,
+  );
+  await page.mouse.wheel(0, 1_000);
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
+    viewport.scrollTop
+  )).toBeGreaterThan(0);
+  await expect.poll(() => page.locator(".chat-scroll-indicator").evaluate((indicator) => {
+    const shell = indicator.parentElement;
+    if (shell === null) return Number.NaN;
+    return indicator.getBoundingClientRect().top - shell.getBoundingClientRect().top;
+  })).toBeGreaterThan(3);
   await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
   await page.getByRole("button", { name: "Jump to latest" }).click();
   await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
@@ -1440,6 +1530,99 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeGreaterThan(400);
   await page.getByRole("button", { name: "Use windowed history" }).press("Enter");
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
+});
+
+test("prefetches older history before the reader reaches the loaded boundary", async ({ page }) => {
+  const historyPage = (start: number, end: number, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 240,
+    has_older: hasOlder,
+    items: Array.from({ length: end - start }, (_, index) => ({
+      kind: "user",
+      turn: 1_000 + start + index,
+      content: `Buffered prompt ${start + index}`,
+      attachments: [],
+    })),
+  });
+  let olderRequests = 0;
+  let olderResponses = 0;
+  const olderBoundaries: number[] = [];
+  await installProtocolFixtures(page, [], 0, async (before) => {
+    if (before === undefined) {
+      return { snapshot: historyPage(120, 240, true) };
+    }
+    olderRequests += 1;
+    olderBoundaries.push(before);
+    await new Promise((resolve) => globalThis.setTimeout(
+      resolve,
+      before === 120 ? 75 : 250,
+    ));
+    olderResponses += 1;
+    if (before === 120) return { snapshot: historyPage(60, 120, true) };
+    if (before === 60) return { snapshot: historyPage(0, 60, false) };
+    throw new Error(`unexpected history boundary ${before}`);
+  });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await expect.poll(() => olderRequests).toBe(1);
+  await expect.poll(() => olderResponses).toBe(1);
+  await page.waitForTimeout(100);
+  expect(olderRequests, "opening a thread should warm only one bounded page").toBe(1);
+  await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
+
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
+    viewport.scrollTop = Math.min(
+      viewport.scrollHeight - viewport.clientHeight,
+      viewport.clientHeight * 4,
+    );
+    viewport.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(() => olderRequests).toBe(2);
+  await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
+  const anchor = await page.locator(".chat-stream").evaluate((viewport) => {
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+      .find((candidate) => candidate.getBoundingClientRect().bottom > viewportTop);
+    if (row === undefined || row.dataset["virtualId"] === undefined) {
+      throw new Error("missing visible history anchor");
+    }
+    return {
+      id: row.dataset["virtualId"],
+      offset: row.getBoundingClientRect().top - viewportTop,
+    };
+  });
+  await expect.poll(() => olderResponses).toBe(2);
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport, expected) => {
+    const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+      .find((candidate) => candidate.dataset["virtualId"] === expected.id);
+    if (row === undefined) return Number.POSITIVE_INFINITY;
+    return Math.abs(
+      row.getBoundingClientRect().top
+        - viewport.getBoundingClientRect().top
+        - expected.offset,
+    );
+  }, anchor)).toBeLessThanOrEqual(2);
+
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
+    viewport.scrollTop = 0;
+    viewport.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
+    [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")].some((row) => {
+      const match = /^user:snapshot:(\d+)$/.exec(row.dataset["virtualId"] ?? "");
+      return match !== null && Number(match[1]) < 60;
+    })
+  )).toBe(true);
+  expect(olderBoundaries).toContain(60);
+  expect(olderBoundaries.every((boundary) => boundary === 120 || boundary === 60)).toBe(true);
+  expect(olderBoundaries.filter((boundary) => boundary === 60)).toHaveLength(1);
+  // A route refresh may reinstall the same folded tail while this test is
+  // active. Re-fetching that same bounded page is harmless; walking the full
+  // transcript without user scroll is not.
+  expect(olderBoundaries.length).toBeLessThanOrEqual(3);
 });
 
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {

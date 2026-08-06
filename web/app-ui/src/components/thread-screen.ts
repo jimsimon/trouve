@@ -140,6 +140,10 @@ const CHAT_TAIL_EPSILON_PX = 2;
 const CHAT_POSITION_SETTLE_MS = 140;
 const CHAT_SCROLL_CORRECTION_SETTLE_MS = 240;
 const CHAT_TAIL_CONVERGENCE_FRAMES = 3;
+const CHAT_SCROLL_INDICATOR_INSET_PX = 3;
+const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
+const CHAT_HISTORY_PREFETCH_VIEWPORTS = 5;
+const CHAT_HISTORY_PREFETCH_MIN_PX = 2_400;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -262,6 +266,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #historyLoading = false;
   #historyError = "";
   #historyGeneration = 0;
+  readonly #historyWarmThreads = new Set<string>();
   #pendingHistoryPrepend:
     | { readonly scrollTop: number; readonly totalHeight: number }
     | undefined;
@@ -276,6 +281,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #programmaticScrollFrame: number | undefined;
   #tailConvergenceFrame: number | undefined;
   #scrollRenderFrame: number | undefined;
+  #scrollIndicatorFrame: number | undefined;
+  #scrollIndicatorMetrics:
+    | { readonly maxScrollTop: number; readonly thumbTravel: number }
+    | undefined;
   #chatPositionTimer: ReturnType<typeof setTimeout> | undefined;
   #scrollCorrectionResumeAt = 0;
   #followTailControlHeight = 0;
@@ -412,7 +421,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#cancelProgrammaticScrollWindow();
       this.#cancelTailConvergence();
       this.#cancelScheduledScrollRender();
+      this.#cancelScheduledScrollIndicator();
       this.#cancelScheduledChatPosition();
+      this.#scrollIndicatorMetrics = undefined;
       this.#virtualizer = new Virtualizer<VirtualChatItem>({
         estimatedHeight: 120,
         overscanPx: 1_200,
@@ -478,6 +489,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#resizeObserver?.disconnect();
       this.#observedVirtualRows.clear();
       this.#followTailControlHeight = 0;
+      this.#cancelScheduledScrollIndicator();
+      this.#scrollIndicatorMetrics = undefined;
       return;
     }
     this.#followTailControlHeight = viewport
@@ -490,6 +503,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         ? this.#transcriptTailScrollTop(viewport)
         : correction.scrollTop;
       this.#setChatScrollTop(viewport, expected);
+      this.#refreshChatScrollIndicator(viewport);
       this.requestUpdate();
       return;
     }
@@ -498,6 +512,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? this.#transcriptTailScrollTop(viewport)
       : virtualWindow.scrollTop;
     this.#setChatScrollTop(viewport, expected);
+    this.#refreshChatScrollIndicator(viewport);
+    this.#warmOlderHistory();
     if (typeof ResizeObserver === "undefined") return;
     this.#resizeObserver ??= new ResizeObserver((entries) => {
       const activeViewport = this.querySelector<HTMLElement>(".chat-stream");
@@ -565,6 +581,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       } else if (expectedScrollTop !== undefined) {
         this.#setChatScrollTop(activeViewport, expectedScrollTop);
       }
+      this.#refreshChatScrollIndicator(activeViewport);
     });
     const mountedRows = new Set(
       this.querySelectorAll<HTMLElement>("[data-virtual-id]"),
@@ -588,7 +605,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#cancelProgrammaticScrollWindow();
     this.#cancelTailConvergence();
     this.#cancelScheduledScrollRender();
+    this.#cancelScheduledScrollIndicator();
     this.#cancelScheduledChatPosition();
+    this.#scrollIndicatorMetrics = undefined;
     this.#scrollCorrectionResumeAt = 0;
     this.#copyFeedbackGeneration += 1;
     this.#usageGeneration += 1;
@@ -851,9 +870,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   >
                     ${this.#modes.some((mode) => mode.id === thread.mode)
                       ? nothing
-                      : html`<option value=${thread.mode}>${thread.mode}</option>`}
+                      : html`<option value=${thread.mode} .selected=${true}>${thread.mode}</option>`}
                     ${this.#modes.map(
-                      (mode) => html`<option value=${mode.id}>${mode.display_name}</option>`,
+                      (mode) => html`<option
+                        value=${mode.id}
+                        .selected=${mode.id === thread.mode}
+                      >${mode.display_name}</option>`,
                     )}
                   </select>
                 </label>
@@ -896,10 +918,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           )}
                         >
                           ${modelControls.thinking.selected === ""
-                            ? html`<option value="" disabled>Select…</option>`
+                            ? html`<option value="" disabled .selected=${true}>Select…</option>`
                             : nothing}
                           ${modelControls.thinking.values.map(
-                            (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                            (value) => html`<option
+                              value=${value}
+                              .selected=${value === modelControls.thinking!.selected}
+                            >${modelOptionLabel(value)}</option>`,
                           )}
                         </select>
                       </label>
@@ -942,10 +967,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           )}
                         >
                           ${modelControls.context.selected === ""
-                            ? html`<option value="" disabled>Select…</option>`
+                            ? html`<option value="" disabled .selected=${true}>Select…</option>`
                             : nothing}
                           ${modelControls.context.values.map(
-                            (value) => html`<option value=${value}>${value.toUpperCase()}</option>`,
+                            (value) => html`<option
+                              value=${value}
+                              .selected=${value === modelControls.context!.selected}
+                            >${value.toUpperCase()}</option>`,
                           )}
                         </select>
                       </label>
@@ -1270,26 +1298,27 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     const window = this.#virtualizer.window();
     return html`
-      <div
-        class="chat-stream"
-        data-thread-id=${this.threadId}
-        role="log"
-        aria-label="Conversation"
-        aria-live=${window.followingTail ? "polite" : "off"}
-        aria-relevant="additions text"
-        aria-busy=${effectiveTurnRunning || compacting}
-        @wheel=${this.#chatScrollIntended}
-        @pointerdown=${this.#chatScrollIntended}
-        @touchstart=${this.#chatScrollIntended}
-        @scroll=${this.#chatScrolled}
-        @scrollend=${this.#chatScrollEnded}
-      >
-        ${virtualItems.length === 0
-          ? nothing
-          : html`<div
-              class="chat-virtual-canvas"
-              style=${`height:${window.totalHeight}px`}
-            >${repeat(window.items, ({ item }) => item.id, ({ item, start }) => {
+      <div class="chat-scroll-shell">
+        <div
+          class="chat-stream"
+          data-thread-id=${this.threadId}
+          role="log"
+          aria-label="Conversation"
+          aria-live=${window.followingTail ? "polite" : "off"}
+          aria-relevant="additions text"
+          aria-busy=${effectiveTurnRunning || compacting}
+          @wheel=${this.#chatScrollIntended}
+          @pointerdown=${this.#chatScrollIntended}
+          @touchstart=${this.#chatScrollIntended}
+          @scroll=${this.#chatScrolled}
+          @scrollend=${this.#chatScrollEnded}
+        >
+          ${virtualItems.length === 0
+            ? nothing
+            : html`<div
+                class="chat-virtual-canvas"
+                style=${`height:${window.totalHeight}px`}
+              >${repeat(window.items, ({ item }) => item.id, ({ item, start }) => {
               const style = `inset-block-start:${start}px`;
               if (item.kind === "edge-spacer") {
                 return html`<div
@@ -1338,10 +1367,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     presentation,
                     unit.id === nestedActivityUnitId ? activityLabel : undefined,
                   )}</div>`;
-            })}</div>`}
-        ${!window.followingTail && virtualItems.length > 0
-          ? html`<button class="follow-tail" type="button" @click=${this.#followTail}>Jump to latest</button>`
-          : nothing}
+              })}</div>`}
+          ${!window.followingTail && virtualItems.length > 0
+            ? html`<button class="follow-tail" type="button" @click=${this.#followTail}>Jump to latest</button>`
+            : nothing}
+        </div>
+        <span class="chat-scroll-indicator" aria-hidden="true"></span>
       </div>
     `;
   }
@@ -1668,12 +1699,77 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  // WebKitGTK retains native scrollbar hit-testing while intermittently
+  // failing to paint its thumb. This passive layer mirrors only the visual
+  // thumb; pointer input still reaches the native scrollbar underneath. Keep
+  // layout reads out of the scroll hot path so wheel momentum stays smooth.
+  #refreshChatScrollIndicator(viewport: HTMLElement): void {
+    const indicator = viewport.parentElement?.querySelector<HTMLElement>(
+      ".chat-scroll-indicator",
+    );
+    if (indicator === null || indicator === undefined) return;
+    const trackHeight = Math.max(
+      0,
+      viewport.clientHeight - CHAT_SCROLL_INDICATOR_INSET_PX * 2,
+    );
+    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    const proportionalHeight = viewport.scrollHeight <= 0
+      ? trackHeight
+      : trackHeight * viewport.clientHeight / viewport.scrollHeight;
+    const thumbHeight = Math.min(
+      trackHeight,
+      Math.max(CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX, proportionalHeight),
+    );
+    const thumbTravel = Math.max(0, trackHeight - thumbHeight);
+    const scrollable = maxScrollTop > CHAT_TAIL_EPSILON_PX && thumbTravel > 0;
+    this.#scrollIndicatorMetrics = { maxScrollTop, thumbTravel };
+    indicator.style.height = `${thumbHeight}px`;
+    indicator.toggleAttribute("data-scrollable", scrollable);
+    this.#syncChatScrollIndicatorPosition(viewport);
+  }
+
+  #syncChatScrollIndicatorPosition(viewport: HTMLElement): void {
+    const indicator = viewport.parentElement?.querySelector<HTMLElement>(
+      ".chat-scroll-indicator",
+    );
+    const metrics = this.#scrollIndicatorMetrics;
+    if (indicator === null || indicator === undefined || metrics === undefined) return;
+    const scrollTop = Math.min(
+      metrics.maxScrollTop,
+      Math.max(0, viewport.scrollTop),
+    );
+    const thumbTop = metrics.maxScrollTop > CHAT_TAIL_EPSILON_PX
+      ? metrics.thumbTravel * scrollTop / metrics.maxScrollTop
+      : 0;
+    indicator.style.transform = `translate3d(0, ${thumbTop}px, 0)`;
+  }
+
+  #scheduleChatScrollIndicator(viewport: HTMLElement): void {
+    this.#scrollIndicatorFrame ??= globalThis.requestAnimationFrame(() => {
+      this.#scrollIndicatorFrame = undefined;
+      if (
+        this.isConnected
+        && viewport.isConnected
+        && viewport.dataset["threadId"] === this.threadId
+      ) {
+        this.#syncChatScrollIndicatorPosition(viewport);
+      }
+    });
+  }
+
+  #cancelScheduledScrollIndicator(): void {
+    if (this.#scrollIndicatorFrame === undefined) return;
+    globalThis.cancelAnimationFrame(this.#scrollIndicatorFrame);
+    this.#scrollIndicatorFrame = undefined;
+  }
+
   readonly #chatScrolled = (event: Event): void => {
     const viewport = event.currentTarget as HTMLElement;
     if (
       viewport.dataset["threadId"] !== this.threadId ||
       this.#restoredScrollThreadId !== this.threadId
     ) return;
+    this.#scheduleChatScrollIndicator(viewport);
     const before = this.#virtualizer.window();
     // The sticky jump control is an overlay visually, but WebKit retains its
     // border-box in normal flow and includes it in scrollHeight. Its height is
@@ -1712,7 +1808,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       { userInitiated: true, atTail },
     );
     const after = this.#virtualizer.window();
-    if (viewport.scrollTop <= Math.max(320, viewport.clientHeight)) {
+    if (
+      viewport.scrollTop <= Math.max(
+        CHAT_HISTORY_PREFETCH_MIN_PX,
+        viewport.clientHeight * CHAT_HISTORY_PREFETCH_VIEWPORTS,
+      )
+    ) {
       void this.#loadOlderHistory(false);
     }
     if (!before.followingTail && after.followingTail) {
@@ -1725,7 +1826,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (!sameVirtualRenderWindow(before, after)) this.#scheduleScrollRender();
   };
 
-  readonly #chatScrollEnded = (): void => {
+  readonly #chatScrollEnded = (event: Event): void => {
+    this.#syncChatScrollIndicatorPosition(event.currentTarget as HTMLElement);
     this.#flushScheduledChatPosition();
   };
 
@@ -1755,6 +1857,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
     });
     viewport.scrollTop = scrollTop;
+    this.#scheduleChatScrollIndicator(viewport);
   }
 
   #syncMountedVirtualGeometry(
@@ -1860,6 +1963,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#emitChatPosition();
     this.requestUpdate();
   };
+
+  #warmOlderHistory(): void {
+    if (this.threadId === "" || this.#historyWarmThreads.has(this.threadId)) return;
+    const store = this.#store.value;
+    const services = this.#services.value;
+    if (store === undefined || services === undefined) return;
+    const view = store.threadView(this.threadId);
+    if (!view.hasOlder || view.itemOffset === 0) return;
+    // Warm exactly one bounded page per thread. Further pages are loaded by
+    // the rolling scroll threshold, avoiding both a visible boundary pause
+    // and the old full-session replay behavior.
+    this.#historyWarmThreads.add(this.threadId);
+    if (!this.#historyLoading) void this.#loadOlderHistory(false);
+  }
 
   #emitChatPosition(): void {
     if (this.threadId === "") return;
