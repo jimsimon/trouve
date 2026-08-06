@@ -55,7 +55,11 @@ fn main() {
             let end = (*pos + 5).min(chars.len());
             let delta: String = chars[*pos..end].iter().collect();
             *pos = end;
-            streaming.borrow_mut().push(&delta);
+            let mut streaming = streaming.borrow_mut();
+            streaming.push(&delta);
+            if *pos == chars.len() {
+                streaming.finish();
+            }
         },
     );
 
