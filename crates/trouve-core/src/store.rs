@@ -4228,7 +4228,9 @@ impl Store {
     /// Records a finding's published comment coordinates. A comment landing
     /// on an already-closed row re-arms its collapse: a concurrent round may
     /// have closed the finding from a snapshot taken before publication, and
-    /// without re-arming that thread would never be collapsed.
+    /// without re-arming that thread would never be collapsed. The arming
+    /// transition (0 → 1) also resets retry metadata, so a freshly armed
+    /// collapse never inherits backoff from an earlier, unrelated deferral.
     pub fn update_code_review_finding_publication(
         &self,
         id: &str,
@@ -4241,6 +4243,14 @@ impl Store {
              SET github_comment_id = ?2, github_comment_url = ?3,
                  github_publication_status = 'published',
                  github_thread_id = COALESCE(?4, github_thread_id),
+                 collapse_attempts = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN 0
+                     ELSE collapse_attempts
+                 END,
+                 collapse_next_attempt_at = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN NULL
+                     ELSE collapse_next_attempt_at
+                 END,
                  collapse_pending = CASE
                      WHEN status != 'open' AND ?2 IS NOT NULL THEN 1
                      ELSE collapse_pending
@@ -4293,11 +4303,20 @@ impl Store {
     /// Closes an open finding and, in the same committed write, arms its
     /// thread collapse when the row currently has a published comment. The
     /// row's own github_comment_id decides — not a caller snapshot, which
-    /// may predate the comment's publication by a concurrent round.
+    /// may predate the comment's publication by a concurrent round. Arming
+    /// resets retry metadata: an open row cannot carry meaningful backoff.
     pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
              SET status = ?2, resolved_at = ?3,
+                 collapse_attempts = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 0
+                     ELSE collapse_attempts
+                 END,
+                 collapse_next_attempt_at = CASE
+                     WHEN github_comment_id IS NOT NULL THEN NULL
+                     ELSE collapse_next_attempt_at
+                 END,
                  collapse_pending = CASE
                      WHEN github_comment_id IS NOT NULL THEN 1
                      ELSE 0
@@ -4307,13 +4326,55 @@ impl Store {
         )? > 0)
     }
 
-    /// Marks a finding's thread collapse as done; retry state resets with it.
-    pub fn clear_code_review_thread_collapse(&self, id: &str) -> Result<()> {
+    /// Marks a finding's thread collapse as done; retry state resets with
+    /// it. The clear only applies while the row still carries
+    /// `expected_comment_id`: if concurrent publication re-armed the row
+    /// with a different comment after the caller's snapshot, the newly armed
+    /// work survives instead of being wiped by a stale pass.
+    pub fn clear_code_review_thread_collapse(
+        &self,
+        id: &str,
+        expected_comment_id: Option<u64>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
              SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL
+             WHERE id = ?1 AND github_comment_id IS ?2",
+            params![id, expected_comment_id.map(|value| value as i64)],
+        )?;
+        Ok(())
+    }
+
+    /// Caches a finding's GitHub thread id without touching its comment
+    /// coordinates or collapse state, guarded on the comment the caller
+    /// matched the thread against — so a stale pass can never overwrite a
+    /// newer comment id published concurrently.
+    pub fn cache_code_review_thread_id(
+        &self,
+        id: &str,
+        expected_comment_id: u64,
+        thread_id: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET github_thread_id = ?3
+             WHERE id = ?1 AND github_comment_id = ?2",
+            params![id, expected_comment_id as i64, thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reschedules a pending collapse for the next retry tick without
+    /// counting a failure: used when the group budget ran out before the
+    /// finding was attempted, so healthy tail findings do not accumulate
+    /// exponential backoff they never earned.
+    pub fn requeue_code_review_thread_collapse(&self, id: &str) -> Result<()> {
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(60);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET collapse_next_attempt_at = ?2
              WHERE id = ?1",
-            params![id],
+            params![id, next_attempt.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -7586,22 +7647,40 @@ mod tests {
                 .is_empty()
         );
 
+        // Stale backoff accrued while the row had nothing to collapse (e.g.
+        // a cleanup pass deferring on a listing failure) must not delay a
+        // freshly armed collapse.
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id).unwrap();
+
         // A comment published by a concurrent round after the close re-arms
-        // the collapse; without this the thread would never be collapsed.
+        // the collapse with reset retry metadata: due immediately, not after
+        // the inherited delay.
         store
             .update_code_review_finding_publication(&id, Some(9001), "https://example", None)
             .unwrap();
         let pending = store
-            .pending_code_review_thread_collapses(due, 16, &[])
+            .pending_code_review_thread_collapses(chrono::Utc::now(), 16, &[])
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].3.id, id);
 
-        // Exclusions are applied before the limit, so an in-flight row does
-        // not consume the batch.
+        // A clear guarded on a stale comment id is a no-op: the re-armed
+        // work survives a pass that snapshotted the row before publication.
+        store.clear_code_review_thread_collapse(&id, None).unwrap();
+        assert_eq!(
+            store
+                .pending_code_review_thread_collapses(due, 16, &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .clear_code_review_thread_collapse(&id, Some(9001))
+            .unwrap();
         assert!(
             store
-                .pending_code_review_thread_collapses(due, 16, &[id])
+                .pending_code_review_thread_collapses(due, 16, &[])
                 .unwrap()
                 .is_empty()
         );
@@ -7671,6 +7750,20 @@ mod tests {
         assert!(
             still_capped <= chrono::Duration::minutes(61),
             "{still_capped}"
+        );
+
+        // A requeue reschedules for the next tick without counting a
+        // failure: the attempt count is untouched, so a later real failure
+        // resumes the capped backoff instead of restarting from one minute.
+        store.requeue_code_review_thread_collapse(&id).unwrap();
+        let requeued = next_attempt(&store) - chrono::Utc::now();
+        assert!(requeued > chrono::Duration::seconds(55), "{requeued}");
+        assert!(requeued <= chrono::Duration::seconds(61), "{requeued}");
+        store.defer_code_review_thread_collapse(&id).unwrap();
+        let after_requeue = next_attempt(&store) - chrono::Utc::now();
+        assert!(
+            after_requeue > chrono::Duration::minutes(59),
+            "{after_requeue}"
         );
     }
 

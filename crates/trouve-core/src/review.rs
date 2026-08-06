@@ -62,6 +62,9 @@ const REVIEW_COLLAPSE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const REVIEW_COLLAPSE_GROUP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Findings fetched per collapse-retry pass.
 const REVIEW_COLLAPSE_BATCH_LIMIT: u64 = 16;
+/// Pending groups (pull requests) collapsed in parallel per retry pass, so
+/// one slow group delays at most its own wave rather than the whole pass.
+const REVIEW_COLLAPSE_GROUP_CONCURRENCY: usize = 4;
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
 const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
@@ -247,6 +250,15 @@ struct RunningReview {
 /// RAII claim over finding ids in the shared collapse in-flight set;
 /// dropping it — including when a collapse pass future is cancelled —
 /// releases the ids so no finding can be locked out permanently.
+/// How one finding fared inside a collapse pass: `Completed` means its
+/// pending flag was settled (thread collapsed or provably absent), while
+/// `NotReached` means the group budget or an incomplete listing prevented an
+/// attempt — the finding is requeued without a backoff penalty.
+enum CollapseOutcome {
+    Completed,
+    NotReached,
+}
+
 struct CollapseClaim<'a> {
     in_flight: &'a Mutex<HashSet<String>>,
     findings: Vec<trouve_protocol::CodeReviewFinding>,
@@ -5110,12 +5122,13 @@ impl Engine {
     /// finding with bounded exponential backoff, and the loop continues with
     /// its peers — so one deterministically failing thread cannot starve the
     /// others. The deadline is checked between findings rather than
-    /// cancelling them, so no request is aborted mid-write and every
-    /// still-pending finding is deferred exactly once: attempted failures by
-    /// their own error, unattempted tail findings by the deadline check, and
-    /// cleared findings not at all. A defer that itself fails is logged
-    /// without displacing the first substantive error or aborting the loop.
-    /// Every remote request is individually bounded by
+    /// cancelling them, so no request is aborted mid-write; work the budget
+    /// never reached — the unattempted tail, and findings whose comments an
+    /// incomplete listing did not disprove — is requeued for the next tick
+    /// without counting a failure, reserving exponential backoff for actual
+    /// request failures. A defer that itself fails is logged without
+    /// displacing the first substantive error or aborting the loop. Every
+    /// remote request is individually bounded by
     /// [`REVIEW_THREAD_REQUEST_TIMEOUT`]; the first error is returned after
     /// the loop completes.
     async fn resolve_claimed_review_threads(
@@ -5146,27 +5159,35 @@ impl Engine {
         for (index, finding) in findings.iter().enumerate() {
             if Instant::now() >= deadline {
                 for remaining in &findings[index..] {
-                    self.defer_thread_collapse_logged(remaining);
+                    self.requeue_thread_collapse_logged(remaining);
                 }
-                first_error.get_or_insert(anyhow!(
-                    "group budget for {repository}#{pull_number} was exhausted after \
-                     {index} of {} findings; the remainder was deferred",
-                    findings.len()
-                ));
+                tracing::warn!(
+                    repository,
+                    pull_number,
+                    reached = index,
+                    total = findings.len(),
+                    "group budget was exhausted; the unattempted remainder was requeued"
+                );
                 break;
             }
-            let outcome = self
+            match self
                 .collapse_finding_thread(api, &thread_by_comment, listing_complete, finding)
-                .await;
-            if let Err(error) = outcome {
-                tracing::warn!(
-                    finding_id = finding.id,
-                    path = finding.path,
-                    error = format!("{error:#}"),
-                    "collapsing a finding's review thread failed; deferred with backoff"
-                );
-                self.defer_thread_collapse_logged(finding);
-                first_error.get_or_insert(error);
+                .await
+            {
+                Ok(CollapseOutcome::Completed) => {}
+                Ok(CollapseOutcome::NotReached) => {
+                    self.requeue_thread_collapse_logged(finding);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        finding_id = finding.id,
+                        path = finding.path,
+                        error = format!("{error:#}"),
+                        "collapsing a finding's review thread failed; deferred with backoff"
+                    );
+                    self.defer_thread_collapse_logged(finding);
+                    first_error.get_or_insert(error);
+                }
             }
         }
         match first_error {
@@ -5187,31 +5208,43 @@ impl Engine {
         }
     }
 
+    /// Requeues an unattempted collapse for the next tick without counting a
+    /// failure; a store error is logged and merely leaves it due sooner.
+    fn requeue_thread_collapse_logged(&self, finding: &trouve_protocol::CodeReviewFinding) {
+        if let Err(error) = self.store.requeue_code_review_thread_collapse(&finding.id) {
+            tracing::warn!(
+                finding_id = finding.id,
+                error = format!("{error:#}"),
+                "failed to requeue a review thread collapse"
+            );
+        }
+    }
+
     /// Collapses one finding's thread. A finding whose comment has no thread
-    /// in a complete listing is done — there is nothing to collapse — but if
-    /// the listing was truncated the absence proves nothing and the finding
-    /// stays pending for a later pass.
+    /// in a complete listing is done — there is nothing to collapse — but an
+    /// incomplete listing proves nothing, so the finding reports NotReached
+    /// and is requeued without a backoff penalty. Both clears are guarded on
+    /// the snapshot's comment id, so a concurrently re-armed row (a new
+    /// comment published after this snapshot) is never wiped by a stale
+    /// pass.
     async fn collapse_finding_thread(
         &self,
         api: &GithubApi,
         thread_by_comment: &HashMap<u64, (String, bool)>,
         listing_complete: bool,
         finding: &trouve_protocol::CodeReviewFinding,
-    ) -> Result<()> {
+    ) -> Result<CollapseOutcome> {
         let Some(comment_id) = finding.github_comment_id else {
-            // Never published as a comment: there is no thread regardless of
-            // what the listing showed.
-            self.store.clear_code_review_thread_collapse(&finding.id)?;
-            return Ok(());
+            // Never published as a comment when snapshotted: clear only
+            // while the row still has no comment.
+            self.store
+                .clear_code_review_thread_collapse(&finding.id, None)?;
+            return Ok(CollapseOutcome::Completed);
         };
         match thread_by_comment.get(&comment_id).cloned() {
             Some((thread_id, already_resolved)) => {
-                self.store.update_code_review_finding_publication(
-                    &finding.id,
-                    finding.github_comment_id,
-                    &finding.github_comment_url,
-                    Some(&thread_id),
-                )?;
+                self.store
+                    .cache_code_review_thread_id(&finding.id, comment_id, &thread_id)?;
                 if !already_resolved {
                     tokio::time::timeout(
                         REVIEW_THREAD_REQUEST_TIMEOUT,
@@ -5222,12 +5255,13 @@ impl Engine {
                 }
             }
             None if !listing_complete => {
-                bail!("review thread listing was truncated before the finding's comment was seen");
+                return Ok(CollapseOutcome::NotReached);
             }
             None => {}
         }
-        self.store.clear_code_review_thread_collapse(&finding.id)?;
-        Ok(())
+        self.store
+            .clear_code_review_thread_collapse(&finding.id, Some(comment_id))?;
+        Ok(CollapseOutcome::Completed)
     }
 
     /// One pass of the dedicated collapse-retry task: collapses threads that
@@ -5267,55 +5301,79 @@ impl Engine {
                 .or_default()
                 .push(finding);
         }
-        for ((installation_id, repository, pull_number), findings) in groups {
-            // A hung or failing token exchange defers the whole group: left
-            // merely skipped, these deterministically ordered rows would
-            // reclaim the batch head every pass and starve later groups.
-            let api = match tokio::time::timeout(
-                REVIEW_THREAD_REQUEST_TIMEOUT,
-                self.installation_api(installation_id),
+        // Independent pull requests proceed in parallel under a small cap:
+        // one slow group delays at most its wave, keeping the pass close to
+        // the retry cadence instead of a sum of sequential group budgets.
+        stream::iter(groups)
+            .for_each_concurrent(
+                REVIEW_COLLAPSE_GROUP_CONCURRENCY,
+                |((installation_id, repository, pull_number), findings)| async move {
+                    self.collapse_pending_group(
+                        installation_id,
+                        &repository,
+                        pull_number,
+                        &findings,
+                    )
+                    .await;
+                },
             )
-            .await
-            {
-                Ok(Ok(api)) => api,
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        repository,
-                        pull_number,
-                        error = format!("{error:#}"),
-                        "failed to build a GitHub client for pending thread collapses; \
-                         the group was deferred"
-                    );
-                    for finding in &findings {
-                        self.defer_thread_collapse_logged(finding);
-                    }
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        repository,
-                        pull_number,
-                        timeout_seconds = REVIEW_THREAD_REQUEST_TIMEOUT.as_secs(),
-                        "building a GitHub client for pending thread collapses timed out; \
-                         the group was deferred"
-                    );
-                    for finding in &findings {
-                        self.defer_thread_collapse_logged(finding);
-                    }
-                    continue;
-                }
-            };
-            if let Err(error) = self
-                .resolve_review_threads(&api, &repository, pull_number, &findings)
-                .await
-            {
+            .await;
+    }
+
+    /// Collapses one pending group. A hung or failing token exchange defers
+    /// the whole group: left merely skipped, these deterministically ordered
+    /// rows would reclaim the batch head every pass and starve later groups.
+    async fn collapse_pending_group(
+        &self,
+        installation_id: u64,
+        repository: &str,
+        pull_number: u64,
+        findings: &[trouve_protocol::CodeReviewFinding],
+    ) {
+        let api = match tokio::time::timeout(
+            REVIEW_THREAD_REQUEST_TIMEOUT,
+            self.installation_api(installation_id),
+        )
+        .await
+        {
+            Ok(Ok(api)) => api,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     repository,
                     pull_number,
                     error = format!("{error:#}"),
-                    "retrying review thread collapse failed; it stays queued for the next pass"
+                    "failed to build a GitHub client for pending thread collapses; \
+                     the group was deferred"
                 );
+                for finding in findings {
+                    self.defer_thread_collapse_logged(finding);
+                }
+                return;
             }
+            Err(_) => {
+                tracing::warn!(
+                    repository,
+                    pull_number,
+                    timeout_seconds = REVIEW_THREAD_REQUEST_TIMEOUT.as_secs(),
+                    "building a GitHub client for pending thread collapses timed out; \
+                     the group was deferred"
+                );
+                for finding in findings {
+                    self.defer_thread_collapse_logged(finding);
+                }
+                return;
+            }
+        };
+        if let Err(error) = self
+            .resolve_review_threads(&api, repository, pull_number, findings)
+            .await
+        {
+            tracing::warn!(
+                repository,
+                pull_number,
+                error = format!("{error:#}"),
+                "retrying review thread collapse failed; it stays queued for the next pass"
+            );
         }
     }
 
@@ -5358,10 +5416,10 @@ impl Engine {
         let mut cursor: Option<String> = None;
         loop {
             if Instant::now() >= deadline {
-                bail!(
-                    "review thread listing for {repository}#{pull_number} exceeded \
-                     the group budget"
-                );
+                // Budget exhaustion is not a request failure: return the
+                // incomplete listing so unmatched findings are requeued
+                // without a backoff penalty.
+                return Ok((thread_by_comment, false));
             }
             let body = serde_json::json!({
                 "query": query,
