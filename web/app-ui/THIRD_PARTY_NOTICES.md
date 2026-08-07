@@ -26,6 +26,8 @@ license review deliberately change that policy.
 | @codemirror/state | 6.7.1 | MIT | runtime/transitive |
 | @codemirror/view | 6.43.7 | MIT | runtime/transitive |
 | @ctrl/tinycolor | 4.1.0 | MIT | runtime/transitive |
+| @emnapi/core | 2.0.0-alpha.3 | MIT | development |
+| @emnapi/runtime | 2.0.0-alpha.3 | MIT | development |
 | @emnapi/wasi-threads | 2.0.1 | MIT | development |
 | @floating-ui/core | 1.8.0 | MIT | runtime/transitive |
 | @floating-ui/dom | 1.8.0 | MIT | runtime/transitive |
