@@ -373,6 +373,7 @@ def sync_nested_cargo_workspaces(
 
     changes: list[str] = []
     for relative in NESTED_CARGO_WORKSPACES:
+        workspace_change_index = len(changes)
         nested_root = root / relative
         manifest_path = nested_root / "Cargo.toml"
         if not manifest_path.exists():
@@ -503,6 +504,12 @@ def sync_nested_cargo_workspaces(
                 lock_changed = True
         if lock_changed:
             lock_path.write_text(lock_text, encoding="utf-8")
+
+        # Check mode reports stale manifest/lock state without rewriting it.
+        # Running `cargo metadata --locked` against that known-stale state
+        # would turn the actionable drift list into an early exception.
+        if check and len(changes) > workspace_change_index:
+            continue
 
         metadata = subprocess.run(
             [

@@ -98,6 +98,7 @@ const installEventStream = async (page: Page): Promise<void> => {
       onopen: ((event: Event) => void) | null = null;
       onmessage: ((event: MessageEvent<string>) => void) | null = null;
       onerror: ((event: Event) => void) | null = null;
+      readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
 
       constructor(url: string | URL) {
         this.url = String(url);
@@ -105,7 +106,9 @@ const installEventStream = async (page: Page): Promise<void> => {
         globalThis.setTimeout(() => {
           if (this.readyState === FixtureEventSource.CLOSED) return;
           this.readyState = FixtureEventSource.OPEN;
-          this.onopen?.(new Event("open"));
+          const event = new Event("open");
+          this.onopen?.(event);
+          this.dispatch("open", event);
           if (this.url.includes("/v1/threads/th_fixture/events")) {
             for (const event of seedEvents) this.emit(event);
           }
@@ -114,10 +117,37 @@ const installEventStream = async (page: Page): Promise<void> => {
 
       emit(event: { readonly cursor: number }): void {
         if (this.readyState !== FixtureEventSource.OPEN) return;
-        this.onmessage?.(new MessageEvent("message", {
+        const message = new MessageEvent<string>("message", {
           data: JSON.stringify(event),
           lastEventId: String(event.cursor),
-        }));
+        });
+        this.onmessage?.(message);
+        this.dispatch("message", message);
+      }
+
+      addEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+      ): void {
+        if (listener === null) return;
+        const listeners = this.listeners.get(type) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      removeEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+      ): void {
+        if (listener === null) return;
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      dispatch(type: string, event: Event): void {
+        for (const listener of this.listeners.get(type) ?? []) {
+          if (typeof listener === "function") listener.call(this, event);
+          else listener.handleEvent(event);
+        }
       }
 
       close(): void {
@@ -159,15 +189,29 @@ const installEventStream = async (page: Page): Promise<void> => {
   }, history);
 };
 
+interface ProtocolFixtureOptions {
+  readonly sentMessages?: Array<Record<string, unknown>>;
+  readonly messageDelayMs?: number;
+  readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
+  readonly threadViewFixture?: ThreadViewFixtureLoader;
+  readonly permissionMode?: "ask" | "allow_list" | "yolo";
+  readonly additionalThreads?: readonly Record<string, unknown>[];
+  readonly additionalSessions?: readonly Record<string, unknown>[];
+  readonly additionalSessionSummaries?: readonly Record<string, unknown>[];
+}
+
 const installProtocolFixtures = async (
   page: Page,
-  sentMessages: Array<Record<string, unknown>>,
-  messageDelayMs = 0,
-  threadViewFixture?: ThreadViewFixtureLoader,
-  permissionMode: "ask" | "allow_list" | "yolo" = "ask",
-  additionalThreads: readonly Record<string, unknown>[] = [],
-  additionalSessions: readonly Record<string, unknown>[] = [],
-  additionalSessionSummaries: readonly Record<string, unknown>[] = [],
+  {
+    sentMessages = [],
+    messageDelayMs = 0,
+    beforeMessageResponse,
+    threadViewFixture,
+    permissionMode = "ask",
+    additionalThreads = [],
+    additionalSessions = [],
+    additionalSessionSummaries = [],
+  }: ProtocolFixtureOptions = {},
 ): Promise<void> => {
   let messageCount = 0;
   let editedQueue: readonly Record<string, unknown>[] = [];
@@ -178,6 +222,7 @@ const installProtocolFixtures = async (
     if (key === "POST /v1/threads/th_fixture/messages") {
       sentMessages.push(request.postDataJSON() as Record<string, unknown>);
       messageCount += 1;
+      await beforeMessageResponse?.(messageCount);
       if (messageDelayMs > 0) {
         await new Promise((resolve) => globalThis.setTimeout(resolve, messageDelayMs));
       }
@@ -539,7 +584,7 @@ test.beforeEach(async ({ page }, testInfo) => {
 
 test("model picker escapes the composer control strip", async ({ page }) => {
   await page.setViewportSize({ width: 780, height: 620 });
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
 
@@ -588,7 +633,7 @@ test("model picker escapes the composer control strip", async ({ page }) => {
 });
 
 test("new-thread model choices do not wait for subscription health", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   let releaseHealth!: () => void;
   const healthPending = new Promise<void>((resolve) => {
     releaseHealth = resolve;
@@ -613,7 +658,7 @@ test("new-thread model choices do not wait for subscription health", async ({ pa
 });
 
 test("the YOLO warning remains centered and exposes its hover text", async ({ page }) => {
-  await installProtocolFixtures(page, [], 0, undefined, "yolo");
+  await installProtocolFixtures(page, { permissionMode: "yolo" });
   await page.goto("/");
   await replayHistory(page);
 
@@ -646,7 +691,7 @@ test("the YOLO warning remains centered and exposes its hover text", async ({ pa
 });
 
 test("pending image and file attachments reuse submitted chip geometry", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
 
@@ -707,7 +752,7 @@ test("pending image and file attachments reuse submitted chip geometry", async (
 });
 
 test("image attachment thumbnails open an accessible full-size preview", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -771,11 +816,9 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   const sentMessages: Array<Record<string, unknown>> = [];
   await installProtocolFixtures(
     page,
-    sentMessages,
-    0,
-    undefined,
-    "ask",
-    [{
+    {
+      sentMessages,
+      additionalThreads: [{
       id: "th_second",
       session_id: "se_1",
       mode: "code",
@@ -791,8 +834,8 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
       model_options: {},
       permission_mode: "ask",
       created_at: "2026-08-02T08:00:00Z",
-    }],
-    [{
+      }],
+      additionalSessions: [{
       id: "se_2",
       workspace_id: "ws_1",
       title: "Second session",
@@ -800,8 +843,8 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
       worktree_path: "/tmp/second-session",
       base_ref: "main",
       created_at: "2026-08-03T08:00:00Z",
-    }],
-    [{
+      }],
+      additionalSessionSummaries: [{
       session_id: "se_2",
       workspace_id: "ws_1",
       archived: false,
@@ -810,14 +853,22 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
       outcome: "idle",
       latest_cursor: 0,
       updated_at: "2026-08-03T08:00:00Z",
-    }],
+      }],
+    },
   );
   const openSession = async (name: RegExp): Promise<void> => {
     const session = page.getByRole("button", { name });
+    const mobileSessions = page.getByRole("button", {
+      name: "Sessions",
+      exact: true,
+    });
+    await expect.poll(async () =>
+      await session.isVisible() || await mobileSessions.isVisible()
+    ).toBe(true);
     if (!(await session.isVisible())) {
-      await page.getByRole("button", { name: "Sessions", exact: true })
-        .evaluate((button: HTMLButtonElement) => button.click());
+      await mobileSessions.evaluate((button: HTMLButtonElement) => button.click());
     }
+    await expect(session).toBeVisible();
     await session.click();
   };
   await page.goto("/");
@@ -849,11 +900,24 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
 
   await expect.poll(() => page.evaluate(async () => await new Promise<number>((resolve) => {
-    const request = indexedDB.open("trouve-composer-drafts", 1);
+    const request = indexedDB.open("trouve-composer-drafts");
     request.onerror = () => resolve(0);
+    request.onblocked = () => resolve(0);
     request.onsuccess = () => {
       const database = request.result;
-      const transaction = database.transaction("thread-attachments", "readonly");
+      if (!database.objectStoreNames.contains("thread-attachments")) {
+        database.close();
+        resolve(0);
+        return;
+      }
+      let transaction: IDBTransaction;
+      try {
+        transaction = database.transaction("thread-attachments", "readonly");
+      } catch {
+        database.close();
+        resolve(0);
+        return;
+      }
       const stored = transaction.objectStore("thread-attachments").get("th_fixture");
       stored.onerror = () => resolve(0);
       stored.onsuccess = () => {
@@ -888,7 +952,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
 });
 
 test("chat cards unmount collapsed output and expose response copy actions", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
 
@@ -1154,7 +1218,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
 });
 
 test("the Chat preference adds one disclosure around the standard activity timeline", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.addInitScript(() => {
     localStorage.setItem("trouve.chat.v1", JSON.stringify({
       collapseThinkingWithTools: true,
@@ -1254,12 +1318,13 @@ test("the Chat preference adds one disclosure around the standard activity timel
   const geometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
     const summary = group.querySelector<HTMLElement>(":scope > summary");
-    const disclosure = summary?.querySelector<HTMLElement>(".disclosure-icon");
-    const label = summary?.querySelector<HTMLElement>("strong");
+    if (summary === null) throw new Error("missing combined activity summary");
+    const disclosure = summary.querySelector<HTMLElement>(".disclosure-icon");
+    const label = summary.querySelector<HTMLElement>("strong");
     const prose = timeline?.nextElementSibling
       ?.querySelector<HTMLElement>("trouve-markdown-view")
       ?.shadowRoot?.querySelector<HTMLElement>("p");
-    if (timeline === null || summary === null || disclosure === null
+    if (timeline === null || disclosure === null
       || label === null || prose === null || prose === undefined) {
       throw new Error("missing combined activity geometry");
     }
@@ -1360,7 +1425,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
 });
 
 test("the Chat preference persists across a frontend reload", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/settings/chat");
 
   const preference = page.getByRole("checkbox", {
@@ -1382,7 +1447,7 @@ test("the Chat preference persists across a frontend reload", async ({ page }) =
 test("legacy context compaction tools stay outside collapsed-thinking groups", async ({
   page,
 }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.addInitScript(() => {
     localStorage.setItem("trouve.chat.v1", JSON.stringify({
       collapseThinkingWithTools: true,
@@ -1543,7 +1608,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
 test("running activity groups retain explicit disclosure state as tools arrive", async ({
   page,
 }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -1638,7 +1703,7 @@ test("running activity groups retain explicit disclosure state as tools arrive",
 test("context compaction is an animated durable boundary between tool groups", async ({
   page,
 }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -1757,7 +1822,7 @@ test("context compaction is an animated durable boundary between tool groups", a
 test("standalone tool headers align their timeline node and disclosure controls", async ({
   page,
 }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -1870,7 +1935,7 @@ test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
     !["desktop-chromium", "desktop-webkit"].includes(testInfo.project.name),
     "Desktop Chromium and WebKit own the frame-level virtual-row geometry regression",
   );
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -2020,7 +2085,7 @@ test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
 });
 
 test("collapsing the bottom tool keeps the live tail stable", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
   await emitBatch(page, [
@@ -2082,17 +2147,11 @@ test("collapsing the bottom tool keeps the live tail stable", async ({ page }) =
 
   await summary.click();
   await expect(card.getByLabel("Live tool output")).toBeVisible();
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
-  expect(await transcriptComposerGap(page)).toBe(8);
+  await expect.poll(() => transcriptComposerGap(page)).toBe(8);
 
   await summary.click();
   await expect(card.getByLabel("Live tool output")).toHaveCount(0);
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
-  expect(await transcriptComposerGap(page)).toBe(8);
+  await expect.poll(() => transcriptComposerGap(page)).toBe(8);
 
   const collapsedGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
     canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
@@ -2133,10 +2192,7 @@ test("collapsing the bottom tool keeps the live tail stable", async ({ page }) =
     scrollTop: viewport.scrollTop,
   }));
   await page.getByRole("textbox", { name: "Message", exact: true }).fill("Keep the tail still");
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
-  expect(await transcriptComposerGap(page)).toBe(8);
+  await expect.poll(() => transcriptComposerGap(page)).toBe(8);
   const afterTypingGeometry = await page.locator(".chat-stream").evaluate((viewport) => ({
     canvasHeight: viewport.querySelector<HTMLElement>(".chat-virtual-canvas")
       ?.getBoundingClientRect().height ?? 0,
@@ -2158,7 +2214,7 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
     testInfo.project.name !== "desktop-chromium",
     "One Chromium project owns the multi-viewport pathological-content matrix",
   );
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
 
@@ -2430,7 +2486,7 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
 });
 
 test("long chat history keeps a bounded DOM with an accessible full-history fallback", async ({ page }) => {
-  await installProtocolFixtures(page, []);
+  await installProtocolFixtures(page);
   await page.addInitScript(() => {
     localStorage.setItem("trouve.resume.v1", JSON.stringify({
       selectedSessionId: "se_1",
@@ -2647,7 +2703,12 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     viewportBounds.y + viewportBounds.height / 2,
   );
   await page.mouse.wheel(0, -4_000);
-  await page.waitForTimeout(350);
+  await expect.poll(() => page.evaluate(() => {
+    const diagnostics = globalThis as typeof globalThis & {
+      __trouveScrollSamples?: number[];
+    };
+    return diagnostics.__trouveScrollSamples?.length ?? 0;
+  })).toBeGreaterThan(1);
   const fastScrollDiagnostics = await page.evaluate(() => {
     const diagnostics = globalThis as typeof globalThis & {
       __trouveScrollRanges?: Array<{
@@ -2707,6 +2768,7 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
 });
 
 test("prefetches older history before the reader reaches the loaded boundary", async ({ page }) => {
+  const olderPageBoundaries = [150, 120, 90, 60, 30] as const;
   const historyPage = (start: number, end: number, hasOlder: boolean) => ({
     item_offset: start,
     total_items: 240,
@@ -2725,26 +2787,33 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   let olderRequests = 0;
   let olderResponses = 0;
   const olderBoundaries: number[] = [];
+  const completedBoundaries: number[] = [];
   let releaseSecondPage: (() => void) | undefined;
   const secondPageReleased = new Promise<void>((resolve) => {
     releaseSecondPage = resolve;
   });
-  await installProtocolFixtures(page, [], 0, async (before) => {
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
     if (before === undefined) {
-      return { snapshot: historyPage(120, 240, true) };
+      return { snapshot: historyPage(150, 240, true) };
     }
     olderRequests += 1;
     olderBoundaries.push(before);
-    if (before === 120) {
+    if (before === 150) {
       await new Promise((resolve) => globalThis.setTimeout(resolve, 75));
-    } else {
+    } else if (before === 120) {
       await secondPageReleased;
     }
     olderResponses += 1;
-    if (before === 120) return { snapshot: historyPage(60, 120, true) };
-    if (before === 60) return { snapshot: historyPage(0, 60, false) };
-    throw new Error(`unexpected history boundary ${before}`);
-  });
+    completedBoundaries.push(before);
+    const pageIndex = olderPageBoundaries.indexOf(
+      before as typeof olderPageBoundaries[number],
+    );
+    if (pageIndex < 0) throw new Error(`unexpected history boundary ${before}`);
+    const start = olderPageBoundaries[pageIndex + 1] ?? 0;
+    return {
+      snapshot: historyPage(start, before, pageIndex + 1 < olderPageBoundaries.length),
+    };
+  } });
   await page.goto("/");
   await replayHistory(page);
 
@@ -2847,19 +2916,24 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
   });
-  await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
-    [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")].some((row) => {
-      const match = /^user:snapshot:(\d+)$/.exec(row.dataset["virtualId"] ?? "");
-      return match !== null && Number(match[1]) < 60;
-    })
-  )).toBe(true);
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
+  await expect.poll(async () => {
+    await page.locator(".chat-stream").evaluate((viewport) => {
+      viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    return new Set(olderBoundaries).has(60);
+  }).toBe(true);
+  await expect.poll(() => completedBoundaries.includes(60)).toBe(true);
+  const requestedBoundaries = [...new Set(olderBoundaries)];
+  expect(requestedBoundaries).toContain(120);
   expect(olderBoundaries).toContain(60);
-  expect(olderBoundaries.every((boundary) => boundary === 120 || boundary === 60)).toBe(true);
   expect(olderBoundaries.filter((boundary) => boundary === 60)).toHaveLength(1);
-  // A route refresh may reinstall the same folded tail while this test is
-  // active. Re-fetching that same bounded page is harmless; walking the full
-  // transcript without user scroll is not.
-  expect(olderBoundaries.length).toBeLessThanOrEqual(3);
+  // More older pages remain available than the reader requested. Re-fetching
+  // a boundary after a route refresh is harmless; automatically walking every
+  // distinct page from one scroll gesture is not.
+  expect(requestedBoundaries.length).toBeLessThan(olderPageBoundaries.length);
 });
 
 test("keeps a nested thought anchored when history extends the same agent turn", async ({
@@ -2886,7 +2960,7 @@ test("keeps a nested thought anchored when history extends the same agent turn",
   const oldestPageReleased = new Promise<void>((resolve) => {
     releaseOldestPage = resolve;
   });
-  await installProtocolFixtures(page, [], 0, async (before) => {
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
     if (before === undefined) return { snapshot: historyPage(30, 90, true) };
     if (before === 30) {
       oldestRequests += 1;
@@ -2895,7 +2969,7 @@ test("keeps a nested thought anchored when history extends the same agent turn",
       return { snapshot: historyPage(0, 30, false) };
     }
     throw new Error(`unexpected long-turn history boundary ${before}`);
-  });
+  } });
   await page.goto("/");
   await replayHistory(page);
   await expect(page.getByText("Stable thought 30", { exact: true })).toBeVisible();
@@ -2937,6 +3011,8 @@ test("keeps a nested thought anchored when history extends the same agent turn",
             - expected.offset,
         );
   }, anchor)).toBeLessThanOrEqual(2);
+  // Let the 500 ms CHAT_HISTORY_ANCHOR_SETTLE_MS correction window expire,
+  // then prove the released off-screen page cannot move the preserved anchor.
   await page.waitForTimeout(600);
   expect(await viewport.evaluate((element, expected) => {
     const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
@@ -2953,7 +3029,13 @@ test("keeps a nested thought anchored when history extends the same agent turn",
 
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {
   const sentMessages: Array<Record<string, unknown>> = [];
-  await installProtocolFixtures(page, sentMessages, 250);
+  const messageReleases: Array<() => void> = [];
+  await installProtocolFixtures(page, {
+    sentMessages,
+    beforeMessageResponse: () => new Promise<void>((resolve) => {
+      messageReleases.push(resolve);
+    }),
+  });
   await page.goto("/");
   await replayHistory(page);
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
@@ -2963,6 +3045,8 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Send");
   await submit.click();
   await expect(submit).toHaveText("Sending…");
+  expect(messageReleases).toHaveLength(1);
+  messageReleases.shift()?.();
   await expect(submit).toHaveText("Starting…");
   await expect(page.locator('[data-virtual-id="ephemeral:activity"] .agent-activity'))
     .toContainText("Starting turn…");
@@ -2971,6 +3055,8 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Queue");
   await submit.click();
   await expect(submit).toHaveText("Queueing…");
+  expect(messageReleases).toHaveLength(1);
+  messageReleases.shift()?.();
   await expect(submit).toHaveText("Starting…");
 
   await emit(page, threadEvent(16, {
@@ -3085,6 +3171,8 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Send next");
   await submit.click();
   await expect(submit).toHaveText("Queueing…");
+  expect(messageReleases).toHaveLength(1);
+  messageReleases.shift()?.();
   await expect(submit).toHaveText("Stopping…");
   await emit(page, threadEvent(20, { type: "turn.cancelled", turn: 8 }));
   await emit(page, threadEvent(21, {

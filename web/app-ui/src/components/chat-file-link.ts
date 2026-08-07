@@ -27,11 +27,17 @@ export const parseChatFileTarget = (value: string): ChatFileTarget | undefined =
 
   let from = 0;
   let to = 0;
-  const colon = target.lastIndexOf(":");
-  if (colon > 0 && /^\d+$/u.test(target.slice(colon + 1))) {
-    const line = Number(target.slice(colon + 1));
+  const trailingColon = target.lastIndexOf(":");
+  if (trailingColon > 0 && /^\d+$/u.test(target.slice(trailingColon + 1))) {
+    const beforeTrailing = target.slice(0, trailingColon);
+    const lineColon = beforeTrailing.lastIndexOf(":");
+    const hasColumn = lineColon > 0 && /^\d+$/u.test(beforeTrailing.slice(lineColon + 1));
+    const line = Number(target.slice(
+      hasColumn ? lineColon + 1 : trailingColon + 1,
+      hasColumn ? trailingColon : undefined,
+    ));
     if (Number.isSafeInteger(line) && line > 0) {
-      target = target.slice(0, colon);
+      target = target.slice(0, hasColumn ? lineColon : trailingColon);
       from = line;
       to = line;
     }

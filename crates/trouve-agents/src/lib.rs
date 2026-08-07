@@ -177,6 +177,8 @@ pub enum BackendEvent {
     CompactionStarted,
     /// The vendor harness finished compacting its own conversation context.
     CompactionCompleted,
+    /// The vendor harness finished a compaction item unsuccessfully.
+    CompactionFailed,
     Completed {
         usage: Usage,
     },
@@ -213,6 +215,7 @@ impl std::fmt::Debug for BackendEvent {
             Self::UsageUpdated { usage } => write!(f, "UsageUpdated({usage:?})"),
             Self::CompactionStarted => f.write_str("CompactionStarted"),
             Self::CompactionCompleted => f.write_str("CompactionCompleted"),
+            Self::CompactionFailed => f.write_str("CompactionFailed"),
             Self::Completed { usage } => write!(f, "Completed({usage:?})"),
         }
     }
@@ -591,7 +594,11 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         Ok(BackendEvent::UsageUpdated { .. } | BackendEvent::Completed { .. }) => {
             std::mem::size_of::<Usage>()
         }
-        Ok(BackendEvent::CompactionStarted | BackendEvent::CompactionCompleted) => 0,
+        Ok(
+            BackendEvent::CompactionStarted
+            | BackendEvent::CompactionCompleted
+            | BackendEvent::CompactionFailed,
+        ) => 0,
         Err(error) => error.to_string().len(),
     }
 }

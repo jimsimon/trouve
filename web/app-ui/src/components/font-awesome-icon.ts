@@ -8,7 +8,7 @@ import { html, nothing, type TemplateResult } from "lit";
  * or resolving icons from a CDN. The glyphs come from the 7.3.1 free solid
  * font included by @fortawesome/fontawesome-free.
  */
-const FONT_AWESOME_CODEPOINTS = Object.freeze({
+export const FONT_AWESOME_CODEPOINTS = Object.freeze({
   "arrow-down": 0xf063,
   "arrow-left": 0xf060,
   "arrow-right": 0xf061,
@@ -108,5 +108,7 @@ export const fontAwesomeIcon = (
     role=${label === "" ? nothing : "img"}
     aria-label=${label === "" ? nothing : label}
     aria-hidden=${label === "" ? "true" : nothing}
-  >${String.fromCodePoint(FONT_AWESOME_CODEPOINTS[name])}</span>`;
+  >${Number.isInteger(FONT_AWESOME_CODEPOINTS[name])
+    ? String.fromCodePoint(FONT_AWESOME_CODEPOINTS[name])
+    : "□"}</span>`;
 };

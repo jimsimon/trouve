@@ -184,7 +184,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(generated, encoding="utf-8")
-    print(f"wrote {args.output.relative_to(ROOT)}")
+    try:
+        display_path = args.output.relative_to(ROOT)
+    except ValueError:
+        display_path = args.output
+    print(f"wrote {display_path}")
     return 0
 
 

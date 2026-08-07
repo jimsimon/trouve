@@ -2,11 +2,15 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  sessionIndicatorPresentation,
+  type SessionIndicatorFields,
+} from "../state/session-indicator-model.js";
+
 describe("session list component contract", () => {
   const read = (path: string): string =>
     readFileSync(new URL(path, import.meta.url), "utf8");
   const component = read("./session-list.ts");
-  const indicatorModel = read("../state/session-indicator-model.ts");
   const shell = read("../app/trouve-app.ts");
   const styles = read("../styles/app.css");
 
@@ -33,16 +37,29 @@ describe("session list component contract", () => {
 
   it("uses Slint's attention, error, unread, busy, and idle presentations", () => {
     expect(component).toContain("sessionIndicatorPresentation(session)");
-    expect(indicatorModel).toContain('kind: "approval",\n      icon: "triangle-exclamation"');
-    expect(indicatorModel).toContain('kind: "question",\n      icon: "circle-question"');
-    expect(indicatorModel).toContain('kind: "both",\n      icon: "triangle-exclamation"');
-    expect(indicatorModel).toContain('kind: "error",\n      icon: "xmark"');
-    expect(indicatorModel).toContain('kind: "unread", icon: "circle"');
-    expect(indicatorModel).toContain('kind: "busy", icon: undefined');
-    expect(indicatorModel).toContain('kind: "none", icon: undefined');
-    expect(indicatorModel).toContain('session.unread && session.outcome === "failed"');
-    expect(indicatorModel).toContain('session.unread && session.outcome === "succeeded"');
-    expect(indicatorModel).toContain('session.active || session.outcome === "running"');
+    const idle: SessionIndicatorFields = {
+      active: false,
+      attention: "none",
+      outcome: "idle",
+      unread: false,
+    };
+    expect([
+      sessionIndicatorPresentation({ ...idle, attention: "approval" }),
+      sessionIndicatorPresentation({ ...idle, attention: "question" }),
+      sessionIndicatorPresentation({ ...idle, attention: "both" }),
+      sessionIndicatorPresentation({ ...idle, outcome: "failed", unread: true }),
+      sessionIndicatorPresentation({ ...idle, outcome: "succeeded", unread: true }),
+      sessionIndicatorPresentation({ ...idle, active: true }),
+      sessionIndicatorPresentation(idle),
+    ].map(({ kind, icon }) => ({ kind, icon }))).toEqual([
+      { kind: "approval", icon: "triangle-exclamation" },
+      { kind: "question", icon: "circle-question" },
+      { kind: "both", icon: "triangle-exclamation" },
+      { kind: "error", icon: "xmark" },
+      { kind: "unread", icon: "circle" },
+      { kind: "busy", icon: undefined },
+      { kind: "none", icon: undefined },
+    ]);
     expect(styles).toMatch(
       /\.session-indicator\.busy::before \{[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-session-busy-pulse 1\.6s linear infinite/s,
     );

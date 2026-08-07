@@ -91,7 +91,11 @@ version.workspace = true
             )
 
     def test_nested_workspace_version_rewrite_is_scoped_to_its_table(self) -> None:
-        text = """[workspace]
+        text = """[package]
+name = "trouve-isolated"
+version = "9.9.9"
+
+[workspace]
 members = ["."]
 
 [workspace.package]
@@ -104,7 +108,52 @@ example = "9.9.9"
             text, "3.0.0"
         )
         self.assertIn('[workspace.package]\nversion = "3.0.0"', rewritten)
+        self.assertIn('[package]\nname = "trouve-isolated"\nversion = "9.9.9"', rewritten)
         self.assertIn('example = "9.9.9"', rewritten)
+
+    def test_nested_workspace_check_reports_drift_without_running_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "crates/trouve-servo-embed-preview"
+            write(
+                nested / "Cargo.toml",
+                """[workspace]
+members = ["."]
+
+[workspace.package]
+version = "2.1.0"
+
+[workspace.dependencies]
+trouve-client-core = { path = "../trouve-client-core", version = "2.1.0" }
+
+[package]
+name = "trouve-servo-embed-preview"
+version.workspace = true
+""",
+            )
+            write(
+                nested / "Cargo.lock",
+                """version = 4
+
+[[package]]
+name = "trouve-servo-embed-preview"
+version = "2.1.0"
+
+[[package]]
+name = "trouve-client-core"
+version = "2.1.0"
+""",
+            )
+
+            changes = sync_versions.sync_nested_cargo_workspaces(
+                root, "3.0.0", check=True
+            )
+
+            self.assertGreaterEqual(len(changes), 4)
+            self.assertEqual(
+                sync_versions.load_toml(nested / "Cargo.toml")["workspace"]["package"]["version"],
+                "2.1.0",
+            )
 
     def test_workspace_dependency_pins_are_checked_and_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

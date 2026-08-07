@@ -351,7 +351,10 @@ export class ComposerDraftController {
       !force
       && (
         sameAttachments(this.#queuedAttachments.get(threadId), attachments)
-        || sameAttachments(this.#persistedAttachments.get(threadId), attachments)
+        || (
+          !this.#attachmentWrites.has(threadId)
+          && sameAttachments(this.#persistedAttachments.get(threadId), attachments)
+        )
       )
     ) return this.#attachmentWrites.get(threadId) ?? Promise.resolve();
 

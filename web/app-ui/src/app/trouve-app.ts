@@ -1694,10 +1694,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       for (const [index, file] of files.entries()) {
-        if (this.#newSessionAttachments.length >= MAX_PENDING_ATTACHMENTS) {
-          this.#newSessionError = `Attach at most ${MAX_PENDING_ATTACHMENTS} files at once.`;
-          break;
-        }
         let attachment: PendingAttachment;
         try {
           attachment = await encodeAttachment(
@@ -1715,15 +1711,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               : `${file.name || "Attachment"} could not be read.`;
           continue;
         }
-        const total = this.#newSessionAttachments.reduce(
-          (bytes, pending) => bytes + pending.size,
-          attachment.size,
-        );
-        if (total > MAX_PENDING_ATTACHMENT_BYTES) {
-          this.#newSessionError = "Pending attachments exceed the 20 MB mobile memory budget.";
-          break;
-        }
-        this.#newSessionAttachments = [...this.#newSessionAttachments, attachment];
+        if (!this.#stageNewSessionAttachment(attachment)) break;
       }
     } finally {
       this.#newSessionAttachmentPending = false;
@@ -1753,7 +1741,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const prompt = String(data.get("prompt") ?? "").trim();
     const baseRef = String(data.get("base_ref") ?? "");
     const fetchLatest = data.get("fetch_latest") === "on";
-    if (workspaceId === "" || prompt === "") return;
+    if (
+      workspaceId === ""
+      || (prompt === "" && this.#newSessionAttachments.length === 0)
+    ) return;
     this.#newSessionPending = true;
     this.#newSessionError = "";
     this.requestUpdate();
@@ -2009,7 +2000,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.requestUpdate();
         return;
       }
-      void host.openHttpsUrl(event.detail.href).catch(() => {
+      void host.openHttpsUrl(url.href).catch(() => {
         this.#shellNotice = "The external link could not be opened.";
         this.requestUpdate();
       });
@@ -2063,7 +2054,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         (route.inspection ?? "diff") !== "files"
       ) return;
       const workspace = this.querySelector<TrouveInspectionWorkspace>(
-        `trouve-inspection-workspace[session-id="${CSS.escape(pending.sessionId)}"]`,
+        "trouve-inspection-workspace",
       );
       if (workspace === null) {
         this.requestUpdate();

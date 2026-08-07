@@ -701,12 +701,12 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     const appId = Number(appIdControl.value);
     const privateKey = privateKeyControl.value;
     const webhookSecret = webhookControl.value;
-    privateKeyControl.value = "";
-    webhookControl.value = "";
     if (!Number.isSafeInteger(appId) || appId < 1 || privateKey === "") {
       this.#setNotice("Enter a valid App id and complete RSA private key.", true);
       return;
     }
+    privateKeyControl.value = "";
+    webhookControl.value = "";
 
     this.#busy = "github-app";
     this.requestUpdate();
@@ -782,7 +782,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     const draft = this.#repositoryDrafts.get(key);
     if (draft === undefined) return;
     const index = draft.reviewerOverrides.findIndex((override) => override.reviewerId === reviewerId);
-    const current = draft.reviewerOverrides.find((override) => override.reviewerId === reviewerId);
+    const current = index < 0 ? undefined : draft.reviewerOverrides[index];
     const updated: ReviewerOverrideDraft = { ...(current ?? emptyOverride(reviewerId)), ...patch };
     const overrides = index < 0
       ? [...draft.reviewerOverrides, updated]

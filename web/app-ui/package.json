@@ -35,6 +35,7 @@
     "@awesome.me/webawesome": "^3.11.0",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-json": "^6.0.2",
     "@codemirror/language": "^6.12.4",
     "@codemirror/merge": "^6.12.2",
     "@codemirror/search": "^6.7.1",

@@ -1728,6 +1728,7 @@ export interface components {
             /** Format: int64 */
             github_comment_id?: number | null;
             github_comment_url?: string;
+            github_publication_status?: components["schemas"]["CodeReviewFindingPublicationStatus"];
             github_thread_id?: string | null;
             id: string;
             job_id: string;
@@ -1743,6 +1744,11 @@ export interface components {
             /** @description `open`, `fixed`, or `dismissed`. */
             status: string;
         };
+        /**
+         * @description The outcome of attempting to publish a finding as an inline GitHub comment.
+         * @enum {string}
+         */
+        CodeReviewFindingPublicationStatus: "pending" | "published" | "not_eligible" | "failed";
         /** @description A persona/candidate that contributed to a confirmed published finding. */
         CodeReviewFindingSource: {
             candidate_id: string;
@@ -1822,6 +1828,10 @@ export interface components {
             /** Format: int64 */
             running_elapsed_ms?: number;
             scope?: components["schemas"]["CodeReviewJobScope"];
+            /**
+             * @description Snapshotted Additive semantic-routing choice. Automatic jobs route
+             *     semantically regardless of a legacy `false` value.
+             */
             semantic_routing?: boolean;
             session_id?: string | null;
             /** Format: date-time */
@@ -1988,8 +1998,8 @@ export interface components {
              */
             routing_mode?: components["schemas"]["CodeReviewRoutingMode"];
             /**
-             * @description Whether Additive or Automatic mode may run one tool-free semantic
-             *     router pass per diff batch. Semantic choices can only add personas.
+             * @description Whether Additive mode may run one tool-free semantic router pass per
+             *     diff batch. Automatic mode always runs it as the sole selector.
              */
             semantic_routing?: boolean;
         };
@@ -2420,6 +2430,11 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "thread.compaction_completed";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "thread.compaction_failed";
         } | {
             checkpoint_id: components["schemas"]["String"];
             /** @description Git commit hash the checkpoint points at. */
@@ -3674,7 +3689,7 @@ export interface components {
             routing_mode?: null | components["schemas"]["CodeReviewRoutingMode"];
             /**
              * @description Omitted by older clients to preserve the current/default semantic
-             *     routing choice.
+             *     routing choice. Forced to `true` when `routing_mode` is Automatic.
              */
             semantic_routing?: boolean | null;
         };

@@ -5,7 +5,9 @@ import { SignalWatcher, watch } from "@lit-labs/signals";
 import type { ReactiveElement } from "lit";
 import { Signal } from "signal-polyfill";
 
-export type ReadonlySignal<T> = Signal.State<T> | Signal.Computed<T>;
+export interface ReadonlySignal<T> {
+  get(): T;
+}
 
 export const createSignal = <T>(initialValue: T): Signal.State<T> =>
   new Signal.State(initialValue);
@@ -15,7 +17,8 @@ export const createComputed = <T>(compute: () => T): Signal.Computed<T> =>
 
 export const readSignal = <T>(signal: ReadonlySignal<T>): T => signal.get();
 
-export const renderSignal = <T>(signal: ReadonlySignal<T>) => watch(signal);
+export const renderSignal = <T>(signal: ReadonlySignal<T>) =>
+  watch(signal as Signal.State<T> | Signal.Computed<T>);
 
 // The upstream mixin accepts arbitrary constructor signatures.
 // eslint is not part of this package; keep the compatibility type local here.

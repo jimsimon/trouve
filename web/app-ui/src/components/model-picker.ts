@@ -63,9 +63,9 @@ export class TrouveModelPicker extends LitElement {
     }
     const popup = this.querySelector<HTMLElement>(".model-picker-popup");
     if (popup === null) return;
-    if (typeof popup.showPopover === "function" && !popup.matches(":popover-open")) {
+    if (typeof popup.showPopover === "function") {
       try {
-        popup.showPopover();
+        if (!popup.matches(":popover-open")) popup.showPopover();
       } catch {
         // Older embedded engines use the fixed-position fallback below.
       }

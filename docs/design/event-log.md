@@ -45,7 +45,8 @@ session stream.
 - Resumption: clients send `Last-Event-ID: <cursor>` (or `?after=<cursor>`);
   the server replays every persisted event after that cursor, then continues
   live. Replay and live delivery are indistinguishable to the client.
-- Cursors are ordered but not dense. Rows in other scopes consume values, so
+- The store allocates one globally monotonic cursor across all scopes. Scopes
+  only filter which events are delivered, so cursors are ordered but not dense:
   clients must drop duplicates and older events but must never require
   `next_cursor == previous_cursor + 1`.
 - A client may seed itself from a server-derived snapshot carrying

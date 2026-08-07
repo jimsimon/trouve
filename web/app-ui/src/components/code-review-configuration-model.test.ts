@@ -209,4 +209,20 @@ describe("GitHub App diagnostics", () => {
     expect(sanitized.status.last_error).toBe("");
     expect(JSON.stringify(sanitized)).not.toContain("sensitive vendor diagnostic");
   });
+
+  it("does not request attention without a configured diagnostic", () => {
+    for (const status of [{
+      configured: true,
+      app_id: 123,
+      bot_login: "trouve-review[bot]",
+      last_error: "",
+    }, {
+      configured: false,
+      app_id: 0,
+      bot_login: "",
+      last_error: "stale diagnostic",
+    }] satisfies ProtocolGithubAppStatus[]) {
+      expect(sanitizeGithubAppStatus(status).needsAttention).toBe(false);
+    }
+  });
 });

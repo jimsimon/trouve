@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.8"
+    "version": "3.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -6761,6 +6761,27 @@
                 "type": "string",
                 "enum": [
                   "thread.compaction_completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A provider-owned compaction item terminated unsuccessfully. This is a\ndistinct terminal edge so clients can clear their busy state even when\nthe vendor turn continues producing ordinary output.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_failed"
                 ]
               }
             }

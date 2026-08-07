@@ -43,7 +43,7 @@ export interface CodeReviewSettingsDraft {
 
 export const MAX_PARALLEL_REVIEWS = 32;
 export const TIMEOUT_MINUTES_INPUT_MIN = String(1 / 60);
-export const TIMEOUT_MINUTES_INPUT_STEP = TIMEOUT_MINUTES_INPUT_MIN;
+export const TIMEOUT_MINUTES_INPUT_STEP = "any";
 
 const isActiveStatus = (status: string): boolean =>
   status === "queued" || status === "running";

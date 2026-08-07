@@ -3618,11 +3618,13 @@ export component AppWindow inherits Window {
                                 height: compact-content.preferred-height + 10px;
                                 Rectangle {
                                     y: 0px;
+                                    width: parent.width;
                                     height: 1px;
                                     background: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
                                 }
                                 Rectangle {
                                     y: parent.height - 1px;
+                                    width: parent.width;
                                     height: 1px;
                                     background: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
                                 }

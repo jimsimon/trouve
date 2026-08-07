@@ -5,7 +5,8 @@ Status: Accepted (2026-08)
 ## Context
 
 ADR 0023 requires Servo to pass an embedding qualification before it can be a
-desktop engine candidate. Servo 0.4.0 depends on rusqlite 0.37 and
+desktop engine candidate. The Servo revision selected under ADR 0025 depends
+on rusqlite 0.37 and
 libsqlite3-sys 0.35, while the root workspace uses rusqlite 0.40 and
 libsqlite3-sys 0.38. Cargo permits only one package with `links = "sqlite3"`
 in a resolver graph, so the exact Servo release and the product server cannot
@@ -19,7 +20,8 @@ conflict, but would not test a chrome-free in-process embedder or its lifecycle.
 
 Keep `crates/trouve-servo-embed-preview` as a nested Cargo workspace excluded
 from the root workspace. It has its own lockfile and resolves the exact Servo
-0.4.0 dependency independently. It remains a first-party package whose product
+nightly revision mandated by ADR 0025 independently. It remains a first-party
+package whose product
 version and internal Trouve dependency pins are synchronized from the root
 workspace version.
 

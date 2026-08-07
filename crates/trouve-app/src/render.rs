@@ -1135,6 +1135,7 @@ fn segment_rows(
                 args,
                 status,
                 result,
+                duration_ms: _,
             } => {
                 let mut row = tool_row(call_id, tool, args, *status, result, expanded);
                 row.md_indent = indent;
@@ -2445,6 +2446,7 @@ mod tests {
                     args,
                     status: ToolCallStatus::Running,
                     result: None,
+                    duration_ms: None,
                 }],
                 turn_running: true,
                 ..Default::default()
@@ -2498,6 +2500,7 @@ mod tests {
             args: serde_json::json!({}),
             status,
             result: None,
+            duration_ms: None,
         };
         let vm = ThreadViewModel {
             items: vec![
@@ -2913,6 +2916,7 @@ mod tests {
             args: serde_json::json!({}),
             status: ToolCallStatus::Ok,
             result: None,
+            duration_ms: None,
         };
         let mut vm = ThreadViewModel {
             items: vec![
@@ -3157,6 +3161,7 @@ mod tests {
             args: serde_json::json!({}),
             status: ToolCallStatus::Running,
             result: None,
+            duration_ms: None,
         };
         // Mid-turn: the agent has made three tool calls but streamed no
         // text yet, so no Assistant item exists.
@@ -3218,6 +3223,7 @@ mod tests {
             args: serde_json::json!({"file_path": format!("{id}.rs")}),
             status: ToolCallStatus::Ok,
             result: None,
+            duration_ms: None,
         };
         let vm = ThreadViewModel {
             items: vec![
@@ -3290,6 +3296,7 @@ mod tests {
                     args: serde_json::json!({"file_path": "a.rs"}),
                     status: ToolCallStatus::Ok,
                     result: None,
+                    duration_ms: None,
                 },
                 ChatItem::Assistant {
                     turn: 1,
@@ -3330,6 +3337,7 @@ mod tests {
             args: serde_json::json!({}),
             status: ToolCallStatus::Ok,
             result: None,
+            duration_ms: None,
         };
         let vm = ThreadViewModel {
             items: vec![
@@ -3423,6 +3431,7 @@ mod tests {
             args,
             status: ToolCallStatus::Ok,
             result: None,
+            duration_ms: None,
         };
         let vm = ThreadViewModel {
             items: vec![
@@ -3458,6 +3467,7 @@ mod tests {
             args,
             status: ToolCallStatus::Ok,
             result: None,
+            duration_ms: None,
         };
         let vm = ThreadViewModel {
             items: vec![

@@ -60,7 +60,7 @@ export const sanitizeGithubAppStatus = (
   value: ProtocolGithubAppStatus,
 ): SanitizedGithubAppStatus => ({
   status: { ...value, last_error: "" },
-  needsAttention: (value.last_error ?? "") !== "",
+  needsAttention: value.configured && (value.last_error ?? "") !== "",
 });
 
 export const repositoryDraft = (

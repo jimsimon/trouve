@@ -749,6 +749,15 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       this.requestUpdate();
       return;
     }
+    const thinking = thinkingOption(
+      this.#models.find((model) => model.id === this.#draft.model),
+    );
+    if (
+      this.#draft.thinkingLevel !== ""
+      && thinking?.values.includes(this.#draft.thinkingLevel) !== true
+    ) {
+      this.#draft = { ...this.#draft, thinkingLevel: "" };
+    }
     const errors = validateAutomationDraft(this.#draft);
     if (hasAutomationDraftErrors(errors)) {
       this.#draftErrors = errors;
@@ -878,11 +887,18 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   async #refreshAutomations(): Promise<void> {
     const services = this.#services.value;
-    if (services === undefined || this.#polling || this.#loading || this.#busyId !== "") return;
+    if (
+      services === undefined
+      || this.#polling
+      || this.#refreshing
+      || this.#loading
+      || this.#busyId !== ""
+    ) return;
+    const generation = this.#loadGeneration;
     this.#polling = true;
     try {
       const automations = await services.protocol.automations();
-      if (!this.isConnected) return;
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
       this.#automations = automations;
       if (!automations.some((automation) => automation.id === this.#selectedId)) {
         this.#selectedId = automations[0]?.id ?? "";
@@ -890,10 +906,14 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       }
       this.#liveError = "";
     } catch {
-      if (this.isConnected) this.#liveError = "Live refresh paused";
+      if (generation === this.#loadGeneration && this.isConnected) {
+        this.#liveError = "Live refresh paused";
+      }
     } finally {
-      this.#polling = false;
-      this.requestUpdate();
+      if (generation === this.#loadGeneration) {
+        this.#polling = false;
+        this.requestUpdate();
+      }
     }
   }
 

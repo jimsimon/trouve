@@ -76,6 +76,15 @@ impl ThreadProjection {
                     self.push(ThreadViewItem::Compaction { turn: *turn, state });
                 }
             }
+            Event::CompactionFailed { turn } => {
+                self.snapshot.compacting = false;
+                let state = ThreadCompactionState::Failed;
+                if let Some(idx) = self.indexes.open_compactions.remove(turn) {
+                    self.snapshot.items[idx] = ThreadViewItem::Compaction { turn: *turn, state };
+                } else {
+                    self.push(ThreadViewItem::Compaction { turn: *turn, state });
+                }
+            }
             Event::UserMessage {
                 turn,
                 content,
@@ -185,6 +194,14 @@ impl ThreadProjection {
                     } else {
                         ThreadToolStatus::Running
                     };
+                }
+                if *decision != ApprovalDecision::Deny {
+                    // Approval resolution is the execution boundary for
+                    // backends that do not emit ToolStarted. A later explicit
+                    // start replaces this fallback anchor.
+                    self.tool_started_at
+                        .entry(call_id.clone())
+                        .or_insert(envelope.ts);
                 }
             }
             Event::ToolStarted { call_id } => {
@@ -498,6 +515,41 @@ mod tests {
     }
 
     #[test]
+    fn approval_timestamp_is_fallback_when_started_event_is_absent() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "command".into(),
+                tool: "commandExecution".into(),
+                args: serde_json::json!({}),
+                requires_approval: true,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            100,
+            Event::ApprovalResolved {
+                call_id: "command".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            127,
+            Event::ToolCompleted {
+                call_id: "command".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({ "exit_code": 0 }),
+            },
+        ));
+
+        assert_eq!(measured_duration(&projection), Some(27));
+    }
+
+    #[test]
     fn compaction_is_one_durable_item_that_completes_in_place() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(1, 0, Event::CompactionStarted { turn: 7 }));
@@ -588,6 +640,22 @@ mod tests {
                 text: "continuing".into(),
             },
         ));
+
+        assert!(!projection.snapshot.compacting);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Compaction {
+                turn: 3,
+                state: ThreadCompactionState::Failed,
+            })
+        ));
+    }
+
+    #[test]
+    fn explicit_compaction_failure_closes_the_running_item() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(1, 0, Event::CompactionStarted { turn: 3 }));
+        projection.apply(&envelope(2, 10, Event::CompactionFailed { turn: 3 }));
 
         assert!(!projection.snapshot.compacting);
         assert!(matches!(

@@ -458,12 +458,19 @@ export class AppStore {
       this.#threadViews.delete(oldest);
     }
     const view = ThreadViewModel.fromSnapshot(cursor, snapshot);
+    if (snapshot.todos === undefined) {
+      const preserved = this.#threadTodoEvents.get(threadId)
+        ?? this.#threads.get(threadId)?.todos;
+      if (preserved !== undefined) view.replaceTodos(preserved);
+    }
     this.#threadViews.set(threadId, view);
 
-    const todos = view.todos.map((todo) => ({ ...todo }));
-    this.#threadTodoEvents.set(threadId, todos);
-    const thread = this.#threads.get(threadId);
-    if (thread !== undefined) this.#threads.set(threadId, { ...thread, todos });
+    if (snapshot.todos !== undefined) {
+      const todos = view.todos.map((todo) => ({ ...todo }));
+      this.#threadTodoEvents.set(threadId, todos);
+      const thread = this.#threads.get(threadId);
+      if (thread !== undefined) this.#threads.set(threadId, { ...thread, todos });
+    }
     this.#touch();
     return true;
   }
@@ -481,6 +488,18 @@ export class AppStore {
 
   applyThreadEvent(threadId: string, envelope: ProtocolEventEnvelope): boolean {
     return this.applyThreadEvents(threadId, [envelope]);
+  }
+
+  resolveApprovalOptimistically(
+    threadId: string,
+    callId: string,
+    decision: "approve" | "always_approve" | "deny",
+  ): boolean {
+    const tool = this.#threadViews.get(threadId)?.findTool(callId);
+    if (tool?.status !== "awaiting-approval") return false;
+    tool.status = decision === "deny" ? "denied" : "running";
+    this.#touch();
+    return true;
   }
 
   /** Fold a replay burst while invalidating Lit's shared store signal once.

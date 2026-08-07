@@ -63,7 +63,7 @@ until that is fixed and verified on all supported platforms. See the
 ## Implementation checkpoint
 
 The implementation now includes the accepted architecture/rollback ADR,
-`@trouve-ai/app-ui`, the internal desktop host, the protocol 2.4 session
+`@trouve-ai/app-ui`, the internal desktop host, the protocol 3.9 session
 summary and notification-edge projection, generated and runtime-validated clients, stable
 `@lit/context` providers, the contained `@lit-labs/signals` adapter, the shared
 five-theme visual system, the feature-gated Wry preview, and distinct desktop
@@ -377,21 +377,23 @@ Before promotion:
 Use an app-owned loopback gateway between the desktop web UI and either the
 embedded or remote Trouve server:
 
-    Lit application
-      screens/components → normalized store → services
-                         │ same-origin HTTP/SSE
-                         ▼
-    trouve-desktop-host loopback gateway
-      /                  bundled static UI
-      /v1/*              streaming HTTP/SSE proxy
-      /desktop/v1/*      narrow typed native API
-                         │
-               ┌─────────┴──────────┐
-               ▼                    ▼
-      embedded bind_local       validated OS APIs
-      or remote server          picker/clipboard/etc.
-               │
-      trouve-server/core/providers
+```text
+Lit application
+  screens/components → normalized store → services
+                     │ same-origin HTTP/SSE
+                     ▼
+trouve-desktop-host loopback gateway
+  /                  bundled static UI
+  /v1/*              streaming HTTP/SSE proxy
+  /desktop/v1/*      narrow typed native API
+                     │
+           ┌─────────┴──────────┐
+           ▼                    ▼
+  embedded bind_local       validated OS APIs
+  or remote server          picker/clipboard/etc.
+           │
+  trouve-server/core/providers
+```
 
 The gateway belongs to the desktop application rather than trouve-server
 because:
@@ -423,18 +425,20 @@ acceptable substitute for this rule.
 The initial mobile delivery is a PWA built from the same
 @trouve-ai/app-ui source:
 
-    Installed mobile PWA
-      Lit screens + responsive/mobile navigation
-      web capability adapter
-                         │ same-origin HTTPS preferred
-                         ▼
-    PWA web host / reverse proxy
-      /                  hashed frontend assets
-      /manifest.webmanifest
-      /v1/*              HTTP/SSE proxy
-                         │ authenticated HTTP/SSE
-                         ▼
-                 remote trouve-server
+```text
+Installed mobile PWA
+  Lit screens + responsive/mobile navigation
+  web capability adapter
+                     │ same-origin HTTPS preferred
+                     ▼
+PWA web host / reverse proxy
+  /                  hashed frontend assets
+  /manifest.webmanifest
+  /v1/*              HTTP/SSE proxy
+                     │ authenticated HTTP/SSE
+                     ▼
+             remote trouve-server
+```
 
 Mobile rules:
 
@@ -675,21 +679,23 @@ only if actual sharing becomes more valuable than custom-element fit.
 
 Proposed structure:
 
-    web/app-ui/
-      src/
-        app/
-        services/
-        state/
-        contexts/
-        router/
-        capabilities/
-        components/
-        screens/
-        workers/
-        styles/
-        generated/
-        pwa/
-        test/
+```text
+web/app-ui/
+  src/
+    app/
+    services/
+    state/
+    contexts/
+    router/
+    capabilities/
+    components/
+    screens/
+    workers/
+    styles/
+    generated/
+    pwa/
+    test/
+```
 
 ### Services and generated types
 
@@ -802,13 +808,16 @@ Requirements:
 - Let the PWA rebuild after foregrounding without all thread histories or
   continuous background execution.
 
-The original summary projection moved the protocol from 2.2 to 2.3. Exact
-compact notification edges are the additive 2.4 change, independently of the
+After the breaking 3.0 semantic-router change on `main`, the summary projection
+is the additive 3.1 change and exact compact notification edges are the
+additive 3.2 change, independently of the
 workspace product version. Follow the protocol-change workflow, update
 trouve-protocol/server/client tests, and regenerate OpenAPI deliberately:
 
-    TROUVE_UPDATE_OPENAPI=1 cargo test -p trouve-server openapi
-    cargo test -p trouve-server
+```sh
+TROUVE_UPDATE_OPENAPI=1 cargo test -p trouve-server openapi
+cargo test -p trouve-server
+```
 
 ### Active history and terminal
 
@@ -1403,14 +1412,16 @@ synchronized to the root under ADR 0024.
 
 Before promotion:
 
-    cargo fmt --all
-    cargo clippy --all-targets -- -D warnings
-    cargo test --workspace
-    cargo metadata --offline --no-deps
-    cargo metadata \
-      --manifest-path crates/trouve-servo-embed-preview/Cargo.toml \
-      --locked --no-deps
-    python3 scripts/sync_versions.py
+```sh
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+cargo metadata --offline --no-deps
+cargo metadata \
+  --manifest-path crates/trouve-servo-embed-preview/Cargo.toml \
+  --locked --no-deps
+python3 scripts/sync_versions.py
+```
 
 Also run frontend, OpenAPI, packaging, engine, PWA, mobile, visual, and offline
 suites.

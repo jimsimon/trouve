@@ -383,6 +383,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
   #draggedGroup = "";
   #dropTarget = "";
   #dropAfter = false;
+  #loadedServices: object | undefined;
 
   constructor() {
     super();
@@ -400,6 +401,21 @@ export class TrouveCodeReviewDashboard extends LitElement {
   });
 
   protected override firstUpdated(): void {
+    this.#loadForCurrentServices();
+  }
+
+  protected override updated(): void {
+    this.#loadForCurrentServices();
+  }
+
+  #loadForCurrentServices(): void {
+    const services = this.#services.value;
+    if (services === undefined) {
+      this.#loadedServices = undefined;
+      return;
+    }
+    if (services === this.#loadedServices) return;
+    this.#loadedServices = services;
     void this.#loadInitial();
   }
 

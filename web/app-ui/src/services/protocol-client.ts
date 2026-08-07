@@ -1,6 +1,5 @@
 import createClient, { type Client } from "openapi-fetch";
 
-import * as precompiledProtocolValidators from "../generated/protocol-validators.js";
 import type {
   components as ProtocolComponents,
   paths as ProtocolPaths,
@@ -131,6 +130,9 @@ export interface ProtocolCursorSnapshot<T> {
   readonly cursor: number;
   readonly value: T;
 }
+
+/** Keep tail snapshots large enough to avoid a visible first backfill. */
+export const THREAD_VIEW_PAGE_SIZE = 256;
 export type ProtocolGithubIntegration =
   ProtocolComponents["schemas"]["GithubIntegration"];
 export type ProtocolAddGithubHostRequest =
@@ -218,12 +220,19 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
-const loadedValidators: ProtocolValidators = {
-  ...precompiledProtocolValidators,
-  knownEventTypes: new Set(precompiledProtocolValidators.knownEventTypes),
-};
+let loadedValidators: Promise<ProtocolValidators> | undefined;
 
-const validators = async (): Promise<ProtocolValidators> => loadedValidators;
+/** Runtime schemas are sizeable generated code. Load them on the first
+ * protocol response or event instead of charging every initial app render. */
+const validators = (): Promise<ProtocolValidators> => {
+  loadedValidators ??= import("../generated/protocol-validators.js").then(
+    (precompiled) => ({
+      ...precompiled,
+      knownEventTypes: new Set(precompiled.knownEventTypes),
+    }),
+  );
+  return loadedValidators;
+};
 
 const validateResponse = async <T>(
   name:
@@ -1360,7 +1369,9 @@ export class ProtocolClient {
     before?: number,
   ): Promise<ProtocolCursorSnapshot<ProtocolThreadViewSnapshot>> {
     const { threadView } = await import("../generated/thread-view-validator.js");
-    const query = new URLSearchParams({ limit: "256" });
+    const query = new URLSearchParams({
+      limit: String(THREAD_VIEW_PAGE_SIZE),
+    });
     if (before !== undefined) query.set("before", String(before));
     return this.#validatedCursorJson(
       `/v1/threads/${encodeURIComponent(threadId)}/view?${query.toString()}`,

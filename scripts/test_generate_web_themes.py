@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,6 +45,20 @@ class GenerateWebThemesTests(unittest.TestCase):
         self.assertIn('[data-theme="high-contrast-dark"]', css)
         self.assertIn("--trouve-win-bg: #141414;", css)
         self.assertIn("--trouve-scrim: #000000aa;", css)
+
+    def test_main_supports_an_output_path_outside_the_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "themes.css"
+            result = generate_web_themes.main(
+                [
+                    "--source",
+                    str(generate_web_themes.SOURCE),
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(output.read_text(encoding="utf-8").startswith("/* Generated"))
 
 
 if __name__ == "__main__":

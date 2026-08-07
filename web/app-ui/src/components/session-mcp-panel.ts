@@ -27,6 +27,7 @@ export class TrouveSessionMcpPanel extends LitElement {
   #error = "";
   #generation = 0;
   #observedSessionId = "";
+  #loadIssued = false;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -39,12 +40,21 @@ export class TrouveSessionMcpPanel extends LitElement {
 
   protected override updated(changed: PropertyValues<this>): void {
     const sessionId = this.#effectiveSessionId;
-    if (!changed.has("sessionId") && sessionId === this.#observedSessionId) return;
+    const sessionChanged = sessionId !== this.#observedSessionId;
+    const servicesAvailable = this.#services.value?.protocol !== undefined;
+    if (
+      !changed.has("sessionId")
+      && !sessionChanged
+      && !(servicesAvailable && !this.#loadIssued)
+    ) return;
     this.#observedSessionId = sessionId;
-    this.#generation += 1;
-    this.#servers = [];
-    this.#loading = false;
-    this.#error = "";
+    if (sessionChanged) {
+      this.#generation += 1;
+      this.#servers = [];
+      this.#loading = false;
+      this.#error = "";
+      this.#loadIssued = false;
+    }
     void this.#load();
   }
 
@@ -109,6 +119,7 @@ export class TrouveSessionMcpPanel extends LitElement {
     const protocol = this.#services.value?.protocol;
     const sessionId = this.#effectiveSessionId;
     if (protocol === undefined || sessionId === "" || this.#loading) return;
+    this.#loadIssued = true;
     const generation = ++this.#generation;
     this.#loading = true;
     this.#error = "";

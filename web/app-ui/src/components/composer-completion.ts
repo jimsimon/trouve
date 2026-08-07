@@ -3,6 +3,7 @@ export const MAX_COMPOSER_COMPLETION_SOURCES = 5_000;
 
 const MAX_COMPLETION_VALUE_LENGTH = 4_096;
 const MAX_COMPLETION_DETAIL_LENGTH = 512;
+const MAX_COMPLETION_DETAIL_SOURCE_LENGTH = 4_096;
 const UNSAFE_COMPLETION_TEXT = /[\u0000-\u001f\u007f]/u;
 const UTF8_ENCODER = new TextEncoder();
 
@@ -182,10 +183,11 @@ export const rankComposerCompletions = (
       if (score === undefined) return undefined;
       return {
         value,
-        detail: (candidate.detail ?? "").replace(/\s+/gu, " ").trim().slice(
-          0,
-          MAX_COMPLETION_DETAIL_LENGTH,
-        ),
+        detail: (candidate.detail ?? "")
+          .slice(0, MAX_COMPLETION_DETAIL_SOURCE_LENGTH)
+          .replace(/\s+/gu, " ")
+          .trim()
+          .slice(0, MAX_COMPLETION_DETAIL_LENGTH),
         sourceIndex,
         score,
       };

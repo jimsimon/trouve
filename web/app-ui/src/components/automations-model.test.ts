@@ -40,6 +40,10 @@ describe("automation form model", () => {
     };
     expect(validateAutomationDraft({ ...base, scheduleKind: "hourly", minute: "60" }))
       .toMatchObject({ schedule: expect.stringContaining("0 through 59") });
+    for (const minute of ["", "  ", "1e1", "0x10", "1.5"]) {
+      expect(validateAutomationDraft({ ...base, scheduleKind: "hourly", minute }))
+        .toMatchObject({ schedule: expect.stringContaining("whole number") });
+    }
     expect(validateAutomationDraft({ ...base, scheduleKind: "daily", time: "24:00" }))
       .toMatchObject({ schedule: expect.stringContaining("24-hour time") });
     expect(validateAutomationDraft({ ...base, scheduleKind: "weekly", days: [] }))

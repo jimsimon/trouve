@@ -486,9 +486,12 @@ fn turn_stream(
                                 commentary_messages.remove(id);
                             }
                             if ty == "contextCompaction" {
-                                if item["status"].as_str() != Some("failed") {
-                                    let _ = tx.send(Ok(BackendEvent::CompactionCompleted)).await;
-                                }
+                                let event = if item["status"].as_str() == Some("failed") {
+                                    BackendEvent::CompactionFailed
+                                } else {
+                                    BackendEvent::CompactionCompleted
+                                };
+                                let _ = tx.send(Ok(event)).await;
                             } else if !matches!(
                                 ty,
                                 "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
@@ -4235,6 +4238,38 @@ sleep 10
                     && usage.cached_input_tokens == 1000
                     && usage.context_input_tokens == Some(1250)
                     && usage.context_window == Some(272000)
+        ));
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": { "id": "compact-2", "type": "contextCompaction" }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "compact-2",
+                        "type": "contextCompaction",
+                        "status": "failed"
+                    }
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionStarted))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionFailed))
         ));
         route_tx
             .try_send(ServerMsg::Notification {

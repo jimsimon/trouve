@@ -18,6 +18,7 @@ license review deliberately change that policy.
 | @codemirror/autocomplete | 6.20.3 | MIT | runtime/transitive |
 | @codemirror/commands | 6.10.4 | MIT | runtime/transitive |
 | @codemirror/lang-javascript | 6.2.5 | MIT | runtime/transitive |
+| @codemirror/lang-json | 6.0.2 | MIT | runtime/transitive |
 | @codemirror/language | 6.12.4 | MIT | runtime/transitive |
 | @codemirror/lint | 6.9.7 | MIT | runtime/transitive |
 | @codemirror/merge | 6.12.2 | MIT | runtime/transitive |
@@ -35,6 +36,7 @@ license review deliberately change that policy.
 | @lezer/common | 1.5.2 | MIT | runtime/transitive |
 | @lezer/highlight | 1.2.3 | MIT | runtime/transitive |
 | @lezer/javascript | 1.5.4 | MIT | runtime/transitive |
+| @lezer/json | 1.0.3 | MIT | runtime/transitive |
 | @lezer/lr | 1.4.10 | MIT | runtime/transitive |
 | @lit-labs/signals | 0.3.0 | BSD-3-Clause | runtime/transitive |
 | @lit-labs/ssr | 4.1.0 | BSD-3-Clause | runtime/transitive |

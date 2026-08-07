@@ -3163,6 +3163,13 @@ impl Engine {
     pub fn server_projection_snapshot(
         &self,
     ) -> Result<(u64, trouve_protocol::ServerProjection), EngineError> {
+        // Capture the resume boundary before reading any projection data. A
+        // concurrent event can then only make the returned data newer than
+        // this cursor; it cannot be hidden behind a cursor that already
+        // covers data we did not read.
+        let cursor = self
+            .store
+            .latest_event_cursor(&trouve_protocol::Scope::Server)?;
         let mut github_pull_requests = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(envelope) = self.store.latest_github_pr_snapshot_event(&host)? else {
@@ -3211,7 +3218,7 @@ impl Engine {
             }
         }
 
-        let (cursor, git_worktree_settings) = self.git_worktree_settings_snapshot()?;
+        let git_worktree_settings = self.git_worktree_settings();
         Ok((
             cursor,
             trouve_protocol::ServerProjection {
@@ -6473,6 +6480,9 @@ impl Engine {
                         turn,
                         messages_compacted: 0,
                     });
+                }
+                BackendEvent::CompactionFailed => {
+                    persisted.push(Event::CompactionFailed { turn });
                 }
                 BackendEvent::ToolCompleted {
                     call_id,

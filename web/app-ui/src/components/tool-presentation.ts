@@ -1,5 +1,6 @@
 import { utf8Length, utf8Prefix } from "../services/utf8-text.js";
 import type { FontAwesomeIconName } from "./font-awesome-icon.js";
+import { todoStatusIcon } from "./todo-plan-model.js";
 
 export type ToolDiffLineKind = "separator" | "context" | "add" | "delete";
 
@@ -424,9 +425,7 @@ const todoRows = (args: JsonRecord, resultValue: unknown): readonly ToolTodoRow[
     if (item === undefined) return [];
     const status = stringValue(item.status) ?? "pending";
     const content = stringValue(item.content) ?? "";
-    const icon = status === "completed"
-      ? "check"
-      : status === "in_progress" ? "play" : status === "cancelled" ? "xmark" : "circle";
+    const icon = todoStatusIcon(status);
     return [{ status, content, icon }];
   });
 };

@@ -572,7 +572,14 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
             ? html`<p class="mcp-empty">No MCP servers configured.</p>`
             : this.#servers.map((server) => html`
                 <article class="mcp-row">
-                  <span class="mcp-health ${server.health}" aria-label=${server.health}>${fontAwesomeIcon(server.health === "ok" || server.health === "error" ? "circle" : "circle-dot")}</span>
+                  <span class="mcp-health ${server.health}">${fontAwesomeIcon(
+                    server.health === "ok"
+                      ? "check"
+                      : server.health === "error"
+                        ? "xmark"
+                        : server.health === "untrusted" ? "ban" : "circle-question",
+                    { label: `MCP server health: ${server.health}` },
+                  )}</span>
                   <div class="mcp-copy">
                     <span><strong>${server.name}</strong><span class="mcp-scope">${server.scope === "workspace" ? `workspace · ${server.workspace_name ?? ""}` : "app-wide"}</span></span>
                     <small>${server.command} ${(server.args ?? []).join(" ")}${server.detail ? ` · ${server.detail}` : ""}</small>

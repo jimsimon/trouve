@@ -349,9 +349,10 @@ export class ProtocolIngress {
   }
 
   async #refreshProjectionGeneration(generation: number): Promise<void> {
-    const [info, boundary] = await Promise.all([
+    const [info, boundary, projection] = await Promise.all([
       this.#client.serverInfo(),
       this.#sessionSummaryBoundary(),
+      this.#serverProjectionBoundary(),
     ]);
     if (!this.#isCurrentGeneration(generation)) return;
     const metadataRevision = this.#metadataRevision;
@@ -371,6 +372,15 @@ export class ProtocolIngress {
     if (snapshot.cursor >= acceptedCursor) {
       this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
       this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
+    }
+    if (
+      projection.kind === "snapshot"
+      && projection.snapshot.cursor >= acceptedCursor
+    ) {
+      this.#store.replaceServerProjection(
+        projection.snapshot.cursor,
+        projection.snapshot.value,
+      );
     }
   }
 

@@ -365,7 +365,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #completionWorkerMatches: readonly RankedComposerCompletion[] = [];
   #completionWorkerGeneration = 0;
   #completionWorkerPending = false;
+  #completionCommandSource: readonly {
+    readonly name: string;
+    readonly description?: string;
+  }[] = [];
+  #completionCommandSourceRevision = 0;
   #sessionPaths: readonly string[] = [];
+  #sessionPathsRevision = 0;
   #pathsSessionId = "";
   #pathsLoadingSessionId = "";
   #pathsUnavailableSessionId = "";
@@ -432,6 +438,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#newThreadError = "";
       this.#pathsGeneration += 1;
       this.#sessionPaths = [];
+      this.#sessionPathsRevision += 1;
       this.#pathsSessionId = "";
       this.#pathsLoadingSessionId = "";
       this.#pathsUnavailableSessionId = "";
@@ -552,6 +559,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     void this.#ensureThreadOptions();
     this.#refreshSubscriptionHealthAfterTurn();
     void this.#ensureSessionUsage();
+    this.#syncComposerCompletionEffect(this.#currentComposerCommands());
     const draftThreadId = this.#draftThreadIdForCurrentScope();
     if (this.#composerDraftThreadId !== draftThreadId) {
       this.#restoreComposerDraft(draftThreadId);
@@ -932,7 +940,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.name}>${attachment.name}</strong>
-                          <small>${attachment.mime} · ${this.#formatBytes(attachment.size_bytes)}</small>
+                          <small>${attachment.mime} · ${formatAttachmentBytes(attachment.size_bytes)}</small>
                         </div>
                         <button
                           class="attachment-remove"
@@ -958,7 +966,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                             ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
-                          <small>${attachment.upload.mime} · ${this.#formatBytes(attachment.size)}</small>
+                          <small>${attachment.upload.mime} · ${formatAttachmentBytes(attachment.size)}</small>
                         </div>
                         <button
                           class="attachment-remove"
@@ -1274,19 +1282,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #activeComposerCompletion(
     commands: readonly { readonly name: string; readonly description?: string }[],
   ): ActiveComposerCompletion | undefined {
-    if (this.#completionDismissed || this.#composerComposing) {
-      this.#completionWorkerGeneration += 1;
-      this.#completionWorkerPending = false;
-      this.#completionWorkerRequestedKey = "";
-      return undefined;
-    }
+    if (this.#completionDismissed || this.#composerComposing) return undefined;
     const token = composerCompletionToken(this.#composerDraft, this.#composerCursor);
-    if (token === undefined) {
-      this.#completionWorkerGeneration += 1;
-      this.#completionWorkerPending = false;
-      this.#completionWorkerRequestedKey = "";
-      return undefined;
-    }
+    if (token === undefined) return undefined;
     const candidates: readonly ComposerCompletionCandidate[] = token.kind === "command"
       ? commands.map((command) => ({
           value: command.name.replace(/^\/+/, ""),
@@ -1296,41 +1294,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     let matches: readonly RankedComposerCompletion[];
     let searching = false;
     if (candidates.length < WORKER_COMPLETION_THRESHOLD) {
-      this.#completionWorkerGeneration += 1;
-      this.#completionWorkerPending = false;
-      this.#completionWorkerRequestedKey = "";
       matches = rankComposerCompletions(candidates, token.query);
     } else {
-      const key = `${token.kind}\u0000${token.query}\u0000${candidates
-        .map((candidate) => `${candidate.value}\u0001${candidate.detail ?? ""}`)
-        .join("\u0000")}`;
-      if (key !== this.#completionWorkerRequestedKey) {
-        this.#completionWorkerRequestedKey = key;
-        this.#completionWorkerPending = true;
-        const generation = ++this.#completionWorkerGeneration;
-        void rankComposerCompletionsOffThread(
-          candidates,
-          token.query,
-          MAX_COMPOSER_COMPLETIONS,
-        ).then(
-          (nextMatches) => {
-            if (generation !== this.#completionWorkerGeneration || !this.isConnected) return;
-            this.#completionWorkerKey = key;
-            this.#completionWorkerMatches = nextMatches;
-            this.#completionWorkerPending = false;
-            this.#completionSelected = 0;
-            this.requestUpdate();
-          },
-          () => {
-            if (generation !== this.#completionWorkerGeneration || !this.isConnected) return;
-            this.#completionWorkerRequestedKey = "";
-            this.#completionWorkerPending = false;
-            this.requestUpdate();
-          },
-        );
-      }
+      const key = this.#completionWorkerIdentity(token.kind, token.query);
       matches = this.#completionWorkerKey === key ? this.#completionWorkerMatches : [];
-      searching = this.#completionWorkerPending;
+      searching = this.#completionWorkerPending
+        && this.#completionWorkerRequestedKey === key;
     }
     const loading = token.kind === "file" && this.#pathsLoadingSessionId === this.sessionId;
     const unavailable =
@@ -1343,6 +1312,86 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         ? "No workspace files are available."
         : "No matching workspace files.";
     return { token, matches, loading, searching, unavailable, emptyMessage };
+  }
+
+  #currentComposerCommands(): readonly {
+    readonly name: string;
+    readonly description?: string;
+  }[] {
+    return this.threadId === ""
+      ? []
+      : (this.#store.value?.threadView(this.threadId).commands ?? []);
+  }
+
+  #completionWorkerIdentity(kind: "command" | "file", query: string): string {
+    const sourceRevision = kind === "file"
+      ? this.#sessionPathsRevision
+      : this.#completionCommandSourceRevision;
+    return `${kind}\u0000${query}\u0000${sourceRevision}`;
+  }
+
+  #cancelCompletionWorker(): void {
+    if (
+      !this.#completionWorkerPending
+      && this.#completionWorkerRequestedKey === ""
+    ) return;
+    this.#completionWorkerGeneration += 1;
+    this.#completionWorkerPending = false;
+    this.#completionWorkerRequestedKey = "";
+  }
+
+  #syncComposerCompletionEffect(
+    commands: readonly { readonly name: string; readonly description?: string }[],
+  ): void {
+    if (commands !== this.#completionCommandSource) {
+      this.#completionCommandSource = commands;
+      this.#completionCommandSourceRevision += 1;
+    }
+    if (this.#completionDismissed || this.#composerComposing) {
+      this.#cancelCompletionWorker();
+      return;
+    }
+    const token = composerCompletionToken(this.#composerDraft, this.#composerCursor);
+    if (token === undefined) {
+      this.#cancelCompletionWorker();
+      return;
+    }
+    const candidates: readonly ComposerCompletionCandidate[] = token.kind === "command"
+      ? commands.map((command) => ({
+          value: command.name.replace(/^\/+/, ""),
+          detail: command.description ?? "",
+        }))
+      : this.#sessionPaths.map((path) => ({ value: path }));
+    if (candidates.length < WORKER_COMPLETION_THRESHOLD) {
+      this.#cancelCompletionWorker();
+      return;
+    }
+    const key = this.#completionWorkerIdentity(token.kind, token.query);
+    if (key === this.#completionWorkerRequestedKey) return;
+    this.#completionWorkerRequestedKey = key;
+    this.#completionWorkerPending = true;
+    const generation = ++this.#completionWorkerGeneration;
+    this.requestUpdate();
+    void rankComposerCompletionsOffThread(
+      candidates,
+      token.query,
+      MAX_COMPOSER_COMPLETIONS,
+    ).then(
+      (nextMatches) => {
+        if (generation !== this.#completionWorkerGeneration || !this.isConnected) return;
+        this.#completionWorkerKey = key;
+        this.#completionWorkerMatches = nextMatches;
+        this.#completionWorkerPending = false;
+        this.#completionSelected = 0;
+        this.requestUpdate();
+      },
+      () => {
+        if (generation !== this.#completionWorkerGeneration || !this.isConnected) return;
+        this.#completionWorkerRequestedKey = "";
+        this.#completionWorkerPending = false;
+        this.requestUpdate();
+      },
+    );
   }
 
   #renderComposerCompletion(completion: ActiveComposerCompletion) {
@@ -2363,15 +2412,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#virtualizer.setViewport(
       viewport.scrollTop,
       viewport.clientHeight,
-      { userInitiated: true, atTail },
+      { userInitiated, atTail },
     );
     const after = this.#virtualizer.window();
-    if (
-      viewport.scrollTop <= Math.max(
+    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    const historyPrefetchThreshold = Math.min(
+      maxScrollTop / 2,
+      Math.max(
         CHAT_HISTORY_PREFETCH_MIN_PX,
         viewport.clientHeight * CHAT_HISTORY_PREFETCH_VIEWPORTS,
-      )
-    ) {
+      ),
+    );
+    if (viewport.scrollTop <= historyPrefetchThreshold) {
       void this.#loadOlderHistory(false);
     }
     if (!before.followingTail && after.followingTail) {
@@ -4226,7 +4278,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ? {}
           : { attachments: this.#pendingAttachments.map(({ upload }) => upload) }),
       });
-      await services.composerDrafts.clear(threadId);
       if (
         requestGeneration !== this.#turnRequestGeneration
         || threadId !== this.threadId
@@ -4245,6 +4296,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pendingAttachments = [];
       const input = form.querySelector<HTMLInputElement>('input[type="file"]');
       if (input !== null) input.value = "";
+      void services.composerDrafts.clear(threadId).catch(() => undefined);
     } catch {
       if (
         requestGeneration === this.#turnRequestGeneration
@@ -4455,12 +4507,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     );
   }
 
-  #formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
-
   readonly #composerChanged = (event: InputEvent): void => {
     const textarea = event.currentTarget as HTMLTextAreaElement;
     this.#resizeComposer(textarea);
@@ -4570,6 +4616,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const paths = await protocol.sessionPaths(sessionId);
       if (generation !== this.#pathsGeneration || this.sessionId !== sessionId) return;
       this.#sessionPaths = paths.slice(0, MAX_COMPOSER_COMPLETION_SOURCES);
+      this.#sessionPathsRevision += 1;
       this.#pathsSessionId = sessionId;
       this.#pathsLoadedAt = Date.now();
       this.#pathsRetryAfter = 0;
@@ -4631,9 +4678,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       isComposing: event.isComposing,
       compositionActive: this.#composerComposing,
     })) return;
-    const commands = this.threadId === ""
-      ? []
-      : (this.#store.value?.threadView(this.threadId).commands ?? []);
+    const commands = this.#currentComposerCommands();
+    this.#syncComposerCompletionEffect(commands);
     const completion = this.#activeComposerCompletion(commands);
     if (completion !== undefined) {
       if (event.key === "Escape") {
@@ -4776,10 +4822,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       // The HTTP response can win the race with its durable SSE event. Remove
       // the controls immediately after a successful mutation so a second
       // click/key cannot submit the already-consumed approval in that gap.
-      const tool = this.#store.value?.threadView(threadId).findTool(callId);
-      if (tool?.status === "awaiting-approval") {
-        tool.status = decision === "deny" ? "denied" : "running";
-      }
+      this.#store.value?.resolveApprovalOptimistically(threadId, callId, decision);
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
         this.#requestError = "Approval could not be submitted.";

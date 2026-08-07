@@ -3341,6 +3341,8 @@ impl Controller {
             .as_ref()
             .map(|u| {
                 u.context_input_tokens.unwrap_or_else(|| {
+                    // Codex reports cached input as a subset of input_tokens;
+                    // other integrations report it as an additional counter.
                     u.input_tokens
                         .saturating_add(if thread.model.starts_with("codex/") {
                             0
@@ -7051,13 +7053,25 @@ impl Controller {
                     }
                     _ => 0,
                 };
+                let (mode, model, thinking_level) = self
+                    .automations
+                    .iter()
+                    .find(|automation| automation.id == id)
+                    .map(|automation| {
+                        (
+                            automation.mode.clone(),
+                            automation.model.clone(),
+                            automation.thinking_level.clone(),
+                        )
+                    })
+                    .unwrap_or((None, None, None));
                 let req = trouve_protocol::UpsertAutomationRequest {
                     name,
                     prompt,
                     workspace_id,
-                    mode: None,
-                    model: None,
-                    thinking_level: None,
+                    mode,
+                    model,
+                    thinking_level,
                     permission_mode: match permission_index {
                         1 => PermissionMode::AllowList,
                         2 => PermissionMode::Yolo,

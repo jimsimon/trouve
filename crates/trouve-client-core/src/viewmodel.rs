@@ -95,6 +95,7 @@ pub enum ChatItem {
         args: serde_json::Value,
         status: ToolCallStatus,
         result: Option<serde_json::Value>,
+        duration_ms: Option<u64>,
     },
     TurnStatus {
         turn: u64,
@@ -145,6 +146,10 @@ pub struct ThreadViewModel {
     /// outside `ChatItem` so existing native renderers remain source-compatible
     /// while web and native projections share replay semantics.
     pub tool_outputs: HashMap<String, ToolOutputBuffer>,
+    /// Execution start anchors used to derive the same per-tool durations as
+    /// the server projection. Completed snapshot rows carry the result.
+    #[doc(hidden)]
+    pub tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
@@ -183,6 +188,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             items: snapshot.items.into_iter().map(ChatItem::from).collect(),
             cursor: 0,
             tool_outputs: HashMap::new(),
+            tool_started_at: HashMap::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage: snapshot.last_usage,
@@ -245,7 +251,7 @@ impl From<ThreadViewItem> for ChatItem {
                 args,
                 status,
                 result,
-                duration_ms: _,
+                duration_ms,
             } => Self::ToolCall {
                 call_id,
                 tool,
@@ -259,6 +265,7 @@ impl From<ThreadViewItem> for ChatItem {
                     ThreadToolStatus::Aborted => ToolCallStatus::Aborted,
                 },
                 result,
+                duration_ms,
             },
             ThreadViewItem::TurnStatus { turn, state } => Self::TurnStatus {
                 turn,
@@ -404,6 +411,18 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
+            Event::CompactionFailed { turn } => {
+                if let Some(idx) = self.fail_open_compaction(*turn) {
+                    Some(idx)
+                } else {
+                    self.compacting = false;
+                    self.items.push(ChatItem::Compaction {
+                        turn: *turn,
+                        state: CompactionState::Failed,
+                    });
+                    Some(self.items.len() - 1)
+                }
+            }
             Event::UserMessage {
                 turn,
                 content,
@@ -500,7 +519,11 @@ impl ThreadViewModel {
                         ToolCallStatus::Running
                     },
                     result: None,
+                    duration_ms: None,
                 });
+                if !requires_approval {
+                    self.tool_started_at.insert(call_id.clone(), envelope.ts);
+                }
                 Some(self.items.len() - 1)
             }
             Event::ApprovalRequested { call_id, .. } => {
@@ -530,12 +553,18 @@ impl ThreadViewModel {
                         ToolCallStatus::Running
                     };
                 }
+                if !denied {
+                    self.tool_started_at
+                        .entry(call_id.clone())
+                        .or_insert(envelope.ts);
+                }
                 idx
             }
             Event::ToolStarted { call_id } => {
                 let idx = self.items.iter().rposition(
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 );
+                let mut started = false;
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
                     let terminal = matches!(
                         *status,
@@ -546,7 +575,11 @@ impl ThreadViewModel {
                     );
                     if !terminal && *status != ToolCallStatus::AwaitingApproval {
                         *status = ToolCallStatus::Running;
+                        started = true;
                     }
+                }
+                if started {
+                    self.tool_started_at.insert(call_id.clone(), envelope.ts);
                 }
                 idx
             }
@@ -580,12 +613,17 @@ impl ThreadViewModel {
                 status,
                 result,
             } => {
+                let measured_duration_ms = self
+                    .tool_started_at
+                    .remove(call_id)
+                    .map(|started| (envelope.ts - started).num_milliseconds().max(0) as u64);
                 let idx = self.items.iter().rposition(
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 );
                 if let Some(ChatItem::ToolCall {
                     status: s,
                     result: r,
+                    duration_ms,
                     ..
                 }) = self.find_tool(call_id)
                 {
@@ -601,6 +639,9 @@ impl ThreadViewModel {
                         };
                     }
                     *r = Some(result.clone());
+                    if measured_duration_ms.is_some() {
+                        *duration_ms = measured_duration_ms;
+                    }
                 }
                 self.pending_approvals.retain(|c| c != call_id);
                 idx
@@ -1138,6 +1179,20 @@ mod tests {
         assert!(retained.omitted);
         assert!(retained.text.len() <= MAX_TOOL_OUTPUT_BYTES);
         assert!(retained.text.ends_with("🙂tail"));
+    }
+
+    #[test]
+    fn incremental_tool_output_trim_preserves_a_utf8_boundary() {
+        let mut buffer = ToolOutputBuffer {
+            text: format!("{}🙂", "x".repeat(MAX_TOOL_OUTPUT_BYTES - 4)),
+            omitted: false,
+        };
+
+        assert!(buffer.append("tail"));
+        assert!(buffer.omitted);
+        assert!(buffer.text.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(buffer.text.is_char_boundary(0));
+        assert!(buffer.text.ends_with("🙂tail"));
     }
 
     #[test]

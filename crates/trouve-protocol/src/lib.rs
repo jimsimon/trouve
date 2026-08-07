@@ -181,7 +181,9 @@ pub use requests::*;
 // session-to-PR associations, and Git & Worktrees settings at a server cursor
 // so clients no longer replay the complete server event log on startup
 // (additive).
-pub const PROTOCOL_VERSION: &str = "3.8";
+// 3.9: failed provider-owned context compactions emit an explicit terminal
+// lifecycle edge so clients can clear compaction state immediately (additive).
+pub const PROTOCOL_VERSION: &str = "3.9";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

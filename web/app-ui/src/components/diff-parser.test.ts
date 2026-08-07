@@ -81,6 +81,20 @@ Binary files a/asset.bin and b/asset.bin differ
     ]);
   });
 
+  it("treats hunk additions beginning with plus signs as content", () => {
+    const [file] = parseUnifiedDiff(`diff --git a/a b/a
+--- a/a
++++ b/a
+@@ -1 +1 @@
+-old
++++ new
+`);
+
+    expect(file?.path).toBe("a");
+    expect(file?.modified).toBe("++ new");
+    expect(file?.additions).toBe(1);
+  });
+
   it("tracks source positions independently through additions and deletions", () => {
     const [file] = parseUnifiedDiff(`diff --git a/a b/a
 @@ -20,4 +30,5 @@

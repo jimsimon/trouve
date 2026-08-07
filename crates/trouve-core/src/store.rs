@@ -1076,12 +1076,15 @@ fn session_summary(conn: &Connection, session_id: &str) -> Result<Option<Session
             "idle" => SessionOutcome::Idle,
             "succeeded" => SessionOutcome::Succeeded,
             "failed" => SessionOutcome::Failed,
-            other => anyhow::bail!("invalid persisted session outcome {other}"),
+            // A downgrade may encounter a newer additive outcome literal.
+            // Keep the writer transaction available and expose the neutral
+            // state until a known event replaces the projection value.
+            _ => SessionOutcome::Idle,
         }
     };
     let updated_at = chrono::DateTime::parse_from_rfc3339(&ts)
-        .with_context(|| format!("invalid session summary timestamp {ts}"))?
-        .with_timezone(&chrono::Utc);
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
     Ok(Some(SessionSummary {
         session_id: session_id.to_string(),
         workspace_id,

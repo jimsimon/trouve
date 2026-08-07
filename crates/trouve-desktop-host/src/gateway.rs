@@ -27,7 +27,7 @@ use crate::{
     HostCapabilities, HostKind, HostLifecycleEnvelope, HostLifecycleState, HostNativeActions,
     HostPreferences, HostValidationError, LocalFileAction, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES,
     MAX_NATIVE_ATTACHMENTS, MAX_SYSTEM_FONT_FAMILIES, NativeAttachment, NativeNotification,
-    system_font_families, validate_native_attachment,
+    system_font_families, valid_session_relative_path, validate_native_attachment,
 };
 
 pub const HOST_API_PREFIX: &str = "/__trouve/host/v1";
@@ -697,12 +697,7 @@ async fn pick_directory(
     {
         return Err(GatewayRejection::Missing);
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 1024)
-        .await
-        .map_err(|_| GatewayRejection::InvalidAction)?;
-    if !bytes.is_empty() {
-        return Err(GatewayRejection::InvalidAction);
-    }
+    require_empty_action_body(request).await?;
     let _permit = state
         .native_picker_permit
         .clone()
@@ -1002,7 +997,7 @@ async fn local_file_action(
     if !action_available {
         return Err(GatewayRejection::Missing);
     }
-    if !valid_bridge_id(&request.session_id) || !valid_relative_file_request(&request.relative_path)
+    if !valid_bridge_id(&request.session_id) || !valid_session_relative_path(&request.relative_path)
     {
         return Err(GatewayRejection::InvalidAction);
     }
@@ -1035,23 +1030,14 @@ async fn open_https_url(
     {
         return Err(GatewayRejection::Missing);
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 8 * 1024)
-        .await
-        .map_err(|_| GatewayRejection::InvalidAction)?;
-    let request: OpenHttpsUrlRequest =
-        serde_json::from_slice(&bytes).map_err(|_| GatewayRejection::InvalidAction)?;
+    let request: OpenHttpsUrlRequest = read_json_action(request, 8 * 1024).await?;
     let url = ExternalHttpsUrl::parse(&request.url).map_err(|_| GatewayRejection::InvalidAction)?;
     state
         .native_actions
         .open_https_url(&url)
         .map_err(|_| GatewayRejection::Internal)?;
 
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    apply_security_headers(response.headers_mut());
-    Ok(response)
+    no_content()
 }
 
 fn validate_picked_directory(path: &Path) -> Result<String, ()> {
@@ -1099,18 +1085,6 @@ fn valid_bridge_id(value: &str) -> bool {
 
 fn valid_chat_item_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-}
-
-fn valid_relative_file_request(value: &str) -> bool {
-    let path = Path::new(value);
-    !value.is_empty()
-        && value.len() <= 32 * 1024
-        && !value.contains('\\')
-        && !value.chars().any(char::is_control)
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn no_content() -> Result<Response, GatewayRejection> {
@@ -1429,7 +1403,12 @@ fn valid_pull_request_group_id(value: &str) -> bool {
 fn asset_response(asset: &Asset) -> Result<Response, GatewayRejection> {
     let content_type =
         HeaderValue::from_str(&asset.content_type).map_err(|_| GatewayRejection::Internal)?;
-    let cache_control = if asset.immutable && asset.content_type != "text/html" {
+    let is_html = asset
+        .content_type
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"));
+    let cache_control = if asset.immutable && !is_html {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
         HeaderValue::from_static("no-store")

@@ -307,7 +307,11 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       .filter(({ item }) => item.group === group);
     if (indexed.length === 0) return nothing;
     return html`
-      <section class="command-palette-group" aria-labelledby=${`command-group-${group}`}>
+      <section
+        class="command-palette-group"
+        role="group"
+        aria-labelledby=${`command-group-${group}`}
+      >
         <h2 id=${`command-group-${group}`}>${group}</h2>
         ${indexed.map(({ item, index }) => {
           const stateDescription = item.pullRequestBadge?.tooltip

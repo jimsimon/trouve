@@ -93,6 +93,7 @@ describe("composer completion", () => {
     const candidates = [
       { value: "" },
       { value: "safe.ts", detail: "  Safe\n  file  " },
+      { value: "bounded.ts", detail: `${" detail ".repeat(10_000)}tail` },
       { value: "spoof\nrow.ts" },
       { value: "x".repeat(4_097) },
       ...Array.from({ length: 20 }, (_, index) => ({ value: `src/file-${index}.ts` })),
@@ -100,6 +101,8 @@ describe("composer completion", () => {
     const matches = rankComposerCompletions(candidates, "", 99);
     expect(matches).toHaveLength(8);
     expect(matches[0]).toMatchObject({ value: "safe.ts", detail: "Safe file" });
+    expect(matches.find(({ value }) => value === "bounded.ts")?.detail.length)
+      .toBeLessThanOrEqual(512);
   });
 
   it("splices command and file selections without discarding surrounding draft text", () => {

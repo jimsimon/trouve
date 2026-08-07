@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
+import { packageName } from "./lockfile.mjs";
+
 const lockPath = fileURLToPath(new URL("../package-lock.json", import.meta.url));
 const outputPath = fileURLToPath(
   new URL("../dist/npm-sbom.cdx.json", import.meta.url),
@@ -10,13 +12,6 @@ const lock = JSON.parse(await readFile(lockPath, "utf8"));
 if (lock.lockfileVersion !== 3 || typeof lock.packages !== "object") {
   throw new Error("expected a package-lock v3 packages inventory");
 }
-
-const packageName = (packagePath, metadata) => {
-  if (typeof metadata.name === "string") return metadata.name;
-  const marker = "node_modules/";
-  const index = packagePath.lastIndexOf(marker);
-  return index < 0 ? packagePath : packagePath.slice(index + marker.length);
-};
 
 const purlName = (name) =>
   name.startsWith("@") ? `%40${name.slice(1)}` : name;

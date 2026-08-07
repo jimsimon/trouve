@@ -311,6 +311,11 @@ pub enum Event {
         /// an external harness reported the boundary without a message count.
         messages_compacted: u64,
     },
+    /// A provider-owned compaction item terminated unsuccessfully. This is a
+    /// distinct terminal edge so clients can clear their busy state even when
+    /// the vendor turn continues producing ordinary output.
+    #[serde(rename = "thread.compaction_failed")]
+    CompactionFailed { turn: u64 },
 
     // --- session scope ----------------------------------------------------
     #[serde(rename = "checkpoint.created")]

@@ -116,7 +116,7 @@ export const parseUnifiedDiff = (diff: string): readonly ParsedDiffFile[] => {
       files.push(current);
     }
     if (current === undefined) continue;
-    if (line.startsWith("+++ ") && line !== "+++ /dev/null") {
+    if (!current.inHunk && line.startsWith("+++ ") && line !== "+++ /dev/null") {
       current.path = line.slice(4).replace(/^b\//, "").replace(/^"|"$/g, "");
       continue;
     }

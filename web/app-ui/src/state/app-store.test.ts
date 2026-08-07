@@ -506,6 +506,20 @@ describe("AppStore", () => {
     expect(view.todos[0]).not.toBe(todos[0]);
   });
 
+  it("preserves live todos when a compatible folded snapshot omits them", () => {
+    const store = new AppStore();
+    const live = [
+      { id: "live", content: "Keep current state", status: "in_progress" as const },
+    ];
+    store.upsertThread(thread("th_1"));
+    store.applyThreadEvent("th_1", todoEvent(1, live));
+
+    expect(store.replaceThreadViewSnapshot("th_1", 2, { items: [] })).toBe(true);
+
+    expect(store.threadView("th_1").todos).toEqual(live);
+    expect(store.thread("th_1")?.todos).toEqual(live);
+  });
+
   it("projects todo replacement events into both view and thread metadata", () => {
     const store = new AppStore();
     store.upsertThread(thread("th_1", [
@@ -541,6 +555,27 @@ describe("AppStore", () => {
       { kind: "user", content: "second" },
     ]);
     expect(store.threadView("th_1").cursor).toBe(2);
+  });
+
+  it("publishes optimistic approval transitions through the store", () => {
+    const store = new AppStore();
+    store.applyThreadEvent("th_1", {
+      cursor: 1,
+      scope: { thread: "th_1" },
+      ts: "2026-08-01T12:03:01Z",
+      type: "tool.requested",
+      turn: 1,
+      call_id: "call_approval",
+      tool: "shell",
+      args: { command: "cargo test" },
+      requires_approval: true,
+    });
+
+    expect(store.resolveApprovalOptimistically("th_1", "call_approval", "approve"))
+      .toBe(true);
+    expect(store.threadView("th_1").findTool("call_approval")?.status).toBe("running");
+    expect(store.resolveApprovalOptimistically("th_1", "call_approval", "deny"))
+      .toBe(false);
   });
 
   it("orders title-model settings snapshots against delayed SSE replay", () => {

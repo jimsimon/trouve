@@ -72,9 +72,10 @@ loopback Vite source policy as Wry, including @lit/context, @lit-labs/signals,
 WebAwesome, and the hard-widget implementations, so those surfaces can be
 qualified in the embedded engine rather than in servoshell.
 
-The first native-Wayland smoke run with Servo 0.4.0 successfully created the
-window, served the desktop assets, and completed protocol requests through the
-gateway. It also showed that Servo 0.4.0 rejected CSS used by the current
+An earlier native-Wayland smoke run with the Servo 0.4.0 release, before the
+current nightly pin, successfully created the window, served the desktop
+assets, and completed protocol requests through the gateway. That release
+also rejected CSS used by the current
 frontend, including `:has()`, `color-scheme`, several accessibility media
 queries, `text-overflow`, `user-select`, `resize`, and `touch-action`. Those are
 open compatibility and visual-parity failures, not acceptable differences or a

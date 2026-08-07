@@ -24,7 +24,8 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    command: `node node_modules/vite/bin/vite.js --host 127.0.0.1 --port ${port}`,
+    command:
+      `TROUVE_APP_UI_DEV_URL=http://127.0.0.1:${port} node node_modules/vite/bin/vite.js`,
     url: `http://127.0.0.1:${port}/gallery.html`,
     reuseExistingServer: !process.env["CI"],
     timeout: 120_000,

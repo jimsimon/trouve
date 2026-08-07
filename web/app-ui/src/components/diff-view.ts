@@ -14,6 +14,8 @@ import {
 
 export type { DiffMode } from "./diff-mode.js";
 
+export const LARGE_DIFF_VIEW_THRESHOLD = 3_000_000;
+
 export class TrouveDiffView extends LitElement {
   static override properties = {
     original: { type: String },
@@ -169,7 +171,7 @@ export class TrouveDiffView extends LitElement {
     if (!this.hasUpdated || !this.isConnected) return;
     const generation = ++this.#generation;
     this.#dispose();
-    const tooLarge = this.original.length + this.modified.length > 3_000_000;
+    const tooLarge = this.original.length + this.modified.length > LARGE_DIFF_VIEW_THRESHOLD;
     if (tooLarge) {
       const originalParent = this.renderRoot.querySelector<HTMLElement>("#large-original");
       const modifiedParent = this.renderRoot.querySelector<HTMLElement>("#large-modified");
@@ -264,7 +266,7 @@ export class TrouveDiffView extends LitElement {
   }
 
   override render() {
-    const tooLarge = this.original.length + this.modified.length > 3_000_000;
+    const tooLarge = this.original.length + this.modified.length > LARGE_DIFF_VIEW_THRESHOLD;
     const mode = constrainDiffMode(this.mode, this.#narrow);
     const lineRangeDescription = diffLineRangeDescription(
       this.originalLineNumbers,

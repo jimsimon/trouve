@@ -71,7 +71,7 @@ signal and the sort key of every session list.
 
 ## Desktop layout (three columns, keyboard-driven)
 
-```
+```text
 ┌───────────┬──────────────────────────────┬───────────────────────┐
 │ nav       │ thread tabs  [+]             │term│diff│plan│file│PR │
 │ workspace │ mode ▾  model ▾  options ▾   │                       │

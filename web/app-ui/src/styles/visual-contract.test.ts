@@ -278,7 +278,7 @@ describe("Slint/Lit visual contract", () => {
       /\.chat-stream \{[^}]*overflow-y:\s*scroll[^}]*scrollbar-gutter:\s*stable[^}]*scrollbar-width:\s*thin/s,
     );
     expect(app).toMatch(
-      /\.chat-scroll-indicator \{[^}]*background:\s*var\(--trouve-scroll-thumb\)[^}]*pointer-events:\s*none/s,
+      /\.chat-scroll-indicator \{[^}]*background:\s*var\(--trouve-scroll-thumb\)[^}]*opacity:\s*0[^}]*pointer-events:\s*none/s,
     );
     expect(app).toMatch(/\.chat-scroll-indicator\[data-scrollable\] \{[^}]*opacity:\s*1/s);
     expect(app).toMatch(/\.message \{[^}]*margin:\s*0 0 10px/s);
@@ -317,7 +317,7 @@ describe("Slint/Lit visual contract", () => {
       /\.tool-card summary \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
     );
     expect(app).toMatch(
-      /\.tool-card pre \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap[^}]*word-break:\s*break-word/s,
+      /\.tool-card pre \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap/s,
     );
     expect(app).toMatch(
       /\.composer-entry \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 76px/s,
@@ -346,6 +346,9 @@ describe("Slint/Lit visual contract", () => {
     );
     expect(app).toMatch(
       /\.agent-activity-timeline\.single-activity::before \{[^}]*inset-block:\s*6px/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline\.has-expanded-group::before \{[^}]*display:\s*none/s,
     );
     expect(app).toMatch(
       /\.agent-activity-timeline > \.activity-group > summary \.disclosure-icon \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*translateY\(-50%\)/s,

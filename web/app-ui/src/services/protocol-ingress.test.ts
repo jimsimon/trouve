@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { AppStore } from "../state/app-store.js";
-import { readSignal } from "../state/reactivity.js";
+import { createSignal, readSignal } from "../state/reactivity.js";
 import type { CursorEventStream } from "./cursor-event-stream.js";
 import { ProtocolIngress, ServerReplayBuffer } from "./protocol-ingress.js";
 import {
@@ -131,6 +131,7 @@ const stream = () => ({
   start: vi.fn(),
   close: vi.fn(),
   reconnectNow: vi.fn(),
+  cursor: createSignal(0),
 }) as unknown as CursorEventStream<ProtocolIngressEvent>;
 
 const retrySources = () => {
@@ -284,6 +285,63 @@ describe("ProtocolIngress", () => {
       expect.objectContaining({ cursor: 9, refreshedAt: "2026-08-01T12:02:09Z" }),
     ]);
     expect(readSignal(store.gitWorktreeSettings)).toMatchObject({ cursor: 10 });
+    ingress.stop();
+  });
+
+  it("recovers a newer durable server projection after reconnect", async () => {
+    const store = new AppStore();
+    const fakeStream = stream();
+    let eventOptions: ServerEventOptions | undefined;
+    let projectionCursor = 10;
+    let viewer = "bootstrap-viewer";
+    const serverProjectionSnapshot = vi.fn(async () => ({
+      cursor: projectionCursor,
+      value: {
+        github_pull_requests: [{
+          cursor: projectionCursor,
+          refreshed_at: "2026-08-01T12:02:09Z",
+          pull_requests: { host: "github.com", viewer, prs: [] },
+        }],
+        session_pull_requests: [],
+        git_worktree_settings: {
+          title_model_load_behavior: "auto",
+          title_model_resource_policy: "adaptive",
+          title_model: {
+            state: "ready",
+            runtime_installed: true,
+            model_downloaded: true,
+          },
+        },
+      },
+    }));
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions: vi.fn(async () => [session("Current")]),
+      sessionSummaries: vi.fn(async () => ({ summaries: [summary], cursor: 8 })),
+      workspaces: vi.fn(async () => [workspace]),
+      serverProjectionSnapshot,
+      serverEvents: vi.fn(async (options: ServerEventOptions) => {
+        eventOptions = options;
+        return fakeStream;
+      }),
+    };
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+    );
+
+    await ingress.start();
+    expect(readSignal(store.githubPullRequests)[0]?.pullRequests.viewer)
+      .toBe("bootstrap-viewer");
+    eventOptions?.onOpen?.();
+    projectionCursor = 12;
+    viewer = "reconnected-viewer";
+    eventOptions?.onOpen?.();
+
+    await vi.waitFor(() => expect(serverProjectionSnapshot).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(
+      readSignal(store.githubPullRequests)[0]?.pullRequests.viewer,
+    ).toBe("reconnected-viewer"));
     ingress.stop();
   });
 

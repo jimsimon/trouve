@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { PendingAttachment } from "./attachments.js";
 import {
@@ -109,6 +109,43 @@ describe("composer draft persistence", () => {
       text: "",
       attachments: [],
     });
+  });
+
+  it("queues a return to persisted attachments behind an in-flight write", async () => {
+    const persisted = attachment("persisted-a.png");
+    const replacement = attachment("pending-b.png");
+    let releaseReplacement!: () => void;
+    const replacementGate = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    const attachmentStorage = new MemoryAttachmentStorage();
+    attachmentStorage.values.set("thread-a", [persisted]);
+    const saves: string[] = [];
+    attachmentStorage.save = async (threadId, attachments) => {
+      const name = attachments[0]?.upload.name ?? "empty";
+      saves.push(name);
+      if (name === replacement.upload.name) await replacementGate;
+      attachmentStorage.values.set(threadId, [...attachments]);
+    };
+    const controller = new ComposerDraftController({ attachmentStorage });
+    await controller.hydrate("thread-a");
+
+    const writeReplacement = controller.save("thread-a", {
+      text: "B",
+      cursor: 1,
+      attachments: [replacement],
+    });
+    await vi.waitFor(() => expect(saves).toEqual([replacement.upload.name]));
+    const restorePersisted = controller.save("thread-a", {
+      text: "A",
+      cursor: 1,
+      attachments: [persisted],
+    });
+    releaseReplacement();
+    await Promise.all([writeReplacement, restorePersisted]);
+
+    expect(saves).toEqual([replacement.upload.name, persisted.upload.name]);
+    expect(attachmentStorage.values.get("thread-a")).toEqual([persisted]);
   });
 
   it("uses bounded versioned browser text records and removes submitted drafts", () => {

@@ -5,4 +5,5 @@
 //! chat items.
 
 pub mod client;
+pub mod protocol_compatibility;
 pub mod viewmodel;

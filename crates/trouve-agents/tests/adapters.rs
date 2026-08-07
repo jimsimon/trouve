@@ -868,6 +868,8 @@ echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":[]}}}'
 echo '{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"thr-1","itemId":"reasoning-1","delta":"Raw reasoning."}}'
 echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":["Raw reasoning."]}}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"compact-1","type":"contextCompaction"}}}'
+echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"compact-1","type":"contextCompaction","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","command":"ls"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
 IFS= read -r approval
@@ -890,6 +892,8 @@ cat > /dev/null
     let mut saw_tool_started = false;
     let mut saw_tool_output = false;
     let mut saw_tool_completed = false;
+    let mut saw_compaction_started = false;
+    let mut saw_compaction_completed = false;
     let mut sessions = Vec::new();
     let mut live_usage = None;
     let mut usage = None;
@@ -915,10 +919,11 @@ cat > /dev/null
             }
             BackendEvent::UsageUpdated { usage } => live_usage = Some(usage),
             BackendEvent::Completed { usage: u } => usage = Some(u),
+            BackendEvent::CompactionStarted => saw_compaction_started = true,
+            BackendEvent::CompactionCompleted => saw_compaction_completed = true,
             BackendEvent::QuestionsNeeded { .. }
             | BackendEvent::CommandsUpdated { .. }
-            | BackendEvent::CompactionStarted
-            | BackendEvent::CompactionCompleted => {}
+            | BackendEvent::CompactionFailed => {}
         }
     }
 
@@ -937,6 +942,7 @@ cat > /dev/null
         "completed reasoning must not repeat a streamed raw delta: {thinking:?}"
     );
     assert!(saw_text && saw_tool_started && saw_tool_output && saw_tool_completed);
+    assert!(saw_compaction_started && saw_compaction_completed);
     assert_eq!(
         live_usage.expect("live usage").context_input_tokens,
         Some(11)

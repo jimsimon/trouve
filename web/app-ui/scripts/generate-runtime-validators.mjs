@@ -88,7 +88,16 @@ for (const name of ["turn_models", "turn_started_at", "turn_duration_ms"]) {
 const eventEnvelope = asRecord(protocolSchemas?.EventEnvelope);
 const eventEnvelopeAllOf = eventEnvelope?.allOf;
 const eventEnvelopeFields = Array.isArray(eventEnvelopeAllOf)
-  ? eventEnvelopeAllOf[1]
+  ? eventEnvelopeAllOf.find((candidate) => {
+      const schema = asRecord(candidate);
+      const properties = asRecord(schema?.properties);
+      const required = schema?.required;
+      return properties !== undefined
+        && Array.isArray(required)
+        && ["cursor", "scope", "ts"].every((field) =>
+          required.includes(field) && properties[field] !== undefined
+        );
+    })
   : undefined;
 if (eventEnvelopeFields === undefined) {
   throw new TypeError("protocol schema has no EventEnvelope fields");

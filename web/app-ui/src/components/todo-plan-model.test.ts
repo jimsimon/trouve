@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTodoPlanModel } from "./todo-plan-model.js";
+import { buildTodoPlanModel, todoStatusIcon } from "./todo-plan-model.js";
 
 describe("buildTodoPlanModel", () => {
+  it("shares one status icon mapping with tool presentations", () => {
+    expect(todoStatusIcon("completed")).toBe("check");
+    expect(todoStatusIcon("in_progress")).toBe("play");
+    expect(todoStatusIcon("cancelled")).toBe("xmark");
+    expect(todoStatusIcon("future-status")).toBe("circle");
+  });
   it("preserves authoritative order and represents every semantic status", () => {
     const model = buildTodoPlanModel([
       { id: "pending", content: "Queue work", status: "pending" },

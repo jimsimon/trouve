@@ -274,6 +274,10 @@ fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String>
     {
         return Err("clipboard image is outside native bounds".into());
     }
+    // Keep a wider raw-pixel ceiling than the encoded attachment limit so a
+    // large but highly compressible image can still fit the 10 MiB wire cap.
+    // The 64 MiB bound limits worst-case PNG work before NativeAttachment
+    // validates the final encoded payload.
     let width = u32::try_from(image.width)
         .map_err(|_| "clipboard image width is outside native bounds".to_string())?;
     let height = u32::try_from(image.height)
@@ -443,13 +447,11 @@ impl App {
 
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.running.is_some() {
-            if let Some(running) = &self.running {
-                running.webview.focus();
-                running.webview.set_throttled(false);
-                running.window.request_redraw();
-                running.lifecycle.set_visible(true);
-            }
+        if let Some(running) = &self.running {
+            running.webview.focus();
+            running.webview.set_throttled(false);
+            running.window.request_redraw();
+            running.lifecycle.set_visible(true);
             return;
         }
 

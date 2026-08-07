@@ -6,6 +6,7 @@ import type {
   ProtocolEventEnvelope,
   ProtocolThreadViewSnapshot,
 } from "../services/protocol-client.js";
+import { ThreadReplayBatcher } from "../services/thread-ingress.js";
 import { ThreadViewModel, type TodoItem } from "./thread-view-model.js";
 
 const envelope = (
@@ -103,7 +104,6 @@ describe("ThreadViewModel", () => {
           tool: "shell",
           args: { command: "cargo test" },
           status: "awaiting_approval",
-          duration_ms: 50,
         },
       ],
       pending_approvals: ["call_snapshot"],
@@ -133,11 +133,29 @@ describe("ThreadViewModel", () => {
         id: "snapshot:42",
         kind: "tool",
         status: "awaiting-approval",
-        durationMs: 50,
       },
     ]);
     expect(view.turnModels.get(7)).toBe("openai/gpt-5.6");
     expect(view.turnDurationMs.get(7)).toBe(4_000);
+  });
+
+  it("retains a completed tool duration from a folded snapshot", () => {
+    const view = ThreadViewModel.fromSnapshot(9, {
+      items: [{
+        kind: "tool_call",
+        call_id: "completed",
+        tool: "shell",
+        args: { command: "cargo test" },
+        status: "ok",
+        duration_ms: 50,
+      }],
+    });
+
+    expect(view.items[0]).toMatchObject({
+      kind: "tool",
+      status: "ok",
+      durationMs: 50,
+    });
   });
 
   it("restores a completed compaction boundary from a folded snapshot", () => {
@@ -159,6 +177,20 @@ describe("ThreadViewModel", () => {
       turn: 4,
       state: { kind: "completed", messagesCompacted: 27 },
     }]);
+  });
+
+  it("preserves live todos when an older-compatible snapshot omits them", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "thread.todos_updated",
+      todos: [{ id: "live", content: "Keep me", status: "in_progress" }],
+    }));
+
+    view.replaceSnapshot(2, { items: [] });
+
+    expect(view.todos).toEqual([
+      { id: "live", content: "Keep me", status: "in_progress" },
+    ]);
   });
 
   it("prepends only a contiguous folded page and keeps absolute item ids stable", () => {
@@ -465,6 +497,19 @@ describe("ThreadViewModel", () => {
     });
   });
 
+  it("persists an explicit failed compaction boundary", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, { type: "thread.compaction_started", turn: 2 }));
+    vm.apply(envelope(2, { type: "thread.compaction_failed", turn: 2 }));
+
+    expect(vm.compacting).toBe(false);
+    expect(vm.items[0]).toMatchObject({
+      kind: "compaction",
+      turn: 2,
+      state: { kind: "failed" },
+    });
+  });
+
   it("defensively applies full todo replacements in protocol order", () => {
     const vm = new ThreadViewModel();
     const snapshot: TodoItem[] = [
@@ -500,8 +545,15 @@ describe("ThreadViewModel", () => {
     const live = new ThreadViewModel();
     const replay = new ThreadViewModel();
     for (const event of events) live.apply(event);
-    for (const event of [...events]) replay.apply(event);
+    const batches: ProtocolEventEnvelope[][] = [];
+    const replayBatcher = new ThreadReplayBatcher((batch) => {
+      batches.push([...batch]);
+      for (const event of batch) replay.apply(event);
+    });
+    for (const event of events) replayBatcher.receive(event);
+    replayBatcher.flush();
 
+    expect(batches).toEqual([events]);
     expect(replay.items).toEqual(live.items);
     expect(replay.cursor).toBe(live.cursor);
     expect(replay.turnRunning).toBe(false);

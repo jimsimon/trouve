@@ -13,6 +13,11 @@ describe("chat file links", () => {
       from: 42,
       to: 42,
     });
+    expect(parseChatFileTarget("crates/app/src/main.rs:42:7")).toEqual({
+      path: "crates/app/src/main.rs",
+      from: 42,
+      to: 42,
+    });
     expect(parseChatFileTarget("crates/app/src/main.rs#L10-L14")).toEqual({
       path: "crates/app/src/main.rs",
       from: 10,

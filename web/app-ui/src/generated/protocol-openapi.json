@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "2.15"
+    "version": "3.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -4728,6 +4728,9 @@
           "github_comment_url": {
             "type": "string"
           },
+          "github_publication_status": {
+            "$ref": "#/components/schemas/CodeReviewFindingPublicationStatus"
+          },
           "github_thread_id": {
             "type": [
               "string",
@@ -4775,6 +4778,16 @@
             "description": "`open`, `fixed`, or `dismissed`."
           }
         }
+      },
+      "CodeReviewFindingPublicationStatus": {
+        "type": "string",
+        "description": "The outcome of attempting to publish a finding as an inline GitHub comment.",
+        "enum": [
+          "pending",
+          "published",
+          "not_eligible",
+          "failed"
+        ]
       },
       "CodeReviewFindingSource": {
         "type": "object",
@@ -5002,7 +5015,8 @@
             "$ref": "#/components/schemas/CodeReviewJobScope"
           },
           "semantic_routing": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Snapshotted Additive semantic-routing choice. Automatic jobs route\nsemantically regardless of a legacy `false` value."
           },
           "session_id": {
             "type": [
@@ -5423,7 +5437,7 @@
           },
           "semantic_routing": {
             "type": "boolean",
-            "description": "Whether Additive or Automatic mode may run one tool-free semantic\nrouter pass per diff batch. Semantic choices can only add personas."
+            "description": "Whether Additive mode may run one tool-free semantic router pass per\ndiff batch. Automatic mode always runs it as the sole selector."
           }
         }
       },
@@ -6747,6 +6761,27 @@
                 "type": "string",
                 "enum": [
                   "thread.compaction_completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A provider-owned compaction item terminated unsuccessfully. This is a\ndistinct terminal edge so clients can clear their busy state even when\nthe vendor turn continues producing ordinary output.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_failed"
                 ]
               }
             }
@@ -10075,7 +10110,7 @@
               "boolean",
               "null"
             ],
-            "description": "Omitted by older clients to preserve the current/default semantic\nrouting choice."
+            "description": "Omitted by older clients to preserve the current/default semantic\nrouting choice. Forced to `true` when `routing_mode` is Automatic."
           }
         }
       },

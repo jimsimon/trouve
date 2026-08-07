@@ -17,8 +17,7 @@ const languageExtension = async (language: string): Promise<Extension[]> => {
     case "jsx":
     case "typescript":
     case "ts":
-    case "tsx":
-    case "json": {
+    case "tsx": {
       const { javascript } = await import("@codemirror/lang-javascript");
       return [
         javascript({
@@ -26,6 +25,10 @@ const languageExtension = async (language: string): Promise<Extension[]> => {
           typescript: normalized.startsWith("t"),
         }),
       ];
+    }
+    case "json": {
+      const { json } = await import("@codemirror/lang-json");
+      return [json()];
     }
     default: {
       const [{ StateField }, view, highlighter] = await Promise.all([

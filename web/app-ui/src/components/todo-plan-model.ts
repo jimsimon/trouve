@@ -33,6 +33,9 @@ const PRESENTATION: Readonly<
   cancelled: { icon: "xmark", statusLabel: "Cancelled" },
 };
 
+export const todoStatusIcon = (status: string): FontAwesomeIconName =>
+  PRESENTATION[status as TodoStatus]?.icon ?? PRESENTATION.pending.icon;
+
 /** Project the full-replacement protocol snapshot without reordering it. */
 export const buildTodoPlanModel = (
   todos: readonly ProtocolTodoItem[],

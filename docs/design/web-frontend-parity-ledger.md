@@ -1315,7 +1315,7 @@ state on Slint and Lit whenever both frontends can render the surface.
 Create one packet per surface and qualification run. Keep artifact paths
 repository-relative or link to the immutable CI artifact.
 
-~~~yaml
+```yaml
 surface:
 surface_status:
 fixture_id:
@@ -1387,7 +1387,7 @@ security_packaging:
 overall_result:
 open_findings:
 approved_deviation_ids: []
-~~~
+```
 
 ## Current evidence register
 

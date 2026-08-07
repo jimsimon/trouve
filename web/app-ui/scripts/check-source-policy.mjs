@@ -30,7 +30,7 @@ const policies = [
     message: "raw HTML sinks bypass Lit and the Markdown sanitizer",
   },
   {
-    expression: /(?:from\s+|import\s*)["'`](?:preact|react)(?:\/[^"'`]*)?["'`]/u,
+    expression: /(?:from\s+|import\s*)["'`](?:preact|react(?:-dom)?)(?:\/[^"'`]*)?["'`]/u,
     message: "Lit is the only application component runtime",
   },
   {

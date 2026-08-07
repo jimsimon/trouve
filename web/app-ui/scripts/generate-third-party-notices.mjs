@@ -1,6 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
+import { packageName } from "./lockfile.mjs";
+
 const root = fileURLToPath(new URL("../", import.meta.url));
 const lockPath = fileURLToPath(new URL("../package-lock.json", import.meta.url));
 const noticePath = fileURLToPath(new URL("../THIRD_PARTY_NOTICES.md", import.meta.url));
@@ -18,13 +20,6 @@ const approvedLicenses = new Set([
   "MPL-2.0",
   "Python-2.0",
 ]);
-
-const packageName = (packagePath, metadata) => {
-  if (typeof metadata.name === "string") return metadata.name;
-  const marker = "node_modules/";
-  const index = packagePath.lastIndexOf(marker);
-  return index < 0 ? packagePath : packagePath.slice(index + marker.length);
-};
 
 const lock = JSON.parse(await readFile(lockPath, "utf8"));
 const packages = Object.entries(lock.packages ?? {})

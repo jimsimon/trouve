@@ -1,5 +1,8 @@
-import { copyFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { copyFileSync, mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const appRoot = fileURLToPath(new URL("../", import.meta.url));
 
 const copies = [
   [
@@ -13,5 +16,8 @@ const copies = [
 ];
 
 for (const [source, destination] of copies) {
-  copyFileSync(resolve(source), resolve(destination));
+  const sourcePath = resolve(appRoot, source);
+  const destinationPath = resolve(appRoot, destination);
+  mkdirSync(dirname(destinationPath), { recursive: true });
+  copyFileSync(sourcePath, destinationPath);
 }

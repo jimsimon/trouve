@@ -138,8 +138,9 @@ export const validateAutomationDraft = (
   if (draft.workspaceId === "") errors.workspaceId = "Choose a workspace.";
 
   if (draft.scheduleKind === "hourly") {
-    const minute = Number(draft.minute);
-    if (!Number.isInteger(minute) || minute < 0 || minute > 59) {
+    const minuteText = draft.minute.trim();
+    const minute = Number(minuteText);
+    if (!/^\d+$/u.test(minuteText) || !Number.isInteger(minute) || minute > 59) {
       errors.schedule = "Minute must be a whole number from 0 through 59.";
     }
   } else if (!TIME_OF_DAY.test(draft.time.trim())) {

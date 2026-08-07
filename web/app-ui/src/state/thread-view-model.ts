@@ -183,7 +183,9 @@ export class ThreadViewModel {
     this.thinking = snapshot.thinking ?? false;
     this.commands = [...(snapshot.commands ?? [])];
     this.queue = [...(snapshot.queue ?? [])];
-    this.replaceTodos(snapshot.todos ?? []);
+    // Protocol 3.1 snapshots predate the todo projection. Preserve any live
+    // todo events already folded when an older-compatible snapshot omits it.
+    if (snapshot.todos !== undefined) this.replaceTodos(snapshot.todos);
   }
 
   /** Prepend one contiguous folded history page without replacing live state. */
@@ -353,6 +355,21 @@ export class ThreadViewModel {
               kind: "completed",
               messagesCompacted: envelope.messages_compacted,
             },
+          });
+        }
+        return true;
+      }
+      case "thread.compaction_failed": {
+        this.compacting = false;
+        const compaction = this.findRunningCompaction(envelope.turn);
+        if (compaction !== undefined) {
+          compaction.state = { kind: "failed" };
+        } else {
+          this.appendItem({
+            id: `compaction:${envelope.turn}:${envelope.cursor}`,
+            kind: "compaction",
+            turn: envelope.turn,
+            state: { kind: "failed" },
           });
         }
         return true;

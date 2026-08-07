@@ -743,7 +743,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
             class="icon-button"
             type="button"
             ?disabled=${safeUrl === undefined}
-            aria-label="Copy pull request URL"
+            aria-label=${copied ? "Pull request URL copied" : "Copy pull request URL"}
             @click=${() => void this.#copyUrl(row, safeUrl)}
           >${fontAwesomeIcon(copied ? "check" : "copy")}</button>
           <button

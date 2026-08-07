@@ -147,8 +147,6 @@ export class TrouveCliSettings extends LitElement {
       color: var(--trouve-text-dim);
       font: 10px / 1.4 var(--trouve-font-mono, monospace);
     }
-    .badges, .metadata, .path { display: none; }
-
     .actions { flex-wrap: wrap; justify-content: flex-end; }
     .progress-row {
       grid-column: 1 / -1;
@@ -659,7 +657,12 @@ export class TrouveCliSettings extends LitElement {
   }
 }
 
-customElements.define("trouve-cli-settings", TrouveCliSettings);
+if (
+  typeof customElements !== "undefined"
+  && customElements.get("trouve-cli-settings") === undefined
+) {
+  customElements.define("trouve-cli-settings", TrouveCliSettings);
+}
 
 declare global {
   interface HTMLElementTagNameMap {

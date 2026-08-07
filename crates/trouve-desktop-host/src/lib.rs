@@ -673,26 +673,33 @@ pub struct VerifiedSessionFile {
     relative_path: String,
 }
 
+/// Whether a client-supplied path is a bounded, platform-neutral relative
+/// file path. The gateway and native resolver share this predicate so their
+/// validation policies cannot drift.
+pub fn valid_session_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 32 * 1024
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 impl VerifiedSessionFile {
     pub fn resolve(
         worktree: impl AsRef<Path>,
         relative_path: impl Into<String>,
     ) -> Result<Self, HostValidationError> {
         let relative_path = relative_path.into();
-        let relative = Path::new(&relative_path);
-        if relative_path.is_empty()
-            || relative_path.len() > 32 * 1024
-            || relative_path.contains('\\')
-            || relative_path.chars().any(char::is_control)
-            || relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
+        if !valid_session_relative_path(&relative_path) {
             return Err(HostValidationError::InvalidSessionFile(
                 "path must be a bounded worktree-relative file".into(),
             ));
         }
+        let relative = Path::new(&relative_path);
         let root = worktree.as_ref().canonicalize().map_err(|_| {
             HostValidationError::InvalidSessionFile("session worktree is unavailable".into())
         })?;

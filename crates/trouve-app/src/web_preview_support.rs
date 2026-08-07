@@ -13,7 +13,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use trouve_client_core::client::ProtocolClient;
+use trouve_client_core::{
+    client::ProtocolClient, protocol_compatibility::ensure_compatible_protocol,
+};
 use trouve_desktop_host::{
     FrontendSource, HostCapabilities, HostGateway, HostNativeActions, HostPreferences,
     HostPreferencesHandle, VerifiedSessionFile,
@@ -119,9 +121,7 @@ impl WebPreviewHost {
             });
 
         let preference_path = dirs::config_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("trouve")
-            .join("web-preferences.json");
+            .map(|directory| directory.join("trouve").join("web-preferences.json"));
         let (gateway_address, gateway, preferences) =
             runtime.block_on(HostGateway::bind_loopback_with_actions_and_preferences(
                 "127.0.0.1:0"
@@ -131,7 +131,7 @@ impl WebPreviewHost {
                 HostCapabilities::desktop(),
                 HostPreferences::default(),
                 Some(&upstream),
-                Some(preference_path),
+                preference_path,
                 native_actions,
             ))?;
         let initial_preferences = runtime.block_on(preferences.snapshot());
@@ -236,31 +236,6 @@ fn required_server_url(value: Option<String>) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn ensure_compatible_protocol(server: &str, required: &str) -> Result<()> {
-    fn parse(version: &str) -> Option<(u64, u64)> {
-        let (major, minor) = version.split_once('.')?;
-        if minor.contains('.') {
-            return None;
-        }
-        Some((major.parse().ok()?, minor.parse().ok()?))
-    }
-
-    let compatible = match (parse(server), parse(required)) {
-        (Some((server_major, server_minor)), Some((required_major, required_minor))) => {
-            server_major == required_major && server_minor >= required_minor
-        }
-        _ => false,
-    };
-    if !compatible {
-        bail!(
-            "server protocol {server} is incompatible; expected {required} or newer {required_major}.x",
-            required_major =
-                parse(required).map_or("unknown".to_owned(), |(major, _)| major.to_string())
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,22 +261,5 @@ mod tests {
             required_server_url(Some("  http://127.0.0.1:7433  ".into())).unwrap(),
             "http://127.0.0.1:7433"
         );
-    }
-
-    #[test]
-    fn preview_accepts_current_and_newer_compatible_protocols() {
-        ensure_compatible_protocol("2.4", "2.4").unwrap();
-        ensure_compatible_protocol("2.99", "2.4").unwrap();
-    }
-
-    #[test]
-    fn preview_rejects_older_other_major_and_malformed_protocols() {
-        for server in ["2.3", "1.17", "3.0", "unknown", "2.4.1"] {
-            let error = ensure_compatible_protocol(server, "2.4")
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(server));
-            assert!(error.contains("2.4 or newer 2.x"));
-        }
     }
 }
