@@ -10,6 +10,7 @@
 //! desktop gateway and keeps Servo's own storage in a process-owned temporary
 //! directory. It never starts an engine or opens Trouve's durable database.
 
+mod native_notification;
 mod system_opener;
 mod web_preview_support;
 
@@ -333,38 +334,12 @@ impl NativeSleepInhibitor {
 }
 
 fn show_native_notification(notification: NativeNotification, lifecycle: HostLifecycleHandle) {
-    std::thread::spawn(move || {
-        let mut request = notify_rust::Notification::new();
-        request
-            .appname("Trouve")
-            .summary(notification.title())
-            .body(notification.body())
-            .icon("trouve");
-        if notification.sound() {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            request.sound_name("message-new-instant");
-            #[cfg(target_os = "macos")]
-            request.sound_name("Ping");
-        }
-
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            request.hint(notify_rust::Hint::DesktopEntry("trouve".into()));
-            request.action("default", "Open");
-            if let Ok(handle) = request.show() {
-                handle.wait_for_action(|action| {
-                    if action == "default" {
-                        lifecycle.notification_activated(&notification);
-                    }
-                });
-            }
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            let _ = lifecycle;
-            let _ = request.show();
-        }
-    });
+    native_notification::show(
+        notification.title().to_owned(),
+        notification.body().to_owned(),
+        notification.sound(),
+        move || lifecycle.notification_activated(&notification),
+    );
 }
 
 type DirectoryPickerReply = oneshot::Sender<Result<Option<PathBuf>, String>>;

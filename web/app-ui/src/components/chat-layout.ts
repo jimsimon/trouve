@@ -7,7 +7,7 @@ export type AgentChatItem = Extract<
 
 export type AgentActivityItem = Extract<
   AgentChatItem,
-  { readonly kind: "thinking" | "tool" }
+  { readonly kind: "thinking" | "compaction" | "tool" }
 >;
 
 /** Older Codex transcripts represented native context compaction as a tool
@@ -173,10 +173,15 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   let commands = 0;
   let tools = 0;
   let thoughts = 0;
+  let compactions = 0;
 
   for (const item of items) {
     if (item.kind === "thinking") {
       thoughts += 1;
+      continue;
+    }
+    if (item.kind === "compaction" || isContextCompactionTool(item)) {
+      compactions += 1;
       continue;
     }
     if (item.kind !== "tool") continue;
@@ -223,6 +228,9 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   if (commands > 0) parts.push(`ran ${plural(commands, "command", "commands")}`);
   if (tools > 0) parts.push(`called ${plural(tools, "tool", "tools")}`);
   if (thoughts > 0) parts.push(`thought ${plural(thoughts, "time", "times")}`);
+  if (compactions > 0) {
+    parts.push(compactions === 1 ? "compacted context" : `compacted context ${compactions} times`);
+  }
   const summary = parts.join(", ");
   return summary === "" ? "Worked" : `${summary[0]?.toUpperCase() ?? ""}${summary.slice(1)}`;
 };

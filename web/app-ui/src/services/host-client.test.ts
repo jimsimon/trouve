@@ -572,16 +572,28 @@ describe("HostClient", () => {
     });
     expect(chatPreferencesFromHost(preferences)).toEqual({
       collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
     });
     expect(chatPreferencesFromHost(preferences, {
       collapseThinkingWithTools: true,
-    })).toEqual({ collapseThinkingWithTools: true });
+      collapseCompactionWithTools: true,
+    })).toEqual({
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    });
     expect(chatPreferencesFromHost({
       ...preferences,
-      chat: { collapse_thinking_with_tools: false },
+      chat: {
+        collapse_thinking_with_tools: false,
+        collapse_compaction_with_tools: false,
+      },
     }, {
       collapseThinkingWithTools: true,
-    })).toEqual({ collapseThinkingWithTools: false });
+      collapseCompactionWithTools: true,
+    })).toEqual({
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
+    });
     expect(notificationPreferencesFromHost(preferences)).toEqual({
       enabled: true,
       onFinish: true,
@@ -594,6 +606,7 @@ describe("HostClient", () => {
     });
     next = withHostChatPreferences(next, {
       collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
     });
     next = withHostNotificationPreferences(next, {
       enabled: true,
@@ -616,6 +629,7 @@ describe("HostClient", () => {
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
     expect(next.chat?.collapse_thinking_with_tools).toBe(true);
+    expect(next.chat?.collapse_compaction_with_tools).toBe(true);
     expect(next.notifications).toMatchObject({
       on_finish: false,
       on_attention: false,

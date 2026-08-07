@@ -209,6 +209,9 @@ pub struct Chat {
     /// Include thinking output in collapsible tool-activity groups.
     #[serde(default)]
     pub collapse_thinking_with_tools: bool,
+    /// Include context-compaction boundaries in collapsible tool-activity groups.
+    #[serde(default)]
+    pub collapse_compaction_with_tools: bool,
 }
 
 fn config_path(file: &str) -> Option<PathBuf> {
@@ -345,13 +348,18 @@ mod tests {
     }
 
     #[test]
-    fn chat_thinking_collapse_defaults_to_disabled() {
+    fn chat_activity_collapse_preferences_default_to_disabled() {
         assert!(!Chat::default().collapse_thinking_with_tools);
+        assert!(!Chat::default().collapse_compaction_with_tools);
         let restored: Chat = serde_json::from_str("{}").unwrap();
         assert!(!restored.collapse_thinking_with_tools);
-        let enabled: Chat =
-            serde_json::from_str(r#"{"collapse_thinking_with_tools":true}"#).unwrap();
+        assert!(!restored.collapse_compaction_with_tools);
+        let enabled: Chat = serde_json::from_str(
+            r#"{"collapse_thinking_with_tools":true,"collapse_compaction_with_tools":true}"#,
+        )
+        .unwrap();
         assert!(enabled.collapse_thinking_with_tools);
+        assert!(enabled.collapse_compaction_with_tools);
     }
 
     #[test]

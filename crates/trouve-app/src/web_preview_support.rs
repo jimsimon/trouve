@@ -95,6 +95,9 @@ impl WebPreviewHost {
     ) -> Result<Self> {
         trouve_server::install_crypto_provider();
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            // The gateway, embedded server, and notification dispatcher are
+            // I/O-bound; four workers avoid per-core allocator arena growth.
+            .worker_threads(4)
             .enable_all()
             .build()
             .context("creating the desktop host runtime")?;

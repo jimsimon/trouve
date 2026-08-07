@@ -108,4 +108,21 @@ describe("activityGroupSummary", () => {
     expect(isContextCompactionTool(item("compact_context"))).toBe(true);
     expect(isContextCompactionTool(item("commandExecution"))).toBe(false);
   });
+
+  it("keeps collapsed compaction visible in the activity summary", () => {
+    const legacy: AgentActivityItem = {
+      id: "legacy",
+      kind: "tool",
+      callId: "legacy",
+      tool: "contextCompaction",
+      args: {},
+      status: "ok",
+      result: null,
+      output,
+    };
+    expect(activityGroupSummary([
+      { id: "c1", kind: "compaction", turn: 1, state: { kind: "completed", messagesCompacted: 8 } },
+    ])).toBe("Compacted context");
+    expect(activityGroupSummary([legacy])).toBe("Compacted context");
+  });
 });

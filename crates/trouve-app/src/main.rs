@@ -2,6 +2,7 @@
 //! still goes over the protocol on localhost) and runs the Slint UI.
 
 mod controller;
+mod native_notification;
 mod notify;
 mod opener;
 mod render;
@@ -348,11 +349,20 @@ fn main() -> anyhow::Result<()> {
     {
         let prefs = winstate::load_chat();
         window.set_collapse_thinking_with_tools(prefs.collapse_thinking_with_tools);
+        window.set_collapse_compaction_with_tools(prefs.collapse_compaction_with_tools);
         let prefs = std::rc::Rc::new(std::cell::RefCell::new(prefs));
         let tx_prefs = tx.clone();
+        let thinking_prefs = prefs.clone();
         window.on_collapse_thinking_with_tools_toggled(move |on| {
-            let mut prefs = prefs.borrow_mut();
+            let mut prefs = thinking_prefs.borrow_mut();
             prefs.collapse_thinking_with_tools = on;
+            winstate::save_chat(&prefs);
+            let _ = tx_prefs.send(UiCommand::ChatPrefsChanged(prefs.clone()));
+        });
+        let tx_prefs = tx.clone();
+        window.on_collapse_compaction_with_tools_toggled(move |on| {
+            let mut prefs = prefs.borrow_mut();
+            prefs.collapse_compaction_with_tools = on;
             winstate::save_chat(&prefs);
             let _ = tx_prefs.send(UiCommand::ChatPrefsChanged(prefs.clone()));
         });
@@ -1554,6 +1564,10 @@ fn main() -> anyhow::Result<()> {
     let deferred_quit = quit_when_idle.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            // The desktop controller and embedded server are I/O-bound. A
+            // worker per logical CPU creates dozens of allocator arenas on
+            // high-core machines and amplifies transient replay allocations.
+            .worker_threads(4)
             .enable_all()
             .build()
             .expect("tokio runtime");

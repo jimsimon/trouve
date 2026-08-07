@@ -5,6 +5,8 @@
 //! requiring an explicit server so it remains safe to run beside another
 //! frontend. Both load Lit exclusively through the hardened loopback gateway.
 
+#[path = "native_notification.rs"]
+mod native_notification;
 #[path = "opener.rs"]
 mod opener;
 #[path = "sleep.rs"]
@@ -362,38 +364,12 @@ fn capture_window_geometry(
 }
 
 fn show_native_notification(notification: NativeNotification, lifecycle: HostLifecycleHandle) {
-    std::thread::spawn(move || {
-        let mut request = notify_rust::Notification::new();
-        request
-            .appname("Trouve")
-            .summary(notification.title())
-            .body(notification.body())
-            .icon("trouve");
-        if notification.sound() {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            request.sound_name("message-new-instant");
-            #[cfg(target_os = "macos")]
-            request.sound_name("Ping");
-        }
-
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            request.hint(notify_rust::Hint::DesktopEntry("trouve".into()));
-            request.action("default", "Open");
-            if let Ok(handle) = request.show() {
-                handle.wait_for_action(|action| {
-                    if action == "default" {
-                        lifecycle.notification_activated(&notification);
-                    }
-                });
-            }
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            let _ = lifecycle;
-            let _ = request.show();
-        }
-    });
+    native_notification::show(
+        notification.title().to_owned(),
+        notification.body().to_owned(),
+        notification.sound(),
+        move || lifecycle.notification_activated(&notification),
+    );
 }
 
 fn read_selected_attachments(paths: Vec<PathBuf>) -> Result<Vec<NativeAttachment>, String> {

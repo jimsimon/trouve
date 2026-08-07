@@ -868,6 +868,9 @@ export const chatPreferencesFromHost = (
   collapseThinkingWithTools:
     preferences.chat?.collapse_thinking_with_tools ??
     fallback.collapseThinkingWithTools,
+  collapseCompactionWithTools:
+    preferences.chat?.collapse_compaction_with_tools ??
+    fallback.collapseCompactionWithTools,
 });
 
 export const notificationPreferencesFromHost = (
@@ -924,7 +927,10 @@ export const withHostChatPreferences = (
   chat: ChatPreferences,
 ): HostPreferences => ({
   ...preferences,
-  chat: { collapse_thinking_with_tools: chat.collapseThinkingWithTools },
+  chat: {
+    collapse_thinking_with_tools: chat.collapseThinkingWithTools,
+    collapse_compaction_with_tools: chat.collapseCompactionWithTools,
+  },
 });
 
 export const withHostNotificationPreferences = (

@@ -1688,6 +1688,8 @@ export component AppWindow inherits Window {
     // Chat transcript presentation (persisted in chat.json).
     in-out property <bool> collapse-thinking-with-tools: false;
     callback collapse-thinking-with-tools-toggled(bool);
+    in-out property <bool> collapse-compaction-with-tools: false;
+    callback collapse-compaction-with-tools-toggled(bool);
 
     // Local (offline) models — state pushed by the controller, actions out.
     in property <[LocalModelItem]> local-models;
@@ -5769,6 +5771,10 @@ export component AppWindow inherits Window {
         collapse-thinking-with-tools <=> root.collapse-thinking-with-tools;
         collapse-thinking-with-tools-toggled(on) => {
             root.collapse-thinking-with-tools-toggled(on);
+        }
+        collapse-compaction-with-tools <=> root.collapse-compaction-with-tools;
+        collapse-compaction-with-tools-toggled(on) => {
+            root.collapse-compaction-with-tools-toggled(on);
         }
         title-model-load-index <=> root.settings-title-model-load-index;
         title-model-resource-index <=> root.settings-title-model-resource-index;

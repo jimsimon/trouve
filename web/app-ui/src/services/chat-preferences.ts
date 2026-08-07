@@ -6,10 +6,13 @@ import {
 export interface ChatPreferences {
   /** Include thinking output in the collapsible runs formed around tool calls. */
   readonly collapseThinkingWithTools: boolean;
+  /** Include context-compaction boundaries in collapsible tool-activity runs. */
+  readonly collapseCompactionWithTools: boolean;
 }
 
 export const DEFAULT_CHAT_PREFERENCES: ChatPreferences = Object.freeze({
   collapseThinkingWithTools: false,
+  collapseCompactionWithTools: false,
 });
 
 const STORAGE_KEY = "trouve.chat.v1";
@@ -27,6 +30,10 @@ export const normalizeChatPreferences = (
     typeof value.collapseThinkingWithTools === "boolean"
       ? value.collapseThinkingWithTools
       : fallback.collapseThinkingWithTools,
+  collapseCompactionWithTools:
+    typeof value.collapseCompactionWithTools === "boolean"
+      ? value.collapseCompactionWithTools
+      : fallback.collapseCompactionWithTools,
 });
 
 export const browserChatPreferenceStorage = (

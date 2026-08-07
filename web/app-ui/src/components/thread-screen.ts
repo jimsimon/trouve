@@ -1769,6 +1769,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     timelineConnections: {
       readonly before: boolean;
       readonly after: boolean;
+      readonly nested?: boolean;
     } = { before: false, after: false },
   ) {
     const running = state.kind === "running";
@@ -1789,7 +1790,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       <section
         class=${`context-compaction-marker ${state.kind} ${
           timelineConnections.before ? "timeline-connect-before" : ""
-        } ${timelineConnections.after ? "timeline-connect-after" : ""}`}
+        } ${timelineConnections.after ? "timeline-connect-after" : ""} ${
+          timelineConnections.nested ? "nested-timeline-marker" : ""
+        }`}
         data-chat-anchor-id=${anchorId === undefined ? nothing : `item:${anchorId}`}
         role="status"
         aria-live="polite"
@@ -1819,9 +1822,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
   ) {
-    const collapseThinkingWithTools = this.#services.value === undefined
-      ? false
-      : readSignal(this.#services.value.chatPreferences).collapseThinkingWithTools;
+    const chatPreferences = this.#services.value === undefined
+      ? undefined
+      : readSignal(this.#services.value.chatPreferences);
+    const collapseThinkingWithTools = chatPreferences?.collapseThinkingWithTools ?? false;
+    const collapseCompactionWithTools = chatPreferences?.collapseCompactionWithTools ?? false;
     const rows: unknown[] = [];
     let activityConnectedFromCompaction = false;
     let activityRows: Array<{
@@ -1883,7 +1888,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index += 1;
         continue;
       }
-      if (item.kind === "compaction") {
+      if (item.kind === "compaction" && !collapseCompactionWithTools) {
         const connectBefore = activityRows.length > 0;
         const connectAfter = activityFollows(index + 1);
         flushActivityRows(connectBefore);
@@ -1896,25 +1901,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         continue;
       }
       if (item.kind === "tool" && isContextCompactionTool(item)) {
-        if (!hasNativeCompaction) {
+        if (hasNativeCompaction) {
+          if (!collapseCompactionWithTools) flushActivityRows();
+          index += 1;
+          continue;
+        }
+        if (!collapseCompactionWithTools) {
           const connectBefore = activityRows.length > 0;
           const connectAfter = activityFollows(index + 1);
           flushActivityRows(connectBefore);
-          const state: CompactionState = item.status === "ok"
-            ? { kind: "completed", messagesCompacted: 0 }
-            : item.status === "running" || item.status === "awaiting-approval"
-              ? { kind: "running" }
-              : { kind: "failed" };
-          rows.push(this.#renderCompactionMarker(state, item.id, {
+          rows.push(this.#renderCompactionMarker(this.#legacyCompactionState(item), item.id, {
             before: connectBefore,
             after: connectAfter,
           }));
           activityConnectedFromCompaction = connectAfter;
-        } else {
-          flushActivityRows();
+          index += 1;
+          continue;
         }
-        index += 1;
-        continue;
       }
       if (item.kind === "thinking" && !collapseThinkingWithTools) {
         activityRows.push({
@@ -1932,18 +1935,32 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           candidate === undefined
           || candidate.kind === "assistant"
           || candidate.kind === "questions"
-          || candidate.kind === "compaction"
-          || (candidate.kind === "tool" && isContextCompactionTool(candidate))
+          || (!collapseCompactionWithTools && candidate.kind === "compaction")
+          || (!collapseCompactionWithTools
+            && candidate.kind === "tool"
+            && isContextCompactionTool(candidate))
           || (!collapseThinkingWithTools && candidate.kind === "thinking")
         ) break;
+        if (
+          hasNativeCompaction
+          && candidate.kind === "tool"
+          && isContextCompactionTool(candidate)
+        ) {
+          index += 1;
+          continue;
+        }
         run.push(candidate as AgentActivityItem);
         index += 1;
       }
       const only = run[0];
-      const groupSingleThought = collapseThinkingWithTools
-        && run.length === 1
-        && only?.kind === "thinking";
-      if (run.length < 2 && !groupSingleThought) {
+      const groupSinglePreferenceBoundary = run.length === 1 && (
+        (collapseThinkingWithTools && only?.kind === "thinking")
+        || (collapseCompactionWithTools && (
+          only?.kind === "compaction"
+          || (only?.kind === "tool" && isContextCompactionTool(only))
+        ))
+      );
+      if (run.length < 2 && !groupSinglePreferenceBoundary) {
         if (only !== undefined) {
           activityRows.push({
             content: this.#renderItem(only, turnModels, turnDurationMs, presentation),
@@ -2011,11 +2028,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const active = items.some((item) =>
       item.kind === "thinking"
         ? !item.complete
-        : item.status === "running" || item.status === "awaiting-approval"
+        : item.kind === "compaction"
+          ? item.state.kind === "running"
+          : item.status === "running" || item.status === "awaiting-approval"
     );
     const failed = items.some((item) =>
-      item.kind === "tool"
-      && (item.status === "error" || item.status === "denied" || item.status === "aborted")
+      item.kind === "compaction"
+        ? item.state.kind === "failed"
+        : item.kind === "tool"
+          && (item.status === "error" || item.status === "denied" || item.status === "aborted")
     );
     const tone = failed
       ? "error"
@@ -2045,19 +2066,51 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               <div class=${`agent-activity-timeline activity-group-timeline ${
                 items.length === 1 ? "single-activity" : ""
               }`}>
-                ${items.map((item) => item.kind === "thinking"
-                  ? this.#renderVisibleThinking(item)
-                  : this.#renderItem(
-                      item,
-                      turnModels,
-                      turnDurationMs,
-                      presentation,
-                    ))}
+                ${items.map((item) => this.#renderGroupedActivityItem(
+                  item,
+                  turnModels,
+                  turnDurationMs,
+                  presentation,
+                ))}
               </div>
             </div>`
           : nothing}
       </details>
     `;
+  }
+
+  #legacyCompactionState(
+    item: Extract<AgentActivityItem, { readonly kind: "tool" }>,
+  ): CompactionState {
+    return item.status === "ok"
+      ? { kind: "completed", messagesCompacted: 0 }
+      : item.status === "running" || item.status === "awaiting-approval"
+        ? { kind: "running" }
+        : { kind: "failed" };
+  }
+
+  #renderGroupedActivityItem(
+    item: AgentActivityItem,
+    turnModels: ReadonlyMap<number, string>,
+    turnDurationMs: ReadonlyMap<number, number>,
+    presentation: ChatPresentationIndex,
+  ) {
+    if (item.kind === "thinking") return this.#renderVisibleThinking(item);
+    if (item.kind === "compaction") {
+      return this.#renderCompactionMarker(item.state, item.id, {
+        before: false,
+        after: false,
+        nested: true,
+      });
+    }
+    if (isContextCompactionTool(item)) {
+      return this.#renderCompactionMarker(this.#legacyCompactionState(item), item.id, {
+        before: false,
+        after: false,
+        nested: true,
+      });
+    }
+    return this.#renderItem(item, turnModels, turnDurationMs, presentation);
   }
 
   #activityGroupOpen(

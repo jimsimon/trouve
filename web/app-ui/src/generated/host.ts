@@ -226,6 +226,8 @@ export interface components {
          *     durable thread view shared through the harness protocol.
          */
         ChatPreferences: {
+            /** @description Include context-compaction boundaries in collapsible tool-activity groups. */
+            collapse_compaction_with_tools?: boolean;
             /** @description Include thinking output in collapsible tool-activity groups. */
             collapse_thinking_with_tools?: boolean;
         };

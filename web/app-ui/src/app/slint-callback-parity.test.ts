@@ -252,15 +252,26 @@ const SURFACES: readonly CallbackSurface[] = [
   },
   {
     description: "chat presentation preference",
-    callbacks: ["collapse-thinking-with-tools-toggled"],
+    callbacks: [
+      "collapse-thinking-with-tools-toggled",
+      "collapse-compaction-with-tools-toggled",
+    ],
     evidence: [
       {
         path: "../components/settings-screen.ts",
-        markers: ["collapseThinkingWithTools", "setChatPreferences"],
+        markers: [
+          "collapseThinkingWithTools",
+          "collapseCompactionWithTools",
+          "setChatPreferences",
+        ],
       },
       {
         path: "../components/thread-screen.ts",
-        markers: ["#renderVisibleThinking", "collapseThinkingWithTools"],
+        markers: [
+          "#renderVisibleThinking",
+          "collapseThinkingWithTools",
+          "collapseCompactionWithTools",
+        ],
       },
     ],
   },

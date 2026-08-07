@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "8"
+    "version": "9"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -469,6 +469,10 @@
         "type": "object",
         "description": "Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.",
         "properties": {
+          "collapse_compaction_with_tools": {
+            "type": "boolean",
+            "description": "Include context-compaction boundaries in collapsible tool-activity groups."
+          },
           "collapse_thinking_with_tools": {
             "type": "boolean",
             "description": "Include thinking output in collapsible tool-activity groups."

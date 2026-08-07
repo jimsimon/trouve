@@ -341,10 +341,12 @@ export component SettingsScreen inherits Rectangle {
     in-out property <bool> prevent-sleep-while-running: true;
     callback prevent-sleep-while-running-toggled(bool);
 
-    // Chat transcript presentation. Disabled by default so thinking remains
-    // a visible top-level boundary between collapsible tool runs.
+    // Chat transcript presentation. Disabled by default so thinking and
+    // context compaction remain visible boundaries between tool runs.
     in-out property <bool> collapse-thinking-with-tools: false;
     callback collapse-thinking-with-tools-toggled(bool);
+    in-out property <bool> collapse-compaction-with-tools: false;
+    callback collapse-compaction-with-tools-toggled(bool);
 
     // Git & Worktrees: lifecycle for the optional session-naming model.
     // 0 adaptive, 1 keep ready, 2 load when needed, 3 rules only.
@@ -718,6 +720,21 @@ export component SettingsScreen inherits Rectangle {
 
                             Text {
                                 text: "When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.collapse-compaction-with-tools;
+                                label: "Collapse context compaction with tool calls.";
+                                toggled(on) => {
+                                    root.collapse-compaction-with-tools-toggled(on);
+                                }
+                            }
+
+                            Text {
+                                text: "When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;

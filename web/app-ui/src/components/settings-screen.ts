@@ -316,6 +316,20 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                           <span>Collapse thinking output with tool calls.</span>
                         </label>
                         <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
+                        <label class="settings-toggle-row" for="settings-collapse-compaction">
+                          <input
+                            id="settings-collapse-compaction"
+                            type="checkbox"
+                            .checked=${chatPreferences.collapseCompactionWithTools}
+                            @change=${(event: Event) => services.setChatPreferences({
+                              collapseCompactionWithTools:
+                                (event.currentTarget as HTMLInputElement).checked,
+                            })}
+                          />
+                          <span class="toggle-state">${chatPreferences.collapseCompactionWithTools ? "On" : "Off"}</span>
+                          <span>Collapse context compaction with tool calls.</span>
+                        </label>
+                        <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
                       </div>
                     `
                 : active === "modes"

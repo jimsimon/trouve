@@ -1434,13 +1434,25 @@ test("the Chat preference persists across a frontend reload", async ({ page }) =
   await expect(preference).not.toBeChecked();
   await page.locator('label[for="settings-collapse-thinking"]').click();
   await expect(preference).toBeChecked();
+  const compactionPreference = page.getByRole("checkbox", {
+    name: "Collapse context compaction with tool calls.",
+  });
+  await expect(compactionPreference).not.toBeChecked();
+  await page.locator('label[for="settings-collapse-compaction"]').click();
+  await expect(compactionPreference).toBeChecked();
   await expect.poll(() => page.evaluate(() =>
     localStorage.getItem("trouve.chat.v1")
-  )).toBe(JSON.stringify({ collapseThinkingWithTools: true }));
+  )).toBe(JSON.stringify({
+    collapseThinkingWithTools: true,
+    collapseCompactionWithTools: true,
+  }));
 
   await page.reload();
   await expect(page.getByRole("checkbox", {
     name: "Collapse thinking output with tool calls.",
+  })).toBeChecked();
+  await expect(page.getByRole("checkbox", {
+    name: "Collapse context compaction with tool calls.",
   })).toBeChecked();
 });
 
@@ -1817,6 +1829,120 @@ test("context compaction is an animated durable boundary between tool groups", a
   await expect(agent.locator(
     ":scope > .message-body > .agent-activity-timeline > .activity-group",
   )).toHaveCount(2);
+});
+
+test("the Chat preference collapses context compaction into one tool activity run", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    localStorage.setItem("trouve.chat.v1", JSON.stringify({
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: true,
+    }));
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(60, {
+      type: "turn.started",
+      turn: 13,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(61, {
+      type: "user.message",
+      turn: 13,
+      content: "Collapse the compaction boundary",
+      attachments: [],
+    }),
+    threadEvent(62, {
+      type: "tool.requested",
+      turn: 13,
+      call_id: "before_collapsed_compaction",
+      tool: "Bash",
+      args: { command: "before" },
+      requires_approval: false,
+    }),
+    threadEvent(63, {
+      type: "tool.completed",
+      call_id: "before_collapsed_compaction",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(64, { type: "thread.compaction_started", turn: 13 }),
+    threadEvent(65, {
+      type: "thread.compaction_completed",
+      turn: 13,
+      messages_compacted: 12,
+    }),
+    threadEvent(66, {
+      type: "tool.requested",
+      turn: 13,
+      call_id: "after_collapsed_compaction",
+      tool: "Bash",
+      args: { command: "after" },
+      requires_approval: false,
+    }),
+    threadEvent(67, {
+      type: "tool.completed",
+      call_id: "after_collapsed_compaction",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(68, {
+      type: "turn.completed",
+      turn: 13,
+      usage: { input_tokens: 10, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const agent = page.locator(".agent-turn-card").last();
+  const topLevelTimeline = agent.locator(
+    ":scope > .message-body > .agent-activity-timeline",
+  );
+  await expect(topLevelTimeline).toHaveCount(1);
+  await expect(agent.locator(
+    ":scope > .message-body > .context-compaction-marker",
+  )).toHaveCount(0);
+
+  const group = topLevelTimeline.locator(":scope > .activity-group");
+  await expect(group.getByText(
+    "Ran 2 commands, compacted context",
+    { exact: true },
+  )).toBeVisible();
+  await expect(group.locator(":scope > .activity-group-body")).toHaveCount(0);
+
+  await group.locator(":scope > summary").click();
+  const marker = group.locator(
+    ".activity-group-timeline > .context-compaction-marker.completed",
+  );
+  await expect(marker).toContainText("Context compacted");
+  await expect(marker).toContainText("12 earlier transcript messages summarized");
+  await expect(marker).toHaveClass(/nested-timeline-marker/u);
+  await expect(group.locator(".tool-card")).toHaveCount(2);
+  const markerAlignment = await marker.evaluate((element) => {
+    const timeline = element.parentElement;
+    const symbol = element.querySelector<HTMLElement>(".context-compaction-symbol");
+    if (timeline === null || symbol === null) {
+      throw new Error("missing nested compaction timeline geometry");
+    }
+    const timelineBounds = timeline.getBoundingClientRect();
+    const rail = getComputedStyle(timeline, "::before");
+    const symbolBounds = symbol.getBoundingClientRect();
+    const railCenter = timelineBounds.left
+      + Number.parseFloat(rail.left)
+      + Number.parseFloat(rail.width) / 2;
+    return {
+      centerDrift: Math.abs(
+        symbolBounds.left + symbolBounds.width / 2 - railCenter,
+      ),
+      horizontalOverflow: element.scrollWidth - element.clientWidth,
+    };
+  });
+  expect(markerAlignment.centerDrift).toBeLessThanOrEqual(0.25);
+  expect(markerAlignment.horizontalOverflow).toBeLessThanOrEqual(0);
 });
 
 test("standalone tool headers align their timeline node and disclosure controls", async ({

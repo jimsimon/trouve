@@ -9,11 +9,21 @@ import {
 
 describe("chat preferences", () => {
   it("defaults to visible, top-level thinking output", () => {
-    expect(DEFAULT_CHAT_PREFERENCES).toEqual({ collapseThinkingWithTools: false });
-    expect(normalizeChatPreferences({})).toEqual({ collapseThinkingWithTools: false });
+    expect(DEFAULT_CHAT_PREFERENCES).toEqual({
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
+    });
+    expect(normalizeChatPreferences({})).toEqual({
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
+    });
     expect(normalizeChatPreferences({
       collapseThinkingWithTools: "yes" as unknown as boolean,
-    })).toEqual({ collapseThinkingWithTools: false });
+      collapseCompactionWithTools: "yes" as unknown as boolean,
+    })).toEqual({
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
+    });
   });
 
   it("normalizes and persists explicit changes", () => {
@@ -25,10 +35,19 @@ describe("chat preferences", () => {
     const adapter = browserChatPreferenceStorage(storage);
     const controller = new ChatPreferencesController(adapter);
 
-    controller.update({ collapseThinkingWithTools: true });
+    controller.update({
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    });
 
-    expect(controller.current.get()).toEqual({ collapseThinkingWithTools: true });
-    expect(adapter.load()).toEqual({ collapseThinkingWithTools: true });
+    expect(controller.current.get()).toEqual({
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    });
+    expect(adapter.load()).toEqual({
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    });
     expect(storage.setItem).toHaveBeenCalledOnce();
   });
 
@@ -41,12 +60,16 @@ describe("chat preferences", () => {
 
     new ChatPreferencesController(browserChatPreferenceStorage(storage)).update({
       collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
     });
     const reloaded = new ChatPreferencesController(
       browserChatPreferenceStorage(storage),
     );
 
-    expect(reloaded.current.get()).toEqual({ collapseThinkingWithTools: true });
+    expect(reloaded.current.get()).toEqual({
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    });
   });
 
   it("ignores corrupt browser state", () => {

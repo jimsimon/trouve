@@ -433,7 +433,9 @@ pub fn chat_rows(
     collapsed: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
-    chat_rows_at_offset_with_preferences(vm, 0, expanded, raw_turns, collapsed, wizards, false)
+    chat_rows_at_offset_with_preferences(
+        vm, 0, expanded, raw_turns, collapsed, wizards, false, false,
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +455,7 @@ pub fn chat_rows_at_offset(
         collapsed,
         wizards,
         false,
+        false,
     )
 }
 
@@ -465,6 +468,7 @@ pub fn chat_rows_at_offset_with_preferences(
     collapsed: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
     collapse_thinking_with_tools: bool,
+    collapse_compaction_with_tools: bool,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
     let mut rows: Vec<ChatRowData> = Vec::new();
     let mut call_ids: Vec<Option<String>> = Vec::new();
@@ -643,6 +647,7 @@ pub fn chat_rows_at_offset_with_preferences(
                         expanded,
                         wizards,
                         collapse_thinking_with_tools,
+                        collapse_compaction_with_tools,
                     );
                 }
                 // The turn's token/cost summary shows in the header of the
@@ -743,6 +748,7 @@ pub fn chat_rows_at_offset_with_preferences(
                         expanded,
                         wizards,
                         collapse_thinking_with_tools,
+                        collapse_compaction_with_tools,
                     );
                 }
                 // Orphan items mean no assistant item in this turn, so this
@@ -867,7 +873,8 @@ enum Segment {
 /// ("Edited 2 files, read 3 files, called 1 tool"), expanded while the turn
 /// streams so progress is visible and collapsed by default once it is done.
 /// Thinking is a top-level boundary unless the chat preference explicitly
-/// opts it into these collapsible runs.
+/// opts it into these collapsible runs. Context compaction follows the same
+/// rule through its independent preference.
 #[allow(clippy::too_many_arguments)]
 fn card_body_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
@@ -881,6 +888,7 @@ fn card_body_rows(
     expanded: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
     collapse_thinking_with_tools: bool,
+    collapse_compaction_with_tools: bool,
 ) {
     let mut segments: Vec<Segment> = Vec::new();
     let mut k = 0;
@@ -909,15 +917,15 @@ fn card_body_rows(
         }
     }
 
-    // Questions and context compaction stay out of activity groups. Thinking
-    // does too by default, making its visible output a transcript boundary;
-    // the Chat preference may opt it back into the old collapsible runs.
+    // Questions stay out of activity groups. Thinking and context compaction
+    // do too by default, making each visible output a transcript boundary;
+    // independent Chat preferences may opt either into collapsible runs.
     let groupable = |seg: &Segment| {
         let Segment::Item(j) = seg else { return false };
-        !matches!(
-            vm.items[*j],
-            ChatItem::Questions { .. } | ChatItem::Compaction { .. }
-        ) && (collapse_thinking_with_tools || !matches!(vm.items[*j], ChatItem::Thinking { .. }))
+        !matches!(vm.items[*j], ChatItem::Questions { .. })
+            && (collapse_compaction_with_tools
+                || !matches!(vm.items[*j], ChatItem::Compaction { .. }))
+            && (collapse_thinking_with_tools || !matches!(vm.items[*j], ChatItem::Thinking { .. }))
     };
     let mut s = 0;
     while s < segments.len() {
@@ -938,6 +946,7 @@ fn card_body_rows(
                 expanded,
                 wizards,
                 collapse_thinking_with_tools,
+                collapse_compaction_with_tools,
             );
             s += 1;
             continue;
@@ -948,7 +957,10 @@ fn card_body_rows(
             s += 1;
         }
         let run = &segments[start..s];
-        if run.len() < 2 {
+        let group_single_compaction = collapse_compaction_with_tools
+            && run.len() == 1
+            && matches!(run[0], Segment::Item(j) if matches!(vm.items[j], ChatItem::Compaction { .. }));
+        if run.len() < 2 && !group_single_compaction {
             for seg in run {
                 segment_rows(
                     body,
@@ -961,6 +973,7 @@ fn card_body_rows(
                     expanded,
                     wizards,
                     collapse_thinking_with_tools,
+                    collapse_compaction_with_tools,
                 );
             }
             continue;
@@ -1009,14 +1022,15 @@ fn card_body_rows(
                     expanded,
                     wizards,
                     collapse_thinking_with_tools,
+                    collapse_compaction_with_tools,
                 );
             }
         }
     }
 }
 
-/// Append the rows of one body segment. `indent` nests tool cards and
-/// thinking pills one level under a group header.
+/// Append the rows of one body segment. `indent` nests tool cards, thinking
+/// output, and opted-in compaction markers under a group header.
 #[allow(clippy::too_many_arguments)]
 fn segment_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
@@ -1029,6 +1043,7 @@ fn segment_rows(
     expanded: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
     collapse_thinking_with_tools: bool,
+    collapse_compaction_with_tools: bool,
 ) {
     match segment {
         Segment::Text(text) => text_rows(body, text, raw),
@@ -1124,6 +1139,11 @@ fn segment_rows(
                         text,
                         detail,
                         turn_state,
+                        md_indent: if collapse_compaction_with_tools {
+                            indent
+                        } else {
+                            0
+                        },
                         ..Default::default()
                     },
                     None,
@@ -1294,7 +1314,8 @@ fn text_rows(body: &mut Vec<(ChatRowData, Option<String>)>, text: &str, raw: boo
 /// Group-header summary of a card's working activity: file edits and reads
 /// count distinct paths, shell-style tools count commands, everything else
 /// counts as a generic tool call, plus thinking blocks — e.g.
-/// "Edited 2 files, read 3 files, ran 1 command, thought 2 times".
+/// "Edited 2 files, read 3 files, ran 1 command, thought 2 times". When
+/// compaction is opted into a run, the summary keeps that boundary visible.
 fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
     let mut edited: HashSet<&str> = HashSet::new();
     let mut edits_unpathed = 0usize;
@@ -1303,10 +1324,12 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
     let mut commands = 0usize;
     let mut tools = 0usize;
     let mut thoughts = 0usize;
+    let mut compactions = 0usize;
     for seg in segments {
         let Segment::Item(j) = seg else { continue };
         match &vm.items[*j] {
             ChatItem::Thinking { .. } => thoughts += 1,
+            ChatItem::Compaction { .. } => compactions += 1,
             ChatItem::ToolCall { tool, args, .. } => {
                 // Codex app-server wraps MCP calls in an `mcpToolCall` item.
                 // Classify the underlying tool using its real arguments so
@@ -1391,6 +1414,13 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
     }
     if thoughts > 0 {
         parts.push(format!("thought {}", plural(thoughts, "time", "times")));
+    }
+    if compactions > 0 {
+        parts.push(if compactions == 1 {
+            "compacted context".into()
+        } else {
+            format!("compacted context {compactions} times")
+        });
     }
     let mut summary = parts.join(", ");
     // Sentence-case the first part.
@@ -3131,6 +3161,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             true,
+            false,
         );
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
         assert_eq!(think.len(), 1);
@@ -3145,6 +3176,7 @@ mod tests {
             &toggled,
             &HashMap::new(),
             true,
+            false,
         );
         let think = rows.iter().find(|r| r.kind == 4).unwrap();
         assert!(
@@ -3314,6 +3346,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             true,
+            false,
         );
         // The thinking + read run groups under one summarized header; the
         // narration/answer text stays outside the group.
@@ -3389,6 +3422,44 @@ mod tests {
         assert_eq!(marker.text, "Context compacted");
         assert_eq!(marker.detail, "18 earlier transcript messages summarized");
         assert_eq!(marker.md_indent, 0, "compaction is never group-indented");
+
+        let (rows, _) = chat_rows_at_offset_with_preferences(
+            &vm,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            true,
+        );
+        let body_kinds = rows
+            .iter()
+            .skip_while(|row| !(row.kind == 7 && row.tool_name == "Agent"))
+            .skip(1)
+            .map(|row| row.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(body_kinds, vec![9, 1]);
+        let group = rows.iter().find(|row| row.kind == 9).unwrap();
+        assert_eq!(group.text, "Called 4 tools, compacted context");
+        assert!(!group.expanded);
+
+        let opened: HashSet<String> = ["g1:6".to_string()].into();
+        let (rows, _) = chat_rows_at_offset_with_preferences(
+            &vm,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            &opened,
+            &HashMap::new(),
+            false,
+            true,
+        );
+        let marker = rows.iter().find(|row| row.kind == 11).unwrap();
+        assert_eq!(
+            marker.md_indent, 1,
+            "grouped compaction follows the group indent"
+        );
     }
 
     #[test]

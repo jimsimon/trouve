@@ -2957,6 +2957,7 @@ impl Controller {
             &collapsed,
             &self.wizards,
             self.chat.collapse_thinking_with_tools,
+            self.chat.collapse_compaction_with_tools,
         )
     }
 

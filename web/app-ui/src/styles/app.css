@@ -338,6 +338,8 @@ trouve-session-list { display: block; }
 .context-compaction-marker.timeline-connect-before::before { inset-block-start: -14px; }
 .context-compaction-marker.timeline-connect-after::before { inset-block-end: -14px; }
 .context-compaction-marker.timeline-connect-before .context-compaction-symbol, .context-compaction-marker.timeline-connect-after .context-compaction-symbol { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -1.5px; border-radius: 50%; background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); transform: translateY(-50%); }
+.activity-group-timeline > .context-compaction-marker.nested-timeline-marker { width: calc(100% + 20px); margin-inline-start: -20px; grid-template-columns: minmax(0, max-content) minmax(24px, 1fr); overflow: visible; padding-inline: 28px 4px; }
+.activity-group-timeline > .context-compaction-marker.nested-timeline-marker .context-compaction-symbol { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -1.5px; border-radius: 50%; background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); transform: translateY(-50%); }
 .context-compaction-marker::after { width: 100%; height: 1px; border-radius: 999px; background: var(--trouve-rule); content: ""; opacity: .8; }
 .context-compaction-marker.running::after { background: linear-gradient(90deg, var(--trouve-rule) 15%, var(--trouve-accent) 50%, var(--trouve-rule) 85%); background-size: 240% 100%; animation: trouve-compaction-flow 1.8s ease-in-out infinite; }
 .context-compaction-marker.failed::after { background: var(--trouve-warn); opacity: .65; }

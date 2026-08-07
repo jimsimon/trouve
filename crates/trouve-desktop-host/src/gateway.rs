@@ -3179,6 +3179,7 @@ mod tests {
         assert_eq!(loaded.appearance.theme, "light");
         assert!(!loaded.general.prevent_sleep_while_running);
         assert!(loaded.chat.collapse_thinking_with_tools);
+        assert!(!loaded.chat.collapse_compaction_with_tools);
         assert!(!loaded.notifications.on_finish);
         assert!(loaded.notifications.sound);
         assert_eq!(loaded.workspace_order, ["ws-2", "ws-1"]);

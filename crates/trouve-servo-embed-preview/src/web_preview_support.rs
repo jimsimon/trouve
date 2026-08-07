@@ -37,6 +37,7 @@ impl WebPreviewHost {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let upstream = required_server_url(std::env::var(SERVER_URL_ENV).ok())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
             .enable_all()
             .build()
             .context("creating the embedded Servo gateway runtime")?;

@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 8;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 9;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -257,6 +257,9 @@ pub struct ChatPreferences {
     /// Include thinking output in collapsible tool-activity groups.
     #[serde(default)]
     pub collapse_thinking_with_tools: bool,
+    /// Include context-compaction boundaries in collapsible tool-activity groups.
+    #[serde(default)]
+    pub collapse_compaction_with_tools: bool,
 }
 
 /// Notification policy remains frontend-owned. The native host persists the

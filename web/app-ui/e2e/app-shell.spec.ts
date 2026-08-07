@@ -372,14 +372,25 @@ test("Chat settings default thoughts to visible and persist the grouping opt-in"
     "When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.",
     { exact: true },
   )).toBeVisible();
+  const compactionToggle = page.getByLabel("Collapse context compaction with tool calls.");
+  await expect(compactionToggle).not.toBeChecked();
+  await expect(page.getByText(
+    "When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.",
+    { exact: true },
+  )).toBeVisible();
 
   await page.getByText("Collapse thinking output with tool calls.", { exact: true }).click();
   await expect(toggle).toBeChecked();
+  await page.getByText("Collapse context compaction with tool calls.", { exact: true }).click();
+  await expect(compactionToggle).toBeChecked();
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
     .toContain('"collapseThinkingWithTools":true');
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
+    .toContain('"collapseCompactionWithTools":true');
 
   await page.reload();
   await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
+  await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
 });
 
 test("Settings reopens the last screen until the app restarts", async ({ page }) => {

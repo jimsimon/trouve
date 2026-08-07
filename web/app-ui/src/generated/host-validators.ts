@@ -413,7 +413,7 @@ export const hostPreferences = validate26;
 const schema36 = {"$id":"urn:trouve:host-validator:hostPreferences","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostPreferences"};
 const schema37 = {"type":"object","description":"Nonsecret settings that the native host may persist across ephemeral ports.","required":["appearance","navigation_width","inspection_width"],"properties":{"appearance":{"$ref":"#/components/schemas/AppearancePreferences"},"chat":{"$ref":"#/components/schemas/ChatPreferences"},"general":{"$ref":"#/components/schemas/GeneralPreferences"},"geometry":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/WindowGeometry"}]},"inspection_width":{"type":"number","format":"float"},"navigation_width":{"type":"number","format":"float"},"notifications":{"$ref":"#/components/schemas/NotificationPreferences"},"pull_request_group_order":{"type":"array","items":{"type":"string"}},"resume":{"$ref":"#/components/schemas/ResumePreferences"},"workspace_order":{"type":"array","items":{"type":"string"}}}};
 const schema38 = {"type":"object","required":["theme","font_family","font_size","reduce_motion"],"properties":{"font_family":{"type":"string"},"font_size":{"type":"integer","format":"int32","minimum":0},"reduce_motion":{"type":"boolean"},"theme":{"type":"string"}}};
-const schema39 = {"type":"object","description":"Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.","properties":{"collapse_thinking_with_tools":{"type":"boolean","description":"Include thinking output in collapsible tool-activity groups."}}};
+const schema39 = {"type":"object","description":"Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.","properties":{"collapse_compaction_with_tools":{"type":"boolean","description":"Include context-compaction boundaries in collapsible tool-activity groups."},"collapse_thinking_with_tools":{"type":"boolean","description":"Include thinking output in collapsible tool-activity groups."}}};
 const schema40 = {"type":"object","description":"General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.","properties":{"prevent_sleep_while_running":{"type":"boolean"}}};
 const schema41 = {"type":"object","required":["x","y","width","height","maximized"],"properties":{"height":{"type":"integer","format":"int32","minimum":0},"maximized":{"type":"boolean"},"width":{"type":"integer","format":"int32","minimum":0},"x":{"type":"integer","format":"int32"},"y":{"type":"integer","format":"int32"}}};
 const schema42 = {"type":"object","description":"Notification policy remains frontend-owned. The native host persists the\nchoices and delivers only already-gated notification requests.","properties":{"enabled":{"type":"boolean"},"on_attention":{"type":"boolean"},"on_fail":{"type":"boolean"},"on_finish":{"type":"boolean"},"sound":{"type":"boolean"}}};
@@ -718,10 +718,28 @@ const _errs12 = errors;
 const _errs13 = errors;
 if(errors === _errs13){
 if(data5 && typeof data5 == "object" && !Array.isArray(data5)){
+if(data5.collapse_compaction_with_tools !== undefined){
+const _errs15 = errors;
+if(typeof data5.collapse_compaction_with_tools !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/chat/collapse_compaction_with_tools",schemaPath:"#/components/schemas/ChatPreferences/properties/collapse_compaction_with_tools/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid4 = _errs15 === errors;
+}
+else {
+var valid4 = true;
+}
+if(valid4){
 if(data5.collapse_thinking_with_tools !== undefined){
+const _errs17 = errors;
 if(typeof data5.collapse_thinking_with_tools !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/chat/collapse_thinking_with_tools",schemaPath:"#/components/schemas/ChatPreferences/properties/collapse_thinking_with_tools/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
+}
+var valid4 = _errs17 === errors;
+}
+else {
+var valid4 = true;
 }
 }
 }
@@ -737,13 +755,13 @@ var valid0 = true;
 }
 if(valid0){
 if(data.general !== undefined){
-let data7 = data.general;
-const _errs17 = errors;
-const _errs18 = errors;
-if(errors === _errs18){
-if(data7 && typeof data7 == "object" && !Array.isArray(data7)){
-if(data7.prevent_sleep_while_running !== undefined){
-if(typeof data7.prevent_sleep_while_running !== "boolean"){
+let data8 = data.general;
+const _errs19 = errors;
+const _errs20 = errors;
+if(errors === _errs20){
+if(data8 && typeof data8 == "object" && !Array.isArray(data8)){
+if(data8.prevent_sleep_while_running !== undefined){
+if(typeof data8.prevent_sleep_while_running !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/general/prevent_sleep_while_running",schemaPath:"#/components/schemas/GeneralPreferences/properties/prevent_sleep_while_running/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
@@ -754,20 +772,20 @@ validate27.errors = [{instancePath:instancePath+"/general",schemaPath:"#/compone
 return false;
 }
 }
-var valid0 = _errs17 === errors;
+var valid0 = _errs19 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.geometry !== undefined){
-let data9 = data.geometry;
-const _errs22 = errors;
-const _errs23 = errors;
+let data10 = data.geometry;
+const _errs24 = errors;
+const _errs25 = errors;
 let valid7 = false;
 let passing0 = null;
-const _errs24 = errors;
-if(data9 !== null){
+const _errs26 = errors;
+if(data10 !== null){
 const err0 = {instancePath:instancePath+"/geometry",schemaPath:"#/properties/geometry/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err0];
@@ -777,17 +795,17 @@ vErrors.push(err0);
 }
 errors++;
 }
-var _valid0 = _errs24 === errors;
+var _valid0 = _errs26 === errors;
 if(_valid0){
 valid7 = true;
 passing0 = 0;
 }
-const _errs26 = errors;
-const _errs27 = errors;
-if(errors === _errs27){
-if(data9 && typeof data9 == "object" && !Array.isArray(data9)){
+const _errs28 = errors;
+const _errs29 = errors;
+if(errors === _errs29){
+if(data10 && typeof data10 == "object" && !Array.isArray(data10)){
 let missing2;
-if((((((data9.x === undefined) && (missing2 = "x")) || ((data9.y === undefined) && (missing2 = "y"))) || ((data9.width === undefined) && (missing2 = "width"))) || ((data9.height === undefined) && (missing2 = "height"))) || ((data9.maximized === undefined) && (missing2 = "maximized"))){
+if((((((data10.x === undefined) && (missing2 = "x")) || ((data10.y === undefined) && (missing2 = "y"))) || ((data10.width === undefined) && (missing2 = "width"))) || ((data10.height === undefined) && (missing2 = "height"))) || ((data10.maximized === undefined) && (missing2 = "maximized"))){
 const err1 = {instancePath:instancePath+"/geometry",schemaPath:"#/components/schemas/WindowGeometry/required",keyword:"required",params:{missingProperty: missing2},message:"must have required property '"+missing2+"'"};
 if(vErrors === null){
 vErrors = [err1];
@@ -798,10 +816,10 @@ vErrors.push(err1);
 errors++;
 }
 else {
-if(data9.height !== undefined){
-let data10 = data9.height;
-const _errs29 = errors;
-if(!((typeof data10 == "number") && (!(data10 % 1) && !isNaN(data10)))){
+if(data10.height !== undefined){
+let data11 = data10.height;
+const _errs31 = errors;
+if(!((typeof data11 == "number") && (!(data11 % 1) && !isNaN(data11)))){
 const err2 = {instancePath:instancePath+"/geometry/height",schemaPath:"#/components/schemas/WindowGeometry/properties/height/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err2];
@@ -811,9 +829,9 @@ vErrors.push(err2);
 }
 errors++;
 }
-if(errors === _errs29){
-if(typeof data10 == "number"){
-if(data10 < 0 || isNaN(data10)){
+if(errors === _errs31){
+if(typeof data11 == "number"){
+if(data11 < 0 || isNaN(data11)){
 const err3 = {instancePath:instancePath+"/geometry/height",schemaPath:"#/components/schemas/WindowGeometry/properties/height/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
 if(vErrors === null){
 vErrors = [err3];
@@ -825,15 +843,15 @@ errors++;
 }
 }
 }
-var valid9 = _errs29 === errors;
+var valid9 = _errs31 === errors;
 }
 else {
 var valid9 = true;
 }
 if(valid9){
-if(data9.maximized !== undefined){
-const _errs31 = errors;
-if(typeof data9.maximized !== "boolean"){
+if(data10.maximized !== undefined){
+const _errs33 = errors;
+if(typeof data10.maximized !== "boolean"){
 const err4 = {instancePath:instancePath+"/geometry/maximized",schemaPath:"#/components/schemas/WindowGeometry/properties/maximized/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
 if(vErrors === null){
 vErrors = [err4];
@@ -843,16 +861,16 @@ vErrors.push(err4);
 }
 errors++;
 }
-var valid9 = _errs31 === errors;
+var valid9 = _errs33 === errors;
 }
 else {
 var valid9 = true;
 }
 if(valid9){
-if(data9.width !== undefined){
-let data12 = data9.width;
-const _errs33 = errors;
-if(!((typeof data12 == "number") && (!(data12 % 1) && !isNaN(data12)))){
+if(data10.width !== undefined){
+let data13 = data10.width;
+const _errs35 = errors;
+if(!((typeof data13 == "number") && (!(data13 % 1) && !isNaN(data13)))){
 const err5 = {instancePath:instancePath+"/geometry/width",schemaPath:"#/components/schemas/WindowGeometry/properties/width/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err5];
@@ -862,9 +880,9 @@ vErrors.push(err5);
 }
 errors++;
 }
-if(errors === _errs33){
-if(typeof data12 == "number"){
-if(data12 < 0 || isNaN(data12)){
+if(errors === _errs35){
+if(typeof data13 == "number"){
+if(data13 < 0 || isNaN(data13)){
 const err6 = {instancePath:instancePath+"/geometry/width",schemaPath:"#/components/schemas/WindowGeometry/properties/width/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
 if(vErrors === null){
 vErrors = [err6];
@@ -876,16 +894,16 @@ errors++;
 }
 }
 }
-var valid9 = _errs33 === errors;
+var valid9 = _errs35 === errors;
 }
 else {
 var valid9 = true;
 }
 if(valid9){
-if(data9.x !== undefined){
-let data13 = data9.x;
-const _errs35 = errors;
-if(!((typeof data13 == "number") && (!(data13 % 1) && !isNaN(data13)))){
+if(data10.x !== undefined){
+let data14 = data10.x;
+const _errs37 = errors;
+if(!((typeof data14 == "number") && (!(data14 % 1) && !isNaN(data14)))){
 const err7 = {instancePath:instancePath+"/geometry/x",schemaPath:"#/components/schemas/WindowGeometry/properties/x/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err7];
@@ -895,16 +913,16 @@ vErrors.push(err7);
 }
 errors++;
 }
-var valid9 = _errs35 === errors;
+var valid9 = _errs37 === errors;
 }
 else {
 var valid9 = true;
 }
 if(valid9){
-if(data9.y !== undefined){
-let data14 = data9.y;
-const _errs37 = errors;
-if(!((typeof data14 == "number") && (!(data14 % 1) && !isNaN(data14)))){
+if(data10.y !== undefined){
+let data15 = data10.y;
+const _errs39 = errors;
+if(!((typeof data15 == "number") && (!(data15 % 1) && !isNaN(data15)))){
 const err8 = {instancePath:instancePath+"/geometry/y",schemaPath:"#/components/schemas/WindowGeometry/properties/y/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err8];
@@ -914,7 +932,7 @@ vErrors.push(err8);
 }
 errors++;
 }
-var valid9 = _errs37 === errors;
+var valid9 = _errs39 === errors;
 }
 else {
 var valid9 = true;
@@ -936,7 +954,7 @@ vErrors.push(err9);
 errors++;
 }
 }
-var _valid0 = _errs26 === errors;
+var _valid0 = _errs28 === errors;
 if(_valid0 && valid7){
 valid7 = false;
 passing0 = [passing0, 1];
@@ -966,41 +984,27 @@ validate27.errors = vErrors;
 return false;
 }
 else {
-errors = _errs23;
+errors = _errs25;
 if(vErrors !== null){
-if(_errs23){
-vErrors.length = _errs23;
+if(_errs25){
+vErrors.length = _errs25;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs22 === errors;
+var valid0 = _errs24 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.inspection_width !== undefined){
-const _errs39 = errors;
-if(errors === _errs39){
-if(!(typeof data.inspection_width == "number")){
-validate27.errors = [{instancePath:instancePath+"/inspection_width",schemaPath:"#/properties/inspection_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
-return false;
-}
-}
-var valid0 = _errs39 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.navigation_width !== undefined){
 const _errs41 = errors;
 if(errors === _errs41){
-if(!(typeof data.navigation_width == "number")){
-validate27.errors = [{instancePath:instancePath+"/navigation_width",schemaPath:"#/properties/navigation_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
+if(!(typeof data.inspection_width == "number")){
+validate27.errors = [{instancePath:instancePath+"/inspection_width",schemaPath:"#/properties/inspection_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
 return false;
 }
 }
@@ -1010,28 +1014,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.notifications !== undefined){
-let data17 = data.notifications;
+if(data.navigation_width !== undefined){
 const _errs43 = errors;
-const _errs44 = errors;
-if(errors === _errs44){
-if(data17 && typeof data17 == "object" && !Array.isArray(data17)){
-if(data17.enabled !== undefined){
-const _errs46 = errors;
-if(typeof data17.enabled !== "boolean"){
-validate27.errors = [{instancePath:instancePath+"/notifications/enabled",schemaPath:"#/components/schemas/NotificationPreferences/properties/enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(errors === _errs43){
+if(!(typeof data.navigation_width == "number")){
+validate27.errors = [{instancePath:instancePath+"/navigation_width",schemaPath:"#/properties/navigation_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
 return false;
 }
-var valid11 = _errs46 === errors;
+}
+var valid0 = _errs43 === errors;
 }
 else {
-var valid11 = true;
+var valid0 = true;
 }
-if(valid11){
-if(data17.on_attention !== undefined){
+if(valid0){
+if(data.notifications !== undefined){
+let data18 = data.notifications;
+const _errs45 = errors;
+const _errs46 = errors;
+if(errors === _errs46){
+if(data18 && typeof data18 == "object" && !Array.isArray(data18)){
+if(data18.enabled !== undefined){
 const _errs48 = errors;
-if(typeof data17.on_attention !== "boolean"){
-validate27.errors = [{instancePath:instancePath+"/notifications/on_attention",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data18.enabled !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/notifications/enabled",schemaPath:"#/components/schemas/NotificationPreferences/properties/enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid11 = _errs48 === errors;
@@ -1040,10 +1046,10 @@ else {
 var valid11 = true;
 }
 if(valid11){
-if(data17.on_fail !== undefined){
+if(data18.on_attention !== undefined){
 const _errs50 = errors;
-if(typeof data17.on_fail !== "boolean"){
-validate27.errors = [{instancePath:instancePath+"/notifications/on_fail",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_fail/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data18.on_attention !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/notifications/on_attention",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid11 = _errs50 === errors;
@@ -1052,10 +1058,10 @@ else {
 var valid11 = true;
 }
 if(valid11){
-if(data17.on_finish !== undefined){
+if(data18.on_fail !== undefined){
 const _errs52 = errors;
-if(typeof data17.on_finish !== "boolean"){
-validate27.errors = [{instancePath:instancePath+"/notifications/on_finish",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_finish/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data18.on_fail !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/notifications/on_fail",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_fail/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid11 = _errs52 === errors;
@@ -1064,13 +1070,25 @@ else {
 var valid11 = true;
 }
 if(valid11){
-if(data17.sound !== undefined){
+if(data18.on_finish !== undefined){
 const _errs54 = errors;
-if(typeof data17.sound !== "boolean"){
-validate27.errors = [{instancePath:instancePath+"/notifications/sound",schemaPath:"#/components/schemas/NotificationPreferences/properties/sound/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data18.on_finish !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/notifications/on_finish",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_finish/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid11 = _errs54 === errors;
+}
+else {
+var valid11 = true;
+}
+if(valid11){
+if(data18.sound !== undefined){
+const _errs56 = errors;
+if(typeof data18.sound !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/notifications/sound",schemaPath:"#/components/schemas/NotificationPreferences/properties/sound/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid11 = _errs56 === errors;
 }
 else {
 var valid11 = true;
@@ -1085,26 +1103,26 @@ validate27.errors = [{instancePath:instancePath+"/notifications",schemaPath:"#/c
 return false;
 }
 }
-var valid0 = _errs43 === errors;
+var valid0 = _errs45 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.pull_request_group_order !== undefined){
-let data23 = data.pull_request_group_order;
-const _errs56 = errors;
-if(errors === _errs56){
-if(Array.isArray(data23)){
-var valid12 = true;
-const len0 = data23.length;
-for(let i0=0; i0<len0; i0++){
+let data24 = data.pull_request_group_order;
 const _errs58 = errors;
-if(typeof data23[i0] !== "string"){
+if(errors === _errs58){
+if(Array.isArray(data24)){
+var valid12 = true;
+const len0 = data24.length;
+for(let i0=0; i0<len0; i0++){
+const _errs60 = errors;
+if(typeof data24[i0] !== "string"){
 validate27.errors = [{instancePath:instancePath+"/pull_request_group_order/" + i0,schemaPath:"#/properties/pull_request_group_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid12 = _errs58 === errors;
+var valid12 = _errs60 === errors;
 if(!valid12){
 break;
 }
@@ -1115,38 +1133,38 @@ validate27.errors = [{instancePath:instancePath+"/pull_request_group_order",sche
 return false;
 }
 }
-var valid0 = _errs56 === errors;
+var valid0 = _errs58 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.resume !== undefined){
-const _errs60 = errors;
+const _errs62 = errors;
 if(!(validate28(data.resume, {instancePath:instancePath+"/resume",parentData:data,parentDataProperty:"resume",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate28.errors : vErrors.concat(validate28.errors);
 errors = vErrors.length;
 }
-var valid0 = _errs60 === errors;
+var valid0 = _errs62 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.workspace_order !== undefined){
-let data26 = data.workspace_order;
-const _errs61 = errors;
-if(errors === _errs61){
-if(Array.isArray(data26)){
-var valid13 = true;
-const len1 = data26.length;
-for(let i1=0; i1<len1; i1++){
+let data27 = data.workspace_order;
 const _errs63 = errors;
-if(typeof data26[i1] !== "string"){
+if(errors === _errs63){
+if(Array.isArray(data27)){
+var valid13 = true;
+const len1 = data27.length;
+for(let i1=0; i1<len1; i1++){
+const _errs65 = errors;
+if(typeof data27[i1] !== "string"){
 validate27.errors = [{instancePath:instancePath+"/workspace_order/" + i1,schemaPath:"#/properties/workspace_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid13 = _errs63 === errors;
+var valid13 = _errs65 === errors;
 if(!valid13){
 break;
 }
@@ -1157,7 +1175,7 @@ validate27.errors = [{instancePath:instancePath+"/workspace_order",schemaPath:"#
 return false;
 }
 }
-var valid0 = _errs61 === errors;
+var valid0 = _errs63 === errors;
 }
 else {
 var valid0 = true;
