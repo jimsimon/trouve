@@ -83,7 +83,7 @@ describe("pull request dashboard model", () => {
       .toBe("drafts");
   });
 
-  it("matches the Slint status-pill semantics and latest reviewer verdict", () => {
+  it("matches status-pill semantics and the latest reviewer verdict", () => {
     expect(pullRequestCheckPill(pr())).toEqual({ label: "no checks", tone: "neutral" });
     expect(pullRequestCheckPill(pr({
       checks: [{ name: "test", status: "in_progress", conclusion: null }],

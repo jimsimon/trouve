@@ -1,6 +1,6 @@
 # ADR 0006: Slint under the Royalty-Free license
 
-Status: Accepted (2026-07)
+Status: Superseded by 0028
 
 ## Context
 

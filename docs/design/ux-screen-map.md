@@ -1,12 +1,11 @@
 # UX screen map
 
 The shared information architecture and screen inventory for every trouve
-client. The Lit/Wry desktop is the staged product default; Slint remains the
-rollback path and visual baseline while qualification and soak evidence is
-collected. The Servo-first embedder remains a qualification preview; the same
-Lit frontend supplies the initial mobile PWA. `trouve-client-core` and protocol
-fixtures define shared semantics while rendering layers adapt layout without
-redesigning the experience.
+client. The Lit/Wry desktop is the product frontend, and the same Lit
+application supplies the initial mobile PWA. The Servo-first embedder remains
+a qualification preview, not a second product UI. `trouve-client-core` and
+protocol fixtures define shared semantics while rendering layers adapt layout
+without redesigning the experience (ADR 0028).
 
 ## Design principles
 
@@ -22,8 +21,8 @@ redesigning the experience.
    (command, output, exit status), never spinners. Users must be able to
    audit what ran — non-negotiable given the no-OS-sandbox decision
    (ADR 0004).
-5. **Migration is not a redesign.** The Lit frontend preserves the Slint
-   frontend's themes, semantic colors, typography, density, layout,
+5. **Visual continuity is product behavior.** The Lit frontend preserves
+   Trouve's themes, semantic colors, typography, density, layout,
    information hierarchy, and core interactions. Ordinary web control chrome
    may vary where the same intent and Trouve styling remain recognizable.
 
@@ -60,8 +59,7 @@ signal and the sort key of every session list.
 - **S6 First-run / provider onboarding** — API key entry or OAuth login
   (device code must render well on mobile: show code, open browser).
 - **S7 About** — `/settings/about`; frontend, server, protocol, deployment,
-  connectivity, version, and licenses. Retain `AboutSlint` attribution while
-  any distributed artifact contains Slint.
+  connectivity, version, and licenses.
 - **S8 Code-review dashboard** — `/reviews`; App health, recent review jobs,
   execution limits, GitHub App configuration, repository review policy and
   routing, and built-in/custom reviewer administration.

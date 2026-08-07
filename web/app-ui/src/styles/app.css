@@ -172,7 +172,7 @@ trouve-session-list { display: block; }
 .session-indicator.error:hover { color: var(--trouve-err); background: var(--trouve-err-bg); }
 .session-indicator.unread:hover { color: var(--trouve-accent-hover); }
 .session-indicator.busy::before { width: 10px; height: 10px; border-radius: 50%; background: var(--trouve-accent); opacity: .55; animation: trouve-session-busy-pulse 1.6s linear infinite; content: ""; }
-/* Slint's background activity clock samples this sine wave every 100ms. */
+/* The product activity clock samples this sine wave every 100ms. */
 @keyframes trouve-session-busy-pulse {
   0%, 50%, 100% { opacity: .55; }
   6.25%, 43.75% { opacity: .722; }
@@ -826,12 +826,6 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .capability-grid dd, .about-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--trouve-text-hi); font-size: 11px; }
 .legal-copy { display: grid; gap: 8px; }
 .legal-copy p { margin: 0; }
-.about-slint { width: 280px; min-height: 150px; display: grid; justify-items: center; align-content: start; gap: 8px; border: 0; padding: 12px; color: var(--trouve-text); background: transparent; font: inherit; text-align: center; cursor: pointer; }
-.about-slint:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 2px; }
-.about-slint > span:last-child { width: 256px; color: var(--trouve-text); font-size: 10px; line-height: 1.35; }
-.made-with-slint-logo { width: 212px; height: 97px; display: flex; align-items: center; justify-content: center; gap: 9px; border-radius: 49px; color: var(--trouve-win-bg); background: var(--trouve-text-hi); }
-.made-with-slint-logo i { color: var(--trouve-accent); font: 700 31px/1 var(--trouve-font-mono); letter-spacing: -11px; transform: translateX(-5px); }
-.made-with-slint-logo strong { color: inherit; font-size: 17px; }
 @media (max-width: 810px) {
   .settings-layout { width: 100%; grid-template-columns: 160px minmax(0, 1fr); }
   .settings-content { width: auto; }

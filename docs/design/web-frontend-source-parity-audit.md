@@ -1,4 +1,4 @@
-# Rust/Slint to TypeScript frontend source-parity audit
+# Historical Rust/Slint to TypeScript frontend source-parity audit
 
 **Audit date:** 2026-08-04
 
@@ -7,6 +7,15 @@
 **Surface ledger:** [Web frontend parity and qualification ledger](web-frontend-parity-ledger.md)
 
 **Implementation audit:** [Web frontend implementation audit](web-frontend-implementation-audit.md)
+
+**Archived 2026-08-07:** This audit records the source comparison that enabled
+retirement. ADR 0028 removed the audited Slint sources after their relevant
+behavior was ported. The current
+[`native-source-contract.test.ts`](../../web/app-ui/src/app/native-source-contract.test.ts)
+keeps the remaining Rust host boundary explicit, and
+[`app-action-contract.test.ts`](../../web/app-ui/src/app/app-action-contract.test.ts)
+preserves executable evidence for the established application actions. Paths
+in the historical matrices below are available through version control.
 
 ## Verdict
 
@@ -37,15 +46,12 @@ gates in the implementation audit remain open.
 
 ## Scope and method
 
-The source set is executable. The
-[`rust-source-parity.test.ts`](../../web/app-ui/src/app/rust-source-parity.test.ts)
-inventory recursively discovers Rust and Slint files under the retained
-frontend roots and fails if a file is added or removed without updating this
-audit. The existing
-[`slint-callback-parity.test.ts`](../../web/app-ui/src/app/slint-callback-parity.test.ts)
-extracts all 134 `AppWindow` callbacks and requires exactly one web
-disposition. The new source test also compares all 21 event variants folded by
-the Rust `ThreadViewModel` with the TypeScript reducer's wire-event cases.
+The source set was executable during the migration. The current native-source
+contract recursively discovers the remaining Rust host sources and fails if a
+second native UI grows unnoticed. The application-action contract retains the
+149-action inventory and implementation evidence. The source contract also
+compares all 21 event variants folded by the Rust `ThreadViewModel` with the
+TypeScript reducer's wire-event cases.
 
 For each file, the audit checked whichever of the following apply:
 
@@ -140,7 +146,7 @@ These are not missing web features:
 | `crates/trouve-app/src/render.rs` | `src/state/thread-view-model.ts`, `tool-output.ts`; `src/components/chat-presentation.ts`, `tool-presentation.ts`, `streaming-markdown.ts`, `markdown-view.ts`, diff/file-language helpers, `thread-screen.ts` | Chat segmentation, tool naming/activity, status, output formatting/collapse/copy, questions, turn metadata, attachment summaries, raw/formatted modes, syntax, diffs, processing state, and UTF-8 bounds are preserved or richer. |
 | `crates/trouve-app/src/servo_preview.rs` | Desktop production build plus `trouve-desktop-host`; no presentation-layer TS equivalent | External servoshell qualification launcher remains intentionally separate from the direct embedder. Exact version verification, chrome suppression, display backend choice, signals, and child exit handling are native harness concerns. |
 | `crates/trouve-app/src/sleep.rs` | `src/services/desktop-host-coordinator.ts`, `browser-wake-lock.ts` | Desired-state reconciliation, failure retry, running-count gating, and PWA reacquisition are implemented. |
-| `crates/trouve-app/src/theme.rs` | `src/styles/themes.generated.css`, `tokens.css`, `src/services/theme-controller.ts`, `appearance-preferences.ts`, `system-fonts.ts` | All five palettes/semantic roles, system theme, font family/size, terminal/syntax colors, and installed-font enumeration are mapped. CSS generation prevents palette drift. |
+| `crates/trouve-app/src/theme.rs` | `src/styles/themes.css`, `tokens.css`, `src/services/theme-controller.ts`, `appearance-preferences.ts`, `system-fonts.ts` | All five palettes/semantic roles, system theme, font family/size, terminal/syntax colors, and installed-font enumeration were mapped; the CSS palettes are now authoritative. |
 | `crates/trouve-app/src/ui.rs` | `src/app/trouve-app.ts`, `src/state/app-store.ts`, `src/contexts/app-contexts.ts`, all Lit components | Native setter façade becomes signal-backed normalized state and scoped `@lit/context`; list identity uses keyed `repeat`, terminal views are retained by id, and chat/list history is virtualized. The 134 callbacks are source-checked separately. |
 | `crates/trouve-app/src/web_preview.rs` | `src/services/host-client.ts`, `capabilities.ts`, `desktop-host-coordinator.ts`, generated host client | Wry adapter owns window geometry, lifecycle, attachment/clipboard bridges, notification/attention, safe opening, sleep, CSRF bootstrap, and chrome-free content. These are native host actions consumed by TS rather than reimplemented in JS. |
 | `crates/trouve-app/src/web_preview_support.rs` | `src/services/host-client.ts`, `protocol-client.ts`, `protocol-ingress.ts`, Vite/build environment | The product host owns one embedded server by default; explicit comparison hosts require a server URL. Protocol compatibility, one gateway, shared packaged/runtime/Vite frontend source, and teardown map to validated bootstrap clients. The gateway remains the page origin and reserves native and protocol routes; the frontend never opens the database or bypasses HTTP/SSE. |
@@ -152,7 +158,7 @@ These are not missing web features:
 | `crates/trouve-app/ui/pull-requests-screen.slint` | `src/components/pull-requests-dashboard.ts`, `pull-requests-dashboard-model.ts`, `code-review-dashboard.ts`, session PR components/badge, shared `AppStore` PR projection | Repository filter, seven ordered/collapsible groups, drag/keyboard reordering, refresh age, checks/reviews/findings, chat/fix actions, configuration CTA, loading/error/empty states, and shared dashboard/pane/badge state are implemented. |
 | `crates/trouve-app/ui/scroll-keys.slint` | `src/components/tab-navigation.ts`, component key handlers, native scroll containers | Arrow/Home/End/Enter/Space navigation is handled with semantic controls/roving logic where required; browser scroll, focus, selection, and platform shortcuts remain native. |
 | `crates/trouve-app/ui/settings-window.slint` | `src/components/settings-screen.ts`, provider/mode/local/CLI/workspace/management/code-review settings components | General, Providers, Modes & Models, Git & Worktrees, MCP, Integrations, Appearance, Notifications, About, validation, login/device flow, installed fonts, install/download progress, and centered desktop layout are implemented. |
-| `crates/trouve-app/ui/theme.slint` | `src/styles/tokens.css`, `themes.generated.css`, `app.css` | Semantic colors, density, radii, typography, selection, status, focus, and forced-colors contracts map to CSS custom properties; widget-internal chrome may differ as allowed by the plan. |
+| `crates/trouve-app/ui/theme.slint` | `src/styles/tokens.css`, `themes.css`, `app.css` | Semantic colors, density, radii, typography, selection, status, focus, and forced-colors contracts map to CSS custom properties; widget-internal chrome may differ as allowed by the plan. |
 
 ### Shared Rust client/view model and native host
 

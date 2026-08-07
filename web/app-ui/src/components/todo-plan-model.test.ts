@@ -13,7 +13,7 @@ describe("buildTodoPlanModel", () => {
     const model = buildTodoPlanModel([
       { id: "pending", content: "Queue work", status: "pending" },
       { id: "active", content: "Build surface", status: "in_progress" },
-      { id: "done", content: "Audit Slint", status: "completed" },
+      { id: "done", content: "Audit frontend", status: "completed" },
       { id: "cancelled", content: "Discard spike", status: "cancelled" },
     ]);
 

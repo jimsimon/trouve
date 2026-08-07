@@ -74,7 +74,7 @@ describe("question wizard", () => {
     expect(state.selections[1]).toEqual([OTHER_OPTION_ID]);
   });
 
-  it("builds the same review and submission representation as Slint", () => {
+  it("builds the established review and submission representation", () => {
     let state = createQuestionWizard(questions.length);
     state = toggleQuestionOption(state, questions, "blue");
     state = advanceQuestionWizard(state, questions.length);

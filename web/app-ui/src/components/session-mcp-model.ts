@@ -13,7 +13,7 @@ export interface ParsedMcpCommandLine {
   readonly args: readonly string[];
 }
 
-/** Parse the same small POSIX-style command-line shape accepted by the Slint
+/** Parse the small POSIX-style command-line shape accepted by the product
  * settings form. This only tokenizes data for the protocol; it never invokes
  * a shell. */
 export const parseMcpCommandLine = (value: string): ParsedMcpCommandLine | undefined => {

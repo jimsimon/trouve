@@ -35,7 +35,7 @@ describe("session list component contract", () => {
     expect(component).toContain("Status: ${sessionStatusText(session)}");
   });
 
-  it("uses Slint's attention, error, unread, busy, and idle presentations", () => {
+  it("uses the attention, error, unread, busy, and idle presentations", () => {
     expect(component).toContain("sessionIndicatorPresentation(session)");
     const idle: SessionIndicatorFields = {
       active: false,
@@ -78,7 +78,7 @@ describe("session list component contract", () => {
     expect(shell).toContain('route.kind === "inbox" && recoverySession !== undefined');
   });
 
-  it("keeps actions in the Slint-shaped popup and rename/delete in a modal", () => {
+  it("keeps actions in the compact popup and rename/delete in a modal", () => {
     expect(component).toContain('class="session-actions"');
     expect(component).toContain('class="session-modal"');
     expect(component).toContain('dialog.showModal()');

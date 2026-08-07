@@ -27,7 +27,7 @@ export interface SessionIndicatorPresentation {
 }
 
 /** Shared presentation contract for every compact session picker. Keep this
- * priority aligned with Slint's navigation row: actionable attention first,
+ * established priority: actionable attention first,
  * then unseen terminal outcomes, live activity, and finally idle. */
 export const sessionIndicatorPresentation = (
   session: SessionIndicatorFields,

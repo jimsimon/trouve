@@ -121,7 +121,7 @@ const effectiveToolCall = (
   return { tool: nestedTool ?? tool, args: nestedArgs };
 };
 
-/** Match the retained Slint tool naming contract across native and vendor
+/** Match the established tool naming contract across native and vendor
  * harness identifiers. */
 export const toolDisplayName = (tool: string): string => {
   const mcp = tool.startsWith("mcp__") ? tool.slice(5).split("__", 2) : [];
@@ -502,7 +502,7 @@ const textBlocks = (value: unknown): string | undefined => {
   return texts.join("\n");
 };
 
-/** The expanded non-edit detail contract from the Slint renderer: readable
+/** The expanded non-edit detail contract: readable
  * key/value blocks without JSON brace/quote noise, with vendor text result
  * wrappers flattened and a strict historical-card bound. */
 export const toolDetailText = (args: unknown, result?: unknown): string => {

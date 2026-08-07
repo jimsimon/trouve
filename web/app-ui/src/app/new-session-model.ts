@@ -62,7 +62,7 @@ export const sessionTitleFallback = (prompt: string): string => {
   return title === "" ? NEW_SESSION_TITLE_FALLBACK : title;
 };
 
-/** Returns the first valid thinking option in the same precedence as Slint. */
+/** Returns the first valid thinking option in the established precedence. */
 export const thinkingOption = (
   model: ProtocolModelInfo | null | undefined,
 ): ThinkingOption | undefined => {

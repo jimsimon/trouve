@@ -93,7 +93,7 @@ export const indexChatPresentation = (
   };
 };
 
-/** Match the compact duration labels used by the existing Slint chat cards. */
+/** Match the compact duration labels used by existing chat cards. */
 export const formatTurnDuration = (durationMs: number): string => {
   const milliseconds = Math.max(0, Math.floor(durationMs));
   if (milliseconds < 1_000) return `${milliseconds}ms`;

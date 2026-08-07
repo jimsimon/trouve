@@ -7,7 +7,7 @@ export interface ChatFileTarget {
 
 const MAX_FILE_TARGET_LENGTH = 4_096;
 
-/** Match the retained Slint behavior for model-authored workspace file links
+/** Match the established behavior for model-authored workspace file links
  * while keeping URL-like targets out of the typed file workflow. */
 export const parseChatFileTarget = (value: string): ChatFileTarget | undefined => {
   if (value.startsWith("file://") && !value.startsWith("file:///")) return undefined;

@@ -638,7 +638,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#githubRefreshPending = true;
     try {
       // Account snapshots are durable server events. Refreshing them at the
-      // shell level keeps Slint-equivalent session PR badges current even
+      // shell level keeps session PR badges current even
       // when the full Pull Requests route has never been opened.
       await this.#protocolClient.refreshGithubPrs();
     } catch {

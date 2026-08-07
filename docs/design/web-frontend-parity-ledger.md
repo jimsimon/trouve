@@ -1,5 +1,10 @@
 # Web frontend parity and qualification ledger
 
+**Retirement update (2026-08-07):** ADR 0028 made Wry/Lit the sole product
+frontend and removed the Slint rollback. Slint comparisons below are retained
+as historical migration evidence; current visual authority lives in Trouve's
+CSS themes, component gallery, and browser regression suite.
+
 **Status:** Existing Slint functionality ported; promotion qualification remains open
 
 **Last updated:** 2026-08-07
@@ -14,18 +19,15 @@
 
 ## Purpose and interpretation
 
-This document records the current, source-inspected Lit coverage for the 21
-migration surfaces in section 10 of the migration plan. The existing Slint
-frontend's user-visible callback contract is now functionally represented in
-the Lit frontend. That claim is enforced by
-[the exhaustive callback manifest](../../web/app-ui/src/app/slint-callback-parity.test.ts),
-which extracts all 134 `AppWindow` callbacks from `app.slint` and requires
-exactly one documented Lit implementation or intentional browser-native
-consolidation for each callback.
-The complementary source audit inventories all 50 retained Rust/Slint frontend
-files, compares their non-callback state/performance/failure behavior, and
-mechanically rejects an unaudited source file or Rust/TypeScript thread-event
-reducer mismatch.
+This document records source-inspected Lit coverage for the 21 migration
+surfaces in section 10 of the migration plan. The retired frontend's
+user-visible action contract is represented in Lit and frozen by
+[the application action contract](../../web/app-ui/src/app/app-action-contract.test.ts),
+which requires one implementation-evidence disposition for each of the 149
+established actions. The complementary
+[native source contract](../../web/app-ui/src/app/native-source-contract.test.ts)
+inventories the remaining Rust desktop-host boundary and mechanically rejects
+an unreviewed native source or Rust/TypeScript thread-event reducer mismatch.
 
 This is still an implementation and evidence ledger, not a declaration that
 the web frontend is ready to replace Slint. Functional port closure and
@@ -120,12 +122,12 @@ The main cross-cutting implementation anchors are:
 - [contained signals adapter](../../web/app-ui/src/state/reactivity.ts)
 - [reactivity import-boundary test](../../web/app-ui/src/state/reactivity-boundary.test.ts)
 - [theme controller](../../web/app-ui/src/services/theme-controller.ts)
-- [generated semantic themes](../../web/app-ui/src/styles/themes.generated.css)
+- [semantic themes](../../web/app-ui/src/styles/themes.css)
 - [application tokens](../../web/app-ui/src/styles/tokens.css)
-- [Slint-derived theme generator](../../scripts/generate_web_themes.py)
+- [semantic theme-role contract](../../web/app-ui/src/styles/visual-contract.test.ts)
 - [visual parity component gallery](../../web/app-ui/src/app/component-gallery.ts)
 - [static visual contract tests](../../web/app-ui/src/styles/visual-contract.test.ts)
-- [exhaustive Slint callback parity manifest](../../web/app-ui/src/app/slint-callback-parity.test.ts)
+- [application action contract](../../web/app-ui/src/app/app-action-contract.test.ts)
 - [application parity contract tests](../../web/app-ui/src/app/trouve-app-parity.test.ts)
 - [humanized tool, inline-diff, todo, and activity presentation](../../web/app-ui/src/components/tool-presentation.ts)
 - [session pull-request integration and lifecycle panel](../../web/app-ui/src/components/session-pr-panel.ts)
@@ -843,8 +845,8 @@ remains open.
 - [system-font discovery](../../web/app-ui/src/services/system-fonts.ts)
 - [typed desktop-host bootstrap](../../crates/trouve-desktop-host/src/gateway.rs)
 - [theme controller](../../web/app-ui/src/services/theme-controller.ts)
-- [generated themes](../../web/app-ui/src/styles/themes.generated.css)
-- [theme generator](../../scripts/generate_web_themes.py)
+- [semantic themes](../../web/app-ui/src/styles/themes.css)
+- [semantic theme-role contract](../../web/app-ui/src/styles/visual-contract.test.ts)
 - [component gallery](../../web/app-ui/src/app/component-gallery.ts)
 - [visual contract tests](../../web/app-ui/src/styles/visual-contract.test.ts)
 

@@ -31,7 +31,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 /** Normalize untrusted persisted/host state without allowing truthy strings
- * or partial corruption to silently change the established Slint defaults. */
+ * or partial corruption to silently change the established product defaults. */
 export const normalizeNotificationPreferences = (
   value: Partial<NotificationPreferences>,
   fallback: NotificationPreferences = DEFAULT_NOTIFICATION_PREFERENCES,

@@ -1,7 +1,7 @@
 import "@awesome.me/webawesome/dist/styles/themes/default.css";
 import "@awesome.me/webawesome/dist/components/button/button.js";
 
-import "./styles/themes.generated.css";
+import "./styles/themes.css";
 import "./styles/tokens.css";
 import "./styles/app.css";
 import "./app/trouve-app.js";

@@ -83,7 +83,7 @@ const attachment = (
 });
 
 describe("new thread setup model", () => {
-  it("starts a provisional draft with Slint-compatible mode/model defaults", () => {
+  it("starts a provisional draft with product mode/model defaults", () => {
     const draft = createInitialNewThreadDraft(catalog);
     expect(draft).toMatchObject({
       modeId: "code",

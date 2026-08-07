@@ -1524,7 +1524,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     if (virtualItems.length > 0) {
       // Keep the transcript tail flush with the virtual canvas. The queue and
-      // composer own Slint's 8px separation outside the scrollport; a virtual
+      // composer own the established 8px separation outside the scrollport; a virtual
       // end spacer would duplicate that gap and move every tail-pin target.
       virtualItems.unshift({
         id: CHAT_START_SPACER_ID,

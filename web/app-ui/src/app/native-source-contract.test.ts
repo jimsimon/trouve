@@ -12,37 +12,19 @@ const sourceRoots = [
   "crates/trouve-desktop-host/src",
   "crates/trouve-desktop-host/tests",
   "crates/trouve-servo-embed-preview/src",
-  "crates/trouve-slint-code-view",
-  "crates/trouve-slint-diff-view",
-  "crates/trouve-slint-markdown",
-  "crates/trouve-slint-terminal",
 ] as const;
 
-/** Every retained native-frontend source reviewed in the source audit. Keep
- * this explicit: a newly added Rust/Slint frontend file must receive a web
- * disposition instead of silently falling outside the comparison. */
+/** Every native frontend-host source. Keep this explicit so native UI logic
+ * cannot silently grow beside the shared Lit application. */
 const auditedSources = [
   "crates/trouve-app/build.rs",
-  "crates/trouve-app/src/controller.rs",
-  "crates/trouve-app/src/main.rs",
-  "crates/trouve-app/src/notify.rs",
+  "crates/trouve-app/src/native_notification.rs",
   "crates/trouve-app/src/opener.rs",
-  "crates/trouve-app/src/render.rs",
   "crates/trouve-app/src/servo_preview.rs",
   "crates/trouve-app/src/sleep.rs",
-  "crates/trouve-app/src/theme.rs",
-  "crates/trouve-app/src/ui.rs",
   "crates/trouve-app/src/web_preview.rs",
   "crates/trouve-app/src/web_preview_support.rs",
-  "crates/trouve-app/src/winstate.rs",
   "crates/trouve-app/src/wry_main.rs",
-  "crates/trouve-app/ui/app.slint",
-  "crates/trouve-app/ui/automations-screen.slint",
-  "crates/trouve-app/ui/connectivity-banner.slint",
-  "crates/trouve-app/ui/pull-requests-screen.slint",
-  "crates/trouve-app/ui/scroll-keys.slint",
-  "crates/trouve-app/ui/settings-window.slint",
-  "crates/trouve-app/ui/theme.slint",
   "crates/trouve-client-core/src/client.rs",
   "crates/trouve-client-core/src/lib.rs",
   "crates/trouve-client-core/src/protocol_compatibility.rs",
@@ -51,29 +33,9 @@ const auditedSources = [
   "crates/trouve-desktop-host/src/lib.rs",
   "crates/trouve-desktop-host/tests/openapi_snapshot.rs",
   "crates/trouve-servo-embed-preview/src/main.rs",
+  "crates/trouve-servo-embed-preview/src/native_notification.rs",
   "crates/trouve-servo-embed-preview/src/system_opener.rs",
   "crates/trouve-servo-embed-preview/src/web_preview_support.rs",
-  "crates/trouve-slint-code-view/build.rs",
-  "crates/trouve-slint-code-view/examples/code_view_demo.rs",
-  "crates/trouve-slint-code-view/src/lib.rs",
-  "crates/trouve-slint-code-view/ui/code-view-window.slint",
-  "crates/trouve-slint-code-view/ui/code-view.slint",
-  "crates/trouve-slint-diff-view/build.rs",
-  "crates/trouve-slint-diff-view/examples/diff_view_demo.rs",
-  "crates/trouve-slint-diff-view/src/lib.rs",
-  "crates/trouve-slint-diff-view/ui/diff-view-window.slint",
-  "crates/trouve-slint-diff-view/ui/diff-view.slint",
-  "crates/trouve-slint-markdown/build.rs",
-  "crates/trouve-slint-markdown/examples/markdown_demo.rs",
-  "crates/trouve-slint-markdown/src/lib.rs",
-  "crates/trouve-slint-markdown/ui/markdown-view.slint",
-  "crates/trouve-slint-markdown/ui/markdown-window.slint",
-  "crates/trouve-slint-terminal/build.rs",
-  "crates/trouve-slint-terminal/examples/terminal_demo.rs",
-  "crates/trouve-slint-terminal/src/lib.rs",
-  "crates/trouve-slint-terminal/ui/terminal-grid.slint",
-  "crates/trouve-slint-terminal/ui/terminal-view.slint",
-  "crates/trouve-slint-terminal/ui/terminal-window.slint",
 ] as const;
 
 const collectFrontendSources = (path: string): readonly string[] => {
@@ -84,7 +46,7 @@ const collectFrontendSources = (path: string): readonly string[] => {
       if (entry.name === "target") return [];
       return collectFrontendSources(child);
     }
-    return entry.isFile() && (entry.name.endsWith(".rs") || entry.name.endsWith(".slint"))
+    return entry.isFile() && entry.name.endsWith(".rs")
       ? [child]
       : [];
   });
@@ -119,15 +81,15 @@ const rustEventToWire = {
   UserMessage: "user.message",
 } as const;
 
-describe("retained Rust/Slint frontend source parity", () => {
-  it("keeps every frontend source in the explicit audit inventory", () => {
+describe("native frontend-host source contract", () => {
+  it("keeps every native host source in the explicit inventory", () => {
     const discovered = sourceRoots.flatMap(collectFrontendSources).sort();
     expect(discovered).toEqual([...auditedSources].sort());
   });
 
-  it("records a disposition for every source in the saved audit", () => {
-    const audit = readRepositoryFile("docs/design/web-frontend-source-parity-audit.md");
-    for (const source of auditedSources) expect(audit).toContain(`\`${source}\``);
+  it("does not retain a second native product UI", () => {
+    expect(auditedSources.some((source) => source.endsWith(".slint"))).toBe(false);
+    expect(sourceRoots.some((source) => source.includes("slint"))).toBe(false);
   });
 
   it("folds every native thread view-model event in the TypeScript projection", () => {
@@ -151,7 +113,7 @@ describe("retained Rust/Slint frontend source parity", () => {
 
   it("resolves the repository root used by the inventory", () => {
     expect(relative(repositoryRoot, fileURLToPath(import.meta.url))).toBe(
-      "web/app-ui/src/app/rust-source-parity.test.ts",
+      "web/app-ui/src/app/native-source-contract.test.ts",
     );
   });
 });

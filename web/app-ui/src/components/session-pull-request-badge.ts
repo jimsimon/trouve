@@ -47,7 +47,7 @@ const pullRequestStatus = (pr: ProtocolPrInfo): PullRequestBadgeStatus => {
   };
 };
 
-/** Account snapshots are also the established Slint sidebar source. Match a
+/** Account snapshots are also the established sidebar source. Match a
  * session by the server-enriched workspace id and exact head branch, then keep
  * open PRs first and newest PRs first within each terminal-state group. */
 export const pullRequestsForSession = (
@@ -55,7 +55,7 @@ export const pullRequestsForSession = (
   lists: readonly ProtocolGithubPrList[],
 ): readonly ProtocolPrInfo[] => projectSessionPullRequests(session, lists);
 
-/** Exact web counterpart of the Slint navigation badge aggregation: every
+/** Navigation badge aggregation: every
  * open PR must be GitHub-ready before the aggregate becomes green. */
 export const sessionPullRequestBadge = (
   prs: readonly ProtocolPrInfo[],
@@ -76,7 +76,7 @@ export const sessionPullRequestBadge = (
   });
 };
 
-/** Apply the same Slint-derived precedence used by every session navigator:
+/** Apply the same precedence used by every session navigator:
  * attention, failure, unread, and busy indicators win over pull-request state.
  * A selected completed session has already cleared its local unread marker, so
  * it can hand off to the pull-request badge during the intervening render. */

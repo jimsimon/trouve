@@ -104,7 +104,7 @@ describe("local model settings helpers", () => {
     })).toBe(true);
   });
 
-  it("matches Slint's repo-level local-search fit filters", () => {
+  it("matches the repo-level local-search fit filters", () => {
     const results = [
       searchResult("gpu-only", ["gpu"]),
       searchResult("cpu-only", ["cpu"]),

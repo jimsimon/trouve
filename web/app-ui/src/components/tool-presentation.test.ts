@@ -9,7 +9,7 @@ import {
   toolLabel,
 } from "./tool-presentation.js";
 
-describe("Slint-equivalent tool presentation", () => {
+describe("tool presentation", () => {
   it("humanizes native, vendor, and MCP identifiers", () => {
     expect(toolDisplayName("search")).toBe("Code Search");
     expect(toolDisplayName("find_related")).toBe("Find Related");

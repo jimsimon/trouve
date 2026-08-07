@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("trouve-todo-plan-panel semantic contract", () => {
-  it("renders the Slint-shaped progress label and ordered status rows", () => {
+  it("renders the compact progress label and ordered status rows", () => {
     const source = readFileSync(
       new URL("./todo-plan-panel.ts", import.meta.url),
       "utf8",

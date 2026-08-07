@@ -83,7 +83,7 @@ export const localModelSections = (
   return { yours, recommended };
 };
 
-/** Match the established Slint behavior: a repository remains visible when
+/** Match the established behavior: a repository remains visible when
  * any file fits an enabled tier, and its complete file picker remains intact. */
 export const filterLocalSearchResults = (
   results: readonly ProtocolLocalSearchResult[],

@@ -11,16 +11,10 @@ const numberFrom = (source: string, expression: RegExp, label: string): number =
   return Number(value);
 };
 
-describe("Slint/Lit visual contract", () => {
-  const slint = read("../../../../crates/trouve-app/ui/app.slint");
-  const settingsSlint = read(
-    "../../../../crates/trouve-app/ui/settings-window.slint",
-  );
-  const slintActivitySpinner = read(
-    "../../../../crates/trouve-app/ui/assets/activity-spinner.svg",
-  );
+describe("Trouve visual contract", () => {
+  const desktopHost = read("../../../../crates/trouve-app/src/web_preview.rs");
   const tokens = read("./tokens.css");
-  const themes = read("./themes.generated.css");
+  const themes = read("./themes.css");
   const app = read("./app.css");
   const shell = read("../app/trouve-app.ts");
   const sessionList = read("../components/session-list.ts");
@@ -41,16 +35,12 @@ describe("Slint/Lit visual contract", () => {
   const main = read("../main.ts");
   const gallery = read("../gallery.ts");
 
-  it("keeps the authoritative desktop geometry and native density", () => {
-    const left = numberFrom(slint, /left-width:\s*(\d+)px/, "Slint left pane");
-    const right = numberFrom(slint, /right-width:\s*(\d+)px/, "Slint right pane");
-    const font = numberFrom(slint, /default-font-size:\s*Theme\.fs\((\d+)px\)/, "Slint font");
-
-    expect(numberFrom(tokens, /--trouve-navigation-width:\s*(\d+)px/, "Lit left pane")).toBe(left);
-    expect(numberFrom(tokens, /--trouve-inspection-width:\s*(\d+)px/, "Lit right pane")).toBe(right);
-    expect(numberFrom(tokens, /--trouve-font-size:\s*(\d+)px/, "Lit font")).toBe(font);
-    expect(slint).toContain("preferred-width: 1400px");
-    expect(slint).toContain("preferred-height: 900px");
+  it("keeps the authoritative desktop geometry and density", () => {
+    expect(numberFrom(tokens, /--trouve-navigation-width:\s*(\d+)px/, "left pane")).toBe(260);
+    expect(numberFrom(tokens, /--trouve-inspection-width:\s*(\d+)px/, "right pane")).toBe(460);
+    expect(numberFrom(tokens, /--trouve-font-size:\s*(\d+)px/, "font size")).toBe(13);
+    expect(desktopHost).toContain(".with_inner_size(LogicalSize::new(1_400, 900))");
+    expect(desktopHost).toContain(".with_min_inner_size(LogicalSize::new(900, 560))");
     expect(app).toContain(
       "grid-template-columns: var(--trouve-navigation-width) 5px minmax(420px, 1fr) 5px var(--trouve-inspection-width)",
     );
@@ -113,7 +103,24 @@ describe("Slint/Lit visual contract", () => {
     expect([...used].filter((name) => !defined.has(name)).sort()).toEqual([]);
   });
 
-  it("keeps the Slint desktop navigation hierarchy and density", () => {
+  it("keeps every product theme on one semantic role contract", () => {
+    const palettes = [...themes.matchAll(/(?:^:root,\n)?\[data-theme="([^"]+)"\] \{\n([\s\S]*?)\n\}/gmu)]
+      .map((match) => ({
+        name: match[1]!,
+        roles: [...match[2]!.matchAll(/(--trouve-[a-z0-9-]+)\s*:/g)].map((role) => role[1]!),
+      }));
+    expect(palettes.map((palette) => palette.name)).toEqual([
+      "dark",
+      "light",
+      "high-contrast-dark",
+      "colorblind-dark",
+      "colorblind-light",
+    ]);
+    const contract = [...palettes[0]!.roles].sort();
+    for (const palette of palettes) expect([...palette.roles].sort()).toEqual(contract);
+  });
+
+  it("keeps the established desktop navigation hierarchy and density", () => {
     expect(shell).not.toContain('class="brand-row"');
     expect(shell).not.toContain(">Inbox</button>");
     const pullRequests = shell.indexOf("<strong>Pull Requests</strong>");
@@ -174,6 +181,9 @@ describe("Slint/Lit visual contract", () => {
     expect(settings).not.toContain('class="theme-preview"');
     expect(settings).toMatch(/id="settings-font-family"[\s\S]*?<option value="">System default<\/option>/);
     expect(settings).not.toMatch(/<input\s+id="settings-font-family"/);
+    expect(settings).not.toContain("AboutSlint");
+    expect(settings).not.toContain("MadeWithSlint");
+    expect(settings).not.toContain("slint.dev");
   });
 
   it("keeps mode rows compact on desktop and touch-safe when stacked", () => {
@@ -213,7 +223,7 @@ describe("Slint/Lit visual contract", () => {
     expect(shell).not.toContain('this.#protocolReady ? "No session selected"');
   });
 
-  it("keeps Slint's primary inspection order and desktop-height contract", () => {
+  it("keeps the primary inspection order and desktop-height contract", () => {
     expect(shell).toMatch(
       /const INSPECTION_PANELS = \[\s*"diff",\s*"files",\s*"pr",\s*"mcp",\s*"terminal",/,
     );
@@ -266,7 +276,7 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toMatch(/\.new-session-screen\[hidden\] \{[^}]*display:\s*none\s*!important/s);
   });
 
-  it("keeps the Slint thread, turn-card, and composer geometry", () => {
+  it("keeps the thread, turn-card, and composer geometry", () => {
     expect(app).toMatch(/\.thread-tabs button \{[^}]*width:\s*145px[^}]*height:\s*30px/s);
     expect(app).toMatch(/\.thread-header \{[^}]*padding:\s*10px[^}]*box-shadow:/s);
     expect(app).toMatch(
@@ -414,12 +424,7 @@ describe("Slint/Lit visual contract", () => {
     );
   });
 
-  it("uses a local Font Awesome running-tool spinner with Slint's timing", () => {
-    const spinnerPath = /d="([^"]+)"/.exec(slintActivitySpinner)?.[1];
-    expect(spinnerPath).toBe("M12 3a9 9 0 1 1-9 9");
-    expect(slintActivitySpinner).toContain('stroke-linecap="round"');
-    expect(slintActivitySpinner).toContain('stroke-width="3"');
-    expect(slint).toContain("360deg * (mod(root.animation-time, 900ms) / 900ms)");
+  it("uses a local Font Awesome running-tool spinner with product timing", () => {
     expect(icons).toContain('@fortawesome/fontawesome-free/css/solid.css');
     expect(icons).toContain('spinner: 0xf110');
     expect(thread).toContain('running: "spinner"');
@@ -432,15 +437,7 @@ describe("Slint/Lit visual contract", () => {
     );
   });
 
-  it("matches Slint's session-list status precedence and indicators", () => {
-    expect(slint).toContain("attention, error, unread, busy, PR");
-    expect(slint).toContain('icon: row.attention-kind == 2 ? "?" : "!"');
-    expect(slint).toContain('icon: "×"');
-    expect(slint).toContain('icon: "●"');
-    expect(slint).toContain("width: 10px");
-    expect(slint).toContain("height: 10px");
-    expect(slint).toContain("background: Theme.c.accent");
-    expect(slint).toContain("mod(root.activity-animation-time, 1.6s) / 1.6s");
+  it("keeps the session-list status precedence and indicators", () => {
     expect(sessionList).toContain("sessionIndicatorPresentation(session)");
     expect(sessionIndicators).toContain('icon: "triangle-exclamation"');
     expect(sessionIndicators).toContain('icon: "circle-question"');
@@ -568,7 +565,7 @@ describe("Slint/Lit visual contract", () => {
     );
   });
 
-  it("keeps compact Slint settings labels, meters, copy, and form alignment", () => {
+  it("keeps compact settings labels, meters, copy, and form alignment", () => {
     expect(cliSettings).toContain(">Uninstall</button>");
     expect(cliSettings).not.toContain(">Remove managed</button>");
     expect(managementSettings).toMatch(
@@ -584,7 +581,7 @@ describe("Slint/Lit visual contract", () => {
     expect(providerSettings).not.toContain("${health.status}</span>");
   });
 
-  it("keeps Slint's session-naming choices and reactive explanations", () => {
+  it("keeps the session-naming choices and reactive explanations", () => {
     for (const label of [
       "Adaptive (Recommended)",
       "Keep Ready",
@@ -594,7 +591,6 @@ describe("Slint/Lit visual contract", () => {
       "GPU Only",
       "CPU & RAM Only",
     ]) {
-      expect(settingsSlint).toContain(`"${label}"`);
       expect(managementSettings).toContain(`label: "${label}"`);
     }
     for (const description of [
@@ -607,7 +603,6 @@ describe("Slint/Lit visual contract", () => {
       "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
       "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
     ]) {
-      expect(settingsSlint).toContain(`"${description}"`);
       expect(managementSettings).toContain(`"${description}"`);
     }
     expect(managementSettings).toContain("this.#draftLoadBehavior = behaviorSelect.value");

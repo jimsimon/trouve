@@ -16,7 +16,7 @@ export interface ParsedDiffFile {
 export type ParsedUnifiedDiffRowKind = "hunk" | "context" | "add" | "delete";
 
 /** One non-file-header row in the same continuous unified presentation used
- * by the retained Slint DiffView. File headers are rendered from
+ * by the original unified diff contract. File headers are rendered from
  * ParsedDiffFile so collapse and per-file copy remain separate controls. */
 export interface ParsedUnifiedDiffRow {
   readonly kind: ParsedUnifiedDiffRowKind;

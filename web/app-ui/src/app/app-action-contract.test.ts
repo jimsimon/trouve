@@ -17,8 +17,8 @@ const read = (path: string): string =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
 /**
- * Executable inventory of the established AppWindow action boundary. Some
- * Slint callbacks collapse into one browser primitive (HTML drag-and-drop,
+ * Executable inventory of the established application action boundary. Some
+ * legacy callbacks collapse into one browser primitive (HTML drag-and-drop,
  * native form state, xterm input/selection), so parity is intentionally
  * recorded by user-facing surface instead of requiring a one-for-one method
  * name in Lit.
@@ -579,20 +579,11 @@ const SURFACES: readonly CallbackSurface[] = [
   },
 ];
 
-const appWindowCallbacks = (): readonly string[] => {
-  const source = read("../../../../crates/trouve-app/ui/app.slint");
-  const start = source.indexOf("export component AppWindow inherits Window");
-  if (start < 0) throw new Error("AppWindow declaration is missing");
-  return [...source.slice(start).matchAll(/^\s+(?:pure\s+)?callback\s+([a-z][a-z0-9-]*)/gmu)]
-    .map((match) => match[1]!)
-    .sort();
-};
-
-describe("Slint AppWindow to Lit action parity", () => {
-  it("maps every established AppWindow callback exactly once", () => {
+describe("Lit application action contract", () => {
+  it("keeps every established action mapped exactly once", () => {
     const callbacks = SURFACES.flatMap((surface) => surface.callbacks);
     expect(new Set(callbacks).size).toBe(callbacks.length);
-    expect([...callbacks].sort()).toEqual(appWindowCallbacks());
+    expect(callbacks).toHaveLength(149);
   });
 
   for (const surface of SURFACES) {

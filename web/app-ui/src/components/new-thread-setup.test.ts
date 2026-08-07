@@ -31,7 +31,7 @@ describe("new thread setup component contract", () => {
     expect(component).toContain(">Cancel</button>");
   });
 
-  it("renders every setup control, the Slint first-message gate, and bounded uploads", () => {
+  it("renders every setup control, the first-message gate, and bounded uploads", () => {
     expect(component).toContain('name="mode"');
     expect(component).toContain("<trouve-model-picker");
     expect(component).toContain(".value=${this.#draft.modelId}");

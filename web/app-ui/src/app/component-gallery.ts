@@ -19,7 +19,7 @@ export class TrouveComponentGallery extends LitElement {
         <div>
           <p class="gallery-eyebrow">Migration reference</p>
           <h1>Visual parity gallery</h1>
-          <p>Semantic colors and product hierarchy extracted from the Slint frontend.</p>
+          <p>Trouve-owned semantic colors and product hierarchy.</p>
         </div>
         <a href="/">Open application shell</a>
       </header>
@@ -71,7 +71,7 @@ export class TrouveComponentGallery extends LitElement {
           </div>
           <div>
             <p class="gallery-label">Code and state colors</p>
-            <pre class="diff-lines"><span class="context">  const shell = "existing";</span><span class="addition">+ const frontend = "lit";</span><span class="gallery-deletion">- const frontend = "slint";</span></pre>
+            <pre class="diff-lines"><span class="context">  const shell = "existing";</span><span class="addition">+ const frontend = "lit";</span><span class="gallery-deletion">- const frontend = "legacy";</span></pre>
             <div class="gallery-statuses"><span class="additions">Success</span><span class="deletions">Error</span><span class="gallery-warning">Attention</span></div>
           </div>
         </div>

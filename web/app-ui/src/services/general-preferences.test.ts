@@ -8,7 +8,7 @@ import {
 } from "./general-preferences.js";
 
 describe("general frontend preferences", () => {
-  it("normalizes untrusted state against the Slint default", () => {
+  it("normalizes untrusted state against the product default", () => {
     expect(normalizeGeneralPreferences({ preventSleepWhileRunning: false })).toEqual({
       preventSleepWhileRunning: false,
     });

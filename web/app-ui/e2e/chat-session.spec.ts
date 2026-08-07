@@ -2711,7 +2711,7 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   expect(scrollGeometry.scrollHeight).toBeGreaterThan(scrollGeometry.clientHeight);
 
   await expect.poll(() => transcriptComposerGap(page), {
-    message: "the transcript tail should use Slint's 8px composer separation",
+    message: "the transcript tail should use the established 8px composer separation",
   }).toBe(8);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
@@ -2756,7 +2756,7 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
   await expect.poll(() => transcriptComposerGap(page), {
-    message: "jumping to the tail should preserve Slint's 8px composer separation",
+    message: "jumping to the tail should preserve the established 8px composer separation",
   }).toBe(8);
 
   await page.locator(".chat-stream").evaluate((viewport) => {

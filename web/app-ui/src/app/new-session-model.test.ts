@@ -82,7 +82,7 @@ describe("new session model", () => {
     }))).toEqual({ key: "effort", values: ["low", "high"] });
   });
 
-  it("supports Codex-style reasoning option names in Slint precedence order", () => {
+  it("supports Codex-style reasoning option names in product precedence order", () => {
     expect(thinkingOption(model({
       properties: {
         reasoning_effort: {

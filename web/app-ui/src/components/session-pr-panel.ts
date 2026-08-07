@@ -160,12 +160,12 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     .pr-toolbar > select { min-width: 0; }
     .pr-refresh-additive { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; padding: 0; clip: rect(0, 0, 0, 0); }
     .pr-refresh-additive:focus-visible { position: static; width: auto; height: auto; min-height: 34px; overflow: visible; padding: 4px 9px; clip: auto; }
-    .slint-pr-card { gap: 10px; padding: 14px; border: 0; }
-    .slint-pr-meta { display: flex; align-items: center; gap: 8px; color: var(--trouve-text-dim); font-size: 12px; }
-    .slint-pr-meta > span:last-child { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .slint-pr-actions { display: flex; }
-    .slint-pr-detail { display: grid; gap: 4px; }
-    .slint-pr-detail p { color: var(--trouve-text); font-size: 12px; white-space: pre-wrap; }
+    .session-pr-card { gap: 10px; padding: 14px; border: 0; }
+    .session-pr-meta { display: flex; align-items: center; gap: 8px; color: var(--trouve-text-dim); font-size: 12px; }
+    .session-pr-meta > span:last-child { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .session-pr-actions { display: flex; }
+    .session-pr-detail { display: grid; gap: 4px; }
+    .session-pr-detail p { color: var(--trouve-text); font-size: 12px; white-space: pre-wrap; }
     .pr-management { margin-top: 2px; }
     .pr-management > summary { color: var(--trouve-text-dim); font-size: 11px; }
     .pr-management[open] { display: grid; gap: 9px; }
@@ -375,24 +375,24 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     const url = safeSessionPrHref(pr.url);
     const reviewUrl = safeSessionPrHref(pr.trouve_review?.review_url);
     return html`
-      <article class="pr-card slint-pr-card" aria-labelledby=${`session-pr-${pr.number}`}>
+      <article class="pr-card session-pr-card" aria-labelledby=${`session-pr-${pr.number}`}>
         <h3 id=${`session-pr-${pr.number}`}>${pr.title}</h3>
-        <div class="slint-pr-meta">
+        <div class="session-pr-meta">
           <span class=${`status-pill ${pr.state === "open" || pr.state === "merged" ? pr.state : ""}`}>${pr.state}${pr.draft ? " · draft" : ""}</span>
           <span>#${pr.number} · ${pr.head} → ${pr.base}</span>
         </div>
-        <div class="slint-pr-actions">
+        <div class="session-pr-actions">
           ${url === undefined ? nothing : html`<button type="button" @click=${() => this.#openExternal(url)}>Open on GitHub ${fontAwesomeIcon("arrow-up-right-from-square")}</button>`}
         </div>
         ${pr.checks.length === 0
           ? nothing
-          : html`<section class="slint-pr-detail">
+          : html`<section class="session-pr-detail">
               <h4>Checks</h4>
               <p>${pr.checks.map((check) => `${check.name}: ${humanize(check.conclusion ?? check.status)}`).join("\n")}</p>
             </section>`}
         ${pr.reviews.length === 0 && (pr.requested_reviewers?.length ?? 0) === 0
           ? nothing
-          : html`<section class="slint-pr-detail">
+          : html`<section class="session-pr-detail">
               <h4>Reviews</h4>
               <p>${[
                 ...pr.reviews.map((review) => `${review.reviewer}: ${humanize(review.state)}`),

@@ -73,7 +73,7 @@ describe("chat presentation", () => {
     expect(formatTurnDuration(duration)).toBe(expected);
   });
 
-  it("formats Slint-compatible usage, cost, and duration metadata", () => {
+  it("formats compact usage, cost, and duration metadata", () => {
     expect(formatTurnMetadata(
       { input_tokens: 1_234, output_tokens: 56, cost_usd: 0.123456 },
       65_000,

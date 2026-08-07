@@ -2,11 +2,16 @@
 
 **Audit date:** 2026-08-04
 
+**Retirement update (2026-08-07):** ADR 0028 promoted this audit's Lit/Wry
+implementation to the sole product frontend and removed the Slint rollback,
+widget crates, build inputs, and attribution. The traceability tables below
+preserve the evidence and gate status at the time of the audit.
+
 **Plan:** [Web frontend migration implementation plan](web-frontend-migration-plan.md)
 
 **Surface ledger:** [Web frontend parity and qualification ledger](web-frontend-parity-ledger.md)
 
-**Source audit:** [Rust/Slint to TypeScript frontend source-parity audit](web-frontend-source-parity-audit.md)
+**Source audit:** [Historical Rust/Slint to TypeScript frontend source-parity audit](web-frontend-source-parity-audit.md)
 
 ## Verdict
 
@@ -22,13 +27,10 @@ frontend files and closed state-lifecycle, replay, timeout, process-cleanup,
 terminal, streaming, and oversized-document virtualization gaps that a
 screen/callback inventory alone could not expose.
 
-The migration project as a whole is **not promotion-complete**. Phases 0, 2,
-10, 11, and 12 deliberately require evidence that cannot be manufactured from
-one Linux development host: paired Slint/Lit reviews, assistive-technology and
-device matrices, all release targets, signed packages, production PWA
-authentication/HTTPS/deployment, measured memory/performance workloads,
-failure/renderer recovery, soak, promotion, and post-release retirement. Slint
-therefore remains the default and rollback frontend.
+At the audit date, platform and rollout qualification remained open. The
+subsequent Wry rollout, daily-use fixes, memory investigation, and retirement
+decision are recorded by ADRs 0027 and 0028. PWA deployment and Servo
+qualification remain independent work; neither requires a second product UI.
 
 One repository-visible decision also remains unapproved: the implementation
 uses self-hosted WebAwesome Free for selected ordinary/brand controls while

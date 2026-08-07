@@ -8,7 +8,7 @@ import {
 } from "./model-health.js";
 
 describe("model health presentation", () => {
-  it("matches the Slint highest-window summary and warning tones", () => {
+  it("matches the highest-window summary and warning tones", () => {
     const health = modelHealthPresentation({
       provider_id: "codex",
       status: "ok",
@@ -44,7 +44,7 @@ describe("model health presentation", () => {
     })).toMatchObject({ summary: "login required", tone: "error" });
   });
 
-  it("uses Slint's healthy, warning, and exhausted meter thresholds", () => {
+  it("uses the healthy, warning, and exhausted meter thresholds", () => {
     expect(subscriptionUsageTone(0)).toBe("ok");
     expect(subscriptionUsageTone(69)).toBe("ok");
     expect(subscriptionUsageTone(70)).toBe("warning");

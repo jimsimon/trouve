@@ -46,7 +46,7 @@ const isSplitSurrogatePair = (text: string, cursor: number): boolean => {
 };
 
 /** Convert a textarea selection offset into the UTF-8 byte offsets used by
- * the protocol and Slint composer. Offsets inside a surrogate pair are
+ * the protocol and composer. Offsets inside a surrogate pair are
  * rejected instead of silently moving the caret. */
 export const domUtf16OffsetToProtocolUtf8 = (
   text: string,
@@ -83,7 +83,7 @@ export const protocolUtf8OffsetToDomUtf16 = (
 
 /** Find the completion token currently being edited. Slash commands only
  * activate for a bare first token; file mentions can appear anywhere and are
- * resolved against the caret, matching the Slint composer's contract. */
+ * resolved against the caret, matching the product composer's contract. */
 export const composerCompletionToken = (
   draft: string,
   cursor: number,

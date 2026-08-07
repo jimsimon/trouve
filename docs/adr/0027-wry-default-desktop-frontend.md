@@ -1,6 +1,6 @@
 # ADR 0027: Wry as the default desktop frontend
 
-Status: Accepted (2026-08)
+Status: Superseded by 0028
 
 ## Context
 

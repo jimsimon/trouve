@@ -503,10 +503,6 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                           <div class="settings-section">
                             <h1 id="settings-title">About</h1>
                             <p class="settings-tagline">trouve — a protocol-first AI coding harness.</p>
-                            <button class="about-slint" type="button" aria-label=${`Made with Slint, version ${__TROUVE_SLINT_VERSION__}, open slint.dev`} @click=${() => this.dispatchEvent(new CustomEvent("trouve-open-external", { detail: { href: "https://slint.dev" }, bubbles: true, composed: true }))}>
-                              <span class="made-with-slint-logo" aria-hidden="true"><i>‹›</i><strong>#MadeWithSlint</strong></span>
-                              <span>Version ${__TROUVE_SLINT_VERSION__}<br />https://slint.dev/</span>
-                            </button>
                           </div>
                         `}
                   `}

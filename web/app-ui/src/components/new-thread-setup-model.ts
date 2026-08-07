@@ -102,7 +102,7 @@ export const newThreadThinkingOption = (
   catalog: NewThreadSetupCatalog,
 ): ThinkingOption | undefined => thinkingOption(effectiveNewThreadModel(draft, catalog));
 
-/** Mirror the Slint setup's initial code mode and first advertised model. */
+/** Use the established initial code mode and first advertised model. */
 export const createInitialNewThreadDraft = (
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
@@ -120,7 +120,7 @@ export const createInitialNewThreadDraft = (
   };
 };
 
-/** Selecting a mode adopts its known default model, matching the Slint picker. */
+/** Selecting a mode adopts its known default model, matching the product picker. */
 export const selectNewThreadMode = (
   draft: NewThreadSetupDraft,
   modeId: string,

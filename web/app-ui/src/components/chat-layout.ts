@@ -53,7 +53,7 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   || item.kind === "questions";
 
 /**
- * Preserve the retained Slint transcript hierarchy: prompts are individual
+ * Preserve the established transcript hierarchy: prompts are individual
  * cards, while each uninterrupted assistant/work run is one Agent card.
  * Running/completed status rows are represented by the Agent header/activity
  * treatment and therefore do not become empty virtual rows.
@@ -164,7 +164,7 @@ const argumentPath = (args: unknown): string | undefined => {
 const plural = (count: number, one: string, many: string): string =>
   `${count} ${count === 1 ? one : many}`;
 
-/** Match the Slint activity-group sentence used for consecutive work items. */
+/** Build the activity-group sentence used for consecutive work items. */
 export const activityGroupSummary = (items: readonly AgentActivityItem[]): string => {
   const edited = new Set<string>();
   const read = new Set<string>();

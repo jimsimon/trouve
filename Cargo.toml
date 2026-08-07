@@ -3,7 +3,6 @@
 # Members:
 #   crates/trouve-search   — code search/indexing library + CLI (published)
 #   crates/trouve-*        — harness crates (protocol, core, providers, server, cli, ...)
-#   crates/trouve-slint-*  — reusable Slint widget crates
 #
 # Every first-party artifact shares one release version and repository tag.
 # See docs/adr/0012-single-version-monorepo-release-train.md.
@@ -23,7 +22,6 @@ version = "3.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
-# Slint 1.17 and its compiler crates require Rust 1.92.
 rust-version = "1.92"
 
 [workspace.dependencies]
@@ -44,7 +42,6 @@ reqwest = { version = "0.13", default-features = false, features = ["form", "jso
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
-slint = "1.17"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
@@ -68,10 +65,6 @@ trouve-server = { path = "crates/trouve-server", version = "3.7.0" }
 trouve-client-core = { path = "crates/trouve-client-core", version = "3.7.0" }
 trouve-thread-view = { path = "crates/trouve-thread-view", version = "3.7.0" }
 trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "3.7.0" }
-trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.7.0" }
-trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.7.0" }
-trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.7.0" }
-trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.7.0" }
 
 [profile.release]
 lto = "thin"

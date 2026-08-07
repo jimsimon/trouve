@@ -45,12 +45,6 @@ export default defineConfig(({ mode }) => {
   const packageJson = JSON.parse(
     readFileSync(fileURLToPath(new URL("./package.json", import.meta.url)), "utf8"),
   ) as { version: string };
-  const cargoLock = readFileSync(
-    fileURLToPath(new URL("../../Cargo.lock", import.meta.url)),
-    "utf8",
-  );
-  const slintVersion = /^name = "slint"\nversion = "([^"]+)"$/mu.exec(cargoLock)?.[1];
-  if (slintVersion === undefined) throw new Error("Cargo.lock does not contain Slint");
   const sourceRevision =
     process.env["GITHUB_SHA"]?.slice(0, 12) ??
     execFileSync("git", ["rev-parse", "--short=12", "HEAD"], {
@@ -69,7 +63,7 @@ export default defineConfig(({ mode }) => {
   }
   const iconSource = readFileSync(
     fileURLToPath(
-      new URL("../../crates/trouve-app/ui/assets/trouve.png", import.meta.url),
+      new URL("../../crates/trouve-app/assets/trouve.png", import.meta.url),
     ),
   );
   const productIconPlugin: Plugin = {
@@ -117,7 +111,6 @@ export default defineConfig(({ mode }) => {
     },
     define: {
       __TROUVE_FRONTEND_VERSION__: JSON.stringify(packageJson.version),
-      __TROUVE_SLINT_VERSION__: JSON.stringify(slintVersion),
       __TROUVE_SOURCE_REVISION__: JSON.stringify(sourceRevision),
       __TROUVE_PWA_CACHE_NAME__: JSON.stringify(pwaCacheName),
     },

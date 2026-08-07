@@ -186,7 +186,7 @@ fn main() -> Result<()> {
         text_selection = "keyboard-in-editable-controls",
         temporary_storage = true,
         browser_chrome = false,
-        "launching qualification-only in-process Servo adapter; Wry is the product default and Slint remains the rollback"
+        "launching qualification-only in-process Servo adapter; Wry is the product frontend"
     );
 
     let run_result = event_loop
@@ -255,7 +255,7 @@ fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String>
     let mut clipboard =
         arboard::Clipboard::new().map_err(|_| "desktop clipboard is unavailable".to_string())?;
     // Rich clipboard sources can advertise both representations. Match the
-    // shipping Slint behavior and allow ordinary text paste to win.
+    // product behavior and allow ordinary text paste to win.
     if clipboard.get_text().is_ok() {
         return Ok(None);
     }

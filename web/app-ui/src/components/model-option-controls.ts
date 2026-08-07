@@ -63,7 +63,7 @@ const selectedEnum = (
   return defaultValue !== undefined && values.includes(defaultValue) ? defaultValue : "";
 };
 
-/** Derive only the option controls already supported by the Slint composer.
+/** Derive only the option controls supported by the product composer.
  * Model schemas are untrusted catalog data, so malformed enums are ignored. */
 export const modelOptionControls = (
   model: ProtocolModelInfo | undefined,

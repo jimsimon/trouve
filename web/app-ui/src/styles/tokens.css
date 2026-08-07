@@ -1,5 +1,5 @@
 :root {
-  /* Slint's empty font-family preference means the platform UI font. Keep the
+  /* An empty font-family preference means the platform UI font. Keep the
    * browser default on that same contract instead of preferring a font that
    * may happen to be installed on only one host. */
   --trouve-font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -43,7 +43,7 @@
 
   /* WebAwesome supplies the control implementation and its complete default
    * variable graph. These overrides make that graph use Trouve's compact
-   * Slint-derived geometry and semantic palette. */
+   * compact Trouve geometry and semantic palette. */
   --wa-font-family-body: var(--trouve-font-sans);
   --wa-font-family-heading: var(--trouve-font-sans);
   --wa-font-family-code: var(--trouve-font-mono);

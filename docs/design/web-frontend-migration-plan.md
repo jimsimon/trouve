@@ -1,12 +1,17 @@
 # Web frontend migration implementation plan
 
-**Status:** Port implementation complete; rendered, platform, and promotion qualification remain
-**Last updated:** 2026-08-04
+**Status:** Completed; Wry/Lit promoted and Slint retired by ADR 0028
+**Last updated:** 2026-08-07
 **Source analysis:** <https://chatgpt.com/s/cd_6a6e636d63f48191bfed1ce04ae4bac6>
 
 **Qualification ledger:** [Web frontend parity and qualification ledger](web-frontend-parity-ledger.md)
 
 **Implementation audit:** [Web frontend implementation audit](web-frontend-implementation-audit.md)
+
+> This document preserves the migration plan and its original gates. ADR 0028
+> records their final disposition: Wry/Lit is the sole product frontend, the
+> Slint rollback and widget crates have been removed, and Servo remains a
+> qualification host for the same Lit application.
 
 ## Outcome
 
@@ -111,7 +116,7 @@ then registers the selected path through the existing protocol; PWA and remote
 deployments retain the explicit manual-path fallback.
 
 The existing Slint frontend's functional surface is now ported. The executable
-[callback parity manifest](../../web/app-ui/src/app/slint-callback-parity.test.ts)
+[application action contract](../../web/app-ui/src/app/app-action-contract.test.ts)
 extracts all 134 `AppWindow` callbacks from `app.slint` and requires exactly
 one Lit implementation or documented browser-native consolidation for each.
 The closure pass covers completion/queue edge states, checkpoint undo/redo,

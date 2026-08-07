@@ -1,5 +1,4 @@
-//! Bounded native-notification delivery shared by the Slint rollback and the
-//! default Wry host.
+//! Bounded native-notification delivery for the Wry desktop host.
 //!
 //! `notify-rust` keeps a D-Bus connection alive while waiting for an action.
 //! Its synchronous waiter also enters `zbus::block_on`, which lazily creates a

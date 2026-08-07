@@ -215,7 +215,7 @@ const validDateMilliseconds = (value: string | null | undefined): number | undef
   return Number.isFinite(milliseconds) ? milliseconds : undefined;
 };
 
-/** Exact client-side counterpart of the established Slint/Rust dashboard
+/** Client-side counterpart of the established dashboard
  * classifier. Priority is significant: a non-draft merge conflict wins over
  * the viewer's review request, while a conflicted draft remains a draft. */
 export const classifyPullRequest = (

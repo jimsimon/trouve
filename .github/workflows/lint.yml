@@ -35,10 +35,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: version sync tests
         run: python3 -m unittest scripts/test_sync_versions.py
-      - name: web theme parity tests
-        run: |
-          python3 -m unittest scripts/test_generate_web_themes.py
-          python3 scripts/generate_web_themes.py --check
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
       - name: Rust dependency licenses, notices, and SBOM
@@ -101,11 +97,10 @@ jobs:
             web/app-ui/dist/npm-sbom.cdx.json
             target/compliance/rust-sbom.cdx.json
           if-no-files-found: error
-      - name: Wry default and desktop rollback targets
+      - name: Wry product and comparison targets
         run: |
           cargo check -p trouve-app --bin trouve
           cargo check -p trouve-app --features web-preview --bin trouve-web-preview
-          cargo check -p trouve-app --no-default-features --bin trouve-slint
         env:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
       - name: Servo nested-workspace dependency graph

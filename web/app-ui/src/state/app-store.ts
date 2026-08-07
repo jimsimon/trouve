@@ -503,7 +503,7 @@ export class AppStore {
   }
 
   /** Fold a replay burst while invalidating Lit's shared store signal once.
-   * The retained Slint controller batches persisted history for the same
+   * The native client historically batched persisted history for the same
    * reason: a reconnect should not schedule one complete chat render for
    * every historical envelope. */
   applyThreadEvents(

@@ -1,4 +1,4 @@
-//! System-webview desktop host (ADRs 0023 and 0027).
+//! System-webview desktop host (ADRs 0023 and 0028).
 //!
 //! The default `trouve` binary embeds the protocol server when no explicit
 //! server URL is configured. The `trouve-web-preview` comparison binary keeps
@@ -419,7 +419,7 @@ fn read_selected_attachments(paths: Vec<PathBuf>) -> Result<Vec<NativeAttachment
 fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|_| "desktop clipboard is unavailable".to_string())?;
-    // Match the Slint frontend: text wins when a rich clipboard advertises
+    // Text wins when a rich clipboard advertises
     // both text and image representations.
     if clipboard.get_text().is_ok() {
         return Ok(None);

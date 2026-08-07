@@ -168,7 +168,7 @@ describe("files inspection component contract", () => {
     "utf8",
   );
 
-  it("wires the existing directory/file endpoints alongside the Slint-shaped unified diff", () => {
+  it("wires the existing directory/file endpoints alongside the established unified diff", () => {
     expect(component).toContain("services.protocol.sessionFiles(sessionId, path)");
     expect(component).toContain("services.protocol.sessionFile(sessionId, path)");
     expect(component).toContain("<trouve-code-view");
@@ -204,7 +204,7 @@ describe("files inspection component contract", () => {
     expect(styles).toContain(".files-inspection.file-tree-collapsed > .file-view-shell");
   });
 
-  it("keeps the Slint unified diff as default and exposes the desktop split enhancement", () => {
+  it("keeps the unified diff as default and exposes the desktop split enhancement", () => {
     expect(component).toContain('#diffMode: DiffMode = "unified"');
     expect(component).toContain('class="diff-mode-additive"');
     expect(component).toContain('class="split-diff-file-picker"');
