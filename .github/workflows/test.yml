@@ -36,7 +36,9 @@ jobs:
           persist-credentials: false
       - name: Install Linux native build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
@@ -46,6 +48,18 @@ jobs:
           cache-on-failure: true
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: github.ref == 'refs/heads/main'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/app-ui/package-lock.json
+      - name: Build desktop UI for the cached release app
+        if: github.ref == 'refs/heads/main'
+        working-directory: web/app-ui
+        run: |
+          npm ci
+          npm run build
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
       # Match the release job's package set and target on trusted main pushes.
@@ -58,6 +72,8 @@ jobs:
           --package trouve-search
           --package trouve-app
           --target ${{ matrix.target }}
+        env:
+          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
 
   # Windows-only dependencies and trait impls must be compiled on Windows.
   # Pull requests get a fast check; trusted main pushes build the exact release

@@ -60,6 +60,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | async-signal | 0.2.14 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | async-task | 4.7.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | async-trait | 0.1.91 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| atk | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| atk-sys | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | atomic-waker | 1.1.2 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | atspi | 0.29.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | atspi-common | 0.13.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -129,6 +131,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | bytes | 1.12.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | bytes-utils | 0.1.4 | Apache-2.0/MIT | registry+https://github.com/rust-lang/crates.io-index |
+| cairo-rs | 0.18.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| cairo-sys-rs | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | calloop | 0.13.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | calloop | 0.14.4 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | calloop-wayland-source | 0.3.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -140,7 +144,9 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | castaway | 0.2.4 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | cbc | 0.1.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | cc | 1.2.67 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| cesu8 | 1.1.0 | Apache-2.0/MIT | registry+https://github.com/rust-lang/crates.io-index |
 | cexpr | 0.6.0 | Apache-2.0/MIT | registry+https://github.com/rust-lang/crates.io-index |
+| cfg-expr | 0.15.8 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | cfg_aliases | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | cfg_aliases | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -180,7 +186,9 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | core-foundation | 0.9.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core-graphics | 0.23.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| core-graphics | 0.25.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core-graphics-types | 0.1.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| core-graphics-types | 0.2.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | core_maths | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | countme | 3.0.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -197,6 +205,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | crypto-bigint | 0.5.5 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | crypto-common | 0.1.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| cssparser | 0.37.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| cssparser-macros | 0.7.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | ctor | 0.10.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | ctutils | 0.4.2 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
@@ -208,6 +218,7 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | darling_macro | 0.20.11 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | dary_heap | 0.3.9 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | data-url | 0.3.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| dbus | 0.9.12 | Apache-2.0/MIT | registry+https://github.com/rust-lang/crates.io-index |
 | der | 0.7.10 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | deranged | 0.5.8 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | derive_builder | 0.20.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -224,13 +235,18 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | displaydoc | 0.2.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | dlib | 0.5.3 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| dlopen2 | 0.8.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| dlopen2_derive | 0.4.3 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | document-features | 0.2.12 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| dom_query | 0.28.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | downcast-rs | 1.2.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | dpi | 0.1.2 | Apache-2.0 AND MIT | registry+https://github.com/rust-lang/crates.io-index |
 | drm | 0.14.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | drm-ffi | 0.9.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | drm-fourcc | 2.2.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | drm-sys | 0.8.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| dtoa | 1.0.11 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| dtoa-short | 0.3.5 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | dtor | 0.8.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | dunce | 1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | ecdsa | 0.16.9 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -296,6 +312,13 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | gbm | 0.18.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | gbm-sys | 0.4.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | gcp_auth | 0.12.7 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdk | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdk-pixbuf | 0.18.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdk-pixbuf-sys | 0.18.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdk-sys | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdkwayland-sys | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdkx11 | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gdkx11-sys | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | generic-array | 0.14.9 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | gethostname | 1.1.0 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | getopts | 0.2.24 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -303,7 +326,12 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | gif | 0.14.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| gio | 0.18.4 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gio-sys | 0.18.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | gl_generator | 0.14.0 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| glib | 0.18.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| glib-macros | 0.18.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| glib-sys | 0.18.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | glob | 0.3.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | globset | 0.4.19 | Unlicense OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
@@ -312,8 +340,12 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | glutin_egl_sys | 0.7.1 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | glutin_glx_sys | 0.6.1 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | glutin_wgl_sys | 0.6.1 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| gobject-sys | 0.18.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | grid | 1.0.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | group | 0.13.0 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| gtk | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gtk-sys | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| gtk3-macros | 0.18.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | h2 | 0.3.27 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | h2 | 0.4.15 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | half | 2.7.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -323,6 +355,7 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | hashlink | 0.12.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| heck | 0.4.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | heck | 0.5.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | hermit-abi | 0.3.9 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | hermit-abi | 0.5.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -402,6 +435,9 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | itertools | 0.13.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | itertools | 0.14.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| javascriptcore-rs | 1.1.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| javascriptcore-rs-sys | 1.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| jni | 0.21.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | jni | 0.22.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | jni-macros | 0.22.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | jni-sys | 0.3.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -421,6 +457,7 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | lebe | 0.5.3 | BSD-3-Clause | registry+https://github.com/rust-lang/crates.io-index |
 | libc | 0.2.189 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| libdbus-sys | 0.2.7 | Apache-2.0/MIT | registry+https://github.com/rust-lang/crates.io-index |
 | libfuzzer-sys | 0.4.13 | (MIT OR Apache-2.0) AND NCSA | registry+https://github.com/rust-lang/crates.io-index |
 | libloading | 0.8.9 | ISC | registry+https://github.com/rust-lang/crates.io-index |
 | libm | 0.2.16 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -506,9 +543,11 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | objc2-core-image | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-core-image | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-core-location | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| objc2-core-location | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-core-text | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-core-video | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-encode | 4.1.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| objc2-exception-helper | 0.1.1 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-foundation | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-foundation | 0.3.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-io-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -523,6 +562,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | objc2-ui-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-uniform-type-identifiers | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | objc2-user-notifications | 0.2.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| objc2-user-notifications | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| objc2-web-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | octocrab | 0.54.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -540,6 +581,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | p256 | 0.13.2 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | p384 | 0.13.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | page_size | 0.6.0 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| pango | 0.18.3 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| pango-sys | 0.18.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | parking | 2.2.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -585,7 +628,11 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | precomputed-hash | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | prettyplease | 0.2.37 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | primeorder | 0.13.6 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| proc-macro-crate | 1.3.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| proc-macro-crate | 2.0.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| proc-macro-error | 1.0.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| proc-macro-error-attr | 1.0.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | profiling | 1.0.18 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | profiling-procmacros | 1.0.18 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -679,6 +726,7 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | secret-service | 5.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| selectors | 0.38.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | semver | 1.0.28 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -686,9 +734,11 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_path_to_error | 0.1.20 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_repr | 0.1.21 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| serde_spanned | 0.6.9 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serial2 | 0.2.37 | BSD-2-Clause OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| servo_arc | 0.4.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sha1 | 0.10.7 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -727,6 +777,8 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | socket2 | 0.6.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | socks | 0.3.4 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | softbuffer | 0.4.8 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| soup3 | 0.5.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| soup3-sys | 0.5.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | spin | 0.9.9 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | spin_on | 0.1.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | spki | 0.7.3 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -744,14 +796,19 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | subtle | 2.6.1 | BSD-3-Clause | registry+https://github.com/rust-lang/crates.io-index |
 | svgtypes | 0.16.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | swash | 0.2.10 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| syn | 1.0.109 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | syn | 2.0.119 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | syn | 3.0.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sync_wrapper | 1.0.2 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | synstructure | 0.13.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | syntect | 5.3.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | sys-locale | 0.3.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| system-deps | 6.2.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | taffy | 0.10.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| tao | 0.36.0 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| tao-macros | 0.1.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tar | 0.4.46 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| target-lexicon | 0.12.16 | Apache-2.0 WITH LLVM-exception | registry+https://github.com/rust-lang/crates.io-index |
 | task-local | 0.1.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tauri-winrt-notification | 0.7.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -783,8 +840,12 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tokio-stream | 0.1.19 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tokio-util | 0.7.19 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| toml | 0.8.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | toml | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| toml_datetime | 0.6.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| toml_edit | 0.19.15 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| toml_edit | 0.20.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | toml_edit | 0.25.13+spec-1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -889,6 +950,7 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | v_frame | 0.3.9 | BSD-2-Clause | registry+https://github.com/rust-lang/crates.io-index |
 | valuable | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| version-compare | 0.2.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | version_check | 0.9.5 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | virtue | 0.0.18 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | vsimd | 0.8.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -922,9 +984,14 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | web-time | 1.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | web_atoms | 0.2.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | webbrowser | 1.2.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| webkit2gtk | 2.0.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| webkit2gtk-sys | 2.0.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | webpki-root-certs | 1.0.9 | CDLA-Permissive-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | webpki-roots | 0.26.11 | CDLA-Permissive-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | webpki-roots | 1.0.9 | CDLA-Permissive-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| webview2-com | 0.38.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| webview2-com-macros | 0.8.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| webview2-com-sys | 0.38.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | weezl | 0.1.12 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | winapi | 0.3.9 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -949,47 +1016,59 @@ shipping artifacts. The Lit frontend's npm inventory is generated separately in
 | windows-result | 0.4.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-strings | 0.4.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows-sys | 0.45.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-sys | 0.48.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-sys | 0.59.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-sys | 0.60.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows-targets | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-targets | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-targets | 0.53.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-threading | 0.1.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows-version | 0.1.7 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_aarch64_gnullvm | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_gnullvm | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_gnullvm | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_aarch64_msvc | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_msvc | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_aarch64_msvc | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_i686_gnu | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_gnu | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_gnu | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_gnu | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_gnullvm | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_gnullvm | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_i686_msvc | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_msvc | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_msvc | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_i686_msvc | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_x86_64_gnu | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnu | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnu | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnu | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_x86_64_gnullvm | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnullvm | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_gnullvm | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| windows_x86_64_msvc | 0.42.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_msvc | 0.48.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | winit | 0.30.13 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| winnow | 0.5.40 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | winnow | 1.0.4 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | winreg | 0.10.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | wl-clipboard-rs | 0.9.3 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | write-fonts | 0.48.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | writeable | 0.6.3 | Unicode-3.0 | registry+https://github.com/rust-lang/crates.io-index |
+| wry | 0.56.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| x11 | 2.21.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | x11-clipboard | 0.9.3 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | x11-dl | 2.21.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | x11rb | 0.13.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |

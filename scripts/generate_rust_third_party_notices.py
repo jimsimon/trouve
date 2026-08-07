@@ -25,6 +25,7 @@ APPROVED_LICENSES = {
     "Apache-2.0 OR ISC OR MIT",
     "Apache-2.0 OR MIT",
     "Apache-2.0 OR MIT OR Zlib",
+    "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
     "Apache-2.0/MIT",
     "BSD-2-Clause",
