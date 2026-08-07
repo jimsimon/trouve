@@ -2788,6 +2788,10 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   let olderResponses = 0;
   const olderBoundaries: number[] = [];
   const completedBoundaries: number[] = [];
+  let releaseWarmPage: (() => void) | undefined;
+  const warmPageReleased = new Promise<void>((resolve) => {
+    releaseWarmPage = resolve;
+  });
   let releaseSecondPage: (() => void) | undefined;
   const secondPageReleased = new Promise<void>((resolve) => {
     releaseSecondPage = resolve;
@@ -2799,7 +2803,7 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     olderRequests += 1;
     olderBoundaries.push(before);
     if (before === 150) {
-      await new Promise((resolve) => globalThis.setTimeout(resolve, 75));
+      await warmPageReleased;
     } else if (before === 120) {
       await secondPageReleased;
     }
@@ -2818,8 +2822,14 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   await replayHistory(page);
 
   await expect.poll(() => olderRequests).toBe(1);
+  const heightBeforeWarmPage = await page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  );
+  releaseWarmPage?.();
   await expect.poll(() => olderResponses).toBe(1);
-  await page.waitForTimeout(100);
+  await expect.poll(() => page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  )).toBeGreaterThan(heightBeforeWarmPage);
   expect(olderRequests, "opening a thread should warm only one bounded page").toBe(1);
   await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
 
@@ -2882,8 +2892,14 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     };
     requestAnimationFrame(sample);
   }, anchor);
+  const heightBeforeSecondPage = await page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  );
   releaseSecondPage?.();
   await expect.poll(() => olderResponses).toBe(2);
+  await expect.poll(() => page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  )).toBeGreaterThan(heightBeforeSecondPage);
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport, expected) => {
     const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
       .find((candidate) => candidate.dataset["virtualId"] === expected.id);
@@ -2911,6 +2927,9 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   expect(anchorProbe.missingFrames).toBe(0);
   expect(anchorProbe.maxDeviation).toBeLessThanOrEqual(2);
 
+  const heightBeforeThirdPage = await page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  );
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
     viewport.scrollTop = 0;
@@ -2918,17 +2937,22 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   });
   await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
   await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
+  // The route fixture records its response before the browser has consumed
+  // and rendered it. Wait for the newly prepended page itself instead of a
+  // fixed number of animation frames, which can still race a loaded CI host.
+  await expect.poll(() => page.locator(".chat-stream").evaluate(
+    (viewport) => viewport.scrollHeight,
+  )).toBeGreaterThan(heightBeforeThirdPage);
   // This is one deliberate reader gesture. A polling callback that emits a
   // wheel event can race a fast response and accidentally request every
   // remaining page, testing the poller rather than the prefetch boundary.
-  await page.locator(".chat-stream").evaluate((viewport) => {
-    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
-    viewport.scrollTop = 0;
-    viewport.dispatchEvent(new Event("scroll"));
-  });
+  const chatBounds = await page.locator(".chat-stream").boundingBox();
+  if (chatBounds === null) throw new Error("missing chat scroll bounds");
+  await page.mouse.move(
+    chatBounds.x + chatBounds.width / 2,
+    chatBounds.y + chatBounds.height / 2,
+  );
+  await page.mouse.wheel(0, -1_000);
   await expect.poll(() => new Set(olderBoundaries).has(60)).toBe(true);
   await expect.poll(() => completedBoundaries.includes(60)).toBe(true);
   const requestedBoundaries = [...new Set(olderBoundaries)];

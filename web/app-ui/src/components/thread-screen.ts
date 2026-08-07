@@ -305,6 +305,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #newThreadError = "";
   #accessibleHistory = false;
   #historyLoading = false;
+  #historyLoadRequested = false;
   #historyError = "";
   #historyGeneration = 0;
   readonly #historyWarmThreads = new Set<string>();
@@ -467,6 +468,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#threadInteractionGeneration += 1;
       this.#historyGeneration += 1;
       this.#historyLoading = false;
+      this.#historyLoadRequested = false;
       this.#historyError = "";
       this.#pendingHistoryPrepend = undefined;
       this.#historyAnchorToRestore = undefined;
@@ -2428,7 +2430,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     // gesture may advance another page; otherwise one wheel tick can walk the
     // complete transcript after each prepend settles.
     if (userInitiated && viewport.scrollTop <= historyPrefetchThreshold) {
-      void this.#loadOlderHistory(false);
+      if (this.#historyLoading) {
+        // Preserve one explicit reader gesture that arrives while the prior
+        // page is still settling. This remains bounded: programmatic prepend
+        // events cannot set the flag, and multiple gestures coalesce into one
+        // additional page instead of replaying the full transcript.
+        this.#historyLoadRequested = true;
+      } else {
+        void this.#loadOlderHistory(false);
+      }
     }
     if (!before.followingTail && after.followingTail) {
       this.#cancelScheduledChatPosition();
@@ -2646,8 +2656,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       }
     } finally {
       if (generation === this.#historyGeneration && threadId === this.threadId) {
+        const loadRequested = this.#historyLoadRequested;
+        this.#historyLoadRequested = false;
         this.#historyLoading = false;
         this.requestUpdate();
+        if (loadRequested) void this.#loadOlderHistory(false);
       }
     }
   }
