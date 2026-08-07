@@ -379,6 +379,25 @@ test("Chat settings default thoughts to visible and persist the grouping opt-in"
   await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
 });
 
+test("Settings reopens the last screen until the app restarts", async ({ page }) => {
+  await page.goto("/settings/general");
+
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await expect(page).toHaveURL(/\/settings\/chat$/u);
+  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /Close/u }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+  await expect(page).toHaveURL(/\/settings\/chat$/u);
+  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /Close/u }).click();
+  await page.reload();
+  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+  await expect(page).toHaveURL(/\/settings$/u);
+  await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
+});
+
 test("Modes & Models uses provider-qualified model labels", async ({ page }) => {
   await page.route("**/v1/models", async (route) => {
     await route.fulfill({

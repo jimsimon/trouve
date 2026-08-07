@@ -306,18 +306,19 @@ trouve-session-list { display: block; }
 .agent-activity-timeline::before { position: absolute; inset-block: 15px; inset-inline-start: 7px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
 .agent-activity-timeline.single-activity::before { inset-block: 6px; }
 .agent-activity-timeline.has-expanded-group::before { display: none; }
+.agent-activity-timeline.compaction-connected-timeline::before { inset-block: 6px; display: block; }
 .agent-activity-timeline > .activity-group, .agent-activity-timeline > .tool-card, .agent-activity-timeline > .thinking-card, .agent-activity-timeline > .thinking-output { width: 100%; margin: 0; }
 .agent-activity-timeline + .agent-text-block { margin-block-start: 6px; }
 .agent-text-block + .agent-activity-timeline { margin-block-start: 2px; }
 .activity-group, .tool-card, .thinking-card, .thinking-output { position: relative; isolation: isolate; }
-.agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before, .agent-activity-timeline > .thinking-card::before, .agent-activity-timeline > .thinking-output::before { position: absolute; z-index: 2; inset-block-start: 12px; inset-inline-start: -17px; width: var(--trouve-chat-timeline-node-size); height: var(--trouve-chat-timeline-node-size); border-radius: 50%; background: var(--trouve-text-faint); box-shadow: 0 0 0 3px var(--trouve-win-bg); content: ""; pointer-events: none; transition: background-color 120ms ease, transform 120ms ease; }
-.agent-activity-timeline > .activity-group::before { display: none; }
+.agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before, .agent-activity-timeline > .thinking-card::before, .agent-activity-timeline > .thinking-output::before { position: absolute; z-index: 2; inset-block-start: 12px; inset-inline-start: -16px; width: var(--trouve-chat-timeline-node-size); height: var(--trouve-chat-timeline-node-size); border-radius: 50%; background: var(--trouve-text-faint); box-shadow: 0 0 0 3px var(--trouve-win-bg); content: ""; pointer-events: none; transition: background-color 120ms ease, transform 120ms ease; }
+.agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before { display: none; }
 .agent-activity-timeline > .activity-group.active::before, .agent-activity-timeline > .activity-group[open]::before, .agent-activity-timeline > .tool-card.tool-running::before, .agent-activity-timeline > .thinking-card.running::before, .agent-activity-timeline > .thinking-output.running::before, .agent-activity-timeline > .activity-group:hover::before, .agent-activity-timeline > .activity-group:focus-within::before, .agent-activity-timeline > .tool-card:hover::before, .agent-activity-timeline > .tool-card:focus-within::before, .agent-activity-timeline > .thinking-card:hover::before, .agent-activity-timeline > .thinking-card:focus-within::before, .agent-activity-timeline > .thinking-output:hover::before, .agent-activity-timeline > .thinking-output:focus-within::before { background: var(--trouve-accent); transform: scale(1.15); }
 .agent-activity-timeline > .activity-group.warning::before, .agent-activity-timeline > .tool-card.tool-awaiting-approval::before { background: var(--trouve-warn); }
 .agent-activity-timeline > .activity-group.error::before, .agent-activity-timeline > .tool-card.tool-error::before, .agent-activity-timeline > .tool-card.tool-denied::before, .agent-activity-timeline > .tool-card.tool-aborted::before { background: var(--trouve-err); }
 .activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: visible; border: 0; border-radius: 0; background: transparent; }
 .activity-group > summary { position: relative; min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 7px; overflow: visible; padding: 3px 8px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-mid); background: transparent; cursor: pointer; list-style: none; }
-.agent-activity-timeline > .activity-group > summary .disclosure-icon { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -18px; transform: translateY(-50%); }
+.agent-activity-timeline > .activity-group > summary .disclosure-icon { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -17.5px; transform: translateY(-50%); }
 .activity-group > summary:hover { background: var(--trouve-hover-bg); }
 .agent-activity-timeline.has-expanded-group > .activity-group > summary { background: var(--trouve-hover-bg); }
 .activity-group > summary::-webkit-details-marker { display: none; }
@@ -327,35 +328,44 @@ trouve-session-list { display: block; }
 .activity-group:hover > summary .disclosure-icon, .activity-group:focus-within > summary .disclosure-icon { color: var(--trouve-accent); }
 .activity-group.warning > summary .disclosure-icon { color: var(--trouve-warn); }
 .activity-group.error > summary .disclosure-icon { color: var(--trouve-err); }
-.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 3px 8px 6px 16px; border: 0; background: transparent; }
-.activity-group-body > .message { margin: 0; }
+.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); padding: 3px 0 6px; border: 0; background: transparent; }
+.activity-group-timeline { width: calc(100% + 4px); max-width: none; gap: 2px; margin-inline-start: -4px; }
 .activity-group-body .tool-card, .activity-group-body .thinking-card { margin-top: 0; }
-.context-compaction-marker { position: relative; isolation: isolate; width: 100%; min-width: 0; max-width: 100%; min-height: 42px; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 10px; overflow: hidden; padding: 7px 10px; border-block: 1px solid var(--trouve-accent); color: var(--trouve-text-mid); background: linear-gradient(90deg, var(--trouve-accent-bg), transparent 72%); }
-.context-compaction-marker.running::before { position: absolute; z-index: -1; inset: 0; content: ""; background: linear-gradient(105deg, transparent 20%, var(--trouve-accent-bg) 44%, var(--trouve-hover-strong) 50%, var(--trouve-accent-bg) 56%, transparent 80%); background-size: 240% 100%; animation: trouve-compaction-flow 1.8s ease-in-out infinite; }
-.context-compaction-marker.failed { border-block-color: var(--trouve-warn); background: linear-gradient(90deg, var(--trouve-warn-bg), transparent 72%); }
-.context-compaction-symbol { width: 24px; height: 24px; display: grid; place-items: center; color: var(--trouve-accent); }
+.context-compaction-marker { position: relative; width: 100%; min-width: 0; max-width: 100%; min-height: 32px; display: grid; grid-template-columns: 18px minmax(0, max-content) minmax(24px, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 4px; border: 0; color: var(--trouve-text-mid); background: transparent; }
+.context-compaction-marker.timeline-connect-before, .context-compaction-marker.timeline-connect-after { grid-template-columns: minmax(0, max-content) minmax(24px, 1fr); overflow: visible; padding-inline: 28px 4px; }
+.context-compaction-marker.timeline-connect-before::before, .context-compaction-marker.timeline-connect-after::before { position: absolute; z-index: 0; inset-block: 50%; inset-inline-start: 7px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
+.context-compaction-marker.timeline-connect-before::before { inset-block-start: -14px; }
+.context-compaction-marker.timeline-connect-after::before { inset-block-end: -14px; }
+.context-compaction-marker.timeline-connect-before .context-compaction-symbol, .context-compaction-marker.timeline-connect-after .context-compaction-symbol { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -1.5px; border-radius: 50%; background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); transform: translateY(-50%); }
+.context-compaction-marker::after { width: 100%; height: 1px; border-radius: 999px; background: var(--trouve-rule); content: ""; opacity: .8; }
+.context-compaction-marker.running::after { background: linear-gradient(90deg, var(--trouve-rule) 15%, var(--trouve-accent) 50%, var(--trouve-rule) 85%); background-size: 240% 100%; animation: trouve-compaction-flow 1.8s ease-in-out infinite; }
+.context-compaction-marker.failed::after { background: var(--trouve-warn); opacity: .65; }
+.context-compaction-symbol { width: 18px; height: 18px; display: grid; place-items: center; color: var(--trouve-accent); }
+.context-compaction-marker.completed .context-compaction-symbol { opacity: .75; }
 .context-compaction-marker.failed .context-compaction-symbol { color: var(--trouve-warn); }
-.context-compaction-glyph { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 50%; font-size: 11px; font-weight: 800; }
-.context-compaction-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 9px; }
-.context-compaction-copy strong { flex: none; color: var(--trouve-text-hi); font-size: 11px; }
-.context-compaction-copy small { min-width: 0; color: var(--trouve-text-dim); font-size: 10px; overflow-wrap: anywhere; }
+.context-compaction-glyph { width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 50%; font-size: 9px; font-weight: 800; }
+.context-compaction-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 1px 7px; }
+.context-compaction-copy strong { flex: none; color: var(--trouve-text-mid); font-size: 11px; }
+.context-compaction-marker.running .context-compaction-copy strong { color: var(--trouve-text-hi); }
+.context-compaction-copy small { min-width: 0; color: var(--trouve-text-faint); font-size: 10px; overflow-wrap: anywhere; }
 @keyframes trouve-compaction-flow {
   0%, 15% { background-position: 130% 0; opacity: .2; }
   50% { opacity: .75; }
   85%, 100% { background-position: -130% 0; opacity: .2; }
 }
 .message p { margin: 0; }
-.tool-card { min-width: 0; max-width: 100%; margin-top: 8px; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
+.tool-card { min-width: 0; max-width: 100%; margin-top: 8px; overflow: visible; border: 0; border-radius: 0; background: transparent; }
 .tool-card summary { min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: hidden; padding: 2px 8px; cursor: pointer; list-style: none; }
 .tool-card summary:hover { background: var(--trouve-hover-bg); }
 .tool-card.approval-required .tool-approval-actions { margin-inline-start: auto; }
 .tool-card summary::-webkit-details-marker { display: none; }
 .tool-card summary small { color: var(--trouve-text-dim); }
-.tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--trouve-text-mid); text-overflow: ellipsis; white-space: nowrap; }
+.tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--trouve-text-mid); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .tool-card pre { min-width: 0; max-width: 100%; margin: 0; padding: 10px; overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.5 var(--trouve-font-mono); overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
 .tool-disclosure { width: 10px; flex: none; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
-.tool-status { width: 12px; flex: none; align-self: center; color: var(--trouve-text-faint); font-size: 12px; line-height: 1; text-align: center; }
-.tool-status.running { height: 12px; color: var(--trouve-accent); }
+.tool-status { position: absolute; z-index: 3; inset-block-start: calc((29px - 10px) / 2); inset-inline-start: -17.5px; width: 10px; height: 10px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 10px; line-height: 1; text-align: center; pointer-events: none; }
+.tool-status-icon { --trouve-icon-width: 10px; }
+.tool-status.running { color: var(--trouve-accent); }
 .tool-status.ok { color: var(--trouve-ok); }
 .tool-status.error, .tool-status.denied, .tool-status.aborted { color: var(--trouve-err); }
 .tool-status.awaiting-approval { color: var(--trouve-warn); }
@@ -398,8 +408,6 @@ trouve-session-list { display: block; }
 .thinking-output .thinking-header > strong { font-size: 10px; font-weight: 600; }
 .thinking-header-spacer { min-width: 0; flex: 1; }
 .thinking-output .thinking-body { padding: 2px 8px 6px; border-top: 0; }
-.grouped-thinking-output .thinking-header { padding-inline: 8px; }
-.grouped-thinking-output .thinking-body { padding: 2px 8px 8px; }
 .thinking-output trouve-markdown-view { width: 100%; min-width: 0; max-width: 120ch; display: block; }
 .message-context-menu { position: fixed; z-index: 64; width: 220px; max-width: calc(100vw - 16px); display: grid; gap: 2px; padding: 4px; border: 1px solid var(--trouve-border-strong); border-radius: 6px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
 .message-context-menu button { width: 100%; min-height: 30px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 7px; border: 0; border-radius: 4px; padding: 4px 8px; color: var(--trouve-text); background: transparent; font-size: 12px; text-align: start; }
@@ -455,9 +463,9 @@ trouve-session-list { display: block; }
 [data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }
 [data-reduce-motion] .tool-status.running { color: var(--trouve-text-dim); }
 [data-reduce-motion] .trouve-icon-spin { animation: none; }
-[data-reduce-motion] .context-compaction-marker.running::before { animation: none; opacity: .25; }
+[data-reduce-motion] .context-compaction-marker.running::after { animation: none; opacity: .5; }
 @media (prefers-reduced-motion: reduce) {
-  .context-compaction-marker.running::before, .trouve-icon-spin { animation: none; }
+  .context-compaction-marker.running::after, .trouve-icon-spin { animation: none; }
 }
 .turn-error { min-width: 0; max-width: 100%; padding: 9px 11px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); color: var(--trouve-err); background: var(--trouve-err-bg); overflow-wrap: anywhere; }
 .turn-cancelled { min-width: 0; max-width: 100%; padding: 8px 10px; border-left: 2px solid var(--trouve-text-faint); overflow-wrap: anywhere; }
@@ -465,7 +473,6 @@ trouve-session-list { display: block; }
 .turn-metadata-standalone { padding: 4px 10px; font-size: 10px; overflow-wrap: anywhere; }
 .attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
 .attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }
-.attachment-list img { width: 64px; height: 48px; border-radius: 3px; object-fit: cover; background: var(--trouve-code-bg); }
 .attachment-icon { width: 64px; height: 48px; display: grid; place-items: center; border-radius: 3px; color: var(--trouve-text-faint); background: var(--trouve-code-bg); font-size: 17px; text-align: center; }
 .attachment-details { min-width: 0; display: grid; gap: 2px; }
 .attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

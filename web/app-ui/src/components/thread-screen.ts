@@ -136,8 +136,9 @@ import {
   type VirtualItem,
   type VirtualWindow,
 } from "./virtualization/virtualizer.js";
-import "./new-thread-setup.js";
+import "./image-preview.js";
 import "./model-picker.js";
+import "./new-thread-setup.js";
 
 type VirtualChatItem = VirtualItem & (
   | { readonly kind: "unit"; readonly unitIndex: number }
@@ -157,6 +158,7 @@ const CHAT_SCROLL_INDICATOR_INSET_PX = 3;
 const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
 const CHAT_HISTORY_PREFETCH_VIEWPORTS = 5;
 const CHAT_HISTORY_PREFETCH_MIN_PX = 2_400;
+const CHAT_HISTORY_ANCHOR_SETTLE_MS = 500;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -190,6 +192,22 @@ interface MarkdownContextMenu {
   readonly selection: string;
   readonly x: number;
   readonly y: number;
+}
+
+interface ChatDomAnchor {
+  readonly id: string;
+  readonly offset: number;
+}
+
+interface ActiveChatDomAnchor extends ChatDomAnchor {
+  readonly scrollTop: number;
+}
+
+interface PendingHistoryPrepend {
+  readonly scrollTop: number;
+  readonly totalHeight: number;
+  readonly followingTail: boolean;
+  readonly anchor: ChatDomAnchor | undefined;
 }
 
 const PATH_REFRESH_INTERVAL_MS = 5_000;
@@ -290,9 +308,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #historyError = "";
   #historyGeneration = 0;
   readonly #historyWarmThreads = new Set<string>();
-  #pendingHistoryPrepend:
-    | { readonly scrollTop: number; readonly totalHeight: number }
-    | undefined;
+  #pendingHistoryPrepend: PendingHistoryPrepend | undefined;
+  #historyAnchorToRestore: ChatDomAnchor | undefined;
+  #historyAnchorStabilizer: ActiveChatDomAnchor | undefined;
+  #historyAnchorSettleTimer: ReturnType<typeof setTimeout> | undefined;
   #virtualizer = new Virtualizer<VirtualChatItem>({
     estimatedHeight: 120,
     overscanPx: 1_200,
@@ -443,6 +462,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#historyLoading = false;
       this.#historyError = "";
       this.#pendingHistoryPrepend = undefined;
+      this.#historyAnchorToRestore = undefined;
+      this.#clearHistoryAnchorStabilizer();
       this.#requestPending = false;
       this.#requestError = "";
       this.#threadSettingsPending = false;
@@ -510,6 +531,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#virtualizer.enableFollowTail();
       this.#restoredScrollThreadId = this.threadId;
     }
+    if (!changed.has("threadId") && this.#pendingHistoryPrepend !== undefined) {
+      const viewport = this.querySelector<HTMLElement>(".chat-stream");
+      if (viewport !== null) {
+        const virtualWindow = this.#virtualizer.window();
+        this.#pendingHistoryPrepend = {
+          scrollTop: viewport.scrollTop,
+          totalHeight: virtualWindow.totalHeight,
+          followingTail: virtualWindow.followingTail,
+          anchor: virtualWindow.followingTail
+            ? undefined
+            : this.#captureChatDomAnchor(viewport),
+        };
+      }
+    }
   }
 
   protected override updated(): void {
@@ -545,6 +580,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#followTailControlHeight = viewport
       .querySelector<HTMLElement>(".follow-tail")
       ?.offsetHeight ?? 0;
+    this.#restoreHistoryPrependAnchor(viewport);
     if (viewport.clientHeight !== this.#viewportHeight) {
       this.#viewportHeight = viewport.clientHeight;
       const correction = this.#virtualizer.resizeViewport(viewport.clientHeight);
@@ -630,6 +666,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       } else if (expectedScrollTop !== undefined) {
         this.#setChatScrollTop(activeViewport, expectedScrollTop);
       }
+      if (!followingTail && this.#historyAnchorStabilizer !== undefined) {
+        // A single paged Agent turn can re-render many nested markdown blocks
+        // after the parent update. Keep the exact visible thought/tool fixed
+        // through those pre-paint ResizeObserver deliveries.
+        this.#correctHistoryAnchor(activeViewport);
+        this.#scheduleHistoryAnchorRelease();
+      }
       this.#refreshChatScrollIndicator(activeViewport);
     });
     const mountedRows = new Set(
@@ -669,6 +712,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#cancelScheduledScrollRender();
     this.#cancelScheduledScrollIndicator();
     this.#cancelScheduledChatPosition();
+    this.#clearHistoryAnchorStabilizer();
     this.#scrollIndicatorMetrics = undefined;
     this.#scrollCorrectionResumeAt = 0;
     this.#copyFeedbackGeneration += 1;
@@ -882,11 +926,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           ? html`<span class="attachment-icon">${fontAwesomeIcon(
                               isImageAttachment(attachment) ? "file-image" : "file",
                             )}</span>`
-                          : html`<img
-                              src=${preview}
-                              alt=${`Preview of ${attachment.name}`}
-                              decoding="async"
-                            />`}
+                          : html`<trouve-image-preview
+                              .source=${preview}
+                              .name=${attachment.name}
+                            ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.name}>${attachment.name}</strong>
                           <small>${attachment.mime} · ${this.#formatBytes(attachment.size_bytes)}</small>
@@ -909,11 +952,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
                           ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
-                          : html`<img
-                              src=${preview}
-                              alt=${`Preview of ${attachment.upload.name}`}
-                              decoding="async"
-                            />`}
+                          : html`<trouve-image-preview
+                              .source=${preview}
+                              .name=${attachment.upload.name}
+                            ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
                           <small>${attachment.upload.mime} · ${this.#formatBytes(attachment.size)}</small>
@@ -1445,14 +1487,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.#pendingHistoryPrepend !== undefined) {
       const before = this.#pendingHistoryPrepend;
       this.#pendingHistoryPrepend = undefined;
-      const addedHeight = Math.max(
-        0,
-        this.#virtualizer.window().totalHeight - before.totalHeight,
-      );
-      this.#virtualizer.setViewport(
-        before.scrollTop + addedHeight,
-        this.#viewportHeight,
-      );
+      this.#historyAnchorToRestore = before.anchor;
+      if (!before.followingTail) {
+        const addedHeight = Math.max(
+          0,
+          this.#virtualizer.window().totalHeight - before.totalHeight,
+        );
+        this.#virtualizer.setViewport(
+          before.scrollTop + addedHeight,
+          this.#viewportHeight,
+          { userInitiated: true, atTail: false },
+        );
+      }
     }
     if (this.#restoredScrollThreadId !== this.threadId) {
       const bookmark = this.scrollBookmark;
@@ -1668,6 +1714,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderCompactionMarker(
     state: CompactionState,
+    anchorId?: string,
+    timelineConnections: {
+      readonly before: boolean;
+      readonly after: boolean;
+    } = { before: false, after: false },
   ) {
     const running = state.kind === "running";
     const completed = state.kind === "completed";
@@ -1685,7 +1736,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         : "Compaction did not report completion; the turn continued.";
     return html`
       <section
-        class=${`context-compaction-marker ${state.kind}`}
+        class=${`context-compaction-marker ${state.kind} ${
+          timelineConnections.before ? "timeline-connect-before" : ""
+        } ${timelineConnections.after ? "timeline-connect-after" : ""}`}
+        data-chat-anchor-id=${anchorId === undefined ? nothing : `item:${anchorId}`}
         role="status"
         aria-live="polite"
         aria-label=${`${label}. ${detail}`}
@@ -1718,18 +1772,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? false
       : readSignal(this.#services.value.chatPreferences).collapseThinkingWithTools;
     const rows: unknown[] = [];
+    let activityConnectedFromCompaction = false;
     let activityRows: Array<{
       readonly content: unknown;
       readonly expandedGroup: boolean;
     }> = [];
-    const flushActivityRows = (): void => {
+    const flushActivityRows = (activityConnectedToCompaction = false): void => {
       if (activityRows.length === 0) return;
-      rows.push(html`<div class=${`agent-activity-timeline ${
+      const compactionConnected = activityConnectedFromCompaction
+        || activityConnectedToCompaction;
+      const timelineClass = `agent-activity-timeline ${
         activityRows.length === 1 ? "single-activity" : ""
       } ${activityRows.some(({ expandedGroup }) => expandedGroup)
         ? "has-expanded-group"
-        : ""}`}>${activityRows.map(({ content }) => content)}</div>`);
+        : ""} ${compactionConnected ? "compaction-connected-timeline" : ""}`;
+      rows.push(html`<div class=${timelineClass}>${
+        activityRows.map(({ content }) => content)
+      }</div>`);
       activityRows = [];
+      activityConnectedFromCompaction = false;
+    };
+    const activityFollows = (start: number): boolean => {
+      for (let cursor = start; cursor < unit.items.length; cursor += 1) {
+        const candidate = unit.items[cursor];
+        if (candidate === undefined) return false;
+        if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
+        return candidate.kind === "thinking" || candidate.kind === "tool";
+      }
+      return false;
     };
     const hasNativeCompaction = unit.items.some((item) => item.kind === "compaction");
     let index = 0;
@@ -1745,7 +1815,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         const content = stretch.map((part) => part.content).filter(Boolean).join("\n\n");
         if (content !== "") {
-          rows.push(html`<div class="agent-text-block"><trouve-markdown-view
+          rows.push(html`<div
+            class="agent-text-block"
+            data-chat-anchor-id=${`assistant:${stretch.at(-1)?.id ?? stretch[0]?.id}`}
+          ><trouve-markdown-view
                 class="turn-markdown"
                 .content=${content}
                 .streaming=${stretch.some((part) => !part.complete)}
@@ -1760,20 +1833,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         continue;
       }
       if (item.kind === "compaction") {
-        flushActivityRows();
-        rows.push(this.#renderItem(item, turnModels, turnDurationMs, presentation));
+        const connectBefore = activityRows.length > 0;
+        const connectAfter = activityFollows(index + 1);
+        flushActivityRows(connectBefore);
+        rows.push(this.#renderCompactionMarker(item.state, item.id, {
+          before: connectBefore,
+          after: connectAfter,
+        }));
+        activityConnectedFromCompaction = connectAfter;
         index += 1;
         continue;
       }
       if (item.kind === "tool" && isContextCompactionTool(item)) {
-        flushActivityRows();
         if (!hasNativeCompaction) {
+          const connectBefore = activityRows.length > 0;
+          const connectAfter = activityFollows(index + 1);
+          flushActivityRows(connectBefore);
           const state: CompactionState = item.status === "ok"
             ? { kind: "completed", messagesCompacted: 0 }
             : item.status === "running" || item.status === "awaiting-approval"
               ? { kind: "running" }
               : { kind: "failed" };
-          rows.push(this.#renderCompactionMarker(state));
+          rows.push(this.#renderCompactionMarker(state, item.id, {
+            before: connectBefore,
+            after: connectAfter,
+          }));
+          activityConnectedFromCompaction = connectAfter;
+        } else {
+          flushActivityRows();
         }
         index += 1;
         continue;
@@ -1801,8 +1888,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         run.push(candidate as AgentActivityItem);
         index += 1;
       }
-      if (run.length < 2) {
-        const only = run[0];
+      const only = run[0];
+      const groupSingleThought = collapseThinkingWithTools
+        && run.length === 1
+        && only?.kind === "thinking";
+      if (run.length < 2 && !groupSingleThought) {
         if (only !== undefined) {
           activityRows.push({
             content: this.#renderItem(only, turnModels, turnDurationMs, presentation),
@@ -1828,13 +1918,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderVisibleThinking(
     item: Extract<ThreadChatItem, { readonly kind: "thinking" }>,
-    grouped = false,
   ) {
     this.#ensureMarkdown();
     return html`
-      <article class=${`message thinking-output ${
-        item.complete ? "complete" : "running"
-      } ${grouped ? "grouped-thinking-output" : ""}`}>
+      <article
+        class=${`message thinking-output ${item.complete ? "complete" : "running"}`}
+        data-chat-anchor-id=${`item:${item.id}`}
+      >
         <header class="thinking-header">
           <strong>${item.complete ? "Thought" : "Thinking"}</strong>
           <span class="thinking-header-spacer"></span>
@@ -1887,6 +1977,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     return html`
       <details
         class=${`activity-group ${tone}`}
+        data-chat-anchor-id=${`activity:${items.at(-1)?.id ?? first.id}`}
         .open=${open}
       >
         <summary
@@ -1900,14 +1991,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         </summary>
         ${open
           ? html`<div class="activity-group-body">
-              ${items.map((item) => item.kind === "thinking"
-                ? this.#renderVisibleThinking(item, true)
-                : this.#renderItem(
-                    item,
-                    turnModels,
-                    turnDurationMs,
-                    presentation,
-                  ))}
+              <div class=${`agent-activity-timeline activity-group-timeline ${
+                items.length === 1 ? "single-activity" : ""
+              }`}>
+                ${items.map((item) => item.kind === "thinking"
+                  ? this.#renderVisibleThinking(item)
+                  : this.#renderItem(
+                      item,
+                      turnModels,
+                      turnDurationMs,
+                      presentation,
+                    ))}
+              </div>
             </div>`
           : nothing}
       </details>
@@ -2035,6 +2130,122 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  #captureChatDomAnchor(viewport: HTMLElement): ChatDomAnchor | undefined {
+    const viewportRect = viewport.getBoundingClientRect();
+    const viewportTop = viewportRect.top;
+    const viewportBottom = viewportRect.bottom;
+    const visible = [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(({ element, rect }) =>
+        element.dataset["chatAnchorId"] !== undefined
+        && rect.height > 0
+        && rect.bottom > viewportTop
+        && rect.top < viewportBottom
+      );
+    const crossingTop = visible
+      .filter(({ rect }) => rect.top <= viewportTop + 0.5 && rect.bottom > viewportTop + 0.5)
+      .sort((left, right) => left.rect.height - right.rect.height)[0];
+    const nextVisible = visible
+      .filter(({ rect }) => rect.top > viewportTop + 0.5)
+      .sort((left, right) => left.rect.top - right.rect.top)[0];
+    const candidate = crossingTop ?? nextVisible;
+    if (candidate !== undefined) {
+      const id = candidate.element.dataset["chatAnchorId"];
+      if (id !== undefined) {
+        return { id, offset: candidate.rect.top - viewportTop };
+      }
+    }
+
+    const virtualRow = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(({ rect }) =>
+        rect.height > 0
+        && rect.bottom > viewportTop
+        && rect.top < viewportBottom
+      )
+      .sort((left, right) => {
+        const leftCrosses = left.rect.top <= viewportTop && left.rect.bottom > viewportTop;
+        const rightCrosses = right.rect.top <= viewportTop && right.rect.bottom > viewportTop;
+        if (leftCrosses !== rightCrosses) return leftCrosses ? -1 : 1;
+        return left.rect.top - right.rect.top;
+      })[0];
+    const id = virtualRow?.element.dataset["virtualId"];
+    return id === undefined || virtualRow === undefined
+      ? undefined
+      : { id: `virtual:${id}`, offset: virtualRow.rect.top - viewportTop };
+  }
+
+  #restoreHistoryPrependAnchor(viewport: HTMLElement): void {
+    const anchor = this.#historyAnchorToRestore;
+    this.#historyAnchorToRestore = undefined;
+    if (anchor === undefined) return;
+    this.#historyAnchorStabilizer = { ...anchor, scrollTop: viewport.scrollTop };
+
+    const beforeMeasure = this.#virtualizer.window();
+    for (const row of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
+      const id = row.dataset["virtualId"];
+      const height = row.getBoundingClientRect().height;
+      if (id === undefined || height <= 0) continue;
+      try {
+        this.#virtualizer.measure(id, height);
+      } catch {
+        // A row can leave the window while this one-time history correction runs.
+      }
+    }
+    const afterMeasure = this.#virtualizer.window();
+    if (!sameVirtualRenderWindow(beforeMeasure, afterMeasure)) {
+      this.#syncMountedVirtualGeometry(viewport, afterMeasure);
+    }
+
+    this.#correctHistoryAnchor(viewport);
+    this.#scheduleHistoryAnchorRelease();
+  }
+
+  #correctHistoryAnchor(viewport: HTMLElement): void {
+    const anchor = this.#historyAnchorStabilizer;
+    if (anchor === undefined) return;
+    const virtualId = anchor.id.startsWith("virtual:")
+      ? anchor.id.slice("virtual:".length)
+      : undefined;
+    const candidates = virtualId === undefined
+      ? [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+        .filter((element) => element.dataset["chatAnchorId"] === anchor.id)
+      : [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+        .filter((element) => element.dataset["virtualId"] === virtualId);
+    const element = candidates[0];
+    if (element === undefined) return;
+
+    const delta = element.getBoundingClientRect().top
+      - viewport.getBoundingClientRect().top
+      - anchor.offset;
+    const target = Math.max(0, viewport.scrollTop + delta);
+    this.#virtualizer.setViewport(target, viewport.clientHeight, {
+      userInitiated: true,
+      atTail: false,
+    });
+    const correctedScrollTop = this.#virtualizer.window().scrollTop;
+    this.#historyAnchorStabilizer = { ...anchor, scrollTop: correctedScrollTop };
+    this.#setChatScrollTop(viewport, correctedScrollTop);
+  }
+
+  #scheduleHistoryAnchorRelease(): void {
+    if (this.#historyAnchorSettleTimer !== undefined) {
+      clearTimeout(this.#historyAnchorSettleTimer);
+    }
+    this.#historyAnchorSettleTimer = setTimeout(() => {
+      this.#historyAnchorSettleTimer = undefined;
+      this.#historyAnchorStabilizer = undefined;
+    }, CHAT_HISTORY_ANCHOR_SETTLE_MS);
+  }
+
+  #clearHistoryAnchorStabilizer(): void {
+    if (this.#historyAnchorSettleTimer !== undefined) {
+      clearTimeout(this.#historyAnchorSettleTimer);
+      this.#historyAnchorSettleTimer = undefined;
+    }
+    this.#historyAnchorStabilizer = undefined;
+  }
+
   // WebKitGTK retains native scrollbar hit-testing while intermittently
   // failing to paint its thumb. This passive layer mirrors only the visual
   // thumb; pointer input still reaches the native scrollbar underneath. Keep
@@ -2131,6 +2342,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       // Ignore their resulting DOM events instead of treating them as another
       // user scroll and starting a render/persistence loop.
       return;
+    }
+    if (atTail) {
+      this.#clearHistoryAnchorStabilizer();
+    } else if (this.#historyAnchorStabilizer !== undefined) {
+      const anchor = this.#historyAnchorStabilizer;
+      this.#historyAnchorStabilizer = {
+        ...anchor,
+        offset: anchor.offset - (viewport.scrollTop - anchor.scrollTop),
+        scrollTop: viewport.scrollTop,
+      };
+      this.#scheduleHistoryAnchorRelease();
     }
     if (before.followingTail && atTail) return;
     this.#scrollCorrectionResumeAt = Date.now() + CHAT_SCROLL_CORRECTION_SETTLE_MS;
@@ -2289,6 +2511,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #followTail = (): void => {
     this.#cancelScheduledChatPosition();
+    this.#clearHistoryAnchorStabilizer();
     this.#scrollCorrectionResumeAt = 0;
     this.#virtualizer.enableFollowTail();
     const viewport = this.querySelector<HTMLElement>(".chat-stream");
@@ -2347,9 +2570,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const page = await services.protocol.threadView(threadId, view.itemOffset);
         if (generation !== this.#historyGeneration || threadId !== this.threadId) return;
         const virtualWindow = this.#virtualizer.window();
+        const viewport = this.querySelector<HTMLElement>(".chat-stream");
         this.#pendingHistoryPrepend = {
-          scrollTop: virtualWindow.scrollTop,
+          scrollTop: viewport?.scrollTop ?? virtualWindow.scrollTop,
           totalHeight: virtualWindow.totalHeight,
+          followingTail: virtualWindow.followingTail,
+          anchor: virtualWindow.followingTail || viewport === null
+            ? undefined
+            : this.#captureChatDomAnchor(viewport),
         };
         if (!store.prependThreadViewSnapshot(threadId, page.value)) {
           this.#pendingHistoryPrepend = undefined;
@@ -2388,7 +2616,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const preview = collapsedChatPreview(item.content)
           || `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
         return html`
-          <article class="message turn-card user-message">
+          <article
+            class="message turn-card user-message"
+            data-chat-anchor-id=${`item:${item.id}`}
+          >
             <header class="message-header user-header ${open ? "" : "collapsed"}">
               <button
                 class="message-disclosure"
@@ -2433,6 +2664,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         return html`
           <article
             class="message turn-card assistant-message"
+            data-chat-anchor-id=${`item:${item.id}`}
             @contextmenu=${(event: MouseEvent) =>
               this.#openMarkdownContextMenu(event, item.content)}
           >
@@ -2485,7 +2717,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const open = this.#messageDisclosure.get(item.id) ?? defaultOpen;
         const preview = collapsedChatPreview(item.content);
         return html`
-          <article class=${`message thinking-card ${item.complete ? "complete" : "running"}`}>
+          <article
+            class=${`message thinking-card ${item.complete ? "complete" : "running"}`}
+            data-chat-anchor-id=${`item:${item.id}`}
+          >
             <header class="thinking-header">
               <button
                 class="message-disclosure"
@@ -2519,7 +2754,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         `;
       }
       case "compaction":
-        return this.#renderCompactionMarker(item.state);
+        return this.#renderCompactionMarker(item.state, item.id);
       case "tool": {
         const approvalPending = this.#approvalSubmissions.has(item.callId);
         const approvalRequired = item.status === "awaiting-approval";
@@ -2537,6 +2772,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         return html`
           <details
             class=${`message tool-card tool-${item.status} ${approvalRequired ? "approval-required" : ""}`}
+            data-chat-anchor-id=${`item:${item.id}`}
             data-call-id=${item.callId}
             ?open=${toolOpen}
             @keydown=${(event: KeyboardEvent) =>
@@ -2672,7 +2908,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             ? []
             : resolvedQuestionSummary(item.questions, item.answers);
           return html`
-            <section class="message question-card question-resolved">
+            <section
+              class="message question-card question-resolved"
+              data-chat-anchor-id=${`item:${item.id}`}
+            >
               <header>
                 <strong>${item.title ?? "Questions"}</strong>
                 <span>${item.answers === null ? "Skipped" : "Answered"}</span>
@@ -2696,6 +2935,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           return html`
             <section
               class="message question-card question-pending"
+              data-chat-anchor-id=${`item:${item.id}`}
               data-question-request-id=${item.requestId}
               aria-busy=${submitting ? "true" : "false"}
             >
@@ -2846,12 +3086,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             <li class=${isImageAttachment(attachment) ? "image-attachment" : "file-attachment"}>
               ${path !== undefined && isImageAttachment(attachment)
                 ? html`
-                    <img
-                      src=${path}
-                      alt=${`Preview of ${attachment.name}`}
-                      loading="lazy"
-                      decoding="async"
-                    />
+                    <trouve-image-preview
+                      .source=${path}
+                      .name=${attachment.name}
+                      lazy
+                    ></trouve-image-preview>
                   `
                 : html`<span class="attachment-icon">${fontAwesomeIcon(
                     isImageAttachment(attachment) ? "file-image" : "file",

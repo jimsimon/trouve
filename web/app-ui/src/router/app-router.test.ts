@@ -58,6 +58,50 @@ describe("application routes", () => {
     expect(readSignal(router.route)).toEqual({ kind: "settings", section: "providers" });
   });
 
+  it("remembers the last settings screen for the router lifetime", () => {
+    let pathname = "/inbox";
+    const push = vi.fn((href: string) => {
+      pathname = href;
+    });
+    const router = new AppRouter({
+      pathname: () => pathname,
+      push,
+      replace: vi.fn(),
+      listen: () => () => undefined,
+    });
+
+    router.navigate({ kind: "settings", section: "chat" });
+    router.navigate({ kind: "inbox" });
+    router.navigate({ kind: "settings" });
+
+    expect(push).toHaveBeenLastCalledWith("/settings/chat");
+    expect(readSignal(router.route)).toEqual({ kind: "settings", section: "chat" });
+  });
+
+  it("does not persist the settings screen into a new app router", () => {
+    let pathname = "/inbox";
+    const platform = () => ({
+      pathname: () => pathname,
+      push: vi.fn((href: string) => {
+        pathname = href;
+      }),
+      replace: vi.fn(),
+      listen: () => () => undefined,
+    });
+    const firstPlatform = platform();
+    const firstRouter = new AppRouter(firstPlatform);
+    firstRouter.navigate({ kind: "settings", section: "appearance" });
+    firstRouter.dispose();
+
+    pathname = "/inbox";
+    const restartedPlatform = platform();
+    const restartedRouter = new AppRouter(restartedPlatform);
+    restartedRouter.navigate({ kind: "settings" });
+
+    expect(restartedPlatform.push).toHaveBeenLastCalledWith("/settings");
+    expect(readSignal(restartedRouter.route)).toEqual({ kind: "settings" });
+  });
+
   it("preserves the selected inspection pane across session and thread changes", () => {
     let pathname = "/workspaces/ws/sessions/se-1/threads/th-1/inspect/files";
     const push = vi.fn((href: string) => {

@@ -116,30 +116,47 @@ export class AppRouter {
   readonly #route = createSignal<AppRoute>({ kind: "inbox" });
   readonly route: ReadonlySignal<AppRoute> = this.#route;
   readonly #stopListening: () => void;
+  #lastSettingsSection: string | undefined;
 
   constructor(platform: RouterPlatform) {
     this.#platform = platform;
-    this.#route.set(parseRoute(platform.pathname()));
+    const initialRoute = parseRoute(platform.pathname());
+    this.#rememberSettingsSection(initialRoute);
+    this.#route.set(initialRoute);
     this.#stopListening = platform.listen(() => {
-      this.#route.set(parseRoute(platform.pathname()));
+      const route = parseRoute(platform.pathname());
+      this.#rememberSettingsSection(route);
+      this.#route.set(route);
     });
   }
 
   navigate(route: Exclude<AppRoute, { kind: "not-found" }>, replace = false): void {
     const current = this.#route.get();
+    const settingsDestination = route.kind === "settings"
+      && route.section === undefined
+      && this.#lastSettingsSection !== undefined
+      ? { kind: "settings" as const, section: this.#lastSettingsSection }
+      : route;
     // Inspection is one app-level selection, not a per-thread/session default.
     // Most chat navigation intentionally constructs only the new identity;
     // retain the visible right pane unless the caller explicitly selects one.
-    const destination = route.kind === "session"
-      && route.inspection === undefined
+    const destination = settingsDestination.kind === "session"
+      && settingsDestination.inspection === undefined
       && current.kind === "session"
       && current.inspection !== undefined
-      ? { ...route, inspection: current.inspection }
-      : route;
+      ? { ...settingsDestination, inspection: current.inspection }
+      : settingsDestination;
+    this.#rememberSettingsSection(destination);
     const href = routeHref(destination);
     if (replace) this.#platform.replace(href);
     else this.#platform.push(href);
     this.#route.set(destination);
+  }
+
+  #rememberSettingsSection(route: AppRoute): void {
+    if (route.kind === "settings" && route.section !== undefined) {
+      this.#lastSettingsSection = route.section;
+    }
   }
 
   dispose(): void {

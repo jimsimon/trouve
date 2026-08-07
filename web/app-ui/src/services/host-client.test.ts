@@ -573,6 +573,15 @@ describe("HostClient", () => {
     expect(chatPreferencesFromHost(preferences)).toEqual({
       collapseThinkingWithTools: false,
     });
+    expect(chatPreferencesFromHost(preferences, {
+      collapseThinkingWithTools: true,
+    })).toEqual({ collapseThinkingWithTools: true });
+    expect(chatPreferencesFromHost({
+      ...preferences,
+      chat: { collapse_thinking_with_tools: false },
+    }, {
+      collapseThinkingWithTools: true,
+    })).toEqual({ collapseThinkingWithTools: false });
     expect(notificationPreferencesFromHost(preferences)).toEqual({
       enabled: true,
       onFinish: true,

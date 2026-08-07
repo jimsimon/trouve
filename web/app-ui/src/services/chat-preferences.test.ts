@@ -32,6 +32,23 @@ describe("chat preferences", () => {
     expect(storage.setItem).toHaveBeenCalledOnce();
   });
 
+  it("restores an explicit change in a new frontend lifetime", () => {
+    const memory = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => memory.get(key) ?? null,
+      setItem: (key: string, value: string) => memory.set(key, value),
+    };
+
+    new ChatPreferencesController(browserChatPreferenceStorage(storage)).update({
+      collapseThinkingWithTools: true,
+    });
+    const reloaded = new ChatPreferencesController(
+      browserChatPreferenceStorage(storage),
+    );
+
+    expect(reloaded.current.get()).toEqual({ collapseThinkingWithTools: true });
+  });
+
   it("ignores corrupt browser state", () => {
     const storage = {
       getItem: vi.fn(() => "not-json"),

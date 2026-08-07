@@ -863,10 +863,11 @@ export const generalPreferencesFromHost = (
 
 export const chatPreferencesFromHost = (
   preferences: HostPreferences,
+  fallback: ChatPreferences = DEFAULT_CHAT_PREFERENCES,
 ): ChatPreferences => Object.freeze({
   collapseThinkingWithTools:
     preferences.chat?.collapse_thinking_with_tools ??
-    DEFAULT_CHAT_PREFERENCES.collapseThinkingWithTools,
+    fallback.collapseThinkingWithTools,
 });
 
 export const notificationPreferencesFromHost = (

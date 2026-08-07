@@ -142,6 +142,7 @@ import {
   type FontAwesomeIconName,
 } from "../components/font-awesome-icon.js";
 import "../components/command-palette.js";
+import "../components/image-preview.js";
 import "../components/session-list.js";
 import "../components/thread-screen.js";
 import "../components/todo-plan-panel.js";
@@ -196,9 +197,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #generalPreferences = createBrowserGeneralPreferencesController(
     deployment !== "desktop",
   );
-  readonly #chatPreferences = createBrowserChatPreferencesController(
-    deployment !== "desktop",
-  );
+  // Keep a same-origin mirror even on desktop. The native host remains
+  // authoritative whenever it exposes `chat`, while the mirror preserves a
+  // newly HMR-added preference across reloads against an older live host that
+  // does not know that field yet.
+  readonly #chatPreferences = createBrowserChatPreferencesController();
   readonly #composerDrafts = createBrowserComposerDraftController();
   readonly #workspaceOrder = createBrowserWorkspaceOrderController(
     deployment !== "desktop",
@@ -771,7 +774,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }, false);
     this.#applyAppearanceToElement(appearance);
     this.#generalPreferences.replace(generalPreferencesFromHost(preferences), false);
-    this.#chatPreferences.replace(chatPreferencesFromHost(preferences), false);
+    this.#chatPreferences.replace(chatPreferencesFromHost(
+      preferences,
+      readSignal(this.#chatPreferences.current),
+    ));
     this.#notificationPreferences.replace(
       notificationPreferencesFromHost(preferences),
       false,
@@ -2626,11 +2632,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       return html`<li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
                           ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
-                          : html`<img
-                              src=${preview}
-                              alt=${`Preview of ${attachment.upload.name}`}
-                              decoding="async"
-                            />`}
+                          : html`<trouve-image-preview
+                              .source=${preview}
+                              .name=${attachment.upload.name}
+                            ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
                           <small>${attachment.upload.mime} · ${this.#formatAttachmentBytes(attachment.size)}</small>

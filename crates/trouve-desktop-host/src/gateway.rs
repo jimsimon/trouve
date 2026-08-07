@@ -3156,6 +3156,7 @@ mod tests {
         let mut stored = HostPreferences::default();
         stored.appearance.theme = "light".into();
         stored.general.prevent_sleep_while_running = false;
+        stored.chat.collapse_thinking_with_tools = true;
         stored.notifications.on_finish = false;
         stored.notifications.sound = true;
         stored.workspace_order = vec!["ws-2".into(), "ws-1".into()];
@@ -3198,6 +3199,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.appearance.theme, "light");
         assert!(!loaded.general.prevent_sleep_while_running);
+        assert!(loaded.chat.collapse_thinking_with_tools);
         assert!(!loaded.notifications.on_finish);
         assert!(loaded.notifications.sound);
         assert_eq!(loaded.workspace_order, ["ws-2", "ws-1"]);
@@ -3208,6 +3210,7 @@ mod tests {
 
         let mut updated = loaded;
         updated.appearance.theme = "colorblind-dark".into();
+        updated.chat.collapse_thinking_with_tools = false;
         let response = client
             .put(format!("{origin}{PREFERENCES_PATH}"))
             .header(ORIGIN, &origin)
@@ -3223,6 +3226,12 @@ mod tests {
                 .appearance
                 .theme,
             "colorblind-dark"
+        );
+        assert!(
+            !load_preferences(&path, HostPreferences::default())
+                .unwrap()
+                .chat
+                .collapse_thinking_with_tools
         );
         let parent = path.parent().unwrap();
         let leftovers = std::fs::read_dir(parent)

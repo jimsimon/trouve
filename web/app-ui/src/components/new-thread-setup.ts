@@ -34,6 +34,7 @@ import {
   type NewThreadSetupDraft,
   type NewThreadSetupSubmitDetail,
 } from "./new-thread-setup-model.js";
+import "./image-preview.js";
 import "./model-picker.js";
 
 export const NEW_THREAD_SETUP_SUBMIT_EVENT = "trouve-new-thread-submit" as const;
@@ -162,13 +163,12 @@ export class TrouveNewThreadSetup extends LitElement {
       background: var(--trouve-surface);
       font-size: 10px;
     }
-    .attachment-list img, .attachment-icon {
+    .attachment-icon {
       width: 64px;
       height: 48px;
       border-radius: 3px;
       background: var(--trouve-code-bg);
     }
-    .attachment-list img { object-fit: cover; }
     .attachment-icon { display: grid; place-items: center; color: var(--trouve-text-faint); font-size: 17px; }
     .attachment-details { min-width: 0; display: grid; gap: 2px; }
     .attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -454,11 +454,10 @@ export class TrouveNewThreadSetup extends LitElement {
                       <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
                         ${preview === undefined
                           ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
-                          : html`<img
-                              src=${preview}
-                              alt=${`Preview of ${attachment.upload.name}`}
-                              decoding="async"
-                            />`}
+                          : html`<trouve-image-preview
+                              .source=${preview}
+                              .name=${attachment.upload.name}
+                            ></trouve-image-preview>`}
                         <div class="attachment-details">
                           <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
                           <small>${attachment.upload.mime} · ${formatNewThreadAttachmentBytes(attachment.size)}</small>

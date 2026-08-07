@@ -26,6 +26,7 @@ describe("Slint/Lit visual contract", () => {
   const sessionList = read("../components/session-list.ts");
   const sessionIndicators = read("../state/session-indicator-model.ts");
   const icons = read("../components/font-awesome-icon.ts");
+  const imagePreview = read("../components/image-preview.ts");
   const attachments = read("../services/attachments.ts");
   const thread = read("../components/thread-screen.ts");
   const markdown = read("../components/markdown-view.ts");
@@ -304,10 +305,13 @@ describe("Slint/Lit visual contract", () => {
       /\.activity-group \{[^}]*width:\s*100%[^}]*margin:\s*0/s,
     );
     expect(app).toMatch(
-      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*2px/s,
+      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*padding:\s*3px 0 6px/s,
     );
     expect(app).toMatch(
-      /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
+      /\.activity-group-timeline \{[^}]*width:\s*calc\(100% \+ 4px\)[^}]*max-width:\s*none[^}]*gap:\s*2px[^}]*margin-inline-start:\s*-4px/s,
+    );
+    expect(app).toMatch(
+      /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*visible/s,
     );
     expect(app).toMatch(
       /\.tool-card summary \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
@@ -344,13 +348,28 @@ describe("Slint/Lit visual contract", () => {
       /\.agent-activity-timeline\.single-activity::before \{[^}]*inset-block:\s*6px/s,
     );
     expect(app).toMatch(
-      /\.agent-activity-timeline > \.activity-group::before \{[^}]*display:\s*none/s,
-    );
-    expect(app).toMatch(
-      /\.agent-activity-timeline > \.activity-group > summary \.disclosure-icon \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-18px[^}]*translateY\(-50%\)/s,
+      /\.agent-activity-timeline > \.activity-group > summary \.disclosure-icon \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*translateY\(-50%\)/s,
     );
     expect(app).toMatch(
       /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before, \.agent-activity-timeline > \.thinking-card::before, \.agent-activity-timeline > \.thinking-output::before \{[^}]*width:\s*var\(--trouve-chat-timeline-node-size\)[^}]*height:\s*var\(--trouve-chat-timeline-node-size\)[^}]*border-radius:\s*50%[^}]*background:\s*var\(--trouve-text-faint\)/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before \{[^}]*display:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.tool-status \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*calc\(\(29px - 10px\) \/ 2\)[^}]*inset-inline-start:\s*-17\.5px[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-win-bg\)/s,
+    );
+    expect(app).toMatch(
+      /\.tool-card summary > strong \{[^}]*font-size:\s*11px[^}]*font-weight:\s*600/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline\.compaction-connected-timeline::before \{[^}]*inset-block:\s*6px[^}]*display:\s*block/s,
+    );
+    expect(app).toMatch(
+      /\.context-compaction-marker\.timeline-connect-before::before, \.context-compaction-marker\.timeline-connect-after::before \{[^}]*inset-block:\s*50%[^}]*inset-inline-start:\s*7px[^}]*width:\s*var\(--trouve-chat-timeline-rail-width\)/s,
+    );
+    expect(app).toMatch(
+      /\.context-compaction-marker\.timeline-connect-before \.context-compaction-symbol, \.context-compaction-marker\.timeline-connect-after \.context-compaction-symbol \{[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-1\.5px[^}]*translateY\(-50%\)/s,
     );
     expect(app).toMatch(
       /\.agent-activity-timeline > \.activity-group\.error::before[^}]*background:\s*var\(--trouve-err\)/s,
@@ -523,9 +542,20 @@ describe("Slint/Lit visual contract", () => {
     expect(shell).toContain("pendingAttachmentPreviewUrl(attachment)");
     expect(newThread).toContain("pendingAttachmentPreviewUrl(attachment)");
     expect(attachments).toContain("data:${mime};base64,${attachment.upload.data}");
-    expect(app).toMatch(
-      /\.attachment-list img \{[^}]*width:\s*64px[^}]*height:\s*48px[^}]*object-fit:\s*cover/s,
+    for (const source of [thread, shell, newThread]) {
+      expect(source).toContain("<trouve-image-preview");
+    }
+    expect(imagePreview).toMatch(
+      /\.image-preview-trigger \{[^}]*width:\s*64px[^}]*height:\s*48px/s,
     );
+    expect(imagePreview).toMatch(
+      /\.image-preview-trigger img \{[^}]*object-fit:\s*cover/s,
+    );
+    expect(imagePreview).toMatch(
+      /\.image-preview-full \{[^}]*object-fit:\s*contain/s,
+    );
+    expect(imagePreview).toContain("dialog.showModal()");
+    expect(imagePreview).toContain("View full-size image:");
     expect(app).toMatch(
       /\.attachment-icon \{[^}]*width:\s*64px[^}]*height:\s*48px[^}]*display:\s*grid[^}]*place-items:\s*center/s,
     );

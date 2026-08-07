@@ -221,7 +221,10 @@ const installProtocolFixtures = async (
       await route.fulfill({ json: editedQueue });
       return;
     }
-    if (key === "GET /v1/attachments/att_queue_1") {
+    if (
+      key === "GET /v1/attachments/att_queue_1"
+      || key === "GET /v1/attachments/att_preview_1"
+    ) {
       await route.fulfill({
         contentType: "image/png",
         body: Buffer.from(
@@ -673,7 +676,10 @@ test("pending image and file attachments reuse submitted chip geometry", async (
 
   const geometry = await attachments.evaluate((list) => {
     const image = list.querySelector<HTMLElement>(".image-attachment");
-    const preview = image?.querySelector<HTMLElement>("img");
+    const preview = image
+      ?.querySelector<HTMLElement>("trouve-image-preview")
+      ?.shadowRoot
+      ?.querySelector<HTMLElement>(".image-preview-trigger img");
     const file = list.querySelector<HTMLElement>(".file-attachment");
     const icon = file?.querySelector<HTMLElement>(".attachment-icon");
     if (image === null || image === undefined || preview === null || preview === undefined
@@ -698,6 +704,65 @@ test("pending image and file attachments reuse submitted chip geometry", async (
   expect(geometry.fileBackground).toBe(geometry.imageBackground);
   expect(geometry.fileBorderRadius).toBe(geometry.imageBorderRadius);
   expect(geometry.filePadding).toBe(geometry.imagePadding);
+});
+
+test("image attachment thumbnails open an accessible full-size preview", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Preview this image",
+      attachments: [{
+        id: "att_preview_1",
+        name: "full-size-preview.png",
+        mime: "image/png",
+        size_bytes: 68,
+      }],
+    }),
+    threadEvent(18, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 4, output_tokens: 0, cost_usd: 0 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const message = page.locator(".user-message").filter({ hasText: "Preview this image" });
+  const preview = message.locator("trouve-image-preview");
+  const trigger = preview.getByRole("button", {
+    name: "View full-size image: full-size-preview.png",
+  });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const dialog = preview.getByRole("dialog", {
+    name: "Full-size preview of full-size-preview.png",
+  });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".image-preview-full")).toHaveAttribute(
+    "src",
+    "/v1/attachments/att_preview_1",
+  );
+  await expect(dialog.locator(".image-preview-full")).toHaveCSS("object-fit", "contain");
+  await expect(dialog.getByRole("button", { name: "Close image preview" })).toBeFocused();
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await dialog.getByRole("button", { name: "Close image preview" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
 });
 
 test("unsubmitted composer drafts persist per thread across navigation and reload", async ({
@@ -1088,7 +1153,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   )).toEqual([]);
 });
 
-test("the Chat preference opts thinking back into collapsible activity", async ({ page }) => {
+test("the Chat preference adds one disclosure around the standard activity timeline", async ({ page }) => {
   await installProtocolFixtures(page, []);
   await page.addInitScript(() => {
     localStorage.setItem("trouve.chat.v1", JSON.stringify({
@@ -1098,13 +1163,21 @@ test("the Chat preference opts thinking back into collapsible activity", async (
   await page.goto("/");
   await replayHistory(page);
 
-  await expect(page.locator(".thinking-output")).toHaveCount(0);
-  const thought = page.locator(".thinking-card");
-  await expect(thought.getByRole("button", { name: "Collapse thought process" })).toBeVisible();
-  await thought.getByRole("button", { name: "Collapse thought process" }).click();
-  await expect(thought.locator(".thinking-body")).toHaveCount(0);
-  await expect(thought.locator(".message-collapsed-preview"))
+  const historicalAgent = page.locator(".agent-turn-card").first();
+  const thoughtGroup = historicalAgent.locator(".activity-group").filter({
+    hasText: "Thought 1 time",
+  });
+  await expect(thoughtGroup.locator(":scope > .activity-group-body")).toHaveCount(0);
+  await thoughtGroup.locator(":scope > summary").click();
+  const historicalThought = thoughtGroup.locator(".thinking-output");
+  await expect(historicalThought.locator(".thinking-body"))
     .toContainText("Compare both frontends");
+  await expect(historicalThought.getByRole("button", {
+    name: /^(?:Collapse|Expand) thought process$/u,
+  }))
+    .toHaveCount(0);
+  await expect(thoughtGroup.locator(".thinking-card")).toHaveCount(0);
+  await expect(thoughtGroup.locator(".activity-group-timeline")).toBeVisible();
 
   await emitBatch(page, [
     threadEvent(16, {
@@ -1214,24 +1287,96 @@ test("the Chat preference opts thinking back into collapsible activity", async (
   await combinedGroup.locator(":scope > summary").click();
   await expect(combinedTimeline).toHaveClass(/has-expanded-group/u);
   await expect(combinedGroup.locator(".thinking-card")).toHaveCount(0);
-  await expect(combinedGroup.locator(".grouped-thinking-output .thinking-body"))
+  await expect(combinedGroup.locator(".thinking-output .thinking-body"))
     .toContainText("Inspect the grouped activity geometry");
+  await expect(combinedGroup.getByRole("button", {
+    name: /^(?:Collapse|Expand) thought process$/u,
+  }))
+    .toHaveCount(0);
   const expandedGeometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
     const summary = group.querySelector<HTMLElement>(":scope > summary");
     const body = group.querySelector<HTMLElement>(":scope > .activity-group-body");
-    if (timeline === null || summary === null || body === null) {
+    const nestedTimeline = body?.querySelector<HTMLElement>(
+      ":scope > .activity-group-timeline",
+    );
+    const thought = nestedTimeline?.querySelector<HTMLElement>(":scope > .thinking-output");
+    const toolStatus = nestedTimeline?.querySelector<HTMLElement>(
+      ":scope > .tool-card .tool-status",
+    );
+    const toolCard = toolStatus?.closest<HTMLElement>(".tool-card");
+    if (timeline === null || summary === null || body === null
+      || nestedTimeline === null || nestedTimeline === undefined
+      || thought === null || thought === undefined
+      || toolStatus === null || toolStatus === undefined
+      || toolCard === null || toolCard === undefined) {
       throw new Error("missing expanded combined activity geometry");
     }
+    const outerRail = getComputedStyle(timeline, "::before");
+    const nestedRail = getComputedStyle(nestedTimeline, "::before");
+    const thoughtNode = getComputedStyle(thought, "::before");
+    const timelineBounds = timeline.getBoundingClientRect();
+    const nestedTimelineBounds = nestedTimeline.getBoundingClientRect();
+    const thoughtBounds = thought.getBoundingClientRect();
+    const toolStatusBounds = toolStatus.getBoundingClientRect();
+    const nestedRailCenter = nestedTimelineBounds.left
+      + Number.parseFloat(nestedRail.left)
+      + Number.parseFloat(nestedRail.width) / 2;
+    const outerRailCenter = timelineBounds.left
+      + Number.parseFloat(outerRail.left)
+      + Number.parseFloat(outerRail.width) / 2;
     return {
       railDisplay: getComputedStyle(timeline, "::before").display,
+      nestedRailDisplay: nestedRail.display,
+      nestedRailHeight: Number.parseFloat(nestedRail.height),
+      nestedRailIndent: nestedRailCenter - outerRailCenter,
+      thoughtNodeDisplay: thoughtNode.display,
+      thoughtNodeToRail: Math.abs(
+        thoughtBounds.left
+          + Number.parseFloat(thoughtNode.left)
+          + Number.parseFloat(thoughtNode.width) / 2
+          - nestedRailCenter,
+      ),
+      toolStatusToRail: Math.abs(
+        toolStatusBounds.left + toolStatusBounds.width / 2 - nestedRailCenter,
+      ),
+      duplicateToolNodeDisplay: getComputedStyle(toolCard, "::before").display,
       summaryBackground: getComputedStyle(summary).backgroundColor,
       bodyPaddingLeft: getComputedStyle(body).paddingLeft,
+      nestedMarginLeft: getComputedStyle(nestedTimeline).marginLeft,
     };
   });
   expect(expandedGeometry.railDisplay).toBe("none");
+  expect(expandedGeometry.nestedRailDisplay).not.toBe("none");
+  expect(expandedGeometry.nestedRailHeight).toBeGreaterThan(10);
+  expect(expandedGeometry.nestedRailIndent).toBe(16);
+  expect(expandedGeometry.thoughtNodeDisplay).not.toBe("none");
+  expect(expandedGeometry.thoughtNodeToRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.toolStatusToRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.duplicateToolNodeDisplay).toBe("none");
   expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
-  expect(expandedGeometry.bodyPaddingLeft).toBe("16px");
+  expect(expandedGeometry.bodyPaddingLeft).toBe("0px");
+  expect(expandedGeometry.nestedMarginLeft).toBe("-4px");
+});
+
+test("the Chat preference persists across a frontend reload", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/settings/chat");
+
+  const preference = page.getByRole("checkbox", {
+    name: "Collapse thinking output with tool calls.",
+  });
+  await expect(preference).not.toBeChecked();
+  await page.locator('label[for="settings-collapse-thinking"]').click();
+  await expect(preference).toBeChecked();
+  await expect.poll(() => page.evaluate(() =>
+    localStorage.getItem("trouve.chat.v1")
+  )).toBe(JSON.stringify({ collapseThinkingWithTools: true }));
+
+  await page.reload();
+  await expect(page.getByRole("checkbox", {
+    name: "Collapse thinking output with tool calls.",
+  })).toBeChecked();
 });
 
 test("legacy context compaction tools stay outside collapsed-thinking groups", async ({
@@ -1292,6 +1437,11 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       result: {},
     }),
     threadEvent(47, {
+      type: "assistant.thinking",
+      turn: 11,
+      text: "Continue from the compacted context",
+    }),
+    threadEvent(48, {
       type: "tool.requested",
       turn: 11,
       call_id: "after_legacy_compaction",
@@ -1299,7 +1449,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       args: { command: "after" },
       requires_approval: false,
     }),
-    threadEvent(48, {
+    threadEvent(49, {
       type: "tool.completed",
       call_id: "after_legacy_compaction",
       status: "ok",
@@ -1320,6 +1470,74 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
           : "other"),
   );
   expect(topLevelKinds.slice(0, 3)).toEqual(["timeline", "compaction", "timeline"]);
+
+  const timelines = agent.locator(":scope > .message-body > .agent-activity-timeline");
+  await expect(timelines).toHaveCount(2);
+  await expect(timelines.nth(0)).toHaveClass(/compaction-connected-timeline/u);
+  await expect(timelines.nth(1)).toHaveClass(/compaction-connected-timeline/u);
+  const groups = timelines.locator(":scope > .activity-group");
+  await expect(groups).toHaveCount(2);
+  await groups.nth(0).locator(":scope > summary").click();
+  await groups.nth(1).locator(":scope > summary").click();
+  await expect(groups.nth(0)).toHaveAttribute("open", "");
+  await expect(groups.nth(1)).toHaveAttribute("open", "");
+
+  const connection = await agent.locator(
+    ":scope > .message-body > .context-compaction-marker",
+  ).evaluate((marker) => {
+    const before = marker.previousElementSibling;
+    const after = marker.nextElementSibling;
+    const symbol = marker.querySelector<HTMLElement>(".context-compaction-symbol");
+    const beforeNested = before?.querySelector<HTMLElement>(".activity-group-timeline");
+    const afterNested = after?.querySelector<HTMLElement>(".activity-group-timeline");
+    if (!(before instanceof HTMLElement) || !(after instanceof HTMLElement)
+      || symbol === null || beforeNested === null || beforeNested === undefined
+      || afterNested === null || afterNested === undefined) {
+      throw new Error("missing connected compaction timeline geometry");
+    }
+    const segment = (element: HTMLElement, pseudo: string) => {
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element, pseudo);
+      const top = bounds.top + Number.parseFloat(style.top);
+      const left = bounds.left + Number.parseFloat(style.left);
+      return {
+        top,
+        bottom: top + Number.parseFloat(style.height),
+        center: left + Number.parseFloat(style.width) / 2,
+        display: style.display,
+      };
+    };
+    const beforeRail = segment(before, "::before");
+    const bridge = segment(marker as HTMLElement, "::before");
+    const afterRail = segment(after, "::before");
+    const beforeNestedRail = segment(beforeNested, "::before");
+    const afterNestedRail = segment(afterNested, "::before");
+    const symbolBounds = symbol.getBoundingClientRect();
+    return {
+      beforeGap: Math.abs(beforeRail.bottom - bridge.top),
+      afterGap: Math.abs(bridge.bottom - afterRail.top),
+      centerDrift: Math.max(
+        Math.abs(beforeRail.center - bridge.center),
+        Math.abs(bridge.center - afterRail.center),
+        Math.abs(
+          symbolBounds.left + symbolBounds.width / 2 - bridge.center,
+        ),
+      ),
+      bridgeDisplay: bridge.display,
+      beforeNestedRail: beforeNestedRail.display,
+      afterNestedRail: afterNestedRail.display,
+      beforeNestedIndent: beforeNestedRail.center - beforeRail.center,
+      afterNestedIndent: afterNestedRail.center - afterRail.center,
+    };
+  });
+  expect(connection.beforeGap).toBeLessThanOrEqual(0.25);
+  expect(connection.afterGap).toBeLessThanOrEqual(0.25);
+  expect(connection.centerDrift).toBeLessThanOrEqual(0.25);
+  expect(connection.bridgeDisplay).not.toBe("none");
+  expect(connection.beforeNestedRail).not.toBe("none");
+  expect(connection.afterNestedRail).not.toBe("none");
+  expect(connection.beforeNestedIndent).toBe(16);
+  expect(connection.afterNestedIndent).toBe(16);
 });
 
 test("running activity groups retain explicit disclosure state as tools arrive", async ({
@@ -1497,6 +1715,26 @@ test("context compaction is an animated durable boundary between tool groups", a
   const marker = agent.locator(".context-compaction-marker.completed");
   await expect(marker).toContainText("Context compacted");
   await expect(marker).toContainText("24 earlier transcript messages summarized");
+  await expect(marker).toHaveClass(/timeline-connect-before/u);
+  await expect(marker).toHaveClass(/timeline-connect-after/u);
+  const completedMarkerStyle = await marker.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const rule = getComputedStyle(element, "::after");
+    return {
+      backgroundImage: style.backgroundImage,
+      borderTopWidth: style.borderTopWidth,
+      borderBottomWidth: style.borderBottomWidth,
+      ruleContent: rule.content,
+      ruleHeight: rule.height,
+    };
+  });
+  expect(completedMarkerStyle).toEqual({
+    backgroundImage: "none",
+    borderTopWidth: "0px",
+    borderBottomWidth: "0px",
+    ruleContent: '\"\"',
+    ruleHeight: "1px",
+  });
   const topLevelKinds = await agent.locator(":scope > .message-body > *").evaluateAll(
     (elements) => elements.map((element) =>
       element.classList.contains("agent-activity-timeline")
@@ -1509,8 +1747,120 @@ test("context compaction is an animated durable boundary between tool groups", a
   await expect(agent.locator(":scope > .message-body > .agent-activity-timeline"))
     .toHaveCount(2);
   await expect(agent.locator(
+    ":scope > .message-body > .agent-activity-timeline.compaction-connected-timeline",
+  )).toHaveCount(2);
+  await expect(agent.locator(
     ":scope > .message-body > .agent-activity-timeline > .activity-group",
   )).toHaveCount(2);
+});
+
+test("standalone tool headers align their timeline node and disclosure controls", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(50, {
+      type: "turn.started",
+      turn: 12,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(51, {
+      type: "user.message",
+      turn: 12,
+      content: "Align one standalone tool call",
+      attachments: [],
+    }),
+    threadEvent(52, {
+      type: "tool.requested",
+      turn: 12,
+      call_id: "standalone_alignment",
+      tool: "Bash",
+      args: { command: "printf aligned" },
+      requires_approval: false,
+    }),
+    threadEvent(53, { type: "tool.started", call_id: "standalone_alignment" }),
+    threadEvent(54, {
+      type: "tool.completed",
+      call_id: "standalone_alignment",
+      status: "ok",
+      result: { exit_code: 0, stdout: "aligned" },
+    }),
+    threadEvent(55, {
+      type: "assistant.message",
+      turn: 12,
+      content: "Aligned.",
+    }),
+    threadEvent(56, {
+      type: "turn.completed",
+      turn: 12,
+      usage: { input_tokens: 12, output_tokens: 2 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const tool = page.locator(
+    '.agent-turn-card:last-of-type .agent-activity-timeline > .tool-card[data-call-id="standalone_alignment"]',
+  );
+  await expect(tool).toBeVisible();
+  const alignment = async () => await tool.evaluate((card) => {
+    const summary = card.querySelector<HTMLElement>(":scope > summary");
+    const disclosure = summary?.querySelector<HTMLElement>(".tool-disclosure");
+    const status = summary?.querySelector<HTMLElement>(".tool-status");
+    const title = summary?.querySelector<HTMLElement>(":scope > strong");
+    const timeline = card.parentElement;
+    if (summary === null || summary === undefined || disclosure === null
+      || disclosure === undefined || status === null || status === undefined
+      || title === null || title === undefined || timeline === null) {
+      throw new Error("missing standalone tool header geometry");
+    }
+    const timelineBounds = timeline.getBoundingClientRect();
+    const rail = getComputedStyle(timeline, "::before");
+    const railCenter = timelineBounds.left
+      + Number.parseFloat(rail.left)
+      + Number.parseFloat(rail.width) / 2;
+    const center = (element: HTMLElement): number => {
+      const bounds = element.getBoundingClientRect();
+      return bounds.top + bounds.height / 2;
+    };
+    const statusBounds = status.getBoundingClientRect();
+    const statusCenter = center(status);
+    return {
+      disclosure: Math.abs(center(disclosure) - statusCenter),
+      title: Math.abs(center(title) - statusCenter),
+      titleFontSize: getComputedStyle(title).fontSize,
+      titleFontWeight: getComputedStyle(title).fontWeight,
+      statusWidth: statusBounds.width,
+      statusHeight: statusBounds.height,
+      statusToRail: Math.abs(
+        statusBounds.left + statusBounds.width / 2 - railCenter,
+      ),
+      duplicateNodeDisplay: getComputedStyle(card, "::before").display,
+    };
+  });
+
+  const collapsedAlignment = await alignment();
+  expect(collapsedAlignment.duplicateNodeDisplay).toBe("none");
+  expect(collapsedAlignment.titleFontSize).toBe("11px");
+  expect(collapsedAlignment.titleFontWeight).toBe("600");
+  expect(collapsedAlignment.statusWidth).toBe(10);
+  expect(collapsedAlignment.statusHeight).toBe(10);
+  expect(Math.max(
+    collapsedAlignment.disclosure,
+    collapsedAlignment.title,
+    collapsedAlignment.statusToRail,
+  )).toBeLessThanOrEqual(0.25);
+  await tool.locator(":scope > summary").click();
+  await expect(tool).toHaveAttribute("open", "");
+  const expandedAlignment = await alignment();
+  expect(expandedAlignment.duplicateNodeDisplay).toBe("none");
+  expect(Math.max(
+    expandedAlignment.disclosure,
+    expandedAlignment.title,
+    expandedAlignment.statusToRail,
+  )).toBeLessThanOrEqual(0.25);
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
@@ -2364,23 +2714,32 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     items: Array.from({ length: end - start }, (_, index) => ({
       kind: "user",
       turn: 1_000 + start + index,
-      content: `Buffered prompt ${start + index}`,
+      content: `Buffered prompt ${start + index}${
+        start === 0
+          ? ` ${"with deliberately variable-height history content ".repeat(12 + index % 5 * 4)}`
+          : ""
+      }`,
       attachments: [],
     })),
   });
   let olderRequests = 0;
   let olderResponses = 0;
   const olderBoundaries: number[] = [];
+  let releaseSecondPage: (() => void) | undefined;
+  const secondPageReleased = new Promise<void>((resolve) => {
+    releaseSecondPage = resolve;
+  });
   await installProtocolFixtures(page, [], 0, async (before) => {
     if (before === undefined) {
       return { snapshot: historyPage(120, 240, true) };
     }
     olderRequests += 1;
     olderBoundaries.push(before);
-    await new Promise((resolve) => globalThis.setTimeout(
-      resolve,
-      before === 120 ? 75 : 250,
-    ));
+    if (before === 120) {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 75));
+    } else {
+      await secondPageReleased;
+    }
     olderResponses += 1;
     if (before === 120) return { snapshot: historyPage(60, 120, true) };
     if (before === 60) return { snapshot: historyPage(0, 60, false) };
@@ -2405,7 +2764,15 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   });
   await expect.poll(() => olderRequests).toBe(2);
   await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
-  const anchor = await page.locator(".chat-stream").evaluate((viewport) => {
+  const anchor = await page.locator(".chat-stream").evaluate(async (viewport) => {
+    // Keep moving after the fetch starts. The response must preserve the
+    // reader's latest position, not the position that triggered prefetch.
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -600 }));
+    viewport.scrollTop = Math.max(0, viewport.scrollTop - viewport.clientHeight * 0.75);
+    viewport.dispatchEvent(new Event("scroll"));
+    await new Promise<void>((resolve) => requestAnimationFrame(() =>
+      requestAnimationFrame(() => resolve())
+    ));
     const viewportTop = viewport.getBoundingClientRect().top;
     const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
       .find((candidate) => candidate.getBoundingClientRect().bottom > viewportTop);
@@ -2417,6 +2784,36 @@ test("prefetches older history before the reader reaches the loaded boundary", a
       offset: row.getBoundingClientRect().top - viewportTop,
     };
   });
+  await page.locator(".chat-stream").evaluate((viewport, expected) => {
+    type AnchorProbe = {
+      active: boolean;
+      maxDeviation: number;
+      missingFrames: number;
+    };
+    const target = viewport as HTMLElement & { historyAnchorProbe?: AnchorProbe };
+    const probe: AnchorProbe = { active: true, maxDeviation: 0, missingFrames: 0 };
+    target.historyAnchorProbe = probe;
+    const sample = (): void => {
+      if (!probe.active) return;
+      const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+        .find((candidate) => candidate.dataset["virtualId"] === expected.id);
+      if (row === undefined) {
+        probe.missingFrames += 1;
+      } else {
+        probe.maxDeviation = Math.max(
+          probe.maxDeviation,
+          Math.abs(
+            row.getBoundingClientRect().top
+              - viewport.getBoundingClientRect().top
+              - expected.offset,
+          ),
+        );
+      }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }, anchor);
+  releaseSecondPage?.();
   await expect.poll(() => olderResponses).toBe(2);
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport, expected) => {
     const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
@@ -2428,6 +2825,22 @@ test("prefetches older history before the reader reaches the loaded boundary", a
         - expected.offset,
     );
   }, anchor)).toBeLessThanOrEqual(2);
+  await page.waitForTimeout(100);
+  const anchorProbe = await page.locator(".chat-stream").evaluate((viewport) => {
+    type AnchorProbe = {
+      active: boolean;
+      maxDeviation: number;
+      missingFrames: number;
+    };
+    const target = viewport as HTMLElement & { historyAnchorProbe?: AnchorProbe };
+    if (target.historyAnchorProbe === undefined) {
+      throw new Error("missing history anchor probe");
+    }
+    target.historyAnchorProbe.active = false;
+    return target.historyAnchorProbe;
+  });
+  expect(anchorProbe.missingFrames).toBe(0);
+  expect(anchorProbe.maxDeviation).toBeLessThanOrEqual(2);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
@@ -2447,6 +2860,95 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   // active. Re-fetching that same bounded page is harmless; walking the full
   // transcript without user scroll is not.
   expect(olderBoundaries.length).toBeLessThanOrEqual(3);
+});
+
+test("keeps a nested thought anchored when history extends the same agent turn", async ({
+  page,
+}) => {
+  const historyPage = (start: number, end: number, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 90,
+    has_older: hasOlder,
+    items: Array.from({ length: end - start }, (_, index) => ({
+      kind: "thinking",
+      turn: 900,
+      content: `Stable thought ${start + index}\n\n${
+        "Variable-height thought content remains anchored while earlier history arrives. ".repeat(
+          3 + index % 4,
+        )
+      }`,
+      complete: true,
+    })),
+  });
+  let oldestRequests = 0;
+  let oldestResponses = 0;
+  let releaseOldestPage: (() => void) | undefined;
+  const oldestPageReleased = new Promise<void>((resolve) => {
+    releaseOldestPage = resolve;
+  });
+  await installProtocolFixtures(page, [], 0, async (before) => {
+    if (before === undefined) return { snapshot: historyPage(30, 90, true) };
+    if (before === 30) {
+      oldestRequests += 1;
+      await oldestPageReleased;
+      oldestResponses += 1;
+      return { snapshot: historyPage(0, 30, false) };
+    }
+    throw new Error(`unexpected long-turn history boundary ${before}`);
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await expect(page.getByText("Stable thought 30", { exact: true })).toBeVisible();
+  await expect.poll(() => oldestRequests).toBeGreaterThanOrEqual(1);
+
+  const viewport = page.locator(".chat-stream");
+  await viewport.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
+    element.scrollTop = Math.min(element.scrollHeight - element.clientHeight, 400);
+    element.dispatchEvent(new Event("scroll"));
+  });
+  const anchor = await viewport.evaluate(async (element) => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() =>
+      requestAnimationFrame(() => resolve())
+    ));
+    const viewportTop = element.getBoundingClientRect().top;
+    const candidate = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .filter((row) => row.dataset["chatAnchorId"]?.startsWith("item:snapshot:") === true)
+      .find((row) => row.getBoundingClientRect().bottom > viewportTop);
+    const id = candidate?.dataset["chatAnchorId"];
+    if (candidate === undefined || id === undefined) {
+      throw new Error("missing nested thought anchor");
+    }
+    return {
+      id,
+      offset: candidate.getBoundingClientRect().top - viewportTop,
+    };
+  });
+  releaseOldestPage?.();
+  await expect.poll(() => oldestResponses).toBeGreaterThanOrEqual(1);
+  await expect.poll(() => viewport.evaluate((element, expected) => {
+    const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .find((candidate) => candidate.dataset["chatAnchorId"] === expected.id);
+    return row === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.abs(
+          row.getBoundingClientRect().top
+            - element.getBoundingClientRect().top
+            - expected.offset,
+        );
+  }, anchor)).toBeLessThanOrEqual(2);
+  await page.waitForTimeout(600);
+  expect(await viewport.evaluate((element, expected) => {
+    const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .find((candidate) => candidate.dataset["chatAnchorId"] === expected.id);
+    return row === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.abs(
+          row.getBoundingClientRect().top
+            - element.getBoundingClientRect().top
+            - expected.offset,
+        );
+  }, anchor)).toBeLessThanOrEqual(2);
 });
 
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {
