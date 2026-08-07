@@ -11,7 +11,7 @@
 ## Verdict
 
 Every retained Rust or Slint frontend source is accounted for below. The audit
-covers 50 files across the native application, shared client view model,
+covers 51 files across the native application, shared client view model,
 desktop host, direct Servo qualification embedder, and four reusable Slint
 widgets. It compares behavior, state transitions, performance controls,
 failure handling, security boundaries, and accessibility-relevant interaction;
@@ -30,9 +30,10 @@ failure/question detail and repeated attention requests. After those changes,
 no relevant native feature or optimization is known to be absent from the
 TypeScript application.
 
-This is a repository implementation verdict, not a promotion verdict. The
-external visual, assistive-technology, platform, packaging, performance,
-security, and soak gates in the implementation audit remain open.
+This is a repository implementation verdict, not a qualification verdict. ADR
+0027 separately authorizes a reversible Wry default; the external visual,
+assistive-technology, platform, packaging, performance, security, and soak
+gates in the implementation audit remain open.
 
 ## Scope and method
 
@@ -142,8 +143,9 @@ These are not missing web features:
 | `crates/trouve-app/src/theme.rs` | `src/styles/themes.generated.css`, `tokens.css`, `src/services/theme-controller.ts`, `appearance-preferences.ts`, `system-fonts.ts` | All five palettes/semantic roles, system theme, font family/size, terminal/syntax colors, and installed-font enumeration are mapped. CSS generation prevents palette drift. |
 | `crates/trouve-app/src/ui.rs` | `src/app/trouve-app.ts`, `src/state/app-store.ts`, `src/contexts/app-contexts.ts`, all Lit components | Native setter façade becomes signal-backed normalized state and scoped `@lit/context`; list identity uses keyed `repeat`, terminal views are retained by id, and chat/list history is virtualized. The 134 callbacks are source-checked separately. |
 | `crates/trouve-app/src/web_preview.rs` | `src/services/host-client.ts`, `capabilities.ts`, `desktop-host-coordinator.ts`, generated host client | Wry adapter owns window geometry, lifecycle, attachment/clipboard bridges, notification/attention, safe opening, sleep, CSRF bootstrap, and chrome-free content. These are native host actions consumed by TS rather than reimplemented in JS. |
-| `crates/trouve-app/src/web_preview_support.rs` | `src/services/host-client.ts`, `protocol-client.ts`, `protocol-ingress.ts`, Vite/build environment | Explicit server URL, protocol compatibility, one gateway, shared packaged/runtime/Vite frontend source, and teardown map to validated bootstrap clients. The gateway remains the page origin and reserves native and protocol routes; the frontend never opens the database or bypasses HTTP/SSE. |
+| `crates/trouve-app/src/web_preview_support.rs` | `src/services/host-client.ts`, `protocol-client.ts`, `protocol-ingress.ts`, Vite/build environment | The product host owns one embedded server by default; explicit comparison hosts require a server URL. Protocol compatibility, one gateway, shared packaged/runtime/Vite frontend source, and teardown map to validated bootstrap clients. The gateway remains the page origin and reserves native and protocol routes; the frontend never opens the database or bypasses HTTP/SSE. |
 | `crates/trouve-app/src/winstate.rs` | preference services (`appearance`, `general`, `notification`, `resume`, workspace/PR order) and host preferences | Defaults, corruption fallback, bounded values, geometry, route/thread resume, scroll bookmarks, and ordering are preserved. Desktop persists through the host; PWA uses browser storage where native-only fields do not apply. |
+| `crates/trouve-app/src/wry_main.rs` | Default desktop build/entry point; no presentation-layer TS equivalent | Selects the product Wry bootstrap while `web_preview.rs` remains reusable by the explicit comparison target. All state and presentation continue through the shared Lit frontend and protocol. |
 | `crates/trouve-app/ui/app.slint` | `src/app/trouve-app.ts`, `src/components/thread-screen.ts`, `session-list.ts`, `inspection-workspace.ts`, composer/queue/approval/question/todo/terminal/MCP/PR components, `src/styles/app.css` | The full shell, chat, composer, inspection tabs, resize/pane behavior, overlays, mobile pane order, titlebar-less desktop surface, and close modal are ported. Every callback has executable mapping evidence. |
 | `crates/trouve-app/ui/automations-screen.slint` | `src/components/automations-screen.ts`, `automations-model.ts` | List/form/template/schedule validation, enable/run/delete, loading/error/empty states, status/last run, refresh polling plus live invalidation, and responsive layout are implemented. |
 | `crates/trouve-app/ui/connectivity-banner.slint` | `src/app/trouve-app.ts`, `src/components/model-health.ts`, `src/styles/app.css` | Offline severity, subscription/account health, recovery notice, and local-model-only behavior are implemented without blocking usable local workflows. |
@@ -259,7 +261,7 @@ parity failure.
 The source comparison is complete for the current tree and mechanically fails
 when the retained frontend source set drifts. Relevant native behavior has a
 TypeScript implementation, a deliberate browser/native translation, or an
-explicit architecture-level qualification disposition. Slint should remain in
-the tree as the visual/rollback baseline until the external promotion gates
-close, but it is no longer carrying an undiscovered repository-only UI
-behavior in the audited source set.
+explicit architecture-level qualification disposition. Slint remains in the
+tree as the visual/rollback baseline during the staged Wry rollout, but it is
+no longer carrying an undiscovered repository-only UI behavior in the audited
+source set.

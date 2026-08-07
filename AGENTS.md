@@ -23,8 +23,8 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   capability boundary, and replaceable desktop webview host.
 - `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
   view, markdown, terminal). No trouve-specific types in their public APIs.
-- `crates/trouve-app` — main desktop application; retains the Slint frontend
-  during the gated Lit/webview migration.
+- `crates/trouve-app` — main desktop application; ships Lit in Wry by default
+  and retains the Slint frontend as an explicit rollback during rollout.
 - `crates/trouve-servo-embed-preview` — disposable, chrome-free Servo
   embedding qualification harness. It is an excluded nested Cargo workspace
   with its own lockfile, not the shipping desktop host (ADR 0024).
@@ -72,7 +72,9 @@ These are load-bearing. Do not violate them without a new ADR.
    nightly and the product server require incompatible native SQLite link
    versions, but its first-party version and internal pins are still
    synchronized to the root version (ADRs 0024 and 0025).
-9. **The web host is not a second client protocol.** The desktop gateway may
+9. **The web host is not a second client protocol.** Wry/Lit is the default
+   desktop frontend and Slint remains the explicit rollback (ADR 0027). The
+   desktop gateway may
    serve assets, proxy HTTP/SSE, and expose narrowly typed native capabilities
    such as window state, pickers, clipboard, notifications, and external-open.
    It never carries durable agent state or arbitrary filesystem, shell, URL,
@@ -80,7 +82,10 @@ These are load-bearing. Do not violate them without a new ADR.
    harness state and effects through `trouve-server` (ADR 0023). Runtime asset
    directories and Vite proxying are explicit development/qualification
    sources, remain loopback-only behind the same gateway origin, and are never
-   enabled by shipping product hosts (ADR 0026).
+   enabled by shipping product hosts (ADR 0026). The default Wry process owns
+   one embedded server through `trouve_server::bind_local`; comparison and
+   Servo qualification hosts require an explicit server URL and never open
+   the default database.
 
 ## Conventions
 

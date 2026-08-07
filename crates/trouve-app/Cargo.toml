@@ -2,14 +2,21 @@
 name = "trouve-app"
 version.workspace = true
 edition.workspace = true
-description = "trouve desktop client: Slint UI over the trouve protocol."
+description = "trouve desktop client: Lit/Wry UI over the trouve protocol, with a Slint rollback frontend."
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+autobins = false
+default-run = "trouve"
 
 [[bin]]
 name = "trouve"
+path = "src/wry_main.rs"
+required-features = ["web-preview"]
+
+[[bin]]
+name = "trouve-slint"
 path = "src/main.rs"
 
 [[bin]]
@@ -23,9 +30,9 @@ path = "src/servo_preview.rs"
 required-features = ["servo-preview"]
 
 [features]
-default = []
-# Qualification/rollback preview only. Slint remains the product default until
-# the webview, parity, accessibility, memory, and soak gates pass (ADR 0023).
+default = ["web-preview"]
+# Wry is the staged product default. The feature name remains stable for the
+# explicit comparison binary and existing qualification scripts (ADR 0027).
 web-preview = ["dep:tao", "dep:trouve-desktop-host", "dep:wry"]
 # First-pass Servo qualification runner. This launches a pinned external
 # servoshell against the same hardened asset/protocol gateway; it is not the
@@ -82,8 +89,9 @@ mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
 
-# Maintained system-webview candidate. Optional so ordinary offline builds and
-# Slint rollback artifacts do not acquire WebKitGTK/WebView2 requirements.
+# Maintained default system-webview host. These stay optional so the explicit
+# `--no-default-features --bin trouve-slint` rollback does not acquire
+# WebKitGTK/WebView2 requirements.
 tao = { version = "0.36.0", optional = true }
 wry = { version = "0.56.0", optional = true }
 

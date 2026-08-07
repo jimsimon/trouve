@@ -1,6 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+import { stabilizeVisualFonts } from "./visual-fonts";
+
 const pr = {
   host: "github.com",
   repository: "acme/app",
@@ -282,6 +284,7 @@ test("one durable pull-request projection drives the session badge and dashboard
   await expect(page.getByText("Make it better", { exact: true })).toBeVisible();
 
   if (browserName === "chromium") {
+    await stabilizeVisualFonts(page);
     await page.locator("trouve-pull-requests-dashboard").evaluate((dashboard) => {
       const status = dashboard.shadowRoot?.querySelector<HTMLElement>(".refresh-status");
       if (status !== null && status !== undefined) status.style.visibility = "hidden";
@@ -521,6 +524,8 @@ test("management screens retain their reviewed desktop geometry", async ({ page 
   ]) {
     await page.goto(screen.path);
     await expect(page.getByRole("heading", { name: screen.heading, exact: true })).toBeVisible();
+
+    await stabilizeVisualFonts(page);
 
     const result = await new AxeBuilder({ page })
       .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])

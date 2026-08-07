@@ -35,6 +35,7 @@ const auditedSources = [
   "crates/trouve-app/src/web_preview.rs",
   "crates/trouve-app/src/web_preview_support.rs",
   "crates/trouve-app/src/winstate.rs",
+  "crates/trouve-app/src/wry_main.rs",
   "crates/trouve-app/ui/app.slint",
   "crates/trouve-app/ui/automations-screen.slint",
   "crates/trouve-app/ui/connectivity-banner.slint",

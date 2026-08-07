@@ -356,7 +356,7 @@ trouve-session-list { display: block; }
 }
 .message p { margin: 0; }
 .tool-card { min-width: 0; max-width: 100%; margin-top: 8px; overflow: visible; border: 0; border-radius: 0; background: transparent; }
-.tool-card summary { min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: hidden; padding: 2px 8px; cursor: pointer; list-style: none; }
+.tool-card summary { position: relative; min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: hidden; padding: 2px 8px; cursor: pointer; list-style: none; }
 .tool-card summary:hover { background: var(--trouve-hover-bg); }
 .tool-card.approval-required .tool-approval-actions { margin-inline-start: auto; }
 .tool-card summary::-webkit-details-marker { display: none; }
@@ -364,7 +364,7 @@ trouve-session-list { display: block; }
 .tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--trouve-text-mid); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .tool-card pre { min-width: 0; max-width: 100%; margin: 0; padding: 10px; overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.5 var(--trouve-font-mono); overflow-wrap: anywhere; white-space: pre-wrap; }
 .tool-disclosure { width: 10px; flex: none; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
-.tool-status { position: absolute; z-index: 3; inset-block-start: calc((29px - 10px) / 2); inset-inline-start: -17.5px; width: 10px; height: 10px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 10px; line-height: 1; text-align: center; pointer-events: none; }
+.tool-status { position: absolute; z-index: 3; inset-block-start: 50%; inset-inline-start: -17.5px; width: 10px; height: 10px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 10px; line-height: 1; text-align: center; transform: translateY(-50%); pointer-events: none; }
 .tool-status-icon { --trouve-icon-width: 10px; }
 .tool-status.running { color: var(--trouve-accent); }
 .tool-status.ok { color: var(--trouve-ok); }
@@ -866,7 +866,7 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
   overflow: auto;
   background: var(--trouve-win-bg);
 }
-.new-session-screen[hidden] { display: none; }
+.new-session-screen[hidden] { display: none !important; }
 .new-session-screen form {
   width: 100%;
   min-height: 100%;

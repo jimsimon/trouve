@@ -36,3 +36,4 @@ sequentially.
 | [0024](0024-isolated-servo-embedding-qualification-workspace.md) | Isolated Servo embedding qualification workspace | Accepted |
 | [0025](0025-pin-servo-qualification-to-nightly-revision.md) | Pin Servo qualification to a nightly revision | Accepted |
 | [0026](0026-desktop-frontend-asset-sources.md) | Desktop frontend asset sources | Accepted |
+| [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Accepted |

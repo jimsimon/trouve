@@ -34,8 +34,9 @@ The recommendation is a conditional go:
   host. It proves that Trouve can create and drive a direct Servo `WebView`,
   but it does not by itself satisfy accessibility-action, native-capability,
   crash-recovery, packaging, visual-parity, platform, or memory gates.
-- Retain the maintained Wry system-webview host as the fallback and comparison
-  path. It must still pass its own qualification matrix before promotion.
+- Use the maintained Wry system-webview host as the staged default and retain
+  its explicit comparison mode. Its qualification matrix remains open under
+  ADR 0027 and must pass before Slint retirement.
 - Use a **PWA as the initial mobile application**. The PWA will reuse the Lit
   frontend, connect to a remote Trouve server over the public protocol, and
   expose only capabilities supported by its browser. Evaluate native mobile,
@@ -121,8 +122,9 @@ local-model fit and runtime lifecycle controls, and the explicit GitHub setup
 path for session pull requests. The parity ledger is the authoritative
 surface-by-surface evidence and additive-feature register.
 
-This checkpoint is deliberately **not** desktop promotion or PWA publication.
-Slint remains the default and rollback frontend. Production PWA HTTPS
+ADR 0027 now makes this checkpoint a **reversible staged desktop promotion**,
+not a claim of completed qualification or PWA publication. Wry is the default
+and Slint remains the rollback frontend. Production PWA HTTPS
 authentication/deployment, broader cross-language fixtures, automated
 Slint-versus-Lit screenshots, keyboard/focus and assistive-technology/device
 matrices, memory and performance budgets, six-platform packaging, security
@@ -146,9 +148,9 @@ the default, while the plan's desktop split-diff and code/diff search features
 are now wired into the real inspection workflow as documented, opt-in
 enhancements.
 
-This is implementation progress only: full visual parity is not claimed,
+This is implementation and staged-rollout progress only: full visual parity is not claimed,
 the existing ad-hoc local comparisons do not satisfy the deterministic paired
-evidence matrix, and every Servo/Wry promotion gate remains open.
+evidence matrix, and the remaining Servo/Wry qualification gates stay open.
 
 That run also demonstrated that the desktop gateway's no-dynamic-code CSP is
 an effective qualification constraint: runtime Ajv compilation was blocked.
@@ -162,7 +164,7 @@ Current phase status is deliberately conservative:
 | --- | --- | --- |
 | 0 — baseline | In progress | Complete Slint screenshots, interaction fixtures, workloads, and measured baselines. |
 | 1 — decisions and gates | Architecture accepted | Approve the evidence matrix and close all unresolved deviations. |
-| 2 — engine qualification | Chrome-free, exact-revision Servo nightly harness and Wry fallback implemented; both unqualified | Run the complete six-platform accessibility-action, hard-widget, lifecycle, recovery, packaging, memory, performance, and visual-parity matrix. The existence of the embedder is only first-pass evidence. |
+| 2 — engine qualification | Chrome-free, exact-revision Servo nightly harness and default Wry host implemented; both remain incompletely qualified | Run the complete six-platform accessibility-action, hard-widget, lifecycle, recovery, packaging, memory, performance, and visual-parity matrix. The existence of the embedder is only first-pass evidence. |
 | 3 — foundations | Implemented for preview | Finish cross-language conformance evidence and production remote-host validation. |
 | 4 — visual system/primitives | Implemented for preview | Capture and approve all five-theme, state, viewport, keyboard, focus, and accessibility comparisons against Slint. |
 | 5 — hard widgets | Functionally ported; unqualified | Qualify rendering, selection, disposal, IME, scale, touch, accessibility alternatives, memory, and performance. |
@@ -171,7 +173,7 @@ Current phase status is deliberately conservative:
 | 8 — inspections | Functionally ported; unqualified | Qualify review/checkpoint behavior and the desktop and capability-gated PWA workflows. |
 | 9 — management/settings | Functionally ported; unqualified | Attach visual, desktop, and PWA evidence to every ledger item and complete live-service failure matrices. |
 | 10 — soak | Not started | Run the dual-frontend functional, visual, accessibility, security, memory, performance, update, and recovery soak. |
-| 11 — promote | Blocked by gates | Keep Slint as default until every independent desktop or PWA promotion condition passes. |
+| 11 — promote | Reversible Wry default authorized by ADR 0027 | Complete the independent desktop qualification and rollout evidence while keeping Slint rollback; PWA promotion remains separately blocked. |
 | 12 — retire/evaluate | Deferred | Retire Slint only after a successful default-release soak; evaluate post-PWA mobile options from measured usage. |
 
 ### Qualification-preview runbook
@@ -187,6 +189,15 @@ npm test
 npm run build
 npm run build:pwa
 npm run verify:build-modes
+```
+
+The normal Wry desktop is now the default. It embeds exactly one local server
+when `TROUVE_SERVER_URL` is absent, or connects to the selected server when the
+variable is present. With Vite already running, launch the normal app with:
+
+```sh
+TROUVE_APP_UI_DEV_URL=http://127.0.0.1:5173 \
+  cargo run -p trouve-app
 ```
 
 Desktop qualification reuses exactly one already-running `trouve-server`.
@@ -226,7 +237,8 @@ Direct embedding is now implemented, but native Wayland and X11/XWayland must
 still be tested independently along with every other supported target. A
 successful window on one backend is not a platform qualification pass.
 
-Use the Wry/system-webview host as the fallback and comparison run:
+Use the explicit Wry/system-webview comparison host without opening the
+default database:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
@@ -243,7 +255,8 @@ embedding it into the Rust binary. To use HMR, run `npm run dev` from
 desktop gateway stays the webview origin: it proxies Vite assets while keeping
 native-capability and `/v1` routes local to the gateway.
 
-These commands do not change the default `trouve` binary. `dist/pwa` is a
+The `trouve` binary is the Wry product host; `trouve-slint` is its explicit
+rollback. `dist/pwa` is a
 separate deployable artifact and must not be passed to either desktop build.
 Both qualification hosts reject invalid desktop assets and an older,
 newer-major, or malformed server protocol before opening the preview. Build a
@@ -607,9 +620,9 @@ qualification failure.
 
 ### System-webview qualification
 
-Retain Wry or a similarly maintained thin system-webview host as the fallback
-and comparison path after the initial Servo run. Wry must be qualified even if
-Servo's first rendering pass looks viable.
+Use Wry as the staged default and retain its explicit comparison path after the
+initial Servo run. Wry must still be qualified even if Servo's first rendering
+pass looks viable.
 Wry maps to WebKitGTK on Linux, WKWebView on macOS, and WebView2 on Windows,
 but Linux runtime dependencies, Wayland integration, accessibility, and
 cross-compilation still require validation for Trouve’s six desktop targets.
@@ -1131,7 +1144,7 @@ trigger.
 ### Phase 2 — desktop engine qualification
 
 Run the pinned, chrome-free, in-process Servo nightly qualification harness
-first, then the Wry fallback/comparison host. Test recreation, resize/DPI,
+first, then the Wry comparison host. Test recreation, resize/DPI,
 focus/IME/dead keys,
 clipboard, drag/drop, pickers/downloads/navigation, custom elements/Shadow DOM/
 forms/observers, Lit context/signals/tasks, WebAwesome, all hard widgets,
@@ -1228,11 +1241,12 @@ unexplained visual differences before promotion.
 **Exit:** no severity-one parity, visual, security, growth, platform, or PWA
 data-handling failure remains.
 
-### Phase 11 — promote
+### Phase 11 — promote and qualify
 
-Promote desktop only when the engine passes, functional and visual parity
-passes, assets are complete/offline, Slint rollback remains, diagnostics/docs
-are updated, and rollback is reproducible. Publish PWA only when HTTPS/auth/
+ADR 0027 authorizes Wry as a staged default while the remaining engine,
+functional, visual, packaging, and soak evidence is completed. Keep Slint
+rollback, diagnostics, and rollback reproduction current throughout that
+rollout. Publish PWA only when HTTPS/auth/
 service-worker/update/mobile AT/background-resume and visual-identity gates
 independently pass. They may ship in different releases.
 
@@ -1491,7 +1505,7 @@ to solve the hard widgets, Slint must be deleted before soak, the migration is
 used as an implicit redesign, the PWA is expected to provide unsupported native
 behavior, or parallel paths cannot be maintained.
 
-Desktop promotion requires:
+Desktop qualification and Slint retirement require:
 
 - All 21 desktop surfaces pass functional and visual parity.
 - Themes, semantic colors, layout, density, hierarchy, and core UX remain

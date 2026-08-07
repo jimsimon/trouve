@@ -1,12 +1,12 @@
 # UX screen map
 
 The shared information architecture and screen inventory for every trouve
-client. The Slint desktop remains the product default, rollback path, and
-visual baseline during the gated Lit/webview migration. The feature-gated
-Servo-first embedder and system-webview fallback are qualification previews,
-not promoted replacements; the same Lit frontend supplies the initial mobile
-PWA. `trouve-client-core` and protocol fixtures define shared semantics while
-rendering layers adapt layout without redesigning the experience.
+client. The Lit/Wry desktop is the staged product default; Slint remains the
+rollback path and visual baseline while qualification and soak evidence is
+collected. The Servo-first embedder remains a qualification preview; the same
+Lit frontend supplies the initial mobile PWA. `trouve-client-core` and protocol
+fixtures define shared semantics while rendering layers adapt layout without
+redesigning the experience.
 
 ## Design principles
 
@@ -135,23 +135,22 @@ capability evidence; they are not a prerequisite for the initial delivery.
 
 The Lit application now implements the named screens and the existing Slint
 `AppWindow` callback contract across the exact-nightly Servo embedder, the
-feature-gated system-webview host, and the responsive PWA. The desktop hosts
+default system-webview host, and the responsive PWA. The desktop hosts
 expose the versioned typed capability boundary for preferences, pickers,
 clipboard, validated local-file and HTTPS opening, notifications, attention,
 sleep, and window/lifecycle state. The PWA uses browser capability adapters
 and retains explicit fallbacks or explanations where the browser cannot
 provide the equivalent operation.
 
-This functional closure is evidence for qualification, not evidence that
-desktop promotion is complete. Native and browser notification paths are
+This functional closure supports the staged default in ADR 0027; it is not a
+claim that desktop qualification is complete. Native and browser notification paths are
 wired, including preference gating, event-derived summaries, focused-session
 suppression, activation routing, and a user-initiated test; dependable PWA
 background delivery remains a publication gate. Promotion still requires the
 platform, accessibility, security, memory, widget, visual-parity,
 offline-packaging, rollback, and soak gates in
-[ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md). Until those gates
-pass, desktop workflows that require an unavailable native capability continue
-to use the Slint default.
+[ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md). Slint remains the
+explicit rollback while those gates and the Wry rollout are completed.
 
 ## Key workflows
 

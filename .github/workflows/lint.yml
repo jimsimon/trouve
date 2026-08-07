@@ -101,8 +101,11 @@ jobs:
             web/app-ui/dist/npm-sbom.cdx.json
             target/compliance/rust-sbom.cdx.json
           if-no-files-found: error
-      - name: packaged system-webview preview
-        run: cargo check -p trouve-app --features web-preview --bin trouve-web-preview
+      - name: Wry default and desktop rollback targets
+        run: |
+          cargo check -p trouve-app --bin trouve
+          cargo check -p trouve-app --features web-preview --bin trouve-web-preview
+          cargo check -p trouve-app --no-default-features --bin trouve-slint
         env:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
       - name: Servo nested-workspace dependency graph

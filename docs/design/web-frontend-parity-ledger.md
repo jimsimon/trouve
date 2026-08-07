@@ -57,8 +57,9 @@ Current status totals:
 ## Non-negotiable parity contract
 
 The existing Slint frontend is the visual and interaction baseline throughout
-the migration. Slint remains the default and rollback frontend until the
-promotion gates in the migration plan pass. The primary baseline sources are
+the migration. Wry/Lit is the staged default under ADR 0027; Slint remains the
+rollback frontend until the qualification and soak gates pass. The primary
+baseline sources are
 the [Slint application](../../crates/trouve-app/ui/app.slint), the
 [authoritative Slint theme definitions](../../crates/trouve-app/src/theme.rs),
 the retained generic
@@ -139,7 +140,7 @@ The main cross-cutting implementation anchors are:
 - [Wry database-safe preview bootstrap](../../crates/trouve-app/src/web_preview_support.rs)
 - [chrome-free pinned Servo nightly embedding harness](../../crates/trouve-servo-embed-preview/README.md)
 - [Servo database-safe host bootstrap](../../crates/trouve-servo-embed-preview/src/web_preview_support.rs)
-- [Wry fallback preview](../../crates/trouve-app/src/web_preview.rs)
+- [Wry default and comparison host](../../crates/trouve-app/src/web_preview.rs)
 - [PWA service worker](../../web/app-ui/src/pwa/service-worker.ts)
 - [shared Rust/web thread projection fixture](../../crates/trouve-client-core/fixtures/thread-turn.json)
 - [bounded live tool-output projection](../../web/app-ui/src/state/tool-output.ts)
@@ -177,8 +178,8 @@ an explicit qualification item rather than a claimed engine capability.
 This establishes a real in-process, chrome-free embedding path; it does not
 close text-selection, accessibility-action, native-capability,
 renderer-recreation, lifecycle, crash/OOM-recovery, memory/performance,
-visual-parity, packaging, or six-platform gates. Wry remains the fallback and
-comparison host and is also unqualified.
+visual-parity, packaging, or six-platform gates. Wry is the staged default and
+remains incompletely qualified across that external matrix.
 
 The Servo harness is an excluded nested Cargo workspace with its own lockfile,
 as recorded in [ADR 0024](../adr/0024-isolated-servo-embedding-qualification-workspace.md).
@@ -189,11 +190,12 @@ link or start `trouve-server`. It requires and probes an explicit
 `TROUVE_SERVER_URL`, reaches
 that server only through the hardened loopback gateway, and gives both Servo
 storage and host preferences retained temporary directories. It cannot open
-Trouve's default database. The Wry comparison host likewise requires an
-explicit server URL and must not create a second database owner. These are
-data-integrity constraints: two live engines over one SQLite database would
-have competing writers and separate in-memory event broadcasts, schedulers,
-turn state, and worktree locks.
+Trouve's default database. The explicit Wry comparison host likewise requires
+a server URL and must not create a second database owner; the normal Wry
+product host instead owns one embedded server when no URL is configured. These
+are data-integrity constraints: two live engines over one SQLite database
+would have competing writers and separate in-memory event broadcasts,
+schedulers, turn state, and worktree locks.
 
 From the repository root, after building `web/app-ui/dist/desktop`, run Servo
 first:
@@ -206,7 +208,7 @@ TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/app-ui/dist/desktop \
     --locked
 ```
 
-Use Wry only as the fallback/comparison run:
+Use the explicit Wry comparison host without opening the default database:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
@@ -303,8 +305,9 @@ xterm input/resize are examples.
 
 Surfaces 1–20 are **functionally-ported**. Surface 21 is **gated** because its
 implementation exists but no desktop engine or production PWA deployment may
-be promoted without the independent evidence above. This state does not
-authorize deleting Slint or changing the default frontend.
+be treated as fully qualified without the independent evidence above. ADR 0027
+authorizes a reversible Wry default, but this state does not authorize deleting
+Slint or publishing the PWA.
 
 ## Historical detailed implementation record
 
@@ -1124,8 +1127,9 @@ remains open.
   snapshot.
 - The in-process Servo harness pinned to the exact 2026-08-02 nightly at
   revision `35672cc3d4beb768489f5218e73bee7aff0ddb01` exercises that packaged
-  gateway first; Wry provides the fallback/comparison path. Both connect to one
-  explicitly selected server. The nested Servo harness structurally cannot
+  gateway first; Wry is the staged default and also provides an explicit
+  comparison path. Qualification hosts connect to one explicitly selected
+  server. The nested Servo harness structurally cannot
   link or start `trouve-server`, uses temporary storage and host-preference
   directories, and cannot open the default database.
 - A native Wayland smoke run on 2026-08-02 created the window successfully and
@@ -1149,7 +1153,7 @@ remains open.
   while PWA and remote deployments remain explicitly unsupported.
 - The Lit client consumes a typed host/capability abstraction, while the PWA
   uses a separate adapter with no implied native access.
-- The desktop webview remains feature-gated, with Slint as the default and
+- The desktop Wry host is the default, with Slint retained as the explicit
   rollback path.
 
 **Primary Lit/host evidence**
@@ -1163,7 +1167,7 @@ remains open.
 - [Servo embedding harness](../../crates/trouve-servo-embed-preview/src/main.rs)
 - [Servo database-safe host bootstrap](../../crates/trouve-servo-embed-preview/src/web_preview_support.rs)
 - [Servo harness runbook](../../crates/trouve-servo-embed-preview/README.md)
-- [Wry fallback preview](../../crates/trouve-app/src/web_preview.rs)
+- [Wry default and comparison host](../../crates/trouve-app/src/web_preview.rs)
 - [ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md)
 - [ADR 0024](../adr/0024-isolated-servo-embedding-qualification-workspace.md)
 
@@ -1185,7 +1189,8 @@ remains open.
   native capabilities, renderer recreation, crash/OOM containment, packaging,
   lifecycle, memory/performance budgets, visual parity, and the complete
   platform/display-backend matrix. The direct embedding smoke test is not an
-  engine-promotion result. Qualify Wry independently as the fallback.
+  engine-promotion result. Complete Wry's independent staged-default
+  qualification before retiring Slint.
 - Finish production PWA HTTPS authentication/deployment, allowed origins,
   service-worker scope/caching rules, OAuth behavior, offline shell, install/
   update behavior, and real phone/tablet/browser qualification. Never expose a
@@ -1428,8 +1433,8 @@ Functional closure does not advance any evidence field automatically: failure
 injection, lifecycle, visual, keyboard, accessibility, device, performance,
 memory, security, packaging, and soak results must be recorded independently.
 
-No surface may be treated as parity-qualified, and the Lit frontend may not
-replace Slint by default, until:
+No surface may be treated as parity-qualified, and Slint may not be retired,
+until:
 
 1. every required evidence field has a linked artifact and reviewer;
 2. all five themes preserve the Slint visual/semantic contract;
@@ -1441,7 +1446,8 @@ replace Slint by default, until:
    and
 7. rollback remains proven until the migration plan explicitly retires it.
 
-The PWA can be evaluated and released on its own evidence path without making
-an unqualified desktop engine the default. A later decision to pursue another
-mobile packaging model requires evidence from the initial PWA and, when it
-changes the load-bearing architecture, a new or superseding ADR.
+ADR 0027 separately authorizes the reversible Wry default while this evidence
+is collected. The PWA can be evaluated and released on its own evidence path.
+A later decision to pursue another mobile packaging model requires evidence
+from the initial PWA and, when it changes the load-bearing architecture, a new
+or superseding ADR.

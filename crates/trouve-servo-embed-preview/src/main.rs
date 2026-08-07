@@ -185,7 +185,7 @@ fn main() -> Result<()> {
         text_selection = "keyboard-in-editable-controls",
         temporary_storage = true,
         browser_chrome = false,
-        "launching qualification-only in-process Servo adapter; Slint remains the product default"
+        "launching qualification-only in-process Servo adapter; Wry is the product default and Slint remains the rollback"
     );
 
     let run_result = event_loop

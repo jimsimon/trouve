@@ -61,12 +61,12 @@ service, deployment, or longitudinal evidence.
 
 | Plan section | Repository implementation | Automated evidence | Status / remaining gate |
 | --- | --- | --- | --- |
-| Outcome | Shared Lit frontend, protocol-only desktop/PWA clients, Wry fallback, pinned direct Servo embedder, PWA-first mobile strategy, retained Slint rollback. | Build-mode checks and host/protocol boundary tests. | Implemented; promotion remains gated. |
-| 1. Current baseline | Slint and Rust surfaces remain present while the Lit port is feature-gated. | Callback manifest extracts all 134 Slint callbacks. | Functional inventory closed; measured baseline evidence remains. |
+| Outcome | Shared Lit frontend, protocol-only Wry desktop/PWA clients, pinned direct Servo embedder, PWA-first mobile strategy, retained Slint rollback. | Build-mode checks and host/protocol boundary tests. | Implemented; Wry is the staged default and qualification remains open. |
+| 1. Current baseline | Slint and Rust surfaces remain present as the rollback and visual baseline during the Wry rollout. | Callback manifest extracts all 134 Slint callbacks. | Functional inventory closed; measured baseline evidence remains. |
 | 2. Visual continuity | Slint-derived generated palettes, semantic tokens, compact geometry, responsive shell, five-theme gallery, fixed browser snapshots, forced-colors and 200% text cases. | Theme generator drift test, visual-contract tests, Playwright snapshots, axe. | Lit baselines exist; paired Slint/Lit approval matrix remains external. |
-| 3. Target architecture | `web/app-ui`, `trouve-desktop-host`, Wry preview, isolated Servo preview, HTTP/SSE state path, typed native boundary, separate desktop/PWA builds. | Cargo boundary tests, protocol/host schema tests, build-mode verifier. | Implemented. |
-| 4. ADRs/design | ADRs 0023–0026 record web stack/host, Servo isolation, the exact nightly pin, and asset-source policy; plan and ledger remain living records. | Version/ADR-linked source invariants. | Implemented. |
-| 5. Engine decision | Chrome-free in-process Servo `WebView` pinned to revision `35672cc3d4beb768489f5218e73bee7aff0ddb01`; Wry system-webview fallback; both require one explicit server and cannot open the default DB. | Root metadata gate plus path/nightly nested-workspace `cargo test`; Wry feature check. | Embedders implemented; six-platform, AT-action, recovery, packaging, visual, memory, and performance qualification remains external. |
+| 3. Target architecture | `web/app-ui`, `trouve-desktop-host`, default Wry host, isolated Servo preview, HTTP/SSE state path, typed native boundary, separate desktop/PWA builds. | Cargo boundary tests, protocol/host schema tests, build-mode verifier. | Implemented. |
+| 4. ADRs/design | ADRs 0023–0027 record web stack/host, Servo isolation, the exact nightly pin, asset-source policy, and staged Wry promotion; plan and ledger remain living records. | Version/ADR-linked source invariants. | Implemented. |
+| 5. Engine decision | Wry is the staged default and owns one embedded server when no URL is configured; the chrome-free Servo `WebView` remains pinned to revision `35672cc3d4beb768489f5218e73bee7aff0ddb01` for qualification. Explicit comparison hosts require one server and cannot open the default DB. | Root metadata gate plus path/nightly nested-workspace `cargo test`; default and comparison Wry checks. | Embedders implemented; six-platform, AT-action, recovery, packaging, visual, memory, and performance qualification remains external. |
 | 6. Lit versus Preact | Lit 3 is the only application component runtime; no Preact/React application layer, SSR, hydration, or Node renderer. | Dependency inventory and bundle inspection. | Implemented. |
 | 7. State model | Normalized application store, stable service/store/capability contexts, route-scoped workspace/session/thread contexts, terminal scope, contained signals adapter, cursor controllers, local UI state, typed preference persistence. | State, context boundary, subscription-count, ingress, resume, and preference tests. | Implemented. |
 | 7. Workers | One lazy bounded content worker handles Markdown/sanitization, source highlighting, diff preparation, composer/palette fuzzy matching; pure direct fallbacks preserve behavior; idle termination releases it. | Worker lifecycle/fallback tests, worker TypeScript build, emitted-worker bundle budget, browser worker smoke through the gallery. | Implemented. |
@@ -86,7 +86,7 @@ service, deployment, or longitudinal evidence.
 | 15. PWA deployment | Deterministic PWA artifact and metadata exist. | PWA build/cache tests. | Hosting/auth/HTTPS/atomic rollout/post-deploy smoke require deployment infrastructure and security approval. |
 | 15. Versions/licenses | Root version synchronization includes first-party Cargo/Node/Servo artifacts; generated npm and Rust dependency inventories; WebAwesome Free/Slint policy recorded; CycloneDX npm and Rust SBOMs uploaded by CI. | Version sync and notice/license allowlist checks. | Implemented for repository artifacts; final packaged-notice inspection remains promotion evidence. |
 | 16. Gains/losses/cost | Architectural consequences are reflected in the implementation and rollback strategy. | Not an executable requirement. | Recorded. |
-| 17. Go/no-go | Slint remains default; neither desktop engine nor public PWA is promoted; rollback stays intact. | Feature gates and conservative evidence ledger. | Correctly blocked until the definition-of-done evidence is current. |
+| 17. Go/no-go | ADR 0027 authorizes Wry as a reversible staged default; Slint remains the rollback and the public PWA is not promoted. | Default-target checks and conservative evidence ledger. | Default switched; qualification, rollout, and retirement evidence remains open. |
 
 ## Defects and gaps closed by this audit
 
@@ -249,7 +249,7 @@ environment limitation is recorded as a promotion pass.
 | Production PWA security | No public origin, identity provider, TLS termination, revocation policy, or deployment authority is in scope. | Approved threat model/config, authenticated HTTPS deployment, headers/origin/CSRF/revocation tests, rollout/rollback smoke. |
 | Six-target packaging | The current host cannot build, sign, install, and inspect every Linux/macOS/Windows architecture. | Release artifacts and install/smoke evidence for the supported matrix. |
 | Dual-frontend soak | Soak is longitudinal release evidence, not a code-generation task. | Current functional/visual/a11y/security/performance/recovery soak results. |
-| Promotion/retirement | Changing the default and deleting Slint are product/release decisions gated on all evidence above. | Explicit go decision, proven rollback, successful default-release soak. |
+| Qualification/retirement | ADR 0027 supplies the explicit reversible-default decision; deleting Slint remains gated on all evidence above. | Proven rollback, completed qualification, successful default-release soak. |
 
 ## Promotion-safe conclusion
 

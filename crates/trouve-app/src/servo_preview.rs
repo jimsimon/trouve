@@ -3,8 +3,8 @@
 //! This binary is deliberately not a shipping desktop host. It launches the
 //! pinned Servo shell as a separate process so the real packaged frontend can
 //! be exercised while Servo's embedding, accessibility, lifecycle, and native
-//! capability gaps are evaluated. Slint remains the product default and
-//! rollback path.
+//! capability gaps are evaluated. Wry is the staged product default and Slint
+//! remains the rollback path.
 //!
 //! Servo 0.4.0's experimental web-platform bundle is an explicit qualification
 //! condition: without it CSS Grid is disabled and the Lit shell's layout is not

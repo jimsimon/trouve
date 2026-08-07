@@ -2423,7 +2423,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         viewport.clientHeight * CHAT_HISTORY_PREFETCH_VIEWPORTS,
       ),
     );
-    if (viewport.scrollTop <= historyPrefetchThreshold) {
+    // Prepend corrections and virtual-row measurement can emit scroll events
+    // while the reader remains inside the threshold. Only an actual input
+    // gesture may advance another page; otherwise one wheel tick can walk the
+    // complete transcript after each prepend settles.
+    if (userInitiated && viewport.scrollTop <= historyPrefetchThreshold) {
       void this.#loadOlderHistory(false);
     }
     if (!before.followingTail && after.followingTail) {

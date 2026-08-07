@@ -1,6 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
+import { stabilizeVisualFonts } from "./visual-fonts";
+
 const themes = [
   "dark",
   "light",
@@ -14,6 +16,7 @@ const openGallery = async (page: Page): Promise<void> => {
   await page.locator("trouve-component-gallery").waitFor();
   await page.locator(".gallery-theme").first().waitFor();
   await page.locator("trouve-terminal-view .xterm").waitFor();
+  await stabilizeVisualFonts(page);
   await page.addStyleTag({
     content: `
       *, *::before, *::after {

@@ -1,10 +1,9 @@
-//! Shared bootstrap and lifecycle for desktop webview qualification hosts.
+//! Shared bootstrap and lifecycle for desktop Wry and qualification hosts.
 //!
-//! Preview hosts are clients of an already-running `trouve-server`. They must
-//! never silently create a second engine against the default data directory:
-//! two engines would contend for SQLite's single WAL writer and would have
-//! independent in-memory schedulers and event broadcasts for the same durable
-//! state.
+//! The product host owns one embedded `trouve-server` unless an explicit
+//! `TROUVE_SERVER_URL` selects another process. Qualification hosts always
+//! require that explicit URL so they cannot silently become a second owner of
+//! the default database.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -32,6 +31,7 @@ const SERVER_URL_ENV: &str = "TROUVE_SERVER_URL";
 pub struct WebPreviewHost {
     gateway_origin: String,
     gateway_task: Option<JoinHandle<()>>,
+    embedded_server_task: Option<JoinHandle<()>>,
     runtime: Option<Runtime>,
     #[allow(dead_code)]
     initial_preferences: HostPreferences,
@@ -47,7 +47,7 @@ impl WebPreviewHost {
     // also compiled independently for the Wry binary.
     #[allow(dead_code)]
     pub fn start(frontend: FrontendSource) -> Result<Self> {
-        Self::start_with_actions(frontend, native_actions())
+        Self::start_with_actions(frontend, native_actions(), false)
     }
 
     /// Start the gateway with an application-owned, event-loop-backed
@@ -61,7 +61,11 @@ impl WebPreviewHost {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Option<PathBuf>, String>> + Send + 'static,
     {
-        Self::start_with_actions(frontend, native_actions().with_directory_picker(picker))
+        Self::start_with_actions(
+            frontend,
+            native_actions().with_directory_picker(picker),
+            false,
+        )
     }
 
     /// Start with the complete, explicitly app-owned native action set.
@@ -70,19 +74,52 @@ impl WebPreviewHost {
         frontend: FrontendSource,
         native_actions: HostNativeActions,
     ) -> Result<Self> {
-        Self::start_with_actions(frontend, native_actions)
+        Self::start_with_actions(frontend, native_actions, false)
+    }
+
+    /// Start the shipping desktop host. With no configured upstream, this
+    /// process becomes the single owner of the local server and database.
+    // The shared support module is also compiled into qualification binaries.
+    #[allow(dead_code)]
+    pub fn start_product_with_native_actions(
+        frontend: FrontendSource,
+        native_actions: HostNativeActions,
+    ) -> Result<Self> {
+        Self::start_with_actions(frontend, native_actions, true)
     }
 
     fn start_with_actions(
         frontend: FrontendSource,
         native_actions: HostNativeActions,
+        allow_embedded_server: bool,
     ) -> Result<Self> {
         trouve_server::install_crypto_provider();
-        let upstream = required_server_url(std::env::var(SERVER_URL_ENV).ok())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .context("creating the desktop preview runtime")?;
+            .context("creating the desktop host runtime")?;
+
+        let configured_upstream =
+            configured_server_url(std::env::var(SERVER_URL_ENV).ok(), allow_embedded_server)?;
+        let (upstream, embedded_server_task) = match configured_upstream {
+            Some(upstream) => (upstream, None),
+            None => {
+                let (address, server) = runtime
+                    .block_on(trouve_server::bind_local(
+                        "127.0.0.1:0"
+                            .parse()
+                            .expect("static loopback address parses"),
+                        trouve_server::ServerSecurity::loopback(),
+                    ))
+                    .context("binding the embedded trouve server")?;
+                let server_task = runtime.spawn(async move {
+                    if let Err(error) = server.await {
+                        tracing::error!(%error, "embedded trouve server stopped");
+                    }
+                });
+                (format!("http://{address}"), Some(server_task))
+            }
+        };
 
         let protocol = ProtocolClient::new(&upstream);
         let server_info = runtime
@@ -91,9 +128,9 @@ impl WebPreviewHost {
                     .await
                     .context("timed out after 5 seconds")?
             })
-            .with_context(|| format!("connecting desktop preview to {upstream}"))?;
+            .with_context(|| format!("connecting desktop host to {upstream}"))?;
         ensure_compatible_protocol(&server_info.protocol_version, PROTOCOL_VERSION)
-            .with_context(|| format!("connecting desktop preview to {upstream}"))?;
+            .with_context(|| format!("connecting desktop host to {upstream}"))?;
         // Resolve a requested file through the public protocol on every
         // action, then canonicalize it beneath that session's worktree. The
         // gateway advertises this adapter only for a loopback protocol server.
@@ -144,6 +181,7 @@ impl WebPreviewHost {
         Ok(Self {
             gateway_origin: format!("http://{gateway_address}"),
             gateway_task: Some(gateway_task),
+            embedded_server_task,
             runtime: Some(runtime),
             initial_preferences,
             preferences,
@@ -206,13 +244,22 @@ impl WebPreviewHost {
                 tracing::warn!(%error, "joining desktop frontend gateway task failed");
             }
         }
+        if let Some(server_task) = self.embedded_server_task.take() {
+            server_task.abort();
+            let result = runtime.block_on(server_task);
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!(%error, "joining embedded trouve server task failed");
+            }
+        }
         runtime.shutdown_timeout(Duration::from_secs(1));
     }
 }
 
 fn native_actions() -> HostNativeActions {
     HostNativeActions::default().with_external_https_opener(|url| {
-        crate::opener::open(url.as_url().as_str());
+        super::opener::open(url.as_url().as_str());
         Ok(())
     })
 }
@@ -223,8 +270,11 @@ impl Drop for WebPreviewHost {
     }
 }
 
-fn required_server_url(value: Option<String>) -> Result<String> {
+fn configured_server_url(value: Option<String>, allow_embedded: bool) -> Result<Option<String>> {
     let Some(value) = value else {
+        if allow_embedded {
+            return Ok(None);
+        }
         bail!(
             "{SERVER_URL_ENV} is required for desktop web previews; start or reuse a trouve-server and set {SERVER_URL_ENV} to its base URL (preview hosts never open the default database)"
         );
@@ -233,7 +283,7 @@ fn required_server_url(value: Option<String>) -> Result<String> {
     if value.is_empty() {
         bail!("{SERVER_URL_ENV} cannot be empty");
     }
-    Ok(value.to_owned())
+    Ok(Some(value.to_owned()))
 }
 
 #[cfg(test)]
@@ -242,14 +292,19 @@ mod tests {
 
     #[test]
     fn preview_requires_an_explicit_server_url() {
-        let error = required_server_url(None).unwrap_err().to_string();
+        let error = configured_server_url(None, false).unwrap_err().to_string();
         assert!(error.contains(SERVER_URL_ENV));
         assert!(error.contains("never open the default database"));
     }
 
     #[test]
+    fn product_uses_an_embedded_server_by_default() {
+        assert_eq!(configured_server_url(None, true).unwrap(), None);
+    }
+
+    #[test]
     fn preview_rejects_a_blank_server_url() {
-        let error = required_server_url(Some("  \n".into()))
+        let error = configured_server_url(Some("  \n".into()), false)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "TROUVE_SERVER_URL cannot be empty");
@@ -258,8 +313,8 @@ mod tests {
     #[test]
     fn preview_trims_its_explicit_server_url() {
         assert_eq!(
-            required_server_url(Some("  http://127.0.0.1:7433  ".into())).unwrap(),
-            "http://127.0.0.1:7433"
+            configured_server_url(Some("  http://127.0.0.1:7433  ".into()), true).unwrap(),
+            Some("http://127.0.0.1:7433".into())
         );
     }
 }

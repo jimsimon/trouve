@@ -1,12 +1,15 @@
-//! Feature-gated system-webview qualification host (ADR 0023).
+//! System-webview desktop host (ADRs 0023 and 0027).
 //!
-//! This is intentionally a second binary while Slint remains the product
-//! default and rollback path. It connects to an explicitly selected protocol
-//! server, then loads a packaged, runtime-directory, or loopback Vite Lit
-//! frontend exclusively through the hardened loopback gateway.
+//! The default `trouve` binary embeds the protocol server when no explicit
+//! server URL is configured. The `trouve-web-preview` comparison binary keeps
+//! requiring an explicit server so it remains safe to run beside another
+//! frontend. Both load Lit exclusively through the hardened loopback gateway.
 
+#[path = "opener.rs"]
 mod opener;
+#[path = "sleep.rs"]
 mod sleep;
+#[path = "web_preview_support.rs"]
 mod web_preview_support;
 
 use std::cell::RefCell;
@@ -17,6 +20,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use self::web_preview_support::WebPreviewHost;
 use rfd::AsyncFileDialog;
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
@@ -29,7 +33,6 @@ use trouve_desktop_host::{
     MAX_NATIVE_ATTACHMENT_BYTES, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS,
     NativeAttachment, NativeNotification, WindowGeometry,
 };
-use web_preview_support::WebPreviewHost;
 use wry::{NewWindowResponse, WebViewBuilder};
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
@@ -47,7 +50,12 @@ enum AppEvent {
 
 const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
 
+#[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
+    run(false)
+}
+
+pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -136,7 +144,11 @@ fn main() -> anyhow::Result<()> {
             opener::open(url.as_url().as_str());
             Ok(())
         });
-    let host = WebPreviewHost::start_with_native_actions(frontend, native_actions)?;
+    let host = if product_host {
+        WebPreviewHost::start_product_with_native_actions(frontend, native_actions)?
+    } else {
+        WebPreviewHost::start_with_native_actions(frontend, native_actions)?
+    };
     let picker_runtime = host.runtime_handle();
     let picker_closed_proxy = event_loop.create_proxy();
     let gateway_origin = host.gateway_origin().to_owned();
@@ -144,7 +156,11 @@ fn main() -> anyhow::Result<()> {
     let allowed_prefix = format!("{allowed_origin}/");
     let restored_geometry = host.initial_preferences().geometry.clone();
     let mut window_builder = WindowBuilder::new()
-        .with_title("trouve — web preview")
+        .with_title(if product_host {
+            "trouve"
+        } else {
+            "trouve — web preview"
+        })
         .with_min_inner_size(LogicalSize::new(900, 560));
     if let Some(geometry) = restored_geometry.as_ref() {
         window_builder = window_builder

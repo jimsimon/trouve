@@ -263,6 +263,7 @@ describe("Slint/Lit visual contract", () => {
     expect(shell).toContain("Use latest remote branch");
     expect(app).toMatch(/\.new-session-screen \{[^}]*grid-column:\s*3[^}]*grid-row:\s*1/s);
     expect(app).toMatch(/\.new-session-screen form \{[^}]*align-content:\s*center[^}]*padding:\s*40px/s);
+    expect(app).toMatch(/\.new-session-screen\[hidden\] \{[^}]*display:\s*none\s*!important/s);
   });
 
   it("keeps the Slint thread, turn-card, and composer geometry", () => {
@@ -314,7 +315,7 @@ describe("Slint/Lit visual contract", () => {
       /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*visible/s,
     );
     expect(app).toMatch(
-      /\.tool-card summary \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
+      /\.tool-card summary \{[^}]*position:\s*relative[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
     );
     expect(app).toMatch(
       /\.tool-card pre \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap/s,
@@ -360,7 +361,7 @@ describe("Slint/Lit visual contract", () => {
       /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before \{[^}]*display:\s*none/s,
     );
     expect(app).toMatch(
-      /\.tool-status \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*calc\(\(29px - 10px\) \/ 2\)[^}]*inset-inline-start:\s*-17\.5px[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-win-bg\)/s,
+      /\.tool-status \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-win-bg\)[^}]*transform:\s*translateY\(-50%\)/s,
     );
     expect(app).toMatch(
       /\.tool-card summary > strong \{[^}]*font-size:\s*11px[^}]*font-weight:\s*600/s,
