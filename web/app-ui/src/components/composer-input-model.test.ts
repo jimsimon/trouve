@@ -22,6 +22,10 @@ describe("composer input model", () => {
       height: COMPOSER_MIN_HEIGHT,
       overflowY: "hidden",
     });
+    expect(composerTextareaLayout(96, false)).toEqual({
+      height: COMPOSER_MIN_HEIGHT,
+      overflowY: "hidden",
+    });
   });
 
   it("recognizes composition, Process, and legacy IME commit key events", () => {

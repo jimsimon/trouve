@@ -4549,7 +4549,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   ): void {
     if (textarea === null) return;
     textarea.style.height = "auto";
-    const layout = composerTextareaLayout(textarea.scrollHeight);
+    const layout = composerTextareaLayout(
+      textarea.scrollHeight,
+      textarea.value.length > 0,
+    );
     textarea.style.height = `${layout.height}px`;
     textarea.style.overflowY = layout.overflowY;
   }

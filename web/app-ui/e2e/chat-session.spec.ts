@@ -2917,14 +2917,19 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     viewport.dispatchEvent(new Event("scroll"));
   });
   await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
-  await expect.poll(async () => {
-    await page.locator(".chat-stream").evaluate((viewport) => {
-      viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
-      viewport.scrollTop = 0;
-      viewport.dispatchEvent(new Event("scroll"));
-    });
-    return new Set(olderBoundaries).has(60);
-  }).toBe(true);
+  await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  // This is one deliberate reader gesture. A polling callback that emits a
+  // wheel event can race a fast response and accidentally request every
+  // remaining page, testing the poller rather than the prefetch boundary.
+  await page.locator(".chat-stream").evaluate((viewport) => {
+    viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
+    viewport.scrollTop = 0;
+    viewport.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(() => new Set(olderBoundaries).has(60)).toBe(true);
   await expect.poll(() => completedBoundaries.includes(60)).toBe(true);
   const requestedBoundaries = [...new Set(olderBoundaries)];
   expect(requestedBoundaries).toContain(120);

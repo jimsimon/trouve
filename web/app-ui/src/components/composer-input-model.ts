@@ -10,8 +10,14 @@ export interface ComposerTextareaLayout {
  * composer's 34–162 px contract. */
 export const composerTextareaLayout = (
   scrollHeight: number,
+  hasContent = true,
 ): ComposerTextareaLayout => {
-  const contentHeight = Number.isFinite(scrollHeight)
+  // Chromium includes a wrapped placeholder in scrollHeight. An empty
+  // narrow composer must stay at its minimum height so entering a short
+  // message cannot shrink the composer and visibly shift a pinned transcript.
+  const contentHeight = !hasContent
+    ? COMPOSER_MIN_HEIGHT
+    : Number.isFinite(scrollHeight)
     ? Math.max(0, scrollHeight)
     : COMPOSER_MIN_HEIGHT;
   return {

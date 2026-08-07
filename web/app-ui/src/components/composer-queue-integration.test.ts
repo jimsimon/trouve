@@ -17,7 +17,8 @@ describe("thread composer and queue integration", () => {
   });
 
   it("keeps input autogrow and submission safe across IME composition", () => {
-    expect(screen).toContain("composerTextareaLayout(textarea.scrollHeight)");
+    expect(screen).toContain("composerTextareaLayout(");
+    expect(screen).toContain("textarea.value.length > 0");
     expect(screen).toContain("@compositionstart=${this.#composerCompositionStarted}");
     expect(screen).toContain("@compositionend=${this.#composerCompositionEnded}");
     expect(screen).toContain("isComposerCompositionKey({");
