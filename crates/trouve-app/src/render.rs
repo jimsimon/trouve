@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
+use trouve_client_core::viewmodel::{
+    ChatItem, CompactionState, ThreadViewModel, ToolCallStatus, TurnState,
+};
 use trouve_protocol::QuestionAnswer;
 use trouve_slint_markdown::{BlockKind, parse_blocks};
 
@@ -15,7 +17,8 @@ use trouve_slint_markdown::{BlockKind, parse_blocks};
 /// 7 card header (collapsible group for user/agent items),
 /// 8 horizontal rule between turns, 9 grouped tool-run header
 /// ("Called n tools"), 10 question wizard (pending questions or the
-/// answered summary).
+/// answered summary), 11 durable context-compaction boundary, 12 visible
+/// non-collapsible thought boundary.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatRowData {
     pub kind: i32,
@@ -419,8 +422,9 @@ fn running_activity_label(vm: &ThreadViewModel) -> String {
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
 /// map from row index to the tool call id (for approvals/expansion).
 /// Turns listed in `raw_turns` render their assistant text as one plain
-/// (selectable) block instead of styled markdown. User/assistant/thinking
-/// items get a collapsible header row; keys in `collapsed` hide the body.
+/// (selectable) block instead of styled markdown. User/assistant items get a
+/// collapsible header row; thinking remains visible at the top level by
+/// default. Keys in `collapsed` hide collapsible bodies.
 #[cfg(test)]
 pub fn chat_rows(
     vm: &ThreadViewModel,
@@ -429,9 +433,10 @@ pub fn chat_rows(
     collapsed: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
-    chat_rows_at_offset(vm, 0, expanded, raw_turns, collapsed, wizards)
+    chat_rows_at_offset_with_preferences(vm, 0, expanded, raw_turns, collapsed, wizards, false)
 }
 
+#[cfg(test)]
 pub fn chat_rows_at_offset(
     vm: &ThreadViewModel,
     item_offset: u64,
@@ -439,6 +444,27 @@ pub fn chat_rows_at_offset(
     raw_turns: &HashSet<u64>,
     collapsed: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
+) -> (Vec<ChatRowData>, Vec<Option<String>>) {
+    chat_rows_at_offset_with_preferences(
+        vm,
+        item_offset,
+        expanded,
+        raw_turns,
+        collapsed,
+        wizards,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn chat_rows_at_offset_with_preferences(
+    vm: &ThreadViewModel,
+    item_offset: u64,
+    expanded: &HashSet<String>,
+    raw_turns: &HashSet<u64>,
+    collapsed: &HashSet<String>,
+    wizards: &HashMap<String, WizardState>,
+    collapse_thinking_with_tools: bool,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
     let mut rows: Vec<ChatRowData> = Vec::new();
     let mut call_ids: Vec<Option<String>> = Vec::new();
@@ -456,6 +482,7 @@ pub fn chat_rows_at_offset(
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
+                | ChatItem::Compaction { .. }
                 | ChatItem::Questions { .. } => {
                     if let Some(a) = prev {
                         owner.insert(i, a);
@@ -470,6 +497,7 @@ pub fn chat_rows_at_offset(
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
+                | ChatItem::Compaction { .. }
                 | ChatItem::Questions { .. } => {
                     if let (None, Some(a)) = (owner.get(&i), next) {
                         owner.insert(i, a);
@@ -554,6 +582,7 @@ pub fn chat_rows_at_offset(
                         }
                         ChatItem::ToolCall { .. }
                         | ChatItem::Thinking { .. }
+                        | ChatItem::Compaction { .. }
                         | ChatItem::Questions { .. } => end = k,
                         _ => break,
                     }
@@ -569,7 +598,25 @@ pub fn chat_rows_at_offset(
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let key = format!("a:{}", item_offset + i as u64);
-                let open = !collapsed.contains(&key);
+                let compaction_running = (i..=end).any(|j| {
+                    matches!(
+                        vm.items[j],
+                        ChatItem::Compaction {
+                            state: CompactionState::Running,
+                            ..
+                        }
+                    )
+                }) || owner.iter().any(|(&j, &a)| {
+                    a == i
+                        && matches!(
+                            vm.items[j],
+                            ChatItem::Compaction {
+                                state: CompactionState::Running,
+                                ..
+                            }
+                        )
+                });
+                let open = compaction_running || !collapsed.contains(&key);
                 let raw = raw_turns.contains(turn);
                 let done = turn_state(vm, *turn).is_some();
                 let mut body = Vec::new();
@@ -595,6 +642,7 @@ pub fn chat_rows_at_offset(
                         collapsed,
                         expanded,
                         wizards,
+                        collapse_thinking_with_tools,
                     );
                 }
                 // The turn's token/cost summary shows in the header of the
@@ -627,7 +675,10 @@ pub fn chat_rows_at_offset(
                 };
                 push_card(&mut rows, &mut call_ids, header, body);
             }
-            ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
+            ChatItem::ToolCall { .. }
+            | ChatItem::Thinking { .. }
+            | ChatItem::Compaction { .. }
+            | ChatItem::Questions { .. } => {
                 // Owned tool calls / thinking were rendered inside their
                 // assistant card; ones folded into an earlier synthesized
                 // card below are done too.
@@ -646,6 +697,7 @@ pub fn chat_rows_at_offset(
                         vm.items[k],
                         ChatItem::ToolCall { .. }
                             | ChatItem::Thinking { .. }
+                            | ChatItem::Compaction { .. }
                             | ChatItem::Questions { .. }
                     ) {
                         merged.insert(k);
@@ -665,7 +717,16 @@ pub fn chat_rows_at_offset(
                     })
                     .unwrap_or(0);
                 let key = format!("a:{}", item_offset + i as u64);
-                let open = !collapsed.contains(&key);
+                let compaction_running = run.iter().any(|&j| {
+                    matches!(
+                        vm.items[j],
+                        ChatItem::Compaction {
+                            state: CompactionState::Running,
+                            ..
+                        }
+                    )
+                });
+                let open = compaction_running || !collapsed.contains(&key);
                 let done = turn_state(vm, turn).is_some();
                 let raw = raw_turns.contains(&turn);
                 let mut body = Vec::new();
@@ -681,6 +742,7 @@ pub fn chat_rows_at_offset(
                         collapsed,
                         expanded,
                         wizards,
+                        collapse_thinking_with_tools,
                     );
                 }
                 // Orphan items mean no assistant item in this turn, so this
@@ -801,11 +863,11 @@ enum Segment {
 
 /// Append a card body in stream order. Text stretches — the agent's
 /// narration and answer — always render at the card's top level. Runs of
-/// 2+ consecutive working items (tool calls, thinking) between them fold
-/// under one summarized group header ("Edited 2 files, read 3 files,
-/// called 1 tool"), expanded while the turn streams so progress is
-/// visible, collapsed by default once it's done (the group key in
-/// `collapsed` flips whichever default applies).
+/// 2+ consecutive working items fold under one summarized group header
+/// ("Edited 2 files, read 3 files, called 1 tool"), expanded while the turn
+/// streams so progress is visible and collapsed by default once it is done.
+/// Thinking is a top-level boundary unless the chat preference explicitly
+/// opts it into these collapsible runs.
 #[allow(clippy::too_many_arguments)]
 fn card_body_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
@@ -818,6 +880,7 @@ fn card_body_rows(
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
+    collapse_thinking_with_tools: bool,
 ) {
     let mut segments: Vec<Segment> = Vec::new();
     let mut k = 0;
@@ -846,9 +909,16 @@ fn card_body_rows(
         }
     }
 
-    // Question items stay out of activity groups: the wizard needs to be
-    // answered, so it always renders at the card's top level, like text.
-    let groupable = |seg: &Segment| matches!(seg, Segment::Item(j) if !matches!(vm.items[*j], ChatItem::Questions { .. }));
+    // Questions and context compaction stay out of activity groups. Thinking
+    // does too by default, making its visible output a transcript boundary;
+    // the Chat preference may opt it back into the old collapsible runs.
+    let groupable = |seg: &Segment| {
+        let Segment::Item(j) = seg else { return false };
+        !matches!(
+            vm.items[*j],
+            ChatItem::Questions { .. } | ChatItem::Compaction { .. }
+        ) && (collapse_thinking_with_tools || !matches!(vm.items[*j], ChatItem::Thinking { .. }))
+    };
     let mut s = 0;
     while s < segments.len() {
         if let Segment::Text(text) = &segments[s] {
@@ -867,6 +937,7 @@ fn card_body_rows(
                 collapsed,
                 expanded,
                 wizards,
+                collapse_thinking_with_tools,
             );
             s += 1;
             continue;
@@ -889,6 +960,7 @@ fn card_body_rows(
                     collapsed,
                     expanded,
                     wizards,
+                    collapse_thinking_with_tools,
                 );
             }
             continue;
@@ -936,6 +1008,7 @@ fn card_body_rows(
                     collapsed,
                     expanded,
                     wizards,
+                    collapse_thinking_with_tools,
                 );
             }
         }
@@ -955,6 +1028,7 @@ fn segment_rows(
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
     wizards: &HashMap<String, WizardState>,
+    collapse_thinking_with_tools: bool,
 ) {
     match segment {
         Segment::Text(text) => text_rows(body, text, raw),
@@ -964,6 +1038,23 @@ fn segment_rows(
                 content,
                 complete,
             } => {
+                if !collapse_thinking_with_tools {
+                    body.push((
+                        ChatRowData {
+                            kind: 12,
+                            text: if *complete { "Thought" } else { "Thinking" }.into(),
+                            detail: content.clone(),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+                    let start = body.len();
+                    push_blocks(body, content);
+                    for (row, _) in &mut body[start..] {
+                        row.tone = 2;
+                    }
+                    return;
+                }
                 let key = format!("t:{}", item_offset + *j as u64);
                 // The toggle set flips whichever default applies: expanded
                 // while its turn is the latest, collapsed once the next
@@ -997,6 +1088,46 @@ fn segment_rows(
                         b.tone = 2;
                     }
                 }
+            }
+            ChatItem::Compaction { state, .. } => {
+                let (text, detail, turn_state) = match state {
+                    CompactionState::Running => (
+                        "Compacting context".into(),
+                        "Summarizing earlier messages to make room for this turn…".into(),
+                        0,
+                    ),
+                    CompactionState::Completed { messages_compacted } => {
+                        let detail = if *messages_compacted == 0 {
+                            "Earlier context summarized by the model harness".into()
+                        } else {
+                            format!(
+                                "{} earlier transcript {} summarized",
+                                messages_compacted,
+                                if *messages_compacted == 1 {
+                                    "message"
+                                } else {
+                                    "messages"
+                                }
+                            )
+                        };
+                        ("Context compacted".into(), detail, 1)
+                    }
+                    CompactionState::Failed => (
+                        "Context compaction stopped".into(),
+                        "Compaction did not report completion; the turn continued.".into(),
+                        2,
+                    ),
+                };
+                body.push((
+                    ChatRowData {
+                        kind: 11,
+                        text,
+                        detail,
+                        turn_state,
+                        ..Default::default()
+                    },
+                    None,
+                ));
             }
             ChatItem::ToolCall {
                 call_id,
@@ -1857,6 +1988,7 @@ fn latest_turn(vm: &ThreadViewModel) -> u64 {
             ChatItem::User { turn, .. }
             | ChatItem::Assistant { turn, .. }
             | ChatItem::Thinking { turn, .. }
+            | ChatItem::Compaction { turn, .. }
             | ChatItem::TurnStatus { turn, .. } => Some(*turn),
             ChatItem::ToolCall { .. } | ChatItem::Questions { .. } => None,
         })
@@ -2870,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_nests_in_the_agent_card() {
+    fn thinking_is_visible_and_non_collapsible_by_default() {
         let vm = ThreadViewModel {
             items: vec![
                 ChatItem::User {
@@ -2911,20 +3043,19 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
         );
-        // One You card, one Agent card; a lone thinking item between text
-        // stretches stays inline (no group header for a single item): a
-        // kind-4 header pill followed by its content as markdown rows
-        // (tone 2), in stream order.
+        // One You card, one Agent card; each thought is a top-level marker
+        // followed by visible, tinted markdown in stream order.
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
-        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 1, 4, 1, 1]);
-        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
-        assert_eq!(think[0].card_key, "t:1");
-        assert!(think[0].expanded, "expanded by default");
-        assert_eq!(think[0].meta, "hmm, let me see");
+        assert_eq!(kinds, vec![7, 1, 7, 12, 1, 1, 12, 1, 1]);
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 12).collect();
+        assert_eq!(think.len(), 2);
+        assert_eq!(think[0].text, "Thought");
+        assert_eq!(think[0].detail, "hmm, let me see");
+        assert!(think.iter().all(|row| row.card_key.is_empty()));
         assert_eq!(rows[4].tone, 2, "thinking content is tinted");
         assert_eq!(rows[5].tone, 0, "agent text is not");
         assert!(rows[3..].iter().all(|r| r.card_pos >= 2), "all nested");
-        // Collapsing one thinking block keeps its header pill only.
+        // Existing collapse keys cannot hide top-level thought output.
         let collapsed: HashSet<String> = ["t:1".to_string()].into();
         let (rows, _) = chat_rows(
             &vm,
@@ -2934,21 +3065,17 @@ mod tests {
             &HashMap::new(),
         );
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
-        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 4, 1, 1]);
-        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
-        assert!(!think[0].expanded);
-        assert!(think[1].expanded);
+        assert_eq!(kinds, vec![7, 1, 7, 12, 1, 1, 12, 1, 1]);
         // Raw view keeps stream order too: each text stretch becomes a
         // kind-6 row in place, not one blob hoisted to the top.
         let raw: HashSet<u64> = [1].into();
         let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new(), &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
-        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 6, 4, 1, 6]);
+        assert_eq!(kinds, vec![7, 1, 7, 12, 1, 6, 12, 1, 6]);
         assert_eq!(rows[5].text, "part one");
         assert_eq!(rows[8].text, "part two");
 
-        // Submitting the next prompt flips the default: earlier turns'
-        // thinking collapses to its header pill (the reader moved on)…
+        // Submitting the next prompt does not collapse earlier thoughts.
         let mut vm = vm;
         vm.items.push(ChatItem::User {
             turn: 2,
@@ -2962,23 +3089,64 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
         );
-        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
-        assert!(
-            think.iter().all(|r| !r.expanded),
-            "collapsed once superseded"
-        );
-        // …and the toggle set now re-expands instead of collapsing.
-        let toggled: HashSet<String> = ["t:1".to_string()].into();
-        let (rows, _) = chat_rows(
+        assert_eq!(rows.iter().filter(|r| r.kind == 12).count(), 2);
+    }
+
+    #[test]
+    fn thinking_can_opt_into_collapsible_activity() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "q".into(),
+                    attachments: vec![],
+                },
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm, let me see".into(),
+                    complete: true,
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "answer".into(),
+                    complete: true,
+                },
+                ChatItem::User {
+                    turn: 2,
+                    content: "next question".into(),
+                    attachments: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows_at_offset_with_preferences(
             &vm,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            true,
+        );
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
+        assert_eq!(think.len(), 1);
+        assert!(!think[0].expanded, "older thought collapses when opted in");
+
+        let toggled: HashSet<String> = ["t:1".to_string()].into();
+        let (rows, _) = chat_rows_at_offset_with_preferences(
+            &vm,
+            0,
             &HashSet::new(),
             &HashSet::new(),
             &toggled,
             &HashMap::new(),
+            true,
         );
-        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
-        assert!(think[0].expanded);
-        assert!(!think[1].expanded);
+        let think = rows.iter().find(|r| r.kind == 4).unwrap();
+        assert!(
+            think.expanded,
+            "the existing disclosure behavior remains available"
+        );
     }
 
     #[test]
@@ -3043,7 +3211,67 @@ mod tests {
     }
 
     #[test]
-    fn mixed_thinking_and_tool_runs_group_with_a_summary() {
+    fn thinking_splits_adjacent_tool_groups_by_default() {
+        let tool = |id: &str| ChatItem::ToolCall {
+            call_id: id.into(),
+            tool: "Read".into(),
+            args: serde_json::json!({"file_path": format!("{id}.rs")}),
+            status: ToolCallStatus::Ok,
+            result: None,
+        };
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "q".into(),
+                    attachments: vec![],
+                },
+                tool("before-1"),
+                tool("before-2"),
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm".into(),
+                    complete: true,
+                },
+                tool("after-1"),
+                tool("after-2"),
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "answer".into(),
+                    complete: true,
+                },
+                ChatItem::TurnStatus {
+                    turn: 1,
+                    state: TurnState::Completed {
+                        usage: Default::default(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let body_kinds = rows
+            .iter()
+            .skip_while(|row| !(row.kind == 7 && row.tool_name == "Agent"))
+            .skip(1)
+            .map(|row| row.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(body_kinds, vec![9, 12, 1, 9, 1]);
+        assert_eq!(rows.iter().filter(|row| row.kind == 9).count(), 2);
+        let thought = rows.iter().find(|row| row.kind == 12).unwrap();
+        assert_eq!(thought.text, "Thought");
+        assert_eq!(thought.detail, "hmm");
+        assert_eq!(thought.md_indent, 0);
+    }
+
+    #[test]
+    fn mixed_thinking_and_tool_runs_group_when_enabled() {
         let vm = ThreadViewModel {
             items: vec![
                 ChatItem::User {
@@ -3071,12 +3299,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(
+        let (rows, _) = chat_rows_at_offset_with_preferences(
             &vm,
+            0,
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            true,
         );
         // The thinking + read run groups under one summarized header; the
         // narration/answer text stays outside the group.
@@ -3090,6 +3320,99 @@ mod tests {
         assert_eq!(tool.md_indent, 1);
         // The answer text is a top-level markdown row, not grouped.
         assert!(rows.iter().any(|r| r.kind == 1 && r.text == "answer"));
+    }
+
+    #[test]
+    fn compaction_is_top_level_and_splits_adjacent_activity_groups() {
+        let tool = |id: &str| ChatItem::ToolCall {
+            call_id: id.into(),
+            tool: "search".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Ok,
+            result: None,
+        };
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "continue".into(),
+                    attachments: vec![],
+                },
+                tool("before-1"),
+                tool("before-2"),
+                ChatItem::Compaction {
+                    turn: 1,
+                    state: CompactionState::Completed {
+                        messages_compacted: 18,
+                    },
+                },
+                tool("after-1"),
+                tool("after-2"),
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "done".into(),
+                    complete: true,
+                },
+                ChatItem::TurnStatus {
+                    turn: 1,
+                    state: TurnState::Completed {
+                        usage: Default::default(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        let body_kinds = rows
+            .iter()
+            .skip_while(|row| !(row.kind == 7 && row.tool_name == "Agent"))
+            .skip(1)
+            .map(|row| row.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(body_kinds, vec![9, 11, 9, 1]);
+        let marker = rows.iter().find(|row| row.kind == 11).unwrap();
+        assert_eq!(marker.text, "Context compacted");
+        assert_eq!(marker.detail, "18 earlier transcript messages summarized");
+        assert_eq!(marker.md_indent, 0, "compaction is never group-indented");
+    }
+
+    #[test]
+    fn active_compaction_forces_its_agent_card_open() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 3,
+                    content: "continue".into(),
+                    attachments: vec![],
+                },
+                ChatItem::Compaction {
+                    turn: 3,
+                    state: CompactionState::Running,
+                },
+            ],
+            ..Default::default()
+        };
+        let collapsed: HashSet<String> = ["a:1".into()].into();
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &collapsed,
+            &HashMap::new(),
+        );
+        let header = rows
+            .iter()
+            .find(|row| row.kind == 7 && row.tool_name == "Agent")
+            .unwrap();
+        assert!(header.expanded);
+        assert!(rows.iter().any(|row| row.kind == 11 && row.turn_state == 0));
     }
 
     #[test]

@@ -133,6 +133,13 @@ export const modelOptionLabel = (value: string): string => {
     high: "High",
     xhigh: "Extra High",
     max: "Max",
+    ultra: "Ultra",
   };
   return labels[value] ?? value;
 };
+
+/** Model selectors use the provider-qualified protocol id as their visible
+ * label so identically named models from different providers stay distinct. */
+export const modelSelectorLabel = (
+  model: Pick<ProtocolModelInfo, "id">,
+): string => model.id;

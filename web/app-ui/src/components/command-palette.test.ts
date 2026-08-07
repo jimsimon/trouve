@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import type { ProtocolPrInfo } from "../services/protocol-client.js";
 import {
   buildCommandPaletteItems,
   filterCommandPaletteItems,
@@ -9,6 +10,26 @@ import {
   nextCommandPaletteIndex,
   type CommandPaletteInput,
 } from "./command-palette-model.js";
+
+const pr = (
+  number: number,
+  overrides: Partial<ProtocolPrInfo> = {},
+): ProtocolPrInfo => ({
+  host: "github.com",
+  repository: "trouve-ai/trouve",
+  workspace_id: "ws-app",
+  number,
+  url: `https://github.com/trouve-ai/trouve/pull/${number}`,
+  title: `Pull request ${number}`,
+  state: "open",
+  draft: false,
+  base: "main",
+  head: "trouve/protocol-review",
+  checks: [],
+  reviews: [],
+  author: "octocat",
+  ...overrides,
+});
 
 const input: CommandPaletteInput = {
   route: {
@@ -29,7 +50,12 @@ const input: CommandPaletteInput = {
       title: "Preserve frontend parity",
       branch: "trouve/web-parity",
       archived: false,
+      active: true,
+      attention: "none",
+      outcome: "running",
+      unread: false,
       latestThreadId: "th-code",
+      pullRequests: [],
       state: "running",
     },
     {
@@ -38,7 +64,12 @@ const input: CommandPaletteInput = {
       title: "Review protocol changes",
       branch: "trouve/protocol-review",
       archived: false,
+      active: false,
+      attention: "approval",
+      outcome: "idle",
+      unread: false,
       latestThreadId: "th-review",
+      pullRequests: [pr(3183)],
       state: "attention",
     },
   ],
@@ -76,8 +107,10 @@ describe("command palette model", () => {
       });
     expect(items.find((item) => item.id === "thread:th-code")).toMatchObject({
       group: "Threads",
-      label: "⑂ code · claude-sonnet",
-      detail: "Current · Thread 2",
+      label: "code · claude-sonnet",
+      icon: "code-branch",
+      detail: "Thread 2",
+      current: true,
       action: {
         kind: "navigate",
         mobilePane: "thread",
@@ -86,12 +119,24 @@ describe("command palette model", () => {
     });
     expect(items.find((item) => item.id === "session:se-review")).toMatchObject({
       state: "attention",
-      detail: "Trouve app · trouve/protocol-review",
+      current: false,
+      sessionIndicator: {
+        kind: "approval",
+        icon: "triangle-exclamation",
+        tooltip: "Approval pending",
+      },
+      detail: "Trouve app · trouve/protocol-review · PR #3183",
       action: {
         kind: "navigate",
         mobilePane: "thread",
         route: { sessionId: "se-review", threadId: "th-review" },
       },
+    });
+    expect(items.find((item) => item.id === "session:se-review")?.pullRequestBadge)
+      .toBeUndefined();
+    expect(items.find((item) => item.id === "session:se-active")).toMatchObject({
+      detail: "Trouve search · trouve/web-parity",
+      current: true,
     });
   });
 
@@ -126,6 +171,48 @@ describe("command palette model", () => {
     expect(filterCommandPaletteItems(items, "cde claude").map((item) => item.id))
       .toContain("thread:th-code");
     expect(filterCommandPaletteItems(items, "no-such-command")).toEqual([]);
+  });
+
+  it("finds sessions by associated pull request number", () => {
+    const items = buildCommandPaletteItems(input);
+    expect(filterCommandPaletteItems(items, "3183").map((item) => item.id))
+      .toEqual(["session:se-review"]);
+    expect(filterCommandPaletteItems(items, "#3183").map((item) => item.id))
+      .toEqual(["session:se-review"]);
+    expect(filterCommandPaletteItems(items, "pr 3183").map((item) => item.id))
+      .toEqual(["session:se-review"]);
+  });
+
+  it("projects the sidebar pull-request icon tone into eligible session results", () => {
+    const base = input.sessions[1]!;
+    const cases = [
+      ["ready", pr(44, { merge_state_status: "clean" })],
+      ["blocked", pr(43, { draft: true, merge_state_status: "clean" })],
+      ["merged", pr(42, { state: "merged" })],
+      ["closed", pr(41, { state: "closed" })],
+    ] as const;
+    const items = buildCommandPaletteItems({
+      ...input,
+      sessions: cases.map(([tone, pullRequest]) => ({
+        ...base,
+        id: `se-${tone}`,
+        title: `${tone} pull request`,
+        attention: "none",
+        outcome: "idle",
+        state: "idle",
+        pullRequests: [pullRequest],
+      })),
+    });
+
+    for (const [tone, pullRequest] of cases) {
+      expect(items.find((item) => item.id === `session:se-${tone}`)).toMatchObject({
+        pullRequestBadge: {
+          tone,
+          count: 1,
+          tooltip: expect.stringContaining(`#${pullRequest.number}`),
+        },
+      });
+    }
   });
 
   it("wraps vertical selection and supports direct first/last movement", () => {
@@ -170,6 +257,7 @@ describe("command palette component contract", () => {
     expect(component).toContain("withSignalTracking(LitElement)");
     expect(component).toContain("readSignal(services.router.route)");
     expect(component).toContain("readSignal(store.sessions)");
+    expect(component).toContain("pullRequests: store.sessionPullRequests(session.id)");
   });
 
   it("ships the keyboard, focus, and combobox/listbox interaction contract", () => {
@@ -186,6 +274,29 @@ describe("command palette component contract", () => {
     expect(styles).toContain("trouve-command-palette { display: contents; }");
     expect(styles).toContain(".command-palette-option[aria-selected=\"true\"]");
     expect(styles).toContain("var(--trouve-accent-bg)");
+  });
+
+  it("renders session results with the shared sidebar status and pull-request indicators", () => {
+    expect(component).toContain('class="session-indicator ${item.sessionIndicator.kind}"');
+    expect(component).toContain('class="session-pr-badge ${item.pullRequestBadge.tone}"');
+    expect(component).toContain('fontAwesomeIcon("code-pull-request")');
+    expect(component).not.toContain('class="status-dot ${item.state}"');
+    expect(component).toContain("item.sessionIndicator.tooltip");
+    expect(styles).toContain(".session-indicator.busy::before");
+    expect(styles).toContain(".session-pr-badge.ready { color: var(--trouve-ok); }");
+    expect(styles).toContain(".session-pr-badge.blocked { color: var(--trouve-warn); }");
+    expect(styles).toContain(".session-pr-badge.merged { color: var(--trouve-merged); }");
+    expect(styles).toContain(".session-pr-badge.closed { color: var(--trouve-err); }");
+    expect(styles).toContain(
+      ".command-palette-icon .session-indicator { font-family: var(--trouve-font-sans); }",
+    );
+  });
+
+  it("uses the trailing badge only for the current result", () => {
+    expect(component).toContain('class="command-palette-current">Current</span>');
+    expect(component).not.toContain('class="command-palette-state');
+    expect(styles).toContain(".command-palette-current");
+    expect(styles).toContain("color: var(--trouve-ok)");
   });
 
   it("opens the provisional setup for new-thread actions", () => {

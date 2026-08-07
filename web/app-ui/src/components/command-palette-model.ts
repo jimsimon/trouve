@@ -1,19 +1,31 @@
 import type { AppRoute, InspectionPanel } from "../router/app-router.js";
 import { filterFuzzyTextItems } from "../services/fuzzy-ranking.js";
+import type { ProtocolPrInfo } from "../services/protocol-client.js";
 import type { SessionVisualState } from "../state/app-store.js";
+import {
+  sessionIndicatorPresentation,
+  type SessionIndicatorFields,
+  type SessionIndicatorPresentation,
+} from "../state/session-indicator-model.js";
+import type { FontAwesomeIconName } from "./font-awesome-icon.js";
+import {
+  visibleSessionPullRequestBadge,
+  type SessionPullRequestBadge,
+} from "./session-pull-request-badge.js";
 
 export interface CommandPaletteWorkspace {
   readonly id: string;
   readonly name: string;
 }
 
-export interface CommandPaletteSession {
+export interface CommandPaletteSession extends SessionIndicatorFields {
   readonly id: string;
   readonly workspaceId: string;
   readonly title: string;
   readonly branch: string;
   readonly archived: boolean;
   readonly latestThreadId: string | undefined;
+  readonly pullRequests: readonly ProtocolPrInfo[];
   readonly state: SessionVisualState;
 }
 
@@ -49,8 +61,11 @@ export interface CommandPaletteItem {
   readonly label: string;
   readonly detail: string;
   readonly keywords: string;
-  readonly icon: string;
+  readonly icon: FontAwesomeIconName | undefined;
   readonly state?: SessionVisualState;
+  readonly sessionIndicator?: SessionIndicatorPresentation;
+  readonly pullRequestBadge?: SessionPullRequestBadge;
+  readonly current?: boolean;
   readonly action: CommandPaletteAction;
 }
 
@@ -64,13 +79,18 @@ export interface CommandPaletteInput {
 }
 
 const INSPECTION_VIEWS = [
-  ["diff", "Diff", "±", "changes patch review"],
-  ["files", "Files", "▤", "source tree code"],
-  ["pr", "Pull request", "⑂", "branch review status"],
-  ["mcp", "MCP", "⌁", "effective model context protocol tools servers"],
-  ["terminal", "Terminal", ">_", "shell pty console"],
-  ["plan", "Plan", "☷", "todos tasks"],
-] as const satisfies readonly [InspectionPanel, string, string, string][];
+  ["diff", "Diff", "code-compare", "changes patch review"],
+  ["files", "Files", "file-lines", "source tree code"],
+  ["pr", "Pull request", "code-pull-request", "branch review status"],
+  ["mcp", "MCP", "plug", "effective model context protocol tools servers"],
+  ["terminal", "Terminal", "terminal", "shell pty console"],
+  ["plan", "Plan", "list-check", "todos tasks"],
+] as const satisfies readonly [
+  InspectionPanel,
+  string,
+  FontAwesomeIconName,
+  string,
+][];
 
 const shortModelName = (model: string): string => {
   const segments = model.split("/").filter((segment) => segment !== "");
@@ -104,7 +124,7 @@ export const buildCommandPaletteItems = (
       label: "New session",
       detail: primaryWorkspace.name,
       keywords: `create start workspace ${primaryWorkspace.name}`,
-      icon: "+",
+      icon: "plus",
       action: { kind: "new-session", workspaceId: primaryWorkspace.id },
     });
   }
@@ -117,7 +137,7 @@ export const buildCommandPaletteItems = (
       detail: sessions.find((session) => session.id === route.sessionId)?.title
         ?? "Current session",
       keywords: "create start conversation tab",
-      icon: "+",
+      icon: "plus",
       action: {
         kind: "new-thread",
         workspaceId: route.workspaceId,
@@ -134,22 +154,23 @@ export const buildCommandPaletteItems = (
       label: `New session in ${workspace.name}`,
       detail: workspace.name,
       keywords: `create start workspace ${workspace.name}`,
-      icon: "+",
+      icon: "plus",
       action: { kind: "new-session", workspaceId: workspace.id },
     });
   }
 
   if (route.kind === "session") {
     for (const [index, thread] of activeThreads.entries()) {
-      const marker = thread.spawned === true ? "⑂ " : "";
-      const label = `${marker}${thread.mode} · ${shortModelName(thread.model)}`;
+      const label = `${thread.mode} · ${shortModelName(thread.model)}`;
+      const current = thread.id === route.threadId;
       items.push({
         id: `thread:${thread.id}`,
         group: "Threads",
         label,
-        detail: `${thread.id === route.threadId ? "Current · " : ""}Thread ${index + 1}`,
-        keywords: `${thread.id} ${thread.mode} ${thread.model} conversation tab`,
-        icon: "◌",
+        detail: `Thread ${index + 1}`,
+        keywords: `${current ? "current " : ""}${thread.id} ${thread.mode} ${thread.model} conversation tab`,
+        icon: thread.spawned === true ? "code-branch" : "message",
+        current,
         action: {
           kind: "navigate",
           mobilePane: "thread",
@@ -171,14 +192,31 @@ export const buildCommandPaletteItems = (
   for (const session of sessions) {
     const workspaceName = workspaceNames.get(session.workspaceId) ?? "Workspace";
     const current = route.kind === "session" && route.sessionId === session.id;
+    const indicator = sessionIndicatorPresentation(session);
+    const pullRequestBadge = visibleSessionPullRequestBadge(
+      session.pullRequests,
+      session.state,
+      current,
+    );
+    const pullRequestNumbers = [...new Set(session.pullRequests.map(({ number }) => number))]
+      .sort((left, right) => right - left);
+    const pullRequestDetail = pullRequestNumbers.length === 0
+      ? ""
+      : ` · ${pullRequestNumbers.length === 1 ? "PR" : "PRs"} ${pullRequestNumbers.map((number) => `#${number}`).join(", ")}`;
+    const pullRequestKeywords = pullRequestNumbers
+      .map((number) => `${number} #${number} pr ${number}`)
+      .join(" ");
     items.push({
       id: `session:${session.id}`,
       group: "Sessions",
       label: session.title,
-      detail: `${current ? "Current · " : ""}${workspaceName} · ${session.branch}${session.archived ? " · Archived" : ""}`,
-      keywords: `${session.id} ${workspaceName} ${session.branch} ${session.state} ${session.archived ? "archived" : "active"}`,
-      icon: "",
+      detail: `${workspaceName} · ${session.branch}${pullRequestDetail}${session.archived ? " · Archived" : ""}`,
+      keywords: `${current ? "current " : ""}${session.id} ${workspaceName} ${session.branch} ${session.state} ${session.attention} ${session.outcome} ${indicator.tooltip} ${pullRequestKeywords} ${session.archived ? "archived" : "active"}`,
+      icon: undefined,
       state: session.state,
+      sessionIndicator: indicator,
+      ...(pullRequestBadge === undefined ? {} : { pullRequestBadge }),
+      current,
       action: {
         kind: "navigate",
         mobilePane: "thread",
@@ -201,7 +239,7 @@ export const buildCommandPaletteItems = (
       label: "Pull Requests",
       detail: "Review dashboard",
       keywords: "code reviews github branches",
-      icon: "⎇",
+      icon: "code-pull-request",
       action: { kind: "navigate", mobilePane: "thread", route: { kind: "reviews" } },
     },
     {
@@ -210,7 +248,7 @@ export const buildCommandPaletteItems = (
       label: "Automations",
       detail: "Scheduled prompts",
       keywords: "jobs schedule timer",
-      icon: "⏱",
+      icon: "stopwatch",
       action: { kind: "navigate", mobilePane: "thread", route: { kind: "automations" } },
     },
     {
@@ -219,7 +257,7 @@ export const buildCommandPaletteItems = (
       label: "Settings",
       detail: "Appearance, providers, models, and integrations",
       keywords: "preferences configuration theme capabilities about",
-      icon: "⚙",
+      icon: "gear",
       action: { kind: "navigate", mobilePane: "thread", route: { kind: "settings" } },
     },
   );

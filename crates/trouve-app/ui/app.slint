@@ -128,7 +128,10 @@ export struct ChatTableCell {
 export struct ChatRow {
     // 0 user, 1 markdown block, 2 tool card, 3 turn status,
     // 4 thinking, 5 activity (spinner + label),
-    // 6 raw response text (selectable markdown source)
+    // 6 raw response text (selectable markdown source),
+    // 7 card header, 8 turn divider, 9 grouped activity,
+    // 10 question wizard, 11 context-compaction boundary,
+    // 12 visible non-collapsible thought boundary.
     kind: int,
     // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence,
     // 6 numbered list item, 7 table.
@@ -1682,6 +1685,10 @@ export component AppWindow inherits Window {
     in-out property <bool> prevent-sleep-while-running: true;
     callback prevent-sleep-while-running-toggled(bool);
 
+    // Chat transcript presentation (persisted in chat.json).
+    in-out property <bool> collapse-thinking-with-tools: false;
+    callback collapse-thinking-with-tools-toggled(bool);
+
     // Local (offline) models — state pushed by the controller, actions out.
     in property <[LocalModelItem]> local-models;
     in property <bool> local-enabled: true;
@@ -3159,7 +3166,8 @@ export component AppWindow inherits Window {
                             property <bool> hdr: row.kind == 7;
                             property <bool> body: row.kind == 0 || row.kind == 1
                                 || row.kind == 3 || row.kind == 4 || row.kind == 6
-                                || row.kind == 9 || row.kind == 10
+                                || row.kind == 9 || row.kind == 10 || row.kind == 11
+                                || row.kind == 12
                                 // Tool cards nested in an assistant card
                                 // indent with the rest of the body, as does
                                 // a nested activity row.
@@ -3177,7 +3185,7 @@ export component AppWindow inherits Window {
                                 || (row.kind == 1 && row.md-kind == 5)
                                 || row.kind == 4
                                 || row.kind == 6 || row.kind == 9
-                                || row.kind == 10;
+                                || row.kind == 10 || row.kind == 11;
 
                             // Tool cards and thinking pills under an
                             // activity-group header (md-indent 1) and
@@ -3206,6 +3214,7 @@ export component AppWindow inherits Window {
                                 // Question wizard: amber while it wants an
                                 // answer, settling to card grey once done.
                                 : row.kind == 10 ? (row.q-done ? Theme.c.surface : Theme.c.warn-bg)
+                                : row.kind == 11 ? (row.turn-state == 2 ? Theme.c.warn-bg : Theme.c.accent-bg)
                                 // Thinking pills share the tool-card grey.
                                 : row.kind == 2 || row.kind == 4
                                     || row.kind == 9 || hdr ? Theme.c.surface
@@ -3216,10 +3225,10 @@ export component AppWindow inherits Window {
                                 : transparent;
                             // Headers with a body keep square bottom corners
                             // so they merge into the card outline below.
-                            border-top-left-radius: 6px;
-                            border-top-right-radius: 6px;
-                            border-bottom-left-radius: hdr && row.card-pos == 1 ? 0px : 6px;
-                            border-bottom-right-radius: hdr && row.card-pos == 1 ? 0px : 6px;
+                            border-top-left-radius: row.kind == 11 ? 0px : 6px;
+                            border-top-right-radius: row.kind == 11 ? 0px : 6px;
+                            border-bottom-left-radius: row.kind == 11 ? 0px : hdr && row.card-pos == 1 ? 0px : 6px;
+                            border-bottom-right-radius: row.kind == 11 ? 0px : hdr && row.card-pos == 1 ? 0px : 6px;
                             border-width: (row.kind == 1 && row.md-kind == 5)
                                 || row.kind == 6 || row.kind == 10 || hdr ? 1px : 0px;
                             border-color: hdr && row.tool-name == "You" ? Theme.c.user-border
@@ -3240,14 +3249,16 @@ export component AppWindow inherits Window {
                             padding: 6px;
                             padding-top: row.kind == 7 ? 2px
                                 : row.kind == 8 ? 8px
-                                : row.kind == 2 || row.kind == 4 || row.kind == 9 ? 3px
+                                : row.kind == 2 || row.kind == 4 || row.kind == 9 || row.kind == 11 ? 3px
+                                : row.kind == 12 ? 3px
                                 : md-list ? 2px : md-heading ? 14px : 6px;
                             padding-bottom: row.kind == 7 ? 2px
                                 // The next card header brings its own 8px
                                 // gap; adding more here would double the
                                 // space below the rule.
                                 : row.kind == 8 ? 0px
-                                : row.kind == 2 || row.kind == 4 || row.kind == 9 ? 3px
+                                : row.kind == 2 || row.kind == 4 || row.kind == 9 || row.kind == 11 ? 3px
+                                : row.kind == 12 ? 3px
                                 : md-list ? 2px : md-heading ? 4px : 6px;
                             padding-left: md-list ? 22px + row.md-indent * 18px : 10px;
                             spacing: 4px;
@@ -3597,6 +3608,99 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // Context compaction is engine lifecycle state,
+                            // not a tool call. It stays at the Agent-card top
+                            // level, splits grouped work on either side, and
+                            // persists as the transcript's summary boundary.
+                            if row.kind == 11: Rectangle {
+                                height: compact-content.preferred-height + 10px;
+                                Rectangle {
+                                    y: 0px;
+                                    height: 1px;
+                                    background: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
+                                }
+                                Rectangle {
+                                    y: parent.height - 1px;
+                                    height: 1px;
+                                    background: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
+                                }
+                                compact-content := HorizontalLayout {
+                                    x: 2px;
+                                    y: 5px;
+                                    width: parent.width - 4px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        if row.turn-state == 0: ActivitySpinner {
+                                            width: 20px;
+                                            height: 20px;
+                                            animate: !Theme.reduce-motion;
+                                            animation-time: root.activity-animation-time;
+                                        }
+                                        if row.turn-state != 0: Rectangle {
+                                            width: 20px;
+                                            height: 20px;
+                                            border-width: 1px;
+                                            border-radius: 10px;
+                                            border-color: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
+                                            Text {
+                                                text: row.turn-state == 1 ? "✓" : "!";
+                                                color: row.turn-state == 2 ? Theme.c.warn : Theme.c.accent;
+                                                font-size: Theme.fs(11px);
+                                                font-weight: 800;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 1px;
+                                        Text {
+                                            text: row.text;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(11px);
+                                            font-weight: 700;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: row.detail;
+                                            color: Theme.c.text-dim;
+                                            font-size: Theme.fs(10px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Visible thinking output is a top-level boundary
+                            // by default: labeled and copyable, but never a
+                            // disclosure or member of a collapsed tool run.
+                            if row.kind == 12: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "✦";
+                                    color: Theme.c.accent;
+                                    font-size: Theme.fs(11px);
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.text;
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(11px);
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    CopyButton {
+                                        payload: row.detail;
+                                        height: Theme.fs(18px);
+                                        tip: "Copy thinking";
+                                    }
+                                }
                             }
 
                             // Raw response text: the turn's markdown source
@@ -5659,6 +5763,10 @@ export component AppWindow inherits Window {
         prevent-sleep-while-running <=> root.prevent-sleep-while-running;
         prevent-sleep-while-running-toggled(on) => {
             root.prevent-sleep-while-running-toggled(on);
+        }
+        collapse-thinking-with-tools <=> root.collapse-thinking-with-tools;
+        collapse-thinking-with-tools-toggled(on) => {
+            root.collapse-thinking-with-tools-toggled(on);
         }
         title-model-load-index <=> root.settings-title-model-load-index;
         title-model-resource-index <=> root.settings-title-model-resource-index;

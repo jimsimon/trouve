@@ -219,6 +219,74 @@ describe("ProtocolIngress", () => {
     ingress.stop();
   });
 
+  it("hydrates PR badges from the server projection and resumes after the summary cursor", async () => {
+    const store = new AppStore();
+    const fakeStream = stream();
+    const linkedPr = {
+      host: "github.com",
+      repository: "acme/trouve",
+      workspace_id: "ws_1",
+      number: 141,
+      url: "https://github.com/acme/trouve/pull/141",
+      title: "Linked from durable session activity",
+      state: "open",
+      draft: false,
+      base: "main",
+      head: "different-branch",
+      checks: [],
+      reviews: [],
+    };
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions: vi.fn(async () => [session("Current")]),
+      sessionSummaries: vi.fn(async () => ({ summaries: [summary], cursor: 8 })),
+      workspaces: vi.fn(async () => [workspace]),
+      serverProjectionSnapshot: vi.fn(async () => ({
+        cursor: 10,
+        value: {
+          github_pull_requests: [{
+            cursor: 9,
+            refreshed_at: "2026-08-01T12:02:09Z",
+            pull_requests: {
+              host: "github.com",
+              viewer: "octocat",
+              prs: [linkedPr],
+            },
+          }],
+          session_pull_requests: [{ session_id: "se_1", prs: [linkedPr] }],
+          git_worktree_settings: {
+            title_model_load_behavior: "auto",
+            title_model_resource_policy: "adaptive",
+            title_model: {
+              state: "ready",
+              runtime_installed: true,
+              model_downloaded: true,
+            },
+          },
+        },
+      })),
+      serverEvents: vi.fn(async () => fakeStream),
+    };
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+    );
+
+    await ingress.start();
+
+    expect(protocol.serverEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ after: 8 }),
+    );
+    expect(store.sessionPullRequests("se_1")).toEqual([
+      expect.objectContaining({ number: 141, head: "different-branch" }),
+    ]);
+    expect(readSignal(store.githubPullRequests)).toEqual([
+      expect.objectContaining({ cursor: 9, refreshedAt: "2026-08-01T12:02:09Z" }),
+    ]);
+    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({ cursor: 10 });
+    ingress.stop();
+  });
+
   it("bootstraps early protocol servers through a cursor-fenced metadata fallback", async () => {
     const store = new AppStore();
     const requestOrder: string[] = [];

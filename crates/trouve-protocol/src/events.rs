@@ -147,11 +147,20 @@ pub struct CommandInfo {
 /// Token/cost usage for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
+    /// Non-cached input tokens. This counter is mutually exclusive with
+    /// `cached_input_tokens`, even when the upstream provider reports an
+    /// inclusive input total.
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cached/read tokens where the provider reports them.
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Provider-authoritative model-visible tokens for the most recent
+    /// request. Unlike the aggregate turn counters above, this is the current
+    /// context-size measurement used for context-window presentation and
+    /// compaction decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_input_tokens: Option<u64>,
     /// Estimated cost in USD, when list pricing for the model is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
@@ -191,6 +200,11 @@ pub enum Event {
         mode: String,
         model: String,
     },
+    /// Live usage from the most recently completed model request in a running
+    /// turn. This replaces the thread's context-usage snapshot without
+    /// completing the turn; `turn.completed` still carries final aggregates.
+    #[serde(rename = "turn.usage_updated")]
+    TurnUsageUpdated { turn: u64, usage: Usage },
     #[serde(rename = "turn.completed")]
     TurnCompleted {
         turn: u64,
@@ -293,7 +307,8 @@ pub enum Event {
     #[serde(rename = "thread.compaction_completed")]
     CompactionCompleted {
         turn: u64,
-        /// Provider-transcript messages folded into the summary.
+        /// Provider-transcript messages folded into the summary. Zero means
+        /// an external harness reported the boundary without a message count.
         messages_compacted: u64,
     },
 

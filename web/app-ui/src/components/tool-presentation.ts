@@ -1,4 +1,5 @@
 import { utf8Length, utf8Prefix } from "../services/utf8-text.js";
+import type { FontAwesomeIconName } from "./font-awesome-icon.js";
 
 export type ToolDiffLineKind = "separator" | "context" | "add" | "delete";
 
@@ -11,7 +12,7 @@ export interface ToolDiffLine {
 
 export interface ToolTodoRow {
   readonly status: string;
-  readonly glyph: "○" | "▸" | "✓" | "✕";
+  readonly icon: FontAwesomeIconName;
   readonly content: string;
 }
 
@@ -423,10 +424,10 @@ const todoRows = (args: JsonRecord, resultValue: unknown): readonly ToolTodoRow[
     if (item === undefined) return [];
     const status = stringValue(item.status) ?? "pending";
     const content = stringValue(item.content) ?? "";
-    const glyph = status === "completed"
-      ? "✓"
-      : status === "in_progress" ? "▸" : status === "cancelled" ? "✕" : "○";
-    return [{ status, content, glyph }];
+    const icon = status === "completed"
+      ? "check"
+      : status === "in_progress" ? "play" : status === "cancelled" ? "xmark" : "circle";
+    return [{ status, content, icon }];
   });
 };
 

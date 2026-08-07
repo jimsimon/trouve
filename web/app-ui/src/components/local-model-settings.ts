@@ -16,6 +16,7 @@ import {
   DownloadRateTracker,
   formatDownloadRate,
 } from "../services/download-rate.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const LOCAL_REFRESH_MS = 1_000;
 const MAX_LOCAL_REFRESH_ATTEMPTS = 600;
@@ -333,7 +334,7 @@ export class TrouveLocalModelSettings extends LitElement {
             <span>${status.enabled ? "Enabled" : "Disabled"}</span>
           </label>
           ${status.enabled
-            ? html`<button type="button" ?disabled=${this.#loading} @click=${() => void this.#load()}>${this.#loading ? "Refreshing…" : "⟳ Refresh"}</button>`
+            ? html`<button type="button" ?disabled=${this.#loading} @click=${() => void this.#load()}>${this.#loading ? "Refreshing…" : html`${fontAwesomeIcon("arrows-rotate")} Refresh`}</button>`
             : nothing}
         </header>
 
@@ -384,7 +385,7 @@ export class TrouveLocalModelSettings extends LitElement {
           ? nothing
           : html`<section class="server-card">
               <span>${status.server_status || "running"}${status.running_model ? ` · ${status.running_model}` : ""}</span>
-              <button type="button" ?disabled=${this.#busy !== "" || !status.running_model} @click=${() => void this.#restartServer()}>⟳ Restart</button>
+              <button type="button" ?disabled=${this.#busy !== "" || !status.running_model} @click=${() => void this.#restartServer()}>${fontAwesomeIcon("arrows-rotate")} Restart</button>
               <button type="button" ?disabled=${this.#busy !== "" || status.server_status === "stopped"} @click=${() => void this.#stopServer()}>Stop (free memory)</button>
             </section>`}
 

@@ -29,6 +29,7 @@ license review deliberately change that policy.
 | @floating-ui/core | 1.8.0 | MIT | runtime/transitive |
 | @floating-ui/dom | 1.8.0 | MIT | runtime/transitive |
 | @floating-ui/utils | 0.2.12 | MIT | runtime/transitive |
+| @fortawesome/fontawesome-free | 7.3.1 | (CC-BY-4.0 AND OFL-1.1 AND MIT) | runtime/transitive |
 | @jridgewell/sourcemap-codec | 1.5.5 | MIT | development |
 | @konnorr/qr-creator | 1.1.0 | MIT | runtime/transitive |
 | @lezer/common | 1.5.2 | MIT | runtime/transitive |

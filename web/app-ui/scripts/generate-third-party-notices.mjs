@@ -7,6 +7,7 @@ const noticePath = fileURLToPath(new URL("../THIRD_PARTY_NOTICES.md", import.met
 const check = process.argv.includes("--check");
 
 const approvedLicenses = new Set([
+  "(CC-BY-4.0 AND OFL-1.1 AND MIT)",
   "(MIT OR CC0-1.0)",
   "0BSD",
   "Apache-2.0",

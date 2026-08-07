@@ -36,6 +36,11 @@ import {
   createBrowserGeneralPreferencesController,
   type GeneralPreferences,
 } from "../services/general-preferences.js";
+import {
+  createBrowserChatPreferencesController,
+  type ChatPreferences,
+} from "../services/chat-preferences.js";
+import { createBrowserComposerDraftController } from "../services/composer-drafts.js";
 import { createBrowserWorkspaceOrderController } from "../services/workspace-order.js";
 import { createBrowserPullRequestGroupOrderController } from "../services/pull-request-group-order.js";
 import { PullToRefreshGesture } from "../services/pull-to-refresh.js";
@@ -50,14 +55,17 @@ import {
   encodeAttachment,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
 import {
+  chatPreferencesFromHost,
   generalPreferencesFromHost,
   HostClient,
   notificationPreferencesFromHost,
   pullRequestGroupOrderFromHost,
   resumePreferencesFromHost,
+  withHostChatPreferences,
   withHostGeneralPreferences,
   withHostNotificationPreferences,
   withHostPullRequestGroupOrder,
@@ -128,6 +136,11 @@ import {
 } from "../components/chat-file-link.js";
 import { pickAndRegisterWorkspace } from "../components/workspace-settings-model.js";
 import { modelHealthPresentations } from "../components/model-health.js";
+import { modelOptionLabel } from "../components/model-option-controls.js";
+import {
+  fontAwesomeIcon,
+  type FontAwesomeIconName,
+} from "../components/font-awesome-icon.js";
 import "../components/command-palette.js";
 import "../components/session-list.js";
 import "../components/thread-screen.js";
@@ -153,13 +166,16 @@ const INSPECTION_PANELS = [
 
 const GITHUB_REFRESH_INTERVAL_MS = 30_000;
 
-const INSPECTION_PANEL_LABELS: Readonly<Record<InspectionPanel, string>> = {
-  diff: "±  Diff",
-  files: "▤  Files",
-  pr: "⑂  Pull Requests",
-  mcp: "⌁  MCP",
-  terminal: "›_  Terminal",
-  plan: "Todos",
+const INSPECTION_PANEL_LABELS: Readonly<Record<
+  InspectionPanel,
+  { readonly icon: FontAwesomeIconName; readonly label: string }
+>> = {
+  diff: { icon: "code-compare", label: "Diff" },
+  files: { icon: "file-lines", label: "Files" },
+  pr: { icon: "code-pull-request", label: "Pull Requests" },
+  mcp: { icon: "plug", label: "MCP" },
+  terminal: { icon: "terminal", label: "Terminal" },
+  plan: { icon: "list-check", label: "Todos" },
 };
 
 export class TrouveApp extends withSignalTracking(LitElement) {
@@ -180,6 +196,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #generalPreferences = createBrowserGeneralPreferencesController(
     deployment !== "desktop",
   );
+  readonly #chatPreferences = createBrowserChatPreferencesController(
+    deployment !== "desktop",
+  );
+  readonly #composerDrafts = createBrowserComposerDraftController();
   readonly #workspaceOrder = createBrowserWorkspaceOrderController(
     deployment !== "desktop",
   );
@@ -290,6 +310,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     generalPreferences: this.#generalPreferences.current,
     setGeneralPreferences: (patch: Partial<GeneralPreferences>) =>
       this.#updateGeneralPreferences(patch),
+    chatPreferences: this.#chatPreferences.current,
+    setChatPreferences: (patch: Partial<ChatPreferences>) =>
+      this.#updateChatPreferences(patch),
+    composerDrafts: this.#composerDrafts,
     protocol: this.#protocolClient,
     subscriptionHealth: this.#subscriptionHealth,
     pullRequestGroupOrder: this.#pullRequestGroupOrder.order,
@@ -747,6 +771,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }, false);
     this.#applyAppearanceToElement(appearance);
     this.#generalPreferences.replace(generalPreferencesFromHost(preferences), false);
+    this.#chatPreferences.replace(chatPreferencesFromHost(preferences), false);
     this.#notificationPreferences.replace(
       notificationPreferencesFromHost(preferences),
       false,
@@ -803,6 +828,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#persistHostPreferences(withHostGeneralPreferences(current, general));
     }
     this.#syncDesktopActivity();
+    this.requestUpdate();
+  }
+
+  #updateChatPreferences(patch: Partial<ChatPreferences>): void {
+    const chat = this.#chatPreferences.update(patch);
+    const current = this.#hostPreferences;
+    if (current !== undefined) {
+      this.#persistHostPreferences(withHostChatPreferences(current, chat));
+    }
     this.requestUpdate();
   }
 
@@ -2221,9 +2255,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 : this.#pullRefreshArmed ? "Release to refresh" : "Pull to refresh"}</div>
               <p class="visually-hidden" role="status" aria-live="polite">${this.#pullRefreshStatus}</p>`}
           <div class="primary-links" aria-label="Application sections">
-            <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}><span aria-hidden="true">⎇</span><strong>Pull Requests</strong></button>
-            <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}><span aria-hidden="true">⏱</span><strong>Automations</strong></button>
-            <button type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}><span class="settings-link-icon" aria-hidden="true">⚙</span><strong>Settings</strong></button>
+            <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}<strong>Pull Requests</strong></button>
+            <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}<strong>Automations</strong></button>
+            <button type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}<strong>Settings</strong></button>
           </div>
           <div class="workspace-list-heading">
             <strong>Workspaces</strong>
@@ -2243,7 +2277,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               aria-keyshortcuts="Control+K Meta+K"
               title="Command palette (Ctrl/Cmd-K)"
               @click=${this.#openCommandPalette}
-            >⌕</button>
+            >${fontAwesomeIcon("magnifying-glass")}</button>
             <wa-button
               size="s"
               aria-label="Open workspace"
@@ -2252,7 +2286,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 : "Browse is unavailable here; register a server-host path in Settings"}
               ?disabled=${!directoryPickerAvailable || this.#workspacePickerPending}
               @click=${() => void this.#openWorkspace()}
-            >${this.#workspacePickerPending ? "Opening…" : "+ Open"}</wa-button>
+            >${this.#workspacePickerPending
+              ? "Opening…"
+              : html`${fontAwesomeIcon("plus")} Open`}</wa-button>
           </div>
           <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">${this.#workspaceOrderStatus}</p>
           ${orderedWorkspaces.map(
@@ -2275,7 +2311,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       aria-controls=${`workspace-sessions-${index}`}
                       @click=${() => this.#toggleWorkspace(workspace.id)}
                     >
-                      <span aria-hidden="true">${collapsed ? "›" : "⌄"}</span>
+                      ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
                       <h2 id=${`workspace-${index}`}>${workspace.name}</h2>
                     </button>
                     <span
@@ -2292,7 +2328,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                         @keydown=${(event: KeyboardEvent) => this.#workspaceOrderKeyDown(event, workspace.id)}
                         @dragstart=${(event: DragEvent) => this.#startWorkspaceDrag(event, workspace.id)}
                         @dragend=${this.#finishWorkspaceDrag}
-                      >⠿</button>
+                      >${fontAwesomeIcon("grip-vertical")}</button>
                     </span>
                     <span class="workspace-actions-wrap">
                       <button
@@ -2302,7 +2338,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                         title="Workspace actions"
                         aria-expanded=${this.#workspaceActionMenuId === workspace.id ? "true" : "false"}
                         @click=${() => this.#toggleWorkspaceActions(workspace.id)}
-                      >⋯</button>
+                      >${fontAwesomeIcon("ellipsis")}</button>
                       ${this.#workspaceActionMenuId === workspace.id
                         ? html`<span class="workspace-actions-menu" role="menu" aria-label=${`${workspace.name} workspace actions`}>
                             <strong>Workspace</strong>
@@ -2311,7 +2347,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                               role="menuitemcheckbox"
                               aria-checked=${this.#showArchivedWorkspaceIds.has(workspace.id) ? "true" : "false"}
                               @click=${() => this.#toggleArchivedWorkspaceSessions(workspace.id)}
-                            ><span>Archived</span><span aria-hidden="true">${this.#showArchivedWorkspaceIds.has(workspace.id) ? "✓" : ""}</span></button>
+                            ><span>Archived</span><span>${this.#showArchivedWorkspaceIds.has(workspace.id) ? fontAwesomeIcon("check") : nothing}</span></button>
                             <button
                               type="button"
                               role="menuitem"
@@ -2327,7 +2363,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       aria-label=${`New session in ${workspace.name}`}
                       title=${`New session in ${workspace.name}`}
                       @click=${() => this.#showNewSession(workspace.id)}
-                    >+</button>
+                    >${fontAwesomeIcon("plus")}</button>
                   </header>
                   <trouve-session-list
                     id=${`workspace-sessions-${index}`}
@@ -2356,7 +2392,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       aria-controls=${`workspace-orphan-sessions-${index}`}
                       @click=${() => this.#toggleWorkspace(workspaceId)}
                     >
-                      <span aria-hidden="true">${collapsed ? "›" : "⌄"}</span>
+                      ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
                       <h2 id=${`workspace-orphan-${index}`}>Workspace</h2>
                     </button>
                   </header>
@@ -2464,9 +2500,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   @click=${() => this.#selectInspection(
                     selectedInspection === "plan" ? "diff" : "plan",
                   )}
-                >${selectedInspection === "plan" ? "← Diff" : `Todos  ${
-                    activeView.todos.filter((todo) => todo.status === "completed").length
-                  }/${activeView.todos.length} complete`}</button>
+                >${selectedInspection === "plan"
+                  ? html`${fontAwesomeIcon("arrow-left")} Diff`
+                  : html`${fontAwesomeIcon("list-check")} Todos  ${
+                      activeView.todos.filter((todo) => todo.status === "completed").length
+                    }/${activeView.todos.length} complete`}</button>
               </div>`
             : nothing}
           <div class="inspection-tabs" role="tablist" aria-label="Inspection views">
@@ -2487,7 +2525,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   @keydown=${(event: KeyboardEvent) =>
                     this.#selectInspectionWithKeyboard(event, index)}
                   @click=${() => this.#selectInspection(panel)}
-                >${INSPECTION_PANEL_LABELS[panel]}</button>
+                >${fontAwesomeIcon(INSPECTION_PANEL_LABELS[panel].icon)}${INSPECTION_PANEL_LABELS[panel].label}</button>
               `,
             )}
           </div>
@@ -2581,18 +2619,31 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             </label>
             ${this.#newSessionAttachments.length === 0
               ? nothing
-              : html`<ul class="pending-attachments" aria-label="Initial prompt attachments">
+              : html`<ul class="attachment-list pending-attachments" aria-label="Initial prompt attachments">
                   ${this.#newSessionAttachments.map(
-                    (attachment, index) => html`<li>
-                      <span>${attachment.upload.name}</span>
-                      <small>${this.#formatAttachmentBytes(attachment.size)}</small>
-                      <button
-                        type="button"
-                        aria-label=${`Remove ${attachment.upload.name}`}
-                        ?disabled=${this.#newSessionPending}
-                        @click=${() => this.#removeNewSessionAttachment(index)}
-                      >×</button>
-                    </li>`,
+                    (attachment, index) => {
+                      const preview = pendingAttachmentPreviewUrl(attachment);
+                      return html`<li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
+                        ${preview === undefined
+                          ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
+                          : html`<img
+                              src=${preview}
+                              alt=${`Preview of ${attachment.upload.name}`}
+                              decoding="async"
+                            />`}
+                        <div class="attachment-details">
+                          <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
+                          <small>${attachment.upload.mime} · ${this.#formatAttachmentBytes(attachment.size)}</small>
+                        </div>
+                        <button
+                          class="attachment-remove"
+                          type="button"
+                          aria-label=${`Remove ${attachment.upload.name}`}
+                          ?disabled=${this.#newSessionPending}
+                          @click=${() => this.#removeNewSessionAttachment(index)}
+                        >${fontAwesomeIcon("xmark")}</button>
+                      </li>`;
+                    },
                   )}
                 </ul>`}
             <label class="new-session-prompt">
@@ -2617,7 +2668,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               aria-disabled=${this.#newSessionPending || this.#newSessionAttachmentPending ? "true" : "false"}
               title="Attach files to the initial prompt"
             >
-              <span aria-hidden="true">📎</span><span class="visually-hidden">${this.#newSessionAttachmentPending ? "Reading files…" : "Attach files"}</span>
+              ${fontAwesomeIcon("paperclip")}<span class="visually-hidden">${this.#newSessionAttachmentPending ? "Reading files…" : "Attach files"}</span>
               <input
                 type="file"
                 multiple
@@ -2664,7 +2715,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 ></trouve-model-picker>
               </div>
               <label class="new-session-permission">
-                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? "⚠ " : ""}Permission mode</span>
+                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? fontAwesomeIcon("triangle-exclamation") : nothing}Permission mode</span>
                 <select
                   name="permission_mode"
                   class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}
@@ -2695,13 +2746,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     >
                       <option value="">Model default</option>
                       ${newSessionThinkingOption.values.map(
-                        (value) => html`<option value=${value}>${value}</option>`,
+                        (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
                       )}
                     </select>
                   </label>`}
             </div>
             ${this.#newSessionPermissionMode === "yolo"
-              ? html`<div class="new-session-yolo-warning" role="note"><strong>⚠ Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
+              ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
               : nothing}
             ${this.#newSessionOptionsError === ""
               ? nothing

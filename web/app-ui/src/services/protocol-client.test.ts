@@ -46,6 +46,37 @@ describe("ProtocolClient", () => {
     });
   });
 
+  it("loads the cursor-bearing server projection used for cold startup", async () => {
+    const requests: Request[] = [];
+    const projection = {
+      github_pull_requests: [],
+      session_pull_requests: [],
+      git_worktree_settings: {
+        title_model_load_behavior: "auto",
+        title_model_resource_policy: "adaptive",
+        title_model: {
+          state: "ready",
+          runtime_installed: true,
+          model_downloaded: true,
+        },
+      },
+    };
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(projection, {
+          headers: { "x-trouve-event-cursor": "42" },
+        });
+      }),
+    });
+
+    await expect(client.serverProjectionSnapshot()).resolves.toEqual({
+      cursor: 42,
+      value: projection,
+    });
+    expect(new URL(requests[0]!.url).pathname).toBe("/v1/server-projection");
+  });
+
   it("rejects malformed responses without copying payload data into the error", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async () =>
       Response.json({ summaries: [{ prompt: "repository secret" }], cursor: "bad" }),
@@ -385,6 +416,7 @@ describe("ProtocolClient", () => {
           { status: 202 },
         );
       }
+      if (request.method === "GET") return Response.json([queued]);
       if (request.method === "PUT") return Response.json([queued]);
       return new Response(null, { status: 204 });
     });
@@ -393,21 +425,33 @@ describe("ProtocolClient", () => {
       mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
     });
 
-    await expect(client.updateQueuedPrompt("qp_1", "Run all tests")).resolves.toBeUndefined();
+    await expect(client.updateQueuedPrompt("qp_1", {
+      content: "Run all tests",
+      retained_attachment_ids: ["at_existing"],
+      attachments: [{ name: "new.txt", mime: "text/plain", data: "bmV3" }],
+    })).resolves.toBeUndefined();
+    await expect(client.listQueue("th_1")).resolves.toEqual([queued]);
     await expect(client.reorderQueue("th_1", ["qp_1"])).resolves.toEqual([queued]);
     await expect(client.dispatchQueue("th_1")).resolves.toMatchObject({ turn: 3 });
     await expect(client.deleteQueuedPrompt("qp_1")).resolves.toBeUndefined();
 
     expect(requests.map((request) => request.method)).toEqual([
       "PATCH",
+      "GET",
       "PUT",
       "POST",
       "DELETE",
     ]);
     expect(requests[0]?.url).toContain("/v1/queue/qp_1");
+    await expect(requests[0]?.json()).resolves.toEqual({
+      content: "Run all tests",
+      retained_attachment_ids: ["at_existing"],
+      attachments: [{ name: "new.txt", mime: "text/plain", data: "bmV3" }],
+    });
     expect(requests[1]?.url).toContain("/v1/threads/th_1/queue");
+    expect(requests[2]?.url).toContain("/v1/threads/th_1/queue");
     expect(
-      requests.every(
+      requests.filter((request) => request.method !== "GET").every(
         (request) => request.headers.get("x-trouve-host-csrf") === "ephemeral-token",
       ),
     ).toBe(true);

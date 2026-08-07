@@ -165,7 +165,23 @@ pub use requests::*;
 // optional compact detail without per-thread background streams (additive).
 // 3.3: folded tool-call items expose server-measured execution duration so
 // clients do not depend on incomplete provider result metadata (additive).
-pub const PROTOCOL_VERSION: &str = "3.3";
+// 3.4: folded thread snapshots retain context-compaction boundaries and
+// their running/completed/failed lifecycle as top-level transcript items
+// (additive).
+// 3.5: automations persist an optional thinking level and apply it to every
+// fresh thread they create (additive).
+// 3.6: turn usage exposes the most recent request's authoritative context
+// size and a durable live replacement event so clients do not infer context
+// utilization from aggregate or provider-specific billing counters
+// (additive).
+// 3.7: queued-prompt edits can retain/remove existing stored attachments
+// and append new attachment uploads without re-uploading unchanged files
+// (additive).
+// 3.8: GET /v1/server-projection bootstraps account PR snapshots, durable
+// session-to-PR associations, and Git & Worktrees settings at a server cursor
+// so clients no longer replay the complete server event log on startup
+// (additive).
+pub const PROTOCOL_VERSION: &str = "3.8";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

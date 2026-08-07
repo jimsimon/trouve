@@ -24,6 +24,9 @@ describe("Slint/Lit visual contract", () => {
   const app = read("./app.css");
   const shell = read("../app/trouve-app.ts");
   const sessionList = read("../components/session-list.ts");
+  const sessionIndicators = read("../state/session-indicator-model.ts");
+  const icons = read("../components/font-awesome-icon.ts");
+  const attachments = read("../services/attachments.ts");
   const thread = read("../components/thread-screen.ts");
   const markdown = read("../components/markdown-view.ts");
   const newThread = read("../components/new-thread-setup.ts");
@@ -141,7 +144,8 @@ describe("Slint/Lit visual contract", () => {
     );
     for (const screen of [settings, automations, pullRequests]) {
       expect(screen).toContain("trouve-close-full-screen");
-      expect(screen).toContain("✕ Close");
+      expect(screen).toContain('fontAwesomeIcon("xmark")');
+      expect(screen).toContain("Close</button>");
     }
   });
 
@@ -212,8 +216,15 @@ describe("Slint/Lit visual contract", () => {
     expect(shell).toMatch(
       /const INSPECTION_PANELS = \[\s*"diff",\s*"files",\s*"pr",\s*"mcp",\s*"terminal",/,
     );
-    for (const label of ["±  Diff", "▤  Files", "⑂  Pull Requests", "⌁  MCP", "›_  Terminal", "Todos"]) {
-      expect(shell).toContain(label);
+    for (const [panel, icon, label] of [
+      ["diff", "code-compare", "Diff"],
+      ["files", "file-lines", "Files"],
+      ["pr", "code-pull-request", "Pull Requests"],
+      ["mcp", "plug", "MCP"],
+      ["terminal", "terminal", "Terminal"],
+      ["plan", "list-check", "Todos"],
+    ]) {
+      expect(shell).toContain(`${panel}: { icon: "${icon}", label: "${label}" }`);
     }
     expect(app).toMatch(/\.status-bar \{[^}]*display:\s*none/s);
     expect(app).toMatch(/\.status-bar\.actionable \{[^}]*display:\s*flex/s);
@@ -293,7 +304,7 @@ describe("Slint/Lit visual contract", () => {
       /\.activity-group \{[^}]*width:\s*100%[^}]*margin:\s*0/s,
     );
     expect(app).toMatch(
-      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*4px/s,
+      /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*2px/s,
     );
     expect(app).toMatch(
       /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
@@ -315,46 +326,87 @@ describe("Slint/Lit visual contract", () => {
       /\.activity-group \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
     );
     expect(app).toMatch(
-      /\.activity-group > summary \{[^}]*border:\s*1px solid var\(--trouve-card-border\)[^}]*border-radius:\s*var\(--trouve-radius\)[^}]*color:\s*var\(--trouve-text-mid\)[^}]*background:\s*var\(--trouve-surface\)/s,
+      /\.activity-group > summary \{[^}]*border:\s*0[^}]*color:\s*var\(--trouve-text-mid\)[^}]*background:\s*transparent/s,
     );
     expect(app).toMatch(
       /\.activity-group-body \{[^}]*border:\s*0[^}]*background:\s*transparent/s,
+    );
+    expect(app).toMatch(
+      /\.tool-card \{[^}]*border:\s*0[^}]*border-radius:\s*0[^}]*background:\s*transparent/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline \{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*gap:\s*6px[^}]*padding-inline-start:\s*20px/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline::before \{[^}]*inset-block:\s*15px[^}]*width:\s*var\(--trouve-chat-timeline-rail-width\)[^}]*background:\s*var\(--trouve-border-strong\)[^}]*opacity:\s*\.65/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline\.single-activity::before \{[^}]*inset-block:\s*6px/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline > \.activity-group::before \{[^}]*display:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline > \.activity-group > summary \.disclosure-icon \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-18px[^}]*translateY\(-50%\)/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before, \.agent-activity-timeline > \.thinking-card::before, \.agent-activity-timeline > \.thinking-output::before \{[^}]*width:\s*var\(--trouve-chat-timeline-node-size\)[^}]*height:\s*var\(--trouve-chat-timeline-node-size\)[^}]*border-radius:\s*50%[^}]*background:\s*var\(--trouve-text-faint\)/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline > \.activity-group\.error::before[^}]*background:\s*var\(--trouve-err\)/s,
+    );
+    expect(app).toMatch(
+      /\.agent-activity-timeline \+ \.agent-text-block \{[^}]*margin-block-start:\s*6px/s,
+    );
+    expect(app).toMatch(
+      /\.agent-text-block \{[^}]*max-inline-size:\s*120ch/s,
+    );
+    expect(app).toMatch(
+      /\.agent-copy-action \{[^}]*display:\s*inline-flex[^}]*flex:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.assistant-message:hover > \.agent-header > \.agent-copy-action[^}]*opacity:\s*1/s,
+    );
+    expect(app).toMatch(
+      /\.thinking-output trouve-markdown-view \{[^}]*max-width:\s*120ch/s,
     );
     expect(thread).toContain('class="composer-option mode-option"');
     expect(thread).toContain('class="composer-option model-option"');
     expect(thread).toContain('class="composer-option permission-option"');
     expect(thread).toContain('class="message-body turn-body-stream user-body-stream"');
     expect(thread).toContain('class="message-body turn-body-stream agent-body-stream"');
+    expect(thread).toContain("agent-activity-timeline");
+    expect(thread).toContain('activityRows.length === 1 ? "single-activity" : ""');
     expect(thread).toContain('class="turn-markdown"');
+    expect(thread).toContain('class="agent-copy-action"');
+    expect(thread).toContain('"Copy assistant output"');
     expect(markdown).toMatch(
       /:host\(\.turn-markdown\) :where\([^}]*\) \{[^}]*margin-inline:\s*10px/s,
     );
-    expect(thread).toContain('thread.spawned === true ? "⑂ "');
+    expect(thread).toContain('candidate.spawned === true');
+    expect(thread).toContain('fontAwesomeIcon("code-branch")');
     expect(thread).toContain('event.key !== "Enter" || event.shiftKey');
     expect(app).toMatch(
       /@media \(max-width: 760px\)[\s\S]*\.thread-tabs \{[^}]*height:\s*42px/,
     );
   });
 
-  it("matches Slint's running-tool activity spinner", () => {
+  it("uses a local Font Awesome running-tool spinner with Slint's timing", () => {
     const spinnerPath = /d="([^"]+)"/.exec(slintActivitySpinner)?.[1];
     expect(spinnerPath).toBe("M12 3a9 9 0 1 1-9 9");
     expect(slintActivitySpinner).toContain('stroke-linecap="round"');
     expect(slintActivitySpinner).toContain('stroke-width="3"');
     expect(slint).toContain("360deg * (mod(root.animation-time, 900ms) / 900ms)");
-    expect(thread).toContain(`d="${spinnerPath}"`);
-    expect(thread).toContain('class="tool-running-static">◌</span>');
+    expect(icons).toContain('@fortawesome/fontawesome-free/css/solid.css');
+    expect(icons).toContain('spinner: 0xf110');
+    expect(thread).toContain('running: "spinner"');
+    expect(thread).toContain('spin: item.status === "running"');
     expect(app).toMatch(
-      /\.tool-status\.running \{[^}]*height:\s*12px[^}]*color:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-context-spin 900ms linear infinite/s,
+      /\.trouve-icon-spin \{[^}]*animation:\s*trouve-font-awesome-spin 900ms linear infinite/s,
     );
     expect(app).toMatch(
-      /\.tool-running-spinner \{[^}]*width:\s*12px[^}]*height:\s*12px[^}]*fill:\s*none[^}]*stroke:\s*currentColor[^}]*stroke-linecap:\s*round[^}]*stroke-width:\s*3/s,
+      /\[data-reduce-motion\] \.trouve-icon-spin \{[^}]*animation:\s*none/s,
     );
-    expect(app).toMatch(
-      /\[data-reduce-motion\] \.tool-status\.running \{[^}]*color:\s*var\(--trouve-text-dim\)[^}]*animation:\s*none/s,
-    );
-    expect(app).toContain("[data-reduce-motion] .tool-running-spinner { display: none; }");
-    expect(app).toContain("[data-reduce-motion] .tool-running-static { display: inline; }");
   });
 
   it("matches Slint's session-list status precedence and indicators", () => {
@@ -366,12 +418,13 @@ describe("Slint/Lit visual contract", () => {
     expect(slint).toContain("height: 10px");
     expect(slint).toContain("background: Theme.c.accent");
     expect(slint).toContain("mod(root.activity-animation-time, 1.6s) / 1.6s");
-    expect(sessionList).toContain('kind: "approval", glyph: "!"');
-    expect(sessionList).toContain('kind: "question", glyph: "?"');
-    expect(sessionList).toContain('kind: "error", glyph: "×"');
-    expect(sessionList).toContain('kind: "unread", glyph: "●"');
-    expect(sessionList).toContain('kind: "busy", glyph: ""');
-    expect(sessionList).toContain('kind: "none", glyph: ""');
+    expect(sessionList).toContain("sessionIndicatorPresentation(session)");
+    expect(sessionIndicators).toContain('icon: "triangle-exclamation"');
+    expect(sessionIndicators).toContain('icon: "circle-question"');
+    expect(sessionIndicators).toContain('icon: "xmark"');
+    expect(sessionIndicators).toContain('kind: "unread", icon: "circle"');
+    expect(sessionIndicators).toContain('kind: "busy", icon: undefined');
+    expect(sessionIndicators).toContain('kind: "none", icon: undefined');
     expect(sessionList).toContain('class="session-pr-badge ${pullRequestBadge.tone}"');
     expect(app).toMatch(
       /\.session-indicator\.approval,[^}]*color:\s*var\(--trouve-warn\)[^}]*font-size:\s*16px/s,
@@ -453,8 +506,32 @@ describe("Slint/Lit visual contract", () => {
     expect(app).toMatch(
       /\.permission-option select\.permission-yolo:disabled \{[^}]*border-color:\s*var\(--trouve-border\)[^}]*color:\s*var\(--trouve-text-disabled\)[^}]*font-weight:\s*400/s,
     );
+    expect(thread).toContain('class="permission-warning"');
+    expect(thread).toContain('title="YOLO: changes run without approval"');
+    expect(thread).toContain('fontAwesomeIcon("triangle-exclamation")');
+    expect(app).toMatch(
+      /\.permission-warning \{[^}]*width:\s*22px[^}]*height:\s*30px[^}]*display:\s*grid[^}]*place-items:\s*center/s,
+    );
     expect(app).toContain(".composer-option select:hover:not(:disabled)");
     expect(app).not.toContain(".composer-option select:hover {");
+  });
+
+  it("reuses submitted attachment-card geometry for pending images and files", () => {
+    expect(thread).toContain('class="attachment-list pending-attachments"');
+    expect(shell).toContain('class="attachment-list pending-attachments"');
+    expect(thread).toContain("pendingAttachmentPreviewUrl(attachment)");
+    expect(shell).toContain("pendingAttachmentPreviewUrl(attachment)");
+    expect(newThread).toContain("pendingAttachmentPreviewUrl(attachment)");
+    expect(attachments).toContain("data:${mime};base64,${attachment.upload.data}");
+    expect(app).toMatch(
+      /\.attachment-list img \{[^}]*width:\s*64px[^}]*height:\s*48px[^}]*object-fit:\s*cover/s,
+    );
+    expect(app).toMatch(
+      /\.attachment-icon \{[^}]*width:\s*64px[^}]*height:\s*48px[^}]*display:\s*grid[^}]*place-items:\s*center/s,
+    );
+    expect(app).toMatch(
+      /\.pending-attachments li \{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto/s,
+    );
   });
 
   it("keeps compact Slint settings labels, meters, copy, and form alignment", () => {

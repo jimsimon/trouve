@@ -23,6 +23,25 @@ describe("composer usage presentation", () => {
     });
   });
 
+  it("prefers an explicit current-context measurement over aggregate counters", () => {
+    expect(composerContextUsage({
+      input_tokens: 140_000,
+      cached_input_tokens: 120_000,
+      context_input_tokens: 150_000,
+      context_window: 300_000,
+    }, undefined, false).percent).toBe(50);
+  });
+
+  it("does not double-count cached input in legacy Codex usage", () => {
+    const context = composerContextUsage({
+      input_tokens: 90_606,
+      cached_input_tokens: 80_640,
+      context_window: 258_400,
+    }, undefined, false, true);
+    expect(context.usedTokens).toBe(90_606);
+    expect(context.percent).toBe(35);
+  });
+
   it("falls back to the catalog window and clamps a full dial", () => {
     const context = composerContextUsage({ input_tokens: 250_000 }, 200_000, true);
     expect(context.fill).toBe(1);

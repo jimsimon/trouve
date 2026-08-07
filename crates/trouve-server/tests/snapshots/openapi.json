@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.3"
+    "version": "3.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -2433,6 +2433,44 @@
         }
       }
     },
+    "/v1/server-projection": {
+      "get": {
+        "tags": [],
+        "operationId": "server_projection",
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "x-trouve-event-cursor": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Server event cursor for this snapshot"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerProjection"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/session-summaries": {
       "get": {
         "tags": [],
@@ -4319,6 +4357,13 @@
           "schedule": {
             "$ref": "#/components/schemas/AutomationSchedule"
           },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking level for the runs (None = the selected model/mode/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."
+          },
           "workspace_id": {
             "$ref": "#/components/schemas/String"
           }
@@ -6188,6 +6233,31 @@
           },
           {
             "type": "object",
+            "description": "Live usage from the most recently completed model request in a running\nturn. This replaces the thread's context-usage snapshot without\ncompleting the turn; `turn.completed` still carries final aggregates.",
+            "required": [
+              "turn",
+              "usage",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.usage_updated"
+                ]
+              },
+              "usage": {
+                "$ref": "#/components/schemas/Usage"
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "turn",
               "usage",
@@ -6679,7 +6749,7 @@
               "messages_compacted": {
                 "type": "integer",
                 "format": "int64",
-                "description": "Provider-transcript messages folded into the summary.",
+                "description": "Provider-transcript messages folded into the summary. Zero means\nan external harness reported the boundary without a message count.",
                 "minimum": 0
               },
               "turn": {
@@ -7623,6 +7693,29 @@
           },
           "source": {
             "type": "string"
+          }
+        }
+      },
+      "GithubPrHostProjection": {
+        "type": "object",
+        "description": "Latest persisted account-level PR replacement for one GitHub host.\nThe event cursor and timestamp let clients order this bootstrap state\nagainst newer SSE events without replaying the retained server history.",
+        "required": [
+          "cursor",
+          "refreshed_at",
+          "pull_requests"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pull_requests": {
+            "$ref": "#/components/schemas/GithubPrList"
+          },
+          "refreshed_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },
@@ -8810,6 +8903,32 @@
           }
         }
       },
+      "ServerProjection": {
+        "type": "object",
+        "description": "Durable server-owned state that is not part of the session-summary\nsnapshot. Clients fetch this once during bootstrap and can then resume the\nserver event stream at the session-summary cursor instead of cursor zero.",
+        "required": [
+          "github_pull_requests",
+          "session_pull_requests",
+          "git_worktree_settings"
+        ],
+        "properties": {
+          "git_worktree_settings": {
+            "$ref": "#/components/schemas/GitWorktreeSettings"
+          },
+          "github_pull_requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GithubPrHostProjection"
+            }
+          },
+          "session_pull_requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionPrProjection"
+            }
+          }
+        }
+      },
       "Session": {
         "type": "object",
         "required": [
@@ -8897,6 +9016,25 @@
           "succeeded",
           "failed"
         ]
+      },
+      "SessionPrProjection": {
+        "type": "object",
+        "description": "Pull requests already associated with one session using durable branch or\n`session.pr_opened` evidence. This is a local projection of the persisted\naccount snapshots and never performs a GitHub request.",
+        "required": [
+          "session_id",
+          "prs"
+        ],
+        "properties": {
+          "prs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrInfo"
+            }
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
       },
       "SessionSummariesSnapshot": {
         "type": "object",
@@ -9249,6 +9387,59 @@
           }
         }
       },
+      "ThreadCompactionState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "messages_compacted",
+              "state"
+            ],
+            "properties": {
+              "messages_compacted": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A started compaction did not report completion before normal turn\noutput or a terminal turn event arrived.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ThreadToolStatus": {
         "type": "string",
         "enum": [
@@ -9395,6 +9586,31 @@
                 "enum": [
                   "thinking"
                 ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A context-window compaction boundary in the transcript. Unlike a\ntool call, this is engine lifecycle state and remains visible after\ncompletion so clients can show where earlier context was summarized.",
+            "required": [
+              "turn",
+              "state",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "compaction"
+                ]
+              },
+              "state": {
+                "$ref": "#/components/schemas/ThreadCompactionState"
               },
               "turn": {
                 "type": "integer",
@@ -9883,8 +10099,25 @@
           "content"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            },
+            "description": "New files to append after the retained attachments."
+          },
           "content": {
             "type": "string"
+          },
+          "retained_attachment_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Existing queued attachment ids to keep, in display order. Omit this\nfield to preserve every existing attachment (the behavior of clients\npredating protocol 2.14); send an empty list to remove all of them."
           }
         }
       },
@@ -9983,6 +10216,13 @@
           },
           "schedule": {
             "$ref": "#/components/schemas/AutomationSchedule"
+          },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking level for each fresh automation thread. Omitted by older\nclients preserves normal model/mode/global inheritance."
           },
           "workspace_id": {
             "$ref": "#/components/schemas/String"
@@ -10189,6 +10429,15 @@
             "description": "Cached/read tokens where the provider reports them.",
             "minimum": 0
           },
+          "context_input_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Provider-authoritative model-visible tokens for the most recent\nrequest. Unlike the aggregate turn counters above, this is the current\ncontext-size measurement used for context-window presentation and\ncompaction decisions.",
+            "minimum": 0
+          },
           "context_window": {
             "type": [
               "integer",
@@ -10209,6 +10458,7 @@
           "input_tokens": {
             "type": "integer",
             "format": "int64",
+            "description": "Non-cached input tokens. This counter is mutually exclusive with\n`cached_input_tokens`, even when the upstream provider reports an\ninclusive input total.",
             "minimum": 0
           },
           "output_tokens": {

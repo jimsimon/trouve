@@ -18,6 +18,7 @@ import type {
   TrouveTerminalView,
 } from "./terminal-view.js";
 import { nextHorizontalTabIndex, rovingTabIndex } from "./tab-navigation.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./terminal-view.js";
 
 const INITIAL_COLS = 100;
@@ -132,8 +133,8 @@ export class TrouveTerminalPanel extends LitElement {
               this.#search(!event.shiftKey);
             }}
           />
-          <button type="button" aria-label="Previous terminal search match" ?disabled=${this.#activeId === "" || this.#searchQuery === ""} @click=${() => this.#search(false)}>↑</button>
-          <button type="button" aria-label="Next terminal search match" ?disabled=${this.#activeId === "" || this.#searchQuery === ""} @click=${() => this.#search(true)}>↓</button>
+          <button type="button" aria-label="Previous terminal search match" ?disabled=${this.#activeId === "" || this.#searchQuery === ""} @click=${() => this.#search(false)}>${fontAwesomeIcon("arrow-up")}</button>
+          <button type="button" aria-label="Next terminal search match" ?disabled=${this.#activeId === "" || this.#searchQuery === ""} @click=${() => this.#search(true)}>${fontAwesomeIcon("arrow-down")}</button>
           <button class="terminal-additive-action" type="button" ?disabled=${this.#activeId === "" || this.#busy !== ""} @click=${() => void this.#copySelection()}>Copy</button>
           <button class="terminal-additive-action" type="button" ?disabled=${this.#activeId === "" || this.#busy !== "" || this.#exited.has(this.#activeId)} @click=${() => void this.#pasteClipboard()}>Paste</button>
           ${clipboardRequest === undefined
@@ -146,7 +147,7 @@ export class TrouveTerminalPanel extends LitElement {
                 <button type="button" @click=${() => void this.#resolveClipboardRequest(true)}>Allow copy</button>
                 <button type="button" @click=${() => void this.#resolveClipboardRequest(false)}>Deny</button>
               </span>`}
-          <button type="button" ?disabled=${this.#activeId === "" || this.#busy !== ""} @click=${() => void this.#restartActive()}>${this.#busy === "restart" ? "Restarting…" : "⟳ Restart"}</button>
+          <button type="button" ?disabled=${this.#activeId === "" || this.#busy !== ""} @click=${() => void this.#restartActive()}>${this.#busy === "restart" ? "Restarting…" : html`${fontAwesomeIcon("arrows-rotate")} Restart`}</button>
           <span role="status" aria-live="polite">${this.#controlStatus}</span>
         </div>
         <div class="terminal-tabs" role="tablist" aria-label="Session terminals">
@@ -164,17 +165,19 @@ export class TrouveTerminalPanel extends LitElement {
                   )}
                   @click=${() => this.#select(terminal.id)}
                   @keydown=${(event: KeyboardEvent) => this.#tabKeydown(event, index)}
-                >${terminal.exited || this.#exited.has(terminal.id) ? "● " : ""}${this.#terminalTitle(terminal.id, index)}</button>
+                >${terminal.exited || this.#exited.has(terminal.id)
+                  ? fontAwesomeIcon("circle")
+                  : nothing}${this.#terminalTitle(terminal.id, index)}</button>
                 <button
                   class="terminal-close"
                   type="button"
                   aria-label=${`Close ${this.#terminalTitle(terminal.id, index)}`}
                   @click=${() => this.#closeTerminal(terminal.id)}
-                >×</button>
+                >${fontAwesomeIcon("xmark")}</button>
               </span>
             `,
           )}
-          <button type="button" aria-label="New terminal" ?disabled=${this.#busy !== ""} @click=${() => this.#open(true)}>+</button>
+          <button type="button" aria-label="New terminal" ?disabled=${this.#busy !== ""} @click=${() => this.#open(true)}>${fontAwesomeIcon("plus")}</button>
         </div>
         ${this.#error !== ""
           ? html`<p class="terminal-notice error" role="alert">${this.#error}</p>`

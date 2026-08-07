@@ -8,8 +8,10 @@ import {
   githubIntegrationConfigured,
   mergeabilitySummary,
   mergeMethod,
+  pullRequestsListHref,
   reviewSummary,
   safeSessionPrHref,
+  sessionPullRequestsListHref,
 } from "./session-pr-panel-model.js";
 
 const pullRequest = (overrides: Partial<ProtocolPrInfo> = {}): ProtocolPrInfo => ({
@@ -63,6 +65,30 @@ describe("session pull-request panel model", () => {
     expect(safeSessionPrHref("https://token@github.com/org/repo/pull/1")).toBeUndefined();
     expect(safeSessionPrHref("javascript:alert(1)")).toBeUndefined();
     expect(safeSessionPrHref("/relative")).toBeUndefined();
+  });
+
+  it("resolves the repository pull-request list from an associated PR", () => {
+    expect(pullRequestsListHref(pullRequest())).toBe(
+      "https://github.com/trouve-ai/trouve/pulls",
+    );
+    expect(pullRequestsListHref(pullRequest({
+      url: "https://github.example.com/platform/trouve/pull/42/files?diff=split#discussion",
+    }))).toBe("https://github.example.com/platform/trouve/pulls");
+    expect(pullRequestsListHref(pullRequest({
+      url: "https://github.com/trouve-ai/trouve/issues/42",
+    }))).toBeUndefined();
+    expect(pullRequestsListHref(pullRequest({
+      url: "http://github.com/trouve-ai/trouve/pull/42",
+    }))).toBeUndefined();
+  });
+
+  it("falls back to another PR mapped to the session workspace", () => {
+    const workspacePr = pullRequest({ head: "another-branch" });
+    const lists = [{ host: "github.com", viewer: "octocat", prs: [workspacePr] }];
+    expect(sessionPullRequestsListHref([], "ws_1", lists)).toBe(
+      "https://github.com/trouve-ai/trouve/pulls",
+    );
+    expect(sessionPullRequestsListHref([], "ws_other", lists)).toBeUndefined();
   });
 
   it("summarizes passing, pending, and failing checks", () => {

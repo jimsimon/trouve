@@ -32,7 +32,7 @@ use trouve_protocol::{
     McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
     PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
     SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
     SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
@@ -94,6 +94,7 @@ impl IntoResponse for ApiError {
         list_workspaces,
         close_workspace,
         workspace_branches,
+        server_projection,
         refresh_github_prs,
         generate_session_title,
         create_session,
@@ -209,6 +210,9 @@ impl IntoResponse for ApiError {
         CreateSessionRequest,
         Session,
         SessionSummariesSnapshot,
+        ServerProjection,
+        trouve_protocol::GithubPrHostProjection,
+        trouve_protocol::SessionPrProjection,
         trouve_protocol::SessionSummary,
         trouve_protocol::SessionAttention,
         trouve_protocol::SessionOutcome,
@@ -475,6 +479,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::delete(close_workspace),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
+        .route("/v1/server-projection", get(server_projection))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/session-title", post(generate_session_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
@@ -1005,6 +1010,22 @@ async fn workspace_branches(
     Ok(Json(engine.workspace_branches(&id).await?))
 }
 
+#[utoipa::path(get, path = "/v1/server-projection",
+    responses(
+        (status = 200, body = ServerProjection,
+            headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot"))),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn server_projection(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, projection) = engine.server_projection_snapshot()?;
+    Ok((
+        [(EVENT_CURSOR_HEADER, cursor.to_string())],
+        Json(projection),
+    ))
+}
+
 #[utoipa::path(post, path = "/v1/github/prs/refresh",
     responses((status = 204), (status = 400, body = ErrorBody)))]
 async fn refresh_github_prs(
@@ -1284,7 +1305,7 @@ async fn update_queued_prompt(
     Path(id): Path<String>,
     Json(req): Json<UpdateQueuedPromptRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.update_queued_prompt(&id, &req.content)?;
+    engine.update_queued_prompt(&id, req)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

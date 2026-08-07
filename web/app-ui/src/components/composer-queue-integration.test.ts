@@ -34,7 +34,11 @@ describe("thread composer and queue integration", () => {
 
   it("keeps queue mutations disabled, recoverable, and explicit on failure", () => {
     expect(screen).toContain("queueControlState({");
-    expect(screen).toContain('data-queue-action="edit-input"');
+    expect(screen).toContain("Editing queued prompt");
+    expect(screen).toContain('title="Update queued prompt"');
+    expect(screen).toContain("#queueEditRetainedAttachments");
+    expect(screen).toContain("retained_attachment_ids:");
+    expect(screen).toContain("#restoreComposerAfterQueueEdit");
     expect(screen).toContain('data-queue-action="send-now"');
     expect(screen).toContain('data-queue-action="dispatch"');
     expect(screen).toContain("#sendQueuedNow");

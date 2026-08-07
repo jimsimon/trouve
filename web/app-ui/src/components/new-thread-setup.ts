@@ -10,11 +10,14 @@ import {
 import {
   AttachmentEncodingError,
   encodeAttachment,
+  pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
 import { readSignal } from "../state/reactivity.js";
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import { modelHealthPresentations } from "./model-health.js";
+import { modelOptionLabel } from "./model-option-controls.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
@@ -145,19 +148,32 @@ export class TrouveNewThreadSetup extends LitElement {
     .yolo-warning strong { font-size: 12px; }
     .attachment-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
     .attachment-list li {
-      max-width: 100%;
-      display: flex;
+      width: min(100%, 310px);
+      min-width: 170px;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
       align-items: center;
-      gap: 6px;
+      gap: 7px;
+      overflow: hidden;
       border: 1px solid var(--trouve-border);
-      border-radius: var(--trouve-radius);
-      padding: 3px 4px 3px 8px;
+      border-radius: var(--trouve-radius-sm);
+      padding: 5px 7px;
       color: var(--trouve-text-mid);
-      background: var(--trouve-accent-bg);
+      background: var(--trouve-surface);
       font-size: 10px;
     }
-    .attachment-list li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .attachment-list li small { flex: none; color: var(--trouve-text-dim); }
+    .attachment-list img, .attachment-icon {
+      width: 64px;
+      height: 48px;
+      border-radius: 3px;
+      background: var(--trouve-code-bg);
+    }
+    .attachment-list img { object-fit: cover; }
+    .attachment-icon { display: grid; place-items: center; color: var(--trouve-text-faint); font-size: 17px; }
+    .attachment-details { min-width: 0; display: grid; gap: 2px; }
+    .attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .attachment-details strong { color: var(--trouve-text-mid); }
+    .attachment-details small { color: var(--trouve-text-dim); }
     .attachment-list li button {
       width: 24px;
       height: 24px;
@@ -379,13 +395,15 @@ export class TrouveNewThreadSetup extends LitElement {
                   >
                     <option value="">Model default</option>
                     ${thinking.values.map(
-                      (value) => html`<option value=${value}>${value}</option>`,
+                      (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
                     )}
                   </select>
                 </label>
               `}
           <label class=${`permission-field ${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}`}>
-            <span>${this.#draft.permissionMode === "yolo" ? "⚠ " : ""}Permission mode</span>
+            <span>${this.#draft.permissionMode === "yolo"
+              ? fontAwesomeIcon("triangle-exclamation")
+              : nothing}Permission mode</span>
             <select
               name="permission_mode"
               class=${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}
@@ -404,7 +422,7 @@ export class TrouveNewThreadSetup extends LitElement {
         ${this.#draft.permissionMode === "yolo"
           ? html`
               <div class="yolo-warning" role="note">
-                <strong>⚠ Unattended execution (YOLO) is dangerous</strong>
+                <strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong>
                 <span>The agent can run commands and change or delete files without asking for approval.</span>
               </div>
             `
@@ -430,18 +448,30 @@ export class TrouveNewThreadSetup extends LitElement {
           : html`
               <ul class="attachment-list" aria-label="Initial message attachments">
                 ${this.#draft.attachments.map(
-                  (attachment, index) => html`
-                    <li>
-                      <span>${attachment.upload.name}</span>
-                      <small>${formatNewThreadAttachmentBytes(attachment.size)}</small>
-                      <button
-                        type="button"
-                        aria-label=${`Remove ${attachment.upload.name}`}
-                        ?disabled=${controls.formDisabled}
-                        @click=${() => this.#removeAttachment(index)}
-                      >×</button>
-                    </li>
-                  `,
+                  (attachment, index) => {
+                    const preview = pendingAttachmentPreviewUrl(attachment);
+                    return html`
+                      <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
+                        ${preview === undefined
+                          ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
+                          : html`<img
+                              src=${preview}
+                              alt=${`Preview of ${attachment.upload.name}`}
+                              decoding="async"
+                            />`}
+                        <div class="attachment-details">
+                          <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
+                          <small>${attachment.upload.mime} · ${formatNewThreadAttachmentBytes(attachment.size)}</small>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label=${`Remove ${attachment.upload.name}`}
+                          ?disabled=${controls.formDisabled}
+                          @click=${() => this.#removeAttachment(index)}
+                        >${fontAwesomeIcon("xmark")}</button>
+                      </li>
+                    `;
+                  },
                 )}
               </ul>
             `}
@@ -466,7 +496,7 @@ export class TrouveNewThreadSetup extends LitElement {
             class=${`attachment-picker icon-only ${controls.formDisabled || this.#attachmentLoading ? "disabled" : ""}`}
             title="Attach files to the optional first message"
           >
-            <span aria-hidden="true">📎</span>
+            ${fontAwesomeIcon("paperclip")}
             <span class="visually-hidden">${this.#attachmentLoading ? "Reading files…" : "Attach files"}</span>
             <input
               type="file"
@@ -492,17 +522,35 @@ export class TrouveNewThreadSetup extends LitElement {
     this.#loadedWorkspaceId = workspaceId;
     this.#optionsLoading = true;
     this.#optionsError = "";
+    this.#subscriptionHealth = readSignal(services.subscriptionHealth.current);
     this.requestUpdate();
+
+    // Subscription health only decorates model choices. Provider probes may
+    // launch vendor helpers and take an unbounded amount of time, so they must
+    // never keep the mode and model controls disabled while the required
+    // catalog requests have already completed.
+    void services.subscriptionHealth.refresh("if-stale").then(
+      (subscriptionHealth) => {
+        if (
+          generation !== this.#loadGeneration
+          || workspaceId !== this.#effectiveWorkspaceId
+        ) return;
+        this.#subscriptionHealth = subscriptionHealth;
+        this.requestUpdate();
+      },
+      () => {
+        // Health is optional presentation data; catalog errors are reported
+        // independently below.
+      },
+    );
     try {
-      const [modes, models, providers, subscriptionHealth] = await Promise.all([
+      const [modes, models, providers] = await Promise.all([
         services.protocol.modes(workspaceId),
         services.protocol.models(),
         services.protocol.providers(),
-        services.subscriptionHealth.refresh("if-stale").catch(() => []),
       ]);
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
       this.#catalog = { modes, models, providers };
-      this.#subscriptionHealth = subscriptionHealth;
       const initial = createInitialNewThreadDraft(this.#catalog);
       this.#draft = {
         ...initial,

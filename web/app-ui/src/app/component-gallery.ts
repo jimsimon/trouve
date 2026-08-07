@@ -1,6 +1,7 @@
 import { html, LitElement } from "lit";
 
 import { THEME_NAMES } from "../services/theme-controller.js";
+import { fontAwesomeIcon } from "../components/font-awesome-icon.js";
 
 export class TrouveComponentGallery extends LitElement {
   protected override createRenderRoot(): HTMLElement {
@@ -50,7 +51,7 @@ export class TrouveComponentGallery extends LitElement {
               <span class="session-copy"><strong>Preserve existing UX</strong><small>trouve/web-frontend</small></span>
             </button>
             <button class="session-row">
-              <span class="session-indicator approval" aria-hidden="true">!</span>
+              <span class="session-indicator approval">${fontAwesomeIcon("triangle-exclamation")}</span>
               <span class="session-copy"><strong>Approval needed</strong><small>trouve/protocol</small></span>
             </button>
           </div>
@@ -60,10 +61,12 @@ export class TrouveComponentGallery extends LitElement {
             <article class="message assistant-message">
               <header><span class="status-dot running"></span><strong>trouve</strong></header>
               <p>The generated tokens remain authoritative.</p>
-              <details class="tool-card" open>
-                <summary><span>✓</span><strong>theme parity</strong><small>5 palettes</small></summary>
-                <pre>generated CSS matches theme.rs</pre>
-              </details>
+              <div class="agent-activity-timeline">
+                <details class="tool-card tool-ok" open>
+                  <summary>${fontAwesomeIcon("check")}<strong>theme parity</strong><small>5 palettes</small></summary>
+                  <pre>generated CSS matches theme.rs</pre>
+                </details>
+              </div>
             </article>
           </div>
           <div>

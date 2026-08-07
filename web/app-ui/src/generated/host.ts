@@ -222,6 +222,14 @@ export interface components {
             size_bytes: number;
         };
         /**
+         * @description Chat transcript presentation remains client-owned and does not affect the
+         *     durable thread view shared through the harness protocol.
+         */
+        ChatPreferences: {
+            /** @description Include thinking output in collapsible tool-activity groups. */
+            collapse_thinking_with_tools?: boolean;
+        };
+        /**
          * @description Stable first-visible chat item plus its non-negative offset into the item.
          *     Unlike raw scroll pixels, this survives font and window-size changes.
          */
@@ -339,6 +347,7 @@ export interface components {
         /** @description Nonsecret settings that the native host may persist across ephemeral ports. */
         HostPreferences: {
             appearance: components["schemas"]["AppearancePreferences"];
+            chat?: components["schemas"]["ChatPreferences"];
             general?: components["schemas"]["GeneralPreferences"];
             geometry?: null | components["schemas"]["WindowGeometry"];
             /** Format: float */

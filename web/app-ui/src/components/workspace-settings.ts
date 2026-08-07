@@ -16,6 +16,7 @@ import {
   type WorkspaceRegistrationDraft,
   type WorkspaceRegistrationErrors,
 } from "./workspace-settings-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
   static override styles = css`
@@ -285,13 +286,13 @@ export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
         ${services.deployment === "pwa"
           ? html`
               <p class="server-path-copy">
-                <span aria-hidden="true">i</span>
+                ${fontAwesomeIcon("circle-info")}
                 <span><strong>PWA server path</strong><br />The path is on the machine running trouve-server, not on this device. Enter an absolute repository path already available to the server; this PWA cannot browse the server filesystem.</span>
               </p>
             `
           : html`
               <p class="server-path-copy">
-                <span aria-hidden="true">i</span>
+                ${fontAwesomeIcon("circle-info")}
                 <span><strong>Server path</strong><br />Enter an absolute repository path on the machine running trouve-server. The server validates and opens it.</span>
               </p>
             `}

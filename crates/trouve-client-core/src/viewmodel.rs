@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use trouve_protocol::{
-    ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadToolStatus,
-    ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus, Usage,
+    ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadCompactionState,
+    ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus, Usage,
 };
 
 /// Per-tool retained output budget. The projection keeps the latest valid
@@ -83,6 +83,12 @@ pub enum ChatItem {
         content: String,
         complete: bool,
     },
+    /// Engine context compaction is a durable transcript boundary, not a
+    /// provider tool call. Clients render it at the Agent-card top level.
+    Compaction {
+        turn: u64,
+        state: CompactionState,
+    },
     ToolCall {
         call_id: String,
         tool: String,
@@ -121,6 +127,13 @@ pub enum TurnState {
     Running,
     Completed { usage: Usage },
     Failed { error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionState {
+    Running,
+    Completed { messages_compacted: u64 },
+    Failed,
 }
 
 /// State of one thread's chat, folded from its event stream.
@@ -216,6 +229,16 @@ impl From<ThreadViewItem> for ChatItem {
                 content,
                 complete,
             },
+            ThreadViewItem::Compaction { turn, state } => Self::Compaction {
+                turn,
+                state: match state {
+                    ThreadCompactionState::Running => CompactionState::Running,
+                    ThreadCompactionState::Completed { messages_compacted } => {
+                        CompactionState::Completed { messages_compacted }
+                    }
+                    ThreadCompactionState::Failed => CompactionState::Failed,
+                },
+            },
             ThreadViewItem::ToolCall {
                 call_id,
                 tool,
@@ -287,6 +310,24 @@ impl ThreadViewModel {
         }
     }
 
+    fn fail_open_compaction(&mut self, turn: u64) -> Option<usize> {
+        self.compacting = false;
+        let idx = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Compaction {
+                    turn: candidate,
+                    state: CompactionState::Running,
+                } if *candidate == turn
+            )
+        })?;
+        self.items[idx] = ChatItem::Compaction {
+            turn,
+            state: CompactionState::Failed,
+        };
+        Some(idx)
+    }
+
     /// Wall-clock time of a finished turn, from its started/ended envelope
     /// timestamps (persisted, so replayed history keeps its durations).
     fn record_turn_duration(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
@@ -311,9 +352,13 @@ impl ThreadViewModel {
                 });
                 Some(self.items.len() - 1)
             }
-            Event::CompactionStarted { .. } => {
+            Event::CompactionStarted { turn } => {
                 self.compacting = true;
-                None
+                self.items.push(ChatItem::Compaction {
+                    turn: *turn,
+                    state: CompactionState::Running,
+                });
+                Some(self.items.len() - 1)
             }
             Event::CommandsUpdated { commands } => {
                 self.commands = commands.clone();
@@ -327,9 +372,37 @@ impl ThreadViewModel {
                 self.todos = todos.clone();
                 None
             }
-            Event::CompactionCompleted { .. } => {
+            Event::CompactionCompleted {
+                turn,
+                messages_compacted,
+            } => {
                 self.compacting = false;
-                None
+                let idx = self.items.iter().rposition(|item| {
+                    matches!(
+                        item,
+                        ChatItem::Compaction {
+                            turn: candidate,
+                            state: CompactionState::Running,
+                        } if candidate == turn
+                    )
+                });
+                if let Some(idx) = idx {
+                    self.items[idx] = ChatItem::Compaction {
+                        turn: *turn,
+                        state: CompactionState::Completed {
+                            messages_compacted: *messages_compacted,
+                        },
+                    };
+                    Some(idx)
+                } else {
+                    self.items.push(ChatItem::Compaction {
+                        turn: *turn,
+                        state: CompactionState::Completed {
+                            messages_compacted: *messages_compacted,
+                        },
+                    });
+                    Some(self.items.len() - 1)
+                }
             }
             Event::UserMessage {
                 turn,
@@ -344,6 +417,7 @@ impl ThreadViewModel {
                 Some(self.items.len() - 1)
             }
             Event::AssistantThinking { turn, text } => {
+                self.fail_open_compaction(*turn);
                 self.thinking = true;
                 // Grow the trailing open thinking item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
@@ -363,6 +437,7 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantDelta { turn, text } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 // Grow the trailing incomplete assistant item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
@@ -382,6 +457,7 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantMessage { turn, content } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Assistant { turn: t, complete: false, .. } if t == turn)
@@ -402,12 +478,14 @@ impl ThreadViewModel {
                 }
             }
             Event::ToolRequested {
+                turn,
                 call_id,
                 tool,
                 args,
                 requires_approval,
                 ..
             } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
@@ -528,11 +606,13 @@ impl ThreadViewModel {
                 idx
             }
             Event::QuestionRequested {
+                turn,
                 request_id,
                 title,
                 questions,
                 ..
             } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 if !self.pending_questions.contains(request_id) {
                     self.pending_questions.push(request_id.clone());
@@ -560,9 +640,13 @@ impl ThreadViewModel {
                 }
                 idx
             }
+            Event::TurnUsageUpdated { usage, .. } => {
+                self.last_usage = Some(usage.clone());
+                None
+            }
             Event::TurnCompleted { turn, usage, .. } => {
                 self.turn_running = false;
-                self.compacting = false;
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.last_usage = Some(usage.clone());
@@ -582,7 +666,7 @@ impl ThreadViewModel {
             }
             Event::TurnFailed { turn, error } => {
                 self.turn_running = false;
-                self.compacting = false;
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
@@ -601,7 +685,7 @@ impl ThreadViewModel {
             }
             Event::TurnCancelled { turn } => {
                 self.turn_running = false;
-                self.compacting = false;
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
@@ -641,6 +725,7 @@ mod tests {
                 ChatItem::User { .. } => "user",
                 ChatItem::Assistant { .. } => "assistant",
                 ChatItem::Thinking { .. } => "thinking",
+                ChatItem::Compaction { .. } => "compaction",
                 ChatItem::ToolCall { .. } => "tool",
                 ChatItem::TurnStatus { .. } => "turn-status",
                 ChatItem::Questions { .. } => "questions",
@@ -911,6 +996,20 @@ mod tests {
         assert!(vm.turn_running);
         assert!(!vm.compacting);
 
+        let live_usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 80,
+            context_input_tokens: Some(90),
+            ..Default::default()
+        };
+        vm.apply(&env(Event::TurnUsageUpdated {
+            turn: 1,
+            usage: live_usage.clone(),
+        }));
+        assert!(vm.turn_running);
+        assert_eq!(vm.last_usage, Some(live_usage));
+
         vm.apply(&env(Event::CompactionStarted { turn: 1 }));
         assert!(vm.compacting);
         vm.apply(&env(Event::CompactionCompleted {
@@ -918,6 +1017,15 @@ mod tests {
             messages_compacted: 5,
         }));
         assert!(!vm.compacting);
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::Compaction {
+                turn: 1,
+                state: CompactionState::Completed {
+                    messages_compacted: 5,
+                },
+            })
+        ));
 
         let usage = Usage {
             input_tokens: 1234,

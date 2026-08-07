@@ -18,6 +18,7 @@ import {
   boundedSubscriptionUsage,
   subscriptionUsageTone,
 } from "./model-health.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
@@ -555,18 +556,18 @@ export class TrouveProviderSettings extends LitElement {
       : provider.auth === "gcp"
         ? "Google credential chain"
         : provider.auth === "oauth"
-          ? provider.has_credentials ? "✓ logged in" : "not logged in"
+          ? provider.has_credentials ? "logged in" : "not logged in"
           : provider.auth === "cli"
-            ? provider.has_credentials ? "✓ CLI ready" : "CLI not set up"
-            : provider.has_credentials ? "✓ credentials" : "no credentials";
+            ? provider.has_credentials ? "CLI ready" : "CLI not set up"
+            : provider.has_credentials ? "credentials" : "no credentials";
     const credentialTone = provider.auth === "aws" || provider.auth === "gcp"
       ? ""
       : provider.has_credentials ? "ready" : "warning";
     return html`
       <article class="provider-row">
         <strong class="provider-name">${provider.id}</strong>
-        <span class="provider-kind">${provider.kind}${provider.base_url ? ` · ${provider.base_url}` : ""}${provider.experimental === true ? " · ⚠ experimental" : ""}</span>
-        <span class=${`provider-auth ${credentialTone}`}>${credentialLabel}</span>
+        <span class="provider-kind">${provider.kind}${provider.base_url ? ` · ${provider.base_url}` : ""}${provider.experimental === true ? html` · ${fontAwesomeIcon("triangle-exclamation")} experimental` : ""}</span>
+        <span class=${`provider-auth ${credentialTone}`}>${credentialTone === "ready" ? fontAwesomeIcon("check") : nothing}${credentialLabel}</span>
         <div class="actions">
           ${canLogin ? html`
             <button type="button" ?disabled=${this.#busy !== ""} @click=${() => void this.#beginLogin(provider.id, provider.id)}>

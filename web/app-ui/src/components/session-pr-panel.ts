@@ -22,8 +22,10 @@ import {
   mergeMethod,
   reviewSummary,
   safeSessionPrHref,
+  sessionPullRequestsListHref,
   type PrSummary,
 } from "./session-pr-panel-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const humanize = (value: string): string => {
   const text = value.trim().replaceAll("_", " ");
@@ -136,7 +138,25 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     .pr-setup { min-height: calc(100vh - 96px); align-content: center; gap: 12px; padding: 24px; }
     .pr-setup strong { color: var(--trouve-text-hi); font-size: 14px; }
     .pr-setup-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
-    .pr-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+    .pr-toolbar { position: relative; display: grid; gap: 6px; }
+    .pr-toolbar-heading { display: flex; min-width: 0; align-items: center; gap: 6px; }
+    .pr-toolbar-heading h2 { flex: 1; min-width: 0; }
+    .pr-toolbar-actions { display: flex; align-items: center; gap: 3px; }
+    button.icon-button {
+      display: inline-grid;
+      width: 30px;
+      min-width: 30px;
+      min-height: 30px;
+      place-items: center;
+      padding: 0;
+      border-color: transparent;
+      color: var(--trouve-text-dim);
+      background: transparent;
+    }
+    button.icon-button:hover:not(:disabled), button.icon-button[aria-expanded="true"] {
+      color: var(--trouve-text-hi);
+      background: var(--trouve-hover-bg);
+    }
     .pr-toolbar > select { min-width: 0; }
     .pr-refresh-additive { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; padding: 0; clip: rect(0, 0, 0, 0); }
     .pr-refresh-additive:focus-visible { position: static; width: auto; height: auto; min-height: 34px; overflow: visible; padding: 4px 9px; clip: auto; }
@@ -156,6 +176,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
       .pr-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
       .pr-heading .actions { grid-column: 1 / -1; justify-content: stretch; }
       .actions button, button, input, textarea, select, summary { min-height: 44px; }
+      button.icon-button { width: 44px; min-width: 44px; }
       .actions button { flex: 1 1 auto; }
     }
   `;
@@ -235,6 +256,19 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     const openPr = prs.find((pr) => pr.state === "open");
     const selectedPr = prs.find((pr) => pr.number === this.#selectedPrNumber)
       ?? prs[0];
+    const store = this.#store.value;
+    const session = store?.session(this.#effectiveSessionId);
+    const accountLists = store === undefined
+      ? []
+      : readSignal(store.githubPullRequests).map(({ pullRequests }) => pullRequests);
+    const associated = selectedPr === undefined
+      ? prs
+      : [selectedPr, ...prs.filter((pr) => pr !== selectedPr)];
+    const pullRequestsHref = sessionPullRequestsListHref(
+      associated,
+      session?.workspaceId ?? "",
+      accountLists,
+    );
     return html`
       <section class="panel" aria-label="Pull requests">
         ${this.#githubConfigured === false
@@ -258,11 +292,39 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
               `
           : html`
               <header class="pr-toolbar">
-                <h2 id="session-pr-title" class="visually-hidden">Pull requests</h2>
+                <div class="pr-toolbar-heading">
+                  <h2 id="session-pr-title">Pull requests</h2>
+                  <div class="pr-toolbar-actions" aria-label="Pull request actions">
+                    <button
+                      class="icon-button"
+                      type="button"
+                      title="Create pull request"
+                      aria-label="Create pull request"
+                      aria-controls="create-pr-panel"
+                      aria-expanded=${this.#createOpen ? "true" : "false"}
+                      @click=${() => {
+                        this.#createOpen = !this.#createOpen;
+                        this.requestUpdate();
+                      }}
+                    >${fontAwesomeIcon("code-pull-request")}</button>
+                    <button
+                      class="icon-button"
+                      type="button"
+                      title=${pullRequestsHref === undefined
+                        ? "Open Pull Requests (no associated GitHub repository yet)"
+                        : "Open Pull Requests"}
+                      aria-label="Open Pull Requests"
+                      ?disabled=${pullRequestsHref === undefined}
+                      @click=${() => {
+                        if (pullRequestsHref !== undefined) this.#openExternal(pullRequestsHref);
+                      }}
+                    >${fontAwesomeIcon("arrow-up-right-from-square")}</button>
+                  </div>
+                </div>
                 ${prs.length > 1
-                  ? html`<label class="visually-hidden" for="session-pr-picker">Pull request</label>
-                      <select
+                  ? html`<select
                         id="session-pr-picker"
+                        aria-label="Pull request"
                         .value=${String(selectedPr?.number ?? "")}
                         @change=${(event: Event) => {
                           this.#selectedPrNumber = Number((event.currentTarget as HTMLSelectElement).value);
@@ -270,8 +332,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
                           this.requestUpdate();
                         }}
                       >${prs.map((pr) => html`<option value=${pr.number}>${pr.state}${pr.draft ? " · draft" : ""} · #${pr.number} · ${pr.title}</option>`)}</select>`
-                  : html`<span></span>`}
-                <button type="button" @click=${() => { this.#createOpen = !this.#createOpen; this.requestUpdate(); }}>Create PR</button>
+                  : nothing}
                 <button class="pr-refresh-additive" type="button" ?disabled=${this.#loading || this.#busy !== ""} @click=${() => void this.#load()}>
                   ${this.#loading ? "Refreshing…" : "Refresh"}
                 </button>
@@ -321,7 +382,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
           <span>#${pr.number} · ${pr.head} → ${pr.base}</span>
         </div>
         <div class="slint-pr-actions">
-          ${url === undefined ? nothing : html`<button type="button" @click=${() => this.#openExternal(url)}>Open on GitHub ↗</button>`}
+          ${url === undefined ? nothing : html`<button type="button" @click=${() => this.#openExternal(url)}>Open on GitHub ${fontAwesomeIcon("arrow-up-right-from-square")}</button>`}
         </div>
         ${pr.checks.length === 0
           ? nothing
@@ -408,7 +469,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
 
   #renderCreate(hasOpenPr: boolean) {
     return html`
-      <section class="settings-card" aria-labelledby="create-pr-title">
+      <section id="create-pr-panel" class="settings-card" aria-labelledby="create-pr-title">
         <h3 id="create-pr-title">Create pull request</h3>
         <p>${hasOpenPr
           ? "This session already has an open pull request. Close or merge it before opening another for the same branch."

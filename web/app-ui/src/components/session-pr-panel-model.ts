@@ -1,6 +1,7 @@
 import type {
   ProtocolCreatePrRequest,
   ProtocolGithubIntegration,
+  ProtocolGithubPrList,
   ProtocolPrInfo,
 } from "../services/protocol-client.js";
 
@@ -43,6 +44,44 @@ export const safeSessionPrHref = (
   } catch {
     return undefined;
   }
+};
+
+/** Resolve the repository-level pull-request index from one associated PR.
+ * The protocol's PR URL remains the source of truth for both the GitHub host
+ * and repository path, including configured GitHub Enterprise hosts. */
+export const pullRequestsListHref = (
+  pr: Pick<ProtocolPrInfo, "url">,
+): string | undefined => {
+  const href = safeSessionPrHref(pr.url);
+  if (href === undefined) return undefined;
+  const url = new URL(href);
+  const match = /^\/([^/]+)\/([^/]+)\/pull\/\d+(?:\/.*)?$/u.exec(url.pathname);
+  if (match === null) return undefined;
+  const [, owner, repository] = match;
+  if (owner === undefined || repository === undefined) return undefined;
+  url.pathname = `/${owner}/${repository}/pulls`;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+};
+
+/** Prefer PRs already associated with the session, then fall back to any
+ * account projection mapped to the same local workspace. The latter keeps the
+ * repository shortcut useful when this branch has not opened a PR yet. */
+export const sessionPullRequestsListHref = (
+  associated: readonly ProtocolPrInfo[],
+  workspaceId: string,
+  accountLists: readonly ProtocolGithubPrList[],
+): string | undefined => {
+  const workspaceCandidates = workspaceId === ""
+    ? []
+    : accountLists.flatMap(({ prs }) =>
+        prs.filter((pr) => pr.workspace_id === workspaceId));
+  for (const pr of [...associated, ...workspaceCandidates]) {
+    const href = pullRequestsListHref(pr);
+    if (href !== undefined) return href;
+  }
+  return undefined;
 };
 
 const successfulConclusion = (value: string): boolean =>

@@ -140,6 +140,27 @@ describe("ThreadViewModel", () => {
     expect(view.turnDurationMs.get(7)).toBe(4_000);
   });
 
+  it("restores a completed compaction boundary from a folded snapshot", () => {
+    const view = ThreadViewModel.fromSnapshot(12, {
+      item_offset: 8,
+      total_items: 9,
+      has_older: true,
+      compacting: false,
+      items: [{
+        kind: "compaction",
+        turn: 4,
+        state: { state: "completed", messages_compacted: 27 },
+      }],
+    });
+
+    expect(view.items).toEqual([{
+      id: "snapshot:8",
+      kind: "compaction",
+      turn: 4,
+      state: { kind: "completed", messagesCompacted: 27 },
+    }]);
+  });
+
   it("prepends only a contiguous folded page and keeps absolute item ids stable", () => {
     const newest: ProtocolThreadViewSnapshot = {
       item_offset: 2,
@@ -210,6 +231,34 @@ describe("ThreadViewModel", () => {
       { kind: "assistant", content: "Working now.", complete: true },
     ]);
     expect(vm.turnDurationMs.get(1)).toBe(7_000);
+  });
+
+  it("applies live context usage without completing the running turn", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 1,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(2, {
+      type: "turn.usage_updated",
+      turn: 1,
+      usage: {
+        input_tokens: 10_000,
+        output_tokens: 500,
+        cached_input_tokens: 80_000,
+        context_input_tokens: 90_000,
+        context_window: 258_400,
+      },
+    }));
+
+    expect(vm.turnRunning).toBe(true);
+    expect(vm.lastUsageCursor).toBe(2);
+    expect(vm.lastUsage?.context_input_tokens).toBe(90_000);
+    expect(vm.items).toMatchObject([
+      { kind: "turn-status", state: { kind: "running" } },
+    ]);
   });
 
   it("attaches bridged approvals to tool cards and keeps denials terminal", () => {
@@ -347,19 +396,26 @@ describe("ThreadViewModel", () => {
     vm.apply(envelope(1, { type: "thread.compaction_started", turn: 2 }));
     vm.apply(
       envelope(2, {
+        type: "thread.compaction_completed",
+        turn: 2,
+        messages_compacted: 10,
+      }),
+    );
+    vm.apply(
+      envelope(3, {
         type: "thread.commands_updated",
         commands: [{ name: "review", description: "Review changes" }],
       }),
     );
-    vm.apply(envelope(3, { type: "thread.queue_updated", prompts: [] }));
+    vm.apply(envelope(4, { type: "thread.queue_updated", prompts: [] }));
     vm.apply(
-      envelope(4, {
+      envelope(5, {
         type: "thread.todos_updated",
         todos: [{ id: "one", content: "Wire UI", status: "in_progress" }],
       }),
     );
     vm.apply(
-      envelope(5, {
+      envelope(6, {
         type: "question.requested",
         turn: 2,
         request_id: "question_1",
@@ -373,21 +429,19 @@ describe("ThreadViewModel", () => {
         ],
       }),
     );
-    expect(vm.compacting).toBe(true);
+    expect(vm.compacting).toBe(false);
     expect(vm.pendingQuestions).toEqual(["question_1"]);
+    expect(vm.items.find((item) => item.kind === "compaction")).toMatchObject({
+      kind: "compaction",
+      turn: 2,
+      state: { kind: "completed", messagesCompacted: 10 },
+    });
 
     vm.apply(
-      envelope(6, {
+      envelope(7, {
         type: "question.resolved",
         request_id: "question_1",
         answers: [{ question_id: "q1", selected_option_ids: ["pwa"] }],
-      }),
-    );
-    vm.apply(
-      envelope(7, {
-        type: "thread.compaction_completed",
-        turn: 2,
-        messages_compacted: 10,
       }),
     );
     expect(vm.compacting).toBe(false);
@@ -396,6 +450,19 @@ describe("ThreadViewModel", () => {
     expect(vm.findQuestions("question_1")?.answers).toEqual([
       { question_id: "q1", selected_option_ids: ["pwa"] },
     ]);
+  });
+
+  it("marks an unfinished compaction stopped when normal output resumes", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, { type: "thread.compaction_started", turn: 2 }));
+    vm.apply(envelope(2, { type: "assistant.delta", turn: 2, text: "Continuing" }));
+
+    expect(vm.compacting).toBe(false);
+    expect(vm.items[0]).toMatchObject({
+      kind: "compaction",
+      turn: 2,
+      state: { kind: "failed" },
+    });
   });
 
   it("defensively applies full todo replacements in protocol order", () => {

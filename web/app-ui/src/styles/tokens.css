@@ -17,6 +17,8 @@
   --trouve-navigation-width: 260px;
   --trouve-inspection-width: 460px;
   --trouve-pull-refresh-distance: 0px;
+  --trouve-chat-timeline-rail-width: 1px;
+  --trouve-chat-timeline-node-size: 7px;
   --trouve-chat-streaming-animation: pulse 1s steps(2, end) infinite;
 }
 

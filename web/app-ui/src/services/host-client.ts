@@ -18,6 +18,10 @@ import {
   type GeneralPreferences,
 } from "./general-preferences.js";
 import {
+  DEFAULT_CHAT_PREFERENCES,
+  type ChatPreferences,
+} from "./chat-preferences.js";
+import {
   DEFAULT_NOTIFICATION_PREFERENCES,
   type NotificationPreferences,
 } from "./notification-preferences.js";
@@ -857,6 +861,14 @@ export const generalPreferencesFromHost = (
     DEFAULT_GENERAL_PREFERENCES.preventSleepWhileRunning,
 });
 
+export const chatPreferencesFromHost = (
+  preferences: HostPreferences,
+): ChatPreferences => Object.freeze({
+  collapseThinkingWithTools:
+    preferences.chat?.collapse_thinking_with_tools ??
+    DEFAULT_CHAT_PREFERENCES.collapseThinkingWithTools,
+});
+
 export const notificationPreferencesFromHost = (
   preferences: HostPreferences,
 ): NotificationPreferences => Object.freeze({
@@ -904,6 +916,14 @@ export const withHostGeneralPreferences = (
 ): HostPreferences => ({
   ...preferences,
   general: { prevent_sleep_while_running: general.preventSleepWhileRunning },
+});
+
+export const withHostChatPreferences = (
+  preferences: HostPreferences,
+  chat: ChatPreferences,
+): HostPreferences => ({
+  ...preferences,
+  chat: { collapse_thinking_with_tools: chat.collapseThinkingWithTools },
 });
 
 export const withHostNotificationPreferences = (

@@ -138,6 +138,7 @@ const protocolValidators = {
   terminalInfo: componentRef(protocolSchemaId, "TerminalInfo"),
   terminalInfos: componentArray(protocolSchemaId, "TerminalInfo"),
   serverInfo: componentRef(protocolSchemaId, "ServerInfo"),
+  serverProjection: componentRef(protocolSchemaId, "ServerProjection"),
   providers: componentRef(protocolSchemaId, "ProvidersResponse"),
   provider: componentRef(protocolSchemaId, "ProviderInfo"),
   knownProviders: componentArray(protocolSchemaId, "KnownProvider"),

@@ -872,6 +872,7 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                     cached_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                    context_input_tokens: None,
                     // The CLI reports an estimate even on subscription
                     // plans, where nothing is billed per turn; suppress it
                     // like the other subscription backends.

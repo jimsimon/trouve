@@ -2,8 +2,24 @@ import type { ThreadChatItem } from "../state/thread-view-model.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "thinking" | "tool" | "questions" }
+  { readonly kind: "assistant" | "thinking" | "compaction" | "tool" | "questions" }
 >;
+
+export type AgentActivityItem = Extract<
+  AgentChatItem,
+  { readonly kind: "thinking" | "tool" }
+>;
+
+/** Older Codex transcripts represented native context compaction as a tool
+ * call. Keep recognizing those rows so the renderer can promote them to the
+ * same durable top-level boundary used by the current protocol lifecycle. */
+export const isContextCompactionTool = (item: AgentActivityItem): boolean => {
+  if (item.kind !== "tool") return false;
+  const normalized = (item.tool.split("__").at(-1) ?? item.tool)
+    .replaceAll(/[^a-z0-9]/giu, "")
+    .toLowerCase();
+  return normalized === "contextcompaction" || normalized === "compactcontext";
+};
 
 export type ChatRenderUnit =
   | {
@@ -32,6 +48,7 @@ export interface ChatLayout {
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
   || item.kind === "thinking"
+  || item.kind === "compaction"
   || item.kind === "tool"
   || item.kind === "questions";
 
@@ -54,8 +71,12 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     const first = pendingAgentItems[0];
     if (first === undefined) return;
     const turn = pendingAgentItems.find(
-      (item): item is Extract<AgentChatItem, { readonly kind: "assistant" | "thinking" }> =>
-        item.kind === "assistant" || item.kind === "thinking",
+      (item): item is Extract<AgentChatItem, {
+        readonly kind: "assistant" | "thinking" | "compaction";
+      }> =>
+        item.kind === "assistant"
+        || item.kind === "thinking"
+        || item.kind === "compaction",
     )?.turn ?? currentTurn;
     const id = `agent:${first.id}`;
     const agentItems = Object.freeze([...pendingAgentItems]);
@@ -103,7 +124,11 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     }
     if (isAgentItem(item)) {
       pendingAgentItems.push(item);
-      if (item.kind === "assistant" || item.kind === "thinking") currentTurn = item.turn;
+      if (
+        item.kind === "assistant"
+        || item.kind === "thinking"
+        || item.kind === "compaction"
+      ) currentTurn = item.turn;
       continue;
     }
 
@@ -140,7 +165,7 @@ const plural = (count: number, one: string, many: string): string =>
   `${count} ${count === 1 ? one : many}`;
 
 /** Match the Slint activity-group sentence used for consecutive work items. */
-export const activityGroupSummary = (items: readonly AgentChatItem[]): string => {
+export const activityGroupSummary = (items: readonly AgentActivityItem[]): string => {
   const edited = new Set<string>();
   const read = new Set<string>();
   let editsWithoutPath = 0;

@@ -384,6 +384,8 @@ pub enum UiCommand {
     AppearanceChanged,
     /// General preferences changed (already persisted on the UI thread).
     GeneralPrefsChanged(crate::winstate::General),
+    /// Chat presentation changed (already persisted on the UI thread).
+    ChatPrefsChanged(crate::winstate::Chat),
     /// Notification preferences toggled (already persisted on the UI
     /// thread); the controller keeps a copy to gate event notifications.
     NotifyPrefsChanged(crate::winstate::Notifications),
@@ -961,6 +963,8 @@ struct Controller {
     sleep_inhibitor: crate::sleep::SleepInhibitor,
     /// User preference gating the sleep inhibitor; enabled by default.
     prevent_sleep_while_running: bool,
+    /// Client-local transcript grouping and disclosure policy.
+    chat: crate::winstate::Chat,
     /// The server can't reach the internet (seeded from `ServerInfo.online`,
     /// kept live by `server.connectivity_changed` events). While set, the
     /// model list holds only offline-capable (local) models; when it is
@@ -1245,6 +1249,7 @@ pub async fn run(
         busy_sessions: HashSet::new(),
         sleep_inhibitor: crate::sleep::SleepInhibitor::default(),
         prevent_sleep_while_running: crate::winstate::load_general().prevent_sleep_while_running,
+        chat: crate::winstate::load_chat(),
         offline: false,
         connectivity_notice_seq: 0,
         server_unreachable: false,
@@ -1481,6 +1486,15 @@ impl Controller {
             self.home_workspace_id = workspace.id.clone();
         }
 
+        // Fence metadata reads before fetching the remaining durable server
+        // projection. When both snapshots are available the event follower
+        // resumes here instead of rebuilding state from cursor zero.
+        let session_summary_cursor = self
+            .client
+            .session_summaries()
+            .await
+            .ok()
+            .map(|snapshot| snapshot.cursor);
         self.reload_sessions().await?;
         self.sync_home_workspace();
 
@@ -1496,6 +1510,24 @@ impl Controller {
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
         }
+        let mut server_projection_loaded = false;
+        if let Ok((cursor, projection)) = self.client.server_projection().await {
+            server_projection_loaded = true;
+            for snapshot in projection.github_pull_requests {
+                self.apply_github_pr_snapshot(snapshot.cursor, snapshot.pull_requests);
+            }
+            self.nav_prs = projection
+                .session_pull_requests
+                .into_iter()
+                .map(|session| (session.session_id, session.prs))
+                .collect();
+            self.apply_git_worktree_settings_snapshot(cursor, projection.git_worktree_settings);
+        }
+        let server_resume_cursor = if server_projection_loaded {
+            session_summary_cursor.unwrap_or(0)
+        } else {
+            0
+        };
         self.push_github_integration();
         self.push_prs();
         self.refresh_pr_dashboard();
@@ -1516,7 +1548,7 @@ impl Controller {
             tokio::spawn(async move {
                 use std::sync::atomic::{AtomicU64, Ordering};
 
-                let mut after = 0u64;
+                let mut after = server_resume_cursor;
                 let mut lost_reported = false;
                 let replay =
                     std::sync::Arc::new(std::sync::Mutex::new(ServerReplayBuffer::default()));
@@ -2917,13 +2949,14 @@ impl Controller {
                 }
             }
         }
-        render::chat_rows_at_offset(
+        render::chat_rows_at_offset_with_preferences(
             vm,
             item_offset,
             &self.expanded_tools,
             &raw_turns,
             &collapsed,
             &self.wizards,
+            self.chat.collapse_thinking_with_tools,
         )
     }
 
@@ -3306,7 +3339,16 @@ impl Controller {
         let used = vm
             .last_usage
             .as_ref()
-            .map(|u| u.input_tokens + u.cached_input_tokens)
+            .map(|u| {
+                u.context_input_tokens.unwrap_or_else(|| {
+                    u.input_tokens
+                        .saturating_add(if thread.model.starts_with("codex/") {
+                            0
+                        } else {
+                            u.cached_input_tokens
+                        })
+                })
+            })
             .unwrap_or(0);
         let unavailable = window.is_none_or(|window| window == 0);
         let (fill, tooltip) = match (used, window) {
@@ -7015,6 +7057,7 @@ impl Controller {
                     workspace_id,
                     mode: None,
                     model: None,
+                    thinking_level: None,
                     permission_mode: match permission_index {
                         1 => PermissionMode::AllowList,
                         2 => PermissionMode::Yolo,
@@ -7055,6 +7098,7 @@ impl Controller {
                     workspace_id: automation.workspace_id.clone(),
                     mode: automation.mode.clone(),
                     model: automation.model.clone(),
+                    thinking_level: automation.thinking_level.clone(),
                     permission_mode: automation.permission_mode,
                     schedule: automation.schedule.clone(),
                     enabled,
@@ -7350,6 +7394,10 @@ impl Controller {
             UiCommand::GeneralPrefsChanged(prefs) => {
                 self.prevent_sleep_while_running = prefs.prevent_sleep_while_running;
                 self.sync_sleep_inhibitor();
+            }
+            UiCommand::ChatPrefsChanged(prefs) => {
+                self.chat = prefs;
+                self.render_chat(false);
             }
             UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
             UiCommand::WindowFocusChanged(focused) => {
@@ -7703,6 +7751,7 @@ fn level_label(token: &str) -> String {
         "high" => "High".into(),
         "xhigh" => "Extra High".into(),
         "max" => "Max".into(),
+        "ultra" => "Ultra".into(),
         other => other.to_string(),
     }
 }

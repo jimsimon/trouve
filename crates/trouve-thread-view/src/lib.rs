@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use trouve_protocol::{
-    ApprovalDecision, Event, EventEnvelope, ThreadToolStatus, ThreadTurnState, ThreadViewItem,
-    ThreadViewSnapshot, ToolStatus,
+    ApprovalDecision, Event, EventEnvelope, ThreadCompactionState, ThreadToolStatus,
+    ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -29,6 +29,7 @@ struct ProjectionIndexes {
     open_thinking: HashMap<u64, usize>,
     tools: HashMap<String, usize>,
     turns: HashMap<u64, usize>,
+    open_compactions: HashMap<u64, usize>,
     questions: HashMap<String, usize>,
     latest_thinking: Option<usize>,
 }
@@ -48,11 +49,33 @@ impl ThreadProjection {
                 });
                 self.indexes.turns.insert(*turn, idx);
             }
-            Event::CompactionStarted { .. } => self.snapshot.compacting = true,
+            Event::CompactionStarted { turn } => {
+                self.snapshot.compacting = true;
+                let idx = self.push(ThreadViewItem::Compaction {
+                    turn: *turn,
+                    state: ThreadCompactionState::Running,
+                });
+                self.indexes.open_compactions.insert(*turn, idx);
+            }
             Event::CommandsUpdated { commands } => self.snapshot.commands = commands.clone(),
             Event::QueueUpdated { prompts } => self.snapshot.queue = prompts.clone(),
             Event::TodosUpdated { todos } => self.snapshot.todos = todos.clone(),
-            Event::CompactionCompleted { .. } => self.snapshot.compacting = false,
+            Event::CompactionCompleted {
+                turn,
+                messages_compacted,
+            } => {
+                self.snapshot.compacting = false;
+                let state = ThreadCompactionState::Completed {
+                    messages_compacted: *messages_compacted,
+                };
+                if let Some(idx) = self.indexes.open_compactions.remove(turn) {
+                    self.snapshot.items[idx] = ThreadViewItem::Compaction { turn: *turn, state };
+                } else {
+                    // A projection cache written by an older protocol may
+                    // contain the busy flag without its new transcript row.
+                    self.push(ThreadViewItem::Compaction { turn: *turn, state });
+                }
+            }
             Event::UserMessage {
                 turn,
                 content,
@@ -65,6 +88,7 @@ impl ThreadProjection {
                 });
             }
             Event::AssistantThinking { turn, text } => {
+                self.fail_open_compaction(*turn);
                 self.snapshot.thinking = true;
                 if let Some(&idx) = self.indexes.open_thinking.get(turn) {
                     if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx]
@@ -82,6 +106,7 @@ impl ThreadProjection {
                 }
             }
             Event::AssistantDelta { turn, text } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 if let Some(&idx) = self.indexes.open_assistant.get(turn) {
                     if let ThreadViewItem::Assistant { content, .. } = &mut self.snapshot.items[idx]
@@ -98,6 +123,7 @@ impl ThreadProjection {
                 }
             }
             Event::AssistantMessage { turn, content } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 if let Some(idx) = self.indexes.open_assistant.remove(turn) {
                     self.snapshot.items[idx] = ThreadViewItem::Assistant {
@@ -114,12 +140,14 @@ impl ThreadProjection {
                 }
             }
             Event::ToolRequested {
+                turn,
                 call_id,
                 tool,
                 args,
                 requires_approval,
                 ..
             } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
@@ -210,11 +238,13 @@ impl ThreadProjection {
                 self.snapshot.pending_approvals.retain(|id| id != call_id);
             }
             Event::QuestionRequested {
+                turn,
                 request_id,
                 title,
                 questions,
                 ..
             } => {
+                self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 if !self.snapshot.pending_questions.contains(request_id) {
                     self.snapshot.pending_questions.push(request_id.clone());
@@ -245,6 +275,9 @@ impl ThreadProjection {
                     *resolved = true;
                     *current = answers.clone();
                 }
+            }
+            Event::TurnUsageUpdated { usage, .. } => {
+                self.snapshot.last_usage = Some(usage.clone());
             }
             Event::TurnCompleted { turn, usage, .. } => {
                 self.finish_turn(*turn, envelope.ts);
@@ -302,9 +335,19 @@ impl ThreadProjection {
         }
     }
 
+    fn fail_open_compaction(&mut self, turn: u64) -> Option<usize> {
+        self.snapshot.compacting = false;
+        let idx = self.indexes.open_compactions.remove(&turn)?;
+        self.snapshot.items[idx] = ThreadViewItem::Compaction {
+            turn,
+            state: ThreadCompactionState::Failed,
+        };
+        Some(idx)
+    }
+
     fn finish_turn(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
         self.snapshot.turn_running = false;
-        self.snapshot.compacting = false;
+        self.fail_open_compaction(turn);
         self.finish_thinking();
         self.snapshot.pending_questions.clear();
         if let Some(started) = self.snapshot.turn_started_at.get(&turn) {
@@ -333,6 +376,12 @@ impl ThreadProjection {
                     }
                     self.indexes.latest_thinking = Some(idx);
                 }
+                ThreadViewItem::Compaction {
+                    turn,
+                    state: ThreadCompactionState::Running,
+                } => {
+                    self.indexes.open_compactions.insert(*turn, idx);
+                }
                 ThreadViewItem::ToolCall { call_id, .. } => {
                     self.indexes.tools.insert(call_id.clone(), idx);
                 }
@@ -342,7 +391,9 @@ impl ThreadProjection {
                 ThreadViewItem::Questions { request_id, .. } => {
                     self.indexes.questions.insert(request_id.clone(), idx);
                 }
-                ThreadViewItem::User { .. } | ThreadViewItem::Assistant { .. } => {}
+                ThreadViewItem::User { .. }
+                | ThreadViewItem::Assistant { .. }
+                | ThreadViewItem::Compaction { .. } => {}
             }
         }
     }
@@ -444,5 +495,107 @@ mod tests {
         ));
 
         assert_eq!(measured_duration(&projection), Some(27));
+    }
+
+    #[test]
+    fn compaction_is_one_durable_item_that_completes_in_place() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(1, 0, Event::CompactionStarted { turn: 7 }));
+
+        assert!(projection.snapshot.compacting);
+        assert_eq!(
+            projection.snapshot.items,
+            vec![ThreadViewItem::Compaction {
+                turn: 7,
+                state: ThreadCompactionState::Running,
+            }]
+        );
+
+        // Exercise cache deserialization: the open-compaction index must be
+        // rebuilt before the completion event updates the existing row.
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        projection.apply(&envelope(
+            2,
+            250,
+            Event::CompactionCompleted {
+                turn: 7,
+                messages_compacted: 42,
+            },
+        ));
+
+        assert!(!projection.snapshot.compacting);
+        assert_eq!(
+            projection.snapshot.items,
+            vec![ThreadViewItem::Compaction {
+                turn: 7,
+                state: ThreadCompactionState::Completed {
+                    messages_compacted: 42,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn live_usage_updates_context_without_finishing_the_turn() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 7,
+                mode: "code".into(),
+                model: "codex/gpt-5.6-sol".into(),
+            },
+        ));
+        let usage = trouve_protocol::Usage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cached_input_tokens: 80_000,
+            context_input_tokens: Some(90_000),
+            context_window: Some(258_400),
+            ..Default::default()
+        };
+        projection.apply(&envelope(
+            2,
+            10,
+            Event::TurnUsageUpdated {
+                turn: 7,
+                usage: usage.clone(),
+            },
+        ));
+
+        assert!(projection.snapshot.turn_running);
+        assert_eq!(projection.snapshot.last_usage, Some(usage));
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::TurnStatus {
+                state: ThreadTurnState::Running,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normal_turn_output_closes_an_unfinished_compaction() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(1, 0, Event::CompactionStarted { turn: 3 }));
+        projection.apply(&envelope(
+            2,
+            10,
+            Event::AssistantThinking {
+                turn: 3,
+                text: "continuing".into(),
+            },
+        ));
+
+        assert!(!projection.snapshot.compacting);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Compaction {
+                turn: 3,
+                state: ThreadCompactionState::Failed,
+            })
+        ));
     }
 }

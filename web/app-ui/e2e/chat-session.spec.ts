@@ -164,8 +164,13 @@ const installProtocolFixtures = async (
   sentMessages: Array<Record<string, unknown>>,
   messageDelayMs = 0,
   threadViewFixture?: ThreadViewFixtureLoader,
+  permissionMode: "ask" | "allow_list" | "yolo" = "ask",
+  additionalThreads: readonly Record<string, unknown>[] = [],
+  additionalSessions: readonly Record<string, unknown>[] = [],
+  additionalSessionSummaries: readonly Record<string, unknown>[] = [],
 ): Promise<void> => {
   let messageCount = 0;
+  let editedQueue: readonly Record<string, unknown>[] = [];
   await page.route("**/v1/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -187,9 +192,49 @@ const installProtocolFixtures = async (
       await route.fulfill({ status: 204 });
       return;
     }
-    if (key === "GET /v1/threads/th_fixture/view") {
+    if (key === "PATCH /v1/queue/qp_1") {
+      const update = request.postDataJSON() as {
+        readonly content: string;
+        readonly attachments?: readonly {
+          readonly name: string;
+          readonly mime: string;
+          readonly data: string;
+        }[];
+      };
+      editedQueue = [{
+        id: "qp_1",
+        thread_id: "th_fixture",
+        content: update.content,
+        position: 0,
+        created_at: "2026-08-04T08:00:19Z",
+        attachments: (update.attachments ?? []).map((attachment, index) => ({
+          id: `att_edited_${index + 1}`,
+          name: attachment.name,
+          mime: attachment.mime,
+          size_bytes: Math.max(1, Math.floor(attachment.data.length * 3 / 4)),
+        })),
+      }];
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (key === "GET /v1/threads/th_fixture/queue") {
+      await route.fulfill({ json: editedQueue });
+      return;
+    }
+    if (key === "GET /v1/attachments/att_queue_1") {
+      await route.fulfill({
+        contentType: "image/png",
+        body: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      });
+      return;
+    }
+    const threadViewMatch = /^\/v1\/threads\/([^/]+)\/view$/u.exec(url.pathname);
+    if (request.method() === "GET" && threadViewMatch !== null) {
       const beforeValue = url.searchParams.get("before");
-      const fixture = threadViewFixture === undefined
+      const fixture = threadViewMatch[1] !== "th_fixture" || threadViewFixture === undefined
         ? {
             cursor: 0,
             snapshot: {
@@ -209,11 +254,49 @@ const installProtocolFixtures = async (
       return;
     }
 
+    if (key === "GET /v1/threads") {
+      const sessionId = url.searchParams.get("session_id");
+      const threads = [{
+        id: "th_fixture",
+        session_id: "se_1",
+        mode: "code",
+        model: "test/model",
+        model_options: { reasoning_effort: "max", context: "1m" },
+        permission_mode: permissionMode,
+        created_at: "2026-08-04T08:00:00Z",
+      }, ...additionalThreads];
+      await route.fulfill({
+        json: sessionId === null
+          ? threads
+          : threads.filter((thread) => thread.session_id === sessionId),
+      });
+      return;
+    }
+    if (key === "GET /v1/server-projection") {
+      await route.fulfill({
+        headers: { "x-trouve-event-cursor": "0" },
+        json: {
+          github_pull_requests: [],
+          session_pull_requests: [],
+          git_worktree_settings: {
+            title_model: {
+              model_downloaded: false,
+              runtime_installed: false,
+              state: "not_installed",
+            },
+            title_model_load_behavior: "auto",
+            title_model_resource_policy: "adaptive",
+          },
+        },
+      });
+      return;
+    }
+
     const responses: Record<string, unknown> = {
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "2.9",
+        protocol_version: "2.15",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -227,7 +310,7 @@ const installProtocolFixtures = async (
           outcome: "idle",
           latest_cursor: 15,
           updated_at: "2026-08-04T08:00:15Z",
-        }],
+        }, ...additionalSessionSummaries],
       },
       "GET /v1/sessions": [{
         id: "se_1",
@@ -237,16 +320,7 @@ const installProtocolFixtures = async (
         worktree_path: "/tmp/chat-rendering",
         base_ref: "main",
         created_at: "2026-08-04T08:00:00Z",
-      }],
-      "GET /v1/threads": [{
-        id: "th_fixture",
-        session_id: "se_1",
-        mode: "code",
-        model: "test/model",
-        model_options: { reasoning_effort: "max", context: "1m" },
-        permission_mode: "ask",
-        created_at: "2026-08-04T08:00:00Z",
-      }],
+      }, ...additionalSessions],
       "GET /v1/workspaces": [{ id: "ws_1", name: "trouve", path: "/src/trouve" }],
       "GET /v1/providers": {
         default_model: "test/model",
@@ -306,6 +380,16 @@ const installProtocolFixtures = async (
       "GET /v1/sessions/se_1/paths": [],
       "GET /v1/sessions/se_1/diff": { diff: "" },
       "GET /v1/sessions/se_1/prs": [],
+      "GET /v1/sessions/se_2/usage": {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0,
+        turns: 0,
+      },
+      "GET /v1/sessions/se_2/paths": [],
+      "GET /v1/sessions/se_2/diff": { diff: "" },
+      "GET /v1/sessions/se_2/prs": [],
     };
     const response = responses[key];
     if (response === undefined) {
@@ -367,9 +451,11 @@ const horizontalOverflowFindings = async (
       ".turn-card .message-body",
       ".agent-body-stream",
       ".agent-text-block",
+      ".agent-activity-timeline",
       ".activity-group",
       ".activity-group-body",
       ".thinking-card",
+      ".thinking-output",
       ".thinking-body",
       ".question-card",
       ".question-step",
@@ -448,7 +534,295 @@ test.beforeEach(async ({ page }, testInfo) => {
   await installEventStream(page);
 });
 
-test("chat cards unmount collapsed output and retain formatted/raw views", async ({ page }) => {
+test("model picker escapes the composer control strip", async ({ page }) => {
+  await page.setViewportSize({ width: 780, height: 620 });
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+
+  const picker = page.locator(".composer trouve-model-picker");
+  const trigger = picker.getByRole("combobox", { name: "Model" });
+  await expect(trigger).toContainText("test/model");
+  await expect(trigger).not.toContainText("Test Model");
+  await trigger.click();
+  const popup = picker.locator(".model-picker-popup");
+  await expect(popup).toBeVisible();
+  await expect(popup.getByRole("option", { name: /test\/model/u })).toBeVisible();
+  const geometry = await popup.evaluate((element) => {
+    const controls = element.closest<HTMLElement>(".composer-controls");
+    const pickerTrigger = element.parentElement?.querySelector<HTMLElement>(
+      ".model-picker-trigger",
+    );
+    if (controls === null || pickerTrigger === null || pickerTrigger === undefined) {
+      throw new Error("missing model picker geometry");
+    }
+    const popupBounds = element.getBoundingClientRect();
+    const controlsBounds = controls.getBoundingClientRect();
+    const triggerBounds = pickerTrigger.getBoundingClientRect();
+    const paintedElement = document.elementFromPoint(
+      popupBounds.left + popupBounds.width / 2,
+      popupBounds.top + Math.min(20, popupBounds.height / 2),
+    );
+    return {
+      controlsOverflowX: getComputedStyle(controls).overflowX,
+      escapedControls: popupBounds.top < controlsBounds.top,
+      opensAboveTrigger: popupBounds.bottom <= triggerBounds.top - 4,
+      paintedAboveComposer: paintedElement !== null && element.contains(paintedElement),
+      position: getComputedStyle(element).position,
+      topLayer: typeof element.showPopover !== "function"
+        || element.matches(":popover-open"),
+    };
+  });
+  expect(geometry.controlsOverflowX).toBe("auto");
+  expect(geometry.escapedControls).toBe(true);
+  expect(geometry.opensAboveTrigger).toBe(true);
+  expect(geometry.paintedAboveComposer).toBe(true);
+  expect(geometry.position).toBe("fixed");
+  expect(geometry.topLayer).toBe(true);
+
+  await popup.getByRole("searchbox", { name: "Search models" }).press("Escape");
+  await expect(popup).toHaveCount(0);
+});
+
+test("new-thread model choices do not wait for subscription health", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  let releaseHealth!: () => void;
+  const healthPending = new Promise<void>((resolve) => {
+    releaseHealth = resolve;
+  });
+  await page.route("**/v1/subscriptions", async (route) => {
+    await healthPending;
+    await route.fulfill({ json: [] });
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByRole("button", { name: "New thread", exact: true }).click();
+
+    const setup = page.locator("trouve-new-thread-setup");
+    const picker = setup.getByRole("combobox", { name: "Model" });
+    await expect(setup.getByText("Loading modes and models…", { exact: true })).toHaveCount(0);
+    await expect(picker).toBeEnabled();
+    await expect(picker).toContainText("test/model");
+  } finally {
+    releaseHealth();
+  }
+});
+
+test("the YOLO warning remains centered and exposes its hover text", async ({ page }) => {
+  await installProtocolFixtures(page, [], 0, undefined, "yolo");
+  await page.goto("/");
+  await replayHistory(page);
+
+  const permission = page.locator(".permission-option");
+  const select = permission.getByRole("combobox", { name: "Permission mode" });
+  const warning = permission.locator(".permission-warning");
+  await expect(select).toHaveValue("yolo");
+  await expect(warning).toHaveAttribute("title", "YOLO: changes run without approval");
+  await expect(warning).toHaveAttribute(
+    "aria-label",
+    "Warning: YOLO changes run without approval",
+  );
+  await warning.hover();
+
+  const alignment = await warning.evaluate((element) => {
+    const warning = element.getBoundingClientRect();
+    const icon = element.querySelector<HTMLElement>(".trouve-icon")?.getBoundingClientRect();
+    const select = element.parentElement
+      ?.querySelector<HTMLSelectElement>("select")
+      ?.getBoundingClientRect();
+    if (icon === undefined || select === undefined) throw new Error("missing warning geometry");
+    const centerY = (bounds: DOMRect): number => bounds.top + bounds.height / 2;
+    return {
+      iconToWarning: Math.abs(centerY(icon) - centerY(warning)),
+      warningToSelect: Math.abs(centerY(warning) - centerY(select)),
+    };
+  });
+  expect(alignment.iconToWarning).toBeLessThanOrEqual(1);
+  expect(alignment.warningToSelect).toBeLessThanOrEqual(1);
+});
+
+test("pending image and file attachments reuse submitted chip geometry", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.locator("trouve-thread-screen .attachment-button input").setInputFiles([
+    {
+      name: "preview.png",
+      mimeType: "image/png",
+      buffer: Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        "base64",
+      ),
+    },
+    {
+      name: "notes.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("attachment notes"),
+    },
+  ]);
+
+  const attachments = page.locator(".composer .pending-attachments");
+  const image = attachments.locator(".image-attachment");
+  const file = attachments.locator(".file-attachment");
+  await expect(image.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/u);
+  await expect(image).toContainText("image/png");
+  await expect(file.locator('[data-font-awesome-icon="file"]')).toBeVisible();
+  await expect(file).toContainText("text/plain");
+
+  const geometry = await attachments.evaluate((list) => {
+    const image = list.querySelector<HTMLElement>(".image-attachment");
+    const preview = image?.querySelector<HTMLElement>("img");
+    const file = list.querySelector<HTMLElement>(".file-attachment");
+    const icon = file?.querySelector<HTMLElement>(".attachment-icon");
+    if (image === null || image === undefined || preview === null || preview === undefined
+      || file === null || file === undefined || icon === null || icon === undefined) {
+      throw new Error("missing attachment chip geometry");
+    }
+    const imageStyle = getComputedStyle(image);
+    const fileStyle = getComputedStyle(file);
+    return {
+      icon: [icon.offsetWidth, icon.offsetHeight],
+      preview: [preview.offsetWidth, preview.offsetHeight],
+      imageBackground: imageStyle.backgroundColor,
+      fileBackground: fileStyle.backgroundColor,
+      imageBorderRadius: imageStyle.borderRadius,
+      fileBorderRadius: fileStyle.borderRadius,
+      imagePadding: imageStyle.padding,
+      filePadding: fileStyle.padding,
+    };
+  });
+  expect(geometry.preview).toEqual([64, 48]);
+  expect(geometry.icon).toEqual(geometry.preview);
+  expect(geometry.fileBackground).toBe(geometry.imageBackground);
+  expect(geometry.fileBorderRadius).toBe(geometry.imageBorderRadius);
+  expect(geometry.filePadding).toBe(geometry.imagePadding);
+});
+
+test("unsubmitted composer drafts persist per thread across navigation and reload", async ({
+  page,
+}) => {
+  const sentMessages: Array<Record<string, unknown>> = [];
+  await installProtocolFixtures(
+    page,
+    sentMessages,
+    0,
+    undefined,
+    "ask",
+    [{
+      id: "th_second",
+      session_id: "se_1",
+      mode: "code",
+      model: "test/second",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-03T08:00:00Z",
+    }, {
+      id: "th_third",
+      session_id: "se_2",
+      mode: "code",
+      model: "test/third",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-02T08:00:00Z",
+    }],
+    [{
+      id: "se_2",
+      workspace_id: "ws_1",
+      title: "Second session",
+      branch: "feature/second",
+      worktree_path: "/tmp/second-session",
+      base_ref: "main",
+      created_at: "2026-08-03T08:00:00Z",
+    }],
+    [{
+      session_id: "se_2",
+      workspace_id: "ws_1",
+      archived: false,
+      active: false,
+      attention: "none",
+      outcome: "idle",
+      latest_cursor: 0,
+      updated_at: "2026-08-03T08:00:00Z",
+    }],
+  );
+  const openSession = async (name: RegExp): Promise<void> => {
+    const session = page.getByRole("button", { name });
+    if (!(await session.isVisible())) {
+      await page.getByRole("button", { name: "Sessions", exact: true })
+        .evaluate((button: HTMLButtonElement) => button.click());
+    }
+    await session.click();
+  };
+  await page.goto("/");
+  await openSession(/Chat rendering feature\/chat/u);
+  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+
+  const textarea = page.locator('textarea[name="message"]');
+  await textarea.fill("Draft for the first thread");
+  await page.locator("trouve-thread-screen .attachment-button input").setInputFiles({
+    name: "draft-notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("pending attachment"),
+  });
+  await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
+
+  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await expect(textarea).toHaveValue("");
+  await expect(page.locator(".pending-attachments")).toHaveCount(0);
+  await textarea.fill("Draft for the second thread");
+
+  await openSession(/Second session feature\/second/u);
+  await expect(textarea).toHaveValue("");
+  await textarea.fill("Draft in a different session");
+  await openSession(/Chat rendering feature\/chat/u);
+  await expect(textarea).toHaveValue("Draft for the second thread");
+
+  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+  await expect(textarea).toHaveValue("Draft for the first thread");
+  await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
+
+  await expect.poll(() => page.evaluate(async () => await new Promise<number>((resolve) => {
+    const request = indexedDB.open("trouve-composer-drafts", 1);
+    request.onerror = () => resolve(0);
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction("thread-attachments", "readonly");
+      const stored = transaction.objectStore("thread-attachments").get("th_fixture");
+      stored.onerror = () => resolve(0);
+      stored.onsuccess = () => {
+        const count = Array.isArray(stored.result) ? stored.result.length : 0;
+        database.close();
+        resolve(count);
+      };
+    };
+  }))).toBe(1);
+
+  await page.reload();
+  await expect(textarea).toHaveValue("Draft for the first thread");
+  await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
+  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await expect(textarea).toHaveValue("Draft for the second thread");
+  await openSession(/Second session feature\/second/u);
+  await expect(textarea).toHaveValue("Draft in a different session");
+
+  await openSession(/Chat rendering feature\/chat/u);
+  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(textarea).toHaveValue("");
+  await expect(page.locator(".pending-attachments")).toHaveCount(0);
+  expect(sentMessages).toHaveLength(1);
+  await page.reload();
+  await expect(textarea).toHaveValue("");
+  await expect(page.locator(".pending-attachments")).toHaveCount(0);
+  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await expect(textarea).toHaveValue("Draft for the second thread");
+  await openSession(/Second session feature\/second/u);
+  await expect(textarea).toHaveValue("Draft in a different session");
+});
+
+test("chat cards unmount collapsed output and expose response copy actions", async ({ page }) => {
   await installProtocolFixtures(page, []);
   await page.goto("/");
   await replayHistory(page);
@@ -489,7 +863,9 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
       - Number.parseFloat(bodyStyle.borderRightWidth)
       - Number.parseFloat(bodyStyle.paddingRight);
     const surfaces = [...body.children]
-      .filter((child) => child.matches(".activity-group, .tool-card, .thinking-card, .question-card"))
+      .filter((child) => child.matches(
+        ".agent-activity-timeline, .question-card, .context-compaction-marker",
+      ))
       .map((child) => {
         const bounds = child.getBoundingClientRect();
         return {
@@ -522,12 +898,16 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
 
   await activityGroup.locator(":scope > summary").click();
   await expect(activityGroup.locator(".tool-card")).toHaveCount(2);
+  await page.mouse.move(0, 0);
   const groupedHeaderStyle = await activityGroup.locator(":scope > summary").evaluate(
     (summary) => {
       const style = getComputedStyle(summary);
       return {
         backgroundColor: style.backgroundColor,
-        borderColor: style.borderColor,
+        backgroundImage: style.backgroundImage,
+        borderLeftWidth: style.borderLeftWidth,
+        borderTopWidth: style.borderTopWidth,
+        borderRadius: style.borderRadius,
       };
     },
   );
@@ -536,10 +916,40 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
       const style = getComputedStyle(card);
       return {
         backgroundColor: style.backgroundColor,
-        borderColor: style.borderColor,
+        borderLeftWidth: style.borderLeftWidth,
+        borderTopWidth: style.borderTopWidth,
+        borderRadius: style.borderRadius,
       };
     },
   );
+  const groupNodeStyle = await activityGroup.evaluate((group) => {
+    const style = getComputedStyle(group, "::before");
+    return {
+      backgroundColor: style.backgroundColor,
+      borderRadius: style.borderRadius,
+      display: style.display,
+      height: style.height,
+      width: style.width,
+    };
+  });
+  const groupDisclosureStyle = await activityGroup.locator(
+    ":scope > summary .disclosure-icon",
+  ).evaluate((icon) => {
+    const style = getComputedStyle(icon);
+    return {
+      position: style.position,
+      width: style.width,
+    };
+  });
+  const timelineRailStyle = await activityGroup.locator("..").evaluate((timeline) => {
+    const style = getComputedStyle(timeline, "::before");
+    return {
+      backgroundColor: style.backgroundColor,
+      display: style.display,
+      height: style.height,
+      width: style.width,
+    };
+  });
   const groupedBodyBackground = await activityGroup.locator(".activity-group-body").evaluate(
     (body) => getComputedStyle(body).backgroundColor,
   );
@@ -550,9 +960,27 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
       ? Number.NaN
       : Math.round(second.top - first.bottom);
   });
-  expect(groupedHeaderStyle).toEqual(toolCardStyle);
+  expect(groupedHeaderStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(groupedHeaderStyle.backgroundImage).toBe("none");
+  expect(groupedHeaderStyle.borderLeftWidth).toBe("0px");
+  expect(groupedHeaderStyle.borderTopWidth).toBe("0px");
+  expect(groupedHeaderStyle.borderRadius).toBe("4px");
+  expect(toolCardStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(toolCardStyle.borderLeftWidth).toBe("0px");
+  expect(toolCardStyle.borderTopWidth).toBe("0px");
+  expect(toolCardStyle.borderRadius).toBe("0px");
+  expect(groupNodeStyle.display).toBe("none");
+  expect(groupNodeStyle.width).toBe("7px");
+  expect(groupNodeStyle.height).toBe("7px");
+  expect(groupNodeStyle.borderRadius).toBe("50%");
+  expect(groupNodeStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(groupDisclosureStyle.position).toBe("absolute");
+  expect(groupDisclosureStyle.width).toBe("10px");
+  expect(timelineRailStyle.display).toBe("none");
+  expect(timelineRailStyle.width).toBe("1px");
+  expect(timelineRailStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
   expect(groupedBodyBackground).toBe("rgba(0, 0, 0, 0)");
-  expect(groupedToolGap).toBe(12);
+  expect(groupedToolGap).toBe(2);
   await expect(page.getByLabel("Live tool output")).toHaveCount(0);
 
   const editCard = page.locator('.tool-card[data-call-id="call_edit"]');
@@ -573,16 +1001,82 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
   await activityGroup.locator(":scope > summary").click();
   await expect(activityGroup.locator(".tool-card")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Collapse thought process" }).click();
-  await expect(page.locator(".thinking-body")).toHaveCount(0);
-  await expect(page.locator(".thinking-card .message-collapsed-preview"))
-    .toContainText("Compare both frontends");
+  const visibleThought = page.locator(".thinking-output");
+  await expect(visibleThought.getByText("Thought", { exact: true })).toBeVisible();
+  await expect(visibleThought.locator(".thinking-body")).toContainText("Compare both frontends");
+  await expect(visibleThought.getByRole("button", { name: /thought process/i })).toHaveCount(1);
+  await expect(visibleThought.locator('[data-font-awesome-icon="brain"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Collapse thought process" })).toHaveCount(0);
+  await expect(page.locator(".thinking-card")).toHaveCount(0);
 
   const agentCard = page.locator(".agent-turn-card").first();
   await agentCard.getByRole("button", { name: "Collapse agent message" }).click();
   await expect(agentCard.locator(":scope > .message-body")).toHaveCount(0);
   await expect(agentCard.locator(".agent-collapsed-preview")).toContainText("I'll update it.");
   await agentCard.getByRole("button", { name: "Expand agent message" }).click();
+  const assistantCopy = agentCard.getByRole("button", { name: "Copy assistant output" });
+  await expect(assistantCopy).toHaveCount(1);
+  await expect(agentCard.getByRole("button", { name: /raw assistant output/i })).toHaveCount(0);
+  await page.evaluate(() => {
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText(value: string) {
+          (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
+            .__trouveCopiedMarkdown = value;
+          return Promise.resolve();
+        },
+      },
+    });
+  });
+  await agentCard.hover();
+  await expect(agentCard.locator(".agent-copy-action")).toHaveCSS("opacity", "1");
+  await assistantCopy.click();
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
+      .__trouveCopiedMarkdown
+  )).toBe("I'll update it.\n\nDone.");
+  await agentCard.locator(".agent-text-block").first().click({ button: "right" });
+  const messageMenu = page.getByRole("menu", { name: "Message actions" });
+  await expect(messageMenu).toBeVisible();
+  await expect(messageMenu.getByRole("menuitem", { name: "Copy as markdown" })).toBeFocused();
+  await messageMenu.getByRole("menuitem", { name: "Copy as markdown" }).click();
+  await expect(messageMenu).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
+      .__trouveCopiedMarkdown
+  )).toBe("I'll update it.\n\nDone.");
+  const agentDisclosure = agentCard.getByRole("button", { name: "Collapse agent message" });
+  await agentDisclosure.focus();
+  await agentDisclosure.press("Shift+F10");
+  await expect(messageMenu).toBeVisible();
+  await messageMenu.press("Escape");
+  await expect(messageMenu).toHaveCount(0);
+  await expect(agentDisclosure).toBeFocused();
+  await agentCard.locator(".agent-text-block").first().evaluate((block) => {
+    const paragraph = block
+      .querySelector("trouve-markdown-view")
+      ?.shadowRoot?.querySelector("p");
+    if (paragraph === undefined || paragraph === null) throw new Error("missing response text");
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    const selection = globalThis.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    block.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 80,
+      clientY: 80,
+      composed: true,
+    }));
+  });
+  await expect(messageMenu.getByRole("menuitem", { name: "Copy", exact: true })).toBeVisible();
+  await messageMenu.getByRole("menuitem", { name: "Copy as markdown" }).click();
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
+      .__trouveCopiedMarkdown
+  )).toBe("I'll update it.");
 
   const result = await new AxeBuilder({ page })
     .include(".chat-stream")
@@ -592,6 +1086,240 @@ test("chat cards unmount collapsed output and retain formatted/raw views", async
   expect(result.violations.filter(({ impact }) =>
     impact === "serious" || impact === "critical"
   )).toEqual([]);
+});
+
+test("the Chat preference opts thinking back into collapsible activity", async ({ page }) => {
+  await installProtocolFixtures(page, []);
+  await page.addInitScript(() => {
+    localStorage.setItem("trouve.chat.v1", JSON.stringify({
+      collapseThinkingWithTools: true,
+    }));
+  });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await expect(page.locator(".thinking-output")).toHaveCount(0);
+  const thought = page.locator(".thinking-card");
+  await expect(thought.getByRole("button", { name: "Collapse thought process" })).toBeVisible();
+  await thought.getByRole("button", { name: "Collapse thought process" }).click();
+  await expect(thought.locator(".thinking-body")).toHaveCount(0);
+  await expect(thought.locator(".message-collapsed-preview"))
+    .toContainText("Compare both frontends");
+
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Collapse one contiguous activity run",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "assistant.thinking",
+      turn: 8,
+      text: "Inspect the grouped activity geometry",
+    }),
+    threadEvent(19, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "collapsed_thinking_1",
+      tool: "Bash",
+      args: { command: "first" },
+      requires_approval: false,
+    }),
+    threadEvent(20, { type: "tool.started", call_id: "collapsed_thinking_1" }),
+    threadEvent(21, {
+      type: "tool.completed",
+      call_id: "collapsed_thinking_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(22, {
+      type: "tool.requested",
+      turn: 8,
+      call_id: "collapsed_thinking_2",
+      tool: "Bash",
+      args: { command: "second" },
+      requires_approval: false,
+    }),
+    threadEvent(23, { type: "tool.started", call_id: "collapsed_thinking_2" }),
+    threadEvent(24, {
+      type: "tool.completed",
+      call_id: "collapsed_thinking_2",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(25, {
+      type: "assistant.message",
+      turn: 8,
+      content: "The combined activity is complete.",
+    }),
+    threadEvent(26, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 10, output_tokens: 4 },
+      checkpoint_id: null,
+    }),
+  ]);
+
+  const combinedAgent = page.locator(".agent-turn-card").last();
+  const combinedTimeline = combinedAgent.locator(
+    ":scope > .message-body > .agent-activity-timeline.single-activity",
+  );
+  const combinedGroup = combinedTimeline.locator(":scope > .activity-group");
+  await expect(combinedGroup.getByText(
+    "Ran 2 commands, thought 1 time",
+    { exact: true },
+  )).toBeVisible();
+  await expect(combinedGroup.locator(".activity-group-body")).toHaveCount(0);
+
+  const geometry = await combinedGroup.evaluate((group) => {
+    const timeline = group.parentElement;
+    const summary = group.querySelector<HTMLElement>(":scope > summary");
+    const disclosure = summary?.querySelector<HTMLElement>(".disclosure-icon");
+    const label = summary?.querySelector<HTMLElement>("strong");
+    const prose = timeline?.nextElementSibling
+      ?.querySelector<HTMLElement>("trouve-markdown-view")
+      ?.shadowRoot?.querySelector<HTMLElement>("p");
+    if (timeline === null || summary === null || disclosure === null
+      || label === null || prose === null || prose === undefined) {
+      throw new Error("missing combined activity geometry");
+    }
+    const timelineBounds = timeline.getBoundingClientRect();
+    const disclosureBounds = disclosure.getBoundingClientRect();
+    const rail = getComputedStyle(timeline, "::before");
+    const railCenter = timelineBounds.left
+      + Number.parseFloat(rail.left)
+      + Number.parseFloat(rail.width) / 2;
+    return {
+      disclosureToRail: Math.abs(
+        disclosureBounds.left + disclosureBounds.width / 2 - railCenter,
+      ),
+      groupNodeDisplay: getComputedStyle(group, "::before").display,
+      labelToProse: label.getBoundingClientRect().left
+        - prose.getBoundingClientRect().left,
+      railHeight: Number.parseFloat(rail.height),
+    };
+  });
+  expect(geometry.disclosureToRail).toBeLessThanOrEqual(1);
+  expect(geometry.groupNodeDisplay).toBe("none");
+  expect(geometry.labelToProse).toBeLessThanOrEqual(20);
+  expect(geometry.railHeight).toBeGreaterThan(10);
+
+  await combinedGroup.locator(":scope > summary").click();
+  await expect(combinedTimeline).toHaveClass(/has-expanded-group/u);
+  await expect(combinedGroup.locator(".thinking-card")).toHaveCount(0);
+  await expect(combinedGroup.locator(".grouped-thinking-output .thinking-body"))
+    .toContainText("Inspect the grouped activity geometry");
+  const expandedGeometry = await combinedGroup.evaluate((group) => {
+    const timeline = group.parentElement;
+    const summary = group.querySelector<HTMLElement>(":scope > summary");
+    const body = group.querySelector<HTMLElement>(":scope > .activity-group-body");
+    if (timeline === null || summary === null || body === null) {
+      throw new Error("missing expanded combined activity geometry");
+    }
+    return {
+      railDisplay: getComputedStyle(timeline, "::before").display,
+      summaryBackground: getComputedStyle(summary).backgroundColor,
+      bodyPaddingLeft: getComputedStyle(body).paddingLeft,
+    };
+  });
+  expect(expandedGeometry.railDisplay).toBe("none");
+  expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(expandedGeometry.bodyPaddingLeft).toBe("16px");
+});
+
+test("legacy context compaction tools stay outside collapsed-thinking groups", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, []);
+  await page.addInitScript(() => {
+    localStorage.setItem("trouve.chat.v1", JSON.stringify({
+      collapseThinkingWithTools: true,
+    }));
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(40, {
+      type: "turn.started",
+      turn: 11,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(41, {
+      type: "user.message",
+      turn: 11,
+      content: "Continue through legacy compaction",
+      attachments: [],
+    }),
+    threadEvent(42, {
+      type: "assistant.thinking",
+      turn: 11,
+      text: "Prepare the earlier context",
+    }),
+    threadEvent(43, {
+      type: "tool.requested",
+      turn: 11,
+      call_id: "before_legacy_compaction",
+      tool: "Bash",
+      args: { command: "before" },
+      requires_approval: false,
+    }),
+    threadEvent(44, {
+      type: "tool.completed",
+      call_id: "before_legacy_compaction",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(45, {
+      type: "tool.requested",
+      turn: 11,
+      call_id: "legacy_compaction",
+      tool: "contextCompaction",
+      args: {},
+      requires_approval: false,
+    }),
+    threadEvent(46, {
+      type: "tool.completed",
+      call_id: "legacy_compaction",
+      status: "ok",
+      result: {},
+    }),
+    threadEvent(47, {
+      type: "tool.requested",
+      turn: 11,
+      call_id: "after_legacy_compaction",
+      tool: "Bash",
+      args: { command: "after" },
+      requires_approval: false,
+    }),
+    threadEvent(48, {
+      type: "tool.completed",
+      call_id: "after_legacy_compaction",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+  ]);
+
+  const agent = page.locator(".agent-turn-card").last();
+  await expect(agent.locator('.tool-card[data-call-id="legacy_compaction"]')).toHaveCount(0);
+  await expect(agent.locator(".context-compaction-marker.completed"))
+    .toContainText("Context compacted");
+  const topLevelKinds = await agent.locator(":scope > .message-body > *").evaluateAll(
+    (elements) => elements.map((element) =>
+      element.classList.contains("agent-activity-timeline")
+        ? "timeline"
+        : element.classList.contains("context-compaction-marker")
+          ? "compaction"
+          : "other"),
+  );
+  expect(topLevelKinds.slice(0, 3)).toEqual(["timeline", "compaction", "timeline"]);
 });
 
 test("running activity groups retain explicit disclosure state as tools arrive", async ({
@@ -687,6 +1415,102 @@ test("running activity groups retain explicit disclosure state as tools arrive",
   ]);
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
+});
+
+test("context compaction is an animated durable boundary between tool groups", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, []);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(30, {
+      type: "turn.started",
+      turn: 10,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(31, {
+      type: "user.message",
+      turn: 10,
+      content: "Continue through compaction",
+      attachments: [],
+    }),
+    threadEvent(32, {
+      type: "tool.requested",
+      turn: 10,
+      call_id: "before_compaction_1",
+      tool: "Bash",
+      args: { command: "first" },
+      requires_approval: false,
+    }),
+    threadEvent(33, {
+      type: "tool.requested",
+      turn: 10,
+      call_id: "before_compaction_2",
+      tool: "Bash",
+      args: { command: "second" },
+      requires_approval: false,
+    }),
+    threadEvent(34, { type: "thread.compaction_started", turn: 10 }),
+  ]);
+
+  const agent = page.locator(".agent-turn-card").last();
+  const running = agent.locator(".context-compaction-marker.running");
+  await expect(running).toBeVisible();
+  await expect(running.getByText("Compacting context", { exact: true })).toBeVisible();
+  await expect(agent.locator(".activity-group")).toHaveCount(1);
+  await expect(agent.locator(".activity-group .context-compaction-marker")).toHaveCount(0);
+  expect(await running.locator(".trouve-icon-spin").evaluate(
+    (element) => getComputedStyle(element).animationName,
+  )).not.toBe("none");
+
+  // Active compaction keeps the containing Agent card open until its
+  // terminal state arrives.
+  await expect(agent.getByRole("button", { name: "Collapse agent message" }))
+    .toHaveAttribute("aria-disabled", "true");
+
+  await emitBatch(page, [
+    threadEvent(35, {
+      type: "thread.compaction_completed",
+      turn: 10,
+      messages_compacted: 24,
+    }),
+    threadEvent(36, {
+      type: "tool.requested",
+      turn: 10,
+      call_id: "after_compaction_1",
+      tool: "Bash",
+      args: { command: "third" },
+      requires_approval: false,
+    }),
+    threadEvent(37, {
+      type: "tool.requested",
+      turn: 10,
+      call_id: "after_compaction_2",
+      tool: "Bash",
+      args: { command: "fourth" },
+      requires_approval: false,
+    }),
+  ]);
+
+  const marker = agent.locator(".context-compaction-marker.completed");
+  await expect(marker).toContainText("Context compacted");
+  await expect(marker).toContainText("24 earlier transcript messages summarized");
+  const topLevelKinds = await agent.locator(":scope > .message-body > *").evaluateAll(
+    (elements) => elements.map((element) =>
+      element.classList.contains("agent-activity-timeline")
+        ? "timeline"
+        : element.classList.contains("context-compaction-marker")
+          ? "compaction"
+          : "other"),
+  );
+  expect(topLevelKinds.slice(0, 3)).toEqual(["timeline", "compaction", "timeline"]);
+  await expect(agent.locator(":scope > .message-body > .agent-activity-timeline"))
+    .toHaveCount(2);
+  await expect(agent.locator(
+    ":scope > .message-body > .agent-activity-timeline > .activity-group",
+  )).toHaveCount(2);
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
@@ -1682,11 +2506,51 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   }));
 
   await expect(page.locator(".queue-panel [role=status]")).toHaveText("1 queued prompt");
-  await expect(page.locator(".queue-attachment-badge")).toHaveText("📎1");
-  await expect(page.locator(".queue-attachment-badge")).toHaveAttribute(
+  const queuedAttachment = page.locator(".queue-attachment-badge");
+  await expect(queuedAttachment).toContainText("1");
+  await expect(queuedAttachment.locator('[data-font-awesome-icon="paperclip"]')).toBeVisible();
+  await expect(queuedAttachment).toHaveAttribute(
     "aria-label",
     "1 attachment",
   );
+  await composer.fill("Keep this local draft");
+  await page.getByRole("button", { name: "Edit queued prompt" }).click();
+  await expect(page.locator(".queue-edit-indicator")).toContainText("Editing queued prompt");
+  await expect(submit).toHaveText("Update");
+  await expect(composer).toHaveValue("Queue this while startup is pending");
+  await expect(page.locator('.pending-attachments img[alt="Preview of layout.png"]')).toBeVisible();
+  await page.getByRole("button", { name: "Remove layout.png" }).click();
+  await page.locator("form.composer .attachment-button input").setInputFiles({
+    name: "notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("updated queue attachment"),
+  });
+  await expect(page.locator(".pending-attachments")).toContainText("notes.txt");
+  await composer.fill("Queue this after editing");
+  const updateRequest = page.waitForRequest((request) =>
+    request.method() === "PATCH" && request.url().endsWith("/v1/queue/qp_1")
+  );
+  await submit.click();
+  const updateBody = (await updateRequest).postDataJSON() as Record<string, unknown>;
+  expect(updateBody).toMatchObject({
+    content: "Queue this after editing",
+    retained_attachment_ids: [],
+  });
+  expect(updateBody["attachments"]).toMatchObject([{
+    name: "notes.txt",
+    mime: "text/plain",
+  }]);
+  await expect(page.locator(".queue-edit-indicator")).toHaveCount(0);
+  await expect(composer).toHaveValue("Keep this local draft");
+  await expect(submit).toHaveText("Queue");
+  await page.getByRole("button", { name: "Edit queued prompt" }).click();
+  await expect(composer).toHaveValue("Queue this after editing");
+  await expect(page.locator(".pending-attachments")).toContainText("notes.txt");
+  await page.getByRole("button", { name: "Cancel queued prompt edit" }).click();
+  await expect(page.locator(".queue-edit-indicator")).toHaveCount(0);
+  await expect(composer).toHaveValue("Keep this local draft");
+  await composer.fill("");
+  await expect(submit).toHaveText("Cancel");
   const activeAgent = page.locator(".agent-turn-card").last();
   await expect(activeAgent.locator(".agent-activity")).toContainText("Processing…");
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>

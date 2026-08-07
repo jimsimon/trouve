@@ -251,6 +251,20 @@ const SURFACES: readonly CallbackSurface[] = [
     ],
   },
   {
+    description: "chat presentation preference",
+    callbacks: ["collapse-thinking-with-tools-toggled"],
+    evidence: [
+      {
+        path: "../components/settings-screen.ts",
+        markers: ["collapseThinkingWithTools", "setChatPreferences"],
+      },
+      {
+        path: "../components/thread-screen.ts",
+        markers: ["#renderVisibleThinking", "collapseThinkingWithTools"],
+      },
+    ],
+  },
+  {
     description: "local model and llama.cpp lifecycle",
     callbacks: [
       "local-search",
@@ -353,7 +367,7 @@ const SURFACES: readonly CallbackSurface[] = [
           "#toggleQuestionOption",
           "#submitQuestion",
           "#toggleMessageDisclosure",
-          "#toggleRawAssistant",
+          "#toggleRawTool",
           "trouve-open-file",
         ],
       },

@@ -8,6 +8,7 @@ import {
 import type { ProtocolTodoItem } from "../services/protocol-client.js";
 import { withSignalTracking } from "../state/reactivity.js";
 import { buildTodoPlanModel } from "./todo-plan-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 export class TrouveTodoPlanPanel extends withSignalTracking(LitElement) {
   static override properties = {
@@ -51,7 +52,7 @@ export class TrouveTodoPlanPanel extends withSignalTracking(LitElement) {
                   data-todo-id=${todo.id}
                   aria-current=${todo.current ? "step" : nothing}
                 >
-                  <span class="todo-plan-icon" aria-hidden="true">${todo.icon}</span>
+                  ${fontAwesomeIcon(todo.icon, { className: "todo-plan-icon" })}
                   <span class="todo-plan-content">${todo.content}</span>
                   <span class="visually-hidden">Status: ${todo.statusLabel}</span>
                 </li>

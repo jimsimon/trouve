@@ -13,6 +13,7 @@ import {
   type CommandPaletteGroup,
   type CommandPaletteItem,
 } from "./command-palette-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 export const COMMAND_PALETTE_ACTION_EVENT = "trouve-command-palette-action";
 
@@ -50,6 +51,9 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
   #open = false;
   #query = "";
   #selectedIndex = 0;
+  #selectedItemId: string | undefined;
+  #revealSelectionAfterUpdate = false;
+  #resultsScrollTop = 0;
   #restoreTarget: HTMLElement | null = null;
   #workerMatchKey = "";
   #workerRequestedKey = "";
@@ -74,6 +78,9 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
     this.#restoreTarget = active instanceof HTMLElement ? active : null;
     this.#query = "";
     this.#selectedIndex = 0;
+    this.#selectedItemId = undefined;
+    this.#resultsScrollTop = 0;
+    this.#revealSelectionAfterUpdate = true;
     this.#open = true;
     this.requestUpdate();
   }
@@ -83,6 +90,9 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
     this.#open = false;
     this.#query = "";
     this.#selectedIndex = 0;
+    this.#selectedItemId = undefined;
+    this.#resultsScrollTop = 0;
+    this.#revealSelectionAfterUpdate = false;
     const dialog = this.querySelector<HTMLDialogElement>("#command-palette-dialog");
     if (dialog?.open === true) dialog.close();
     else this.#restoreFocus();
@@ -103,9 +113,24 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       dialog.close();
     }
     if (this.#open) {
-      this.querySelector<HTMLElement>(
-        `[data-command-index="${this.#selectedIndex}"]`,
-      )?.scrollIntoView({ block: "nearest" });
+      const results = this.querySelector<HTMLElement>("#command-palette-results");
+      if (this.#revealSelectionAfterUpdate) {
+        const selected = this.querySelector<HTMLElement>(
+          `[data-command-index="${this.#selectedIndex}"]`,
+        );
+        if (selected !== null) {
+          selected.scrollIntoView({ block: "nearest" });
+          this.#resultsScrollTop = results?.scrollTop ?? 0;
+          this.#revealSelectionAfterUpdate = false;
+        } else if (!this.#workerPending) {
+          this.#revealSelectionAfterUpdate = false;
+        }
+      } else if (results !== null && results.scrollTop !== this.#resultsScrollTop) {
+        // Session activity can rerender every palette row while the user is
+        // browsing with a mouse. Keep that background work from moving the
+        // list; only explicit query/keyboard selection changes reveal a row.
+        results.scrollTop = this.#resultsScrollTop;
+      }
     }
   }
 
@@ -134,6 +159,9 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       this.#open = false;
       this.#query = "";
       this.#selectedIndex = 0;
+      this.#selectedItemId = undefined;
+      this.#resultsScrollTop = 0;
+      this.#revealSelectionAfterUpdate = false;
       this.requestUpdate();
     }
     this.#restoreFocus();
@@ -170,7 +198,10 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
     return buildCommandPaletteItems({
       route,
       workspaces: readSignal(store.workspaces),
-      sessions: readSignal(store.sessions),
+      sessions: readSignal(store.sessions).map((session) => ({
+        ...session,
+        pullRequests: store.sessionPullRequests(session.id),
+      })),
       activeThreads:
         route.kind === "session" ? store.threadsForSession(route.sessionId) : [],
     });
@@ -184,7 +215,9 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       this.#workerRequestedKey = "";
       return filterCommandPaletteItems(items, this.#query);
     }
-    const key = `${this.#query}\u0000${items.map((item) => item.id).join("\u0000")}`;
+    const key = `${this.#query}\u0000${items.map((item) =>
+      `${item.id}\u0001${item.label}\u0001${item.detail}\u0001${item.keywords}`
+    ).join("\u0000")}`;
     if (key !== this.#workerRequestedKey) {
       this.#workerRequestedKey = key;
       this.#workerPending = true;
@@ -195,7 +228,6 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
           this.#workerMatchKey = key;
           this.#workerMatches = matches;
           this.#workerPending = false;
-          this.#selectedIndex = 0;
           this.requestUpdate();
         },
         () => {
@@ -212,7 +244,14 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
   readonly #queryChanged = (event: Event): void => {
     this.#query = (event.currentTarget as HTMLInputElement).value;
     this.#selectedIndex = 0;
+    this.#selectedItemId = undefined;
+    this.#resultsScrollTop = 0;
+    this.#revealSelectionAfterUpdate = true;
     this.requestUpdate();
+  };
+
+  readonly #resultsScrolled = (event: Event): void => {
+    this.#resultsScrollTop = (event.currentTarget as HTMLElement).scrollTop;
   };
 
   readonly #inputKeyDown = (event: KeyboardEvent): void => {
@@ -231,14 +270,17 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       return;
     }
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const matches = this.#matchingItems();
     const next = nextCommandPaletteIndex(
       event.key,
       this.#selectedIndex,
-      this.#matchingItems().length,
+      matches.length,
     );
     if (next === undefined) return;
     event.preventDefault();
     this.#selectedIndex = next;
+    this.#selectedItemId = matches[next]?.id;
+    this.#revealSelectionAfterUpdate = true;
     this.requestUpdate();
   };
 
@@ -267,45 +309,73 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
     return html`
       <section class="command-palette-group" aria-labelledby=${`command-group-${group}`}>
         <h2 id=${`command-group-${group}`}>${group}</h2>
-        ${indexed.map(({ item, index }) => html`
-          <button
-            id=${`command-palette-option-${index}`}
-            class="command-palette-option"
-            type="button"
-            role="option"
-            tabindex="-1"
-            aria-selected=${index === this.#selectedIndex ? "true" : "false"}
-            aria-label=${item.state === undefined
-              ? `${item.label}, ${item.detail}`
-              : `${item.label}, ${stateLabel(item.state)}, ${item.detail}`}
-            data-command-index=${index}
-            @click=${() => this.#activate(item)}
-          >
-            <span class="command-palette-icon" aria-hidden="true">
-              ${item.state === undefined
-                ? item.icon
-                : html`<span class="status-dot ${item.state}"></span>`}
-            </span>
-            <span class="command-palette-copy">
-              <strong>${item.label}</strong>
-              <small>${item.detail}</small>
-            </span>
-            ${item.state === undefined
-              ? nothing
-              : html`<span class="command-palette-state ${item.state}">${stateLabel(item.state)}</span>`}
-          </button>
-        `)}
+        ${indexed.map(({ item, index }) => {
+          const stateDescription = item.pullRequestBadge?.tooltip
+            || item.sessionIndicator?.tooltip
+            || (item.state === undefined ? "" : stateLabel(item.state));
+          const accessibleDescription = [
+            item.label,
+            item.current === true ? "Current" : "",
+            stateDescription,
+            item.detail,
+          ].filter((part) => part !== "").join(", ");
+          return html`
+            <button
+              id=${`command-palette-option-${index}`}
+              class="command-palette-option"
+              type="button"
+              role="option"
+              tabindex="-1"
+              aria-selected=${index === this.#selectedIndex ? "true" : "false"}
+              aria-label=${accessibleDescription}
+              data-command-index=${index}
+              @click=${() => this.#activate(item)}
+            >
+              <span class="command-palette-icon" aria-hidden="true">
+                ${item.pullRequestBadge !== undefined
+                  ? html`<span
+                      class="session-pr-badge ${item.pullRequestBadge.tone}"
+                      title=${item.pullRequestBadge.tooltip}
+                    >${fontAwesomeIcon("code-pull-request")}</span>`
+                  : item.sessionIndicator !== undefined
+                  ? html`<span
+                      class="session-indicator ${item.sessionIndicator.kind}"
+                      title=${item.sessionIndicator.tooltip === ""
+                        ? nothing
+                        : item.sessionIndicator.tooltip}
+                    >${item.sessionIndicator.icon === undefined
+                      ? nothing
+                      : fontAwesomeIcon(item.sessionIndicator.icon)}</span>`
+                  : item.icon === undefined ? nothing : fontAwesomeIcon(item.icon)}
+              </span>
+              <span class="command-palette-copy">
+                <strong>${item.label}</strong>
+                <small>${item.detail}</small>
+              </span>
+              ${item.current !== true
+                ? nothing
+                : html`<span class="command-palette-current">Current</span>`}
+            </button>
+          `;
+        })}
       </section>
     `;
   }
 
   override render() {
     const matches = this.#matchingItems();
-    const selectedIndex = Math.min(
-      this.#selectedIndex,
-      Math.max(0, matches.length - 1),
-    );
-    if (selectedIndex !== this.#selectedIndex) this.#selectedIndex = selectedIndex;
+    const selectedById = this.#selectedItemId === undefined
+      ? -1
+      : matches.findIndex((item) => item.id === this.#selectedItemId);
+    const selectedIndex = this.#workerPending
+      ? this.#selectedIndex
+      : selectedById >= 0
+      ? selectedById
+      : Math.min(this.#selectedIndex, Math.max(0, matches.length - 1));
+    if (!this.#workerPending) {
+      this.#selectedIndex = selectedIndex;
+      this.#selectedItemId = matches[selectedIndex]?.id;
+    }
     const activeDescendant = matches.length === 0
       ? nothing
       : `command-palette-option-${selectedIndex}`;
@@ -319,7 +389,7 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
         @click=${this.#backdropClicked}
       >
         <header class="command-palette-search">
-          <span aria-hidden="true">⌕</span>
+          ${fontAwesomeIcon("magnifying-glass")}
           <label class="visually-hidden" for="command-palette-input" id="command-palette-title">Search commands, sessions, and threads</label>
           <input
             id="command-palette-input"
@@ -343,6 +413,7 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
           class="command-palette-results"
           role="listbox"
           aria-label="Matching commands"
+          @scroll=${this.#resultsScrolled}
         >
           ${this.#workerPending
             ? html`<div class="command-palette-empty" role="status">
@@ -357,8 +428,8 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
             : GROUP_ORDER.map((group) => this.#renderGroup(group, matches))}
         </div>
         <footer class="command-palette-footer">
-          <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-          <span><kbd>↵</kbd> open</span>
+          <span><kbd>${fontAwesomeIcon("arrow-up")}</kbd><kbd>${fontAwesomeIcon("arrow-down")}</kbd> navigate</span>
+          <span><kbd>${fontAwesomeIcon("arrow-turn-down")}</kbd> open</span>
           <span class="command-palette-count" role="status">${matches.length} ${matches.length === 1 ? "result" : "results"}</span>
         </footer>
       </dialog>

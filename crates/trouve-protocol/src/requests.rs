@@ -326,6 +326,13 @@ pub enum ThreadViewItem {
         content: String,
         complete: bool,
     },
+    /// A context-window compaction boundary in the transcript. Unlike a
+    /// tool call, this is engine lifecycle state and remains visible after
+    /// completion so clients can show where earlier context was summarized.
+    Compaction {
+        turn: u64,
+        state: ThreadCompactionState,
+    },
     ToolCall {
         call_id: String,
         tool: String,
@@ -374,6 +381,18 @@ pub enum ThreadTurnState {
     Running,
     Completed { usage: crate::Usage },
     Failed { error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadCompactionState {
+    Running,
+    Completed {
+        messages_compacted: u64,
+    },
+    /// A started compaction did not report completion before normal turn
+    /// output or a terminal turn event arrived.
+    Failed,
 }
 
 /// Folded current thread state and one transcript item page at the cursor
@@ -509,6 +528,14 @@ pub struct QueuedPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateQueuedPromptRequest {
     pub content: String,
+    /// Existing queued attachment ids to keep, in display order. Omit this
+    /// field to preserve every existing attachment (the behavior of clients
+    /// predating protocol 2.14); send an empty list to remove all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_attachment_ids: Option<Vec<String>>,
+    /// New files to append after the retained attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
 }
 
 /// Full desired order for a thread's queue (every queued prompt id, first
@@ -692,6 +719,35 @@ pub struct GithubPrList {
     /// GitHub instance this slice came from.
     pub host: String,
     pub prs: Vec<PrInfo>,
+}
+
+/// Latest persisted account-level PR replacement for one GitHub host.
+/// The event cursor and timestamp let clients order this bootstrap state
+/// against newer SSE events without replaying the retained server history.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GithubPrHostProjection {
+    pub cursor: u64,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    pub pull_requests: GithubPrList,
+}
+
+/// Pull requests already associated with one session using durable branch or
+/// `session.pr_opened` evidence. This is a local projection of the persisted
+/// account snapshots and never performs a GitHub request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionPrProjection {
+    pub session_id: SessionId,
+    pub prs: Vec<PrInfo>,
+}
+
+/// Durable server-owned state that is not part of the session-summary
+/// snapshot. Clients fetch this once during bootstrap and can then resume the
+/// server event stream at the session-summary cursor instead of cursor zero.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ServerProjection {
+    pub github_pull_requests: Vec<GithubPrHostProjection>,
+    pub session_pull_requests: Vec<SessionPrProjection>,
+    pub git_worktree_settings: GitWorktreeSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2043,6 +2099,11 @@ pub struct Automation {
     /// Model for the runs (None = the mode's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Thinking level for the runs (None = the selected model/mode/global
+    /// default). The engine maps this canonical value to the model's
+    /// advertised option key when the turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// Permission policy applied only to sessions created by this automation.
     /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
     #[serde(default)]
@@ -2075,6 +2136,10 @@ pub struct UpsertAutomationRequest {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Thinking level for each fresh automation thread. Omitted by older
+    /// clients preserves normal model/mode/global inheritance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// Permission policy for each fresh automation session. Omitted by older
     /// clients means Ask.
     #[serde(default)]

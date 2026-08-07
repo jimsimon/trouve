@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  chatPreferencesFromHost,
   HostClient,
   HostClientError,
   generalPreferencesFromHost,
   notificationPreferencesFromHost,
   pullRequestGroupOrderFromHost,
   resumePreferencesFromHost,
+  withHostChatPreferences,
   withHostGeneralPreferences,
   withHostNotificationPreferences,
   withHostPullRequestGroupOrder,
@@ -568,6 +570,9 @@ describe("HostClient", () => {
     expect(generalPreferencesFromHost(preferences)).toEqual({
       preventSleepWhileRunning: true,
     });
+    expect(chatPreferencesFromHost(preferences)).toEqual({
+      collapseThinkingWithTools: false,
+    });
     expect(notificationPreferencesFromHost(preferences)).toEqual({
       enabled: true,
       onFinish: true,
@@ -577,6 +582,9 @@ describe("HostClient", () => {
     });
     let next = withHostGeneralPreferences(preferences, {
       preventSleepWhileRunning: false,
+    });
+    next = withHostChatPreferences(next, {
+      collapseThinkingWithTools: true,
     });
     next = withHostNotificationPreferences(next, {
       enabled: true,
@@ -598,6 +606,7 @@ describe("HostClient", () => {
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
+    expect(next.chat?.collapse_thinking_with_tools).toBe(true);
     expect(next.notifications).toMatchObject({
       on_finish: false,
       on_attention: false,

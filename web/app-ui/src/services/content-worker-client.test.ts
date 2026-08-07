@@ -33,7 +33,7 @@ describe("lazy content worker", () => {
         label: "Settings",
         detail: "Application settings",
         keywords: "preferences",
-        icon: "⚙",
+        icon: "gear",
         action: {
           kind: "navigate",
           route: { kind: "settings" },

@@ -2,7 +2,7 @@
 
 **Status:** Existing Slint functionality ported; promotion qualification remains open
 
-**Last updated:** 2026-08-04
+**Last updated:** 2026-08-07
 
 **Migration plan:** [Web frontend migration implementation plan](web-frontend-migration-plan.md)
 
@@ -249,6 +249,19 @@ controls, full-screen routes honor display cutouts and safe areas, Settings
 uses horizontal section navigation, and terminal touch modifiers remain
 available without changing the desktop layout.
 
+The 2026-08-06 chat-hierarchy pass replaces repeated boxed activity rows with
+a restrained timeline for each contiguous activity sequence. A faint neutral
+rail and small nodes connect related thoughts and tools; completed work stays
+neutral, active or expanded work receives the blue accent, and approval or
+failure nodes use their semantic warning or error colors. Prose, questions,
+and context-compaction markers break the timeline, so final responses separate
+through whitespace instead of another container. Response text is selectable
+in the web frontend, so the Slint-era response copy/raw-view header buttons are
+absent. Right-click or Shift+F10 on an Agent response instead opens an
+accessible menu with **Copy as markdown** and, when text is selected, the
+ordinary **Copy** action. Native link, image, tool, thought, question, and
+compaction context menus remain untouched.
+
 This work is implementation progress, not promotion evidence. The local
 captures were not produced by the complete deterministic five-theme/device
 matrix, so the evidence register remains open and all Servo and Wry
@@ -268,8 +281,8 @@ xterm input/resize are examples.
 | ---: | --- | --- | --- | --- |
 | 1 | Shell and inbox | Three-column desktop shell, persisted splitters, responsive pane routes, workspace register/close/reorder, active and archived session groups, attention-first sorting, selection recovery, session rename/archive/delete, PR badges, command palette, and connection/retry states. | [application shell](../../web/app-ui/src/app/trouve-app.ts), [session list](../../web/app-ui/src/components/session-list.ts), [workspace settings](../../web/app-ui/src/components/workspace-settings.ts) | Paired Slint/Lit screenshots, focus and AT matrix, real desktop/PWA lifecycle, performance, and memory. |
 | 2 | Session and thread management | Prompt-first session creation with workspace, branch/fetch, mode, model, thinking, permission, bounded attachments, provisional creation recovery, and cancelable new-thread setup with inherited defaults. Thread select, create, rename, archive, delete, and route restoration are wired. | [new-session model](../../web/app-ui/src/app/new-session-model.ts), [new-thread setup](../../web/app-ui/src/components/new-thread-setup.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts) | Failure-injection, slow/offline races, full keyboard/IME/AT runs, and visual evidence. |
-| 3 | Chat | Streaming user/assistant/thinking/tool/error turns, sanitized Markdown, safe links, attachments, disclosure state, raw and formatted tool regions, humanized tool names, file links, inline diffs, todos, activity, usage, copy, Slint-shaped inline desktop approvals and a large-target mobile approval sheet, question interaction, bounded output, keyed virtualization, follow-tail, stable anchoring with invalid-bookmark recovery, tail-only live-log announcements, active-stream foreground resume, reduced motion, and an accessible full-history fallback. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [chat presentation](../../web/app-ui/src/components/chat-presentation.ts), [tool presentation](../../web/app-ui/src/components/tool-presentation.ts), [thread ingress](../../web/app-ui/src/services/thread-ingress.ts) | Large-history measurements, renderer/selection testing on both engines, screen readers, mobile memory, and screenshot comparison. |
-| 4 | Composer, completion, queue, and attachments | Autogrow input, IME-safe keyboard handling, slash and file completion with DOM UTF-16/protocol UTF-8 conversion, acknowledgement-aware start/cancel/queue/send-after-cancel controls, queued prompt edit/delete/reorder/send-now and paused-queue restart, thread-scoped async mutation recovery, context and session usage, file picker, drag/drop, pasted images, attachment limits, and PWA quick replies. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [turn controls](../../web/app-ui/src/components/chat-turn-controls.ts), [completion model](../../web/app-ui/src/components/composer-completion.ts), [queue controls](../../web/app-ui/src/components/queue-controls.ts), [attachments service](../../web/app-ui/src/services/attachments.ts) | Cross-engine IME/dead-key/mobile-keyboard matrix, picker denial/cancel, queue recovery soak, and visual evidence. |
+| 3 | Chat | Streaming user/assistant/thinking/tool/error turns, sanitized selectable Markdown, safe links, hover/focus response copy plus a **Copy as markdown** context action, attachments, disclosure state, raw and formatted tool regions, humanized tool names, file links, inline diffs, todos, timeline-based activity hierarchy, usage, tool/thought/attachment copy, Slint-shaped inline desktop approvals and a large-target mobile approval sheet, question interaction, bounded output, keyed virtualization, follow-tail, stable anchoring with invalid-bookmark recovery, tail-only live-log announcements, active-stream foreground resume, reduced motion, and an accessible full-history fallback. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [chat presentation](../../web/app-ui/src/components/chat-presentation.ts), [tool presentation](../../web/app-ui/src/components/tool-presentation.ts), [thread ingress](../../web/app-ui/src/services/thread-ingress.ts) | Large-history measurements, renderer/selection testing on both engines, screen readers, mobile memory, and screenshot comparison. |
+| 4 | Composer, completion, queue, and attachments | Autogrow input, IME-safe keyboard handling, slash and file completion with DOM UTF-16/protocol UTF-8 conversion, acknowledgement-aware start/cancel/queue/send-after-cancel controls, queued prompt edit/delete/reorder/send-now and paused-queue restart, durable thread-scoped unsubmitted text/cursor/attachment drafts, thread-scoped async mutation recovery, context and session usage, file picker, drag/drop, pasted images, attachment limits, and PWA quick replies. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [draft persistence](../../web/app-ui/src/services/composer-drafts.ts), [turn controls](../../web/app-ui/src/components/chat-turn-controls.ts), [completion model](../../web/app-ui/src/components/composer-completion.ts), [queue controls](../../web/app-ui/src/components/queue-controls.ts), [attachments service](../../web/app-ui/src/services/attachments.ts) | Cross-engine IME/dead-key/mobile-keyboard matrix, picker denial/cancel, queue recovery soak, and visual evidence. |
 | 5 | Diff | Unified/split modes, per-file grouping, line numbers, changed-file keyboard navigation, copy, responsive unified-only behavior, refresh, checkpoint undo/redo, expansion/collapse, and parsed status/error states. | [diff view](../../web/app-ui/src/components/diff-view.ts), [inspection diff controls](../../web/app-ui/src/components/inspection-diff-controls.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts) | Large-patch performance/memory, selection/AT alternatives, theme screenshots, touch, and engine disposal. |
 | 6 | Files and code | Lazy cached directory tree, roving keyboard navigation, retry/error/empty states, file loading, syntax-aware code view, line/range reveal, Markdown preview, selection/copy, capability-gated desktop open/reveal actions, and a narrow list-to-viewer flow whose tree toggle provides the return path. | [inspection file tree](../../web/app-ui/src/components/inspection-file-tree.ts), [code view](../../web/app-ui/src/components/code-view.ts), [file reveal model](../../web/app-ui/src/components/file-reveal.ts) | Large-tree/file budgets, binary fixtures, engine selection, mobile copy/scroll, visual and AT evidence. |
 | 7 | Terminal | Multiple PTY tabs, create/select/restart/close/exit state, xterm input/paste/copy/selection/search/links/mouse/wheel/resize/IME, offset resume, duplicate-free streaming, OSC 52 confirmation, and renderer disposal. | [terminal panel](../../web/app-ui/src/components/terminal-panel.ts), [terminal view](../../web/app-ui/src/components/terminal-view.ts), [terminal clipboard policy](../../web/app-ui/src/components/terminal-clipboard.ts) | Native clipboard and IME matrices, one/five-terminal budgets, suspend/resume and renderer recreation, AT alternative, touch controls. |
@@ -459,16 +472,18 @@ desktop-device, mobile-PWA, or performance evidence is recorded.
   remove their collapsed bodies from the DOM. Thinking and historical work
   use the same disclosure defaults and collapsed previews as the retained
   frontend.
-- Assistant output supports styled and raw Markdown views. Tool output
-  supports formatted and raw data views, humanized tool names, all tool
+- Assistant output remains styled and selectable. Its mouse/keyboard context
+  menu copies the complete raw Markdown source across tool-separated response
+  segments and preserves ordinary selected-text copy without permanent header
+  chrome. Tool output supports formatted and raw data views, humanized tool names, all tool
   states, readable arguments/results, bounded live output, inline edit/write
   diffs, read-file targets and ranges, todo state, file navigation,
   additions/deletions, duration, and exit metadata.
 - Tool cards preserve separate arguments, bounded UTF-8-safe live output, and
   final-result regions; omitted early output is explicitly marked.
 - Completed turns show token/cost/duration metadata; failures and
-  cancellations remain in transcript order, and copy feedback follows the
-  currently selected raw or formatted presentation.
+  cancellations remain in transcript order, and copy feedback remains scoped
+  to the response context action or currently selected tool presentation.
 - Approval cards expose approve, always approve, and deny actions with scoped
   Y/A/N shortcuts, per-call single-flight behavior, and focus restoration.
 - Pending and resolved question cards preserve wizard progression, answer
@@ -540,10 +555,15 @@ open.
   ignore stale UI completion after navigation, so an old response cannot
   clear busy state, focus controls, or surface an error in a newly selected
   thread.
+- Unsubmitted composer text, selection position, and pending attachments are
+  stored per thread, survive reloads, and restore independently across thread
+  and session navigation. A successfully accepted message clears only its
+  originating thread's draft; a failed request leaves that draft intact.
 
 **Primary Lit evidence**
 
 - [thread screen and composer](../../web/app-ui/src/components/thread-screen.ts)
+- [thread-scoped draft controller](../../web/app-ui/src/services/composer-drafts.ts)
 - [turn-state control model](../../web/app-ui/src/components/chat-turn-controls.ts)
 - [bounded composer completion model](../../web/app-ui/src/components/composer-completion.ts)
 - [queue control model](../../web/app-ui/src/components/queue-controls.ts)
@@ -1206,17 +1226,20 @@ still be qualified.
 | ENH-016 | Diff | A keyboard-reachable **Split view** opens the selected file in CodeMirror MergeView; the default stays the continuous Slint-style unified diff and narrow layouts stay unified-only. | Supports detailed desktop before/after review without making the migration a visual redesign. | Additive, opt-in desktop view. Returning to Unified restores the baseline presentation; binary changes use an explicit fallback. | Implemented and unqualified; [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [diff view](../../web/app-ui/src/components/diff-view.ts), and [responsive diff contract](../../web/app-ui/src/components/diff-mode.ts). |
 | ENH-017 | Mobile PWA | Explicit coarse-pointer PR-group move controls, tree-to-viewer Files navigation, a large-target approval sheet, and safe-area-aware full-screen headers adapt desktop workflows to phones and tablets. | Supplies usable non-drag and non-hover paths and avoids display cutouts without creating a second client implementation. | Mobile-only adaptation of existing operations; desktop hierarchy and default visuals remain unchanged. | Implemented and unqualified; [PR dashboard](../../web/app-ui/src/components/pull-requests-dashboard.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts), [Automations](../../web/app-ui/src/components/automations-screen.ts), and [responsive shell styles](../../web/app-ui/src/styles/app.css). |
 | ENH-018 | Chat turn controls | Explicit `Sending…`, `Queueing…`, `Starting…`, `Stopping…`, `Send next`, and retained cancellation transcript messages bridge request acknowledgements to durable turn events. | Makes in-flight and accepted-but-not-yet-streamed work visible and keeps the follow-up path discoverable during cancellation instead of looking unresponsive. | Additive acknowledgement and cancellation feedback over the same send/cancel/queue protocol; it does not create a second turn state or bypass durable SSE truth. | Implemented and browser-tested; [turn control model](../../web/app-ui/src/components/chat-turn-controls.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts), and [stateful chat tests](../../web/app-ui/e2e/chat-session.spec.ts). |
+| ENH-019 | Chat and settings | A **Chat** preference can opt thinking output into collapsed tool activity. The default instead keeps every thought visible as a labeled, non-collapsible top-level boundary and splits tool groups on either side. | Makes reasoning output and transitions difficult to miss without removing the compact transcript option for users who prefer it. | Additive frontend-owned presentation policy implemented in both Slint and Lit; it changes neither durable thread state nor the harness protocol. | Implemented and unqualified; [Lit chat preferences](../../web/app-ui/src/services/chat-preferences.ts), [Lit transcript](../../web/app-ui/src/components/thread-screen.ts), [Slint settings](../../crates/trouve-app/ui/settings-window.slint), and [Slint transcript fold](../../crates/trouve-app/src/render.rs). |
+| ENH-020 | Composer | Unsubmitted composer text, cursor position, and pending attachments persist independently for each thread across reloads and session/thread navigation. Accepted submissions clear only the originating draft; rejected submissions retain it. | Prevents partially written prompts and staged context from being lost when users compare threads, follow notifications, or refresh a preview. | Additive local frontend state. It does not enter the durable protocol/event log, alter submitted messages, or bypass attachment limits; browser storage is bounded and malformed restored data is rejected. | Implemented and browser-tested; [draft controller](../../web/app-ui/src/services/composer-drafts.ts), [thread integration](../../web/app-ui/src/components/thread-screen.ts), [unit tests](../../web/app-ui/src/services/composer-drafts.test.ts), and [cross-session/reload browser test](../../web/app-ui/e2e/chat-session.spec.ts). |
+| ENH-021 | Session pull request | Compact heading actions open the existing create form or launch the associated repository's GitHub pull-request list through the safe external-open boundary. | Keeps the create workflow available without a full-width primary button and makes repository-level PR navigation available beside it. | Additive browser shortcut plus a denser placement of the existing create action; eligibility, form behavior, protocol mutations, and PR state remain unchanged. | Implemented and unqualified; [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts), [safe repository-link model](../../web/app-ui/src/components/session-pr-panel-model.ts), and [browser shell coverage](../../web/app-ui/e2e/app-shell.spec.ts). |
 
 ## Approved deviations
 
-This register is intentionally empty. A widget-chrome variation is not
-automatically an approved deviation. Add a row only after review against the
-Slint baseline and record objective evidence.
+This register contains only explicitly reviewed differences. A widget-chrome
+variation is not automatically an approved deviation; every row still needs
+objective qualification evidence before promotion.
 
 | ID | Surface | Slint baseline behavior | Approved Lit deviation | Why parity is preserved | Approver and date | Evidence packet |
 | --- | --- | --- | --- | --- | --- | --- |
-
-No deviations are currently approved.
+| DEV-001 | Chat response actions | Slint exposes response copy and raw-Markdown header buttons because general rendered-text selection is limited. | Lit exposes the formatted-response copy action only on hover or keyboard focus and omits the raw-Markdown header button. Rendered response text remains selectable, while right-click or Shift+F10 on the Agent response exposes **Copy as markdown** and an ordinary **Copy** item when a selection exists. Native link/image and nested activity menus are not replaced. | Quick copy retains parity without permanent header chrome; the complete Markdown source remains available from the context menu, ordinary browser selection is preserved, and both actions are keyboard-operable. | User approval, 2026-08-07 | [thread screen](../../web/app-ui/src/components/thread-screen.ts) and [desktop/mobile browser interaction test](../../web/app-ui/e2e/chat-session.spec.ts). |
+| DEV-002 | Chat activity hierarchy | Slint uses bordered/collapsible activity rows and grouped tool presentation. | Lit uses a faint neutral rail and small nodes for each contiguous thought/tool sequence. Completed work is neutral; active, expanded, hovered, or focused work is blue; approval and failure nodes retain semantic colors. Tool groups remain transparent, visible thoughts use quiet labels, compaction and prose split the timeline, and response prose uses a readable maximum measure. | Disclosure, status color, grouping, ordering, output separation, and action semantics are unchanged; the treatment reduces repeated chrome and gives activity, compaction, and the final response distinct hierarchy. | User approval, 2026-08-06 | [chat styling](../../web/app-ui/src/styles/app.css), [visual contract](../../web/app-ui/src/styles/visual-contract.test.ts), and [desktop/mobile browser interaction test](../../web/app-ui/e2e/chat-session.spec.ts). |
 
 ## Open decisions and deviations
 

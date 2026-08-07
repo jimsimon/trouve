@@ -16,10 +16,12 @@ import {
   encodeAttachment,
   MAX_PENDING_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENTS,
+  pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
 import type {
   ProtocolAgentMode,
+  ProtocolAttachment,
   ProtocolModelInfo,
   ProtocolResolveApprovalRequest,
   ProtocolResolveQuestionRequest,
@@ -27,10 +29,15 @@ import type {
   ProtocolUpdateThreadRequest,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
+import type { ComposerDraft } from "../services/composer-drafts.js";
 import type { ChatScrollBookmark } from "../services/resume-preferences.js";
 import { rankComposerCompletionsOffThread } from "../services/content-worker-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
-import type { QueuedPrompt, ThreadChatItem } from "../state/thread-view-model.js";
+import type {
+  CompactionState,
+  QueuedPrompt,
+  ThreadChatItem,
+} from "../state/thread-view-model.js";
 import { TOOL_OUTPUT_OMITTED_MESSAGE } from "../state/tool-output.js";
 import {
   approvalDecisionForShortcut,
@@ -53,6 +60,8 @@ import { chatTurnControlState } from "./chat-turn-controls.js";
 import {
   activityGroupSummary,
   buildChatLayout,
+  isContextCompactionTool,
+  type AgentActivityItem,
   type AgentChatItem,
   type ChatRenderUnit,
 } from "./chat-layout.js";
@@ -87,6 +96,10 @@ import {
   modelOptionLabel,
 } from "./model-option-controls.js";
 import { modelHealthPresentations } from "./model-health.js";
+import {
+  fontAwesomeIcon,
+  type FontAwesomeIconName,
+} from "./font-awesome-icon.js";
 import {
   droppedQueueIds,
   prioritizedQueueIds,
@@ -172,8 +185,16 @@ interface ActiveComposerCompletion {
   readonly emptyMessage: string;
 }
 
+interface MarkdownContextMenu {
+  readonly markdown: string;
+  readonly selection: string;
+  readonly x: number;
+  readonly y: number;
+}
+
 const PATH_REFRESH_INTERVAL_MS = 5_000;
 const WORKER_COMPLETION_THRESHOLD = 200;
+const COMPOSER_DRAFT_PERSIST_DELAY_MS = 200;
 
 const PWA_QUICK_REPLIES = Object.freeze([
   { label: "Continue", prompt: "Continue." },
@@ -195,7 +216,7 @@ const threadTabLabel = (
   modeDisplayName?: string,
 ): string => {
   const mode = modeDisplayName?.trim() || thread.mode;
-  return `${thread.spawned === true ? "⑂ " : ""}${mode} · ${shortModelName(thread.model)}`;
+  return `${mode} · ${shortModelName(thread.model)}`;
 };
 
 const threadTodoProgress = (
@@ -224,17 +245,19 @@ const toolStatusLabel = (status: Extract<ThreadChatItem, { kind: "tool" }>["stat
     error: "Failed",
     denied: "Denied",
     aborted: "Aborted",
-  })[status];
+  } as const)[status];
 
-const toolStatusGlyph = (status: Extract<ThreadChatItem, { kind: "tool" }>["status"]): string =>
+const toolStatusIcon = (
+  status: Extract<ThreadChatItem, { kind: "tool" }>["status"],
+): FontAwesomeIconName =>
   ({
-    "awaiting-approval": "⏸",
-    running: "◌",
-    ok: "✓",
-    error: "✗",
-    denied: "⊘",
-    aborted: "✗",
-  })[status];
+    "awaiting-approval": "pause",
+    running: "spinner",
+    ok: "check",
+    error: "xmark",
+    denied: "ban",
+    aborted: "xmark",
+  } as const)[status];
 
 export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   static override properties = {
@@ -293,7 +316,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
   #queueEditId = "";
-  #queueEditDraft = "";
+  #queueEditRetainedAttachments: ProtocolAttachment[] = [];
+  #queueEditReturnDraft: ComposerDraft | undefined;
   #queueBusy = "";
   #queueError = "";
   #queueDragId = "";
@@ -310,6 +334,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #threadSettingsPending = false;
   #composerDraft = "";
   #composerCursor = 0;
+  #composerDraftThreadId = "";
+  #composerDraftRestoreGeneration = 0;
+  #composerDraftPersistTimer: ReturnType<typeof setTimeout> | undefined;
+  #restoreComposerSelection = false;
   #composerComposing = false;
   #completionSelected = 0;
   #completionDismissed = false;
@@ -331,10 +359,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #usagePending = false;
   #usageGeneration = 0;
   #copyFeedbackGeneration = 0;
+  #markdownContextMenu: MarkdownContextMenu | undefined;
+  #markdownContextMenuStatus = "";
+  #markdownContextMenuReturnFocus: HTMLElement | undefined;
   readonly #approvalSubmissions = new ApprovalSubmissionTracker();
   readonly #copyFeedback = new Map<string, ChatCopyResult>();
   readonly #messageDisclosure = new Map<string, boolean>();
-  readonly #rawAssistantTurns = new Set<number>();
   readonly #rawToolCalls = new Set<string>();
   readonly #toolDisclosure = new Map<string, boolean>();
   readonly #questionWizards = new Map<string, QuestionWizardState>();
@@ -366,6 +396,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   });
 
   protected override willUpdate(changed: PropertyValues<this>): void {
+    const composerScopeChanged = changed.has("sessionId") || changed.has("threadId");
+    if (composerScopeChanged) this.#persistComposerDraftNow();
     if (changed.has("workspaceId")) {
       this.#workspaceProvider.setValue({ workspaceId: this.workspaceId });
       this.#optionCatalogKey = "";
@@ -389,7 +421,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#completionSelected = 0;
       this.#completionDismissed = false;
       this.#queueEditId = "";
-      this.#queueEditDraft = "";
+      this.#queueEditRetainedAttachments = [];
+      this.#queueEditReturnDraft = undefined;
       this.#queueBusy = "";
       this.#queueError = "";
       this.#queueDragId = "";
@@ -437,12 +470,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#threadProvider.setValue({ threadId: this.threadId });
-      this.#pendingAttachments = [];
       this.#attachmentPending = false;
       this.#copyFeedbackGeneration += 1;
       this.#copyFeedback.clear();
+      this.#markdownContextMenu = undefined;
+      this.#markdownContextMenuStatus = "";
+      this.#markdownContextMenuReturnFocus = undefined;
       this.#messageDisclosure.clear();
-      this.#rawAssistantTurns.clear();
       this.#rawToolCalls.clear();
       this.#toolDisclosure.clear();
       this.#questionWizards.clear();
@@ -451,7 +485,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#completionDismissed = false;
       this.#composerComposing = false;
       this.#queueEditId = "";
-      this.#queueEditDraft = "";
+      this.#queueEditRetainedAttachments = [];
+      this.#queueEditReturnDraft = undefined;
       this.#queueBusy = "";
       this.#queueError = "";
       this.#queueDragId = "";
@@ -460,6 +495,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pendingStartTurn = undefined;
       this.#cancelRequestedTurn = undefined;
       this.#messageRequest = undefined;
+    }
+    if (composerScopeChanged) {
+      this.#restoreComposerDraft(this.#draftThreadIdForCurrentScope());
     }
     if (
       changed.has("scrollBookmark")
@@ -479,7 +517,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     void this.#ensureThreadOptions();
     this.#refreshSubscriptionHealthAfterTurn();
     void this.#ensureSessionUsage();
+    const draftThreadId = this.#draftThreadIdForCurrentScope();
+    if (this.#composerDraftThreadId !== draftThreadId) {
+      this.#restoreComposerDraft(draftThreadId);
+    }
     this.#resizeComposer();
+    if (this.#restoreComposerSelection) {
+      const textarea = this.querySelector<HTMLTextAreaElement>('textarea[name="message"]');
+      if (textarea !== null) {
+        textarea.setSelectionRange(this.#composerCursor, this.#composerCursor);
+        this.#restoreComposerSelection = false;
+      }
+    }
     if (this.#invalidScrollBookmarkThreadId === this.threadId) {
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#emitChatPosition();
@@ -598,7 +647,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
+  override connectedCallback(): void {
+    super.connectedCallback();
+    document.addEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
+    document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
+    globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
+    globalThis.addEventListener("pagehide", this.#persistComposerDraftFromPageHide);
+  }
+
   override disconnectedCallback(): void {
+    this.#persistComposerDraftNow();
+    document.removeEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
+    document.removeEventListener("scroll", this.#dismissMarkdownContextMenu, true);
+    globalThis.removeEventListener("resize", this.#dismissMarkdownContextMenu);
+    globalThis.removeEventListener("pagehide", this.#persistComposerDraftFromPageHide);
     this.#resizeObserver?.disconnect();
     this.#resizeObserver = undefined;
     this.#observedVirtualRows.clear();
@@ -618,6 +680,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
     this.#chatScrollIntent = false;
+    this.#markdownContextMenu = undefined;
+    this.#markdownContextMenuReturnFocus = undefined;
     super.disconnectedCallback();
   }
 
@@ -664,7 +728,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const serverOnline = readSignal(store.serverInfo)?.online;
     const connectivityBlocked = serverOnline === false && this.#models.length === 0;
     const hasComposerContent = this.#composerDraft.trim() !== ""
-      || this.#pendingAttachments.length > 0;
+      || this.#pendingAttachments.length > 0
+      || this.#queueEditRetainedAttachments.length > 0;
     const turnControls = chatTurnControlState({
       threadAvailable: thread !== undefined,
       durableTurnRunning: view?.turnRunning ?? false,
@@ -676,9 +741,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       hasContent: hasComposerContent,
       connectivityBlocked,
     });
+    const queueEditing = this.#queueEditId !== "";
+    const queueEditPending = queueEditing && this.#queueBusy === this.#queueEditId;
     const attachmentDisabled = thread === undefined
       || this.#requestPending
       || this.#attachmentPending
+      || queueEditPending
       || connectivityBlocked;
     const completion = connectivityBlocked
       ? undefined
@@ -695,6 +763,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       view?.lastUsage,
       selectedModel?.context_window,
       view?.compacting ?? false,
+      thread?.model.startsWith("codex/") ?? false,
     );
     const sessionUsageText = formatSessionUsage(this.#sessionUsage);
     return html`
@@ -713,7 +782,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   this.#selectThreadWithKeyboard(event, index, threads)}
                 @click=${() => this.#selectThread(candidate.id)}
               >
-                <span class="thread-tab-label">${threadTabLabel(
+                <span class="thread-tab-label">${candidate.spawned === true
+                  ? fontAwesomeIcon("code-branch")
+                  : nothing}${threadTabLabel(
                   candidate,
                   this.#modes.find((mode) => mode.id === candidate.mode)?.display_name,
                 )}</span>
@@ -744,7 +815,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             title="New thread"
             ?disabled=${this.sessionId === "" || this.#newThreadSetupOpen || this.#newThreadBusy}
             @click=${this.openNewThreadSetup}
-          >+</button>
+          >${fontAwesomeIcon("plus")}</button>
         </div>
       </header>
 
@@ -778,18 +849,87 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       )}
 
       <form class="composer" @submit=${this.#sendMessage}>
-        ${this.#pendingAttachments.length === 0
+        ${queueEditing
+          ? html`
+              <div class="queue-edit-indicator" role="status">
+                <span>${fontAwesomeIcon("pen")} Editing queued prompt</span>
+                <button
+                  type="button"
+                  aria-label="Cancel queued prompt edit"
+                  title="Cancel editing"
+                  ?disabled=${queueEditPending || this.#attachmentPending}
+                  @click=${this.#cancelQueueEdit}
+                >${fontAwesomeIcon("xmark")}</button>
+              </div>
+            `
+          : nothing}
+        ${this.#queueEditRetainedAttachments.length === 0
+          && this.#pendingAttachments.length === 0
           ? nothing
           : html`
-              <ul class="pending-attachments" aria-label="Pending attachments">
+              <ul
+                class="attachment-list pending-attachments"
+                aria-label=${queueEditing ? "Queued prompt attachments" : "Pending attachments"}
+              >
+                ${this.#queueEditRetainedAttachments.map(
+                  (attachment, index) => {
+                    const preview = isImageAttachment(attachment)
+                      ? protocolAttachmentPath(attachment)
+                      : undefined;
+                    return html`
+                      <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
+                        ${preview === undefined
+                          ? html`<span class="attachment-icon">${fontAwesomeIcon(
+                              isImageAttachment(attachment) ? "file-image" : "file",
+                            )}</span>`
+                          : html`<img
+                              src=${preview}
+                              alt=${`Preview of ${attachment.name}`}
+                              decoding="async"
+                            />`}
+                        <div class="attachment-details">
+                          <strong title=${attachment.name}>${attachment.name}</strong>
+                          <small>${attachment.mime} · ${this.#formatBytes(attachment.size_bytes)}</small>
+                        </div>
+                        <button
+                          class="attachment-remove"
+                          type="button"
+                          aria-label=${`Remove ${attachment.name}`}
+                          ?disabled=${queueEditPending || this.#attachmentPending}
+                          @click=${() => this.#removeRetainedQueueAttachment(index)}
+                        >${fontAwesomeIcon("xmark")}</button>
+                      </li>
+                    `;
+                  },
+                )}
                 ${this.#pendingAttachments.map(
-                  (attachment, index) => html`
-                    <li>
-                      <span>${attachment.upload.name}</span>
-                      <small>${this.#formatBytes(attachment.size)}</small>
-                      <button type="button" aria-label=${`Remove ${attachment.upload.name}`} ?disabled=${this.#requestPending} @click=${() => this.#removeAttachment(index)}>×</button>
-                    </li>
-                  `,
+                  (attachment, index) => {
+                    const preview = pendingAttachmentPreviewUrl(attachment);
+                    return html`
+                      <li class=${preview === undefined ? "file-attachment" : "image-attachment"}>
+                        ${preview === undefined
+                          ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
+                          : html`<img
+                              src=${preview}
+                              alt=${`Preview of ${attachment.upload.name}`}
+                              decoding="async"
+                            />`}
+                        <div class="attachment-details">
+                          <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
+                          <small>${attachment.upload.mime} · ${this.#formatBytes(attachment.size)}</small>
+                        </div>
+                        <button
+                          class="attachment-remove"
+                          type="button"
+                          aria-label=${`Remove ${attachment.upload.name}`}
+                          ?disabled=${this.#requestPending
+                            || queueEditPending
+                            || this.#attachmentPending}
+                          @click=${() => this.#removeAttachment(index)}
+                        >${fontAwesomeIcon("xmark")}</button>
+                      </li>
+                    `;
+                  },
                 )}
               </ul>
             `}
@@ -818,10 +958,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? "Select or create a thread first"
               : connectivityBlocked
                 ? "Offline — prompts are disabled"
-                : "Message the agent…  (Shift+Enter for a new line)"}
+                : queueEditing
+                  ? "Edit queued prompt…  (Shift+Enter for a new line)"
+                  : "Message the agent…  (Shift+Enter for a new line)"}
             rows="1"
             .value=${live(this.#composerDraft)}
-            ?disabled=${thread === undefined || this.#requestPending || connectivityBlocked}
+            ?disabled=${thread === undefined
+              || this.#requestPending
+              || queueEditPending
+              || connectivityBlocked}
             @input=${this.#composerChanged}
             @select=${this.#composerCursorMoved}
             @click=${this.#composerCursorMoved}
@@ -830,7 +975,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             @compositionend=${this.#composerCompositionEnded}
             @paste=${this.#composerPaste}
           ></textarea>
-          ${turnControls.action === "cancel"
+          ${queueEditing
+            ? html`<wa-button
+                class="composer-submit"
+                type="submit"
+                variant="brand"
+                title="Update queued prompt"
+                ?disabled=${queueEditPending || this.#attachmentPending || !hasComposerContent || connectivityBlocked}
+              >${queueEditPending ? "Updating…" : "Update"}</wa-button>`
+            : turnControls.action === "cancel"
             ? html`<wa-button
                 class="composer-submit"
                 type="button"
@@ -947,7 +1100,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       <option value="yolo">Yolo</option>
                     </select>
                     ${thread.permission_mode === "yolo"
-                      ? html`<span class="permission-warning" role="img" aria-label="Warning: YOLO changes run without approval" title="YOLO: changes run without approval">⚠</span>`
+                      ? html`<span
+                          class="permission-warning"
+                          role="img"
+                          aria-label="Warning: YOLO changes run without approval"
+                          title="YOLO: changes run without approval"
+                        >${fontAwesomeIcon("triangle-exclamation")}</span>`
                       : nothing}
                   </span>
                 </label>
@@ -1002,7 +1160,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             aria-disabled=${attachmentDisabled ? "true" : "false"}
             title="Attach files"
           >
-            <span aria-hidden="true">📎</span><span class="visually-hidden">Attach files</span>
+            ${fontAwesomeIcon("paperclip")}<span class="visually-hidden">Attach files</span>
             <input
               type="file"
               multiple
@@ -1039,9 +1197,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     ></circle>
                   </svg>
                   ${contextUsage.unavailable
-                    ? html`<span class="context-dial-glyph" aria-hidden="true">!</span>`
+                    ? fontAwesomeIcon("triangle-exclamation", {
+                        className: "context-dial-glyph",
+                      })
                     : contextUsage.compacting
-                      ? html`<span class="context-dial-glyph compacting" aria-hidden="true">↻</span>`
+                      ? fontAwesomeIcon("arrows-rotate", {
+                          className: "context-dial-glyph compacting",
+                          spin: true,
+                        })
                       : nothing}
                 </span>
                 ${sessionUsageText === "" && !this.#usagePending
@@ -1059,6 +1222,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         </div>
       </form>
       `}
+      ${this.#renderMarkdownContextMenu()}
+      <span class="visually-hidden" role="status" aria-live="polite">
+        ${this.#markdownContextMenuStatus}
+      </span>
     `;
   }
 
@@ -1211,7 +1378,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         if (
           unit?.kind === "agent"
           && unit.turn === runningTurn
-          && (this.#messageDisclosure.get(unit.id) ?? true)
+          && (
+            unit.items.some(
+              (item) => item.kind === "compaction" && item.state.kind === "running",
+            )
+            || (this.#messageDisclosure.get(unit.id) ?? true)
+          )
         ) {
           nestedActivityUnitId = unit.id;
           break;
@@ -1232,7 +1404,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         (item) => item.kind === "tool" || item.kind === "questions",
       ),
     }));
-    if (compacting) {
+    const hasRunningCompaction = items.some(
+      (item) => item.kind === "compaction" && item.state.kind === "running",
+    );
+    if (compacting && !hasRunningCompaction) {
       virtualItems.push({
         id: "ephemeral:compacting",
         kind: "compacting",
@@ -1330,7 +1505,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               }
               if (item.kind === "compacting") {
                 return html`<div data-virtual-id=${item.id} style=${style}>
-                  <p class="activity-row" role="status">Compacting context…</p>
+                  ${this.#renderCompactionMarker({ kind: "running" })}
                 </div>`;
               }
               if (item.kind === "activity") {
@@ -1418,24 +1593,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       .map((item) => item.content)
       .filter((content) => content !== "")
       .join("\n\n");
-    const open = this.#messageDisclosure.get(unit.id) ?? true;
-    const raw = this.#rawAssistantTurns.has(unit.turn);
+    const compactionRunning = unit.items.some(
+      (item) => item.kind === "compaction" && item.state.kind === "running",
+    );
+    const open = compactionRunning || (this.#messageDisclosure.get(unit.id) ?? true);
     const turnState = presentation.turnStates.get(unit.turn);
     const metadata = turnState?.kind === "completed"
       ? formatTurnMetadata(turnState.usage, turnDurationMs.get(unit.turn))
       : "";
     const preview = collapsedChatPreview(joined);
     return html`
-      <article class="message turn-card assistant-message agent-turn-card">
+      <article
+        class="message turn-card assistant-message agent-turn-card"
+        @contextmenu=${(event: MouseEvent) =>
+          this.#openMarkdownContextMenu(event, joined)}
+      >
         <header class="message-header agent-header ${open ? "" : "collapsed"}">
           <button
             class="message-disclosure"
             type="button"
             aria-expanded=${open ? "true" : "false"}
+            aria-disabled=${compactionRunning ? "true" : "false"}
             aria-label=${open ? "Collapse agent message" : "Expand agent message"}
-            @click=${() => this.#toggleMessageDisclosure(unit.id, true)}
+            title=${compactionRunning ? "Agent output stays open while context is compacting" : ""}
+            @click=${() => this.#toggleMessageDisclosure(unit.id, true, compactionRunning)}
           >
-            <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
+            ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+              className: "disclosure-icon",
+            })}
             <strong>Agent</strong>
             ${turnModels.get(unit.turn) === undefined
               ? nothing
@@ -1447,24 +1632,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? nothing
               : html`<small class="turn-metadata">${metadata}</small>`}
           </button>
-          <div class="message-actions">
-            <button
-              type="button"
-              aria-pressed=${raw ? "true" : "false"}
-              aria-label=${raw ? "Show formatted assistant output" : "Show raw assistant output"}
-              title=${raw ? "Show styled view" : "Show raw Markdown"}
-              @click=${() => this.#toggleRawAssistant(unit.turn)}
-            ><span aria-hidden="true">👁</span></button>
-            ${this.#renderCopyButton(
-              `agent:${unit.id}`,
-              assistantCopyText(joined, raw),
-              "Copy assistant output",
-            )}
-          </div>
+          ${joined === ""
+            ? nothing
+            : html`<span class="agent-copy-action">
+                ${this.#renderCopyButton(
+                  `agent:${unit.id}`,
+                  assistantCopyText(joined),
+                  "Copy assistant output",
+                )}
+              </span>`}
         </header>
         ${open
           ? html`<div class="message-body turn-body-stream agent-body-stream">
-              ${this.#renderAgentBody(unit, raw, turnModels, turnDurationMs, presentation)}
+              ${this.#renderAgentBody(
+                unit,
+                turnModels,
+                turnDurationMs,
+                presentation,
+              )}
               ${activityLabel === undefined
                 ? nothing
                 : this.#renderActivityRow(activityLabel)}
@@ -1481,19 +1666,78 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     </p>`;
   }
 
+  #renderCompactionMarker(
+    state: CompactionState,
+  ) {
+    const running = state.kind === "running";
+    const completed = state.kind === "completed";
+    const label = running
+      ? "Compacting context"
+      : completed
+        ? "Context compacted"
+        : "Context compaction stopped";
+    const detail = running
+      ? "Summarizing earlier messages to make room for this turn…"
+      : completed
+        ? state.messagesCompacted === 0
+          ? "Earlier context summarized by the model harness"
+          : `${state.messagesCompacted} earlier transcript ${state.messagesCompacted === 1 ? "message" : "messages"} summarized`
+        : "Compaction did not report completion; the turn continued.";
+    return html`
+      <section
+        class=${`context-compaction-marker ${state.kind}`}
+        role="status"
+        aria-live="polite"
+        aria-label=${`${label}. ${detail}`}
+      >
+        <span class="context-compaction-symbol">
+          ${running
+            ? fontAwesomeIcon("arrows-rotate", {
+                className: "context-compaction-glyph",
+                spin: true,
+              })
+            : fontAwesomeIcon(completed ? "check" : "triangle-exclamation", {
+                className: "context-compaction-glyph",
+              })}
+        </span>
+        <span class="context-compaction-copy">
+          <strong>${label}</strong>
+          <small>${detail}</small>
+        </span>
+      </section>
+    `;
+  }
+
   #renderAgentBody(
     unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
-    raw: boolean,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
   ) {
+    const collapseThinkingWithTools = this.#services.value === undefined
+      ? false
+      : readSignal(this.#services.value.chatPreferences).collapseThinkingWithTools;
     const rows: unknown[] = [];
+    let activityRows: Array<{
+      readonly content: unknown;
+      readonly expandedGroup: boolean;
+    }> = [];
+    const flushActivityRows = (): void => {
+      if (activityRows.length === 0) return;
+      rows.push(html`<div class=${`agent-activity-timeline ${
+        activityRows.length === 1 ? "single-activity" : ""
+      } ${activityRows.some(({ expandedGroup }) => expandedGroup)
+        ? "has-expanded-group"
+        : ""}`}>${activityRows.map(({ content }) => content)}</div>`);
+      activityRows = [];
+    };
+    const hasNativeCompaction = unit.items.some((item) => item.kind === "compaction");
     let index = 0;
     while (index < unit.items.length) {
       const item = unit.items[index];
       if (item === undefined) break;
       if (item.kind === "assistant") {
+        flushActivityRows();
         const stretch: Extract<AgentChatItem, { readonly kind: "assistant" }>[] = [];
         while (index < unit.items.length && unit.items[index]?.kind === "assistant") {
           stretch.push(unit.items[index] as Extract<AgentChatItem, { readonly kind: "assistant" }>);
@@ -1501,9 +1745,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         const content = stretch.map((part) => part.content).filter(Boolean).join("\n\n");
         if (content !== "") {
-          rows.push(raw
-            ? html`<pre class="assistant-raw agent-text-block">${content}</pre>`
-            : html`<div class="agent-text-block"><trouve-markdown-view
+          rows.push(html`<div class="agent-text-block"><trouve-markdown-view
                 class="turn-markdown"
                 .content=${content}
                 .streaming=${stretch.some((part) => !part.complete)}
@@ -1512,39 +1754,109 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         continue;
       }
       if (item.kind === "questions") {
+        flushActivityRows();
         rows.push(this.#renderItem(item, turnModels, turnDurationMs, presentation));
         index += 1;
         continue;
       }
+      if (item.kind === "compaction") {
+        flushActivityRows();
+        rows.push(this.#renderItem(item, turnModels, turnDurationMs, presentation));
+        index += 1;
+        continue;
+      }
+      if (item.kind === "tool" && isContextCompactionTool(item)) {
+        flushActivityRows();
+        if (!hasNativeCompaction) {
+          const state: CompactionState = item.status === "ok"
+            ? { kind: "completed", messagesCompacted: 0 }
+            : item.status === "running" || item.status === "awaiting-approval"
+              ? { kind: "running" }
+              : { kind: "failed" };
+          rows.push(this.#renderCompactionMarker(state));
+        }
+        index += 1;
+        continue;
+      }
+      if (item.kind === "thinking" && !collapseThinkingWithTools) {
+        activityRows.push({
+          content: this.#renderVisibleThinking(item),
+          expandedGroup: false,
+        });
+        index += 1;
+        continue;
+      }
 
-      const run: AgentChatItem[] = [];
+      const run: AgentActivityItem[] = [];
       while (index < unit.items.length) {
         const candidate = unit.items[index];
-        if (candidate === undefined || candidate.kind === "assistant" || candidate.kind === "questions") break;
-        run.push(candidate);
+        if (
+          candidate === undefined
+          || candidate.kind === "assistant"
+          || candidate.kind === "questions"
+          || candidate.kind === "compaction"
+          || (candidate.kind === "tool" && isContextCompactionTool(candidate))
+          || (!collapseThinkingWithTools && candidate.kind === "thinking")
+        ) break;
+        run.push(candidate as AgentActivityItem);
         index += 1;
       }
       if (run.length < 2) {
         const only = run[0];
         if (only !== undefined) {
-          rows.push(this.#renderItem(only, turnModels, turnDurationMs, presentation));
+          activityRows.push({
+            content: this.#renderItem(only, turnModels, turnDurationMs, presentation),
+            expandedGroup: false,
+          });
         }
         continue;
       }
-      rows.push(this.#renderActivityGroup(
-        unit,
-        run,
-        turnModels,
-        turnDurationMs,
-        presentation,
-      ));
+      activityRows.push({
+        content: this.#renderActivityGroup(
+          unit,
+          run,
+          turnModels,
+          turnDurationMs,
+          presentation,
+        ),
+        expandedGroup: this.#activityGroupOpen(unit, run),
+      });
     }
+    flushActivityRows();
     return rows;
+  }
+
+  #renderVisibleThinking(
+    item: Extract<ThreadChatItem, { readonly kind: "thinking" }>,
+    grouped = false,
+  ) {
+    this.#ensureMarkdown();
+    return html`
+      <article class=${`message thinking-output ${
+        item.complete ? "complete" : "running"
+      } ${grouped ? "grouped-thinking-output" : ""}`}>
+        <header class="thinking-header">
+          <strong>${item.complete ? "Thought" : "Thinking"}</strong>
+          <span class="thinking-header-spacer"></span>
+          ${this.#renderCopyButton(
+            `message:${item.id}`,
+            item.content,
+            "Copy thought process",
+          )}
+        </header>
+        <div class="thinking-body">
+          <trouve-markdown-view
+            .content=${item.content}
+            .streaming=${!item.complete}
+          ></trouve-markdown-view>
+        </div>
+      </article>
+    `;
   }
 
   #renderActivityGroup(
     unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
-    items: readonly AgentChatItem[],
+    items: readonly AgentActivityItem[],
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
@@ -1555,31 +1867,64 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const needsApproval = items.some(
       (item) => item.kind === "tool" && item.status === "awaiting-approval",
     );
-    const open = needsApproval || (this.#messageDisclosure.get(key) ?? false);
+    const active = items.some((item) =>
+      item.kind === "thinking"
+        ? !item.complete
+        : item.status === "running" || item.status === "awaiting-approval"
+    );
+    const failed = items.some((item) =>
+      item.kind === "tool"
+      && (item.status === "error" || item.status === "denied" || item.status === "aborted")
+    );
+    const tone = failed
+      ? "error"
+      : needsApproval
+        ? "warning"
+        : active
+          ? "active"
+          : "complete";
+    const open = this.#activityGroupOpen(unit, items);
     return html`
       <details
-        class="activity-group"
+        class=${`activity-group ${tone}`}
         .open=${open}
       >
         <summary
           @click=${(event: Event) =>
             this.#toggleActivityGroup(event, key, open, needsApproval)}
         >
-          <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
+          ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+            className: "disclosure-icon",
+          })}
           <strong>${activityGroupSummary(items)}</strong>
         </summary>
         ${open
           ? html`<div class="activity-group-body">
-              ${items.map((item) => this.#renderItem(
-                item,
-                turnModels,
-                turnDurationMs,
-                presentation,
-              ))}
+              ${items.map((item) => item.kind === "thinking"
+                ? this.#renderVisibleThinking(item, true)
+                : this.#renderItem(
+                    item,
+                    turnModels,
+                    turnDurationMs,
+                    presentation,
+                  ))}
             </div>`
           : nothing}
       </details>
     `;
+  }
+
+  #activityGroupOpen(
+    unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
+    items: readonly AgentActivityItem[],
+  ): boolean {
+    const first = items[0];
+    if (first === undefined) return false;
+    const needsApproval = items.some(
+      (item) => item.kind === "tool" && item.status === "awaiting-approval",
+    );
+    const key = `activity:${unit.id}:${first.id}`;
+    return needsApproval || (this.#messageDisclosure.get(key) ?? false);
   }
 
   #toggleActivityGroup(
@@ -1600,15 +1945,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     connectivityBlocked: boolean,
   ) {
     if (queue.length === 0) return nothing;
+    const queueMutationBusy = this.#queueBusy !== ""
+      || (this.#queueEditId !== "" && this.#attachmentPending);
     const controls = queueControlState({
       threadAvailable: this.threadId !== "",
       queueLength: queue.length,
       turnRunning,
-      busy: this.#queueBusy !== "",
+      busy: queueMutationBusy,
       connectivityBlocked,
     });
     return html`
-      <section class="queue-panel" aria-busy=${this.#queueBusy !== "" ? "true" : "false"}>
+      <section class="queue-panel" aria-busy=${queueMutationBusy ? "true" : "false"}>
         <header>
           <span role="status" aria-live="polite">${queue.length} queued prompt${queue.length === 1 ? "" : "s"}</span>
           ${turnRunning
@@ -1644,7 +1991,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       controls.mutationsDisabled || queue.length < 2,
                     )}
                     @dragend=${this.#endQueueDrag}
-                  >⠿</span>
+                  >${fontAwesomeIcon("grip-vertical")}</span>
                   <span class="queue-index" aria-hidden="true">${index + 1}.</span>
                   <p title=${prompt.content}>${queuePreview(prompt.content)}</p>
                   ${prompt.attachments === undefined || prompt.attachments.length === 0
@@ -1654,40 +2001,29 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                         role="img"
                         aria-label=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
                         title=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
-                      >📎${prompt.attachments.length}</span>`}
+                      >${fontAwesomeIcon("paperclip")}${prompt.attachments.length}</span>`}
                   <div class="queue-actions" aria-label=${`Actions for queued prompt ${index + 1}`}>
                     ${turnRunning
                       ? nothing
-                      : html`<button type="button" data-queue-action="send-now" aria-label="Send this queued prompt now" title="Send now" ?disabled=${controls.dispatchDisabled} @click=${() => this.#sendQueuedNow(queue, index)}>▶</button>`}
-                    <button type="button" data-queue-action="earlier" aria-label="Run earlier" title="Run earlier" ?disabled=${index === 0 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, -1)}>↑</button>
-                    <button type="button" data-queue-action="later" aria-label="Run later" title="Run later" ?disabled=${index === queue.length - 1 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, 1)}>↓</button>
-                    <button type="button" data-queue-action="edit" aria-label="Edit queued prompt" title="Edit" ?disabled=${controls.mutationsDisabled} @click=${() => this.#startQueueEdit(prompt)}>✎</button>
-                    <button class="danger" type="button" data-queue-action="delete" aria-label="Remove from queue" title="Remove from queue" ?disabled=${controls.mutationsDisabled} @click=${() => this.#deleteQueued(queue, prompt.id)}>✕</button>
+                      : html`<button type="button" data-queue-action="send-now" aria-label="Send this queued prompt now" title="Send now" ?disabled=${controls.dispatchDisabled} @click=${() => this.#sendQueuedNow(queue, index)}>${fontAwesomeIcon("play")}</button>`}
+                    <button type="button" data-queue-action="earlier" aria-label="Run earlier" title="Run earlier" ?disabled=${index === 0 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, -1)}>${fontAwesomeIcon("arrow-up")}</button>
+                    <button type="button" data-queue-action="later" aria-label="Run later" title="Run later" ?disabled=${index === queue.length - 1 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, 1)}>${fontAwesomeIcon("arrow-down")}</button>
+                    <button
+                      type="button"
+                      data-queue-action="edit"
+                      aria-label=${this.#queueEditId === prompt.id
+                        ? "Queued prompt is being edited"
+                        : "Edit queued prompt"}
+                      title=${this.#queueEditId === prompt.id ? "Editing" : "Edit"}
+                      ?disabled=${controls.mutationsDisabled
+                        || this.#requestPending
+                        || this.#attachmentPending
+                        || (this.#queueEditId !== "" && this.#queueEditId !== prompt.id)}
+                      @click=${() => this.#startQueueEdit(prompt)}
+                    >${fontAwesomeIcon("pen")}</button>
+                    <button class="danger" type="button" data-queue-action="delete" aria-label="Remove from queue" title="Remove from queue" ?disabled=${controls.mutationsDisabled} @click=${() => this.#deleteQueued(queue, prompt.id)}>${fontAwesomeIcon("trash-can")}</button>
                   </div>
                 </div>
-                ${this.#queueEditId === prompt.id
-                  ? html`
-                      <form class="queue-edit" @submit=${(event: SubmitEvent) => this.#saveQueued(event, prompt)}>
-                        <label class="visually-hidden" for=${`queue-${prompt.id}`}>Queued prompt</label>
-                        <textarea
-                          id=${`queue-${prompt.id}`}
-                          data-queue-action="edit-input"
-                          name="content"
-                          rows="3"
-                          required
-                          .value=${live(this.#queueEditDraft)}
-                          ?disabled=${controls.mutationsDisabled}
-                          @input=${(event: InputEvent) => {
-                            this.#queueEditDraft = (event.currentTarget as HTMLTextAreaElement).value;
-                            this.requestUpdate();
-                          }}
-                        ></textarea>
-                        <div class="queue-actions">
-                          <button type="button" data-queue-action="cancel-edit" ?disabled=${controls.mutationsDisabled} @click=${this.#cancelQueueEdit}>Cancel</button>
-                          <button class="primary" type="submit" data-queue-action="save" ?disabled=${controls.mutationsDisabled || this.#queueEditDraft.trim() === ""}>Save</button>
-                        </div>
-                      </form>`
-                  : nothing}
               </li>
             `,
           )}
@@ -2061,19 +2397,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 aria-label=${open ? "Collapse your message" : "Expand your message"}
                 @click=${() => this.#toggleMessageDisclosure(item.id, true)}
               >
-                <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
+                ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+                  className: "disclosure-icon",
+                })}
                 <strong>You</strong>
                 ${open
                   ? html`<span class="agent-header-spacer"></span>`
                   : html`<small class="message-collapsed-preview">${preview}</small>`}
               </button>
-              <div class="message-actions">
-                ${this.#renderCopyButton(
-                  `message:${item.id}`,
-                  item.content,
-                  "Copy your message",
-                )}
-              </div>
             </header>
             ${open
               ? html`
@@ -2094,14 +2425,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       case "assistant": {
         this.#ensureMarkdown();
         const open = this.#messageDisclosure.get(item.id) ?? true;
-        const raw = this.#rawAssistantTurns.has(item.turn);
         const turnState = presentation.turnStates.get(item.turn);
         const metadata = presentation.lastAssistantIds.has(item.id)
           && turnState?.kind === "completed"
           ? formatTurnMetadata(turnState.usage, turnDurationMs.get(item.turn))
           : "";
         return html`
-          <article class="message turn-card assistant-message">
+          <article
+            class="message turn-card assistant-message"
+            @contextmenu=${(event: MouseEvent) =>
+              this.#openMarkdownContextMenu(event, item.content)}
+          >
             <header class="message-header agent-header ${open ? "" : "collapsed"}">
               <button
                 class="message-disclosure"
@@ -2110,7 +2444,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 aria-label=${open ? "Collapse agent message" : "Expand agent message"}
                 @click=${() => this.#toggleMessageDisclosure(item.id, true)}
               >
-                <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
+                ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+                  className: "disclosure-icon",
+                })}
                 <strong>Agent</strong>
                 ${turnModels.get(item.turn) === undefined
                   ? nothing
@@ -2119,33 +2455,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   ? nothing
                   : html`<small class="turn-metadata">${metadata}</small>`}
               </button>
-              <div class="message-actions">
-                <button
-                  type="button"
-                  aria-pressed=${raw ? "true" : "false"}
-                  aria-label=${raw ? "Show formatted assistant output" : "Show raw assistant output"}
-                  title=${raw ? "Show formatted output" : "Show raw Markdown"}
-                  @click=${() => this.#toggleRawAssistant(item.turn)}
-                ><span aria-hidden="true">👁</span></button>
-                ${this.#renderCopyButton(
-                  `message:${item.id}`,
-                  assistantCopyText(item.content, raw),
-                  "Copy assistant output",
-                )}
-              </div>
+              ${item.content === ""
+                ? nothing
+                : html`<span class="agent-copy-action">
+                    ${this.#renderCopyButton(
+                      `agent:${item.id}`,
+                      assistantCopyText(item.content),
+                      "Copy assistant output",
+                    )}
+                  </span>`}
             </header>
             ${open
               ? html`
                   <div class="message-body turn-body-stream">
-                    ${raw
-                      ? html`<pre class="assistant-raw">${item.content}</pre>`
-                      : html`
-                          <trouve-markdown-view
-                            class="turn-markdown"
-                            .content=${item.content}
-                            .streaming=${!item.complete}
-                          ></trouve-markdown-view>
-                        `}
+                    <trouve-markdown-view
+                      class="turn-markdown"
+                      .content=${item.content}
+                      .streaming=${!item.complete}
+                    ></trouve-markdown-view>
                   </div>
                 `
               : nothing}
@@ -2158,7 +2485,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const open = this.#messageDisclosure.get(item.id) ?? defaultOpen;
         const preview = collapsedChatPreview(item.content);
         return html`
-          <article class="message thinking-card">
+          <article class=${`message thinking-card ${item.complete ? "complete" : "running"}`}>
             <header class="thinking-header">
               <button
                 class="message-disclosure"
@@ -2167,7 +2494,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 aria-label=${open ? "Collapse thought process" : "Expand thought process"}
                 @click=${() => this.#toggleMessageDisclosure(item.id, defaultOpen)}
               >
-                <span class="disclosure-icon" aria-hidden="true">${open ? "▾" : "▸"}</span>
+                ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+                  className: "disclosure-icon",
+                })}
                 <strong>${item.complete ? "Thought" : "Thinking"}</strong>
                 ${open
                   ? nothing
@@ -2189,6 +2518,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           </article>
         `;
       }
+      case "compaction":
+        return this.#renderCompactionMarker(item.state);
       case "tool": {
         const approvalPending = this.#approvalSubmissions.has(item.callId);
         const approvalRequired = item.status === "awaiting-approval";
@@ -2205,7 +2536,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         ].filter((part) => part !== "").join(" · ");
         return html`
           <details
-            class=${`message tool-card ${approvalRequired ? "approval-required" : ""}`}
+            class=${`message tool-card tool-${item.status} ${approvalRequired ? "approval-required" : ""}`}
             data-call-id=${item.callId}
             ?open=${toolOpen}
             @keydown=${(event: KeyboardEvent) =>
@@ -2215,16 +2546,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               @click=${(event: Event) =>
                 this.#toggleToolDisclosure(event, item.callId, approvalRequired)}
             >
-              <span class="tool-disclosure" aria-hidden="true">${toolOpen ? "▾" : "▸"}</span>
+              ${fontAwesomeIcon(toolOpen ? "caret-down" : "caret-right", {
+                className: "tool-disclosure",
+              })}
               <span class="tool-status ${item.status}" aria-hidden="true">
-                ${item.status === "running"
-                  ? html`
-                      <svg class="tool-running-spinner" viewBox="0 0 24 24">
-                        <path d="M12 3a9 9 0 1 1-9 9"></path>
-                      </svg>
-                      <span class="tool-running-static">◌</span>
-                    `
-                  : toolStatusGlyph(item.status)}
+                ${fontAwesomeIcon(toolStatusIcon(item.status), {
+                  className: "tool-status-icon",
+                  spin: item.status === "running",
+                })}
               </span>
               <strong>${toolPresentation.title}</strong>
               ${toolPresentation.subject === ""
@@ -2254,7 +2583,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   aria-label=${raw ? "Show formatted tool output" : "Show raw tool output"}
                   title=${raw ? "Show formatted output" : "Show raw data"}
                   @click=${() => this.#toggleRawTool(item.callId)}
-                ><span aria-hidden="true">${raw ? "{}" : "≡"}</span></button>
+                >${fontAwesomeIcon(raw ? "code" : "list")}</button>
               </span>
               <span class="tool-copy-action" @click=${(event: Event) => event.stopPropagation()}>
                 ${this.#renderCopyButton(
@@ -2320,7 +2649,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                           ? nothing
                           : html`<ul class="tool-todo-list" aria-label="Todo state">
                               ${toolPresentation.todos.map((todo) => html`<li class=${`todo-${todo.status}`}>
-                                <span aria-hidden="true">${todo.glyph}</span><span>${todo.content}</span>
+                                ${fontAwesomeIcon(todo.icon)}<span>${todo.content}</span>
                               </li>`)}
                             </ul>`}
                         ${toolPresentation.diff.length > 0 || toolPresentation.todos.length > 0 || toolDetail === ""
@@ -2410,9 +2739,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                                 ?disabled=${submitting}
                                 @click=${() => this.#toggleQuestionOption(item, option.id)}
                               >
-                                <span class="question-option-mark" aria-hidden="true">${multiple
-                                  ? checked ? "☑" : "☐"
-                                  : checked ? "◉" : "○"}</span>
+                                ${fontAwesomeIcon(
+                                  multiple
+                                    ? checked ? "square-check" : "square"
+                                    : checked ? "circle-dot" : "circle",
+                                  { className: "question-option-mark" },
+                                )}
                                 <span>${option.label}</span>
                               </button>
                             `;
@@ -2428,9 +2760,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                                 ?disabled=${submitting}
                                 @click=${() => this.#toggleQuestionOption(item, OTHER_OPTION_ID)}
                               >
-                                <span class="question-option-mark" aria-hidden="true">${multiple
-                                  ? checked ? "☑" : "☐"
-                                  : checked ? "◉" : "○"}</span>
+                                ${fontAwesomeIcon(
+                                  multiple
+                                    ? checked ? "square-check" : "square"
+                                    : checked ? "circle-dot" : "circle",
+                                  { className: "question-option-mark" },
+                                )}
                                 <em>Other</em>
                               </button>
                               ${checked
@@ -2518,7 +2853,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       decoding="async"
                     />
                   `
-                : html`<span class="attachment-icon" aria-hidden="true">▧</span>`}
+                : html`<span class="attachment-icon">${fontAwesomeIcon(
+                    isImageAttachment(attachment) ? "file-image" : "file",
+                  )}</span>`}
               <div class="attachment-details">
                 <strong title=${attachment.name}>${attachment.name}</strong>
                 <small>${attachment.mime} · ${formatAttachmentBytes(attachment.size_bytes)}</small>
@@ -2542,9 +2879,161 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  #renderMarkdownContextMenu() {
+    const menu = this.#markdownContextMenu;
+    if (menu === undefined) return nothing;
+    return html`
+      <div
+        class="message-context-menu"
+        role="menu"
+        aria-label="Message actions"
+        style=${`left:${menu.x}px;top:${menu.y}px`}
+        @contextmenu=${(event: Event) => event.preventDefault()}
+        @keydown=${this.#markdownContextMenuKeydown}
+      >
+        ${menu.selection === ""
+          ? nothing
+          : html`<button
+              type="button"
+              role="menuitem"
+              @click=${() => void this.#copyMarkdownContextValue("selection")}
+            >
+              ${fontAwesomeIcon("copy")}
+              <span>Copy</span>
+            </button>`}
+        <button
+          type="button"
+          role="menuitem"
+          @click=${() => void this.#copyMarkdownContextValue("markdown")}
+        >
+          ${fontAwesomeIcon("file-lines")}
+          <span>Copy as markdown</span>
+        </button>
+      </div>
+    `;
+  }
+
+  #openMarkdownContextMenu(event: MouseEvent, markdown: string): void {
+    if (markdown === "") return;
+    const source = event.currentTarget;
+    if (!(source instanceof HTMLElement)) return;
+    const preserveNativeMenu = event.composedPath().some((target) =>
+      target instanceof Element
+      && target.matches(
+        "a, img, video, input, textarea, select, .tool-card, .thinking-card, .thinking-output, .context-compaction-marker, .question-card",
+      )
+    );
+    if (preserveNativeMenu) {
+      this.#dismissMarkdownContextMenu();
+      return;
+    }
+
+    event.preventDefault();
+    const selection = this.#selectedTextWithin(source);
+    const sourceBounds = source.getBoundingClientRect();
+    const keyboardPosition = event.clientX === 0 && event.clientY === 0;
+    const requestedX = keyboardPosition ? sourceBounds.left + 24 : event.clientX;
+    const requestedY = keyboardPosition ? sourceBounds.top + 24 : event.clientY;
+    const viewportWidth = globalThis.innerWidth || document.documentElement.clientWidth;
+    const viewportHeight = globalThis.innerHeight || document.documentElement.clientHeight;
+    const estimatedWidth = 220;
+    const estimatedHeight = selection === "" ? 42 : 76;
+    const menu: MarkdownContextMenu = {
+      markdown,
+      selection,
+      x: Math.max(8, Math.min(requestedX, viewportWidth - estimatedWidth - 8)),
+      y: Math.max(8, Math.min(requestedY, viewportHeight - estimatedHeight - 8)),
+    };
+    this.#markdownContextMenu = menu;
+    this.#markdownContextMenuStatus = "";
+    this.#markdownContextMenuReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : undefined;
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      if (this.#markdownContextMenu !== menu) return;
+      this.querySelector<HTMLButtonElement>(
+        '.message-context-menu [role="menuitem"]',
+      )?.focus();
+    });
+  }
+
+  #selectedTextWithin(source: HTMLElement): string {
+    const selection = globalThis.getSelection?.();
+    if (selection === undefined || selection === null || selection.rangeCount === 0) return "";
+    const range = selection.getRangeAt(0);
+    const commonAncestor = range.commonAncestorContainer;
+    const root = commonAncestor.getRootNode();
+    const inside = source.contains(commonAncestor)
+      || (root instanceof ShadowRoot && source.contains(root.host));
+    return inside ? selection.toString() : "";
+  }
+
+  readonly #dismissMarkdownContextMenuFromPointer = (event: PointerEvent): void => {
+    if (this.#markdownContextMenu === undefined) return;
+    const target = event.target;
+    if (
+      target instanceof Element
+      && target.closest(".message-context-menu") !== null
+    ) return;
+    this.#dismissMarkdownContextMenu();
+  };
+
+  readonly #dismissMarkdownContextMenu = (): void => {
+    this.#closeMarkdownContextMenu(false);
+  };
+
+  #closeMarkdownContextMenu(restoreFocus: boolean): void {
+    if (this.#markdownContextMenu === undefined) return;
+    const returnFocus = this.#markdownContextMenuReturnFocus;
+    this.#markdownContextMenu = undefined;
+    this.#markdownContextMenuReturnFocus = undefined;
+    this.requestUpdate();
+    if (restoreFocus && returnFocus?.isConnected === true) returnFocus.focus();
+  }
+
+  readonly #markdownContextMenuKeydown = (event: KeyboardEvent): void => {
+    const menu = event.currentTarget;
+    if (!(menu instanceof HTMLElement)) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      this.#closeMarkdownContextMenu(true);
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const items = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    if (items.length === 0) return;
+    event.preventDefault();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (current + 1 + items.length) % items.length
+          : (current - 1 + items.length) % items.length;
+    items[next]?.focus();
+  };
+
+  async #copyMarkdownContextValue(kind: "selection" | "markdown"): Promise<void> {
+    const menu = this.#markdownContextMenu;
+    if (menu === undefined) return;
+    const copySelection = kind === "selection" || menu.selection !== "";
+    const value = copySelection ? menu.selection : menu.markdown;
+    const label = copySelection ? "Selection" : "Markdown";
+    this.#markdownContextMenu = undefined;
+    this.#markdownContextMenuReturnFocus = undefined;
+    this.requestUpdate();
+    const result = await copyChatText(value, globalThis.navigator?.clipboard);
+    this.#markdownContextMenuStatus = `${label}: ${copyActionLabel(result)}`;
+    this.requestUpdate();
+  }
+
   #renderCopyButton(key: string, text: string, accessibleLabel: string) {
     const result = this.#copyFeedback.get(key);
-    const glyph = result === "copied" ? "✓" : result === undefined ? "⧉" : "!";
+    const icon = result === "copied"
+      ? "check"
+      : result === undefined ? "copy" : "circle-exclamation";
     return html`
       <button
         class="copy-action"
@@ -2555,19 +3044,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-live="polite"
         ?disabled=${text === ""}
         @click=${() => void this.#copyText(key, text)}
-      ><span aria-hidden="true">${glyph}</span></button>
+      >${fontAwesomeIcon(icon)}</button>
     `;
   }
 
-  #toggleMessageDisclosure(itemId: string, defaultOpen: boolean): void {
+  #toggleMessageDisclosure(
+    itemId: string,
+    defaultOpen: boolean,
+    forcedOpen = false,
+  ): void {
+    if (forcedOpen) return;
     const open = this.#messageDisclosure.get(itemId) ?? defaultOpen;
     this.#messageDisclosure.set(itemId, !open);
-    this.#requestDisclosureUpdate();
-  }
-
-  #toggleRawAssistant(turn: number): void {
-    if (this.#rawAssistantTurns.has(turn)) this.#rawAssistantTurns.delete(turn);
-    else this.#rawAssistantTurns.add(turn);
     this.#requestDisclosureUpdate();
   }
 
@@ -2916,60 +3404,115 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   };
 
   #startQueueEdit(prompt: QueuedPrompt): void {
-    if (this.#queueBusy !== "" || this.#connectivityBlocked()) return;
+    if (
+      this.#queueBusy !== ""
+      || this.#requestPending
+      || this.#attachmentPending
+      || this.#connectivityBlocked()
+    ) return;
+    if (this.#queueEditId === prompt.id) {
+      this.#focusComposerNow();
+      return;
+    }
+    if (this.#queueEditId === "") {
+      this.#persistComposerDraftNow();
+      const currentDraft = this.#composerDraftSnapshot();
+      this.#queueEditReturnDraft = {
+        text: currentDraft.text,
+        cursor: currentDraft.cursor,
+        attachments: [...currentDraft.attachments],
+      };
+    }
+    this.#composerDraftRestoreGeneration += 1;
     this.#queueEditId = prompt.id;
-    this.#queueEditDraft = prompt.content;
+    this.#queueEditRetainedAttachments = [...(prompt.attachments ?? [])];
+    this.#composerDraft = prompt.content;
+    this.#composerCursor = prompt.content.length;
+    this.#pendingAttachments = [];
+    this.#completionSelected = 0;
+    this.#completionDismissed = true;
+    this.#restoreComposerSelection = true;
     this.#queueError = "";
+    this.#requestError = "";
     this.requestUpdate();
     void this.updateComplete.then(() => {
-      this.#focusQueueControlNow(prompt.id, "edit-input");
+      this.#focusComposerNow();
+      this.#resizeComposer();
     });
   }
 
   readonly #cancelQueueEdit = (): void => {
-    if (this.#queueBusy !== "") return;
-    const promptId = this.#queueEditId;
-    this.#queueEditId = "";
-    this.#queueEditDraft = "";
+    if (this.#queueBusy !== "" || this.#attachmentPending) return;
     this.#queueError = "";
-    this.requestUpdate();
-    void this.updateComplete.then(() => {
-      this.#focusQueueControlNow(promptId, "edit");
-    });
+    this.#restoreComposerAfterQueueEdit();
   };
 
-  async #saveQueued(event: SubmitEvent, prompt: QueuedPrompt): Promise<void> {
-    event.preventDefault();
+  #restoreComposerAfterQueueEdit(): void {
+    const draft = this.#queueEditReturnDraft
+      ?? this.#services.value?.composerDrafts.read(this.#composerDraftThreadId);
+    this.#queueEditId = "";
+    this.#queueEditRetainedAttachments = [];
+    this.#queueEditReturnDraft = undefined;
+    this.#composerDraft = draft?.text ?? "";
+    this.#composerCursor = draft?.cursor ?? 0;
+    this.#pendingAttachments = [...(draft?.attachments ?? [])];
+    this.#completionSelected = 0;
+    this.#completionDismissed = false;
+    this.#restoreComposerSelection = true;
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.#focusComposerNow();
+      this.#resizeComposer();
+    });
+  }
+
+  async #saveQueued(form: HTMLFormElement): Promise<void> {
     const services = this.#services.value;
     const store = this.#store.value;
-    const content = this.#queueEditDraft.trim();
+    const promptId = this.#queueEditId;
+    const textarea = form.elements.namedItem("message") as HTMLTextAreaElement | null;
+    const content = textarea?.value.trim() ?? "";
     if (
       services === undefined
       || store === undefined
       || this.threadId === ""
-      || content === ""
+      || promptId === ""
+      || (content === ""
+        && this.#queueEditRetainedAttachments.length === 0
+        && this.#pendingAttachments.length === 0)
       || this.#queueBusy !== ""
       || this.#connectivityBlocked()
     ) return;
     const threadId = this.threadId;
     const generation = this.#threadInteractionGeneration;
-    this.#queueBusy = prompt.id;
+    this.#queueBusy = promptId;
     this.#queueError = "";
     this.requestUpdate();
     let saved = false;
     try {
-      await services.protocol.updateQueuedPrompt(prompt.id, content);
+      await services.protocol.updateQueuedPrompt(promptId, {
+        content,
+        retained_attachment_ids: this.#queueEditRetainedAttachments.map(({ id }) => id),
+        attachments: this.#pendingAttachments.map(({ upload }) => upload),
+      });
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
-      const view = store.threadView(threadId);
-      store.replaceThreadQueue(
-        threadId,
-        view.queue.map((candidate) =>
-          candidate.id === prompt.id ? { ...candidate, content } : candidate,
-        ),
-      );
-      this.#queueEditId = "";
-      this.#queueEditDraft = "";
+      try {
+        store.replaceThreadQueue(threadId, await services.protocol.listQueue(threadId));
+      } catch {
+        const retained = [...this.#queueEditRetainedAttachments];
+        const view = store.threadView(threadId);
+        store.replaceThreadQueue(
+          threadId,
+          view.queue.map((candidate) =>
+            candidate.id === promptId
+              ? { ...candidate, content, attachments: retained }
+              : candidate,
+          ),
+        );
+      }
+      if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
       saved = true;
+      this.#restoreComposerAfterQueueEdit();
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
         this.#queueError = "Queued prompt could not be updated. Your edit is still available.";
@@ -2979,7 +3522,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.#queueBusy = "";
         this.requestUpdate();
         await this.updateComplete;
-        this.#focusQueueControlNow(prompt.id, saved ? "edit" : "edit-input");
+        if (!saved) this.#focusComposerNow();
       }
     }
   }
@@ -3001,6 +3544,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#queueError = "";
     this.requestUpdate();
     let deleted = false;
+    const wasEditing = this.#queueEditId === promptId;
     try {
       await services.protocol.deleteQueuedPrompt(promptId);
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
@@ -3009,10 +3553,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         threadId,
         latest.filter((prompt) => prompt.id !== promptId),
       );
-      if (this.#queueEditId === promptId) {
-        this.#queueEditId = "";
-        this.#queueEditDraft = "";
-      }
+      if (wasEditing) this.#restoreComposerAfterQueueEdit();
       deleted = true;
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
@@ -3025,6 +3566,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         await this.updateComplete;
         if (!deleted) {
           this.#focusQueueControlNow(promptId, "delete");
+        } else if (wasEditing) {
+          this.#focusComposerNow();
         } else if (focusAfterDelete.kind === "prompt") {
           this.#focusQueueControlNow(focusAfterDelete.promptId, "edit");
         } else {
@@ -3270,6 +3813,98 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.querySelector<HTMLTextAreaElement>('textarea[name="message"]')?.focus();
   }
 
+  #draftThreadIdForCurrentScope(): string {
+    if (this.sessionId === "" || this.threadId === "") return "";
+    return this.#store.value?.thread(this.threadId)?.session_id === this.sessionId
+      ? this.threadId
+      : "";
+  }
+
+  #composerDraftSnapshot() {
+    return {
+      text: this.#composerDraft,
+      cursor: this.#composerCursor,
+      attachments: this.#pendingAttachments,
+    } as const;
+  }
+
+  #stageCurrentComposerDraft(): void {
+    if (this.#queueEditId !== "") return;
+    const drafts = this.#services.value?.composerDrafts;
+    if (drafts === undefined || this.#composerDraftThreadId === "") return;
+    drafts.stage(this.#composerDraftThreadId, this.#composerDraftSnapshot());
+  }
+
+  #scheduleComposerDraftPersistence(): void {
+    if (this.#queueEditId !== "") return;
+    this.#stageCurrentComposerDraft();
+    if (this.#composerDraftThreadId === "") return;
+    if (this.#composerDraftPersistTimer !== undefined) {
+      clearTimeout(this.#composerDraftPersistTimer);
+    }
+    const threadId = this.#composerDraftThreadId;
+    this.#composerDraftPersistTimer = setTimeout(() => {
+      this.#composerDraftPersistTimer = undefined;
+      if (this.#composerDraftThreadId === threadId) {
+        void this.#services.value?.composerDrafts.persist(threadId);
+      }
+    }, COMPOSER_DRAFT_PERSIST_DELAY_MS);
+  }
+
+  #persistComposerDraftNow(): void {
+    if (this.#composerDraftPersistTimer !== undefined) {
+      clearTimeout(this.#composerDraftPersistTimer);
+      this.#composerDraftPersistTimer = undefined;
+    }
+    if (this.#queueEditId !== "") return;
+    const drafts = this.#services.value?.composerDrafts;
+    const threadId = this.#composerDraftThreadId;
+    if (drafts === undefined || threadId === "") return;
+    drafts.stage(threadId, this.#composerDraftSnapshot());
+    void drafts.persist(threadId);
+  }
+
+  readonly #persistComposerDraftFromPageHide = (): void => {
+    this.#persistComposerDraftNow();
+  };
+
+  #restoreComposerDraft(threadId: string): void {
+    if (this.#composerDraftPersistTimer !== undefined) {
+      clearTimeout(this.#composerDraftPersistTimer);
+      this.#composerDraftPersistTimer = undefined;
+    }
+    const generation = ++this.#composerDraftRestoreGeneration;
+    const drafts = this.#services.value?.composerDrafts;
+    if (drafts === undefined) {
+      this.#composerDraftThreadId = "";
+      this.#composerDraft = "";
+      this.#composerCursor = 0;
+      this.#pendingAttachments = [];
+      return;
+    }
+
+    this.#composerDraftThreadId = threadId;
+    const draft = drafts.read(threadId);
+    this.#composerDraft = draft.text;
+    this.#composerCursor = draft.cursor;
+    this.#pendingAttachments = [...draft.attachments];
+    this.#restoreComposerSelection = threadId !== "";
+    if (threadId === "") return;
+
+    void drafts.hydrate(threadId).then((hydrated) => {
+      if (
+        generation !== this.#composerDraftRestoreGeneration
+        || threadId !== this.#draftThreadIdForCurrentScope()
+        || this.#queueEditId !== ""
+      ) return;
+      this.#composerDraft = hydrated.text;
+      this.#composerCursor = hydrated.cursor;
+      this.#pendingAttachments = [...hydrated.attachments];
+      this.#restoreComposerSelection = true;
+      this.requestUpdate();
+    });
+  }
+
   #connectivityBlocked(): boolean {
     const store = this.#store.value;
     return store !== undefined
@@ -3322,6 +3957,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     event.preventDefault();
     const services = this.#services.value;
     const form = event.currentTarget as HTMLFormElement;
+    if (this.#queueEditId !== "") {
+      await this.#saveQueued(form);
+      return;
+    }
     const textarea = form.elements.namedItem("message") as HTMLTextAreaElement | null;
     const content = textarea?.value.trim() ?? "";
     if (
@@ -3348,6 +3987,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ? {}
           : { attachments: this.#pendingAttachments.map(({ upload }) => upload) }),
       });
+      await services.composerDrafts.clear(threadId);
       if (
         requestGeneration !== this.#turnRequestGeneration
         || threadId !== this.threadId
@@ -3483,19 +4123,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #stageNativeAttachment(attachment: PendingAttachment): boolean {
-    if (this.#pendingAttachments.length >= MAX_PENDING_ATTACHMENTS) {
+    if (this.#composerAttachmentCount() >= MAX_PENDING_ATTACHMENTS) {
       this.#requestError = `Attach at most ${MAX_PENDING_ATTACHMENTS} files at once.`;
       return false;
     }
-    const total = this.#pendingAttachments.reduce(
-      (bytes, pending) => bytes + pending.size,
-      attachment.size,
-    );
+    const total = this.#composerAttachmentBytes() + attachment.size;
     if (total > MAX_PENDING_ATTACHMENT_BYTES) {
       this.#requestError = "Pending attachments exceed the 20 MB mobile memory budget.";
       return false;
     }
     this.#pendingAttachments = [...this.#pendingAttachments, attachment];
+    this.#scheduleComposerDraftPersistence();
     return true;
   }
 
@@ -3508,7 +4146,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       for (const [index, file] of files.entries()) {
-        if (this.#pendingAttachments.length >= MAX_PENDING_ATTACHMENTS) {
+        if (this.#composerAttachmentCount() >= MAX_PENDING_ATTACHMENTS) {
           this.#requestError = `Attach at most ${MAX_PENDING_ATTACHMENTS} files at once.`;
           break;
         }
@@ -3531,15 +4169,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 : `${file.name || "Attachment"} could not be read.`;
           continue;
         }
-        const total = this.#pendingAttachments.reduce(
-          (bytes, pending) => bytes + pending.size,
-          attachment.size,
-        );
+        const total = this.#composerAttachmentBytes() + attachment.size;
         if (total > MAX_PENDING_ATTACHMENT_BYTES) {
           this.#requestError = "Pending attachments exceed the 20 MB mobile memory budget.";
           break;
         }
         this.#pendingAttachments = [...this.#pendingAttachments, attachment];
+        this.#scheduleComposerDraftPersistence();
       }
     } finally {
       if (generation === this.#attachmentGeneration && threadId === this.threadId) {
@@ -3553,7 +4189,31 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#pendingAttachments = this.#pendingAttachments.filter(
       (_, candidate) => candidate !== index,
     );
+    this.#scheduleComposerDraftPersistence();
     this.requestUpdate();
+  }
+
+  #removeRetainedQueueAttachment(index: number): void {
+    if (
+      this.#queueEditId === ""
+      || this.#queueBusy !== ""
+      || this.#attachmentPending
+    ) return;
+    this.#queueEditRetainedAttachments = this.#queueEditRetainedAttachments.filter(
+      (_, candidate) => candidate !== index,
+    );
+    this.requestUpdate();
+  }
+
+  #composerAttachmentCount(): number {
+    return this.#queueEditRetainedAttachments.length + this.#pendingAttachments.length;
+  }
+
+  #composerAttachmentBytes(): number {
+    return this.#queueEditRetainedAttachments.reduce(
+      (bytes, attachment) => bytes + attachment.size_bytes,
+      this.#pendingAttachments.reduce((bytes, attachment) => bytes + attachment.size, 0),
+    );
   }
 
   #formatBytes(bytes: number): string {
@@ -3573,6 +4233,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#completionDismissed = false;
       this.#loadMentionPathsIfNeeded();
     }
+    this.#scheduleComposerDraftPersistence();
     if (!composing) this.requestUpdate();
   };
 
@@ -3583,6 +4244,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#composerCursor = this.#composerDraft.length;
     this.#completionSelected = 0;
     this.#completionDismissed = false;
+    this.#scheduleComposerDraftPersistence();
     this.requestUpdate();
     void this.updateComplete.then(() => {
       const textarea = this.querySelector<HTMLTextAreaElement>('textarea[name="message"]');
@@ -3610,6 +4272,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#composerDraft = textarea.value;
     this.#composerCursor = cursor;
     this.#completionSelected = 0;
+    this.#scheduleComposerDraftPersistence();
     if (this.#composerComposing) return;
     this.#loadMentionPathsIfNeeded();
     this.requestUpdate();
@@ -3629,6 +4292,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#completionDismissed = false;
     this.#resizeComposer(textarea);
     this.#loadMentionPathsIfNeeded();
+    this.#scheduleComposerDraftPersistence();
     this.requestUpdate();
   };
 
@@ -3711,6 +4375,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#composerCursor = applied.cursor;
     this.#completionSelected = 0;
     this.#completionDismissed = false;
+    this.#scheduleComposerDraftPersistence();
     this.requestUpdate();
     void this.updateComplete.then(() => {
       const textarea = this.querySelector<HTMLTextAreaElement>('textarea[name="message"]');
@@ -3768,6 +4433,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         return;
       }
+    }
+    if (event.key === "Escape" && this.#queueEditId !== "") {
+      event.preventDefault();
+      this.#cancelQueueEdit();
+      return;
     }
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();

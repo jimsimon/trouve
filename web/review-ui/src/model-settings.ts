@@ -98,6 +98,7 @@ export function thinkingLevelLabel(value: string): string {
     high: "High",
     xhigh: "Extra High",
     max: "Max",
+    ultra: "Ultra",
   };
   return labels[value] ?? value;
 }

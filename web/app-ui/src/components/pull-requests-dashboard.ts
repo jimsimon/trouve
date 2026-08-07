@@ -16,6 +16,7 @@ import {
   type PullRequestPill,
   type PullRequestRow,
 } from "./pull-requests-dashboard-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import { safeSessionPrHref } from "./session-pr-panel-model.js";
 import "./code-review-dashboard.js";
 
@@ -546,8 +547,8 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                   class="control"
                   type="button"
                   @click=${() => this.#selectView("pull-requests")}
-                >← Pull requests</button>`}
-            <button class="control" type="button" @click=${this.#close}>✕ Close</button>
+                >${fontAwesomeIcon("arrow-left")} Pull requests</button>`}
+            <button class="control" type="button" @click=${this.#close}>${fontAwesomeIcon("xmark")} Close</button>
           </div>
         </header>
 
@@ -635,8 +636,10 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
             aria-expanded=${!group.collapsed}
             @click=${() => this.#toggleGroup(group.key)}
           >
-            <span class="chevron" aria-hidden="true">${group.collapsed ? "▸" : "▾"}</span>
-            <span class="group-icon ${group.tone}" aria-hidden="true">${group.icon}</span>
+            ${fontAwesomeIcon(group.collapsed ? "caret-right" : "caret-down", {
+              className: "chevron",
+            })}
+            ${fontAwesomeIcon(group.icon, { className: `group-icon ${group.tone}` })}
             <span class="group-copy">
               <strong>${group.title}</strong>
               <small>${group.description}</small>
@@ -653,20 +656,20 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
             @dragstart=${(event: DragEvent) => this.#dragStart(event, group.key)}
             @dragend=${this.#finishDrag}
             @keydown=${(event: KeyboardEvent) => this.#groupKeyDown(event, group)}
-          >⠿</button>
+          >${fontAwesomeIcon("grip-vertical")}</button>
           <span class="touch-group-order" role="group" aria-label=${`Reorder ${group.title}`}>
             <button
               type="button"
               aria-label=${`Move ${group.title} up`}
               ?disabled=${group.position === 0}
               @click=${() => this.#moveGroup(group, -1)}
-            >↑</button>
+            >${fontAwesomeIcon("arrow-up")}</button>
             <button
               type="button"
               aria-label=${`Move ${group.title} down`}
               ?disabled=${group.position === group.groupCount - 1}
               @click=${() => this.#moveGroup(group, 1)}
-            >↓</button>
+            >${fontAwesomeIcon("arrow-down")}</button>
           </span>
         </header>
         ${group.collapsed
@@ -694,7 +697,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
           </div>
           <div class="pr-meta">
             <span class="branch" title=${row.branch}>${row.branch}</span>
-            <span class="metadata">💬 ${row.commentsLabel}</span>
+            <span class="metadata">${fontAwesomeIcon("comments")} ${row.commentsLabel}</span>
             <span class="metadata">· ${row.lastComment}</span>
           </div>
           ${row.reviewSummary === "" && row.reviewFindings.length === 0
@@ -733,21 +736,23 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
               ? "Open the chat this pull request came from"
               : "Start a new chat for this pull request"}
             @click=${() => this.#chat(row)}
-          >${row.hasChat ? "💬" : "＋💬"}</button>
+          >${row.hasChat
+            ? fontAwesomeIcon("comments")
+            : html`${fontAwesomeIcon("plus")}${fontAwesomeIcon("comments")}`}</button>
           <button
             class="icon-button"
             type="button"
             ?disabled=${safeUrl === undefined}
             aria-label="Copy pull request URL"
             @click=${() => void this.#copyUrl(row, safeUrl)}
-          >${copied ? "✓" : "⧉"}</button>
+          >${fontAwesomeIcon(copied ? "check" : "copy")}</button>
           <button
             class="icon-button"
             type="button"
             ?disabled=${safeUrl === undefined}
             aria-label="Open the pull request in your browser"
             @click=${() => this.#openExternal(safeUrl)}
-          >↗</button>
+          >${fontAwesomeIcon("arrow-up-right-from-square")}</button>
         </div>
       </article>
     `;

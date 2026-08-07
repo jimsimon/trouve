@@ -79,8 +79,8 @@ describe("Slint-equivalent tool presentation", () => {
       subject: "Port tool cards",
       meta: "1/2",
       todos: [
-        { status: "completed", glyph: "✓", content: "Audit" },
-        { status: "in_progress", glyph: "▸", content: "Port tool cards" },
+        { status: "completed", icon: "check", content: "Audit" },
+        { status: "in_progress", icon: "play", content: "Port tool cards" },
       ],
     });
   });

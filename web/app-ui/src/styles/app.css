@@ -15,6 +15,8 @@ button, textarea, input, select { font: inherit; }
 button { color: inherit; }
 button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
 button:disabled, textarea:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
+.trouve-icon-spin { animation: trouve-font-awesome-spin 900ms linear infinite; }
+@keyframes trouve-font-awesome-spin { to { transform: rotate(360deg); } }
 
 .app-shell {
   display: grid;
@@ -188,9 +190,7 @@ trouve-session-list { display: block; }
 .status-dot.failed { background: var(--trouve-err); }
 .status-dot.done { background: var(--trouve-text-faint); }
 .session-pr-badge { width: 26px; height: 30px; display: grid; place-items: center; margin: 0 auto; color: var(--trouve-text-mid); }
-.session-pr-badge svg { width: 18px; height: 18px; overflow: visible; }
-.session-pr-badge circle { fill: currentColor; }
-.session-pr-badge path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.session-pr-badge .trouve-icon { --trouve-icon-width: 18px; font-size: 18px; }
 .session-pr-badge.ready { color: var(--trouve-ok); }
 .session-pr-badge.blocked { color: var(--trouve-warn); }
 .session-pr-badge.merged { color: var(--trouve-merged); }
@@ -207,6 +207,7 @@ trouve-session-list { display: block; }
 .thread-tabs button[aria-selected="true"] .thread-todo-progress { background: var(--trouve-accent-dim); }
 .inspection-tabs { height: 38px; display: flex; align-items: end; gap: 2px; padding: 0 8px; }
 .inspection-tabs button, .thread-options button { border: 0; padding: 8px 10px 7px; color: var(--trouve-text-dim); background: transparent; }
+.inspection-tabs button { display: inline-flex; align-items: center; gap: 5px; }
 .inspection-tabs [aria-selected="true"] { color: var(--trouve-text-hi); border-bottom: 2px solid var(--trouve-accent); }
 .inspection-todo-switch { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; padding: 4px 8px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-raised-bg); }
 .inspection-todo-switch button { min-height: 26px; display: inline-flex; align-items: center; gap: 7px; border: 0; border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); }
@@ -282,12 +283,10 @@ trouve-session-list { display: block; }
 .agent-header-spacer { min-width: 0; flex: 1; }
 .agent-collapsed-preview, .message-collapsed-preview { min-width: 0; flex: 1 !important; overflow: hidden; color: var(--trouve-text-dim) !important; text-overflow: ellipsis; white-space: nowrap; }
 .agent-collapsed-preview { min-width: 4ch; }
-.disclosure-icon { width: 10px; flex: none; color: var(--trouve-text-faint); text-align: center; }
-.message-actions { display: flex; flex: none; align-items: center; gap: 4px; }
-.message-actions button, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button, .tool-copy-action button, .tool-raw-action button { min-width: 20px; min-height: 20px; border: 0; border-radius: var(--trouve-radius-sm); padding: 1px 5px; color: var(--trouve-text-dim); background: transparent; font-size: 12px; white-space: nowrap; }
-.message-actions button:hover, .thinking-header > .copy-action:hover, .tool-copy-action button:hover, .tool-raw-action button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
-.message-actions button[aria-pressed="false"]:first-child { color: var(--trouve-accent); background: var(--trouve-accent-bg); }
-.message-actions button[aria-pressed="true"]:first-child { color: var(--trouve-text-disabled); background: transparent; }
+.disclosure-icon { --trouve-icon-width: 10px; width: 10px; flex: none; color: var(--trouve-text-faint); text-align: center; }
+.agent-copy-action > .copy-action, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button, .tool-copy-action button, .tool-raw-action button { min-width: 20px; min-height: 20px; border: 0; border-radius: var(--trouve-radius-sm); padding: 1px 5px; color: var(--trouve-text-dim); background: transparent; font-size: 12px; white-space: nowrap; }
+.agent-copy-action > .copy-action:hover, .thinking-header > .copy-action:hover, .tool-copy-action button:hover, .tool-raw-action button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.agent-copy-action { display: inline-flex; flex: none; }
 .turn-card .message-body { min-width: 0; max-width: 100%; padding: 6px 10px; border: 1px solid; border-top: 0; border-radius: 0 0 var(--trouve-radius) var(--trouve-radius); background: transparent; }
 .turn-card .message-body > p { white-space: pre-wrap; }
 .user-message .message-header { border-color: var(--trouve-user-border); background: var(--trouve-user-bg); }
@@ -295,34 +294,68 @@ trouve-session-list { display: block; }
 .assistant-message .message-header { border-color: var(--trouve-agent-border); background: var(--trouve-agent-bg); }
 .assistant-message .message-body { border-color: var(--trouve-agent-border); }
 .assistant-message trouve-markdown-view, .user-message trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
-.assistant-raw { min-width: 0; max-width: 100%; margin: 0; overflow-x: hidden; overflow-y: auto; color: var(--trouve-code-fg); background: transparent; font: 11px/1.5 var(--trouve-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .turn-body-stream { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .turn-card .turn-body-stream { padding: 8px 16px 10px; }
 .turn-body-stream > * { min-width: 0; max-width: 100%; }
-.agent-text-block { min-width: 0; margin: 0; }
-.turn-body-stream > .assistant-raw { padding-inline: 10px; }
+.agent-text-block { width: 100%; min-width: 0; max-inline-size: 120ch; margin: 0; }
+.user-body-stream > trouve-markdown-view { width: 100%; max-inline-size: 120ch; }
 .user-body-stream > .attachment-list { margin: 0 10px; }
 .agent-body-stream > .message { width: 100%; margin: 0; }
 .agent-body-stream > .question-card { margin-inline-start: 0; }
-.activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
-.activity-group > summary { min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); color: var(--trouve-text-mid); background: var(--trouve-surface); cursor: pointer; list-style: none; }
+.agent-activity-timeline { position: relative; min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; padding-inline-start: 20px; }
+.agent-activity-timeline::before { position: absolute; inset-block: 15px; inset-inline-start: 7px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
+.agent-activity-timeline.single-activity::before { inset-block: 6px; }
+.agent-activity-timeline.has-expanded-group::before { display: none; }
+.agent-activity-timeline > .activity-group, .agent-activity-timeline > .tool-card, .agent-activity-timeline > .thinking-card, .agent-activity-timeline > .thinking-output { width: 100%; margin: 0; }
+.agent-activity-timeline + .agent-text-block { margin-block-start: 6px; }
+.agent-text-block + .agent-activity-timeline { margin-block-start: 2px; }
+.activity-group, .tool-card, .thinking-card, .thinking-output { position: relative; isolation: isolate; }
+.agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before, .agent-activity-timeline > .thinking-card::before, .agent-activity-timeline > .thinking-output::before { position: absolute; z-index: 2; inset-block-start: 12px; inset-inline-start: -17px; width: var(--trouve-chat-timeline-node-size); height: var(--trouve-chat-timeline-node-size); border-radius: 50%; background: var(--trouve-text-faint); box-shadow: 0 0 0 3px var(--trouve-win-bg); content: ""; pointer-events: none; transition: background-color 120ms ease, transform 120ms ease; }
+.agent-activity-timeline > .activity-group::before { display: none; }
+.agent-activity-timeline > .activity-group.active::before, .agent-activity-timeline > .activity-group[open]::before, .agent-activity-timeline > .tool-card.tool-running::before, .agent-activity-timeline > .thinking-card.running::before, .agent-activity-timeline > .thinking-output.running::before, .agent-activity-timeline > .activity-group:hover::before, .agent-activity-timeline > .activity-group:focus-within::before, .agent-activity-timeline > .tool-card:hover::before, .agent-activity-timeline > .tool-card:focus-within::before, .agent-activity-timeline > .thinking-card:hover::before, .agent-activity-timeline > .thinking-card:focus-within::before, .agent-activity-timeline > .thinking-output:hover::before, .agent-activity-timeline > .thinking-output:focus-within::before { background: var(--trouve-accent); transform: scale(1.15); }
+.agent-activity-timeline > .activity-group.warning::before, .agent-activity-timeline > .tool-card.tool-awaiting-approval::before { background: var(--trouve-warn); }
+.agent-activity-timeline > .activity-group.error::before, .agent-activity-timeline > .tool-card.tool-error::before, .agent-activity-timeline > .tool-card.tool-denied::before, .agent-activity-timeline > .tool-card.tool-aborted::before { background: var(--trouve-err); }
+.activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: visible; border: 0; border-radius: 0; background: transparent; }
+.activity-group > summary { position: relative; min-width: 0; min-height: 31px; display: flex; align-items: center; gap: 7px; overflow: visible; padding: 3px 8px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-mid); background: transparent; cursor: pointer; list-style: none; }
+.agent-activity-timeline > .activity-group > summary .disclosure-icon { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -18px; transform: translateY(-50%); }
+.activity-group > summary:hover { background: var(--trouve-hover-bg); }
+.agent-activity-timeline.has-expanded-group > .activity-group > summary { background: var(--trouve-hover-bg); }
 .activity-group > summary::-webkit-details-marker { display: none; }
-.activity-group > summary strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 0 8px 8px 16px; border: 0; background: transparent; }
-.activity-group-body > .message { margin: 8px 0 0; }
+.activity-group > summary strong { min-width: 0; overflow: hidden; color: var(--trouve-text-mid); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.activity-group[open] > summary strong, .activity-group.active > summary strong { color: var(--trouve-text-hi); }
+.activity-group[open] > summary .disclosure-icon, .activity-group.active > summary .disclosure-icon { color: var(--trouve-accent); }
+.activity-group:hover > summary .disclosure-icon, .activity-group:focus-within > summary .disclosure-icon { color: var(--trouve-accent); }
+.activity-group.warning > summary .disclosure-icon { color: var(--trouve-warn); }
+.activity-group.error > summary .disclosure-icon { color: var(--trouve-err); }
+.activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 3px 8px 6px 16px; border: 0; background: transparent; }
+.activity-group-body > .message { margin: 0; }
+.activity-group-body .tool-card, .activity-group-body .thinking-card { margin-top: 0; }
+.context-compaction-marker { position: relative; isolation: isolate; width: 100%; min-width: 0; max-width: 100%; min-height: 42px; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 10px; overflow: hidden; padding: 7px 10px; border-block: 1px solid var(--trouve-accent); color: var(--trouve-text-mid); background: linear-gradient(90deg, var(--trouve-accent-bg), transparent 72%); }
+.context-compaction-marker.running::before { position: absolute; z-index: -1; inset: 0; content: ""; background: linear-gradient(105deg, transparent 20%, var(--trouve-accent-bg) 44%, var(--trouve-hover-strong) 50%, var(--trouve-accent-bg) 56%, transparent 80%); background-size: 240% 100%; animation: trouve-compaction-flow 1.8s ease-in-out infinite; }
+.context-compaction-marker.failed { border-block-color: var(--trouve-warn); background: linear-gradient(90deg, var(--trouve-warn-bg), transparent 72%); }
+.context-compaction-symbol { width: 24px; height: 24px; display: grid; place-items: center; color: var(--trouve-accent); }
+.context-compaction-marker.failed .context-compaction-symbol { color: var(--trouve-warn); }
+.context-compaction-glyph { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 50%; font-size: 11px; font-weight: 800; }
+.context-compaction-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 9px; }
+.context-compaction-copy strong { flex: none; color: var(--trouve-text-hi); font-size: 11px; }
+.context-compaction-copy small { min-width: 0; color: var(--trouve-text-dim); font-size: 10px; overflow-wrap: anywhere; }
+@keyframes trouve-compaction-flow {
+  0%, 15% { background-position: 130% 0; opacity: .2; }
+  50% { opacity: .75; }
+  85%, 100% { background-position: -130% 0; opacity: .2; }
+}
 .message p { margin: 0; }
-.tool-card { min-width: 0; max-width: 100%; margin-top: 10px; overflow: hidden; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
-.tool-card summary { min-width: 0; max-width: 100%; min-height: 31px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; overflow: hidden; padding: 3px 10px; cursor: pointer; list-style: none; }
+.tool-card { min-width: 0; max-width: 100%; margin-top: 8px; overflow: hidden; border: 0; border-radius: 0; background: transparent; }
+.tool-card summary { min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: hidden; padding: 2px 8px; cursor: pointer; list-style: none; }
+.tool-card summary:hover { background: var(--trouve-hover-bg); }
 .tool-card.approval-required .tool-approval-actions { margin-inline-start: auto; }
 .tool-card summary::-webkit-details-marker { display: none; }
 .tool-card summary small { color: var(--trouve-text-dim); }
-.tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--trouve-text-mid); text-overflow: ellipsis; white-space: nowrap; }
 .tool-card pre { min-width: 0; max-width: 100%; margin: 0; padding: 10px; overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.5 var(--trouve-font-mono); overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
 .tool-disclosure { width: 10px; flex: none; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
 .tool-status { width: 12px; flex: none; align-self: center; color: var(--trouve-text-faint); font-size: 12px; line-height: 1; text-align: center; }
-.tool-status.running { height: 12px; color: var(--trouve-accent); animation: trouve-context-spin 900ms linear infinite; }
-.tool-running-spinner { width: 12px; height: 12px; display: block; overflow: visible; fill: none; stroke: currentColor; stroke-linecap: round; stroke-width: 3; }
-.tool-running-static { display: none; }
+.tool-status.running { height: 12px; color: var(--trouve-accent); }
 .tool-status.ok { color: var(--trouve-ok); }
 .tool-status.error, .tool-status.denied, .tool-status.aborted { color: var(--trouve-err); }
 .tool-status.awaiting-approval { color: var(--trouve-warn); }
@@ -333,7 +366,7 @@ trouve-session-list { display: block; }
 .tool-approval-actions button.primary { border-color: var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
 .tool-subject, .tool-meta { min-width: 0; color: var(--trouve-text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-subject { flex: 1 1 auto; }
-.tool-meta { flex: 0 1 auto; }
+.tool-meta { flex: 0 1 auto; font-variant-numeric: tabular-nums; }
 .tool-file-target { min-width: 0; max-width: min(44%, 320px); padding: 1px 3px; border: 0; background: transparent; color: var(--trouve-accent); font: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .tool-file-target:hover { color: var(--trouve-accent-hover); }
 .tool-file-target:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: 1px; }
@@ -354,12 +387,27 @@ trouve-session-list { display: block; }
 .tool-todo-list .todo-completed, .tool-todo-list .todo-cancelled { color: var(--trouve-text-dim); }
 .tool-todo-list .todo-in_progress { color: var(--trouve-accent); font-weight: 600; }
 .card-utility-actions { display: flex; justify-content: flex-end; padding: 4px 8px; border-top: 1px solid var(--trouve-rule); }
-.thinking-card { border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); color: var(--trouve-text-dim); background: var(--trouve-surface); }
+.thinking-card { overflow: hidden; border: 0; border-radius: 0; color: var(--trouve-text-dim); background: transparent; }
 .thinking-header { min-height: 31px; display: flex; align-items: center; gap: 6px; padding: 3px 9px; }
 .thinking-header .message-disclosure { color: var(--trouve-text-mid); }
 .thinking-header .message-disclosure strong { font-size: 11px; }
-.thinking-body { min-width: 0; max-width: 100%; padding: 6px 10px 8px; border-top: 1px solid var(--trouve-rule); }
+.thinking-body { min-width: 0; max-width: 100%; padding: 6px 10px 8px; border-top: 0; }
 .thinking-card trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
+.thinking-output { min-width: 0; max-width: 100%; border: 0; color: var(--trouve-text-dim); background: transparent; }
+.thinking-output .thinking-header { min-height: 27px; padding: 2px 8px; color: var(--trouve-text-dim); }
+.thinking-output .thinking-header > strong { font-size: 10px; font-weight: 600; }
+.thinking-header-spacer { min-width: 0; flex: 1; }
+.thinking-output .thinking-body { padding: 2px 8px 6px; border-top: 0; }
+.grouped-thinking-output .thinking-header { padding-inline: 8px; }
+.grouped-thinking-output .thinking-body { padding: 2px 8px 8px; }
+.thinking-output trouve-markdown-view { width: 100%; min-width: 0; max-width: 120ch; display: block; }
+.message-context-menu { position: fixed; z-index: 64; width: 220px; max-width: calc(100vw - 16px); display: grid; gap: 2px; padding: 4px; border: 1px solid var(--trouve-border-strong); border-radius: 6px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
+.message-context-menu button { width: 100%; min-height: 30px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 7px; border: 0; border-radius: 4px; padding: 4px 8px; color: var(--trouve-text); background: transparent; font-size: 12px; text-align: start; }
+.message-context-menu button:hover, .message-context-menu button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); outline: none; }
+@media (hover: hover) and (pointer: fine) {
+  .agent-copy-action, .thinking-header > .copy-action, .tool-raw-action, .tool-copy-action { opacity: 0; transition: opacity 100ms ease; }
+  .assistant-message:hover > .agent-header > .agent-copy-action, .assistant-message:focus-within > .agent-header > .agent-copy-action, .thinking-card:hover .thinking-header > .copy-action, .thinking-card:focus-within .thinking-header > .copy-action, .thinking-output:hover .thinking-header > .copy-action, .thinking-output:focus-within .thinking-header > .copy-action, .tool-card:hover > summary > .tool-raw-action, .tool-card:focus-within > summary > .tool-raw-action, .tool-card:hover > summary > .tool-copy-action, .tool-card:focus-within > summary > .tool-copy-action { opacity: 1; }
+}
 .card-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 8px 10px; border-top: 1px solid var(--trouve-rule); }
 .card-actions button, .screen-empty button { min-height: 30px; padding: 4px 10px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
 .card-actions button.primary { border-color: var(--trouve-accent); background: var(--trouve-accent); color: var(--trouve-accent-fg, white); }
@@ -405,9 +453,12 @@ trouve-session-list { display: block; }
 }
 [data-reduce-motion] .activity-dots i { animation: none; opacity: .7; translate: none; }
 [data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }
-[data-reduce-motion] .tool-status.running { color: var(--trouve-text-dim); animation: none; }
-[data-reduce-motion] .tool-running-spinner { display: none; }
-[data-reduce-motion] .tool-running-static { display: inline; }
+[data-reduce-motion] .tool-status.running { color: var(--trouve-text-dim); }
+[data-reduce-motion] .trouve-icon-spin { animation: none; }
+[data-reduce-motion] .context-compaction-marker.running::before { animation: none; opacity: .25; }
+@media (prefers-reduced-motion: reduce) {
+  .context-compaction-marker.running::before, .trouve-icon-spin { animation: none; }
+}
 .turn-error { min-width: 0; max-width: 100%; padding: 9px 11px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); color: var(--trouve-err); background: var(--trouve-err-bg); overflow-wrap: anywhere; }
 .turn-cancelled { min-width: 0; max-width: 100%; padding: 8px 10px; border-left: 2px solid var(--trouve-text-faint); overflow-wrap: anywhere; }
 .turn-cancelled strong { color: var(--trouve-text-mid); }
@@ -415,7 +466,7 @@ trouve-session-list { display: block; }
 .attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
 .attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }
 .attachment-list img { width: 64px; height: 48px; border-radius: 3px; object-fit: cover; background: var(--trouve-code-bg); }
-.attachment-icon { width: 26px; color: var(--trouve-text-faint); font-size: 17px; text-align: center; }
+.attachment-icon { width: 64px; height: 48px; display: grid; place-items: center; border-radius: 3px; color: var(--trouve-text-faint); background: var(--trouve-code-bg); font-size: 17px; text-align: center; }
 .attachment-details { min-width: 0; display: grid; gap: 2px; }
 .attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-details strong { color: var(--trouve-text-mid); }
@@ -433,11 +484,16 @@ trouve-session-list { display: block; }
 .composer-completion-status.completion-error { display: flex; align-items: center; gap: 8px; color: var(--trouve-err); }
 .composer-completion-status.completion-error span { flex: 1; }
 .composer-completion-status.completion-error button { min-height: 26px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
-.pending-attachments { display: flex; flex-wrap: wrap; gap: 5px; margin: 0; padding: 0 0 6px; list-style: none; }
-.pending-attachments li { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 3px 4px 3px 7px; border: 1px solid var(--trouve-border); border-radius: 999px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); font-size: 10px; }
-.pending-attachments li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pending-attachments li small { flex: none; color: var(--trouve-text-dim); }
-.pending-attachments li button { flex: none; width: 22px; height: 22px; border: 0; border-radius: 50%; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.queue-edit-indicator { min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0 0 6px; }
+.queue-edit-indicator > span { min-width: 0; display: inline-flex; align-items: center; gap: 5px; overflow: hidden; border: 1px solid var(--trouve-accent); border-radius: 999px; padding: 3px 8px; color: var(--trouve-accent-tint); background: var(--trouve-accent-bg); font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.queue-edit-indicator button { width: 24px; height: 24px; display: grid; flex: none; place-items: center; border: 0; border-radius: 50%; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.queue-edit-indicator button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.queue-edit-indicator button:disabled { color: var(--trouve-text-disabled); }
+.pending-attachments { margin: 0; padding: 0 0 6px; }
+.pending-attachments li { grid-template-columns: auto minmax(0, 1fr) auto; }
+.pending-attachments li button { width: 24px; height: 24px; flex: none; border: 0; border-radius: 50%; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.pending-attachments li button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.pending-attachments li button:disabled { color: var(--trouve-text-disabled); }
 .composer-entry { display: grid; grid-template-columns: minmax(0, 1fr) 76px; align-items: end; gap: 8px; }
 .composer textarea { display: block; width: 100%; min-height: 34px; max-height: 162px; resize: none; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 7px 8px; color: var(--trouve-text); background: var(--trouve-surface); line-height: 18px; outline: none; }
 .composer textarea:focus-visible { border-color: var(--trouve-selection); outline: none; }
@@ -456,11 +512,11 @@ trouve-session-list { display: block; }
 .model-option select { width: 210px; }
 .model-option trouve-model-picker { width: 210px; }
 .model-picker { position: relative; display: block; width: 100%; }
+.model-picker.open { z-index: 20; }
 .model-picker-trigger { width: 100%; height: 30px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); text-align: start; }
 .model-picker-trigger > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-picker-popup { position: absolute; z-index: 8; inset-inline-start: 0; width: min(480px, calc(100vw - 32px)); display: grid; grid-template-rows: auto minmax(0, 280px); gap: 4px; padding: 5px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
-.placement-up .model-picker-popup { inset-block-end: calc(100% + 7px); }
-.placement-down .model-picker-popup { inset-block-start: calc(100% + 4px); }
+.model-picker-popup { position: fixed; z-index: 32; inset: auto; width: min(480px, calc(100vw - 32px)); max-height: min(326px, calc(100dvh - 32px)); display: grid; grid-template-rows: auto minmax(0, 280px); gap: 4px; overflow: hidden; margin: 0; padding: 5px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
+.model-picker-popup::backdrop { background: transparent; }
 .model-picker-popup > input { width: 100%; height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
 .model-picker-options { display: block; min-height: 28px; overflow: auto; }
 .model-picker-options > button { width: 100%; min-height: 28px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 202px); align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text); background: transparent; text-align: start; }
@@ -509,9 +565,8 @@ trouve-session-list { display: block; }
 .context-dial-track { stroke: var(--trouve-border-strong); }
 .context-dial-value { stroke: var(--trouve-accent); stroke-linecap: round; transition: stroke-dasharray 160ms ease; }
 .context-dial-glyph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-warn); font-size: 10px; font-weight: 800; }
-.context-dial-glyph.compacting { color: var(--trouve-accent); animation: trouve-context-spin 900ms linear infinite; }
+.context-dial-glyph.compacting { color: var(--trouve-accent); }
 .composer-session-usage { min-height: 30px; display: inline-flex; align-items: center; flex: none; color: var(--trouve-text-faint); white-space: nowrap; }
-@keyframes trouve-context-spin { to { rotate: 360deg; } }
 .inline-error { overflow: hidden; color: var(--trouve-err); text-overflow: ellipsis; white-space: nowrap; }
 .inline-warning { overflow: hidden; color: var(--trouve-warn); text-overflow: ellipsis; white-space: nowrap; }
 .queue-panel { min-width: 0; max-height: min(36vh, 330px); margin: 8px 10px 0; overflow-x: hidden; overflow-y: auto; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 8px; background: var(--trouve-surface); }
@@ -538,9 +593,6 @@ trouve-session-list { display: block; }
 .queue-actions button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
 .queue-actions button.primary { min-width: 52px; border: 1px solid var(--trouve-accent); color: var(--trouve-accent-fg, white); background: var(--trouve-accent); }
 .queue-actions .danger { color: var(--trouve-err); }
-.queue-edit { min-width: 0; display: grid; gap: 4px; padding: 2px 0 5px 20px; }
-.queue-edit textarea { width: 100%; resize: vertical; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 6px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
-.queue-edit .queue-actions { justify-content: flex-end; }
 .queue-error { min-width: 0; margin: 4px 0 0; padding: 4px 2px; color: var(--trouve-err); font-size: 11px; overflow-wrap: anywhere; }
 .inspection-tabs { border-bottom: 1px solid var(--trouve-border); }
 .diff-card header { display: flex; gap: 10px; align-items: center; padding: 10px; border-bottom: 1px solid var(--trouve-rule); }
@@ -894,19 +946,16 @@ trouve-command-palette { display: contents; }
 .command-palette-results { max-height: min(520px, calc(100dvh - 160px)); overflow: auto; padding: 5px; }
 .command-palette-group + .command-palette-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--trouve-rule); }
 .command-palette-group h2 { margin: 0; padding: 5px 8px 3px; color: var(--trouve-text-faint); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.command-palette-option { width: 100%; min-height: 42px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 5px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
+.command-palette-option { width: 100%; min-height: 42px; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 5px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
 .command-palette-option:hover { background: var(--trouve-hover-bg); }
 .command-palette-option[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
-.command-palette-icon { width: 24px; color: var(--trouve-text-mid); font: 14px/1 var(--trouve-font-mono); text-align: center; }
-.command-palette-icon .status-dot { display: block; }
+.command-palette-icon { width: 26px; color: var(--trouve-text-mid); font: 14px/1 var(--trouve-font-mono); text-align: center; }
+.command-palette-icon .session-indicator { font-family: var(--trouve-font-sans); }
 .command-palette-copy { min-width: 0; }
 .command-palette-copy strong, .command-palette-copy small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-palette-copy strong { color: inherit; font-size: 12px; font-weight: 600; }
 .command-palette-copy small { margin-top: 1px; color: var(--trouve-text-dim); font-size: 10px; }
-.command-palette-state { padding: 2px 6px; border-radius: 999px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; white-space: nowrap; }
-.command-palette-state.running { color: var(--trouve-ok); }
-.command-palette-state.attention { color: var(--trouve-warn); }
-.command-palette-state.failed { color: var(--trouve-err); }
+.command-palette-current { padding: 2px 6px; border-radius: 999px; color: var(--trouve-ok); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 700; white-space: nowrap; }
 .command-palette-empty { min-height: 150px; display: grid; justify-items: center; align-content: center; gap: 4px; padding: 20px; color: var(--trouve-text-dim); text-align: center; }
 .command-palette-empty strong { color: var(--trouve-text-hi); }
 .command-palette-footer { min-height: 31px; display: flex; align-items: center; gap: 12px; padding: 5px 10px; border-top: 1px solid var(--trouve-border); color: var(--trouve-text-faint); background: var(--trouve-raised-bg); font-size: 9px; }
@@ -970,7 +1019,7 @@ trouve-command-palette { display: contents; }
   .composer-completions { width: calc(100% + 2px); max-height: min(260px, 38dvh); }
   .composer-completion-option { min-height: 42px; }
   .attachment-button { min-height: 38px; }
-  .message-actions button, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button { min-height: 36px; }
+  .agent-copy-action > .copy-action, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button { min-height: 36px; }
   .attachment-list li { width: 100%; max-width: none; }
   .pending-attachments li button { width: 34px; height: 34px; }
   .queue-panel { margin-inline: 8px; max-height: min(42vh, 310px); }
@@ -1013,11 +1062,9 @@ trouve-command-palette { display: contents; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
-  .activity-dots i, .tool-status.running { animation: none !important; }
+  .activity-dots i, .trouve-icon-spin { animation: none !important; }
   .session-indicator.busy::before { animation: none !important; opacity: 1; }
   .tool-status.running { color: var(--trouve-text-dim); }
-  .tool-running-spinner { display: none; }
-  .tool-running-static { display: inline; }
 }
 
 trouve-app[data-reduce-motion] *, trouve-app[data-reduce-motion] *::before, trouve-app[data-reduce-motion] *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }

@@ -1,9 +1,10 @@
 import type { ProtocolTodoItem } from "../services/protocol-client.js";
+import type { FontAwesomeIconName } from "./font-awesome-icon.js";
 
 export type TodoStatus = ProtocolTodoItem["status"];
 
 export interface TodoPlanRow extends ProtocolTodoItem {
-  readonly icon: "○" | "▸" | "✓" | "✕";
+  readonly icon: FontAwesomeIconName;
   readonly statusLabel: "Pending" | "In progress" | "Completed" | "Cancelled";
   readonly current: boolean;
 }
@@ -26,10 +27,10 @@ const PRESENTATION: Readonly<
     Pick<TodoPlanRow, "icon" | "statusLabel">
   >
 > = {
-  pending: { icon: "○", statusLabel: "Pending" },
-  in_progress: { icon: "▸", statusLabel: "In progress" },
-  completed: { icon: "✓", statusLabel: "Completed" },
-  cancelled: { icon: "✕", statusLabel: "Cancelled" },
+  pending: { icon: "circle", statusLabel: "Pending" },
+  in_progress: { icon: "play", statusLabel: "In progress" },
+  completed: { icon: "check", statusLabel: "Completed" },
+  cancelled: { icon: "xmark", statusLabel: "Cancelled" },
 };
 
 /** Project the full-replacement protocol snapshot without reordering it. */

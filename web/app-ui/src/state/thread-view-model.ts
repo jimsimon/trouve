@@ -32,6 +32,11 @@ export type TurnState =
   | { readonly kind: "failed"; readonly error: string }
   | { readonly kind: "cancelled" };
 
+export type CompactionState =
+  | { readonly kind: "running" }
+  | { readonly kind: "completed"; readonly messagesCompacted: number }
+  | { readonly kind: "failed" };
+
 export type ThreadChatItem =
   | {
       readonly id: string;
@@ -53,6 +58,12 @@ export type ThreadChatItem =
       readonly turn: number;
       content: string;
       complete: boolean;
+    }
+  | {
+      readonly id: string;
+      readonly kind: "compaction";
+      readonly turn: number;
+      state: CompactionState;
     }
   | {
       readonly id: string;
@@ -224,6 +235,24 @@ export class ThreadViewModel {
           content: item.content,
           complete: item.complete,
         };
+      case "compaction": {
+        let state: CompactionState;
+        switch (item.state.state) {
+          case "running":
+            state = { kind: "running" };
+            break;
+          case "completed":
+            state = {
+              kind: "completed",
+              messagesCompacted: item.state.messages_compacted,
+            };
+            break;
+          case "failed":
+            state = { kind: "failed" };
+            break;
+        }
+        return { id, kind: "compaction", turn: item.turn, state };
+      }
       case "tool_call":
         return {
           id,
@@ -289,6 +318,12 @@ export class ThreadViewModel {
         return true;
       case "thread.compaction_started":
         this.compacting = true;
+        this.appendItem({
+          id: `compaction:${envelope.turn}:${envelope.cursor}`,
+          kind: "compaction",
+          turn: envelope.turn,
+          state: { kind: "running" },
+        });
         return true;
       case "thread.commands_updated":
         this.commands = envelope.commands;
@@ -299,9 +334,29 @@ export class ThreadViewModel {
       case "thread.todos_updated":
         this.replaceTodos(envelope.todos);
         return true;
-      case "thread.compaction_completed":
+      case "thread.compaction_completed": {
         this.compacting = false;
+        const compaction = this.findRunningCompaction(envelope.turn);
+        if (compaction !== undefined) {
+          compaction.state = {
+            kind: "completed",
+            messagesCompacted: envelope.messages_compacted,
+          };
+        } else {
+          // Handles a completion arriving after a snapshot produced by an
+          // older protocol that only carried the transient busy flag.
+          this.appendItem({
+            id: `compaction:${envelope.turn}:${envelope.cursor}`,
+            kind: "compaction",
+            turn: envelope.turn,
+            state: {
+              kind: "completed",
+              messagesCompacted: envelope.messages_compacted,
+            },
+          });
+        }
         return true;
+      }
       case "user.message":
         this.appendItem({
           id: `user:${envelope.turn}`,
@@ -312,6 +367,7 @@ export class ThreadViewModel {
         });
         return true;
       case "assistant.thinking": {
+        this.failOpenCompaction(envelope.turn);
         this.thinking = true;
         const current = this.findTrailingOpen("thinking", envelope.turn);
         if (current?.kind === "thinking") current.content += envelope.text;
@@ -327,6 +383,7 @@ export class ThreadViewModel {
         return true;
       }
       case "assistant.delta": {
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         const current = this.findTrailingOpen("assistant", envelope.turn);
         if (current?.kind === "assistant") current.content += envelope.text;
@@ -342,6 +399,7 @@ export class ThreadViewModel {
         return true;
       }
       case "assistant.message": {
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         const current = this.findTrailingOpen("assistant", envelope.turn);
         if (current?.kind === "assistant") {
@@ -359,6 +417,7 @@ export class ThreadViewModel {
         return true;
       }
       case "tool.requested":
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
@@ -427,6 +486,7 @@ export class ThreadViewModel {
         return tool !== undefined;
       }
       case "question.requested":
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         if (!this.pendingQuestions.includes(envelope.request_id)) {
           this.pendingQuestions.push(envelope.request_id);
@@ -446,9 +506,13 @@ export class ThreadViewModel {
         if (questions !== undefined) questions.answers = envelope.answers ?? null;
         return questions !== undefined;
       }
+      case "turn.usage_updated":
+        this.lastUsage = envelope.usage;
+        this.lastUsageCursor = envelope.cursor;
+        return true;
       case "turn.completed":
         this.turnRunning = false;
-        this.compacting = false;
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.lastUsage = envelope.usage;
@@ -460,7 +524,7 @@ export class ThreadViewModel {
         });
       case "turn.failed":
         this.turnRunning = false;
-        this.compacting = false;
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
@@ -470,7 +534,7 @@ export class ThreadViewModel {
         });
       case "turn.cancelled": {
         this.turnRunning = false;
-        this.compacting = false;
+        this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
@@ -509,6 +573,26 @@ export class ThreadViewModel {
         candidate.kind === "questions" && candidate.requestId === requestId,
     );
     return item?.kind === "questions" ? item : undefined;
+  }
+
+  private findRunningCompaction(
+    turn: number,
+  ): Extract<ThreadChatItem, { kind: "compaction" }> | undefined {
+    const item = this.#findLast(
+      (candidate) =>
+        candidate.kind === "compaction"
+        && candidate.turn === turn
+        && candidate.state.kind === "running",
+    );
+    return item?.kind === "compaction" ? item : undefined;
+  }
+
+  private failOpenCompaction(turn: number): boolean {
+    this.compacting = false;
+    const compaction = this.findRunningCompaction(turn);
+    if (compaction === undefined) return false;
+    compaction.state = { kind: "failed" };
+    return true;
   }
 
   private findTrailingOpen(

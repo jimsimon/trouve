@@ -5,6 +5,8 @@ import {
   filteredModelIndices,
   type ModelHealthPresentation,
 } from "./model-health.js";
+import { modelSelectorLabel } from "./model-option-controls.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 export interface ModelPickedDetail {
   readonly modelId: string;
@@ -39,6 +41,8 @@ export class TrouveModelPicker extends LitElement {
   #open = false;
   #query = "";
   #activeMatch = 0;
+  #popupPositionFrame: number | undefined;
+  #popupListenersAttached = false;
   readonly #listId = `model-picker-list-${++nextModelPickerId}`;
 
   protected override willUpdate(changed: PropertyValues<this>): void {
@@ -49,6 +53,31 @@ export class TrouveModelPicker extends LitElement {
       );
       this.#activeMatch = Math.max(0, selected);
     }
+  }
+
+  protected override updated(): void {
+    if (!this.#open) {
+      this.#detachPopupListeners();
+      this.#cancelPopupPosition();
+      return;
+    }
+    const popup = this.querySelector<HTMLElement>(".model-picker-popup");
+    if (popup === null) return;
+    if (typeof popup.showPopover === "function" && !popup.matches(":popover-open")) {
+      try {
+        popup.showPopover();
+      } catch {
+        // Older embedded engines use the fixed-position fallback below.
+      }
+    }
+    this.#positionPopup();
+    this.#attachPopupListeners();
+  }
+
+  override disconnectedCallback(): void {
+    this.#detachPopupListeners();
+    this.#cancelPopupPosition();
+    super.disconnectedCallback();
   }
 
   override render() {
@@ -75,14 +104,16 @@ export class TrouveModelPicker extends LitElement {
           @click=${this.#toggle}
           @keydown=${this.#triggerKeydown}
         >
-          <span>${selected?.display_name ?? (this.value || this.placeholder)}</span>
+          <span>${selected === undefined
+            ? (this.value || this.placeholder)
+            : modelSelectorLabel(selected)}</span>
           ${selectedHealth === undefined
             ? nothing
             : html`<span class="model-health-dot tone-${selectedHealth.tone}" aria-hidden="true"></span>`}
-          <span aria-hidden="true">${this.placement === "up" ? "▴" : "▾"}</span>
+          ${fontAwesomeIcon(this.placement === "up" ? "caret-up" : "caret-down")}
         </button>
         ${this.#open
-          ? html`<span class="model-picker-popup">
+          ? html`<span class="model-picker-popup" popover="manual">
               <input
                 type="search"
                 role="searchbox"
@@ -102,7 +133,9 @@ export class TrouveModelPicker extends LitElement {
                       const health = this.health[index];
                       if (index !== -1 && model === undefined) return nothing;
                       const modelId = model?.id ?? "";
-                      const label = model?.display_name ?? this.emptyLabel;
+                      const label = model === undefined
+                        ? this.emptyLabel
+                        : modelSelectorLabel(model);
                       return html`<button
                         id=${`${this.#listId}-${index}`}
                         type="button"
@@ -138,6 +171,73 @@ export class TrouveModelPicker extends LitElement {
     const query = this.#query.trim().toLocaleLowerCase();
     const includeEmpty = query === "" || this.emptyLabel.toLocaleLowerCase().includes(query);
     return includeEmpty ? [-1, ...matches].slice(0, 100) : matches;
+  }
+
+  #positionPopup(): void {
+    if (!this.#open) return;
+    const trigger = this.querySelector<HTMLElement>(".model-picker-trigger");
+    const popup = this.querySelector<HTMLElement>(".model-picker-popup");
+    if (trigger === null || popup === null) return;
+
+    const viewportWidth = Math.max(0, globalThis.innerWidth);
+    const viewportHeight = Math.max(0, globalThis.innerHeight);
+    if (viewportWidth === 0 || viewportHeight === 0) return;
+    const inset = 16;
+    const gap = this.placement === "up" ? 7 : 4;
+    const triggerBounds = trigger.getBoundingClientRect();
+    const popupWidth = Math.max(0, Math.min(480, viewportWidth - inset * 2));
+    const spaceAbove = Math.max(0, triggerBounds.top - gap - inset);
+    const spaceBelow = Math.max(0, viewportHeight - triggerBounds.bottom - gap - inset);
+    let opensUp = this.placement === "up";
+    if ((opensUp ? spaceAbove : spaceBelow) < 80) {
+      opensUp = spaceAbove >= spaceBelow;
+    }
+    const availableHeight = opensUp ? spaceAbove : spaceBelow;
+
+    popup.style.inset = "auto";
+    popup.style.width = `${popupWidth}px`;
+    popup.style.maxHeight = `${Math.max(48, Math.min(326, availableHeight))}px`;
+    const maximumLeft = Math.max(inset, viewportWidth - popupWidth - inset);
+    popup.style.left = `${Math.min(maximumLeft, Math.max(inset, triggerBounds.left))}px`;
+
+    const popupHeight = popup.getBoundingClientRect().height;
+    const preferredTop = opensUp
+      ? triggerBounds.top - gap - popupHeight
+      : triggerBounds.bottom + gap;
+    const maximumTop = Math.max(inset, viewportHeight - popupHeight - inset);
+    popup.style.top = `${Math.min(maximumTop, Math.max(inset, preferredTop))}px`;
+  }
+
+  readonly #schedulePopupPosition = (): void => {
+    if (!this.#open || this.#popupPositionFrame !== undefined) return;
+    this.#popupPositionFrame = globalThis.requestAnimationFrame(() => {
+      this.#popupPositionFrame = undefined;
+      this.#positionPopup();
+    });
+  };
+
+  #cancelPopupPosition(): void {
+    if (this.#popupPositionFrame === undefined) return;
+    globalThis.cancelAnimationFrame(this.#popupPositionFrame);
+    this.#popupPositionFrame = undefined;
+  }
+
+  #attachPopupListeners(): void {
+    if (this.#popupListenersAttached) return;
+    this.#popupListenersAttached = true;
+    globalThis.addEventListener("resize", this.#schedulePopupPosition, { passive: true });
+    globalThis.addEventListener("scroll", this.#schedulePopupPosition, true);
+    globalThis.visualViewport?.addEventListener("resize", this.#schedulePopupPosition, {
+      passive: true,
+    });
+  }
+
+  #detachPopupListeners(): void {
+    if (!this.#popupListenersAttached) return;
+    this.#popupListenersAttached = false;
+    globalThis.removeEventListener("resize", this.#schedulePopupPosition);
+    globalThis.removeEventListener("scroll", this.#schedulePopupPosition, true);
+    globalThis.visualViewport?.removeEventListener("resize", this.#schedulePopupPosition);
   }
 
   readonly #toggle = (): void => {
@@ -205,9 +305,15 @@ export class TrouveModelPicker extends LitElement {
     void this.updateComplete.then(() => this.querySelector<HTMLButtonElement>(".model-picker-trigger")?.focus());
   }
 
-  readonly #focusLeft = (): void => {
+  readonly #focusLeft = (event: FocusEvent): void => {
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget instanceof Node && this.contains(relatedTarget)) return;
     queueMicrotask(() => {
-      if (!this.#open || this.contains(globalThis.document?.activeElement ?? null)) return;
+      const root = this.getRootNode();
+      const activeElement = "activeElement" in root
+        ? root.activeElement as Element | null
+        : globalThis.document?.activeElement ?? null;
+      if (!this.#open || activeElement === this || this.contains(activeElement)) return;
       this.#open = false;
       this.requestUpdate();
     });

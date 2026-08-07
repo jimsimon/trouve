@@ -56,8 +56,11 @@ export type ProtocolCreateThreadRequest =
 export type ProtocolUpdateThreadRequest =
   ProtocolComponents["schemas"]["UpdateThreadRequest"];
 export type ProtocolQueuedPrompt = ProtocolComponents["schemas"]["QueuedPrompt"];
+export type ProtocolAttachment = ProtocolComponents["schemas"]["Attachment"];
 export type ProtocolAttachmentUpload =
   ProtocolComponents["schemas"]["AttachmentUpload"];
+export type ProtocolUpdateQueuedPromptRequest =
+  ProtocolComponents["schemas"]["UpdateQueuedPromptRequest"];
 export type ProtocolSendMessageRequest =
   ProtocolComponents["schemas"]["SendMessageRequest"];
 export type ProtocolTurnAccepted = ProtocolComponents["schemas"]["TurnAccepted"];
@@ -73,6 +76,8 @@ export type ProtocolDirEntry = ProtocolComponents["schemas"]["DirEntry"];
 export type ProtocolFileContent = ProtocolComponents["schemas"]["FileContent"];
 export type ProtocolTerminalInfo = ProtocolComponents["schemas"]["TerminalInfo"];
 export type ProtocolServerInfo = ProtocolComponents["schemas"]["ServerInfo"];
+export type ProtocolServerProjection =
+  ProtocolComponents["schemas"]["ServerProjection"];
 export type ProtocolProvidersResponse =
   ProtocolComponents["schemas"]["ProvidersResponse"];
 export type ProtocolProviderInfo = ProtocolComponents["schemas"]["ProviderInfo"];
@@ -179,6 +184,7 @@ interface ProtocolValidators {
   readonly terminalInfo: ValidateFunction;
   readonly terminalInfos: ValidateFunction;
   readonly serverInfo: ValidateFunction;
+  readonly serverProjection: ValidateFunction;
   readonly providers: ValidateFunction;
   readonly provider: ValidateFunction;
   readonly knownProviders: ValidateFunction;
@@ -246,6 +252,7 @@ const validateResponse = async <T>(
     | "TerminalInfo"
     | "TerminalInfo[]"
     | "ServerInfo"
+    | "ServerProjection"
     | "ProvidersResponse"
     | "ProviderInfo"
     | "KnownProvider[]"
@@ -639,6 +646,17 @@ export class ProtocolClient {
       "SessionSummariesSnapshot",
       result.data,
       (loaded) => loaded.summaries,
+    );
+  }
+
+  async serverProjectionSnapshot(): Promise<
+    ProtocolCursorSnapshot<ProtocolServerProjection>
+  > {
+    return this.#validatedCursorJson(
+      "/v1/server-projection",
+      "server projection",
+      "ServerProjection",
+      (loaded) => loaded.serverProjection,
     );
   }
 
@@ -1396,13 +1414,16 @@ export class ProtocolClient {
     );
   }
 
-  async updateQueuedPrompt(promptId: string, content: string): Promise<void> {
+  async updateQueuedPrompt(
+    promptId: string,
+    request: ProtocolUpdateQueuedPromptRequest,
+  ): Promise<void> {
     let result;
     try {
       result = await this.#client.PATCH("/v1/queue/{id}", {
         params: { path: { id: promptId } },
         headers: this.#mutationHeaders(),
-        body: { content },
+        body: request,
       });
     } catch {
       throw new ProtocolClientError("request-failed", "update queued prompt request failed");
@@ -1410,6 +1431,25 @@ export class ProtocolClient {
     if (!result.response.ok) {
       throw new ProtocolClientError("request-failed", "update queued prompt request failed");
     }
+  }
+
+  async listQueue(threadId: string): Promise<readonly ProtocolQueuedPrompt[]> {
+    let result;
+    try {
+      result = await this.#client.GET("/v1/threads/{id}/queue", {
+        params: { path: { id: threadId } },
+      });
+    } catch {
+      throw new ProtocolClientError("request-failed", "list queue request failed");
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError("request-failed", "list queue request failed");
+    }
+    return validateResponse<readonly ProtocolQueuedPrompt[]>(
+      "QueuedPrompt[]",
+      result.data,
+      (loaded) => loaded.queuedPrompts,
+    );
   }
 
   async deleteQueuedPrompt(promptId: string): Promise<void> {

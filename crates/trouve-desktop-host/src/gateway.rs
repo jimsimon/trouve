@@ -189,6 +189,7 @@ struct LifecycleQuery {
         crate::LocalFileAction,
         OpenHttpsUrlRequest,
         crate::AppearancePreferences,
+        crate::ChatPreferences,
         crate::GeneralPreferences,
         crate::NotificationPreferences,
         crate::HostKind,
@@ -3336,6 +3337,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(preferences.general, crate::GeneralPreferences::default());
+        assert_eq!(preferences.chat, crate::ChatPreferences::default());
         assert_eq!(
             preferences.notifications,
             crate::NotificationPreferences::default()

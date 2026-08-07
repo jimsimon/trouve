@@ -57,4 +57,55 @@ describe("application routes", () => {
     expect(push).toHaveBeenCalledWith("/settings/providers");
     expect(readSignal(router.route)).toEqual({ kind: "settings", section: "providers" });
   });
+
+  it("preserves the selected inspection pane across session and thread changes", () => {
+    let pathname = "/workspaces/ws/sessions/se-1/threads/th-1/inspect/files";
+    const push = vi.fn((href: string) => {
+      pathname = href;
+    });
+    const router = new AppRouter({
+      pathname: () => pathname,
+      push,
+      replace: vi.fn(),
+      listen: () => () => undefined,
+    });
+
+    router.navigate({
+      kind: "session",
+      workspaceId: "ws",
+      sessionId: "se-1",
+      threadId: "th-2",
+    });
+    expect(push).toHaveBeenLastCalledWith(
+      "/workspaces/ws/sessions/se-1/threads/th-2/inspect/files",
+    );
+    expect(readSignal(router.route)).toEqual({
+      kind: "session",
+      workspaceId: "ws",
+      sessionId: "se-1",
+      threadId: "th-2",
+      inspection: "files",
+    });
+
+    router.navigate({
+      kind: "session",
+      workspaceId: "ws",
+      sessionId: "se-2",
+      threadId: "th-3",
+    });
+    expect(push).toHaveBeenLastCalledWith(
+      "/workspaces/ws/sessions/se-2/threads/th-3/inspect/files",
+    );
+
+    router.navigate({
+      kind: "session",
+      workspaceId: "ws",
+      sessionId: "se-2",
+      threadId: "th-3",
+      inspection: "mcp",
+    });
+    expect(push).toHaveBeenLastCalledWith(
+      "/workspaces/ws/sessions/se-2/threads/th-3/inspect/mcp",
+    );
+  });
 });

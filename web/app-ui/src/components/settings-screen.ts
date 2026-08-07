@@ -16,6 +16,7 @@ import {
 } from "../services/theme-controller.js";
 import { APPEARANCE_FONT_SIZES } from "../services/appearance-preferences.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
 import "./local-model-settings.js";
 import "./management-settings-panels.js";
@@ -25,6 +26,7 @@ import "./workspace-settings.js";
 
 const SETTINGS_SECTIONS = [
   "general",
+  "chat",
   "providers",
   "modes",
   "git-worktrees",
@@ -221,13 +223,14 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     const selectedFontUnavailable = appearance.fontFamily !== "" &&
       !fontFamilies.includes(appearance.fontFamily);
     const generalPreferences = readSignal(services.generalPreferences);
+    const chatPreferences = readSignal(services.chatPreferences);
     const notificationPreferences = readSignal(services.notificationPreferences);
     const routeSection = this.section;
     return html`
       <div class="settings-screen">
         <header class="full-screen-header">
           <strong>Settings</strong>
-          <button type="button" @click=${this.#close}>✕ Close</button>
+          <button type="button" @click=${this.#close}>${fontAwesomeIcon("xmark")} Close</button>
         </header>
         <div class="settings-frame">
           <div class="settings-layout">
@@ -293,6 +296,26 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                                 provider-category=${routeSection === "provider-api" ? "api" : "subscription"}
                                 .showHeading=${false}
                               ></trouve-provider-settings>`}
+                      </div>
+                    `
+                : active === "chat"
+                  ? html`
+                      <div class="settings-section">
+                        <h1 id="settings-title">Chat</h1>
+                        <label class="settings-toggle-row" for="settings-collapse-thinking">
+                          <input
+                            id="settings-collapse-thinking"
+                            type="checkbox"
+                            .checked=${chatPreferences.collapseThinkingWithTools}
+                            @change=${(event: Event) => services.setChatPreferences({
+                              collapseThinkingWithTools:
+                                (event.currentTarget as HTMLInputElement).checked,
+                            })}
+                          />
+                          <span class="toggle-state">${chatPreferences.collapseThinkingWithTools ? "On" : "Off"}</span>
+                          <span>Collapse thinking output with tool calls.</span>
+                        </label>
+                        <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
                       </div>
                     `
                 : active === "modes"

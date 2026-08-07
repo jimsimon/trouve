@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
-import { modelOptionControls, modelOptionLabel } from "./model-option-controls.js";
+import {
+  modelOptionControls,
+  modelOptionLabel,
+  modelSelectorLabel,
+} from "./model-option-controls.js";
 
 const model = (properties: Record<string, unknown>): ProtocolModelInfo => ({
   id: "provider/model",
@@ -56,6 +60,13 @@ describe("model option controls", () => {
 
   it("uses the same human labels as the desktop controls", () => {
     expect(modelOptionLabel("xhigh")).toBe("Extra High");
+    expect(modelOptionLabel("ultra")).toBe("Ultra");
     expect(modelOptionLabel("custom")).toBe("custom");
+  });
+
+  it("uses provider-qualified ids in every model selector", () => {
+    expect(modelSelectorLabel({ id: "codex/gpt-5.6-sol" })).toBe(
+      "codex/gpt-5.6-sol",
+    );
   });
 });

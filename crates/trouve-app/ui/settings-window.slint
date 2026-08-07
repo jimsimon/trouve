@@ -15,6 +15,7 @@ import { Theme } from "theme.slint";
 
 export enum SectionId {
     general,
+    chat,
     providers,
     modes-models,
     git-worktrees,
@@ -355,6 +356,11 @@ export component SettingsScreen inherits Rectangle {
     in-out property <bool> prevent-sleep-while-running: true;
     callback prevent-sleep-while-running-toggled(bool);
 
+    // Chat transcript presentation. Disabled by default so thinking remains
+    // a visible top-level boundary between collapsible tool runs.
+    in-out property <bool> collapse-thinking-with-tools: false;
+    callback collapse-thinking-with-tools-toggled(bool);
+
     // Git & Worktrees: lifecycle for the optional session-naming model.
     // 0 adaptive, 1 keep ready, 2 load when needed, 3 rules only.
     in-out property <int> title-model-load-index: 0;
@@ -589,6 +595,7 @@ export component SettingsScreen inherits Rectangle {
     in-out property <SectionId> section: SectionId.general;
     property <[SectionItem]> sections: [
         { id: SectionId.general, name: "General" },
+        { id: SectionId.chat, name: "Chat" },
         { id: SectionId.providers, name: "Providers" },
         { id: SectionId.modes-models, name: "Modes & Models" },
         { id: SectionId.git-worktrees, name: "Git & Worktrees" },
@@ -699,6 +706,33 @@ export component SettingsScreen inherits Rectangle {
 
                             Text {
                                 text: "The display may still turn off, and manually requested sleep is not blocked.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ---------------- chat ----------------
+                        if root.section == SectionId.chat: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Chat";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            ToggleRow {
+                                on <=> root.collapse-thinking-with-tools;
+                                label: "Collapse thinking output with tool calls.";
+                                toggled(on) => {
+                                    root.collapse-thinking-with-tools-toggled(on);
+                                }
+                            }
+
+                            Text {
+                                text: "When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;

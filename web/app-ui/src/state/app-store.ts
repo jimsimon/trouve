@@ -4,6 +4,7 @@ import type {
   ProtocolGitWorktreeSettings,
   ProtocolPrInfo,
   ProtocolSession,
+  ProtocolServerProjection,
   ProtocolServerInfo,
   ProtocolSessionSummary,
   ProtocolThread,
@@ -187,6 +188,7 @@ export class AppStore {
   readonly #threads = new Map<string, ProtocolThread>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
+  #serverProjectionCursor = 0;
   readonly #threadViews = new Map<string, ThreadViewModel>();
   readonly #threadTodoEvents = new Map<string, readonly ProtocolTodoItem[]>();
   readonly #serverInfo = createSignal<ProtocolServerInfo | undefined>(undefined);
@@ -286,6 +288,51 @@ export class AppStore {
 
   replaceServerInfo(info: ProtocolServerInfo): void {
     this.#serverInfo.set(info);
+  }
+
+  /** Replace cold-start server-owned projections without replaying retained
+   * server history. Host event cursors still win independently if a live SSE
+   * update raced this response. */
+  replaceServerProjection(
+    cursor: number,
+    projection: ProtocolServerProjection,
+  ): boolean {
+    if (cursor < this.#serverProjectionCursor) return false;
+    this.#serverProjectionCursor = cursor;
+
+    const newerHosts = [...this.#githubPullRequests.entries()]
+      .filter(([, snapshot]) => snapshot.cursor > cursor);
+    this.#githubPullRequests.clear();
+    for (const [host, snapshot] of newerHosts) {
+      this.#githubPullRequests.set(host, snapshot);
+    }
+    for (const snapshot of projection.github_pull_requests) {
+      const host = snapshot.pull_requests.host;
+      const current = this.#githubPullRequests.get(host);
+      if (current !== undefined && current.cursor > snapshot.cursor) continue;
+      const pullRequests: ProtocolGithubPrList = {
+        ...snapshot.pull_requests,
+        prs: [...snapshot.pull_requests.prs],
+      };
+      Object.freeze(pullRequests.prs);
+      Object.freeze(pullRequests);
+      this.#githubPullRequests.set(host, Object.freeze({
+        cursor: snapshot.cursor,
+        refreshedAt: snapshot.refreshed_at,
+        pullRequests,
+      }));
+    }
+
+    this.#sessionPullRequests.clear();
+    for (const session of projection.session_pull_requests) {
+      this.#sessionPullRequests.set(
+        session.session_id,
+        Object.freeze([...session.prs]),
+      );
+    }
+    this.replaceGitWorktreeSettings(cursor, projection.git_worktree_settings);
+    this.#touch();
+    return true;
   }
 
   replaceThreadsForSession(

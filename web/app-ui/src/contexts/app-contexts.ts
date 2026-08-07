@@ -18,6 +18,10 @@ import type {
   GeneralPreferences,
   GeneralPreferencesSignal,
 } from "../services/general-preferences.js";
+import type {
+  ChatPreferences,
+  ChatPreferencesSignal,
+} from "../services/chat-preferences.js";
 import type { AppRouter } from "../router/app-router.js";
 import type { ProtocolClient } from "../services/protocol-client.js";
 import type { PendingAttachment } from "../services/attachments.js";
@@ -31,6 +35,7 @@ import type {
 import type { AppStore } from "../state/app-store.js";
 import type { ReadonlySignal } from "../state/reactivity.js";
 import type { SubscriptionHealthController } from "../services/subscription-health-controller.js";
+import type { ComposerDraftController } from "../services/composer-drafts.js";
 
 export interface NativeHostActions {
   /** Opens the desktop host's directory picker. `undefined` means cancel. */
@@ -84,6 +89,11 @@ export interface AppServices {
   readonly setGeneralPreferences: (
     patch: Partial<GeneralPreferences>,
   ) => void;
+  readonly chatPreferences: ChatPreferencesSignal;
+  readonly setChatPreferences: (
+    patch: Partial<ChatPreferences>,
+  ) => void;
+  readonly composerDrafts: ComposerDraftController;
   readonly protocol: ProtocolClient;
   readonly subscriptionHealth: SubscriptionHealthController;
   readonly pullRequestGroupOrder: ReadonlySignal<readonly string[]>;

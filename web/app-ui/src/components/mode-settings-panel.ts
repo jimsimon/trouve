@@ -8,6 +8,11 @@ import type {
   ProtocolProvidersResponse,
   ProtocolUpsertModeRequest,
 } from "../services/protocol-client.js";
+import {
+  modelOptionLabel,
+  modelSelectorLabel,
+} from "./model-option-controls.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 type PermissionMode = "ask" | "allow_list" | "yolo";
 
@@ -252,10 +257,10 @@ export class TrouveModeSettings extends LitElement {
             const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
             this.#modeFormThinkingDraft = options.includes(current) ? current : "";
             this.requestUpdate();
-          }}><option value="">Global default</option>${this.#models.map((candidate) => html`<option value=${candidate.id}>${candidate.display_name}</option>`)}</select></label>
+          }}><option value="">Global default</option>${this.#models.map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
           ${editorThinking.length === 0
             ? html`<input type="hidden" name="default_thinking_level" value="" />`
-            : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${value}</option>`)}</select></label>`}
+            : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
         </div>
         ${readOnly
           ? html`<p class="meta">Workspace modes are managed by the repository’s .agents configuration.</p>`
@@ -319,7 +324,7 @@ export class TrouveModeSettings extends LitElement {
               model: (event.currentTarget as HTMLSelectElement).value || null,
               thinking: null,
             })}
-          ><option value="">Global default</option>${this.#models.map((model) => html`<option value=${model.id}>${model.display_name}</option>`)}</select>
+          ><option value="">Global default</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}</option>`)}</select>
           ${thinking.length === 0
             ? nothing
             : html`<select
@@ -329,7 +334,7 @@ export class TrouveModeSettings extends LitElement {
                 @change=${(event: Event) => void this.#updateModeDefaults(info, {
                   thinking: (event.currentTarget as HTMLSelectElement).value || null,
                 })}
-              ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${value}</option>`)}</select>`}
+              ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
         </div>
         <div class="mode-row-actions">
           ${readOnly ? nothing : html`<button type="button" @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
@@ -358,11 +363,11 @@ export class TrouveModeSettings extends LitElement {
               const options = thinkingOptions(this.#models.find((model) => model.id === this.#defaultModelDraft));
               if (!options.includes(this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
               this.requestUpdate();
-            }}><option value="" disabled>Choose model</option>${this.#models.map((model) => html`<option value=${model.id}>${model.display_name}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
+            }}><option value="" disabled>Choose model</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
           </div>
           ${thinking.length === 0
             ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
-            : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${value}</option>`)}</select></label>`}
+            : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
           <div class="row"><button type="submit" ?disabled=${this.#busy || this.#models.length === 0}>Set defaults</button></div>
           <p class="meta">Global default permissions — used by new threads whose mode has no default of its own.</p>
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
@@ -371,7 +376,7 @@ export class TrouveModeSettings extends LitElement {
         <p class="modes-copy">A mode combines a prompt, tool policy, permissions, model, and thinking defaults. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.</p>
         <section class="mode-list" aria-label="Modes">${this.#modes.map((info) => this.#modeRow(info))}</section>
         ${this.#editingModeId === ""
-          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>+ Add mode</button></div>`
+          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add mode</button></div>`
           : this.#editingModeId === "__new__"
             ? this.#modeForm()
             : this.#modeForm(this.#modes.find((info) => info.mode.id === this.#editingModeId))}

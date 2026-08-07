@@ -16,6 +16,7 @@ export interface AutomationDraft {
   readonly workspaceId: string;
   readonly mode: string;
   readonly model: string;
+  readonly thinkingLevel: string;
   readonly permissionMode: AutomationPermissionMode;
   readonly scheduleKind: AutomationScheduleKind;
   readonly minute: string;
@@ -90,6 +91,7 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
   workspaceId,
   mode: "",
   model: "",
+  thinkingLevel: "",
   permissionMode: "ask",
   scheduleKind: "daily",
   minute: "0",
@@ -106,6 +108,7 @@ export const automationDraftFrom = (
   workspaceId: automation.workspace_id,
   mode: automation.mode ?? "",
   model: automation.model ?? "",
+  thinkingLevel: automation.thinking_level ?? "",
   permissionMode: permissionMode(automation.permission_mode),
   ...draftForSchedule(automation.schedule),
   enabled: automation.enabled,
@@ -188,6 +191,7 @@ export const automationRequestFromDraft = (
     workspace_id: draft.workspaceId,
     mode: draft.mode === "" ? null : draft.mode,
     model: draft.model === "" ? null : draft.model,
+    thinking_level: draft.thinkingLevel === "" ? null : draft.thinkingLevel,
     permission_mode: draft.permissionMode,
     schedule: scheduleFromDraft(draft),
     enabled: draft.enabled,

@@ -6,6 +6,7 @@ describe("session list component contract", () => {
   const read = (path: string): string =>
     readFileSync(new URL(path, import.meta.url), "utf8");
   const component = read("./session-list.ts");
+  const indicatorModel = read("../state/session-indicator-model.ts");
   const shell = read("../app/trouve-app.ts");
   const styles = read("../styles/app.css");
 
@@ -31,16 +32,17 @@ describe("session list component contract", () => {
   });
 
   it("uses Slint's attention, error, unread, busy, and idle presentations", () => {
-    expect(component).toContain('kind: "approval", glyph: "!"');
-    expect(component).toContain('kind: "question", glyph: "?"');
-    expect(component).toContain('kind: "both", glyph: "!"');
-    expect(component).toContain('kind: "error", glyph: "×"');
-    expect(component).toContain('kind: "unread", glyph: "●"');
-    expect(component).toContain('kind: "busy", glyph: ""');
-    expect(component).toContain('kind: "none", glyph: ""');
-    expect(component).toContain('session.unread && session.outcome === "failed"');
-    expect(component).toContain('session.unread && session.outcome === "succeeded"');
-    expect(component).toContain('session.active || session.outcome === "running"');
+    expect(component).toContain("sessionIndicatorPresentation(session)");
+    expect(indicatorModel).toContain('kind: "approval",\n      icon: "triangle-exclamation"');
+    expect(indicatorModel).toContain('kind: "question",\n      icon: "circle-question"');
+    expect(indicatorModel).toContain('kind: "both",\n      icon: "triangle-exclamation"');
+    expect(indicatorModel).toContain('kind: "error",\n      icon: "xmark"');
+    expect(indicatorModel).toContain('kind: "unread", icon: "circle"');
+    expect(indicatorModel).toContain('kind: "busy", icon: undefined');
+    expect(indicatorModel).toContain('kind: "none", icon: undefined');
+    expect(indicatorModel).toContain('session.unread && session.outcome === "failed"');
+    expect(indicatorModel).toContain('session.unread && session.outcome === "succeeded"');
+    expect(indicatorModel).toContain('session.active || session.outcome === "running"');
     expect(styles).toMatch(
       /\.session-indicator\.busy::before \{[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-session-busy-pulse 1\.6s linear infinite/s,
     );

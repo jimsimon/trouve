@@ -344,6 +344,20 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // --- chat settings: restore, persist, and re-fold the transcript --------
+    {
+        let prefs = winstate::load_chat();
+        window.set_collapse_thinking_with_tools(prefs.collapse_thinking_with_tools);
+        let prefs = std::rc::Rc::new(std::cell::RefCell::new(prefs));
+        let tx_prefs = tx.clone();
+        window.on_collapse_thinking_with_tools_toggled(move |on| {
+            let mut prefs = prefs.borrow_mut();
+            prefs.collapse_thinking_with_tools = on;
+            winstate::save_chat(&prefs);
+            let _ = tx_prefs.send(UiCommand::ChatPrefsChanged(prefs.clone()));
+        });
+    }
+
     // --- notifications: restore, wire the toggles ----------------------------
     // Persisted on this thread like appearance; the controller keeps a copy
     // to gate what event notifications fire.

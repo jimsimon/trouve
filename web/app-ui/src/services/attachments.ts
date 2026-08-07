@@ -9,6 +9,24 @@ export interface PendingAttachment {
   readonly size: number;
 }
 
+const previewUrls = new WeakMap<PendingAttachment, string>();
+
+/** A CSP-compatible local preview for an image that has already been encoded
+ * for upload. Non-images and malformed MIME types deliberately have no URL. */
+export const pendingAttachmentPreviewUrl = (
+  attachment: PendingAttachment,
+): string | undefined => {
+  const mime = attachment.upload.mime.toLowerCase();
+  if (!/^image\/[a-z0-9!#$&^_.+-]+$/iu.test(mime) || attachment.upload.data === "") {
+    return undefined;
+  }
+  const cached = previewUrls.get(attachment);
+  if (cached !== undefined) return cached;
+  const url = `data:${mime};base64,${attachment.upload.data}`;
+  previewUrls.set(attachment, url);
+  return url;
+};
+
 export class AttachmentEncodingError extends Error {
   constructor(readonly kind: "empty" | "too-large" | "read-failed") {
     super(kind);

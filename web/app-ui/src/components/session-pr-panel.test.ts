@@ -15,6 +15,16 @@ describe("session pull-request panel empty-state parity", () => {
     expect(source).toContain("No pull requests for this session's branch yet.");
   });
 
+  it("keeps compact create and browser actions beside the visible heading", () => {
+    expect(source).toContain('class="pr-toolbar-heading"');
+    expect(source).toContain('<h2 id="session-pr-title">Pull requests</h2>');
+    expect(source).toContain('aria-label="Create pull request"');
+    expect(source).toContain('fontAwesomeIcon("code-pull-request")');
+    expect(source).toContain('aria-label="Open Pull Requests"');
+    expect(source).toContain('fontAwesomeIcon("arrow-up-right-from-square")');
+    expect(source).not.toContain(">Create PR</button>");
+  });
+
   it("shows GitHub setup before making an authenticated pull-request request", () => {
     const integration = source.indexOf(
       "const integration = await services.protocol.githubIntegration()",

@@ -15,7 +15,7 @@ import {
 } from "./chat-presentation.js";
 
 describe("chat presentation", () => {
-  it("copies either raw Markdown or the visible formatted response", () => {
+  it("copies the visible response while preserving Markdown for the context action", () => {
     const markdown = [
       "## Result",
       "",
@@ -29,8 +29,7 @@ describe("chat presentation", () => {
       "const ready = true;",
       "```",
     ].join("\n");
-    expect(assistantCopyText(markdown, true)).toBe(markdown);
-    expect(assistantCopyText(markdown, false)).toBe([
+    expect(assistantCopyText(markdown)).toBe([
       "Result",
       "",
       "•  ready with code",

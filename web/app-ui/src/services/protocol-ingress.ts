@@ -9,6 +9,8 @@ import {
   ProtocolClientError,
   type ProtocolEventEnvelope,
   type ProtocolIngressEvent,
+  type ProtocolCursorSnapshot,
+  type ProtocolServerProjection,
   type ProtocolSession,
   type ProtocolSessionSummariesSnapshot,
   type ProtocolSessionSummary,
@@ -46,6 +48,13 @@ type SessionSummaryBoundary =
     readonly kind: "metadata-fallback";
     readonly cursor: number;
   };
+
+type ServerProjectionBoundary =
+  | {
+    readonly kind: "snapshot";
+    readonly snapshot: ProtocolCursorSnapshot<ProtocolServerProjection>;
+  }
+  | { readonly kind: "legacy-replay" };
 
 const materializeSessionSnapshot = (
   boundary: SessionSummaryBoundary,
@@ -225,9 +234,10 @@ export class ProtocolIngress {
       this.#sessionSummaryBoundary(),
     ]);
     if (!this.#isCurrentGeneration(generation)) return;
-    const [sessions, workspaces] = await Promise.all([
+    const [sessions, workspaces, projection] = await Promise.all([
       this.#client.sessions(),
       this.#client.workspaces(),
+      this.#serverProjectionBoundary(),
     ]);
     if (!this.#isCurrentGeneration(generation)) return;
     const snapshot = materializeSessionSnapshot(boundary, sessions);
@@ -236,18 +246,23 @@ export class ProtocolIngress {
     this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
     this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
     this.#store.replaceWorkspaces(workspaces);
+    if (projection.kind === "snapshot") {
+      this.#store.replaceServerProjection(
+        projection.snapshot.cursor,
+        projection.snapshot.value,
+      );
+    }
 
     let skipFirstOpenRefresh = true;
     const stream = await this.#client.serverEvents({
-      // The summary snapshot covers session-list state, but account-level
-      // projections such as GitHub pull requests live only in the durable
-      // server event log. Replay server history so a cold client can fold the
-      // newest of those snapshots even when a refresh finds no changes and
-      // therefore correctly emits no duplicate event.
-      after: 0,
+      // Current servers return every durable replacement projection absent
+      // from session summaries, so only events after that summary boundary
+      // need replay. Older servers retain the cursor-zero compatibility path.
+      after: projection.kind === "snapshot" ? snapshot.cursor : 0,
       onEvent: (event) => {
         if (!this.#isCurrentGeneration(generation)) return;
-        this.#receiveAcrossSnapshotBoundary(event, snapshot.cursor);
+        if (projection.kind === "snapshot") this.#receive(event);
+        else this.#receiveAcrossSnapshotBoundary(event, snapshot.cursor);
       },
       onOpen: () => {
         if (!this.#isCurrentGeneration(generation)) return;
@@ -265,6 +280,25 @@ export class ProtocolIngress {
     }
     this.#stream = stream;
     stream.start();
+  }
+
+  async #serverProjectionBoundary(): Promise<ServerProjectionBoundary> {
+    // Structural check keeps protocol-ingress unit fakes and pre-2.15 clients
+    // on the same compatibility path as a real 404 response.
+    if (typeof this.#client.serverProjectionSnapshot !== "function") {
+      return { kind: "legacy-replay" };
+    }
+    try {
+      return {
+        kind: "snapshot",
+        snapshot: await this.#client.serverProjectionSnapshot(),
+      };
+    } catch (cause) {
+      if (cause instanceof ProtocolClientError && cause.status === 404) {
+        return { kind: "legacy-replay" };
+      }
+      throw cause;
+    }
   }
 
   /** Events at or before the atomic session-summary cursor are bootstrap

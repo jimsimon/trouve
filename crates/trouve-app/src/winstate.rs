@@ -202,6 +202,15 @@ impl Default for General {
     }
 }
 
+/// Chat transcript presentation preferences. Like appearance, this changes
+/// only how the local frontend renders the shared durable thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Chat {
+    /// Include thinking output in collapsible tool-activity groups.
+    #[serde(default)]
+    pub collapse_thinking_with_tools: bool,
+}
+
 fn config_path(file: &str) -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("trouve").join(file))
 }
@@ -248,6 +257,18 @@ pub fn load_general() -> General {
 
 pub fn save_general(general: &General) {
     write_json(config_path("general.json"), general);
+}
+
+pub fn load_chat() -> Chat {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("chat.json")?).ok()?;
+        serde_json::from_str::<Chat>(&text).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_chat(chat: &Chat) {
+    write_json(config_path("chat.json"), chat);
 }
 
 pub fn load_notifications() -> Notifications {
@@ -321,6 +342,16 @@ mod tests {
         assert!(General::default().prevent_sleep_while_running);
         let restored: General = serde_json::from_str("{}").unwrap();
         assert!(restored.prevent_sleep_while_running);
+    }
+
+    #[test]
+    fn chat_thinking_collapse_defaults_to_disabled() {
+        assert!(!Chat::default().collapse_thinking_with_tools);
+        let restored: Chat = serde_json::from_str("{}").unwrap();
+        assert!(!restored.collapse_thinking_with_tools);
+        let enabled: Chat =
+            serde_json::from_str(r#"{"collapse_thinking_with_tools":true}"#).unwrap();
+        assert!(enabled.collapse_thinking_with_tools);
     }
 
     #[test]

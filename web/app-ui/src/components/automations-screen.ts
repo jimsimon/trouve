@@ -1,13 +1,17 @@
 import { ContextConsumer } from "@lit/context";
 import { css, html, LitElement, nothing } from "lit";
 
+import { thinkingOption } from "../app/new-session-model.js";
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import type {
   ProtocolAutomation,
   ProtocolAutomationTemplate,
+  ProtocolModelInfo,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
+import { modelOptionLabel } from "./model-option-controls.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   AUTOMATION_DAY_NAMES,
   automationDraftFrom,
@@ -22,6 +26,7 @@ import {
   type AutomationPermissionMode,
   type AutomationScheduleKind,
 } from "./automations-model.js";
+import "./model-picker.js";
 
 type EditorMode = "" | "create" | "edit";
 
@@ -182,6 +187,18 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     .editor-inline, .schedule-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
     .editor-inline > span, .schedule-row > span { flex: none; color: var(--trouve-text-mid); font-size: 12px; }
     .editor-inline select { min-width: 0; flex: 1; }
+    .editor-inline trouve-model-picker { min-width: 0; flex: 1; }
+    .model-picker { position: relative; display: block; width: 100%; }
+    .model-picker-trigger { width: 100%; min-height: 30px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); text-align: start; }
+    .model-picker-trigger > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-picker-popup { position: absolute; z-index: 8; inset-block-start: calc(100% + 4px); inset-inline-start: 0; width: min(480px, calc(100vw - 32px)); display: grid; grid-template-rows: auto minmax(0, 280px); gap: 4px; padding: 5px; border: 1px solid var(--trouve-border-strong); border-radius: 7px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
+    .model-picker-popup > input { width: 100%; min-height: 32px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 5px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); }
+    .model-picker-options { display: block; min-height: 28px; overflow: auto; }
+    .model-picker-options > button { width: 100%; min-height: 32px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 202px); align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text); background: transparent; text-align: start; }
+    .model-picker-options > button:hover, .model-picker-options > button.active { background: var(--trouve-hover-bg); }
+    .model-picker-options > button[aria-selected="true"] { background: var(--trouve-accent-bg); }
+    .model-picker-options > button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-picker-empty { min-height: 32px; display: flex; align-items: center; padding: 4px 7px; color: var(--trouve-text-disabled); }
     .schedule-row select { width: 120px; }
     .schedule-row input { width: 84px; }
     .schedule-row input.minute { width: 64px; }
@@ -322,6 +339,9 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #automations: readonly ProtocolAutomation[] = [];
   #templates: readonly ProtocolAutomationTemplate[] = [];
   #workspaces: readonly ProtocolWorkspace[] = [];
+  #models: readonly ProtocolModelInfo[] = [];
+  #modelsLoading = true;
+  #modelsError = "";
   #selectedId = "";
   #editorMode: EditorMode = "";
   #draft: AutomationDraft = emptyAutomationDraft();
@@ -391,7 +411,23 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#loading = this.#automations.length === 0;
     this.#refreshing = !this.#loading;
     this.#actionError = "";
+    this.#modelsLoading = true;
+    this.#modelsError = "";
     this.requestUpdate();
+    void services.protocol.models().then(
+      (models) => {
+        if (generation !== this.#loadGeneration || !this.isConnected) return;
+        this.#models = models;
+      },
+      () => {
+        if (generation !== this.#loadGeneration || !this.isConnected) return;
+        this.#modelsError = "Model choices could not be loaded. Existing defaults are preserved.";
+      },
+    ).finally(() => {
+      if (generation !== this.#loadGeneration || !this.isConnected) return;
+      this.#modelsLoading = false;
+      this.requestUpdate();
+    });
     try {
       const [automations, templates, workspaces] = await Promise.all([
         services.protocol.automations(),
@@ -440,7 +476,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       <section class="screen" aria-labelledby="automations-title">
         <header class="page-header">
           <h1 id="automations-title">Automations</h1>
-          <button type="button" @click=${this.#close}>✕ Close</button>
+          <button type="button" @click=${this.#close}>${fontAwesomeIcon("xmark")} Close</button>
         </header>
         <main class="body-scroll">
           <div class="body-column">
@@ -452,13 +488,15 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
                   aria-label="Refresh automations"
                   ?disabled=${this.#refreshing || this.#loading}
                   @click=${() => void this.refresh()}
-                >${this.#refreshing ? "Refreshing…" : "⟳ Refresh"}</button>
+                >${this.#refreshing
+                  ? "Refreshing…"
+                  : html`${fontAwesomeIcon("arrows-rotate")} Refresh`}</button>
                 <button
                   class="primary"
                   type="button"
                   ?disabled=${this.#workspaces.length === 0 || offline}
                   @click=${this.#startCreate}
-                >+ New automation</button>
+                >${fontAwesomeIcon("plus")} New automation</button>
               </div>
             </div>
             <p class="description">Each run creates a fresh session in the chosen workspace and sends the prompt — exactly as if you had typed it. Times follow this machine's clock; runs missed while trouve was closed are skipped.</p>
@@ -567,6 +605,8 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   #renderEditor() {
     const editing = this.#editorMode === "edit";
+    const selectedModel = this.#models.find((model) => model.id === this.#draft.model);
+    const thinking = thinkingOption(selectedModel);
     const nameError = this.#draftErrors.name;
     const promptError = this.#draftErrors.prompt;
     const workspaceError = this.#draftErrors.workspaceId;
@@ -585,6 +625,40 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
         ${promptError === undefined ? nothing : html`<span class="field-error" id="automation-prompt-error">${promptError}</span>`}
         <label class="editor-inline" for="automation-workspace"><span>Workspace</span><select id="automation-workspace" name="workspace" required aria-invalid=${workspaceError === undefined ? "false" : "true"} @change=${this.#workspaceChanged}><option value="" ?selected=${this.#draft.workspaceId === ""}>Choose a workspace</option>${this.#workspaces.map((workspace) => html`<option value=${workspace.id} ?selected=${workspace.id === this.#draft.workspaceId}>${workspace.name}</option>`)}</select></label>
         ${workspaceError === undefined ? nothing : html`<span class="field-error" id="automation-workspace-error">${workspaceError}</span>`}
+        <div class="editor-inline">
+          <span>Model</span>
+          <trouve-model-picker
+            accessible-label="Automation model"
+            placement="down"
+            placeholder="Mode or server default"
+            empty-label="Mode or server default"
+            .value=${this.#draft.model}
+            .models=${this.#models}
+            .disabled=${busy || this.#modelsLoading}
+            @trouve-model-picked=${this.#modelPicked}
+          ></trouve-model-picker>
+        </div>
+        <label class="editor-inline" for="automation-thinking">
+          <span>Thinking</span>
+          <select
+            id="automation-thinking"
+            name="thinking"
+            ?disabled=${busy || this.#modelsLoading || thinking === undefined}
+            @change=${(event: Event) => this.#updateDraft({ thinkingLevel: (event.currentTarget as HTMLSelectElement).value })}
+          >
+            <option value="" ?selected=${this.#draft.thinkingLevel === ""}>${this.#modelsLoading
+              ? "Loading model options…"
+              : thinking === undefined
+                ? "Choose a supported model"
+                : "Model default"}</option>
+            ${thinking?.values.map(
+              (value) => html`<option value=${value} ?selected=${value === this.#draft.thinkingLevel}>${modelOptionLabel(value)}</option>`,
+            )}
+          </select>
+        </label>
+        ${this.#modelsError === ""
+          ? nothing
+          : html`<span class="field-note">${this.#modelsError}</span>`}
         <label class="editor-inline" for="automation-permission"><span>Permissions</span><select id="automation-permission" name="permission" @change=${(event: Event) => { const permissionMode = (event.currentTarget as HTMLSelectElement).value as AutomationPermissionMode; this.#yoloConfirmed = false; this.#updateDraft({ permissionMode }); }}><option value="ask" ?selected=${this.#draft.permissionMode === "ask"}>Ask before changes (safe)</option><option value="allow_list" ?selected=${this.#draft.permissionMode === "allow_list"}>Allow-list (approve as needed)</option><option value="yolo" ?selected=${this.#draft.permissionMode === "yolo"}>Unattended (YOLO)</option></select></label>
         ${this.#draft.permissionMode === "yolo" ? html`<section class="yolo-warning"><strong>Unattended execution is dangerous</strong><span>The agent can run shell commands and edit or delete files without asking. Repository content can influence those actions. This permission applies only to fresh sessions created by this automation and does not change global defaults.</span><label><input type="checkbox" .checked=${this.#yoloConfirmed} @change=${(event: Event) => { this.#yoloConfirmed = (event.currentTarget as HTMLInputElement).checked; this.requestUpdate(); }} />I understand and want this automation to run without approval</label></section>` : nothing}
         <div class="schedule-row"><span>Runs</span><select aria-label="Frequency" @change=${(event: Event) => this.#updateDraft({ scheduleKind: (event.currentTarget as HTMLSelectElement).value as AutomationScheduleKind })}><option value="hourly" ?selected=${this.#draft.scheduleKind === "hourly"}>Hourly</option><option value="daily" ?selected=${this.#draft.scheduleKind === "daily"}>Daily</option><option value="weekly" ?selected=${this.#draft.scheduleKind === "weekly"}>Weekly</option></select>${this.#draft.scheduleKind === "hourly" ? html`<span>at minute</span><input class="minute" aria-label="Minute of the hour" type="number" min="0" max="59" step="1" .value=${this.#draft.minute} @input=${(event: Event) => this.#updateDraft({ minute: (event.currentTarget as HTMLInputElement).value })} />` : html`<span>at</span><input aria-label="Time of day" type="time" step="60" .value=${this.#draft.time} @input=${(event: Event) => this.#updateDraft({ time: (event.currentTarget as HTMLInputElement).value })} />`}<span class="schedule-spacer"></span></div>
@@ -650,6 +724,15 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   readonly #workspaceChanged = (event: Event): void => {
     const workspaceId = (event.currentTarget as HTMLSelectElement).value;
     this.#updateDraft({ workspaceId });
+  };
+
+  readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
+    const model = this.#models.find((candidate) => candidate.id === event.detail.modelId);
+    const thinking = thinkingOption(model);
+    const thinkingLevel = thinking?.values.includes(this.#draft.thinkingLevel)
+      ? this.#draft.thinkingLevel
+      : "";
+    this.#updateDraft({ model: event.detail.modelId, thinkingLevel });
   };
 
   #toggleDay(day: number): void {

@@ -10,6 +10,7 @@ import {
   sessionMcpCommandLine,
   sessionMcpEnvironmentLines,
 } from "./session-mcp-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 export class TrouveSessionMcpPanel extends LitElement {
   static override properties = {
@@ -64,7 +65,9 @@ export class TrouveSessionMcpPanel extends LitElement {
             <strong id="session-mcp-title">Effective MCP servers for this session</strong>
           </span>
           <button type="button" ?disabled=${this.#loading} @click=${() => void this.#load()}>
-            ${this.#loading ? "Refreshing…" : "↻ Refresh"}
+            ${this.#loading
+              ? "Refreshing…"
+              : html`${fontAwesomeIcon("arrows-rotate")} Refresh`}
           </button>
         </header>
         <p class="session-mcp-description">App-wide, workspace, and branch configs merged the way a turn in this session sees them. Each entry shows the layer whose definition won.</p>

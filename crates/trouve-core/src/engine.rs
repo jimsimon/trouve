@@ -381,8 +381,9 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     config_dir: Option<PathBuf>,
-    /// Canonical provider/model metadata and option-schema catalog shared by
-    /// API providers and CLI backends. Live sources contribute availability.
+    /// Canonical provider/model rosters, metadata, and option-schema catalog
+    /// shared by API providers and CLI backends. Explicit integrations may
+    /// still contribute models the catalog cannot represent (notably Cursor).
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved
@@ -1790,6 +1791,7 @@ impl Engine {
             workspace_id: req.workspace_id,
             mode: req.mode,
             model: req.model,
+            thinking_level: req.thinking_level,
             permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
@@ -1818,6 +1820,7 @@ impl Engine {
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
+        automation.thinking_level = req.thinking_level;
         automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
@@ -1847,6 +1850,15 @@ impl Engine {
         }
         if req.prompt.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a prompt".into()));
+        }
+        if req
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| level.trim().is_empty())
+        {
+            return Err(EngineError::BadRequest(
+                "automation thinking_level must not be empty".into(),
+            ));
         }
         if self.store.open_workspace(&req.workspace_id)?.is_none() {
             return Err(EngineError::NotFound(format!(
@@ -2007,11 +2019,18 @@ impl Engine {
                 fetch_latest: true,
             })
             .await?;
+        let mut model_options = serde_json::Map::new();
+        if let Some(thinking_level) = automation.thinking_level.as_ref() {
+            model_options.insert(
+                "thinking_level".into(),
+                serde_json::Value::String(thinking_level.clone()),
+            );
+        }
         let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
             session_id: session.id.clone(),
             mode: automation.mode.clone(),
             model: automation.model.clone(),
-            model_options: Default::default(),
+            model_options,
             // Scoped to this fresh run session; it does not change global
             // mode defaults or carry approvals into future runs.
             permission_mode: Some(automation.permission_mode),
@@ -3011,6 +3030,23 @@ impl Engine {
             .collect())
     }
 
+    /// Browser URLs already linked through persisted session events. Unlike
+    /// `session_prs`, this never contacts GitHub and is therefore safe to fold
+    /// for every session during client bootstrap.
+    fn recorded_session_pr_urls(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
+        Ok(self
+            .store
+            .events_after(&Scope::Session(session_id.to_string()), 0)?
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::SessionPrOpened { url, .. } => {
+                    Some(url.trim_end_matches('/').to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Provider-neutral evidence tying GitHub activity to this session.
     /// Explicit PR references work for any integration; successful tool args
     /// and produced commit IDs preserve enough identity to discover a PR that
@@ -3118,6 +3154,72 @@ impl Engine {
         }
         prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
         Ok(prs)
+    }
+
+    /// Current durable server-owned UI projections paired with a server
+    /// cursor. This is intentionally local-only: account PR state comes from
+    /// the newest persisted replacement event and session associations come
+    /// from branch identity plus recorded `session.pr_opened` links.
+    pub fn server_projection_snapshot(
+        &self,
+    ) -> Result<(u64, trouve_protocol::ServerProjection), EngineError> {
+        let mut github_pull_requests = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(envelope) = self.store.latest_github_pr_snapshot_event(&host)? else {
+                continue;
+            };
+            let Event::GithubPullRequestsUpdated { pull_requests } = envelope.event else {
+                continue;
+            };
+            github_pull_requests.push(trouve_protocol::GithubPrHostProjection {
+                cursor: envelope.cursor,
+                refreshed_at: envelope.ts,
+                pull_requests,
+            });
+        }
+
+        let account_prs = github_pull_requests
+            .iter()
+            .flat_map(|snapshot| snapshot.pull_requests.prs.iter())
+            .collect::<Vec<_>>();
+        let mut session_pull_requests = Vec::new();
+        for session in self.list_sessions(None)? {
+            let linked_urls = self.recorded_session_pr_urls(&session.id)?;
+            let mut seen = HashSet::new();
+            let mut prs = account_prs
+                .iter()
+                .copied()
+                .filter(|pr| {
+                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+                })
+                .filter(|pr| {
+                    seen.insert((
+                        pr.host.to_ascii_lowercase(),
+                        pr.repository.to_ascii_lowercase(),
+                        pr.number,
+                    ))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+            if !prs.is_empty() {
+                session_pull_requests.push(trouve_protocol::SessionPrProjection {
+                    session_id: session.id,
+                    prs,
+                });
+            }
+        }
+
+        let (cursor, git_worktree_settings) = self.git_worktree_settings_snapshot()?;
+        Ok((
+            cursor,
+            trouve_protocol::ServerProjection {
+                github_pull_requests,
+                session_pull_requests,
+                git_worktree_settings,
+            },
+        ))
     }
 
     /// Path of the MCP config file for a scope; workspace scope requires
@@ -4757,12 +4859,51 @@ impl Engine {
         Ok(self.store.queued_prompts(thread_id)?)
     }
 
-    pub fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<(), EngineError> {
+    pub fn update_queued_prompt(
+        &self,
+        prompt_id: &str,
+        request: trouve_protocol::UpdateQueuedPromptRequest,
+    ) -> Result<(), EngineError> {
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
-        if !self.store.update_queued_prompt(prompt_id, content)? {
+        let prompt = self
+            .store
+            .queued_prompts(&thread_id)?
+            .into_iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+
+        let mut attachments = if let Some(retained_ids) = request.retained_attachment_ids {
+            let by_id: std::collections::HashMap<_, _> = prompt
+                .attachments
+                .into_iter()
+                .map(|attachment| (attachment.id.clone(), attachment))
+                .collect();
+            let mut retained = Vec::with_capacity(retained_ids.len());
+            let mut seen = std::collections::HashSet::with_capacity(retained_ids.len());
+            for id in retained_ids {
+                if !seen.insert(id.clone()) {
+                    return Err(EngineError::BadRequest(format!(
+                        "queued attachment {id} was retained more than once"
+                    )));
+                }
+                retained.push(by_id.get(&id).cloned().ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "attachment {id} does not belong to queued prompt {prompt_id}"
+                    ))
+                })?);
+            }
+            retained
+        } else {
+            prompt.attachments
+        };
+        attachments.extend(self.save_attachments(&thread_id, request.attachments)?);
+        if !self
+            .store
+            .update_queued_prompt(prompt_id, &request.content, &attachments)?
+        {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         }
         self.emit_queue(&thread_id)
@@ -5337,11 +5478,14 @@ impl Engine {
             if let Some(cost) = cost {
                 usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
             }
+            if usage.context_window.is_some() {
+                usage_total.context_window = usage.context_window;
+            }
         };
-        // The last request's input size — the context-size proxy for
-        // compaction. Summing per-iteration inputs (usage_total) would
-        // over-count a multi-tool turn many-fold; the final request carries
-        // the whole transcript, so its input is what "context size" means.
+        // The last request's provider-authoritative context measurement.
+        // Summing per-iteration inputs (usage_total) would over-count a
+        // multi-tool turn many-fold; the final request carries the whole
+        // transcript, so its context size is the useful value.
         let mut context_input_tokens = 0u64;
         // Becomes false when the loop ends because the model stopped calling
         // tools (or was cancelled); stays true only if we exhaust the
@@ -5403,9 +5547,14 @@ impl Engine {
                     // carried in the transcript for replay only.
                     ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
-                    ProviderEvent::Completed { usage } => {
+                    ProviderEvent::Completed { mut usage } => {
+                        context_input_tokens = usage.context_input_tokens.unwrap_or_else(|| {
+                            usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                        });
+                        usage.context_input_tokens = Some(context_input_tokens);
                         accumulate_usage(&usage);
-                        context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+                        self.store
+                            .append_event(scope.clone(), Event::TurnUsageUpdated { turn, usage })?;
                     }
                 }
             }
@@ -5526,10 +5675,17 @@ impl Engine {
                                 )?;
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
-                            Ok(ProviderEvent::Completed { usage }) => {
-                                accumulate_usage(&usage);
+                            Ok(ProviderEvent::Completed { mut usage }) => {
                                 context_input_tokens =
-                                    usage.input_tokens + usage.cached_input_tokens;
+                                    usage.context_input_tokens.unwrap_or_else(|| {
+                                        usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                                    });
+                                usage.context_input_tokens = Some(context_input_tokens);
+                                accumulate_usage(&usage);
+                                self.store.append_event(
+                                    scope.clone(),
+                                    Event::TurnUsageUpdated { turn, usage },
+                                )?;
                             }
                             // Tools are deliberately unavailable on this
                             // final pass. Ignore a non-conforming provider's
@@ -5567,6 +5723,7 @@ impl Engine {
             )?;
         }
 
+        usage_total.context_input_tokens = Some(context_input_tokens);
         self.store.record_usage(
             &session.id,
             &thread.id,
@@ -6299,6 +6456,24 @@ impl Engine {
                 BackendEvent::CommandsUpdated { commands } => {
                     persisted.push(Event::CommandsUpdated { commands });
                 }
+                BackendEvent::UsageUpdated { usage } => {
+                    persisted.push(Event::TurnUsageUpdated { turn, usage });
+                }
+                BackendEvent::CompactionStarted => {
+                    if !segment.is_empty() {
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
+                    }
+                    persisted.push(Event::CompactionStarted { turn });
+                }
+                BackendEvent::CompactionCompleted => {
+                    persisted.push(Event::CompactionCompleted {
+                        turn,
+                        messages_compacted: 0,
+                    });
+                }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
@@ -6400,6 +6575,9 @@ impl Engine {
                     if usage.context_window.is_some() {
                         usage_total.context_window = usage.context_window;
                     }
+                    if usage.context_input_tokens.is_some() {
+                        usage_total.context_input_tokens = usage.context_input_tokens;
+                    }
                 }
             }
             if persisted.is_empty() {
@@ -6461,9 +6639,15 @@ impl Engine {
                 .mark_backend_seen(&thread.id, backend_id, seen_after)?;
         }
 
-        // Vendors report one usage per turn, so the totals already reflect
-        // the last (only) request — use them as the context-size proxy.
-        let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
+        // Vendor turns can contain several model calls. Their final usage is
+        // aggregate billing data, while context_input_tokens tracks only the
+        // newest call's provider-authoritative context measurement.
+        let context_input_tokens = usage_total.context_input_tokens.unwrap_or_else(|| {
+            usage_total
+                .input_tokens
+                .saturating_add(usage_total.cached_input_tokens)
+        });
+        usage_total.context_input_tokens = Some(context_input_tokens);
         self.store.record_usage(
             &session.id,
             &thread.id,
@@ -8628,6 +8812,32 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    fn projection_pr(number: u64, workspace_id: &str, head: &str) -> trouve_protocol::PrInfo {
+        trouve_protocol::PrInfo {
+            host: "github.com".into(),
+            repository: "acme/widgets".into(),
+            workspace_id: workspace_id.into(),
+            number,
+            url: format!("https://github.com/acme/widgets/pull/{number}"),
+            title: format!("Pull request {number}"),
+            state: "open".into(),
+            draft: false,
+            base: "main".into(),
+            head: head.into(),
+            head_sha: None,
+            checks: Vec::new(),
+            reviews: Vec::new(),
+            trouve_review: None,
+            author: "octocat".into(),
+            requested_reviewers: Vec::new(),
+            comments: 0,
+            last_comment_at: None,
+            mergeable: None,
+            merge_state_status: None,
+            merged_at: None,
+        }
+    }
+
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
@@ -8720,6 +8930,71 @@ mod tests {
         };
         let cache = cache.lock().await;
         assert!(!cache.has_published_snapshot());
+    }
+
+    #[test]
+    fn server_projection_bootstraps_branch_and_recorded_session_prs_locally() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_workspace(&trouve_protocol::Workspace {
+                id: "ws_projection".into(),
+                name: "projection".into(),
+                path: "/tmp/projection".into(),
+            })
+            .unwrap();
+        let session = Session {
+            id: "se_projection".into(),
+            workspace_id: "ws_projection".into(),
+            title: "Projection".into(),
+            branch: "trouve/exact".into(),
+            worktree_path: "/tmp/projection".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let exact = projection_pr(10, &session.workspace_id, &session.branch);
+        let linked = projection_pr(11, &session.workspace_id, "external-branch");
+        store
+            .append_event(
+                Scope::Server,
+                Event::GithubPullRequestsUpdated {
+                    pull_requests: trouve_protocol::GithubPrList {
+                        viewer: "octocat".into(),
+                        host: "github.com".into(),
+                        prs: vec![exact, linked.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Session(session.id.clone()),
+                Event::SessionPrOpened {
+                    number: linked.number,
+                    url: linked.url,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(store, data.path().into(), &Config::default());
+
+        let (cursor, projection) = engine.server_projection_snapshot().unwrap();
+
+        assert!(cursor > 0);
+        assert_eq!(projection.github_pull_requests.len(), 1);
+        assert_eq!(projection.github_pull_requests[0].cursor, cursor);
+        assert_eq!(projection.session_pull_requests.len(), 1);
+        assert_eq!(projection.session_pull_requests[0].session_id, session.id);
+        assert_eq!(
+            projection.session_pull_requests[0]
+                .prs
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![11, 10]
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ import type {
 import {
   projectSessionPullRequests,
   type SessionPullRequestIdentity,
+  type SessionVisualState,
 } from "../state/app-store.js";
 
 export type { SessionPullRequestIdentity } from "../state/app-store.js";
@@ -73,4 +74,20 @@ export const sessionPullRequestBadge = (
     count: prs.length,
     tooltip: `${heading}\n${lines.join("\n")}`,
   });
+};
+
+/** Apply the same Slint-derived precedence used by every session navigator:
+ * attention, failure, unread, and busy indicators win over pull-request state.
+ * A selected completed session has already cleared its local unread marker, so
+ * it can hand off to the pull-request badge during the intervening render. */
+export const visibleSessionPullRequestBadge = (
+  prs: readonly ProtocolPrInfo[],
+  state: SessionVisualState,
+  selected: boolean,
+): SessionPullRequestBadge | undefined => {
+  const badge = sessionPullRequestBadge(prs);
+  if (badge === undefined) return undefined;
+  return state === "idle" || (state === "done" && selected)
+    ? badge
+    : undefined;
 };

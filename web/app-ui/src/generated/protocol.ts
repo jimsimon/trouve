@@ -926,6 +926,22 @@ export interface paths {
         patch: operations["update_queued_prompt"];
         trace?: never;
     };
+    "/v1/server-projection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["server_projection"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/session-summaries": {
         parameters: {
             query?: never;
@@ -1578,6 +1594,12 @@ export interface components {
             permission_mode?: components["schemas"]["PermissionMode"];
             prompt: string;
             schedule: components["schemas"]["AutomationSchedule"];
+            /**
+             * @description Thinking level for the runs (None = the selected model/mode/global
+             *     default). The engine maps this canonical value to the model's
+             *     advertised option key when the turn starts.
+             */
+            thinking_level?: string | null;
             workspace_id: components["schemas"]["String"];
         };
         /** @description When an automation fires. Times are the server's local time zone. */
@@ -2270,6 +2292,12 @@ export interface components {
             /** @enum {string} */
             type: "turn.started";
         } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.usage_updated";
+            usage: components["schemas"]["Usage"];
+        } | {
             checkpoint_id?: null | components["schemas"]["String"];
             /** Format: int64 */
             turn: number;
@@ -2384,7 +2412,8 @@ export interface components {
         } | {
             /**
              * Format: int64
-             * @description Provider-transcript messages folded into the summary.
+             * @description Provider-transcript messages folded into the summary. Zero means
+             *     an external harness reported the boundary without a message count.
              */
             messages_compacted: number;
             /** Format: int64 */
@@ -2648,6 +2677,18 @@ export interface components {
              */
             oauth_available?: boolean;
             source: string;
+        };
+        /**
+         * @description Latest persisted account-level PR replacement for one GitHub host.
+         *     The event cursor and timestamp let clients order this bootstrap state
+         *     against newer SSE events without replaying the retained server history.
+         */
+        GithubPrHostProjection: {
+            /** Format: int64 */
+            cursor: number;
+            pull_requests: components["schemas"]["GithubPrList"];
+            /** Format: date-time */
+            refreshed_at: string;
         };
         /**
          * @description Pull requests relevant to the authenticated account on one GitHub host,
@@ -3188,6 +3229,16 @@ export interface components {
             protocol_version: string;
             version: string;
         };
+        /**
+         * @description Durable server-owned state that is not part of the session-summary
+         *     snapshot. Clients fetch this once during bootstrap and can then resume the
+         *     server event stream at the session-summary cursor instead of cursor zero.
+         */
+        ServerProjection: {
+            git_worktree_settings: components["schemas"]["GitWorktreeSettings"];
+            github_pull_requests: components["schemas"]["GithubPrHostProjection"][];
+            session_pull_requests: components["schemas"]["SessionPrProjection"][];
+        };
         Session: {
             /**
              * @description One of the session's threads is actively processing prompts right
@@ -3233,6 +3284,15 @@ export interface components {
          * @enum {string}
          */
         SessionOutcome: "idle" | "running" | "succeeded" | "failed";
+        /**
+         * @description Pull requests already associated with one session using durable branch or
+         *     `session.pr_opened` evidence. This is a local projection of the persisted
+         *     account snapshots and never performs a GitHub request.
+         */
+        SessionPrProjection: {
+            prs: components["schemas"]["PrInfo"][];
+            session_id: components["schemas"]["String"];
+        };
         /**
          * @description Atomic session-summary snapshot plus the server-scope cursor after which a
          *     client resumes the existing durable event stream.
@@ -3395,6 +3455,18 @@ export interface components {
              */
             todos?: components["schemas"]["TodoItem"][];
         };
+        ThreadCompactionState: {
+            /** @enum {string} */
+            state: "running";
+        } | {
+            /** Format: int64 */
+            messages_compacted: number;
+            /** @enum {string} */
+            state: "completed";
+        } | {
+            /** @enum {string} */
+            state: "failed";
+        };
         /** @enum {string} */
         ThreadToolStatus: "awaiting_approval" | "running" | "ok" | "error" | "denied" | "aborted";
         ThreadTurnState: {
@@ -3432,6 +3504,12 @@ export interface components {
             content: string;
             /** @enum {string} */
             kind: "thinking";
+            /** Format: int64 */
+            turn: number;
+        } | {
+            /** @enum {string} */
+            kind: "compaction";
+            state: components["schemas"]["ThreadCompactionState"];
             /** Format: int64 */
             turn: number;
         } | {
@@ -3601,7 +3679,15 @@ export interface components {
             semantic_routing?: boolean | null;
         };
         UpdateQueuedPromptRequest: {
+            /** @description New files to append after the retained attachments. */
+            attachments?: components["schemas"]["AttachmentUpload"][];
             content: string;
+            /**
+             * @description Existing queued attachment ids to keep, in display order. Omit this
+             *     field to preserve every existing attachment (the behavior of clients
+             *     predating protocol 2.14); send an empty list to remove all of them.
+             */
+            retained_attachment_ids?: string[] | null;
         };
         /** @description Partial session update (rename / archive). Omitted fields are unchanged. */
         UpdateSessionRequest: {
@@ -3637,6 +3723,11 @@ export interface components {
             permission_mode?: components["schemas"]["PermissionMode"];
             prompt: string;
             schedule: components["schemas"]["AutomationSchedule"];
+            /**
+             * @description Thinking level for each fresh automation thread. Omitted by older
+             *     clients preserves normal model/mode/global inheritance.
+             */
+            thinking_level?: string | null;
             workspace_id: components["schemas"]["String"];
         };
         UpsertMcpServerRequest: {
@@ -3728,6 +3819,14 @@ export interface components {
             cached_input_tokens?: number;
             /**
              * Format: int64
+             * @description Provider-authoritative model-visible tokens for the most recent
+             *     request. Unlike the aggregate turn counters above, this is the current
+             *     context-size measurement used for context-window presentation and
+             *     compaction decisions.
+             */
+            context_input_tokens?: number | null;
+            /**
+             * Format: int64
              * @description The model's context window as reported live by the provider during
              *     the turn. Authoritative over any static catalog value.
              */
@@ -3737,7 +3836,12 @@ export interface components {
              * @description Estimated cost in USD, when list pricing for the model is known.
              */
             cost_usd?: number | null;
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description Non-cached input tokens. This counter is mutually exclusive with
+             *     `cached_input_tokens`, even when the upstream provider reports an
+             *     inclusive input total.
+             */
             input_tokens: number;
             /** Format: int64 */
             output_tokens: number;
@@ -5733,6 +5837,35 @@ export interface operations {
                 content?: never;
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    server_projection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    /** @description Server event cursor for this snapshot */
+                    "x-trouve-event-cursor"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerProjection"];
+                };
+            };
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

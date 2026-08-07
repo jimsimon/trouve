@@ -183,6 +183,8 @@ pub struct HostPreferences {
     #[serde(default)]
     pub general: GeneralPreferences,
     #[serde(default)]
+    pub chat: ChatPreferences,
+    #[serde(default)]
     pub notifications: NotificationPreferences,
     #[serde(default)]
     pub workspace_order: Vec<String>,
@@ -200,6 +202,7 @@ impl Default for HostPreferences {
             geometry: None,
             appearance: AppearancePreferences::default(),
             general: GeneralPreferences::default(),
+            chat: ChatPreferences::default(),
             notifications: NotificationPreferences::default(),
             workspace_order: Vec::new(),
             pull_request_group_order: Vec::new(),
@@ -245,6 +248,15 @@ impl Default for GeneralPreferences {
             prevent_sleep_while_running: true,
         }
     }
+}
+
+/// Chat transcript presentation remains client-owned and does not affect the
+/// durable thread view shared through the harness protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct ChatPreferences {
+    /// Include thinking output in collapsible tool-activity groups.
+    #[serde(default)]
+    pub collapse_thinking_with_tools: bool,
 }
 
 /// Notification policy remains frontend-owned. The native host persists the

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ProtocolEventEnvelope,
   ProtocolPrInfo,
+  ProtocolServerProjection,
   ProtocolThread,
   ProtocolThreadViewSnapshot,
 } from "../services/protocol-client.js";
@@ -309,6 +310,52 @@ describe("AppStore", () => {
       expect.objectContaining({ number: 7 }),
       expect.objectContaining({ number: 8, state: "merged" }),
     ]);
+  });
+
+  it("hydrates all session PR associations from the cold-start server projection", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.replaceSessionSummaries([summary]);
+    const linked = pullRequest(12, {
+      head: "linked-from-durable-activity",
+      title: "Linked before selection",
+    });
+    const projection: ProtocolServerProjection = {
+      github_pull_requests: [{
+        cursor: 20,
+        refreshed_at: "2026-08-01T12:20:00Z",
+        pull_requests: {
+          host: "github.com",
+          viewer: "octocat",
+          prs: [linked],
+        },
+      }],
+      session_pull_requests: [{ session_id: "se_1", prs: [linked] }],
+      git_worktree_settings: {
+        title_model_load_behavior: "auto",
+        title_model_resource_policy: "adaptive",
+        title_model: {
+          state: "ready",
+          runtime_installed: true,
+          model_downloaded: true,
+        },
+      },
+    };
+
+    expect(store.replaceServerProjection(21, projection)).toBe(true);
+    expect(store.sessionPullRequests("se_1")).toEqual([
+      expect.objectContaining({ number: 12, title: "Linked before selection" }),
+    ]);
+    expect(readSignal(store.githubPullRequests)).toEqual([
+      expect.objectContaining({ cursor: 20, refreshedAt: "2026-08-01T12:20:00Z" }),
+    ]);
+    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({ cursor: 21 });
+    expect(store.replaceServerProjection(19, {
+      ...projection,
+      github_pull_requests: [],
+      session_pull_requests: [],
+    })).toBe(false);
+    expect(store.sessionPullRequests("se_1")).toHaveLength(1);
   });
 
   it("applies confirmed management mutations without waiting for SSE", () => {

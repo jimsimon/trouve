@@ -3,6 +3,7 @@ import type {
   ProtocolPrInfo,
 } from "../services/protocol-client.js";
 import type { SessionListItem } from "../state/app-store.js";
+import type { FontAwesomeIconName } from "./font-awesome-icon.js";
 
 export type PullRequestGroupKey =
   | "review-requested"
@@ -51,7 +52,7 @@ export interface PullRequestGroupDefinition {
   readonly key: PullRequestGroupKey;
   readonly title: string;
   readonly description: string;
-  readonly icon: string;
+  readonly icon: FontAwesomeIconName;
   readonly tone: "accent" | "muted" | "warning" | "ok" | "danger" | "tint";
   readonly emptyText: string;
 }
@@ -68,7 +69,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "review-requested",
     title: "Review Requested",
     description: "Pull requests where your review has been requested.",
-    icon: "◉",
+    icon: "circle-dot",
     tone: "accent",
     emptyText: "No reviews waiting on you.",
   },
@@ -76,7 +77,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "drafts",
     title: "Drafts",
     description: "Open pull requests still marked as drafts.",
-    icon: "✎",
+    icon: "pen",
     tone: "muted",
     emptyText: "No draft pull requests right now.",
   },
@@ -84,7 +85,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "needs-reviewers",
     title: "Needs Reviewers",
     description: "Open pull requests that do not have any reviewers yet.",
-    icon: "＋",
+    icon: "user-plus",
     tone: "warning",
     emptyText: "Every open pull request has a reviewer.",
   },
@@ -92,7 +93,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "pending-review",
     title: "Pending Review",
     description: "Open pull requests waiting for review or approval.",
-    icon: "◐",
+    icon: "circle-half-stroke",
     tone: "warning",
     emptyText: "Nothing is waiting on review.",
   },
@@ -100,7 +101,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "ready-to-merge",
     title: "Ready to Merge",
     description: "Fully approved pull requests with every check passing.",
-    icon: "✓",
+    icon: "check",
     tone: "ok",
     emptyText: "Nothing is ready to merge yet.",
   },
@@ -108,7 +109,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "needs-attention",
     title: "Needs Attention",
     description: "Pull requests with merge conflicts, failing checks, or changes requested.",
-    icon: "⚠",
+    icon: "triangle-exclamation",
     tone: "danger",
     emptyText: "Nothing needs attention — all clear.",
   },
@@ -116,7 +117,7 @@ export const PULL_REQUEST_GROUPS = Object.freeze([
     key: "recently-merged",
     title: "Recently Merged",
     description: "Pull requests merged in the last 24 hours.",
-    icon: "⇥",
+    icon: "code-merge",
     tone: "tint",
     emptyText: "Nothing merged in the last 24 hours.",
   },

@@ -29,12 +29,10 @@ export const collapsedChatPreview = (content: string): string => {
   return utf8Length(line) <= 120 ? line : `${utf8Prefix(line, 119)}…`;
 };
 
-/** Approximate the visible text of the styled Markdown response for the
- * header copy action. Raw mode deliberately keeps the original source; the
- * formatted mode removes presentation-only Markdown punctuation while
- * preserving block boundaries and code contents. */
-export const assistantCopyText = (markdown: string, raw: boolean): string => {
-  if (raw) return markdown;
+/** Approximate the visible text of a styled Markdown response for its quick
+ * copy action. The response context menu deliberately retains the original
+ * source for its separate "Copy as markdown" command. */
+export const assistantCopyText = (markdown: string): string => {
   let fenced = false;
   const output: string[] = [];
   for (const sourceLine of markdown.split("\n")) {

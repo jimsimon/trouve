@@ -168,6 +168,15 @@ pub enum BackendEvent {
     CommandsUpdated {
         commands: Vec<trouve_protocol::CommandInfo>,
     },
+    /// Usage for the most recently completed model request while the vendor
+    /// turn is still running. Final turn aggregates arrive in `Completed`.
+    UsageUpdated {
+        usage: Usage,
+    },
+    /// The vendor harness began compacting its own conversation context.
+    CompactionStarted,
+    /// The vendor harness finished compacting its own conversation context.
+    CompactionCompleted,
     Completed {
         usage: Usage,
     },
@@ -201,6 +210,9 @@ impl std::fmt::Debug for BackendEvent {
             Self::CommandsUpdated { commands } => {
                 write!(f, "CommandsUpdated({} commands)", commands.len())
             }
+            Self::UsageUpdated { usage } => write!(f, "UsageUpdated({usage:?})"),
+            Self::CompactionStarted => f.write_str("CompactionStarted"),
+            Self::CompactionCompleted => f.write_str("CompactionCompleted"),
             Self::Completed { usage } => write!(f, "Completed({usage:?})"),
         }
     }
@@ -249,11 +261,10 @@ pub trait AgentBackend: Send + Sync {
     /// the vendor cannot report current availability.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Models available to the current account. Catalog-covered backends use
-    /// vendor output only as an id allowlist and rebuild metadata/settings
-    /// from models.dev. Explicit adapters own uncatalogued integrations such
-    /// as Cursor-only models. Implementations should cache availability; the
-    /// default falls back to the canonical snapshot.
+    /// Models available for this backend. Catalog-covered backends use their
+    /// canonical static roster; explicit adapters own integrations that cannot
+    /// be catalogued, notably Cursor-only models discovered through Cursor's
+    /// CLI. The default returns the canonical snapshot.
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models()
     }
@@ -577,7 +588,10 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         Ok(BackendEvent::CommandsUpdated { commands }) => {
             serde_json::to_string(commands).map_or(0, |json| json.len())
         }
-        Ok(BackendEvent::Completed { .. }) => std::mem::size_of::<Usage>(),
+        Ok(BackendEvent::UsageUpdated { .. } | BackendEvent::Completed { .. }) => {
+            std::mem::size_of::<Usage>()
+        }
+        Ok(BackendEvent::CompactionStarted | BackendEvent::CompactionCompleted) => 0,
         Err(error) => error.to_string().len(),
     }
 }

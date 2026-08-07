@@ -891,6 +891,7 @@ cat > /dev/null
     let mut saw_tool_output = false;
     let mut saw_tool_completed = false;
     let mut sessions = Vec::new();
+    let mut live_usage = None;
     let mut usage = None;
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
@@ -912,8 +913,12 @@ cat > /dev/null
                 assert_eq!(tool, "commandExecution");
                 responder.send(true).unwrap();
             }
+            BackendEvent::UsageUpdated { usage } => live_usage = Some(usage),
             BackendEvent::Completed { usage: u } => usage = Some(u),
-            BackendEvent::QuestionsNeeded { .. } | BackendEvent::CommandsUpdated { .. } => {}
+            BackendEvent::QuestionsNeeded { .. }
+            | BackendEvent::CommandsUpdated { .. }
+            | BackendEvent::CompactionStarted
+            | BackendEvent::CompactionCompleted => {}
         }
     }
 
@@ -932,9 +937,14 @@ cat > /dev/null
         "completed reasoning must not repeat a streamed raw delta: {thinking:?}"
     );
     assert!(saw_text && saw_tool_started && saw_tool_output && saw_tool_completed);
+    assert_eq!(
+        live_usage.expect("live usage").context_input_tokens,
+        Some(11)
+    );
     let usage = usage.expect("turn completed");
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 4);
+    assert_eq!(usage.context_input_tokens, Some(11));
 
     // Our approval reply reached the vendor with an accept decision.
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();

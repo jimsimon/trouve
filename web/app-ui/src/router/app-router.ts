@@ -126,10 +126,20 @@ export class AppRouter {
   }
 
   navigate(route: Exclude<AppRoute, { kind: "not-found" }>, replace = false): void {
-    const href = routeHref(route);
+    const current = this.#route.get();
+    // Inspection is one app-level selection, not a per-thread/session default.
+    // Most chat navigation intentionally constructs only the new identity;
+    // retain the visible right pane unless the caller explicitly selects one.
+    const destination = route.kind === "session"
+      && route.inspection === undefined
+      && current.kind === "session"
+      && current.inspection !== undefined
+      ? { ...route, inspection: current.inspection }
+      : route;
+    const href = routeHref(destination);
     if (replace) this.#platform.replace(href);
     else this.#platform.push(href);
-    this.#route.set(route);
+    this.#route.set(destination);
   }
 
   dispose(): void {

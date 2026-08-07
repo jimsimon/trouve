@@ -31,6 +31,7 @@ import {
 } from "./inspection-file-tree.js";
 import { lineRangeOffsets, parentDirectories } from "./file-reveal.js";
 import { languageForPath } from "./file-language.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import type { TrouveCodeView } from "./code-view.js";
 import "./code-view.js";
 import "./diff-view.js";
@@ -221,7 +222,9 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               )}
               ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
               @click=${() => void this.#restoreCheckpoint("undo")}
-            >${this.#restorePending === "undo" ? "Undoing…" : "↶ Undo turn"}</button>
+            >${this.#restorePending === "undo"
+              ? "Undoing…"
+              : html`${fontAwesomeIcon("rotate-left")} Undo turn`}</button>
             <button
               type="button"
               aria-label=${`Redo. ${checkpointAvailabilityDescription(
@@ -234,14 +237,16 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               )}
               ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
               @click=${() => void this.#restoreCheckpoint("redo")}
-            >${this.#restorePending === "redo" ? "Redoing…" : "↷ Redo"}</button>
+            >${this.#restorePending === "redo"
+              ? "Redoing…"
+              : html`${fontAwesomeIcon("rotate-right")} Redo`}</button>
             ${this.#diffText === ""
               ? nothing
               : html`<button
                   type="button"
                   title="Copy diff"
                   @click=${() => void this.#copyRawDiff()}
-                >⧉ copy diff</button>`}
+                >${fontAwesomeIcon("copy")} copy diff</button>`}
             ${this.#diffFiles.length === 0
               ? nothing
               : html`<button
@@ -276,7 +281,9 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               title="Refresh diff"
               ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
               @click=${() => void this.#refreshDiff({ silent: false })}
-            >${this.#refreshing ? "…" : "↻"}</button>
+            >${fontAwesomeIcon(this.#refreshing ? "spinner" : "arrows-rotate", {
+              spin: this.#refreshing,
+            })}</button>
           </span>
           ${this.#notice === ""
             ? nothing
@@ -313,7 +320,9 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                         @keydown=${(event: KeyboardEvent) => this.#navigateDiffFiles(event, index)}
                         @click=${() => this.#toggleDiffFile(index)}
                       >
-                        <span class="diff-file-disclosure" aria-hidden="true">${expanded ? "▾" : "▸"}</span>
+                        ${fontAwesomeIcon(expanded ? "caret-down" : "caret-right", {
+                          className: "diff-file-disclosure",
+                        })}
                         <strong>${file.path}</strong>
                         <small>(+${file.additions} −${file.deletions})</small>
                       </button>
@@ -323,7 +332,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                         aria-label=${`Copy raw diff for ${file.path}`}
                         title=${`Copy raw diff for ${file.path}`}
                         @click=${() => void this.#copyFileDiff(file)}
-                      >${this.#copiedDiffPath === file.path ? "✓" : "⧉"}</button>
+                      >${fontAwesomeIcon(this.#copiedDiffPath === file.path ? "check" : "copy")}</button>
                     </header>
                     ${expanded
                       ? file.binary
@@ -532,7 +541,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               this.#fileTreeCollapsed = !this.#fileTreeCollapsed;
               this.requestUpdate();
             }}
-          >▤</button>
+          >${fontAwesomeIcon("folder-tree")}</button>
           <strong title=${file?.path ?? "Session worktree"}>${file?.path ?? ""}</strong>
           <button
             class="files-refresh-action"
@@ -540,7 +549,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
             aria-label="Refresh files"
             ?disabled=${root.status === "loading"}
             @click=${() => void this.#loadRootDirectory(true)}
-          >↻</button>
+          >${fontAwesomeIcon("arrows-rotate")}</button>
           ${file === undefined
             ? nothing
             : html`
@@ -551,7 +560,12 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                       title="Open in editor"
                       ?disabled=${this.#fileActionPending !== ""}
                       @click=${() => void this.#actOnFile(file, "open")}
-                    >${this.#fileActionPending === "open" ? "…" : "↗"}</button>`
+                    >${fontAwesomeIcon(
+                      this.#fileActionPending === "open"
+                        ? "spinner"
+                        : "arrow-up-right-from-square",
+                      { spin: this.#fileActionPending === "open" },
+                    )}</button>`
                   : nothing}
                 ${canReveal
                   ? html`<button
@@ -568,7 +582,11 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                   title="Copy file contents"
                   aria-label=${`Copy contents of ${file.path}`}
                   @click=${() => void this.#copyFileContents(file)}
-                >${this.#copiedDiffPath === file.path && !this.#copyFeedbackIsError ? "✓" : "⧉"}</button>
+                >${fontAwesomeIcon(
+                  this.#copiedDiffPath === file.path && !this.#copyFeedbackIsError
+                    ? "check"
+                    : "copy",
+                )}</button>
                 ${markdown
                   ? html`<button
                       type="button"
@@ -579,7 +597,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                         this.#filePreview = !this.#filePreview;
                         this.requestUpdate();
                       }}
-                    >👁</button>`
+                    >${fontAwesomeIcon("eye")}</button>`
                   : nothing}
               `}
         </header>
@@ -610,12 +628,15 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                 @click=${() => void this.#activateFileTreeRow(row.path)}
               >
                 <span class="file-tree-label">
-                  <span class="file-tree-disclosure" aria-hidden="true">${row.isDirectory
-                    ? row.expanded ? "▾" : "▸"
-                    : ""}</span>
-                  <span class="file-tree-icon" aria-hidden="true">${row.isDirectory
-                    ? row.expanded ? "📂" : "📁"
-                    : "📄"}</span>
+                  ${row.isDirectory
+                    ? fontAwesomeIcon(row.expanded ? "caret-down" : "caret-right", {
+                        className: "file-tree-disclosure",
+                      })
+                    : html`<span class="file-tree-disclosure"></span>`}
+                  ${fontAwesomeIcon(
+                    row.isDirectory ? row.expanded ? "folder-open" : "folder" : "file-lines",
+                    { className: "file-tree-icon" },
+                  )}
                   <span>${row.name}</span>
                 </span>
               </button>

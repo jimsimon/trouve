@@ -18,10 +18,10 @@ describe("buildTodoPlanModel", () => {
       "cancelled",
     ]);
     expect(model.rows.map(({ icon, statusLabel }) => ({ icon, statusLabel }))).toEqual([
-      { icon: "○", statusLabel: "Pending" },
-      { icon: "▸", statusLabel: "In progress" },
-      { icon: "✓", statusLabel: "Completed" },
-      { icon: "✕", statusLabel: "Cancelled" },
+      { icon: "circle", statusLabel: "Pending" },
+      { icon: "play", statusLabel: "In progress" },
+      { icon: "check", statusLabel: "Completed" },
+      { icon: "xmark", statusLabel: "Cancelled" },
     ]);
     expect(model.current?.id).toBe("active");
     expect(model.rows.filter(({ current }) => current).map(({ id }) => id)).toEqual([

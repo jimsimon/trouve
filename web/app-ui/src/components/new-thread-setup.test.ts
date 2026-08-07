@@ -43,7 +43,10 @@ describe("new thread setup component contract", () => {
     expect(component).toContain('this.#draft.prompt.trim() === "" && this.#draft.attachments.length === 0');
     expect(component).toContain("encodeAttachment(");
     expect(component).toContain("appendNewThreadAttachment(");
+    expect(component).toContain("pendingAttachmentPreviewUrl(attachment)");
     expect(component).toContain('aria-label="Initial message attachments"');
+    expect(component).toContain('class="attachment-icon"');
+    expect(component).toContain("attachment.upload.mime");
     expect(component).toContain("Unattended execution (YOLO) is dangerous");
   });
 

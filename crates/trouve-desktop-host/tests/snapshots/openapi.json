@@ -465,6 +465,16 @@
           }
         }
       },
+      "ChatPreferences": {
+        "type": "object",
+        "description": "Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.",
+        "properties": {
+          "collapse_thinking_with_tools": {
+            "type": "boolean",
+            "description": "Include thinking output in collapsible tool-activity groups."
+          }
+        }
+      },
       "ChatScrollBookmark": {
         "type": "object",
         "description": "Stable first-visible chat item plus its non-negative offset into the item.\nUnlike raw scroll pixels, this survives font and window-size changes.",
@@ -827,6 +837,9 @@
         "properties": {
           "appearance": {
             "$ref": "#/components/schemas/AppearancePreferences"
+          },
+          "chat": {
+            "$ref": "#/components/schemas/ChatPreferences"
           },
           "general": {
             "$ref": "#/components/schemas/GeneralPreferences"

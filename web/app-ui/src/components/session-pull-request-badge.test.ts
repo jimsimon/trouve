@@ -7,6 +7,7 @@ import type {
 import {
   pullRequestsForSession,
   sessionPullRequestBadge,
+  visibleSessionPullRequestBadge,
 } from "./session-pull-request-badge.js";
 
 const pr = (
@@ -71,5 +72,15 @@ describe("session pull-request navigation badges", () => {
     });
     expect(sessionPullRequestBadge([pr(4, { state: "closed" })])?.tone).toBe("closed");
     expect(sessionPullRequestBadge([])).toBeUndefined();
+  });
+
+  it("uses the same session-state precedence in every navigator", () => {
+    const ready = [pr(7, { merge_state_status: "clean" })];
+    expect(visibleSessionPullRequestBadge(ready, "idle", false)?.tone).toBe("ready");
+    expect(visibleSessionPullRequestBadge(ready, "done", true)?.tone).toBe("ready");
+    expect(visibleSessionPullRequestBadge(ready, "running", true)).toBeUndefined();
+    expect(visibleSessionPullRequestBadge(ready, "attention", true)).toBeUndefined();
+    expect(visibleSessionPullRequestBadge(ready, "failed", true)).toBeUndefined();
+    expect(visibleSessionPullRequestBadge(ready, "done", false)).toBeUndefined();
   });
 });

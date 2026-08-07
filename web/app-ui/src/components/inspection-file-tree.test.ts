@@ -173,7 +173,7 @@ describe("files inspection component contract", () => {
     expect(component).toContain("services.protocol.sessionFile(sessionId, path)");
     expect(component).toContain("<trouve-code-view");
     expect(component).toContain('class="unified-diff-list"');
-    expect(component).toContain('class="file-tree-icon"');
+    expect(component).toContain('{ className: "file-tree-icon" }');
   });
 
   it("renders a roving ARIA tree and localized asynchronous states", () => {

@@ -1,5 +1,5 @@
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 const pr = {
   host: "github.com",
@@ -159,6 +159,15 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       await route.fulfill({ status: 204 });
       return;
     }
+    if (key === "GET /v1/server-projection") {
+      // Exercise the cursor-zero compatibility path; the fixture EventSource
+      // supplies the durable GitHub projection used by these shell tests.
+      await route.fulfill({
+        status: 404,
+        json: { code: "not_found", message: "fixture uses legacy projection replay" },
+      });
+      return;
+    }
     const response = responses[key];
     if (response === undefined) {
       await route.fulfill({
@@ -176,6 +185,53 @@ test.beforeEach(async ({ page }) => {
   await installProtocolFixtures(page);
 });
 
+test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
+  test.skip(
+    testInfo.project.name.startsWith("mobile"),
+    "the desktop keyboard palette owns this scrolling contract",
+  );
+  await page.goto("/");
+  await page.addStyleTag({
+    content: ".command-palette-results { max-height: 80px !important; }",
+  });
+  await page.keyboard.press("Control+k");
+
+  const palette = page.locator("trouve-command-palette");
+  const results = palette.locator("#command-palette-results");
+  await expect(page.locator("#command-palette-dialog")).toBeVisible();
+  await expect(palette.locator(".command-palette-state")).toHaveCount(0);
+  await expect(palette.locator(".command-palette-current")).toHaveText("Current");
+  const navigationPrBadge = page.locator(".session-row .session-pr-badge.ready");
+  const palettePrBadge = palette.locator(".session-pr-badge.ready");
+  await expect(palettePrBadge).toHaveAttribute("title", /#42 · Ready to merge/u);
+  await expect(palettePrBadge.locator('[data-font-awesome-icon="code-pull-request"]'))
+    .toBeVisible();
+  expect(await palettePrBadge.evaluate((element) => getComputedStyle(element).color))
+    .toBe(await navigationPrBadge.evaluate((element) => getComputedStyle(element).color));
+  await expect(palette.locator(".command-palette-copy small").filter({ hasText: "Current" }))
+    .toHaveCount(0);
+  const scrolledTop = await results.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll"));
+    return element.scrollTop;
+  });
+  expect(scrolledTop).toBeGreaterThan(0);
+
+  // Session/chat signals request the same component update while the palette
+  // is open. A background render must not reveal its still-selected first row.
+  await palette.evaluate(async (element) => {
+    const component = element as HTMLElement & {
+      requestUpdate(): void;
+      readonly updateComplete: Promise<boolean>;
+    };
+    component.requestUpdate();
+    await component.updateComplete;
+  });
+
+  await expect.poll(() => results.evaluate((element) => element.scrollTop))
+    .toBe(scrolledTop);
+});
+
 test("one durable pull-request projection drives the session badge and dashboard", async ({ browserName, page }, testInfo) => {
   test.skip(testInfo.project.name.startsWith("mobile"), "the session badge belongs to the desktop navigation surface");
   await page.goto("/");
@@ -183,9 +239,41 @@ test("one durable pull-request projection drives the session badge and dashboard
   await expect(page.getByLabel("Pull request. #42 · Ready to merge")).toBeVisible();
 
   await page.getByRole("tab", { name: /Pull Requests/u }).click();
-  await expect(page.locator("trouve-session-pr-panel").getByText("Make it better", {
+  const sessionPanel = page.locator("trouve-session-pr-panel");
+  await expect(sessionPanel.getByText("Make it better", {
     exact: true,
   })).toBeVisible();
+
+  const headingActions = sessionPanel.locator(".pr-toolbar-heading");
+  await expect(headingActions.getByRole("heading", { name: "Pull requests", exact: true }))
+    .toBeVisible();
+  const create = headingActions.getByRole("button", { name: "Create pull request" });
+  await expect(sessionPanel.getByRole("button", { name: "Create PR", exact: true }))
+    .toHaveCount(0);
+  await expect(create.locator('[data-font-awesome-icon="code-pull-request"]')).toBeVisible();
+  await create.click();
+  await expect(sessionPanel.getByRole("heading", { name: "Create pull request", exact: true }))
+    .toBeVisible();
+  await create.click();
+
+  const openPullRequests = headingActions.getByRole("button", { name: "Open Pull Requests" });
+  await expect(openPullRequests).toBeEnabled();
+  await expect(openPullRequests.locator(
+    '[data-font-awesome-icon="arrow-up-right-from-square"]',
+  )).toBeVisible();
+  await page.evaluate(() => {
+    const state = globalThis as typeof globalThis & { openedPullRequestsHref?: string };
+    state.openedPullRequestsHref = "";
+    globalThis.addEventListener("trouve-open-external", (event) => {
+      state.openedPullRequestsHref = (event as CustomEvent<{ readonly href: string }>).detail.href;
+      event.stopImmediatePropagation();
+    }, { capture: true, once: true });
+  });
+  await openPullRequests.click();
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as typeof globalThis & { openedPullRequestsHref?: string })
+      .openedPullRequestsHref,
+  )).toBe("https://github.com/acme/app/pulls");
 
   await page.getByRole("button", { name: "Pull Requests", exact: true }).first().click();
 
@@ -251,7 +339,9 @@ test("an unconfigured GitHub integration stays aligned with the session empty st
 
   await expect(page).toHaveURL(/\/settings\/integrations$/u);
   await expect(page.getByRole("heading", { name: "Integrations", exact: true })).toBeVisible();
-  await expect(page.getByText("○ not configured", { exact: true })).toBeVisible();
+  const status = page.locator(".integration-status");
+  await expect(status).toHaveText(/not configured/u);
+  await expect(status.locator('[data-font-awesome-icon="circle-dot"]')).toBeVisible();
 });
 
 test("the responsive dashboard remains available from the mobile PWA layout", async ({ page }, testInfo) => {
@@ -267,6 +357,139 @@ test("the responsive dashboard remains available from the mobile PWA layout", as
   expect(result.violations.filter(({ impact }) =>
     impact === "serious" || impact === "critical"
   )).toEqual([]);
+});
+
+test("Chat settings default thoughts to visible and persist the grouping opt-in", async ({ page }) => {
+  await page.goto("/settings/chat");
+
+  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+  const toggle = page.getByLabel("Collapse thinking output with tool calls.");
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByText(
+    "When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.",
+    { exact: true },
+  )).toBeVisible();
+
+  await page.getByText("Collapse thinking output with tool calls.", { exact: true }).click();
+  await expect(toggle).toBeChecked();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
+    .toContain('"collapseThinkingWithTools":true');
+
+  await page.reload();
+  await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
+});
+
+test("Modes & Models uses provider-qualified model labels", async ({ page }) => {
+  await page.route("**/v1/models", async (route) => {
+    await route.fulfill({
+      json: [{
+        id: "codex/gpt-5.6-sol",
+        display_name: "GPT-5.6 Sol",
+        context_window: 500_000,
+        supports_tools: true,
+        options_schema: {},
+      }],
+    });
+  });
+  await page.goto("/settings/modes");
+
+  await expect(page.getByRole("heading", { name: "Modes & Models", exact: true }))
+    .toBeVisible();
+  await expect(page.getByRole("option", { name: "codex/gpt-5.6-sol", exact: true }))
+    .toHaveCount(4);
+  await expect(page.getByRole("option", { name: "GPT-5.6 Sol", exact: true }))
+    .toHaveCount(0);
+});
+
+test("automation create and edit preserve model and thinking choices", async ({ page }) => {
+  await page.route("**/v1/models", async (route) => {
+    await route.fulfill({
+      json: [{
+        id: "codex/gpt-5.6-sol",
+        display_name: "GPT-5.6 Sol",
+        context_window: 500_000,
+        supports_tools: true,
+        options_schema: {
+          type: "object",
+          properties: {
+            reasoning_effort: {
+              type: "string",
+              enum: ["low", "medium", "high", "max", "ultra"],
+              default: "medium",
+            },
+          },
+        },
+      }],
+    });
+  });
+
+  const requests: Array<Record<string, unknown>> = [];
+  let savedAutomation: Record<string, unknown> | undefined;
+  const automationMutation = async (route: Route) => {
+    const method = route.request().method();
+    if (method === "GET" && new URL(route.request().url()).pathname === "/v1/automations") {
+      await route.fulfill({ json: savedAutomation === undefined ? [] : [savedAutomation] });
+      return;
+    }
+    if (method !== "POST" && method !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const request = route.request().postDataJSON() as Record<string, unknown>;
+    requests.push(request);
+    savedAutomation = {
+      id: "auto_1",
+      ...request,
+      next_run_at: null,
+      last_run_at: null,
+      last_session_id: null,
+      last_error: "",
+      created_at: "2026-08-06T08:00:00Z",
+    };
+    await route.fulfill({ json: savedAutomation });
+  };
+  await page.route("**/v1/automations", automationMutation);
+  await page.route("**/v1/automations/**", automationMutation);
+
+  await page.goto("/automations");
+  await page.getByRole("button", { name: "New automation", exact: false }).click();
+  await page.getByLabel("Automation name").fill("Nightly checks");
+  await page.getByLabel("Prompt to send").fill("Run all checks");
+
+  const model = page.getByRole("combobox", { name: "Automation model" });
+  const modelPicker = page.locator("trouve-automations-screen trouve-model-picker");
+  await expect(model).toBeEnabled();
+  await model.click();
+  await expect(model).toHaveAttribute("aria-expanded", "true");
+  await modelPicker
+    .getByRole("option", { name: "codex/gpt-5.6-sol", exact: true })
+    .click();
+  const thinking = page.getByRole("combobox", { name: "Thinking", exact: true });
+  await expect(thinking).toBeEnabled();
+  await thinking.selectOption("max");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+
+  await expect.poll(() => requests.length).toBe(1);
+  expect(requests[0]).toMatchObject({
+    model: "codex/gpt-5.6-sol",
+    thinking_level: "max",
+  });
+
+  await page.reload();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Automation model" }))
+    .toContainText("codex/gpt-5.6-sol");
+  await expect(page.getByRole("combobox", { name: "Thinking", exact: true }))
+    .toHaveValue("max");
+  await page.getByRole("combobox", { name: "Thinking", exact: true })
+    .selectOption("ultra");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]).toMatchObject({
+    model: "codex/gpt-5.6-sol",
+    thinking_level: "ultra",
+  });
 });
 
 test("management screens retain their reviewed desktop geometry", async ({ page }, testInfo) => {

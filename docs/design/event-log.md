@@ -70,6 +70,17 @@ projection mutation and its derived server event are committed in the same
 writer transaction, an update is either already represented by the snapshot
 or appears after its cursor; there is no snapshot/stream race window.
 
+`GET /v1/server-projection` supplies the durable replacement state not carried
+by `SessionSummary`: the newest cached account PR list per configured GitHub
+host, the branch- and `session.pr_opened`-derived PR associations for every
+session, and Git & Worktrees settings. Each host slice retains its source event
+cursor and timestamp, and the response carries the current server cursor in
+`x-trouve-event-cursor`. Clients fetch it after the session-summary boundary,
+apply it before opening SSE, and still resume at the earlier session-summary
+cursor. Any replacement event that raced the projection request is therefore
+replayed and ordered by its own cursor, while cold startup no longer scans the
+complete retained server log merely to find the latest replacement events.
+
 Completion, failure, approval, and question source events also derive a
 compact `session.notification` edge after their replacement summary in that
 same transaction. The edge carries the exact category and source thread plus
@@ -110,8 +121,10 @@ Thread scope:
 - `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
   capacity was acquired; background review work uses a lane that reserves
   capacity for interactive desktop turns
-- `turn.started` `{turn, mode, model}` / `turn.completed` `{turn, usage,
-  checkpoint_id?}` / `turn.failed` `{turn, error}`
+- `turn.started` `{turn, mode, model}` / `turn.usage_updated` `{turn, usage}`
+  (live current-context replacement without ending the turn) /
+  `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
+  `{turn, error}`
 - `user.message` `{turn, content}`
 - `assistant.delta` `{turn, text}` — streamed model output
 - `assistant.message` `{turn, content}` — folded final text for the turn

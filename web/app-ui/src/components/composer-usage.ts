@@ -3,6 +3,7 @@ import type { ProtocolUsageSummary } from "../services/protocol-client.js";
 export interface TurnUsageLike {
   readonly input_tokens: number;
   readonly cached_input_tokens?: number;
+  readonly context_input_tokens?: number | null;
   readonly context_window?: number | null;
 }
 
@@ -23,9 +24,14 @@ export const composerContextUsage = (
   usage: TurnUsageLike | undefined,
   catalogWindow: number | null | undefined,
   compacting: boolean,
+  legacyInputIncludesCached = false,
 ): ComposerContextUsage => {
-  const usedTokens = safeTokenCount(usage?.input_tokens)
-    + safeTokenCount(usage?.cached_input_tokens);
+  const explicitContextReported = usage?.context_input_tokens !== undefined
+    && usage.context_input_tokens !== null;
+  const usedTokens = explicitContextReported
+    ? safeTokenCount(usage?.context_input_tokens)
+    : safeTokenCount(usage?.input_tokens)
+      + (legacyInputIncludesCached ? 0 : safeTokenCount(usage?.cached_input_tokens));
   const configuredWindow = safeTokenCount(catalogWindow);
   const liveWindowReported = usage?.context_window !== undefined
     && usage.context_window !== null;

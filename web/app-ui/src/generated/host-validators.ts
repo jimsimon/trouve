@@ -411,13 +411,14 @@ validate20.evaluated = {"props":{"capabilities":true,"csrf_token":true,"font_fam
 
 export const hostPreferences = validate26;
 const schema36 = {"$id":"urn:trouve:host-validator:hostPreferences","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostPreferences"};
-const schema37 = {"type":"object","description":"Nonsecret settings that the native host may persist across ephemeral ports.","required":["appearance","navigation_width","inspection_width"],"properties":{"appearance":{"$ref":"#/components/schemas/AppearancePreferences"},"general":{"$ref":"#/components/schemas/GeneralPreferences"},"geometry":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/WindowGeometry"}]},"inspection_width":{"type":"number","format":"float"},"navigation_width":{"type":"number","format":"float"},"notifications":{"$ref":"#/components/schemas/NotificationPreferences"},"pull_request_group_order":{"type":"array","items":{"type":"string"}},"resume":{"$ref":"#/components/schemas/ResumePreferences"},"workspace_order":{"type":"array","items":{"type":"string"}}}};
+const schema37 = {"type":"object","description":"Nonsecret settings that the native host may persist across ephemeral ports.","required":["appearance","navigation_width","inspection_width"],"properties":{"appearance":{"$ref":"#/components/schemas/AppearancePreferences"},"chat":{"$ref":"#/components/schemas/ChatPreferences"},"general":{"$ref":"#/components/schemas/GeneralPreferences"},"geometry":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/WindowGeometry"}]},"inspection_width":{"type":"number","format":"float"},"navigation_width":{"type":"number","format":"float"},"notifications":{"$ref":"#/components/schemas/NotificationPreferences"},"pull_request_group_order":{"type":"array","items":{"type":"string"}},"resume":{"$ref":"#/components/schemas/ResumePreferences"},"workspace_order":{"type":"array","items":{"type":"string"}}}};
 const schema38 = {"type":"object","required":["theme","font_family","font_size","reduce_motion"],"properties":{"font_family":{"type":"string"},"font_size":{"type":"integer","format":"int32","minimum":0},"reduce_motion":{"type":"boolean"},"theme":{"type":"string"}}};
-const schema39 = {"type":"object","description":"General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.","properties":{"prevent_sleep_while_running":{"type":"boolean"}}};
-const schema40 = {"type":"object","required":["x","y","width","height","maximized"],"properties":{"height":{"type":"integer","format":"int32","minimum":0},"maximized":{"type":"boolean"},"width":{"type":"integer","format":"int32","minimum":0},"x":{"type":"integer","format":"int32"},"y":{"type":"integer","format":"int32"}}};
-const schema41 = {"type":"object","description":"Notification policy remains frontend-owned. The native host persists the\nchoices and delivers only already-gated notification requests.","properties":{"enabled":{"type":"boolean"},"on_attention":{"type":"boolean"},"on_fail":{"type":"boolean"},"on_finish":{"type":"boolean"},"sound":{"type":"boolean"}}};
-const schema42 = {"type":"object","description":"Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.","properties":{"selected_session_id":{"type":"string"},"session_threads":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string"}},"thread_scroll":{"type":"object","additionalProperties":{"$ref":"#/components/schemas/ChatScrollBookmark"},"propertyNames":{"type":"string"}}}};
-const schema43 = {"type":"object","description":"Stable first-visible chat item plus its non-negative offset into the item.\nUnlike raw scroll pixels, this survives font and window-size changes.","required":["item_id","offset"],"properties":{"item_id":{"type":"string"},"offset":{"type":"number","format":"float"}}};
+const schema39 = {"type":"object","description":"Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.","properties":{"collapse_thinking_with_tools":{"type":"boolean","description":"Include thinking output in collapsible tool-activity groups."}}};
+const schema40 = {"type":"object","description":"General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.","properties":{"prevent_sleep_while_running":{"type":"boolean"}}};
+const schema41 = {"type":"object","required":["x","y","width","height","maximized"],"properties":{"height":{"type":"integer","format":"int32","minimum":0},"maximized":{"type":"boolean"},"width":{"type":"integer","format":"int32","minimum":0},"x":{"type":"integer","format":"int32"},"y":{"type":"integer","format":"int32"}}};
+const schema42 = {"type":"object","description":"Notification policy remains frontend-owned. The native host persists the\nchoices and delivers only already-gated notification requests.","properties":{"enabled":{"type":"boolean"},"on_attention":{"type":"boolean"},"on_fail":{"type":"boolean"},"on_finish":{"type":"boolean"},"sound":{"type":"boolean"}}};
+const schema43 = {"type":"object","description":"Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.","properties":{"selected_session_id":{"type":"string"},"session_threads":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string"}},"thread_scroll":{"type":"object","additionalProperties":{"$ref":"#/components/schemas/ChatScrollBookmark"},"propertyNames":{"type":"string"}}}};
+const schema44 = {"type":"object","description":"Stable first-visible chat item plus its non-negative offset into the item.\nUnlike raw scroll pixels, this survives font and window-size changes.","required":["item_id","offset"],"properties":{"item_id":{"type":"string"},"offset":{"type":"number","format":"float"}}};
 
 function validate28(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -711,14 +712,38 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.general !== undefined){
-let data5 = data.general;
+if(data.chat !== undefined){
+let data5 = data.chat;
 const _errs12 = errors;
 const _errs13 = errors;
 if(errors === _errs13){
 if(data5 && typeof data5 == "object" && !Array.isArray(data5)){
-if(data5.prevent_sleep_while_running !== undefined){
-if(typeof data5.prevent_sleep_while_running !== "boolean"){
+if(data5.collapse_thinking_with_tools !== undefined){
+if(typeof data5.collapse_thinking_with_tools !== "boolean"){
+validate27.errors = [{instancePath:instancePath+"/chat/collapse_thinking_with_tools",schemaPath:"#/components/schemas/ChatPreferences/properties/collapse_thinking_with_tools/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+}
+}
+else {
+validate27.errors = [{instancePath:instancePath+"/chat",schemaPath:"#/components/schemas/ChatPreferences/type",keyword:"type",params:{type: "object"},message:"must be object"}];
+return false;
+}
+}
+var valid0 = _errs12 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.general !== undefined){
+let data7 = data.general;
+const _errs17 = errors;
+const _errs18 = errors;
+if(errors === _errs18){
+if(data7 && typeof data7 == "object" && !Array.isArray(data7)){
+if(data7.prevent_sleep_while_running !== undefined){
+if(typeof data7.prevent_sleep_while_running !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/general/prevent_sleep_while_running",schemaPath:"#/components/schemas/GeneralPreferences/properties/prevent_sleep_while_running/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
@@ -729,20 +754,20 @@ validate27.errors = [{instancePath:instancePath+"/general",schemaPath:"#/compone
 return false;
 }
 }
-var valid0 = _errs12 === errors;
+var valid0 = _errs17 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.geometry !== undefined){
-let data7 = data.geometry;
-const _errs17 = errors;
-const _errs18 = errors;
-let valid5 = false;
+let data9 = data.geometry;
+const _errs22 = errors;
+const _errs23 = errors;
+let valid7 = false;
 let passing0 = null;
-const _errs19 = errors;
-if(data7 !== null){
+const _errs24 = errors;
+if(data9 !== null){
 const err0 = {instancePath:instancePath+"/geometry",schemaPath:"#/properties/geometry/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err0];
@@ -752,17 +777,17 @@ vErrors.push(err0);
 }
 errors++;
 }
-var _valid0 = _errs19 === errors;
+var _valid0 = _errs24 === errors;
 if(_valid0){
-valid5 = true;
+valid7 = true;
 passing0 = 0;
 }
-const _errs21 = errors;
-const _errs22 = errors;
-if(errors === _errs22){
-if(data7 && typeof data7 == "object" && !Array.isArray(data7)){
+const _errs26 = errors;
+const _errs27 = errors;
+if(errors === _errs27){
+if(data9 && typeof data9 == "object" && !Array.isArray(data9)){
 let missing2;
-if((((((data7.x === undefined) && (missing2 = "x")) || ((data7.y === undefined) && (missing2 = "y"))) || ((data7.width === undefined) && (missing2 = "width"))) || ((data7.height === undefined) && (missing2 = "height"))) || ((data7.maximized === undefined) && (missing2 = "maximized"))){
+if((((((data9.x === undefined) && (missing2 = "x")) || ((data9.y === undefined) && (missing2 = "y"))) || ((data9.width === undefined) && (missing2 = "width"))) || ((data9.height === undefined) && (missing2 = "height"))) || ((data9.maximized === undefined) && (missing2 = "maximized"))){
 const err1 = {instancePath:instancePath+"/geometry",schemaPath:"#/components/schemas/WindowGeometry/required",keyword:"required",params:{missingProperty: missing2},message:"must have required property '"+missing2+"'"};
 if(vErrors === null){
 vErrors = [err1];
@@ -773,10 +798,10 @@ vErrors.push(err1);
 errors++;
 }
 else {
-if(data7.height !== undefined){
-let data8 = data7.height;
-const _errs24 = errors;
-if(!((typeof data8 == "number") && (!(data8 % 1) && !isNaN(data8)))){
+if(data9.height !== undefined){
+let data10 = data9.height;
+const _errs29 = errors;
+if(!((typeof data10 == "number") && (!(data10 % 1) && !isNaN(data10)))){
 const err2 = {instancePath:instancePath+"/geometry/height",schemaPath:"#/components/schemas/WindowGeometry/properties/height/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err2];
@@ -786,9 +811,9 @@ vErrors.push(err2);
 }
 errors++;
 }
-if(errors === _errs24){
-if(typeof data8 == "number"){
-if(data8 < 0 || isNaN(data8)){
+if(errors === _errs29){
+if(typeof data10 == "number"){
+if(data10 < 0 || isNaN(data10)){
 const err3 = {instancePath:instancePath+"/geometry/height",schemaPath:"#/components/schemas/WindowGeometry/properties/height/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
 if(vErrors === null){
 vErrors = [err3];
@@ -800,15 +825,15 @@ errors++;
 }
 }
 }
-var valid7 = _errs24 === errors;
+var valid9 = _errs29 === errors;
 }
 else {
-var valid7 = true;
+var valid9 = true;
 }
-if(valid7){
-if(data7.maximized !== undefined){
-const _errs26 = errors;
-if(typeof data7.maximized !== "boolean"){
+if(valid9){
+if(data9.maximized !== undefined){
+const _errs31 = errors;
+if(typeof data9.maximized !== "boolean"){
 const err4 = {instancePath:instancePath+"/geometry/maximized",schemaPath:"#/components/schemas/WindowGeometry/properties/maximized/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
 if(vErrors === null){
 vErrors = [err4];
@@ -818,16 +843,16 @@ vErrors.push(err4);
 }
 errors++;
 }
-var valid7 = _errs26 === errors;
+var valid9 = _errs31 === errors;
 }
 else {
-var valid7 = true;
+var valid9 = true;
 }
-if(valid7){
-if(data7.width !== undefined){
-let data10 = data7.width;
-const _errs28 = errors;
-if(!((typeof data10 == "number") && (!(data10 % 1) && !isNaN(data10)))){
+if(valid9){
+if(data9.width !== undefined){
+let data12 = data9.width;
+const _errs33 = errors;
+if(!((typeof data12 == "number") && (!(data12 % 1) && !isNaN(data12)))){
 const err5 = {instancePath:instancePath+"/geometry/width",schemaPath:"#/components/schemas/WindowGeometry/properties/width/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err5];
@@ -837,9 +862,9 @@ vErrors.push(err5);
 }
 errors++;
 }
-if(errors === _errs28){
-if(typeof data10 == "number"){
-if(data10 < 0 || isNaN(data10)){
+if(errors === _errs33){
+if(typeof data12 == "number"){
+if(data12 < 0 || isNaN(data12)){
 const err6 = {instancePath:instancePath+"/geometry/width",schemaPath:"#/components/schemas/WindowGeometry/properties/width/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
 if(vErrors === null){
 vErrors = [err6];
@@ -851,16 +876,16 @@ errors++;
 }
 }
 }
-var valid7 = _errs28 === errors;
+var valid9 = _errs33 === errors;
 }
 else {
-var valid7 = true;
+var valid9 = true;
 }
-if(valid7){
-if(data7.x !== undefined){
-let data11 = data7.x;
-const _errs30 = errors;
-if(!((typeof data11 == "number") && (!(data11 % 1) && !isNaN(data11)))){
+if(valid9){
+if(data9.x !== undefined){
+let data13 = data9.x;
+const _errs35 = errors;
+if(!((typeof data13 == "number") && (!(data13 % 1) && !isNaN(data13)))){
 const err7 = {instancePath:instancePath+"/geometry/x",schemaPath:"#/components/schemas/WindowGeometry/properties/x/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err7];
@@ -870,16 +895,16 @@ vErrors.push(err7);
 }
 errors++;
 }
-var valid7 = _errs30 === errors;
+var valid9 = _errs35 === errors;
 }
 else {
-var valid7 = true;
+var valid9 = true;
 }
-if(valid7){
-if(data7.y !== undefined){
-let data12 = data7.y;
-const _errs32 = errors;
-if(!((typeof data12 == "number") && (!(data12 % 1) && !isNaN(data12)))){
+if(valid9){
+if(data9.y !== undefined){
+let data14 = data9.y;
+const _errs37 = errors;
+if(!((typeof data14 == "number") && (!(data14 % 1) && !isNaN(data14)))){
 const err8 = {instancePath:instancePath+"/geometry/y",schemaPath:"#/components/schemas/WindowGeometry/properties/y/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err8];
@@ -889,10 +914,10 @@ vErrors.push(err8);
 }
 errors++;
 }
-var valid7 = _errs32 === errors;
+var valid9 = _errs37 === errors;
 }
 else {
-var valid7 = true;
+var valid9 = true;
 }
 }
 }
@@ -911,14 +936,14 @@ vErrors.push(err9);
 errors++;
 }
 }
-var _valid0 = _errs21 === errors;
-if(_valid0 && valid5){
-valid5 = false;
+var _valid0 = _errs26 === errors;
+if(_valid0 && valid7){
+valid7 = false;
 passing0 = [passing0, 1];
 }
 else {
 if(_valid0){
-valid5 = true;
+valid7 = true;
 passing0 = 1;
 var props0 = {};
 props0.height = true;
@@ -928,7 +953,7 @@ props0.x = true;
 props0.y = true;
 }
 }
-if(!valid5){
+if(!valid7){
 const err10 = {instancePath:instancePath+"/geometry",schemaPath:"#/properties/geometry/oneOf",keyword:"oneOf",params:{passingSchemas: passing0},message:"must match exactly one schema in oneOf"};
 if(vErrors === null){
 vErrors = [err10];
@@ -941,114 +966,114 @@ validate27.errors = vErrors;
 return false;
 }
 else {
-errors = _errs18;
+errors = _errs23;
 if(vErrors !== null){
-if(_errs18){
-vErrors.length = _errs18;
+if(_errs23){
+vErrors.length = _errs23;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs17 === errors;
+var valid0 = _errs22 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.inspection_width !== undefined){
-const _errs34 = errors;
-if(errors === _errs34){
+const _errs39 = errors;
+if(errors === _errs39){
 if(!(typeof data.inspection_width == "number")){
 validate27.errors = [{instancePath:instancePath+"/inspection_width",schemaPath:"#/properties/inspection_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
 return false;
 }
 }
-var valid0 = _errs34 === errors;
+var valid0 = _errs39 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.navigation_width !== undefined){
-const _errs36 = errors;
-if(errors === _errs36){
+const _errs41 = errors;
+if(errors === _errs41){
 if(!(typeof data.navigation_width == "number")){
 validate27.errors = [{instancePath:instancePath+"/navigation_width",schemaPath:"#/properties/navigation_width/type",keyword:"type",params:{type: "number"},message:"must be number"}];
 return false;
 }
 }
-var valid0 = _errs36 === errors;
+var valid0 = _errs41 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.notifications !== undefined){
-let data15 = data.notifications;
-const _errs38 = errors;
-const _errs39 = errors;
-if(errors === _errs39){
-if(data15 && typeof data15 == "object" && !Array.isArray(data15)){
-if(data15.enabled !== undefined){
-const _errs41 = errors;
-if(typeof data15.enabled !== "boolean"){
+let data17 = data.notifications;
+const _errs43 = errors;
+const _errs44 = errors;
+if(errors === _errs44){
+if(data17 && typeof data17 == "object" && !Array.isArray(data17)){
+if(data17.enabled !== undefined){
+const _errs46 = errors;
+if(typeof data17.enabled !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/notifications/enabled",schemaPath:"#/components/schemas/NotificationPreferences/properties/enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid9 = _errs41 === errors;
+var valid11 = _errs46 === errors;
 }
 else {
-var valid9 = true;
+var valid11 = true;
 }
-if(valid9){
-if(data15.on_attention !== undefined){
-const _errs43 = errors;
-if(typeof data15.on_attention !== "boolean"){
+if(valid11){
+if(data17.on_attention !== undefined){
+const _errs48 = errors;
+if(typeof data17.on_attention !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/notifications/on_attention",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_attention/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid9 = _errs43 === errors;
+var valid11 = _errs48 === errors;
 }
 else {
-var valid9 = true;
+var valid11 = true;
 }
-if(valid9){
-if(data15.on_fail !== undefined){
-const _errs45 = errors;
-if(typeof data15.on_fail !== "boolean"){
+if(valid11){
+if(data17.on_fail !== undefined){
+const _errs50 = errors;
+if(typeof data17.on_fail !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/notifications/on_fail",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_fail/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid9 = _errs45 === errors;
+var valid11 = _errs50 === errors;
 }
 else {
-var valid9 = true;
+var valid11 = true;
 }
-if(valid9){
-if(data15.on_finish !== undefined){
-const _errs47 = errors;
-if(typeof data15.on_finish !== "boolean"){
+if(valid11){
+if(data17.on_finish !== undefined){
+const _errs52 = errors;
+if(typeof data17.on_finish !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/notifications/on_finish",schemaPath:"#/components/schemas/NotificationPreferences/properties/on_finish/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid9 = _errs47 === errors;
+var valid11 = _errs52 === errors;
 }
 else {
-var valid9 = true;
+var valid11 = true;
 }
-if(valid9){
-if(data15.sound !== undefined){
-const _errs49 = errors;
-if(typeof data15.sound !== "boolean"){
+if(valid11){
+if(data17.sound !== undefined){
+const _errs54 = errors;
+if(typeof data17.sound !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/notifications/sound",schemaPath:"#/components/schemas/NotificationPreferences/properties/sound/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid9 = _errs49 === errors;
+var valid11 = _errs54 === errors;
 }
 else {
-var valid9 = true;
+var valid11 = true;
 }
 }
 }
@@ -1060,27 +1085,27 @@ validate27.errors = [{instancePath:instancePath+"/notifications",schemaPath:"#/c
 return false;
 }
 }
-var valid0 = _errs38 === errors;
+var valid0 = _errs43 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.pull_request_group_order !== undefined){
-let data21 = data.pull_request_group_order;
-const _errs51 = errors;
-if(errors === _errs51){
-if(Array.isArray(data21)){
-var valid10 = true;
-const len0 = data21.length;
+let data23 = data.pull_request_group_order;
+const _errs56 = errors;
+if(errors === _errs56){
+if(Array.isArray(data23)){
+var valid12 = true;
+const len0 = data23.length;
 for(let i0=0; i0<len0; i0++){
-const _errs53 = errors;
-if(typeof data21[i0] !== "string"){
+const _errs58 = errors;
+if(typeof data23[i0] !== "string"){
 validate27.errors = [{instancePath:instancePath+"/pull_request_group_order/" + i0,schemaPath:"#/properties/pull_request_group_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid10 = _errs53 === errors;
-if(!valid10){
+var valid12 = _errs58 === errors;
+if(!valid12){
 break;
 }
 }
@@ -1090,39 +1115,39 @@ validate27.errors = [{instancePath:instancePath+"/pull_request_group_order",sche
 return false;
 }
 }
-var valid0 = _errs51 === errors;
+var valid0 = _errs56 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.resume !== undefined){
-const _errs55 = errors;
+const _errs60 = errors;
 if(!(validate28(data.resume, {instancePath:instancePath+"/resume",parentData:data,parentDataProperty:"resume",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate28.errors : vErrors.concat(validate28.errors);
 errors = vErrors.length;
 }
-var valid0 = _errs55 === errors;
+var valid0 = _errs60 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.workspace_order !== undefined){
-let data24 = data.workspace_order;
-const _errs56 = errors;
-if(errors === _errs56){
-if(Array.isArray(data24)){
-var valid11 = true;
-const len1 = data24.length;
+let data26 = data.workspace_order;
+const _errs61 = errors;
+if(errors === _errs61){
+if(Array.isArray(data26)){
+var valid13 = true;
+const len1 = data26.length;
 for(let i1=0; i1<len1; i1++){
-const _errs58 = errors;
-if(typeof data24[i1] !== "string"){
+const _errs63 = errors;
+if(typeof data26[i1] !== "string"){
 validate27.errors = [{instancePath:instancePath+"/workspace_order/" + i1,schemaPath:"#/properties/workspace_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid11 = _errs58 === errors;
-if(!valid11){
+var valid13 = _errs63 === errors;
+if(!valid13){
 break;
 }
 }
@@ -1132,10 +1157,11 @@ validate27.errors = [{instancePath:instancePath+"/workspace_order",schemaPath:"#
 return false;
 }
 }
-var valid0 = _errs56 === errors;
+var valid0 = _errs61 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -1155,7 +1181,7 @@ return false;
 validate27.errors = vErrors;
 return errors === 0;
 }
-validate27.evaluated = {"props":{"appearance":true,"general":true,"geometry":true,"inspection_width":true,"navigation_width":true,"notifications":true,"pull_request_group_order":true,"resume":true,"workspace_order":true},"dynamicProps":false,"dynamicItems":false};
+validate27.evaluated = {"props":{"appearance":true,"chat":true,"general":true,"geometry":true,"inspection_width":true,"navigation_width":true,"notifications":true,"pull_request_group_order":true,"resume":true,"workspace_order":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate26(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -1176,13 +1202,13 @@ errors = vErrors.length;
 validate26.errors = vErrors;
 return errors === 0;
 }
-validate26.evaluated = {"props":{"appearance":true,"general":true,"geometry":true,"inspection_width":true,"navigation_width":true,"notifications":true,"pull_request_group_order":true,"resume":true,"workspace_order":true},"dynamicProps":false,"dynamicItems":false};
+validate26.evaluated = {"props":{"appearance":true,"chat":true,"general":true,"geometry":true,"inspection_width":true,"navigation_width":true,"notifications":true,"pull_request_group_order":true,"resume":true,"workspace_order":true},"dynamicProps":false,"dynamicItems":false};
 
 export const hostLifecycleBatch = validate31;
-const schema44 = {"$id":"urn:trouve:host-validator:hostLifecycleBatch","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostLifecycleBatch"};
-const schema45 = {"type":"object","description":"Cursor-addressed batch of ephemeral native window events plus the latest\nrecoverable state. The host retains only a bounded event tail.","required":["cursor","state","events"],"properties":{"cursor":{"type":"integer","format":"int64","minimum":0},"events":{"type":"array","items":{"$ref":"#/components/schemas/HostLifecycleEnvelope"}},"state":{"$ref":"#/components/schemas/HostLifecycleState"}}};
-const schema46 = {"type":"object","required":["cursor","event"],"properties":{"cursor":{"type":"integer","format":"int64","minimum":0},"event":{"$ref":"#/components/schemas/HostLifecycleEvent"}}};
-const schema47 = {"oneOf":[{"type":"object","required":["focused","type"],"properties":{"focused":{"type":"boolean"},"type":{"type":"string","enum":["focus_changed"]}}},{"type":"object","required":["visible","type"],"properties":{"type":{"type":"string","enum":["visibility_changed"]},"visible":{"type":"boolean"}}},{"type":"object","required":["occluded","type"],"properties":{"occluded":{"type":"boolean"},"type":{"type":"string","enum":["occlusion_changed"]}}},{"type":"object","required":["request_id","type"],"properties":{"request_id":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["close_requested"]}}},{"type":"object","required":["notification_id","session_id","type"],"properties":{"notification_id":{"type":"string"},"session_id":{"type":"string"},"thread_id":{"type":["string","null"]},"type":{"type":"string","enum":["notification_activated"]}}}],"description":"Ephemeral events emitted by the desktop host to its webview."};
+const schema45 = {"$id":"urn:trouve:host-validator:hostLifecycleBatch","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/HostLifecycleBatch"};
+const schema46 = {"type":"object","description":"Cursor-addressed batch of ephemeral native window events plus the latest\nrecoverable state. The host retains only a bounded event tail.","required":["cursor","state","events"],"properties":{"cursor":{"type":"integer","format":"int64","minimum":0},"events":{"type":"array","items":{"$ref":"#/components/schemas/HostLifecycleEnvelope"}},"state":{"$ref":"#/components/schemas/HostLifecycleState"}}};
+const schema47 = {"type":"object","required":["cursor","event"],"properties":{"cursor":{"type":"integer","format":"int64","minimum":0},"event":{"$ref":"#/components/schemas/HostLifecycleEvent"}}};
+const schema48 = {"oneOf":[{"type":"object","required":["focused","type"],"properties":{"focused":{"type":"boolean"},"type":{"type":"string","enum":["focus_changed"]}}},{"type":"object","required":["visible","type"],"properties":{"type":{"type":"string","enum":["visibility_changed"]},"visible":{"type":"boolean"}}},{"type":"object","required":["occluded","type"],"properties":{"occluded":{"type":"boolean"},"type":{"type":"string","enum":["occlusion_changed"]}}},{"type":"object","required":["request_id","type"],"properties":{"request_id":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["close_requested"]}}},{"type":"object","required":["notification_id","session_id","type"],"properties":{"notification_id":{"type":"string"},"session_id":{"type":"string"},"thread_id":{"type":["string","null"]},"type":{"type":"string","enum":["notification_activated"]}}}],"description":"Ephemeral events emitted by the desktop host to its webview."};
 
 function validate33(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1276,7 +1302,7 @@ vErrors.push(err2);
 errors++;
 }
 if(!(data3 === "focus_changed")){
-const err3 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/0/properties/type/enum",keyword:"enum",params:{allowedValues: schema47.oneOf[0].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err3 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/0/properties/type/enum",keyword:"enum",params:{allowedValues: schema48.oneOf[0].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err3];
 }
@@ -1341,7 +1367,7 @@ vErrors.push(err6);
 errors++;
 }
 if(!(data4 === "visibility_changed")){
-const err7 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/1/properties/type/enum",keyword:"enum",params:{allowedValues: schema47.oneOf[1].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err7 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/1/properties/type/enum",keyword:"enum",params:{allowedValues: schema48.oneOf[1].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err7];
 }
@@ -1449,7 +1475,7 @@ vErrors.push(err12);
 errors++;
 }
 if(!(data7 === "occlusion_changed")){
-const err13 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/2/properties/type/enum",keyword:"enum",params:{allowedValues: schema47.oneOf[2].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err13 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/2/properties/type/enum",keyword:"enum",params:{allowedValues: schema48.oneOf[2].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err13];
 }
@@ -1554,7 +1580,7 @@ vErrors.push(err18);
 errors++;
 }
 if(!(data9 === "close_requested")){
-const err19 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/3/properties/type/enum",keyword:"enum",params:{allowedValues: schema47.oneOf[3].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err19 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/3/properties/type/enum",keyword:"enum",params:{allowedValues: schema48.oneOf[3].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err19];
 }
@@ -1652,7 +1678,7 @@ if(data1.thread_id !== undefined){
 let data12 = data1.thread_id;
 const _errs36 = errors;
 if((typeof data12 !== "string") && (data12 !== null)){
-const err24 = {instancePath:instancePath+"/event/thread_id",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/4/properties/thread_id/type",keyword:"type",params:{type: schema47.oneOf[4].properties.thread_id.type},message:"must be string,null"};
+const err24 = {instancePath:instancePath+"/event/thread_id",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/4/properties/thread_id/type",keyword:"type",params:{type: schema48.oneOf[4].properties.thread_id.type},message:"must be string,null"};
 if(vErrors === null){
 vErrors = [err24];
 }
@@ -1681,7 +1707,7 @@ vErrors.push(err25);
 errors++;
 }
 if(!(data13 === "notification_activated")){
-const err26 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/4/properties/type/enum",keyword:"enum",params:{allowedValues: schema47.oneOf[4].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err26 = {instancePath:instancePath+"/event/type",schemaPath:"#/components/schemas/HostLifecycleEvent/oneOf/4/properties/type/enum",keyword:"enum",params:{allowedValues: schema48.oneOf[4].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err26];
 }
@@ -1773,8 +1799,8 @@ return errors === 0;
 }
 validate33.evaluated = {"props":{"cursor":true,"event":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema48 = {"type":"object","description":"Current frontend-visible native window state. This is ephemeral host state,\nnot agent or session state.","required":["focused","visible","occluded"],"properties":{"focused":{"type":"boolean"},"occluded":{"type":"boolean"},"pending_close":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/PendingCloseRequest"}]},"visible":{"type":"boolean"}}};
-const schema49 = {"type":"object","required":["request_id","waiting_for_idle"],"properties":{"request_id":{"type":"integer","format":"int64","minimum":0},"waiting_for_idle":{"type":"boolean","description":"True only after the frontend chose “quit when idle”. The host never\ndecides whether the application is idle; the protocol-backed frontend\nmust later confirm `quit_now` for this same request."}}};
+const schema49 = {"type":"object","description":"Current frontend-visible native window state. This is ephemeral host state,\nnot agent or session state.","required":["focused","visible","occluded"],"properties":{"focused":{"type":"boolean"},"occluded":{"type":"boolean"},"pending_close":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/PendingCloseRequest"}]},"visible":{"type":"boolean"}}};
+const schema50 = {"type":"object","required":["request_id","waiting_for_idle"],"properties":{"request_id":{"type":"integer","format":"int64","minimum":0},"waiting_for_idle":{"type":"boolean","description":"True only after the frontend chose “quit when idle”. The host never\ndecides whether the application is idle; the protocol-backed frontend\nmust later confirm `quit_now` for this same request."}}};
 
 function validate35(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -2106,8 +2132,8 @@ return errors === 0;
 validate31.evaluated = {"props":{"cursor":true,"events":true,"state":true},"dynamicProps":false,"dynamicItems":false};
 
 export const pickDirectoryResponse = validate38;
-const schema50 = {"$id":"urn:trouve:host-validator:pickDirectoryResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/PickDirectoryResponse"};
-const schema51 = {"type":"object","description":"A cancelled picker succeeds with `path: null`; cancellation is not a host\nerror and must not be presented as one by the frontend.","required":["path"],"properties":{"path":{"type":["string","null"]}}};
+const schema51 = {"$id":"urn:trouve:host-validator:pickDirectoryResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/PickDirectoryResponse"};
+const schema52 = {"type":"object","description":"A cancelled picker succeeds with `path: null`; cancellation is not a host\nerror and must not be presented as one by the frontend.","required":["path"],"properties":{"path":{"type":["string","null"]}}};
 
 function validate38(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 /*# sourceURL="urn:trouve:host-validator:pickDirectoryResponse" */;
@@ -2132,7 +2158,7 @@ else {
 if(data.path !== undefined){
 let data0 = data.path;
 if((typeof data0 !== "string") && (data0 !== null)){
-validate38.errors = [{instancePath:instancePath+"/path",schemaPath:"urn:trouve:desktop-host-openapi#/components/schemas/PickDirectoryResponse/properties/path/type",keyword:"type",params:{type: schema51.properties.path.type},message:"must be string,null"}];
+validate38.errors = [{instancePath:instancePath+"/path",schemaPath:"urn:trouve:desktop-host-openapi#/components/schemas/PickDirectoryResponse/properties/path/type",keyword:"type",params:{type: schema52.properties.path.type},message:"must be string,null"}];
 return false;
 }
 }
@@ -2149,9 +2175,9 @@ return errors === 0;
 validate38.evaluated = {"props":{"path":true},"dynamicProps":false,"dynamicItems":false};
 
 export const pickFilesResponse = validate39;
-const schema52 = {"$id":"urn:trouve:host-validator:pickFilesResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/PickFilesResponse"};
-const schema53 = {"type":"object","description":"Cancellation succeeds with an empty attachment list.","required":["attachments"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentPayload"},"maxItems":4}}};
-const schema54 = {"type":"object","description":"One bounded attachment ready to be staged by a composer. Native paths and\nfile handles are deliberately absent from this schema.","required":["name","mime","data","size_bytes"],"properties":{"data":{"type":"string","description":"Standard padded base64, bounded to the encoded 10 MiB payload limit."},"mime":{"type":"string","description":"ASCII MIME type, bounded to 255 bytes by the host and client."},"name":{"type":"string","description":"UTF-8 display name, bounded to 1 KiB by the host and client."},"size_bytes":{"type":"integer","format":"int64","maximum":10485760,"minimum":1}}};
+const schema53 = {"$id":"urn:trouve:host-validator:pickFilesResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/PickFilesResponse"};
+const schema54 = {"type":"object","description":"Cancellation succeeds with an empty attachment list.","required":["attachments"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentPayload"},"maxItems":4}}};
+const schema55 = {"type":"object","description":"One bounded attachment ready to be staged by a composer. Native paths and\nfile handles are deliberately absent from this schema.","required":["name","mime","data","size_bytes"],"properties":{"data":{"type":"string","description":"Standard padded base64, bounded to the encoded 10 MiB payload limit."},"mime":{"type":"string","description":"ASCII MIME type, bounded to 255 bytes by the host and client."},"name":{"type":"string","description":"UTF-8 display name, bounded to 1 KiB by the host and client."},"size_bytes":{"type":"integer","format":"int64","maximum":10485760,"minimum":1}}};
 
 function validate40(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -2314,8 +2340,8 @@ return errors === 0;
 validate39.evaluated = {"props":{"attachments":true},"dynamicProps":false,"dynamicItems":false};
 
 export const readClipboardImageResponse = validate42;
-const schema55 = {"$id":"urn:trouve:host-validator:readClipboardImageResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/ReadClipboardImageResponse"};
-const schema56 = {"type":"object","description":"Text, an empty clipboard, and unsupported clipboard content all succeed\nwith `attachment: null`, allowing ordinary browser paste to continue.","required":["attachment"],"properties":{"attachment":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/AttachmentPayload"}]}}};
+const schema56 = {"$id":"urn:trouve:host-validator:readClipboardImageResponse","$ref":"urn:trouve:desktop-host-openapi#/components/schemas/ReadClipboardImageResponse"};
+const schema57 = {"type":"object","description":"Text, an empty clipboard, and unsupported clipboard content all succeed\nwith `attachment: null`, allowing ordinary browser paste to continue.","required":["attachment"],"properties":{"attachment":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/AttachmentPayload"}]}}};
 
 function validate43(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;

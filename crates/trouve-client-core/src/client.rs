@@ -159,6 +159,19 @@ impl ProtocolClient {
         self.post_empty("/github/prs/refresh").await
     }
 
+    /// Fetch durable server-owned UI state without replaying retained server
+    /// history. Live server events resume after the accompanying cursor.
+    pub async fn server_projection(&self) -> Result<(u64, ServerProjection)> {
+        let path = "/server-projection";
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, path).await
+    }
+
     pub async fn close_workspace(&self, workspace_id: &str) -> Result<()> {
         self.delete(&format!("/workspaces/{workspace_id}")).await
     }
@@ -278,6 +291,8 @@ impl ProtocolClient {
             .patch(format!("{}{path}", self.base))
             .json(&trouve_protocol::UpdateQueuedPromptRequest {
                 content: content.into(),
+                retained_attachment_ids: None,
+                attachments: Vec::new(),
             })
             .send()
             .await

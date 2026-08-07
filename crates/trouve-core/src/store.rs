@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS automations (
   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
   mode TEXT,
   model TEXT,
+  thinking_level TEXT,
   permission_mode TEXT NOT NULL DEFAULT 'ask',
   schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -402,6 +403,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
+    "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
     "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
@@ -1190,8 +1192,8 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
 
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
-    let permission_mode: String = r.get(6)?;
-    let schedule_json: String = r.get(7)?;
+    let permission_mode: String = r.get(7)?;
+    let schedule_json: String = r.get(8)?;
     Ok(trouve_protocol::Automation {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -1199,6 +1201,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         workspace_id: r.get(3)?,
         mode: r.get(4)?,
         model: r.get(5)?,
+        thinking_level: r.get(6)?,
         permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
@@ -1208,12 +1211,12 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
                 days: vec![],
             },
         ),
-        enabled: r.get(8)?,
-        next_run_at: r.get(9)?,
-        last_run_at: r.get(10)?,
-        last_session_id: r.get(11)?,
-        last_error: r.get(12)?,
-        created_at: r.get(13)?,
+        enabled: r.get(9)?,
+        next_run_at: r.get(10)?,
+        last_run_at: r.get(11)?,
+        last_session_id: r.get(12)?,
+        last_error: r.get(13)?,
+        created_at: r.get(14)?,
     })
 }
 
@@ -2873,13 +2876,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Most recently persisted account PR snapshot for `host`.
+    /// Most recently persisted account PR snapshot event for `host`.
     ///
     /// The scan runs newest-first in bounded pages and stops at the first
     /// matching host. Payloads are decoded after releasing the SQLite
     /// connection mutex so a cold or missing host cannot block unrelated
     /// store operations for the full server history.
-    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+    pub fn latest_github_pr_snapshot_event(&self, host: &str) -> Result<Option<EventEnvelope>> {
         const PAGE_SIZE: usize = 64;
 
         let mut before = i64::MAX;
@@ -2887,12 +2890,16 @@ impl Store {
             let page = {
                 let conn = self.conn.lock().unwrap();
                 let mut stmt = conn.prepare(
-                    "SELECT cursor, payload FROM events
+                    "SELECT cursor, ts, payload FROM events
                      WHERE scope_kind = 'server' AND scope_id = '' AND cursor < ?1
                      ORDER BY cursor DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![before, PAGE_SIZE as i64], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 let mut page = Vec::new();
                 for row in rows {
@@ -2900,25 +2907,41 @@ impl Store {
                 }
                 page
             };
-            let Some((oldest, _)) = page.last() else {
+            let Some((oldest, _, _)) = page.last() else {
                 return Ok(None);
             };
             before = *oldest;
             let exhausted = page.len() < PAGE_SIZE;
-            for (_, payload) in page {
-                let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
-                    serde_json::from_str::<Event>(&payload)
-                else {
+            for (cursor, ts, payload) in page {
+                let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                    continue;
+                };
+                let Event::GithubPullRequestsUpdated { pull_requests } = &event else {
                     continue;
                 };
                 if pull_requests.host.eq_ignore_ascii_case(host) {
-                    return Ok(Some(pull_requests));
+                    return Ok(Some(EventEnvelope {
+                        cursor: cursor as u64,
+                        scope: Scope::Server,
+                        ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                        event,
+                    }));
                 }
             }
             if exhausted {
                 return Ok(None);
             }
         }
+    }
+
+    /// Most recently persisted account PR replacement payload for `host`.
+    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+        Ok(self
+            .latest_github_pr_snapshot_event(host)?
+            .and_then(|envelope| match envelope.event {
+                Event::GithubPullRequestsUpdated { pull_requests } => Some(pull_requests),
+                _ => None,
+            }))
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -3405,11 +3428,19 @@ impl Store {
     }
 
     /// Returns false when the prompt no longer exists (already dispatched).
-    pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
+    pub fn update_queued_prompt(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        let attachments_json = serde_json::to_string(attachments)?;
         let n = conn.execute(
-            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1 AND claimed = 0",
-            params![id, content],
+            "UPDATE queued_prompts
+             SET content = ?2, attachments = ?3
+             WHERE id = ?1 AND claimed = 0",
+            params![id, content, attachments_json],
         )?;
         Ok(n > 0)
     }
@@ -3578,9 +3609,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations (id, name, prompt, workspace_id, mode, model,
-                                      permission_mode, schedule, enabled, next_run_at,
-                                      last_run_at, last_session_id, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      thinking_level, permission_mode, schedule, enabled,
+                                      next_run_at, last_run_at, last_session_id, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 a.id,
                 a.name,
@@ -3588,6 +3619,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -3607,8 +3639,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
-                    model = ?6, permission_mode = ?7, schedule = ?8, enabled = ?9,
-                    next_run_at = ?10
+                    model = ?6, thinking_level = ?7, permission_mode = ?8, schedule = ?9,
+                    enabled = ?10, next_run_at = ?11
              WHERE id = ?1",
             params![
                 a.id,
@@ -3617,6 +3649,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -3670,8 +3703,8 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                    next_run_at, last_run_at, last_session_id, last_error, created_at
+            "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                    schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
              FROM automations ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_automation)?;
@@ -3686,8 +3719,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                        next_run_at, last_run_at, last_session_id, last_error, created_at
+                "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                        schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
                  FROM automations WHERE id = ?1",
                 params![id],
                 row_to_automation,
@@ -6550,11 +6583,10 @@ impl Store {
     // --- usage accounting -------------------------------------------------------
 
     /// Record a turn's usage. `usage` totals are summed across the turn's
-    /// requests (correct for billing); `context_input_tokens` is the input
-    /// size of the turn's *last* request — the only meaningful proxy for the
-    /// current context size, since summing per-iteration inputs over a
-    /// multi-tool turn inflates the figure many-fold and spuriously trips
-    /// compaction.
+    /// requests (correct for billing); `context_input_tokens` is the
+    /// provider-authoritative context size for the turn's *last* request.
+    /// Summing per-iteration inputs over a multi-tool turn inflates the figure
+    /// many-fold and spuriously trips compaction.
     pub fn record_usage(
         &self,
         session_id: &str,
@@ -6582,9 +6614,10 @@ impl Store {
     }
 
     /// Context size (in tokens) of the thread's most recent turn: the last
-    /// request's input, used by the compaction trigger and the UI usage
-    /// indicator. Older rows recorded before this column existed report 0
-    /// (the caller falls back to a character estimate).
+    /// request's provider-authoritative measurement, used by the compaction
+    /// trigger and the UI usage indicator. Older rows recorded before this
+    /// column existed report 0 (the caller falls back to a character
+    /// estimate).
     pub fn last_input_tokens(&self, thread_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -8193,8 +8226,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_1");
         seed_thread(&store, "th_2");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_queue_edit".into(),
+            name: "layout.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4,
+        };
         let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
-        let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
+        let b = store
+            .enqueue_prompt("th_1", "second", std::slice::from_ref(&attachment))
+            .unwrap();
         let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
         let tool_free = store
             .enqueue_prompt_with_tools("th_2", "other thread", &[], false)
@@ -8210,7 +8251,14 @@ mod tests {
         assert_eq!(store.queued_prompt_thread(&a.id).unwrap().unwrap(), "th_1");
 
         // Edit and delete.
-        assert!(store.update_queued_prompt(&b.id, "second v2").unwrap());
+        assert!(
+            store
+                .update_queued_prompt(&b.id, "second v2", std::slice::from_ref(&attachment))
+                .unwrap()
+        );
+        let edited = store.queued_prompts("th_1").unwrap();
+        assert_eq!(edited[1].content, "second v2");
+        assert_eq!(edited[1].attachments, [attachment]);
         assert!(store.delete_queued_prompt(&a.id).unwrap());
         assert!(!store.delete_queued_prompt(&a.id).unwrap());
 
@@ -8280,6 +8328,7 @@ mod tests {
             workspace_id: "ws_1".into(),
             mode: Some("code".into()),
             model: None,
+            thinking_level: Some("high".into()),
             permission_mode: PermissionMode::Yolo,
             schedule: trouve_protocol::AutomationSchedule {
                 kind: "weekly".into(),
@@ -8300,6 +8349,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].schedule, auto.schedule);
         assert_eq!(listed[0].mode.as_deref(), Some("code"));
+        assert_eq!(listed[0].thinking_level.as_deref(), Some("high"));
         assert_eq!(listed[0].permission_mode, PermissionMode::Yolo);
 
         // Edit: rename + disable clears the next fire time.
@@ -8307,12 +8357,14 @@ mod tests {
         edited.name = "Morning triage".into();
         edited.enabled = false;
         edited.next_run_at = None;
+        edited.thinking_level = Some("max".into());
         edited.permission_mode = PermissionMode::AllowList;
         assert!(store.update_automation(&edited).unwrap());
         let got = store.automation("auto_1").unwrap().unwrap();
         assert_eq!(got.name, "Morning triage");
         assert!(!got.enabled);
         assert!(got.next_run_at.is_none());
+        assert_eq!(got.thinking_level.as_deref(), Some("max"));
         assert_eq!(got.permission_mode, PermissionMode::AllowList);
 
         // A run records its outcome without touching the definition.

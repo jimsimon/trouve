@@ -4,7 +4,8 @@ import type { ThreadChatItem } from "../state/thread-view-model.js";
 import {
   activityGroupSummary,
   buildChatLayout,
-  type AgentChatItem,
+  isContextCompactionTool,
+  type AgentActivityItem,
 } from "./chat-layout.js";
 
 const output = { text: "", omitted: false, bytes: 0 } as const;
@@ -40,6 +41,21 @@ describe("buildChatLayout", () => {
     expect(buildChatLayout(items).units[1]).toMatchObject({ kind: "agent", turn: 4 });
   });
 
+  it("keeps compaction between adjacent work runs in the same agent card", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u1", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      { id: "t1", kind: "tool", callId: "c1", tool: "read", args: {}, status: "ok", result: null, output },
+      { id: "c1", kind: "compaction", turn: 4, state: { kind: "completed", messagesCompacted: 12 } },
+      { id: "t2", kind: "tool", callId: "c2", tool: "edit", args: {}, status: "ok", result: null, output },
+    ];
+
+    expect(buildChatLayout(items).units[1]).toMatchObject({
+      kind: "agent",
+      turn: 4,
+      items: [{ id: "t1" }, { id: "c1" }, { id: "t2" }],
+    });
+  });
+
   it("associates the event-folded leading status with its later agent card", () => {
     const items: ThreadChatItem[] = [
       { id: "s7", kind: "turn-status", turn: 7, state: { kind: "completed", usage: { input_tokens: 2, output_tokens: 1 } } },
@@ -64,7 +80,7 @@ describe("buildChatLayout", () => {
 
 describe("activityGroupSummary", () => {
   it("matches the retained activity categories and distinct-path counting", () => {
-    const items: AgentChatItem[] = [
+    const items: AgentActivityItem[] = [
       { id: "e1", kind: "tool", callId: "e1", tool: "edit", args: { path: "a.rs" }, status: "ok", result: null, output },
       { id: "e2", kind: "tool", callId: "e2", tool: "write_file", args: { file_path: "a.rs" }, status: "ok", result: null, output },
       { id: "r1", kind: "tool", callId: "r1", tool: "read", args: { path: "b.rs" }, status: "ok", result: null, output },
@@ -74,5 +90,22 @@ describe("activityGroupSummary", () => {
     expect(activityGroupSummary(items)).toBe(
       "Edited 1 file, read 1 file, ran 1 command, thought 1 time",
     );
+  });
+
+  it("recognizes legacy context-compaction tool names", () => {
+    const item = (tool: string): AgentActivityItem => ({
+      id: tool,
+      kind: "tool",
+      callId: tool,
+      tool,
+      args: {},
+      status: "ok",
+      result: null,
+      output,
+    });
+    expect(isContextCompactionTool(item("contextCompaction"))).toBe(true);
+    expect(isContextCompactionTool(item("mcp__trouve__context_compaction"))).toBe(true);
+    expect(isContextCompactionTool(item("compact_context"))).toBe(true);
+    expect(isContextCompactionTool(item("commandExecution"))).toBe(false);
   });
 });

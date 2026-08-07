@@ -4,6 +4,7 @@ import { html, LitElement, unsafeCSS, type PropertyValues } from "lit";
 
 import { terminalContext } from "../contexts/app-contexts.js";
 import { parseOsc52ClipboardRequest } from "./terminal-clipboard.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   normalizeTerminalTitle,
   terminalRequestedSize,
@@ -460,10 +461,10 @@ export class TrouveTerminalView extends LitElement {
         <button type="button" @click=${() => this.#send("\t")}>Tab</button>
         <button type="button" @click=${() => this.#send("\u0003")}>Ctrl-C</button>
         <button type="button" @click=${() => this.#send("\u0004")}>Ctrl-D</button>
-        <button type="button" aria-label="Arrow up" @click=${() => this.#send("\u001b[A")}>↑</button>
-        <button type="button" aria-label="Arrow down" @click=${() => this.#send("\u001b[B")}>↓</button>
-        <button type="button" aria-label="Arrow left" @click=${() => this.#send("\u001b[D")}>←</button>
-        <button type="button" aria-label="Arrow right" @click=${() => this.#send("\u001b[C")}>→</button>
+        <button type="button" aria-label="Arrow up" @click=${() => this.#send("\u001b[A")}>${fontAwesomeIcon("arrow-up")}</button>
+        <button type="button" aria-label="Arrow down" @click=${() => this.#send("\u001b[B")}>${fontAwesomeIcon("arrow-down")}</button>
+        <button type="button" aria-label="Arrow left" @click=${() => this.#send("\u001b[D")}>${fontAwesomeIcon("arrow-left")}</button>
+        <button type="button" aria-label="Arrow right" @click=${() => this.#send("\u001b[C")}>${fontAwesomeIcon("arrow-right")}</button>
       </div>
     `;
   }

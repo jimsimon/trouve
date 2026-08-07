@@ -33,6 +33,7 @@ import {
   createBrowserCodeReviewGroupOrderStorage,
   type CodeReviewGroupOrderStorage,
 } from "./code-review-group-order-preferences.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./code-review-configuration.js";
 
 interface PendingJobAction {
@@ -584,7 +585,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
                         @keydown=${(event: KeyboardEvent) => this.#groupOrderKeyDown(event, group.repository, visibleRepositories)}
                         @dragstart=${(event: DragEvent) => this.#startGroupDrag(event, group.repository)}
                         @dragend=${this.#endGroupDrag}
-                      >⠿</button>
+                      >${fontAwesomeIcon("grip-vertical")}</button>
                       <button
                         type="button"
                         data-group-order-control="up"
@@ -592,7 +593,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
                         title="Move repository group up"
                         ?disabled=${index === 0}
                         @click=${() => this.#moveGroup(group.repository, -1, visibleRepositories, "up")}
-                      >↑</button>
+                      >${fontAwesomeIcon("arrow-up")}</button>
                       <button
                         type="button"
                         data-group-order-control="down"
@@ -600,7 +601,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
                         title="Move repository group down"
                         ?disabled=${index + 1 === groups.length}
                         @click=${() => this.#moveGroup(group.repository, 1, visibleRepositories, "down")}
-                      >↓</button>
+                      >${fontAwesomeIcon("arrow-down")}</button>
                     </span>
                   </header>
                   <div class="job-list">${group.jobs.map((job) => this.#renderJob(job))}</div>

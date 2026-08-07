@@ -18,6 +18,7 @@ import {
   sessionMcpCommandLine,
   sessionMcpEnvironmentLines,
 } from "./session-mcp-model.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const panelStyles = css`
   :host {
@@ -562,7 +563,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       : readSignal(this.#store.value.workspaces);
     return html`
       <div class="stack">
-        <div class="row"><h2 class="grow">MCP Servers</h2><button type="button" @click=${() => void this.#load()} ?disabled=${this.#busy}>⟳ Refresh</button></div>
+        <div class="row"><h2 class="grow">MCP Servers</h2><button type="button" @click=${() => void this.#load()} ?disabled=${this.#busy}>${fontAwesomeIcon("arrows-rotate")} Refresh</button></div>
         <p class="meta">External tool servers offered to the agent as mcp__&lt;server&gt;__&lt;tool&gt;. In ask and allow-list modes each one needs first-use approval per session; read-only modes block MCP tools entirely; yolo skips prompts. trouve's own built-in servers are not listed.</p>
         <p class="meta">Sessions merge these by name: the app-wide list (applies to every workspace), then the session workspace's list. A session branch can override or disable entries via its own committed .agents/.mcp.json — those per-branch files are managed in git, not here.</p>
         ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
@@ -571,7 +572,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
             ? html`<p class="mcp-empty">No MCP servers configured.</p>`
             : this.#servers.map((server) => html`
                 <article class="mcp-row">
-                  <span class="mcp-health ${server.health}" aria-label=${server.health}>${server.health === "ok" || server.health === "error" ? "●" : "○"}</span>
+                  <span class="mcp-health ${server.health}" aria-label=${server.health}>${fontAwesomeIcon(server.health === "ok" || server.health === "error" ? "circle" : "circle-dot")}</span>
                   <div class="mcp-copy">
                     <span><strong>${server.name}</strong><span class="mcp-scope">${server.scope === "workspace" ? `workspace · ${server.workspace_name ?? ""}` : "app-wide"}</span></span>
                     <small>${server.command} ${(server.args ?? []).join(" ")}${server.detail ? ` · ${server.detail}` : ""}</small>
@@ -580,7 +581,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
                 </article>
               `)}
         </section>
-        <div class="row"><button type="button" @click=${() => this.#openMcpForm("user")}>+ Add app-wide</button><button type="button" ?disabled=${workspaces.length === 0} @click=${() => this.#openMcpForm("workspace")}>+ Add to workspace</button></div>
+        <div class="row"><button type="button" @click=${() => this.#openMcpForm("user")}>${fontAwesomeIcon("plus")} Add app-wide</button><button type="button" ?disabled=${workspaces.length === 0} @click=${() => this.#openMcpForm("workspace")}>${fontAwesomeIcon("plus")} Add to workspace</button></div>
         ${this.#formOpen ? html`<form class="card mcp-form" @submit=${(event: SubmitEvent) => void this.#save(event)}>
           <h3>${this.#editingServer === undefined ? "New" : "Edit"} ${this.#formScope === "user" ? "app-wide server (~/.config/trouve/mcp.json — every workspace)" : "workspace server (.agents/.mcp.json)"}</h3>
           <input name="scope" type="hidden" .value=${this.#formScope} />
@@ -589,7 +590,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
           <label><span class="visually-hidden">Environment</span><textarea name="env" autocomplete="off" spellcheck="false" placeholder="environment, one KEY=VALUE per line; ${"${VAR}"} expands at launch" .value=${this.#editingServer === undefined ? "" : sessionMcpEnvironmentLines(this.#editingServer).join("\n")}></textarea></label>
           <div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${this.#editingServer === undefined ? "Add server" : "Save changes"}</button><button type="button" @click=${() => { this.#formOpen = false; this.#editingServer = undefined; this.requestUpdate(); }}>Cancel</button></div>
         </form>` : nothing}
-        ${this.#logsName === "" ? nothing : html`<section class="card" aria-label=${`Logs for ${this.#logsName}`}><div class="row"><h3 class="grow">Logs — ${this.#logsName}</h3><button type="button" aria-label="Refresh logs" title="Refresh logs" @click=${() => void this.#showLogs(this.#logsName)}>⟳</button><button type="button" aria-label="Close logs" title="Close logs" @click=${() => { this.#logsName = ""; this.#logs = undefined; this.requestUpdate(); }}>✕</button></div><pre>${this.#logs === undefined ? "Loading…" : this.#logs.lines.length === 0 ? "No log lines yet — logs appear after a health check or the first tool call." : this.#logs.lines.join("\n")}</pre></section>`}
+        ${this.#logsName === "" ? nothing : html`<section class="card" aria-label=${`Logs for ${this.#logsName}`}><div class="row"><h3 class="grow">Logs — ${this.#logsName}</h3><button type="button" aria-label="Refresh logs" title="Refresh logs" @click=${() => void this.#showLogs(this.#logsName)}>${fontAwesomeIcon("arrows-rotate")}</button><button type="button" aria-label="Close logs" title="Close logs" @click=${() => { this.#logsName = ""; this.#logs = undefined; this.requestUpdate(); }}>${fontAwesomeIcon("xmark")}</button></div><pre>${this.#logs === undefined ? "Loading…" : this.#logs.lines.length === 0 ? "No log lines yet — logs appear after a health check or the first tool call." : this.#logs.lines.join("\n")}</pre></section>`}
       </div>
     `;
   }
@@ -837,7 +838,7 @@ export class TrouveIntegrationsSettings extends LitElement {
         ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
         ${hosts.length === 0 ? html`<p class="meta">No GitHub host information is available.</p>` : hosts.map((host) => html`
             <article class="card integration-host">
-              <div class="row"><h3 class="grow">${host.host === "github.com" ? "GitHub" : host.host}</h3><span class="integration-status ${host.configured ? "connected" : ""}">${host.configured ? `● connected (${githubConnectionSource(host.source)})` : "○ not configured"}</span>${host.removable ? html`<button type="button" @click=${() => void this.#removeHost(host.host)} ?disabled=${this.#busy}>Remove host</button>` : nothing}</div>
+              <div class="row"><h3 class="grow">${host.host === "github.com" ? "GitHub" : host.host}</h3><span class="integration-status ${host.configured ? "connected" : ""}">${fontAwesomeIcon(host.configured ? "circle" : "circle-dot")} ${host.configured ? `connected (${githubConnectionSource(host.source)})` : "not configured"}</span>${host.removable ? html`<button type="button" @click=${() => void this.#removeHost(host.host)} ?disabled=${this.#busy}>Remove host</button>` : nothing}</div>
               <div class="row">
                 ${host.oauth_available ? html`<button class=${host.configured ? "" : "primary"} type="button" @click=${() => void this.#startLogin(host.host)} ?disabled=${this.#busy}>${host.source === "oauth" ? "Re-sign in with GitHub" : "Sign in with GitHub"}</button>` : nothing}
                 ${host.configured ? html`<button class="danger additive-action" type="button" @click=${() => void this.#disconnect(host.host)} ?disabled=${this.#busy}>Disconnect</button>` : nothing}

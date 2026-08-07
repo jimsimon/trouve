@@ -14,17 +14,24 @@ const files = readdirSync(assets).map((name) => ({
 }));
 const javascript = files.filter(({ name }) => name.endsWith(".js"));
 const styles = files.filter(({ name }) => name.endsWith(".css"));
+const fonts = files.filter(({ name }) => name.endsWith(".woff2"));
 const index = readFileSync(resolve(root, "index.html"), "utf8");
 const entryName = /assets\/(app-[A-Za-z0-9_-]+\.js)/u.exec(index)?.[1];
 const entry = javascript.find(({ name }) => name === entryName);
 const worker = javascript.find(({ name }) => name.startsWith("content-worker-"));
 
+// Desktop retains the native-capability adapter in its entry chunk. Keep its
+// allowance explicit and narrowly above the durable compaction, chat-
+// presentation preference, and Font Awesome icon UI; the PWA remains on the
+// original entry ceiling. Font assets have their own explicit budget below.
+const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 const limits = {
-  entry: 850_000,
+  entry: entryLimit,
   worker: 350_000,
   javascript: 3_000_000,
   styles: 175_000,
-  largestChunk: 850_000,
+  fonts: 125_000,
+  largestChunk: entryLimit,
 };
 const total = (entries) => entries.reduce((bytes, entry) => bytes + entry.bytes, 0);
 const fail = (message) => {
@@ -46,8 +53,12 @@ if (total(javascript) > limits.javascript) {
 if (total(styles) > limits.styles) {
   fail(`CSS totals ${total(styles)} bytes (limit ${limits.styles})`);
 }
+if (total(fonts) > limits.fonts) {
+  fail(`font assets total ${total(fonts)} bytes (limit ${limits.fonts})`);
+}
 
 console.log(
   `${mode} bundle within budget: entry ${basename(entry.name)} ${entry.bytes} B, `
-  + `worker ${worker.bytes} B, JS ${total(javascript)} B, CSS ${total(styles)} B`,
+  + `worker ${worker.bytes} B, JS ${total(javascript)} B, CSS ${total(styles)} B, `
+  + `fonts ${total(fonts)} B`,
 );
