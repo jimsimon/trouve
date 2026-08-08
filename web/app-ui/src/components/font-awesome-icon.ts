@@ -64,6 +64,7 @@ export const FONT_AWESOME_CODEPOINTS = Object.freeze({
   terminal: 0xf120,
   "trash-can": 0xf2ed,
   "triangle-exclamation": 0xf071,
+  user: 0xf007,
   "user-plus": 0xf234,
   xmark: 0xf00d,
 });

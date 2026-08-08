@@ -3135,6 +3135,7 @@ mod tests {
         let mut stored = HostPreferences::default();
         stored.appearance.theme = "light".into();
         stored.general.prevent_sleep_while_running = false;
+        stored.chat.collapse_sequential_tool_calls = true;
         stored.chat.collapse_thinking_with_tools = true;
         stored.notifications.on_finish = false;
         stored.notifications.sound = true;
@@ -3178,6 +3179,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.appearance.theme, "light");
         assert!(!loaded.general.prevent_sleep_while_running);
+        assert!(loaded.chat.collapse_sequential_tool_calls);
         assert!(loaded.chat.collapse_thinking_with_tools);
         assert!(!loaded.chat.collapse_compaction_with_tools);
         assert!(!loaded.notifications.on_finish);
@@ -3190,6 +3192,7 @@ mod tests {
 
         let mut updated = loaded;
         updated.appearance.theme = "colorblind-dark".into();
+        updated.chat.collapse_sequential_tool_calls = false;
         updated.chat.collapse_thinking_with_tools = false;
         let response = client
             .put(format!("{origin}{PREFERENCES_PATH}"))
@@ -3212,6 +3215,12 @@ mod tests {
                 .unwrap()
                 .chat
                 .collapse_thinking_with_tools
+        );
+        assert!(
+            !load_preferences(&path, HostPreferences::default())
+                .unwrap()
+                .chat
+                .collapse_sequential_tool_calls
         );
         let parent = path.parent().unwrap();
         let leftovers = std::fs::read_dir(parent)
@@ -3321,12 +3330,18 @@ mod tests {
                 "font_size": 13,
                 "reduce_motion": false
             },
+            "chat": {
+                "collapse_thinking_with_tools": true,
+                "collapse_compaction_with_tools": true
+            },
             "navigation_width": 260.0,
             "inspection_width": 460.0
         }))
         .unwrap();
         assert_eq!(preferences.general, crate::GeneralPreferences::default());
-        assert_eq!(preferences.chat, crate::ChatPreferences::default());
+        assert!(preferences.chat.collapse_sequential_tool_calls);
+        assert!(preferences.chat.collapse_thinking_with_tools);
+        assert!(preferences.chat.collapse_compaction_with_tools);
         assert_eq!(
             preferences.notifications,
             crate::NotificationPreferences::default()

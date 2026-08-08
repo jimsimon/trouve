@@ -3,19 +3,23 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("inspection diff workspace contract", () => {
-  it("keeps source mappings, disclosure, and file-scoped copy wired together", () => {
+  it("renders a diff-only ARIA file tree with one selected diff viewer", () => {
     const source = readFileSync(
       new URL("./inspection-workspace.ts", import.meta.url),
       "utf8",
     );
 
-    expect(source).toContain('class="unified-diff-list"');
-    expect(source).toContain('aria-expanded=${expanded');
-    expect(source).toContain("diffFileActionForKey(");
-    expect(source).toContain("Copy raw diff for ${file.path}");
-    expect(source).toContain('class=${`unified-diff-row ${row.kind}`}');
-    expect(source).toContain('row.oldNumber ?? ""');
-    expect(source).toContain('row.newNumber ?? ""');
+    expect(source).toContain('id="session-diff-file-tree"');
+    expect(source).toContain('aria-label="Changed files"');
+    expect(source).toContain('role="treeitem"');
+    expect(source).toContain("fileTreeDirectoriesForPaths(");
+    expect(source).toContain("#navigateDiffFileTree");
+    expect(source).toContain("#activateDiffFileTreeRow");
+    expect(source).toContain("Copy raw diff for ${selectedFile.path}");
+    expect(source).toContain("<trouve-diff-view");
+    expect(source).toContain(".original=${file.original}");
+    expect(source).toContain(".modified=${file.modified}");
+    expect(source).not.toContain('class="unified-diff-list"');
   });
 
   it("does not present generic restore failures as authoritative boundaries", () => {

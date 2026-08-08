@@ -4,23 +4,40 @@ import {
   browserChatPreferenceStorage,
   ChatPreferencesController,
   DEFAULT_CHAT_PREFERENCES,
+  effectiveChatCollapsePreferences,
   normalizeChatPreferences,
 } from "./chat-preferences.js";
 
 describe("chat preferences", () => {
-  it("defaults to visible, top-level thinking output", () => {
+  it("defaults to grouped tools with visible, top-level thinking output", () => {
     expect(DEFAULT_CHAT_PREFERENCES).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
     });
     expect(normalizeChatPreferences({})).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
     });
     expect(normalizeChatPreferences({
+      collapseSequentialToolCalls: "yes" as unknown as boolean,
       collapseThinkingWithTools: "yes" as unknown as boolean,
       collapseCompactionWithTools: "yes" as unknown as boolean,
     })).toEqual({
+      collapseSequentialToolCalls: true,
+      collapseThinkingWithTools: false,
+      collapseCompactionWithTools: false,
+    });
+  });
+
+  it("ignores subordinate collapse preferences when sequential grouping is off", () => {
+    expect(effectiveChatCollapsePreferences({
+      collapseSequentialToolCalls: false,
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    })).toEqual({
+      collapseSequentialToolCalls: false,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
     });
@@ -41,10 +58,12 @@ describe("chat preferences", () => {
     });
 
     expect(controller.current.get()).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     });
     expect(adapter.load()).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     });
@@ -67,6 +86,7 @@ describe("chat preferences", () => {
     );
 
     expect(reloaded.current.get()).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     });

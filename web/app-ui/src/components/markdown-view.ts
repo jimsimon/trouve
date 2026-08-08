@@ -28,7 +28,6 @@ export class TrouveMarkdownView extends LitElement {
       :host([streaming])::after { content: ""; display: inline-block; width: .55em; height: 1em; margin-left: .18em; vertical-align: -.14em; background: var(--trouve-accent); animation: var(--trouve-chat-streaming-animation, pulse 1s steps(2, end) infinite); }
       :where(p, ul, ol, blockquote, pre, table) { margin: 0 0 .75em; }
       :where(p, ul, ol, blockquote, pre, table):last-child { margin-bottom: 0; }
-      :host(.turn-markdown) :where(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, table, hr) { margin-inline: 10px; }
       ul, ol { padding-inline-start: 1.7em; }
       blockquote { margin-inline: 0; padding-inline-start: .9em; border-inline-start: 3px solid var(--trouve-rule); color: var(--trouve-text-dim); }
       code { padding: .08em .28em; border-radius: var(--trouve-radius-sm); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font-family: var(--trouve-font-mono); }

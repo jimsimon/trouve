@@ -21,24 +21,15 @@ export const isContextCompactionTool = (item: AgentActivityItem): boolean => {
   return normalized === "contextcompaction" || normalized === "compactcontext";
 };
 
-export type ChatRenderUnit =
-  | {
-      readonly id: string;
-      readonly kind: "user";
-      readonly divider: boolean;
-      readonly item: Extract<ThreadChatItem, { readonly kind: "user" }>;
-    }
-  | {
-      readonly id: string;
-      readonly kind: "agent";
-      readonly turn: number;
-      readonly items: readonly AgentChatItem[];
-    }
-  | {
-      readonly id: string;
-      readonly kind: "status";
-      readonly item: Extract<ThreadChatItem, { readonly kind: "turn-status" }>;
-    };
+export type ChatRenderUnit = {
+  readonly id: string;
+  readonly kind: "turn";
+  readonly turn: number;
+  readonly divider: boolean;
+  readonly prompt: Extract<ThreadChatItem, { readonly kind: "user" }> | undefined;
+  readonly items: readonly AgentChatItem[];
+  readonly status: Extract<ThreadChatItem, { readonly kind: "turn-status" }> | undefined;
+};
 
 export interface ChatLayout {
   readonly units: readonly ChatRenderUnit[];
@@ -52,93 +43,81 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   || item.kind === "tool"
   || item.kind === "questions";
 
-/**
- * Preserve the established transcript hierarchy: prompts are individual
- * cards, while each uninterrupted assistant/work run is one Agent card.
- * Running/completed status rows are represented by the Agent header/activity
- * treatment and therefore do not become empty virtual rows.
- */
+interface MutableTurnUnit {
+  turn: number | undefined;
+  readonly firstId: string;
+  prompt: Extract<ThreadChatItem, { readonly kind: "user" }> | undefined;
+  readonly items: AgentChatItem[];
+  status: Extract<ThreadChatItem, { readonly kind: "turn-status" }> | undefined;
+}
+
+/** Build one stable virtual row per conversational turn. A bounded history
+ * page can begin with a tool that carries no turn number; keep that provisional
+ * row open until the next explicit prompt/assistant/status event claims it. */
 export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout => {
   const units: ChatRenderUnit[] = [];
   const unitIdForItem = new Map<string, string>();
-  let currentTurn = 0;
-  let pendingAgentItems: AgentChatItem[] = [];
-  let pendingStatus: Extract<ThreadChatItem, { readonly kind: "turn-status" }> | undefined;
-  let lastAgentTurn: number | undefined;
-  let lastAgentUnitId: string | undefined;
+  let current: MutableTurnUnit | undefined;
+  let lastExplicitTurn: number | undefined;
 
-  const flushAgent = (): void => {
-    const first = pendingAgentItems[0];
-    if (first === undefined) return;
-    const turn = pendingAgentItems.find(
-      (item): item is Extract<AgentChatItem, {
-        readonly kind: "assistant" | "thinking" | "compaction";
-      }> =>
-        item.kind === "assistant"
-        || item.kind === "thinking"
-        || item.kind === "compaction",
-    )?.turn ?? currentTurn;
-    const id = `agent:${first.id}`;
-    const agentItems = Object.freeze([...pendingAgentItems]);
-    units.push(Object.freeze({ id, kind: "agent", turn, items: agentItems }));
-    for (const item of agentItems) unitIdForItem.set(item.id, id);
-    lastAgentTurn = turn;
-    lastAgentUnitId = id;
-    pendingAgentItems = [];
+  const flush = (): void => {
+    if (current === undefined) return;
+    const turn = current.turn ?? lastExplicitTurn ?? 0;
+    const id = turn === 0 ? `turn:0:${current.firstId}` : `turn:${turn}`;
+    const unit: ChatRenderUnit = Object.freeze({
+      id,
+      kind: "turn",
+      turn,
+      divider: units.length > 0,
+      prompt: current.prompt,
+      items: Object.freeze([...current.items]),
+      status: current.status,
+    });
+    units.push(unit);
+    if (current.prompt !== undefined) unitIdForItem.set(current.prompt.id, id);
+    for (const item of current.items) unitIdForItem.set(item.id, id);
+    if (current.status !== undefined) unitIdForItem.set(current.status.id, id);
+    current = undefined;
   };
 
-  const flushStatus = (): void => {
-    const item = pendingStatus;
-    if (item === undefined) return;
-    pendingStatus = undefined;
+  const claim = (turn: number | undefined, firstId: string): MutableTurnUnit => {
     if (
-      item.state.kind === "running"
-      || (item.state.kind === "completed" && lastAgentTurn === item.turn)
-    ) {
-      if (lastAgentUnitId !== undefined && lastAgentTurn === item.turn) {
-        unitIdForItem.set(item.id, lastAgentUnitId);
-      }
-      return;
+      turn !== undefined
+      && current?.turn !== undefined
+      && current.turn !== turn
+    ) flush();
+    current ??= {
+      turn,
+      firstId,
+      prompt: undefined,
+      items: [],
+      status: undefined,
+    };
+    if (turn !== undefined) {
+      current.turn = turn;
+      lastExplicitTurn = turn;
     }
-    const id = `status:${item.id}`;
-    units.push(Object.freeze({ id, kind: "status", item }));
-    unitIdForItem.set(item.id, id);
+    return current;
   };
 
   for (const item of items) {
     if (item.kind === "user") {
-      flushAgent();
-      if (pendingStatus !== undefined && pendingStatus.turn !== item.turn) {
-        flushStatus();
-      }
-      currentTurn = item.turn;
-      const id = `user:${item.id}`;
-      units.push(Object.freeze({
-        id,
-        kind: "user",
-        divider: units.length > 0,
-        item,
-      }));
-      unitIdForItem.set(item.id, id);
+      claim(item.turn, item.id).prompt = item;
       continue;
     }
     if (isAgentItem(item)) {
-      pendingAgentItems.push(item);
-      if (
+      const explicitTurn =
         item.kind === "assistant"
         || item.kind === "thinking"
         || item.kind === "compaction"
-      ) currentTurn = item.turn;
+          ? item.turn
+          : undefined;
+      claim(explicitTurn, item.id).items.push(item);
       continue;
     }
-
-    flushAgent();
-    flushStatus();
-    currentTurn = item.turn;
-    pendingStatus = item;
+    claim(item.turn, item.id).status = item;
   }
-  flushAgent();
-  flushStatus();
+  flush();
 
   return Object.freeze({ units: Object.freeze(units), unitIdForItem });
 };

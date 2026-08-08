@@ -277,7 +277,7 @@ trouve-session-list { display: block; }
 .turn-rule-actions button:not(:disabled):hover { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
 .turn-rule-actions button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-control-bg); }
 .turn-rule-action-error { max-width: min(38vw, 260px); overflow: hidden; padding-inline-end: 3px; color: var(--trouve-err); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.follow-tail { position: sticky; inset-inline-start: 50%; bottom: 8px; translate: -50% 0; min-height: 32px; padding: 5px 10px; border: 1px solid var(--trouve-border-strong); border-radius: 999px; color: var(--trouve-text-hi); background: var(--trouve-control-bg); box-shadow: 0 2px 8px var(--trouve-scrim); }
+.follow-tail { position: sticky; z-index: 4; inset-inline-start: 50%; bottom: 8px; translate: -50% 0; min-height: 32px; padding: 5px 10px; border: 1px solid var(--trouve-border-strong); border-radius: 999px; color: var(--trouve-text-hi); background: var(--trouve-control-bg); box-shadow: 0 2px 8px var(--trouve-scrim); }
 .message { min-width: 0; max-width: 100%; margin: 0 0 10px; }
 .turn-card { padding: 0; border: 0; border-radius: var(--trouve-radius); background: transparent; }
 .turn-card .message-header { min-height: 27px; display: flex; align-items: center; gap: 8px; margin: 0; padding: 2px 10px; border: 1px solid; border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; }
@@ -308,9 +308,49 @@ trouve-session-list { display: block; }
 .turn-body-stream > * { min-width: 0; max-width: 100%; }
 .agent-text-block { width: 100%; min-width: 0; max-inline-size: 120ch; margin: 0; }
 .user-body-stream > trouve-markdown-view { width: 100%; max-inline-size: 120ch; }
-.user-body-stream > .attachment-list { margin: 0 10px; }
+.user-body-stream > .attachment-list { margin: 0; }
 .agent-body-stream > .message { width: 100%; margin: 0; }
 .agent-body-stream > .question-card { margin-inline-start: 0; }
+.conversation-turn { overflow: visible; border: 1px solid var(--trouve-border); background: transparent; }
+.conversation-turn > .turn-header { min-height: 31px; border: 0; border-bottom: 1px solid var(--trouve-agent-border); border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; color: var(--trouve-text-mid); background: var(--trouve-agent-bg); }
+.conversation-turn > .turn-header.collapsed { border-bottom: 0; border-radius: var(--trouve-radius); }
+.conversation-turn > .turn-timeline { position: relative; gap: 7px; overflow: visible; border: 0; border-radius: 0 0 var(--trouve-radius) var(--trouve-radius); padding: 10px 14px 12px 36px; }
+.conversation-turn > .turn-timeline.has-transient-activity { padding-block-end: 7px; border-radius: 0; }
+.turn-activity-footer { min-width: 0; padding: 0 14px 12px 36px; }
+.turn-timeline::before { position: absolute; z-index: 0; inset-block: 23px; inset-inline-start: 23px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
+.turn-timeline > * { position: relative; z-index: 1; }
+.turn-header .message-disclosure > strong { color: var(--trouve-text-hi); }
+.turn-header .agent-model-label { max-width: min(42%, 420px); }
+.turn-header-metadata-slot { width: 34ch; min-width: 34ch; min-height: 17px; display: inline-flex; flex: none; align-items: center; justify-content: flex-end; overflow: hidden; }
+.turn-header-metadata-slot .turn-metadata { min-width: 0; flex: none; overflow: hidden; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.turn-rail-node { position: relative; min-width: 0; max-width: 100%; border: 0; color: var(--trouve-text); background: transparent; }
+.turn-rail-marker { position: absolute; z-index: 3; inset-block-start: 5.5px; inset-inline-start: -20.5px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 11px; line-height: 1; pointer-events: none; }
+.turn-rail-marker .trouve-icon { --trouve-icon-width: 12px; }
+.turn-rail-marker.prompt { color: var(--trouve-accent); }
+.turn-rail-marker.response.running { color: var(--trouve-accent); }
+.turn-rail-marker.response.complete { color: var(--trouve-ok); }
+.turn-rail-marker.response.update { color: var(--trouve-text-faint); }
+.turn-rail-marker.response.failed, .turn-rail-marker.failed { color: var(--trouve-err); }
+.turn-rail-marker.response.cancelled, .turn-rail-marker.cancelled { color: var(--trouve-text-dim); }
+.turn-node-header { min-width: 0; min-height: 27px; display: flex; align-items: center; gap: 6px; padding: 2px 8px; }
+.turn-node-header strong { color: var(--trouve-text-mid); font-size: 10px; font-weight: 650; }
+.turn-prompt-node .turn-node-header strong { color: var(--trouve-accent-tint); }
+.turn-response-node.complete .turn-node-header strong { color: var(--trouve-ok); }
+.turn-response-node.running .turn-node-header strong { color: var(--trouve-accent-tint); }
+.turn-response-node.failed .turn-node-header strong { color: var(--trouve-err); }
+.turn-node-body { min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 2px 8px 6px; }
+.turn-node-body > trouve-markdown-view, .turn-response-node > trouve-markdown-view { width: 100%; min-width: 0; max-width: 120ch; display: block; }
+.turn-response-node > trouve-markdown-view { padding: 2px 8px 6px; }
+.turn-state-node > p { padding: 2px 8px 6px; color: var(--trouve-text-dim); }
+.turn-state-node.failed > p { color: var(--trouve-err); }
+.turn-timeline > .agent-activity-timeline { padding-inline-start: 0; }
+.turn-timeline > .agent-activity-timeline::before { display: none; }
+.turn-timeline > .agent-activity-timeline.compaction-connected-timeline::before { display: none; }
+.turn-timeline > .context-compaction-marker { grid-template-columns: minmax(0, max-content) minmax(24px, 1fr); overflow: visible; padding-inline: 4px; }
+.turn-timeline > .context-compaction-marker::before { display: none; }
+.turn-timeline > .context-compaction-marker > .context-compaction-symbol { position: absolute; z-index: 3; inset-block-start: 50%; inset-inline-start: -21.5px; border-radius: 50%; background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); transform: translateY(-50%); }
+.turn-timeline > .context-compaction-marker.timeline-connect-before > .context-compaction-symbol,
+.turn-timeline > .context-compaction-marker.timeline-connect-after > .context-compaction-symbol { inset-inline-start: -21.5px; }
 .agent-activity-timeline { position: relative; min-width: 0; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; padding-inline-start: 20px; }
 .agent-activity-timeline::before { position: absolute; inset-block: 15px; inset-inline-start: 7px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
 .agent-activity-timeline.single-activity::before { inset-block: 6px; }
@@ -321,8 +361,8 @@ trouve-session-list { display: block; }
 .agent-text-block + .agent-activity-timeline { margin-block-start: 2px; }
 .activity-group, .tool-card, .thinking-card, .thinking-output { position: relative; isolation: isolate; }
 .agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before { display: none; content: ""; }
-.thinking-rail-icon { position: absolute; z-index: 2; inset-block-start: 10px; inset-inline-start: -18.5px; width: 12px; height: 12px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 10px; line-height: 1; pointer-events: none; transition: color 120ms ease, transform 120ms ease; }
-.thinking-rail-icon .trouve-icon { --trouve-icon-width: 12px; }
+.thinking-rail-icon { position: absolute; z-index: 2; inset-block-start: 8px; inset-inline-start: -20.5px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 12px; line-height: 1; pointer-events: none; transition: color 120ms ease, transform 120ms ease; }
+.thinking-rail-icon .trouve-icon { --trouve-icon-width: 14px; }
 .thinking-card.running > .thinking-rail-icon, .thinking-output.running > .thinking-rail-icon, .thinking-card:hover > .thinking-rail-icon, .thinking-card:focus-within > .thinking-rail-icon, .thinking-output:hover > .thinking-rail-icon, .thinking-output:focus-within > .thinking-rail-icon { color: var(--trouve-accent); transform: scale(1.08); }
 .activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: visible; border: 0; border-radius: 0; background: transparent; }
 .activity-group > summary { position: relative; min-width: 0; min-height: 29px; display: flex; align-items: center; gap: 6px; overflow: visible; padding: 2px 8px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-mid); background: transparent; cursor: pointer; list-style: none; }
@@ -357,6 +397,7 @@ trouve-session-list { display: block; }
 .context-compaction-marker.completed .context-compaction-symbol { opacity: .75; }
 .context-compaction-marker.failed .context-compaction-symbol { color: var(--trouve-warn); }
 .context-compaction-glyph { width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid currentcolor; border-radius: 50%; font-size: 9px; font-weight: 800; }
+.context-compaction-spinner { width: 14px; height: 14px; display: block; border: 2px solid currentcolor; border-inline-end-color: transparent; border-radius: 50%; animation: trouve-context-compaction-spin 900ms linear infinite; }
 .context-compaction-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 1px 7px; }
 .context-compaction-copy strong { flex: none; color: var(--trouve-text-mid); font-size: 11px; }
 .context-compaction-marker.running .context-compaction-copy strong { color: var(--trouve-text-hi); }
@@ -366,18 +407,21 @@ trouve-session-list { display: block; }
   50% { opacity: .75; }
   85%, 100% { background-position: -130% 0; opacity: .2; }
 }
+@keyframes trouve-context-compaction-spin { to { transform: rotate(360deg); } }
 .message p { margin: 0; }
 .tool-card { min-width: 0; max-width: 100%; margin-top: 8px; overflow: visible; border: 0; border-radius: 0; background: transparent; }
-.tool-card summary { position: relative; min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: visible; padding: 2px 8px; cursor: pointer; list-style: none; }
-.tool-card summary:hover { background: var(--trouve-hover-bg); }
-.tool-card summary:focus { background: var(--trouve-accent-bg); }
+.tool-card summary { position: relative; isolation: isolate; min-width: 0; max-width: 100%; min-height: 29px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; overflow: visible; padding: 2px 8px; background: transparent; cursor: pointer; list-style: none; }
+.tool-card summary::before { position: absolute; z-index: -1; inset-block: 0; inset-inline: 0; border-radius: var(--trouve-radius-sm); background: transparent; content: ""; pointer-events: none; }
+.activity-group-timeline > .tool-card > summary::before { inset-inline-start: 22px; }
+.tool-card summary:hover::before { background: var(--trouve-hover-bg); }
+.tool-card summary:focus::before { background: var(--trouve-accent-bg); }
 .tool-card.approval-required .tool-approval-actions { margin-inline-start: auto; }
 .tool-card summary::-webkit-details-marker { display: none; }
 .tool-card summary small { color: var(--trouve-text-dim); }
 .tool-card summary > strong { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--trouve-text-mid); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .tool-card pre { min-width: 0; max-width: 100%; margin: 0; padding: 10px; overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--trouve-rule); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font: 11px/1.5 var(--trouve-font-mono); overflow-wrap: anywhere; white-space: pre-wrap; }
-.activity-rail-disclosure { position: absolute; z-index: 3; inset-block-start: 50%; inset-inline-start: -18.5px; width: 12px; height: 12px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 10px; line-height: 1; text-align: center; transform: translateY(-50%); pointer-events: none; }
-.activity-rail-disclosure-icon { --trouve-icon-width: 8px; }
+.activity-rail-disclosure { position: absolute; z-index: 3; inset-block-start: 50%; inset-inline-start: -20.5px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 14px; line-height: 1; text-align: center; transform: translateY(-50%); pointer-events: none; }
+.activity-rail-disclosure-icon { --trouve-icon-width: 14px; }
 .activity-rail-disclosure.running { color: var(--trouve-accent); }
 .activity-rail-disclosure.ok { color: var(--trouve-ok); }
 .activity-rail-disclosure.error, .activity-rail-disclosure.denied, .activity-rail-disclosure.aborted { color: var(--trouve-err); }
@@ -423,6 +467,7 @@ trouve-session-list { display: block; }
 .thinking-body { min-width: 0; max-width: 100%; padding: 6px 10px 8px; border-top: 0; }
 .thinking-card trouve-markdown-view { min-width: 0; max-width: 100%; display: block; }
 .thinking-output { min-width: 0; max-width: 100%; border: 0; color: var(--trouve-text-dim); background: transparent; }
+.thinking-output > .thinking-rail-icon { inset-block-start: 5.5px; }
 .thinking-output .thinking-header { min-height: 27px; padding: 2px 8px; color: var(--trouve-text-dim); }
 .thinking-output .thinking-header > strong { font-size: 10px; font-weight: 600; }
 .thinking-header-spacer { min-width: 0; flex: 1; }
@@ -433,7 +478,7 @@ trouve-session-list { display: block; }
 .message-context-menu button:hover, .message-context-menu button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); outline: none; }
 @media (hover: hover) and (pointer: fine) {
   .agent-copy-action, .thinking-header > .copy-action, .tool-raw-action, .tool-copy-action { opacity: 0; transition: opacity 100ms ease; }
-  .assistant-message:hover > .agent-header > .agent-copy-action, .assistant-message:focus-within > .agent-header > .agent-copy-action, .thinking-card:hover .thinking-header > .copy-action, .thinking-card:focus-within .thinking-header > .copy-action, .thinking-output:hover .thinking-header > .copy-action, .thinking-output:focus-within .thinking-header > .copy-action, .tool-card:hover > summary > .tool-raw-action, .tool-card:focus-within > summary > .tool-raw-action, .tool-card:hover > summary > .tool-copy-action, .tool-card:focus-within > summary > .tool-copy-action { opacity: 1; }
+  .assistant-message:hover > .agent-header > .agent-copy-action, .assistant-message:focus-within > .agent-header > .agent-copy-action, .turn-response-node:hover > .turn-node-header .agent-copy-action, .turn-response-node:focus-within > .turn-node-header .agent-copy-action, .thinking-card:hover .thinking-header > .copy-action, .thinking-card:focus-within .thinking-header > .copy-action, .thinking-output:hover .thinking-header > .copy-action, .thinking-output:focus-within .thinking-header > .copy-action, .tool-card:hover > summary > .tool-raw-action, .tool-card:focus-within > summary > .tool-raw-action, .tool-card:hover > summary > .tool-copy-action, .tool-card:focus-within > summary > .tool-copy-action { opacity: 1; }
 }
 .card-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 8px 10px; border-top: 1px solid var(--trouve-rule); }
 .card-actions button, .screen-empty button { min-height: 30px; padding: 4px 10px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
@@ -466,10 +511,11 @@ trouve-session-list { display: block; }
 .question-summary dd { margin: 0; color: var(--trouve-text); font-size: 13px; }
 .question-summary dt, .question-summary dd { min-width: 0; overflow-wrap: anywhere; }
 .question-navigation { min-height: 30px; align-items: center; border: 0; padding: 0; }
-.resolved-label, .activity-row, .turn-error, .turn-cancelled, .turn-metadata-standalone { color: var(--trouve-text-dim); }
+.resolved-label, .activity-row { color: var(--trouve-text-dim); }
 .resolved-label { margin: 0; padding: 8px 10px; overflow-wrap: anywhere; }
 .activity-row { min-width: 0; max-width: none; margin: 0 0 14px; overflow-wrap: anywhere; }
 .agent-activity { min-width: 0; min-height: 28px; display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.turn-activity-footer > .agent-activity { max-width: 100%; }
 .activity-dots { width: 22px; display: inline-flex; align-items: center; justify-content: space-between; }
 .activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentcolor; animation: trouve-activity-dot 1.2s ease-in-out infinite; }
 .activity-dots i:nth-child(2) { animation-delay: 120ms; }
@@ -482,21 +528,18 @@ trouve-session-list { display: block; }
 [data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }
 [data-reduce-motion] .tool-inline-status.running { color: var(--trouve-text-dim); }
 [data-reduce-motion] .trouve-icon-spin { animation: none; }
+[data-reduce-motion] .context-compaction-spinner, [data-reduce-motion] .composer-context-usage.compacting .context-dial-value { animation: none; }
 [data-reduce-motion] .context-compaction-marker.running::after { animation: none; opacity: .5; }
 @media (prefers-reduced-motion: reduce) {
-  .context-compaction-marker.running::after, .trouve-icon-spin { animation: none; }
+  .context-compaction-marker.running::after, .context-compaction-spinner, .composer-context-usage.compacting .context-dial-value, .trouve-icon-spin { animation: none; }
 }
-.turn-error { min-width: 0; max-width: 100%; padding: 9px 11px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); color: var(--trouve-err); background: var(--trouve-err-bg); overflow-wrap: anywhere; }
-.turn-cancelled { min-width: 0; max-width: 100%; padding: 8px 10px; border-left: 2px solid var(--trouve-text-faint); overflow-wrap: anywhere; }
-.turn-cancelled strong { color: var(--trouve-text-mid); }
-.turn-metadata-standalone { padding: 4px 10px; font-size: 10px; overflow-wrap: anywhere; }
 .attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
 .attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }
 .attachment-icon { width: 64px; height: 48px; display: grid; place-items: center; border-radius: 3px; color: var(--trouve-text-faint); background: var(--trouve-code-bg); font-size: 17px; text-align: center; }
-.attachment-details { min-width: 0; display: grid; gap: 2px; }
+.attachment-details { min-width: 0; display: grid; gap: 2px; overflow: hidden; }
 .attachment-details strong, .attachment-details small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-details strong { color: var(--trouve-text-mid); }
-.attachment-actions { display: flex; align-items: center; gap: 6px; }
+.attachment-actions { min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
 .attachment-actions a { color: var(--trouve-accent); text-decoration: none; }
 .attachment-actions a:hover { text-decoration: underline; }
 .composer { position: relative; margin: 8px 10px 10px; border: 0; border-radius: 0; background: transparent; }
@@ -585,11 +628,14 @@ trouve-session-list { display: block; }
 .history-mode:focus-visible { z-index: 7; inset-inline-end: 46px; inset-block-end: 0; width: auto; height: 30px; overflow: visible; border-radius: var(--trouve-radius-sm); padding: 3px 7px; clip: auto; color: var(--trouve-text-hi); background: var(--trouve-control-bg); white-space: nowrap; }
 .composer-context-usage { position: relative; width: 28px; height: 30px; display: grid; flex: none; place-items: center; align-self: end; color: var(--trouve-text-dim); }
 .composer-context-usage svg { width: 24px; height: 24px; overflow: visible; rotate: -90deg; }
+.composer-context-usage.turn-context-usage { width: 20px; height: 20px; align-self: center; }
+.composer-context-usage.turn-context-usage svg { width: 18px; height: 18px; }
 .composer-context-usage circle { fill: none; stroke-width: 2.5; }
 .context-dial-track { stroke: var(--trouve-border-strong); }
 .context-dial-value { stroke: var(--trouve-accent); stroke-linecap: round; transition: stroke-dasharray 160ms ease; }
+.composer-context-usage.compacting .context-dial-value { stroke-dasharray: 24 76; stroke-dashoffset: 0; transition: none; animation: trouve-context-dial-indeterminate 900ms linear infinite; }
 .context-dial-glyph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-warn); font-size: 10px; font-weight: 800; }
-.context-dial-glyph.compacting { color: var(--trouve-accent); }
+@keyframes trouve-context-dial-indeterminate { to { stroke-dashoffset: -100; } }
 .composer-session-usage { min-height: 30px; display: inline-flex; align-items: center; flex: none; color: var(--trouve-text-faint); white-space: nowrap; }
 .inline-error { overflow: hidden; color: var(--trouve-err); text-overflow: ellipsis; white-space: nowrap; }
 .inline-warning { overflow: hidden; color: var(--trouve-warn); text-overflow: ellipsis; white-space: nowrap; }
@@ -607,6 +653,7 @@ trouve-session-list { display: block; }
 .queue-panel li[data-keyboard-reordering="true"] .queue-row { outline: 1px dashed var(--trouve-accent); outline-offset: 1px; background: var(--trouve-accent-veil); }
 .queue-panel li[draggable="true"] .queue-row { cursor: grab; user-select: none; }
 .queue-panel li[draggable="true"] .queue-row:active { cursor: grabbing; }
+.queue-drag-image { position: fixed; z-index: 2147483647; inset-block-start: 0; inset-inline-start: -10000px; width: min(320px, calc(100vw - 32px)); height: 32px; box-sizing: border-box; overflow: hidden; border: 1px solid var(--trouve-accent); border-radius: 5px; padding: 6px 10px; color: var(--trouve-text-hi); background: var(--trouve-raised-bg); box-shadow: 0 4px 12px var(--trouve-scrim); font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; opacity: .94; pointer-events: none; }
 .queue-row:hover { background: var(--trouve-hover-bg); }
 .queue-row p { min-width: 0; flex: 1 1 0; margin: 0; overflow: hidden; color: var(--trouve-text-mid); text-overflow: ellipsis; white-space: nowrap; }
 .queue-reorder-badge { flex: none; border: 1px solid var(--trouve-accent); border-radius: 999px; padding: 1px 5px; color: var(--trouve-accent); background: var(--trouve-accent-bg); font-size: 10px; line-height: 1.3; }
@@ -620,27 +667,14 @@ trouve-session-list { display: block; }
 .queue-actions .danger { color: var(--trouve-err); }
 .queue-error { min-width: 0; margin: 4px 0 0; padding: 4px 2px; color: var(--trouve-err); font-size: 11px; overflow-wrap: anywhere; }
 .inspection-tabs { border-bottom: 1px solid var(--trouve-border); }
-.diff-card header { display: flex; gap: 10px; align-items: center; padding: 10px; border-bottom: 1px solid var(--trouve-rule); }
-.diff-card header strong { flex: 1; }
 .additions { color: var(--trouve-ok); } .deletions { color: var(--trouve-err); }
 .file-row { width: 100%; display: flex; justify-content: space-between; padding: 8px 10px; color: var(--trouve-text-mid); border: 0; border-bottom: 1px solid var(--trouve-rule); background: transparent; text-align: start; }
 .file-row.selected { background: var(--trouve-accent-bg); color: var(--trouve-text-hi); }
-.diff-file-list { margin: 0; padding: 0; list-style: none; }
-.diff-file-row { display: grid; grid-template-columns: minmax(0, 1fr) 31px; border-bottom: 1px solid var(--trouve-rule); }
-.diff-file-row.selected { background: var(--trouve-accent-bg); }
-.diff-file-row .file-row { min-width: 0; border-bottom: 0; }
-.diff-file-label { display: flex; min-width: 0; align-items: center; gap: 4px; }
-.diff-file-label > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.diff-file-disclosure { width: 12px; flex: none; color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
-.diff-file-copy { border: 0; border-left: 1px solid var(--trouve-rule); color: var(--trouve-text-dim); background: transparent; }
-.diff-file-copy:hover, .diff-file-copy:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.diff-file-copy:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
-.diff-file-option:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
 .file-row small { color: var(--trouve-text-dim); }
 .file-tree-item { min-height: 22px; justify-content: flex-start; padding-block: 2px; padding-inline: calc(4px + var(--file-tree-indent, 0px)) 4px; font-size: 12px; }
 .file-tree-item:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
 .file-tree-label { min-width: 0; display: flex; align-items: center; gap: 4px; }
-.file-tree-label > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-tree-disclosure { width: 12px; flex: none; color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
 .file-tree-icon { width: 17px; flex: none; font-size: 12px; text-align: center; }
 .file-tree-state { min-height: 22px; display: flex; align-items: center; gap: 7px; margin: 0; padding: 3px 6px 3px calc(20px + var(--file-tree-indent, 0px)); color: var(--trouve-text-dim); font-size: 10px; }
@@ -653,8 +687,8 @@ trouve-session-list { display: block; }
 .diff-lines .addition { background: var(--trouve-diff-add-bg); }
 .inspection-content { display: block; flex: 1; min-height: 0; overflow: auto; }
 .retained-terminal-panel[hidden] { display: none !important; }
-trouve-inspection-workspace:not(:defined), trouve-terminal-panel:not(:defined), trouve-session-pr-panel:not(:defined), trouve-session-mcp-panel:not(:defined) { position: relative; }
-trouve-inspection-workspace:not(:defined)::before, trouve-terminal-panel:not(:defined)::before, trouve-session-pr-panel:not(:defined)::before, trouve-session-mcp-panel:not(:defined)::before { content: "Loading inspection…"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-text-dim); }
+trouve-session-info-panel:not(:defined), trouve-inspection-workspace:not(:defined), trouve-terminal-panel:not(:defined), trouve-session-pr-panel:not(:defined) { position: relative; }
+trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not(:defined)::before, trouve-terminal-panel:not(:defined)::before, trouve-session-pr-panel:not(:defined)::before { content: "Loading inspection…"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--trouve-text-dim); }
 .inspection-content > header { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-bottom: 1px solid var(--trouve-rule); }
 .inspection-content > header strong { flex: 1; }
 .inspection-content > header small { color: var(--trouve-text-dim); }
@@ -676,82 +710,51 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .todo-plan-content { min-width: 0; overflow-wrap: anywhere; }
 .todo-plan-list li.completed .todo-plan-content, .todo-plan-list li.cancelled .todo-plan-content { color: var(--trouve-text-disabled); }
 .todo-plan-empty { min-height: 10rem; }
-.session-mcp-surface { display: flex; min-height: 100%; flex-direction: column; gap: 6px; padding: 6px; }
-.session-mcp-surface > .screen-empty { flex: 1; min-height: 0; }
-.session-mcp-header { padding: 0; border-bottom: 0; }
-.session-mcp-header > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
-.session-mcp-header > span strong, .session-mcp-header > span small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-mcp-header button, .session-mcp-notice button { min-height: 26px; flex: none; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 3px 7px; color: var(--trouve-text); background: var(--trouve-control-bg); }
-.session-mcp-description { margin: 0; color: var(--trouve-text-dim); font-size: 11px; line-height: 1.35; }
-.session-mcp-notice { display: flex; align-items: center; gap: 8px; padding: 7px 9px; color: var(--trouve-err); }
-.session-mcp-notice span { min-width: 0; flex: 1; }
-.session-mcp-list { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; margin: 0; overflow: auto; padding: 8px; border-radius: var(--trouve-radius); background: var(--trouve-surface); list-style: none; }
-.session-mcp-card { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-raised-bg); }
-.session-mcp-card > header { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.session-mcp-card > header strong { min-width: 0; flex: 1; overflow: hidden; color: var(--trouve-text-hi); text-overflow: ellipsis; white-space: nowrap; }
-.session-mcp-card code, .session-mcp-card pre { margin: 0; overflow: auto; color: var(--trouve-text); background: transparent; font: 11px/1.4 var(--trouve-font-mono); white-space: pre; }
-.session-mcp-card code { display: block; padding: 0; }
-.session-mcp-card pre { padding: 0; }
-.session-mcp-card p { margin: 0; color: var(--trouve-text-dim); overflow-wrap: anywhere; }
-.session-mcp-scope { border-radius: 999px; padding: 2px 6px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; white-space: nowrap; }
-.session-mcp-card.health-disabled { opacity: .58; }
 .inspection-split { display: grid; grid-template-rows: auto minmax(70px, 28%) minmax(0, 1fr); height: 100%; min-height: 0; }
 .inspection-summary { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border-bottom: 1px solid var(--trouve-rule); }
 .inspection-summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .inspection-summary button { min-width: 26px; min-height: 26px; border: 0; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
 .diff-summary { flex-wrap: wrap; padding: 6px; }
-.diff-summary .checkpoint-actions { flex: 1; }
+.diff-summary > strong { color: var(--trouve-text-dim); font-size: 12px; font-weight: 400; }
+.diff-summary .checkpoint-actions { flex: 0 1 auto; flex-wrap: wrap; margin-inline-start: auto; }
 .checkpoint-actions { display: flex; align-items: center; gap: 5px; }
 .checkpoint-actions button { padding-inline: 7px; color: var(--trouve-text-mid); white-space: nowrap; }
 .checkpoint-actions button:disabled { cursor: not-allowed; opacity: .56; }
-.split-diff-file-picker { min-width: 90px; flex: 1; }
-.split-diff-file-picker select { width: 100%; min-height: 26px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 2px 6px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); font-size: 11px; text-overflow: ellipsis; }
 .diff-notice { flex-basis: 100%; color: var(--trouve-text-dim); font-size: 10px; }
 .diff-notice.error { color: var(--trouve-err); }
-.diff-refresh-action, .files-refresh-action, .diff-mode-additive { position: absolute; width: 1px; height: 1px; min-width: 0 !important; min-height: 0 !important; overflow: hidden; padding: 0 !important; clip: rect(0, 0, 0, 0); }
-.diff-refresh-action:focus-visible, .files-refresh-action:focus-visible, .diff-mode-additive:focus-visible { position: static; width: auto; height: 26px; min-width: 26px !important; min-height: 26px !important; overflow: visible; padding-inline: 7px !important; clip: auto; }
-.diff-inspection > .diff-empty { grid-row: 2 / 4; background: var(--trouve-surface); }
-.diff-inspection > .diff-collapsed { grid-row: 3; border-top: 0; }
-.diff-inspection > .unified-diff-list { grid-row: 2 / 4; }
-.diff-inspection > .split-diff-widget { grid-row: 2 / 4; min-height: 0; }
-.unified-diff-list { min-width: 0; min-height: 0; overflow: auto; color: var(--trouve-code-fg); background: var(--trouve-surface); }
-.unified-diff-file { min-width: max-content; }
-.unified-diff-file-header { display: flex; min-width: 100%; min-height: calc(var(--trouve-font-size) * 1.5); color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.unified-diff-file-header .diff-file-option { min-width: 0; flex: 1; display: flex; align-items: center; gap: 5px; border: 0; padding: 0 7px; color: inherit; background: transparent; font: 700 var(--trouve-font-size)/1.5 var(--trouve-font-mono); text-align: start; }
-.unified-diff-file-header .diff-file-option strong { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
-.unified-diff-file-header .diff-file-option small { flex: none; color: inherit; font: inherit; }
-.unified-diff-file-header .diff-file-copy { width: calc(var(--trouve-font-size) * 2.1); flex: none; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-gutter); background: transparent; }
-.unified-diff-file-header .diff-file-copy:hover, .unified-diff-file-header .diff-file-copy:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-accent-dim); }
-.unified-diff-rows { min-width: max-content; }
-.diff-binary-state { min-height: 56px; display: grid; place-items: center; color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 11px; }
-.unified-diff-row { display: grid; grid-template-columns: 44px 44px 20px minmax(max-content, 1fr); min-width: 100%; min-height: calc(var(--trouve-font-size) * 1.5); align-items: center; color: var(--trouve-code-fg); font: var(--trouve-font-size)/1.5 var(--trouve-font-mono); }
-.unified-diff-row.add { color: var(--trouve-ok); background: var(--trouve-diff-add-bg); }
-.unified-diff-row.delete { color: var(--trouve-err); background: var(--trouve-diff-del-bg); }
-.unified-diff-row.hunk { color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
-.unified-diff-row > span { color: var(--trouve-gutter); }
-.unified-diff-row.add > .diff-mark { color: var(--trouve-ok); }
-.unified-diff-row.delete > .diff-mark { color: var(--trouve-err); }
-.unified-diff-row > .diff-old-number, .unified-diff-row > .diff-new-number { padding-right: 4px; text-align: right; }
-.unified-diff-row > .diff-mark { text-align: center; }
-.unified-diff-row > code { min-width: 0; padding-right: 8px; color: inherit; font: inherit; white-space: pre; }
+.diff-refresh-action, .files-refresh-action { position: absolute; width: 1px; height: 1px; min-width: 0 !important; min-height: 0 !important; overflow: hidden; padding: 0 !important; clip: rect(0, 0, 0, 0); }
+.diff-refresh-action:focus-visible, .files-refresh-action:focus-visible { position: static; width: auto; height: 26px; min-width: 26px !important; min-height: 26px !important; overflow: visible; padding-inline: 7px !important; clip: auto; }
 .inspection-file-list { min-height: 0; overflow: auto; border-bottom: 1px solid var(--trouve-border); }
 .inspection-widget { display: block; width: 100%; height: 100%; min-height: 0; border: 0; }
-.files-inspection { grid-template-columns: 210px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 6px; padding: 6px; }
-.files-inspection > .inspection-summary { grid-column: 2; grid-row: 1; padding: 0; border-bottom: 0; }
+.files-inspection, .diff-inspection { grid-template-columns: 210px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 6px; padding: 6px; }
+.files-inspection > .inspection-summary, .diff-inspection > .inspection-summary { grid-column: 2; grid-row: 1; padding: 0; border-bottom: 0; }
 .files-inspection > .inspection-summary strong { color: var(--trouve-text-dim); font-size: 12px; font-weight: 400; }
-.files-inspection > .inspection-summary button { width: 26px; height: 26px; min-width: 26px; min-height: 26px; padding: 0; color: var(--trouve-text-dim); background: transparent; }
+.files-inspection > .inspection-summary button, .diff-inspection > .inspection-summary button { min-width: 26px; min-height: 26px; color: var(--trouve-text-dim); background: transparent; }
+.files-inspection > .inspection-summary > button, .diff-inspection > .inspection-summary > button { width: 26px; height: 26px; padding: 0; }
 .files-inspection > .inspection-summary button:hover,
-.files-inspection > .inspection-summary button[aria-pressed="true"] { color: var(--trouve-accent); background: var(--trouve-hover-bg); }
+.files-inspection > .inspection-summary button[aria-pressed="true"],
+.diff-inspection > .inspection-summary button:hover,
+.diff-inspection > .inspection-summary button[aria-pressed="true"] { color: var(--trouve-accent); background: var(--trouve-hover-bg); }
 .files-inspection > .inspection-summary .file-additive-action { position: absolute; width: 1px; height: 1px; min-width: 0; min-height: 0; overflow: hidden; clip: rect(0, 0, 0, 0); }
 .files-inspection > .inspection-summary .file-additive-action:focus-visible { position: static; width: auto; height: 26px; min-width: 26px; min-height: 26px; overflow: visible; clip: auto; }
-.files-inspection > .inspection-file-list { grid-column: 1; grid-row: 1 / 3; border: 0; border-radius: var(--trouve-radius); background: var(--trouve-sidebar-bg); }
+.files-inspection > .inspection-file-list, .diff-inspection > .inspection-file-list { grid-column: 1; grid-row: 1 / 3; border: 0; border-radius: var(--trouve-radius); background: var(--trouve-sidebar-bg); }
 .files-inspection > .file-view-shell,
-.files-inspection > .file-view-state { grid-column: 2; grid-row: 2; min-width: 0; min-height: 0; }
-.files-inspection.file-tree-collapsed { grid-template-columns: minmax(0, 1fr); }
+.files-inspection > .file-view-state,
+.diff-inspection > .diff-view-shell,
+.diff-inspection > .diff-view-state { grid-column: 2; grid-row: 2; min-width: 0; min-height: 0; }
+.diff-inspection > .diff-empty { grid-column: 1 / 3; grid-row: 2; background: var(--trouve-surface); }
+.diff-inspection.diff-empty-inspection > .inspection-summary { grid-column: 1 / 3; }
+.diff-file-tree .file-tree-label { width: 100%; }
+.diff-tree-change-count { flex: none; margin-inline-start: auto; color: var(--trouve-text-faint); font-size: 9px; font-variant-numeric: tabular-nums; }
+.files-inspection.file-tree-collapsed, .diff-inspection.diff-tree-collapsed { grid-template-columns: minmax(0, 1fr); }
 .files-inspection.file-tree-collapsed > .inspection-summary,
 .files-inspection.file-tree-collapsed > .file-view-shell,
-.files-inspection.file-tree-collapsed > .file-view-state { grid-column: 1; }
-.files-inspection.file-tree-collapsed > .inspection-file-list { display: none; }
+.files-inspection.file-tree-collapsed > .file-view-state,
+.diff-inspection.diff-tree-collapsed > .inspection-summary,
+.diff-inspection.diff-tree-collapsed > .diff-view-shell,
+.diff-inspection.diff-tree-collapsed > .diff-view-state { grid-column: 1; }
+.files-inspection.file-tree-collapsed > .inspection-file-list,
+.diff-inspection.diff-tree-collapsed > .inspection-file-list { display: none; }
 .file-view-shell { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
 .file-view-toolbar { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 30px; padding: 3px 6px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-control-bg); }
 .file-view-toolbar strong { min-width: 0; margin-right: auto; overflow: hidden; color: var(--trouve-text-mid); font: 11px var(--trouve-font-mono); text-overflow: ellipsis; white-space: nowrap; }
@@ -828,6 +831,9 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .settings-toggle-row input:checked + .toggle-state { border-color: var(--trouve-primary-border); color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
 .settings-toggle-row input:focus-visible + .toggle-state { outline: 2px solid var(--trouve-accent); outline-offset: 2px; }
 .nested-toggles { display: grid; gap: 12px; padding-left: 12px; }
+.nested-toggles.disabled { opacity: .55; }
+.nested-toggles.disabled .settings-toggle-row { cursor: not-allowed; }
+.nested-toggles.disabled .settings-toggle-row input:disabled + .toggle-state { border-color: var(--trouve-border); color: var(--trouve-text-faint); background: var(--trouve-control-bg); }
 .settings-actions { display: flex; align-items: center; gap: 10px; min-height: 30px; }
 .settings-provider-shell { display: grid; align-content: start; gap: 12px; }
 .settings-provider-header { display: flex; align-items: center; gap: 12px; }
@@ -1044,7 +1050,20 @@ trouve-command-palette { display: contents; }
   .composer-completion-option { min-height: 42px; }
   .attachment-button { min-height: 38px; }
   .agent-copy-action > .copy-action, .thinking-header > .copy-action, .card-utility-actions button, .attachment-actions button, .tool-copy-action button, .tool-raw-action button { min-width: 36px; min-height: 36px; }
-  .attachment-list li { width: 100%; max-width: none; }
+  .conversation-turn > .turn-header { min-height: 48px; padding-block: 4px; }
+  .turn-header .message-disclosure { display: grid; grid-template-columns: 10px auto minmax(0, 1fr) auto; grid-template-rows: auto auto; gap: 1px 7px; }
+  .turn-header .message-disclosure > .disclosure-icon { grid-column: 1; grid-row: 1; }
+  .turn-header .message-disclosure > strong { grid-column: 2; grid-row: 1; }
+  .turn-header .agent-model-label { max-width: 100%; grid-column: 3; grid-row: 1; }
+  .turn-header .agent-header-spacer { display: none; }
+  .turn-header .turn-context-usage { grid-column: 4; grid-row: 1; }
+  .turn-header .turn-header-metadata-slot { width: auto; min-width: 0; grid-column: 2 / 5; grid-row: 2; justify-content: flex-start; }
+  .turn-header.collapsed .agent-collapsed-preview { grid-column: 2 / 3; grid-row: 2; }
+  .turn-header.collapsed .turn-header-metadata-slot { grid-column: 3 / 5; justify-content: flex-end; }
+  .turn-response-node > .turn-rail-marker { inset-block-start: 12px; }
+  .thinking-card > .thinking-rail-icon { inset-block-start: 13px; }
+  .thinking-output > .thinking-rail-icon { inset-block-start: 12px; }
+  .attachment-list li { width: 100%; min-width: 0; max-width: none; }
   .pending-attachments li button { width: 34px; height: 34px; }
   .queue-panel { margin-inline: 8px; max-height: min(42vh, 310px); }
   .queue-panel li { grid-template-columns: 1fr; }
@@ -1055,14 +1074,18 @@ trouve-command-palette { display: contents; }
   .thread-tabs { height: 42px; }
   .thread-tabs button, .inspection-tabs button { min-height: 42px; }
   .checkpoint-actions button { min-height: 42px; }
-  .diff-mode-additive { display: none; }
-  .files-inspection { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-  .files-inspection > .inspection-summary { grid-column: 1; grid-row: 1; }
-  .files-inspection > .inspection-file-list { grid-column: 1; grid-row: 2; }
+  .files-inspection, .diff-inspection { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .files-inspection > .inspection-summary, .diff-inspection > .inspection-summary { grid-column: 1; grid-row: 1; }
+  .files-inspection > .inspection-file-list, .diff-inspection > .inspection-file-list { grid-column: 1; grid-row: 2; }
   .files-inspection:not(.file-tree-collapsed) > .file-view-shell,
-  .files-inspection:not(.file-tree-collapsed) > .file-view-state { display: none; }
+  .files-inspection:not(.file-tree-collapsed) > .file-view-state,
+  .diff-inspection:not(.diff-tree-collapsed) > .diff-view-shell,
+  .diff-inspection:not(.diff-tree-collapsed) > .diff-view-state { display: none; }
   .files-inspection.file-tree-collapsed > .file-view-shell,
-  .files-inspection.file-tree-collapsed > .file-view-state { grid-column: 1; grid-row: 2; }
+  .files-inspection.file-tree-collapsed > .file-view-state,
+  .diff-inspection.diff-tree-collapsed > .diff-view-shell,
+  .diff-inspection.diff-tree-collapsed > .diff-view-state { grid-column: 1; grid-row: 2; }
+  .diff-inspection > .diff-empty { grid-column: 1; grid-row: 2; }
   .tool-approval-actions { position: fixed; z-index: 24; inset-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right)); bottom: calc(60px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius); padding: 8px; background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
   .tool-approval-actions button { min-height: 46px; font-size: 13px; }
   .tool-approval-actions .approval-additive-action:focus-visible { grid-column: 1 / -1; height: 46px; min-height: 46px !important; }
@@ -1161,7 +1184,6 @@ trouve-app[data-reduce-motion] { --trouve-chat-streaming-animation: none; }
   .status-dot, .online-dot, .activity-rail-disclosure, .tool-inline-status { border: 1px solid CanvasText; }
   .session-row.selected, .mobile-nav button[aria-pressed="true"], .composer-completion-option[aria-selected="true"], .command-palette-option[aria-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
   .card-actions button.primary, .tool-approval-actions button.primary { color: HighlightText; background: Highlight; }
-  .turn-error { color: Mark; border-color: Mark; }
 }
 
 @media (prefers-contrast: more) {

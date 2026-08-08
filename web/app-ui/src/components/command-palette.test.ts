@@ -142,6 +142,12 @@ describe("command palette model", () => {
 
   it("routes inspection commands to the mobile inspection pane", () => {
     const items = buildCommandPaletteItems(input);
+    expect(items.find((item) => item.id === "view:inspection:info")?.action)
+      .toEqual({
+        kind: "navigate",
+        mobilePane: "inspection",
+        route: { ...input.route, inspection: "info" },
+      });
     expect(items.find((item) => item.id === "view:inspection:terminal")?.action)
       .toEqual({
         kind: "navigate",

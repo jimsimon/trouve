@@ -79,10 +79,10 @@ export interface CommandPaletteInput {
 }
 
 const INSPECTION_VIEWS = [
+  ["info", "Info", "circle-info", "overview session branch changes pull requests mcp tools"],
   ["diff", "Diff", "code-compare", "changes patch review"],
   ["files", "Files", "file-lines", "source tree code"],
   ["pr", "Pull request", "code-pull-request", "branch review status"],
-  ["mcp", "MCP", "plug", "effective model context protocol tools servers"],
   ["terminal", "Terminal", "terminal", "shell pty console"],
   ["plan", "Plan", "list-check", "todos tasks"],
 ] as const satisfies readonly [

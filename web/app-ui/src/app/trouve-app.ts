@@ -158,10 +158,10 @@ const deployment =
       : "browser";
 
 const INSPECTION_PANELS = [
+  "info",
   "diff",
   "files",
   "pr",
-  "mcp",
   "terminal",
 ] as const satisfies readonly InspectionPanel[];
 
@@ -171,10 +171,10 @@ const INSPECTION_PANEL_LABELS: Readonly<Record<
   InspectionPanel,
   { readonly icon: FontAwesomeIconName; readonly label: string }
 >> = {
+  info: { icon: "circle-info", label: "Info" },
   diff: { icon: "code-compare", label: "Diff" },
   files: { icon: "file-lines", label: "Files" },
   pr: { icon: "code-pull-request", label: "Pull Requests" },
-  mcp: { icon: "plug", label: "MCP" },
   terminal: { icon: "terminal", label: "Terminal" },
   plan: { icon: "list-check", label: "Todos" },
 };
@@ -1117,20 +1117,20 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.#store.threadView(route.threadId).todos.length === 0
       )
     ) {
-      this.#router.navigate({ ...route, inspection: "diff" }, true);
+      this.#router.navigate({ ...route, inspection: "info" }, true);
       return;
     }
     const inspectionVisible =
       !globalThis.matchMedia("(max-width: 760px)").matches ||
       this.#mobilePane === "inspection";
     if (route.kind === "session" && inspectionVisible) {
-      const inspection = route.inspection ?? "diff";
+      const inspection = route.inspection ?? "info";
+      if (inspection === "info") void import("../components/session-info-panel.js");
       if (inspection === "terminal") void import("../components/terminal-panel.js");
       if (inspection === "diff" || inspection === "files") {
         void import("../components/inspection-workspace.js");
       }
       if (inspection === "pr") void import("../components/session-pr-panel.js");
-      if (inspection === "mcp") void import("../components/session-mcp-panel.js");
     }
     const sessions = readSignal(this.#store.sessions);
     const resume = readSignal(this.#resume.current);
@@ -2057,7 +2057,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         pending === undefined ||
         route.kind !== "session" ||
         route.sessionId !== pending.sessionId ||
-        (route.inspection ?? "diff") !== "files"
+        (route.inspection ?? "info") !== "files"
       ) return;
       const workspace = this.querySelector<TrouveInspectionWorkspace>(
         "trouve-inspection-workspace",
@@ -2170,12 +2170,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         ? this.#store.threadView(route.threadId)
         : undefined;
     const requestedInspection =
-      route.kind === "session" ? (route.inspection ?? "diff") : "diff";
+      route.kind === "session" ? (route.inspection ?? "info") : "info";
     // Never leave an empty TODO surface mounted while the route correction
     // scheduled in updated() propagates through history/router signals.
     const selectedInspection = requestedInspection === "plan" &&
         (activeView === undefined || activeView.todos.length === 0)
-      ? "diff"
+      ? "info"
       : requestedInspection;
     const liveSessionIds = new Set(sessions.map((session) => session.id));
     for (const sessionId of this.#terminalSessionIds) {
@@ -2521,10 +2521,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   type="button"
                   aria-pressed=${selectedInspection === "plan" ? "true" : "false"}
                   @click=${() => this.#selectInspection(
-                    selectedInspection === "plan" ? "diff" : "plan",
+                    selectedInspection === "plan" ? "info" : "plan",
                   )}
                 >${selectedInspection === "plan"
-                  ? html`${fontAwesomeIcon("arrow-left")} Diff`
+                  ? html`${fontAwesomeIcon("arrow-left")} Info`
                   : html`${fontAwesomeIcon("list-check")} Todos  ${
                       activeView.todos.filter((todo) => todo.status === "completed").length
                     }/${activeView.todos.length} complete`}</button>
@@ -2568,6 +2568,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           )}
           ${route.kind === "session" && selectedInspection === "terminal"
             ? nothing
+            : route.kind === "session" && selectedInspection === "info"
+            ? html`<trouve-session-info-panel
+                class="inspection-content"
+              ></trouve-session-info-panel>`
             : route.kind === "session" &&
                 (selectedInspection === "diff" || selectedInspection === "files")
             ? html`<trouve-inspection-workspace
@@ -2583,10 +2587,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 class="inspection-content"
                 session-title=${this.#store.sessionMetadata(route.sessionId)?.title ?? ""}
               ></trouve-session-pr-panel>`
-            : route.kind === "session" && selectedInspection === "mcp"
-            ? html`<trouve-session-mcp-panel
-                class="inspection-content"
-              ></trouve-session-mcp-panel>`
             : html`<section class="inspection-content"><div class="screen-empty"><strong>${selectedInspection[0]?.toUpperCase()}${selectedInspection.slice(1)}</strong><span>${route.kind === "session" ? "This live surface will populate when the session exposes matching data." : "Select a session to inspect it."}</span></div></section>`}
         </aside>
 

@@ -30,6 +30,10 @@ import type {
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
+import {
+  DEFAULT_CHAT_PREFERENCES,
+  effectiveChatCollapsePreferences,
+} from "../services/chat-preferences.js";
 import type { ChatScrollBookmark } from "../services/resume-preferences.js";
 import { rankComposerCompletionsOffThread } from "../services/content-worker-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
@@ -50,7 +54,6 @@ import {
   copyActionLabel,
   copyChatText,
   formatAttachmentBytes,
-  formatTurnMetadata,
   indexChatPresentation,
   isImageAttachment,
   protocolAttachmentPath,
@@ -379,6 +382,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #queueError = "";
   #queueStatus = "";
   #queueDragId = "";
+  #queueDragImage: HTMLElement | undefined;
   #queueDropId = "";
   #queueDropPlacement: QueueDropPlacement = "before";
   #queueKeyboardDragId = "";
@@ -788,6 +792,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
     this.#clearChatScrollIntent();
+    this.#clearQueueDragImage();
     this.#markdownContextMenu = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     super.disconnectedCallback();
@@ -949,6 +954,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         view?.thinking ?? false,
         view?.compacting ?? false,
         turnLabels,
+        view?.turnModels ?? new Map<number, string>(),
         view?.turnDurationMs ?? new Map<number, number>(),
         turnControls.activityLabel,
         view?.hasOlder ?? false,
@@ -1294,34 +1300,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ${thread === undefined
             ? nothing
             : html`
-                <span
-                  class="composer-context-usage"
-                  role="img"
-                  aria-label=${contextUsage.label}
-                  title=${contextUsage.label}
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <circle class="context-dial-track" cx="12" cy="12" r="9"></circle>
-                    <circle
-                      class="context-dial-value"
-                      cx="12"
-                      cy="12"
-                      r="9"
-                      pathLength="100"
-                      stroke-dasharray=${`${contextUsage.percent} 100`}
-                    ></circle>
-                  </svg>
-                  ${contextUsage.unavailable
-                    ? fontAwesomeIcon("triangle-exclamation", {
-                        className: "context-dial-glyph",
-                      })
-                    : contextUsage.compacting
-                      ? fontAwesomeIcon("arrows-rotate", {
-                          className: "context-dial-glyph compacting",
-                          spin: true,
-                        })
-                      : nothing}
-                </span>
+                ${this.#renderContextUsage(contextUsage)}
                 ${sessionUsageText === "" && !this.#usagePending
                   ? nothing
                   : html`<span class="composer-session-usage" aria-live="polite">
@@ -1511,6 +1490,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     effectiveTurnRunning: boolean,
     thinking: boolean,
     compacting: boolean,
+    turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     activityOverride: string | undefined,
@@ -1532,7 +1512,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       for (let index = layout.units.length - 1; index >= 0; index -= 1) {
         const unit = layout.units[index];
         if (
-          unit?.kind === "agent"
+          unit?.kind === "turn"
           && unit.turn === runningTurn
           && (
             unit.items.some(
@@ -1551,12 +1531,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       kind: "unit",
       unitIndex,
       estimatedHeight:
-        unit.kind === "agent"
-          ? Math.max(150, Math.min(620, unit.items.length * 90))
-          : unit.kind === "user"
-            ? 80
-            : 70,
-      heavyweight: unit.kind === "agent" && unit.items.some(
+        Math.max(190, Math.min(760, 110 + unit.items.length * 90)),
+      heavyweight: unit.items.some(
         (item) => item.kind === "tool" || item.kind === "questions",
       ),
     }));
@@ -1697,6 +1673,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 ? nothing
                 : html`<div data-virtual-id=${item.id} style=${style}>${this.#renderUnit(
                     unit,
+                    turnLabels,
                     turnModels,
                     turnDurationMs,
                     presentation,
@@ -1715,34 +1692,30 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderUnit(
     unit: ChatRenderUnit,
+    turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
     activityLabel: string | undefined,
     checkpointRestoreDisabled: boolean,
   ) {
-    if (unit.kind === "user") {
-      return html`
-        ${unit.divider
-          ? this.#renderTurnRule(
-              unit.item.turn,
-              presentation,
-              checkpointRestoreDisabled,
-            )
-          : nothing}
-        ${this.#renderItem(unit.item, turnModels, turnDurationMs, presentation)}
-      `;
-    }
-    if (unit.kind === "status") {
-      return this.#renderItem(unit.item, turnModels, turnDurationMs, presentation);
-    }
-    return this.#renderAgentCard(
-      unit,
-      turnModels,
-      turnDurationMs,
-      presentation,
-      activityLabel,
-    );
+    return html`
+      ${unit.divider
+        ? this.#renderTurnRule(
+            unit.turn,
+            presentation,
+            checkpointRestoreDisabled,
+          )
+        : nothing}
+      ${this.#renderTurnCard(
+        unit,
+        turnLabels,
+        turnModels,
+        turnDurationMs,
+        presentation,
+        activityLabel,
+      )}
+    `;
   }
 
   #renderTurnRule(
@@ -1849,8 +1822,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
-  #renderAgentCard(
-    unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
+  #renderTurnCard(
+    unit: ChatRenderUnit,
+    turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
@@ -1869,63 +1843,144 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       (item) => item.kind === "compaction" && item.state.kind === "running",
     );
     const open = compactionRunning || (this.#messageDisclosure.get(unit.id) ?? true);
-    const turnState = presentation.turnStates.get(unit.turn);
-    const preview = collapsedChatPreview(joined);
+    const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
+    const promptPreview = unit.prompt === undefined
+      ? ""
+      : collapsedChatPreview(assistantCopyText(unit.prompt.content))
+        || `${unit.prompt.attachments.length} attachment${unit.prompt.attachments.length === 1 ? "" : "s"}`;
+    const preview = promptPreview || collapsedChatPreview(joined) || `Turn ${unit.turn}`;
+    const activityRunning = unit.items.some((item) =>
+      (item.kind === "assistant" || item.kind === "thinking") && !item.complete
+      || item.kind === "compaction" && item.state.kind === "running"
+      || item.kind === "tool" && (
+        item.status === "running" || item.status === "awaiting-approval"
+      )
+      || item.kind === "questions" && item.answers === undefined
+    );
+    const stateKind = turnState?.kind ?? (
+      activityRunning || unit.items.length === 0 ? "running" : "completed"
+    );
+    const modelLabel = turnLabels.get(unit.turn);
+    const modelId = turnModels.get(unit.turn);
+    const model = this.#models.find((candidate) => candidate.id === modelId);
+    const usage = turnState?.kind === "running" || turnState?.kind === "completed"
+      ? turnState.usage
+      : undefined;
+    const turnContextUsage = composerContextUsage(
+      usage,
+      model?.context_window,
+      compactionRunning,
+      modelId?.startsWith("codex/") ?? false,
+    );
     return html`
       <article
-        class="message turn-card assistant-message agent-turn-card"
-        @contextmenu=${(event: MouseEvent) =>
-          this.#openMarkdownContextMenu(event, joined)}
+        class=${`message turn-card assistant-message agent-turn-card conversation-turn turn-${stateKind}`}
+        aria-labelledby=${`turn-heading-${unit.id}`}
       >
-        <header class="message-header agent-header ${open ? "" : "collapsed"}">
+        <header class="message-header agent-header turn-header ${open ? "" : "collapsed"}">
           <button
             class="message-disclosure"
             type="button"
             aria-expanded=${open ? "true" : "false"}
             aria-disabled=${compactionRunning ? "true" : "false"}
-            aria-label=${open ? "Collapse agent message" : "Expand agent message"}
-            title=${compactionRunning ? "Agent output stays open while context is compacting" : ""}
+            aria-label=${open ? `Collapse turn ${unit.turn}` : `Expand turn ${unit.turn}`}
+            title=${compactionRunning ? "The turn stays open while context is compacting" : ""}
             @click=${() => this.#toggleMessageDisclosure(unit.id, true, compactionRunning)}
           >
             ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
               className: "disclosure-icon",
             })}
-            <strong>Agent</strong>
-            ${turnModels.get(unit.turn) === undefined
-              ? nothing
-              : html`<small class="agent-model-label">(${turnModels.get(unit.turn)})</small>`}
+            <strong id=${`turn-heading-${unit.id}`}>Turn ${unit.turn}</strong>
+            <small class="agent-model-label">${modelLabel === undefined
+              ? "Agent"
+              : `Agent: ${modelLabel}`}</small>
             ${open
               ? html`<span class="agent-header-spacer"></span>`
               : html`<small class="agent-collapsed-preview">${preview}</small>`}
-            ${this.#renderAgentTurnMetadata(
-              turnState,
-              turnDurationMs.get(unit.turn),
-            )}
+            <span class="turn-header-metadata-slot">
+              ${this.#renderAgentTurnMetadata(
+                turnState,
+                turnDurationMs.get(unit.turn),
+              )}
+            </span>
+            ${modelId === undefined
+              ? nothing
+              : this.#renderContextUsage(turnContextUsage, "turn-context-usage")}
           </button>
-          ${joined === ""
-            ? nothing
-            : html`<span class="agent-copy-action">
-                ${this.#renderCopyButton(
-                  `agent:${unit.id}`,
-                  assistantCopyText(joined),
-                  "Copy assistant output",
-                )}
-              </span>`}
         </header>
         ${open
-          ? html`<div class="message-body turn-body-stream agent-body-stream">
+          ? html`<div
+              class=${`message-body turn-body-stream agent-body-stream turn-timeline ${
+                activityLabel === undefined ? "" : "has-transient-activity"
+              }`}
+            >
+              ${unit.prompt === undefined ? nothing : this.#renderPromptNode(unit.prompt)}
               ${this.#renderAgentBody(
                 unit,
-                turnModels,
-                turnDurationMs,
                 presentation,
               )}
-              ${activityLabel === undefined
+              ${unit.status === undefined
                 ? nothing
-                : this.#renderActivityRow(activityLabel)}
-            </div>`
+                : this.#renderTerminalTurnState(unit.status)}
+            </div>
+            ${activityLabel === undefined
+              ? nothing
+              : html`<footer class="turn-activity-footer">
+                  ${this.#renderActivityRow(activityLabel)}
+                </footer>`}`
           : nothing}
       </article>
+    `;
+  }
+
+  #renderPromptNode(
+    item: Extract<ThreadChatItem, { readonly kind: "user" }>,
+  ) {
+    this.#ensureMarkdown();
+    return html`
+      <section
+        class="turn-rail-node turn-prompt-node user-message"
+        data-chat-anchor-id=${`item:${item.id}`}
+        aria-label="Prompt"
+      >
+        <span class="turn-rail-marker prompt" aria-hidden="true">
+          ${fontAwesomeIcon("user")}
+        </span>
+        <header class="turn-node-header"><strong>Prompt</strong></header>
+        <div class="turn-node-body user-body-stream">
+          ${item.content === ""
+            ? nothing
+            : html`<trouve-markdown-view
+                .content=${item.content}
+              ></trouve-markdown-view>`}
+          ${this.#renderAttachments(item.attachments)}
+        </div>
+      </section>
+    `;
+  }
+
+  #renderTerminalTurnState(
+    item: Extract<ThreadChatItem, { readonly kind: "turn-status" }>,
+  ) {
+    if (item.state.kind !== "failed" && item.state.kind !== "cancelled") return nothing;
+    const failed = item.state.kind === "failed";
+    const detail = item.state.kind === "failed"
+      ? item.state.error
+      : "The active response was interrupted.";
+    return html`
+      <section
+        class=${`turn-rail-node turn-state-node ${item.state.kind}`}
+        role=${failed ? "alert" : "status"}
+        aria-label=${failed ? "Turn failed" : "Turn cancelled"}
+      >
+        <span class=${`turn-rail-marker ${item.state.kind}`} aria-hidden="true">
+          ${fontAwesomeIcon(failed ? "xmark" : "ban")}
+        </span>
+        <header class="turn-node-header">
+          <strong>${failed ? "Turn failed" : "Turn cancelled"}</strong>
+        </header>
+        <p>${detail}</p>
+      </section>
     `;
   }
 
@@ -1950,6 +2005,39 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         .durationMs=${running ? undefined : completedDurationMs}
       ></trouve-turn-metadata>
     </small>`;
+  }
+
+  #renderContextUsage(
+    contextUsage: ReturnType<typeof composerContextUsage>,
+    additionalClass = "",
+  ) {
+    return html`<span
+      class=${[
+        "composer-context-usage",
+        additionalClass,
+        contextUsage.compacting ? "compacting" : "",
+      ].filter(Boolean).join(" ")}
+      role="img"
+      aria-label=${contextUsage.label}
+      title=${contextUsage.label}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle class="context-dial-track" cx="12" cy="12" r="9"></circle>
+        <circle
+          class="context-dial-value"
+          cx="12"
+          cy="12"
+          r="9"
+          pathLength="100"
+          stroke-dasharray=${`${contextUsage.percent} 100`}
+        ></circle>
+      </svg>
+      ${contextUsage.unavailable && !contextUsage.compacting
+        ? fontAwesomeIcon("triangle-exclamation", {
+            className: "context-dial-glyph",
+          })
+        : nothing}
+    </span>`;
   }
 
   #renderActivityRow(label: string) {
@@ -1996,10 +2084,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       >
         <span class="context-compaction-symbol">
           ${running
-            ? fontAwesomeIcon("arrows-rotate", {
-                className: "context-compaction-glyph",
-                spin: true,
-              })
+            ? html`<span class="context-compaction-spinner" aria-hidden="true"></span>`
             : fontAwesomeIcon(completed ? "check" : "triangle-exclamation", {
                 className: "context-compaction-glyph",
               })}
@@ -2013,16 +2098,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #renderAgentBody(
-    unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
-    turnModels: ReadonlyMap<number, string>,
-    turnDurationMs: ReadonlyMap<number, number>,
+    unit: ChatRenderUnit,
     presentation: ChatPresentationIndex,
   ) {
     const chatPreferences = this.#services.value === undefined
       ? undefined
       : readSignal(this.#services.value.chatPreferences);
-    const collapseThinkingWithTools = chatPreferences?.collapseThinkingWithTools ?? false;
-    const collapseCompactionWithTools = chatPreferences?.collapseCompactionWithTools ?? false;
+    const effectiveCollapse = effectiveChatCollapsePreferences(
+      chatPreferences ?? DEFAULT_CHAT_PREFERENCES,
+    );
+    const collapseSequentialToolCalls = effectiveCollapse.collapseSequentialToolCalls;
+    const collapseThinkingWithTools = effectiveCollapse.collapseThinkingWithTools;
+    const collapseCompactionWithTools = effectiveCollapse.collapseCompactionWithTools;
     const rows: unknown[] = [];
     let activityConnectedFromCompaction = false;
     let activityRows: Array<{
@@ -2071,20 +2158,52 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         const content = stretch.map((part) => part.content).filter(Boolean).join("\n\n");
         if (content !== "") {
-          rows.push(html`<div
-            class="agent-text-block"
-            data-chat-anchor-id=${`assistant:${stretch.at(-1)?.id ?? stretch[0]?.id}`}
-          ><trouve-markdown-view
-                class="turn-markdown"
-                .content=${content}
-                .streaming=${stretch.some((part) => !part.complete)}
-              ></trouve-markdown-view></div>`);
+          const response = index === unit.items.length
+            && stretch.some((part) => presentation.lastAssistantIds.has(part.id));
+          const streaming = stretch.some((part) => !part.complete);
+          const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
+          const tone = turnState?.kind === "failed"
+            ? "failed"
+            : turnState?.kind === "cancelled"
+              ? "cancelled"
+              : response && (streaming || turnState?.kind === "running")
+                ? "running"
+                : response
+                  ? "complete"
+                  : "update";
+          const anchor = stretch.at(-1)?.id ?? stretch[0]?.id ?? unit.id;
+          rows.push(html`<section
+            class=${`turn-rail-node turn-response-node agent-text-block ${tone}`}
+            data-chat-anchor-id=${`assistant:${anchor}`}
+            aria-label=${response ? "Response" : "Agent update"}
+            @contextmenu=${(event: MouseEvent) =>
+              this.#openMarkdownContextMenu(event, content)}
+          >
+            <span class=${`turn-rail-marker response ${tone}`} aria-hidden="true">
+              ${fontAwesomeIcon("message")}
+            </span>
+            <header class="turn-node-header">
+              <strong>${response ? "Response" : "Update"}</strong>
+              <span class="thinking-header-spacer"></span>
+              <span class="agent-copy-action">
+                ${this.#renderCopyButton(
+                  `agent:${unit.id}:${anchor}`,
+                  assistantCopyText(content),
+                  response ? "Copy assistant response" : "Copy assistant update",
+                )}
+              </span>
+            </header>
+            <trouve-markdown-view
+              .content=${content}
+              .streaming=${streaming}
+            ></trouve-markdown-view>
+          </section>`);
         }
         continue;
       }
       if (item.kind === "questions") {
         flushActivityRows();
-        rows.push(this.#renderItem(item, turnModels, turnDurationMs, presentation));
+        rows.push(this.#renderItem(item, presentation));
         index += 1;
         continue;
       }
@@ -2128,6 +2247,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index += 1;
         continue;
       }
+      if (item.kind === "tool" && !collapseSequentialToolCalls) {
+        activityRows.push({
+          content: this.#renderItem(item, presentation),
+          expandedGroup: false,
+          endsWithExpandedToolGroup: false,
+        });
+        index += 1;
+        continue;
+      }
 
       const run: AgentActivityItem[] = [];
       while (index < unit.items.length) {
@@ -2164,7 +2292,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (run.length < 2 && !groupSinglePreferenceBoundary) {
         if (only !== undefined) {
           activityRows.push({
-            content: this.#renderItem(only, turnModels, turnDurationMs, presentation),
+            content: this.#renderItem(only, presentation),
             expandedGroup: false,
             endsWithExpandedToolGroup: false,
           });
@@ -2181,8 +2309,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         content: this.#renderActivityGroup(
           unit,
           run,
-          turnModels,
-          turnDurationMs,
           presentation,
         ),
         expandedGroup,
@@ -2225,10 +2351,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #renderActivityGroup(
-    unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
+    unit: ChatRenderUnit,
     items: readonly AgentActivityItem[],
-    turnModels: ReadonlyMap<number, string>,
-    turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
   ) {
     const first = items[0];
@@ -2300,8 +2424,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               }`}>
                 ${items.map((item) => this.#renderGroupedActivityItem(
                   item,
-                  turnModels,
-                  turnDurationMs,
                   presentation,
                 ))}
               </div>
@@ -2323,8 +2445,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderGroupedActivityItem(
     item: AgentActivityItem,
-    turnModels: ReadonlyMap<number, string>,
-    turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
   ) {
     if (item.kind === "thinking") return this.#renderVisibleThinking(item);
@@ -2342,11 +2462,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         nested: true,
       });
     }
-    return this.#renderItem(item, turnModels, turnDurationMs, presentation);
+    return this.#renderItem(item, presentation);
   }
 
   #activityGroupOpen(
-    unit: Extract<ChatRenderUnit, { readonly kind: "agent" }>,
+    unit: ChatRenderUnit,
     items: readonly AgentActivityItem[],
   ): boolean {
     const first = items[0];
@@ -3070,112 +3190,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   };
 
   #renderItem(
-    item: ThreadChatItem,
-    turnModels: ReadonlyMap<number, string>,
-    turnDurationMs: ReadonlyMap<number, number>,
+    item: Exclude<AgentChatItem, { readonly kind: "assistant" }>,
     presentation: ChatPresentationIndex,
   ) {
     switch (item.kind) {
-      case "user": {
-        this.#ensureMarkdown();
-        const open = this.#messageDisclosure.get(item.id) ?? true;
-        const preview = collapsedChatPreview(item.content)
-          || `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
-        return html`
-          <article
-            class="message turn-card user-message"
-            data-chat-anchor-id=${`item:${item.id}`}
-          >
-            <header class="message-header user-header ${open ? "" : "collapsed"}">
-              <button
-                class="message-disclosure"
-                type="button"
-                aria-expanded=${open ? "true" : "false"}
-                aria-label=${open ? "Collapse your message" : "Expand your message"}
-                @click=${() => this.#toggleMessageDisclosure(item.id, true)}
-              >
-                ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
-                  className: "disclosure-icon",
-                })}
-                <strong>You</strong>
-                ${open
-                  ? html`<span class="agent-header-spacer"></span>`
-                  : html`<small class="message-collapsed-preview">${preview}</small>`}
-              </button>
-            </header>
-            ${open
-              ? html`
-                  <div class="message-body turn-body-stream user-body-stream">
-                    ${item.content === ""
-                      ? nothing
-                      : html`<trouve-markdown-view
-                          class="turn-markdown"
-                          .content=${item.content}
-                        ></trouve-markdown-view>`}
-                    ${this.#renderAttachments(item.attachments)}
-                  </div>
-                `
-              : nothing}
-          </article>
-        `;
-      }
-      case "assistant": {
-        this.#ensureMarkdown();
-        const open = this.#messageDisclosure.get(item.id) ?? true;
-        const turnState = presentation.turnStates.get(item.turn);
-        return html`
-          <article
-            class="message turn-card assistant-message"
-            data-chat-anchor-id=${`item:${item.id}`}
-            @contextmenu=${(event: MouseEvent) =>
-              this.#openMarkdownContextMenu(event, item.content)}
-          >
-            <header class="message-header agent-header ${open ? "" : "collapsed"}">
-              <button
-                class="message-disclosure"
-                type="button"
-                aria-expanded=${open ? "true" : "false"}
-                aria-label=${open ? "Collapse agent message" : "Expand agent message"}
-                @click=${() => this.#toggleMessageDisclosure(item.id, true)}
-              >
-                ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
-                  className: "disclosure-icon",
-                })}
-                <strong>Agent</strong>
-                ${turnModels.get(item.turn) === undefined
-                  ? nothing
-                  : html`<small class="agent-model-label">(${turnModels.get(item.turn)})</small>`}
-                ${presentation.lastAssistantIds.has(item.id)
-                  ? this.#renderAgentTurnMetadata(
-                      turnState,
-                      turnDurationMs.get(item.turn),
-                    )
-                  : nothing}
-              </button>
-              ${item.content === ""
-                ? nothing
-                : html`<span class="agent-copy-action">
-                    ${this.#renderCopyButton(
-                      `agent:${item.id}`,
-                      assistantCopyText(item.content),
-                      "Copy assistant output",
-                    )}
-                  </span>`}
-            </header>
-            ${open
-              ? html`
-                  <div class="message-body turn-body-stream">
-                    <trouve-markdown-view
-                      class="turn-markdown"
-                      .content=${item.content}
-                      .streaming=${!item.complete}
-                    ></trouve-markdown-view>
-                  </div>
-                `
-              : nothing}
-          </article>
-        `;
-      }
       case "thinking": {
         this.#ensureMarkdown();
         const defaultOpen = item.turn === presentation.latestTurn;
@@ -3518,28 +3536,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             </section>
           `;
         }
-      case "turn-status":
-        if (item.state.kind === "failed") {
-          return html`<p class="message turn-error" role="alert">Turn failed: ${item.state.error}</p>`;
-        }
-        if (item.state.kind === "cancelled") {
-          return html`
-            <p class="message turn-cancelled" role="status">
-              <strong>Turn cancelled</strong> — the active response was interrupted.
-            </p>
-          `;
-        }
-        if (
-          item.state.kind === "completed"
-          && !presentation.turnsWithAssistant.has(item.turn)
-        ) {
-          return html`
-            <p class="message turn-metadata-standalone" role="status">
-              ${formatTurnMetadata(item.state.usage, turnDurationMs.get(item.turn))}
-            </p>
-          `;
-        }
-        return nothing;
     }
   }
 
@@ -4467,6 +4463,31 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : "false";
   };
 
+  #clearQueueDragImage(): void {
+    this.#queueDragImage?.remove();
+    this.#queueDragImage = undefined;
+  }
+
+  #installQueueDragImage(row: HTMLElement, transfer: DataTransfer): void {
+    this.#clearQueueDragImage();
+    const index = row.querySelector<HTMLElement>(".queue-index")?.textContent?.trim() ?? "";
+    const content = row.querySelector<HTMLElement>(".queue-row p")?.textContent?.trim() ?? "";
+    const preview = document.createElement("div");
+    preview.className = "queue-drag-image";
+    preview.ariaHidden = "true";
+    preview.textContent = `${index} ${content}`.trim();
+    document.body.append(preview);
+    const bounds = preview.getBoundingClientRect();
+    this.#queueDragImage = preview;
+    try {
+      transfer.setDragImage(preview, 16, bounds.height + 8);
+    } catch {
+      // Keep reordering functional in engines that expose but do not yet
+      // implement custom drag images.
+      this.#clearQueueDragImage();
+    }
+  }
+
   #startQueueDrag(event: DragEvent, promptId: string, disabled: boolean): void {
     const row = event.currentTarget as HTMLElement;
     const blocked = row.dataset["queueDragBlocked"] === "true";
@@ -4483,6 +4504,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (event.dataTransfer !== null) {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", promptId);
+      this.#installQueueDragImage(row, event.dataTransfer);
     }
   }
 
@@ -4566,6 +4588,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #endQueueDrag = (): void => {
     const changed = this.#queueDragId !== "" || this.#queueDropId !== "";
+    this.#clearQueueDragImage();
     this.#queueDragId = "";
     this.#queueDropId = "";
     this.#queueDropPlacement = "before";

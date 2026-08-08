@@ -303,34 +303,52 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                         <h1 id="settings-title">Sessions &amp; Chat</h1>
                         <div class="settings-subsection">
                           <h2>Chat output</h2>
-                          <label class="settings-toggle-row" for="settings-collapse-thinking">
+                          <label class="settings-toggle-row" for="settings-collapse-sequential-tools">
                             <input
-                              id="settings-collapse-thinking"
+                              id="settings-collapse-sequential-tools"
                               type="checkbox"
-                              .checked=${chatPreferences.collapseThinkingWithTools}
+                              .checked=${chatPreferences.collapseSequentialToolCalls}
                               @change=${(event: Event) => services.setChatPreferences({
-                                collapseThinkingWithTools:
+                                collapseSequentialToolCalls:
                                   (event.currentTarget as HTMLInputElement).checked,
                               })}
                             />
-                            <span class="toggle-state">${chatPreferences.collapseThinkingWithTools ? "On" : "Off"}</span>
-                            <span>Collapse thinking output with tool calls.</span>
+                            <span class="toggle-state">${chatPreferences.collapseSequentialToolCalls ? "On" : "Off"}</span>
+                            <span>Collapse sequential tool calls.</span>
                           </label>
-                          <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
-                          <label class="settings-toggle-row" for="settings-collapse-compaction">
-                            <input
-                              id="settings-collapse-compaction"
-                              type="checkbox"
-                              .checked=${chatPreferences.collapseCompactionWithTools}
-                              @change=${(event: Event) => services.setChatPreferences({
-                                collapseCompactionWithTools:
-                                  (event.currentTarget as HTMLInputElement).checked,
-                              })}
-                            />
-                            <span class="toggle-state">${chatPreferences.collapseCompactionWithTools ? "On" : "Off"}</span>
-                            <span>Collapse context compaction with tool calls.</span>
-                          </label>
-                          <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
+                          <p class="settings-note">When off, every tool call is shown separately; thinking and context compaction remain visible at the top level.</p>
+                          <div class=${`nested-toggles ${chatPreferences.collapseSequentialToolCalls ? "" : "disabled"}`}>
+                            <label class="settings-toggle-row" for="settings-collapse-thinking">
+                              <input
+                                id="settings-collapse-thinking"
+                                type="checkbox"
+                                .checked=${chatPreferences.collapseThinkingWithTools}
+                                ?disabled=${!chatPreferences.collapseSequentialToolCalls}
+                                @change=${(event: Event) => services.setChatPreferences({
+                                  collapseThinkingWithTools:
+                                    (event.currentTarget as HTMLInputElement).checked,
+                                })}
+                              />
+                              <span class="toggle-state">${chatPreferences.collapseThinkingWithTools ? "On" : "Off"}</span>
+                              <span>Collapse thinking output with tool calls.</span>
+                            </label>
+                            <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
+                            <label class="settings-toggle-row" for="settings-collapse-compaction">
+                              <input
+                                id="settings-collapse-compaction"
+                                type="checkbox"
+                                .checked=${chatPreferences.collapseCompactionWithTools}
+                                ?disabled=${!chatPreferences.collapseSequentialToolCalls}
+                                @change=${(event: Event) => services.setChatPreferences({
+                                  collapseCompactionWithTools:
+                                    (event.currentTarget as HTMLInputElement).checked,
+                                })}
+                              />
+                              <span class="toggle-state">${chatPreferences.collapseCompactionWithTools ? "On" : "Off"}</span>
+                              <span>Collapse context compaction with tool calls.</span>
+                            </label>
+                            <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
+                          </div>
                         </div>
                         <trouve-git-worktree-settings></trouve-git-worktree-settings>
                       </div>

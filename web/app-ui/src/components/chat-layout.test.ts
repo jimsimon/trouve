@@ -11,7 +11,7 @@ import {
 const output = { text: "", omitted: false, bytes: 0 } as const;
 
 describe("buildChatLayout", () => {
-  it("groups an uninterrupted assistant/work run into one agent card", () => {
+  it("groups each prompt and assistant/work run into one turn", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 1, content: "Do it", attachments: [] },
       { id: "a1", kind: "assistant", turn: 1, content: "First", complete: true },
@@ -22,23 +22,32 @@ describe("buildChatLayout", () => {
     ];
 
     const layout = buildChatLayout(items);
-    expect(layout.units.map((unit) => unit.kind)).toEqual(["user", "agent", "user"]);
-    expect(layout.units[1]).toMatchObject({
-      kind: "agent",
+    expect(layout.units.map((unit) => unit.kind)).toEqual(["turn", "turn"]);
+    expect(layout.units[0]).toMatchObject({
+      kind: "turn",
       turn: 1,
+      prompt: { id: "u1" },
       items: [{ id: "a1" }, { id: "t1" }, { id: "a2" }],
+      status: { id: "s1" },
     });
-    expect(layout.units[2]).toMatchObject({ kind: "user", divider: true });
-    expect(layout.unitIdForItem.get("t1")).toBe(layout.units[1]?.id);
+    expect(layout.units[1]).toMatchObject({ kind: "turn", divider: true });
+    expect(layout.unitIdForItem.get("u1")).toBe(layout.units[0]?.id);
+    expect(layout.unitIdForItem.get("t1")).toBe(layout.units[0]?.id);
+    expect(layout.unitIdForItem.get("s1")).toBe(layout.units[0]?.id);
   });
 
-  it("synthesizes an agent card when a turn begins with tools", () => {
+  it("keeps tools with their prompt when a turn begins with tools", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 4, content: "Search", attachments: [] },
       { id: "t1", kind: "tool", callId: "c1", tool: "search", args: {}, status: "running", result: undefined, output },
       { id: "t2", kind: "tool", callId: "c2", tool: "read", args: {}, status: "running", result: undefined, output },
     ];
-    expect(buildChatLayout(items).units[1]).toMatchObject({ kind: "agent", turn: 4 });
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      kind: "turn",
+      turn: 4,
+      prompt: { id: "u1" },
+      items: [{ id: "t1" }, { id: "t2" }],
+    });
   });
 
   it("keeps compaction between adjacent work runs in the same agent card", () => {
@@ -49,32 +58,54 @@ describe("buildChatLayout", () => {
       { id: "t2", kind: "tool", callId: "c2", tool: "edit", args: {}, status: "ok", result: null, output },
     ];
 
-    expect(buildChatLayout(items).units[1]).toMatchObject({
-      kind: "agent",
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      kind: "turn",
       turn: 4,
       items: [{ id: "t1" }, { id: "c1" }, { id: "t2" }],
     });
   });
 
-  it("associates the event-folded leading status with its later agent card", () => {
+  it("associates the event-folded leading status with its turn", () => {
     const items: ThreadChatItem[] = [
       { id: "s7", kind: "turn-status", turn: 7, state: { kind: "completed", usage: { input_tokens: 2, output_tokens: 1 } } },
       { id: "u7", kind: "user", turn: 7, content: "Build", attachments: [] },
       { id: "a7", kind: "assistant", turn: 7, content: "Done", complete: true },
     ];
     const layout = buildChatLayout(items);
-    expect(layout.units.map((unit) => unit.kind)).toEqual(["user", "agent"]);
-    expect(layout.unitIdForItem.get("s7")).toBe(layout.units[1]?.id);
+    expect(layout.units.map((unit) => unit.kind)).toEqual(["turn"]);
+    expect(layout.units[0]).toMatchObject({
+      prompt: { id: "u7" },
+      items: [{ id: "a7" }],
+      status: { id: "s7" },
+    });
+    expect(layout.unitIdForItem.get("s7")).toBe(layout.units[0]?.id);
   });
 
-  it("places a terminal failure after the affected turn instead of before its prompt", () => {
+  it("keeps a terminal failure in the affected turn", () => {
     const items: ThreadChatItem[] = [
       { id: "s8", kind: "turn-status", turn: 8, state: { kind: "failed", error: "boom" } },
       { id: "u8", kind: "user", turn: 8, content: "Build", attachments: [] },
       { id: "a8", kind: "assistant", turn: 8, content: "Partial", complete: true },
     ];
-    expect(buildChatLayout(items).units.map((unit) => unit.kind))
-      .toEqual(["user", "agent", "status"]);
+    expect(buildChatLayout(items).units).toHaveLength(1);
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      kind: "turn",
+      prompt: { id: "u8" },
+      items: [{ id: "a8" }],
+      status: { id: "s8", state: { kind: "failed" } },
+    });
+  });
+
+  it("lets a leading tool inherit the next explicit turn in a bounded page", () => {
+    const items: ThreadChatItem[] = [
+      { id: "t1", kind: "tool", callId: "c1", tool: "read", args: {}, status: "ok", result: null, output },
+      { id: "a9", kind: "assistant", turn: 9, content: "Done", complete: true },
+    ];
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      id: "turn:9",
+      turn: 9,
+      items: [{ id: "t1" }, { id: "a9" }],
+    });
   });
 });
 

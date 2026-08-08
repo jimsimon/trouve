@@ -588,26 +588,32 @@ describe("HostClient", () => {
       preventSleepWhileRunning: true,
     });
     expect(chatPreferencesFromHost(preferences)).toEqual({
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
     });
     expect(chatPreferencesFromHost(preferences, {
+      collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     })).toEqual({
+      collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     });
     expect(chatPreferencesFromHost({
       ...preferences,
       chat: {
+        collapse_sequential_tool_calls: false,
         collapse_thinking_with_tools: false,
         collapse_compaction_with_tools: false,
       },
     }, {
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     })).toEqual({
+      collapseSequentialToolCalls: false,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
     });
@@ -622,6 +628,7 @@ describe("HostClient", () => {
       preventSleepWhileRunning: false,
     });
     next = withHostChatPreferences(next, {
+      collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
     });
@@ -645,6 +652,7 @@ describe("HostClient", () => {
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
+    expect(next.chat?.collapse_sequential_tool_calls).toBe(true);
     expect(next.chat?.collapse_thinking_with_tools).toBe(true);
     expect(next.chat?.collapse_compaction_with_tools).toBe(true);
     expect(next.notifications).toMatchObject({

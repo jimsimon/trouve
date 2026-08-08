@@ -448,6 +448,8 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
   await expect(branchNames).not.toBeChecked();
   await expect(page.getByText(/new branches use a compact name such as trouve\/abc123/u))
     .toBeVisible();
+  const sequentialToggle = page.getByLabel("Collapse sequential tool calls.");
+  await expect(sequentialToggle).toBeChecked();
   const toggle = page.getByLabel("Collapse thinking output with tool calls.");
   await expect(toggle).not.toBeChecked();
   await expect(page.getByText(
@@ -460,6 +462,15 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     "When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.",
     { exact: true },
   )).toBeVisible();
+
+  await page.locator('label[for="settings-collapse-sequential-tools"]').click();
+  await expect(sequentialToggle).not.toBeChecked();
+  await expect(toggle).toBeDisabled();
+  await expect(compactionToggle).toBeDisabled();
+  await page.locator('label[for="settings-collapse-sequential-tools"]').click();
+  await expect(sequentialToggle).toBeChecked();
+  await expect(toggle).toBeEnabled();
+  await expect(compactionToggle).toBeEnabled();
 
   await page.getByText("Collapse thinking output with tool calls.", { exact: true }).click();
   await expect(toggle).toBeChecked();
@@ -475,11 +486,14 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     derive_branch_name_from_session_title: true,
   });
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
+    .toContain('"collapseSequentialToolCalls":true');
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
     .toContain('"collapseThinkingWithTools":true');
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
     .toContain('"collapseCompactionWithTools":true');
 
   await page.reload();
+  await expect(page.getByLabel("Collapse sequential tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Use session names in branch names")).toBeChecked();

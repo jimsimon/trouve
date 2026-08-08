@@ -26,7 +26,7 @@ describe("application routes", () => {
       kind: "session",
       workspaceId: "ws",
       sessionId: "se",
-      inspection: "mcp",
+      inspection: "info",
     });
   });
 
@@ -146,10 +146,10 @@ describe("application routes", () => {
       workspaceId: "ws",
       sessionId: "se-2",
       threadId: "th-3",
-      inspection: "mcp",
+      inspection: "info",
     });
     expect(push).toHaveBeenLastCalledWith(
-      "/workspaces/ws/sessions/se-2/threads/th-3/inspect/mcp",
+      "/workspaces/ws/sessions/se-2/threads/th-3/inspect/info",
     );
   });
 });

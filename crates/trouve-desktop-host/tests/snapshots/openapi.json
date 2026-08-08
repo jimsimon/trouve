@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9"
+    "version": "10"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -472,6 +472,10 @@
           "collapse_compaction_with_tools": {
             "type": "boolean",
             "description": "Include context-compaction boundaries in collapsible tool-activity groups."
+          },
+          "collapse_sequential_tool_calls": {
+            "type": "boolean",
+            "description": "Summarize consecutive tool calls inside collapsible activity groups."
           },
           "collapse_thinking_with_tools": {
             "type": "boolean",

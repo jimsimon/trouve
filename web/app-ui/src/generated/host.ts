@@ -228,6 +228,8 @@ export interface components {
         ChatPreferences: {
             /** @description Include context-compaction boundaries in collapsible tool-activity groups. */
             collapse_compaction_with_tools?: boolean;
+            /** @description Summarize consecutive tool calls inside collapsible activity groups. */
+            collapse_sequential_tool_calls?: boolean;
             /** @description Include thinking output in collapsible tool-activity groups. */
             collapse_thinking_with_tools?: boolean;
         };

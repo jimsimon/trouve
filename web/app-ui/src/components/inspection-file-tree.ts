@@ -49,6 +49,34 @@ const compareEntries = (left: ProtocolDirEntry, right: ProtocolDirEntry): number
 const joinedPath = (directory: string, name: string): string =>
   directory === "." ? name : `${directory}/${name}`;
 
+/** Build deterministic directory listings from a bounded set of file paths.
+ * This lets filtered projections such as the Diff pane reuse the Files pane's
+ * ARIA tree and keyboard model without requesting unrelated worktree files. */
+export const fileTreeDirectoriesForPaths = (
+  paths: readonly string[],
+): ReadonlyMap<string, readonly ProtocolDirEntry[]> => {
+  const directories = new Map<string, Map<string, boolean>>([[".", new Map()]]);
+  for (const path of paths) {
+    const segments = path.split("/").filter((segment) => segment !== "");
+    let directory = ".";
+    segments.forEach((name, index) => {
+      const isDirectory = index < segments.length - 1;
+      const entries = directories.get(directory) ?? new Map<string, boolean>();
+      entries.set(name, entries.get(name) === true || isDirectory);
+      directories.set(directory, entries);
+      if (!isDirectory) return;
+      directory = joinedPath(directory, name);
+      if (!directories.has(directory)) directories.set(directory, new Map());
+    });
+  }
+  return new Map(
+    [...directories].map(([directory, entries]) => [
+      directory,
+      [...entries].map(([name, is_dir]) => ({ name, is_dir })),
+    ]),
+  );
+};
+
 /**
  * Cached, lazily populated projection for the Files inspection tree.
  *

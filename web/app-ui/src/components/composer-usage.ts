@@ -40,6 +40,21 @@ export const composerContextUsage = (
     ? liveWindow > 0 ? liveWindow : undefined
     : configuredWindow > 0 ? configuredWindow : undefined;
 
+  // A compaction boundary invalidates the previous request's context size.
+  // Keep the raw values available to callers, but do not present that stale
+  // measurement as a determinate fill while the provider is replacing it.
+  if (compacting) {
+    return {
+      fill: 0,
+      percent: 0,
+      usedTokens,
+      windowTokens,
+      unavailable: windowTokens === undefined,
+      compacting: true,
+      label: "Context compaction in progress",
+    };
+  }
+
   if (windowTokens === undefined) {
     const prefix = usedTokens === 0 ? "" : `Context: ${usedTokens} tokens. `;
     return {

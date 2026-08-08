@@ -30,6 +30,7 @@ const history: readonly FixtureEvent[] = [
     turn: 7,
     mode: "code",
     model: "test/model",
+    thinking_level: "max",
   }),
   threadEvent(2, {
     type: "user.message",
@@ -202,6 +203,9 @@ interface ProtocolFixtureOptions {
   readonly restoredCheckpointIds?: string[];
   readonly codeReviewDashboard?: Record<string, unknown>;
   readonly codeReviewSettings?: Record<string, unknown>;
+  readonly sessionDiff?: string;
+  readonly sessionPullRequests?: readonly Record<string, unknown>[];
+  readonly sessionMcpServers?: readonly Record<string, unknown>[];
 }
 
 const installProtocolFixtures = async (
@@ -219,6 +223,9 @@ const installProtocolFixtures = async (
     restoredCheckpointIds = [],
     codeReviewDashboard,
     codeReviewSettings,
+    sessionDiff = "",
+    sessionPullRequests = [],
+    sessionMcpServers = [],
   }: ProtocolFixtureOptions = {},
 ): Promise<void> => {
   let messageCount = 0;
@@ -348,7 +355,9 @@ const installProtocolFixtures = async (
         headers: { "x-trouve-event-cursor": "0" },
         json: {
           github_pull_requests: [],
-          session_pull_requests: [],
+          session_pull_requests: sessionPullRequests.length === 0
+            ? []
+            : [{ session_id: "se_1", prs: sessionPullRequests }],
           git_worktree_settings: {
             derive_branch_name_from_session_title: false,
             title_model: {
@@ -450,8 +459,9 @@ const installProtocolFixtures = async (
         turns: 1,
       },
       "GET /v1/sessions/se_1/paths": [],
-      "GET /v1/sessions/se_1/diff": { diff: "" },
-      "GET /v1/sessions/se_1/prs": [],
+      "GET /v1/sessions/se_1/diff": { diff: sessionDiff },
+      "GET /v1/sessions/se_1/prs": sessionPullRequests,
+      "GET /v1/sessions/se_1/mcp-servers": sessionMcpServers,
       "GET /v1/sessions/se_2/usage": {
         input_tokens: 0,
         cached_input_tokens: 0,
@@ -462,6 +472,7 @@ const installProtocolFixtures = async (
       "GET /v1/sessions/se_2/paths": [],
       "GET /v1/sessions/se_2/diff": { diff: "" },
       "GET /v1/sessions/se_2/prs": [],
+      "GET /v1/sessions/se_2/mcp-servers": [],
       ...(codeReviewDashboard === undefined
         ? {}
         : { "GET /v1/code-review": codeReviewDashboard }),
@@ -644,7 +655,149 @@ test("the TODO pane follows the thread's durable todo snapshot", async ({
   await emit(page, threadEvent(17, { type: "thread.todos_updated", todos: [] }));
   await expect(todoSwitch).toHaveCount(0);
   await expect(plan).toHaveCount(0);
-  await expect(page.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tab", { name: "Info" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("Diff shows one changed file at a time from a diff-only file tree", async ({
+  page,
+}, testInfo) => {
+  const sessionDiff = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1,2 +1,2 @@",
+    "-const ready = false;",
+    "+const ready = true;",
+    " export { ready };",
+    "diff --git a/docs/guide.md b/docs/guide.md",
+    "index 3333333..4444444 100644",
+    "--- a/docs/guide.md",
+    "+++ b/docs/guide.md",
+    "@@ -1 +1 @@",
+    "-Old guide",
+    "+Updated guide",
+    "",
+  ].join("\n");
+  await installProtocolFixtures(page, { sessionDiff });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture/inspect/diff");
+  await replayHistory(page);
+  if (testInfo.project.name === "mobile-chromium") {
+    await page.locator(".mobile-nav").getByRole(
+      "button",
+      { name: "Inspect" },
+    ).dispatchEvent("click");
+  }
+
+  const workspace = page.locator("trouve-inspection-workspace");
+  const tree = workspace.getByRole("tree", { name: "Changed files" });
+  await expect(tree).toBeVisible();
+  await expect(tree.getByRole("treeitem", { name: /src/ })).toBeVisible();
+  await expect(tree.getByRole("treeitem", { name: /app\.ts/ })).toBeVisible();
+  await expect(tree.getByRole("treeitem", { name: /guide\.md/ })).toBeVisible();
+  await expect(tree.getByText("README.md", { exact: true })).toHaveCount(0);
+
+  const viewers = workspace.locator("trouve-diff-view");
+  await expect(viewers).toHaveCount(1);
+  const appFile = tree.getByRole("treeitem", { name: /app\.ts/ });
+  const guideFile = tree.getByRole("treeitem", { name: /guide\.md/ });
+  await expect(appFile).toHaveAttribute("aria-selected", "true");
+
+  if (testInfo.project.name === "desktop-chromium") {
+    await expect(viewers).toBeVisible();
+    const docsDirectory = tree.getByRole("treeitem", { name: /docs/ });
+    await docsDirectory.focus();
+    await docsDirectory.press("ArrowLeft");
+    await expect(docsDirectory).toHaveAttribute("aria-expanded", "false");
+    await expect(guideFile).toHaveCount(0);
+    await docsDirectory.press("ArrowRight");
+    await expect(docsDirectory).toHaveAttribute("aria-expanded", "true");
+  } else {
+    await expect(viewers).toBeHidden();
+  }
+
+  await tree.getByRole("treeitem", { name: /guide\.md/ }).click();
+  await expect(viewers).toHaveCount(1);
+  await expect(viewers).toHaveAttribute("label", "docs/guide.md");
+  if (testInfo.project.name === "mobile-chromium") {
+    await expect(tree).toBeHidden();
+    await expect(viewers).toBeVisible();
+    await workspace.getByRole("button", { name: "Show changed files" }).click();
+    await expect(tree).toBeVisible();
+    await expect(tree.getByRole("treeitem", { name: /guide\.md/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  } else {
+    await expect(tree).toBeVisible();
+    await expect(tree.getByRole("treeitem", { name: /guide\.md/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  }
+});
+
+test("Info combines session identity, changes, pull requests, and effective MCP tools", async ({
+  page,
+}, testInfo) => {
+  await installProtocolFixtures(page, {
+    sessionDiff: [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -1 +1 @@",
+      "-const ready = false;",
+      "+const ready = true;",
+      "",
+    ].join("\n"),
+    sessionPullRequests: [{
+      number: 42,
+      title: "Improve session overview",
+      state: "open",
+      draft: false,
+      base: "main",
+      head: "feature/chat",
+      url: "https://github.com/trouve/trouve/pull/42",
+      checks: [],
+      reviews: [],
+      host: "github.com",
+      repository: "trouve/trouve",
+      workspace_id: "ws_1",
+      mergeable: true,
+      merge_state_status: "clean",
+    }],
+    sessionMcpServers: [{
+      name: "docs",
+      scope: "app-wide",
+      command: "docs-mcp",
+      args: [],
+      env: {},
+      health: "unknown",
+      detail: "",
+    }],
+  });
+  await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture/inspect/info");
+  await replayHistory(page);
+  if (testInfo.project.name === "mobile-chromium") {
+    await page.locator(".mobile-nav").getByRole(
+      "button",
+      { name: "Inspect" },
+    ).dispatchEvent("click");
+  }
+
+  const tabs = page.locator(".inspection-tabs").getByRole("tab");
+  await expect(tabs.first()).toHaveText(/Info/u);
+  await expect(page.getByRole("tab", { name: "MCP" })).toHaveCount(0);
+
+  const overview = page.locator("trouve-session-info-panel");
+  await expect(overview.getByRole("heading", { name: "Session overview" })).toBeVisible();
+  await expect(overview.getByText("Chat rendering", { exact: true })).toBeVisible();
+  await expect(overview.getByText("feature/chat", { exact: true })).toBeVisible();
+  await expect(overview.getByText("+1", { exact: true })).toBeVisible();
+  await expect(overview.getByText("−1", { exact: true })).toBeVisible();
+  await expect(overview.getByText("#42 Improve session overview", { exact: true })).toBeVisible();
+  await expect(overview.getByText("docs", { exact: true })).toBeVisible();
+  await expect(overview.getByText("Active", { exact: true })).toBeVisible();
 });
 
 test("turn separators retain even, comfortable vertical spacing", async ({ page }) => {
@@ -669,17 +822,19 @@ test("turn separators retain even, comfortable vertical spacing", async ({ page 
   const rule = page.locator(".turn-rule").last();
   await expect(rule).toBeVisible();
   const geometry = await rule.evaluate((element) => {
-    const previous = [...document.querySelectorAll<HTMLElement>(".agent-turn-card")].at(-1);
-    const user = element.parentElement?.querySelector<HTMLElement>(".user-message");
-    if (previous === undefined || user === null || user === undefined) {
+    const current = element.parentElement?.querySelector<HTMLElement>(".conversation-turn");
+    const turns = [...document.querySelectorAll<HTMLElement>(".conversation-turn")];
+    const currentIndex = current === null || current === undefined ? -1 : turns.indexOf(current);
+    const previous = currentIndex > 0 ? turns[currentIndex - 1] : undefined;
+    if (previous === undefined || current === null || current === undefined) {
       throw new Error("missing adjacent turn geometry");
     }
     const previousBounds = previous.getBoundingClientRect();
     const ruleBounds = element.getBoundingClientRect();
-    const userBounds = user.getBoundingClientRect();
+    const currentBounds = current.getBoundingClientRect();
     return {
       above: ruleBounds.top - previousBounds.bottom,
-      below: userBounds.top - ruleBounds.bottom,
+      below: currentBounds.top - ruleBounds.bottom,
     };
   });
   expect(geometry.above).toBe(14);
@@ -835,24 +990,40 @@ test("the Agent header shows live token usage and elapsed time", async ({ page }
       turn: 8,
       usage: { input_tokens: 900, output_tokens: 42, cost_usd: 0.01 },
     }),
+    threadEvent(20, {
+      type: "assistant.delta",
+      turn: 8,
+      text: "Working on it.",
+    }),
   ]);
 
-  const metadata = page.locator(".agent-turn-card").last().locator(".turn-metadata");
-  await expect(page.locator(".agent-turn-card").last().locator(".agent-model-label"))
-    .toHaveText("(test/model · Max)");
+  const runningTurn = page.locator(".agent-turn-card").last();
+  const metadata = runningTurn.locator(".turn-metadata");
+  await expect(runningTurn.locator(".agent-model-label"))
+    .toHaveText("Agent: test/model · Max");
+  await expect(runningTurn.locator(".turn-response-node.running")).toContainText("Working on it.");
   await expect(metadata).toContainText("900 in / 42 out tokens");
   await expect(metadata).toContainText(/1m \d{2}s/u);
   const first = await metadata.textContent();
   await expect.poll(() => metadata.textContent(), { timeout: 3_000 }).not.toBe(first);
-  await emit(page, {
-    ...threadEvent(20, {
-      type: "turn.completed",
+  await emitBatch(page, [
+    threadEvent(21, {
+      type: "assistant.message",
       turn: 8,
-      usage: { input_tokens: 1_000, output_tokens: 50, cost_usd: 0.012 },
-      checkpoint_id: null,
+      content: "Working on it.",
     }),
-    ts: new Date().toISOString(),
-  });
+    {
+      ...threadEvent(22, {
+        type: "turn.completed",
+        turn: 8,
+        usage: { input_tokens: 1_000, output_tokens: 50, cost_usd: 0.012 },
+        checkpoint_id: null,
+      }),
+      ts: new Date().toISOString(),
+    },
+  ]);
+  await expect(runningTurn.locator(".turn-response-node.complete"))
+    .toContainText("Working on it.");
   await expect(metadata).toContainText("1000 in / 50 out tokens");
   const completed = await metadata.textContent();
   await page.waitForTimeout(1_100);
@@ -1260,7 +1431,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(textarea).toHaveValue("Draft in a different session");
 });
 
-test("chat cards unmount collapsed output and expose response copy actions", async ({ page }) => {
+test("turn cards unify prompt, activity, and response while preserving copy actions", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -1268,9 +1439,44 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   await expect(page.locator('select[aria-label="Thinking level"]')).toHaveValue("max");
   await expect(page.locator('select[aria-label="Thinking level"] option:checked')).toHaveText("Max");
   await expect(page.locator('select[aria-label="Context size"]')).toHaveValue("1m");
+  await expect(page.locator(".conversation-turn")).toHaveCount(1);
+  const agentCard = page.locator(".conversation-turn").first();
+  await expect(agentCard).toHaveAccessibleName("Turn 7");
+  await expect(agentCard.locator(":scope > .turn-header"))
+    .toContainText("Agent: test/model · Max");
+  const turnSurfaceColors = await agentCard.evaluate((turn) => {
+    const header = turn.querySelector<HTMLElement>(":scope > .turn-header");
+    const content = turn.querySelector<HTMLElement>(":scope > .turn-timeline");
+    if (header === null || content === null) throw new Error("missing turn surfaces");
+    return {
+      header: getComputedStyle(header).backgroundColor,
+      content: getComputedStyle(content).backgroundColor,
+    };
+  });
+  expect(turnSurfaceColors.header).not.toBe(turnSurfaceColors.content);
+  expect(turnSurfaceColors.header).not.toBe("rgba(0, 0, 0, 0)");
+  await expect(agentCard.locator(".turn-context-usage"))
+    .toHaveAttribute("aria-label", /Context: 20 \/ 128000 tokens/u);
+  await expect(agentCard.locator(".turn-prompt-node").getByText("Prompt", { exact: true }))
+    .toBeVisible();
+  await expect(agentCard.locator(".turn-response-node").getByText("Response", { exact: true }))
+    .toBeVisible();
+  const turnStoryOrder = await agentCard.locator(":scope > .turn-timeline").evaluate((timeline) => {
+    const top = (selector: string): number =>
+      timeline.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top
+      ?? Number.POSITIVE_INFINITY;
+    return {
+      prompt: top(":scope > .turn-prompt-node"),
+      thought: top(".thinking-output"),
+      response: top(":scope > .turn-response-node:last-of-type"),
+    };
+  });
+  expect(turnStoryOrder.prompt).toBeLessThan(turnStoryOrder.thought);
+  expect(turnStoryOrder.thought).toBeLessThan(turnStoryOrder.response);
+  await expect(agentCard.locator(".turn-response-node.complete")).toHaveCount(1);
   await expect(page.locator(".user-message trouve-markdown-view strong")).toHaveText("migration");
   const userBody = page.locator(".user-body-stream").first();
-  await expect(userBody).toHaveCSS("padding", "8px 16px 10px");
+  await expect(userBody).toHaveCSS("padding", "2px 8px 6px");
   const userProseInset = await userBody.evaluate((body) => {
     const bodyBounds = body.getBoundingClientRect();
     const bodyStyle = getComputedStyle(body);
@@ -1283,9 +1489,39 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       ?.getBoundingClientRect();
     return paragraph === undefined ? Number.NaN : paragraph.left - contentLeft;
   });
-  expect(Math.abs(userProseInset - 10)).toBeLessThanOrEqual(1);
+  expect(Math.abs(userProseInset)).toBeLessThanOrEqual(1);
   const activityGroup = page.locator(".activity-group");
   await expect(activityGroup.getByText("Edited 1 file, read 1 file", { exact: true })).toBeVisible();
+  const turnContentAlignment = await agentCard.evaluate((turn) => {
+    const markdownParagraphLeft = (selector: string): number => {
+      const markdown = turn.querySelector<HTMLElement>(selector);
+      return markdown?.shadowRoot?.querySelector<HTMLElement>("p")
+        ?.getBoundingClientRect().left ?? Number.NaN;
+    };
+    const response = turn.querySelector<HTMLElement>(".turn-response-node:last-of-type");
+    return {
+      prompt: markdownParagraphLeft(
+        ":scope > .turn-timeline > .turn-prompt-node trouve-markdown-view",
+      ),
+      thought: markdownParagraphLeft(".thinking-output .thinking-body trouve-markdown-view"),
+      tools: turn.querySelector<HTMLElement>(".activity-group > summary > strong")
+        ?.getBoundingClientRect().left ?? Number.NaN,
+      response: markdownParagraphLeft(
+        ":scope > .turn-timeline > .turn-response-node:last-of-type > trouve-markdown-view",
+      ),
+      responseDecoration: response === null
+        ? "missing"
+        : getComputedStyle(response, "::after").content,
+    };
+  });
+  const contentColumns = [
+    turnContentAlignment.prompt,
+    turnContentAlignment.thought,
+    turnContentAlignment.tools,
+    turnContentAlignment.response,
+  ];
+  expect(Math.max(...contentColumns) - Math.min(...contentColumns)).toBeLessThanOrEqual(1);
+  expect(turnContentAlignment.responseDecoration).toBe("none");
   await expect(activityGroup.locator(".activity-group-body")).toHaveCount(0);
   await expect(activityGroup.locator(":scope > summary"))
     .toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
@@ -1328,8 +1564,8 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       surfaces,
     };
   });
-  expect(agentBodyGeometry.padding).toEqual(["8px", "16px", "10px", "16px"]);
-  expect(Math.abs(agentBodyGeometry.proseInset - 10)).toBeLessThanOrEqual(1);
+  expect(agentBodyGeometry.padding).toEqual(["10px", "14px", "12px", "36px"]);
+  expect(Math.abs(agentBodyGeometry.proseInset - 8)).toBeLessThanOrEqual(1);
   expect(agentBodyGeometry.surfaces.length).toBeGreaterThan(0);
   for (const inset of agentBodyGeometry.surfaces) {
     expect(Math.abs(inset.left)).toBeLessThanOrEqual(1);
@@ -1370,12 +1606,17 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
     ":scope > summary .activity-rail-disclosure",
   ).evaluate((icon) => {
     const style = getComputedStyle(icon);
+    const glyph = icon.querySelector<HTMLElement>(".activity-rail-disclosure-icon");
     return {
       position: style.position,
       width: style.width,
+      height: style.height,
+      glyphWidth: glyph === null ? "" : getComputedStyle(glyph).width,
     };
   });
-  const timelineRailStyle = await activityGroup.locator("..").evaluate((timeline) => {
+  const timelineRailStyle = await activityGroup.evaluate((group) => {
+    const timeline = group.closest<HTMLElement>(".turn-timeline");
+    if (timeline === null) throw new Error("missing turn timeline");
     const style = getComputedStyle(timeline, "::before");
     return {
       backgroundColor: style.backgroundColor,
@@ -1385,7 +1626,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
     };
   });
   const groupDisclosureGeometry = await activityGroup.evaluate((group) => {
-    const timeline = group.parentElement;
+    const timeline = group.closest<HTMLElement>(".turn-timeline");
     const disclosure = group.querySelector<HTMLElement>(
       ":scope > summary > .activity-rail-disclosure",
     );
@@ -1426,7 +1667,9 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   expect(toolCardStyle.borderRadius).toBe("0px");
   expect(groupNodeStyle.display).toBe("none");
   expect(groupDisclosureStyle.position).toBe("absolute");
-  expect(groupDisclosureStyle.width).toBe("12px");
+  expect(groupDisclosureStyle.width).toBe("16px");
+  expect(groupDisclosureStyle.height).toBe("16px");
+  expect(groupDisclosureStyle.glyphWidth).toBe("14px");
   expect(timelineRailStyle.display).not.toBe("none");
   expect(timelineRailStyle.width).toBe("1px");
   expect(timelineRailStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
@@ -1440,8 +1683,23 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   const editCard = page.locator('.tool-card[data-call-id="call_edit"]');
   await editCard.locator(":scope > summary").click();
   await page.mouse.move(0, 0);
-  await expect(editCard.locator(":scope > summary"))
-    .not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  const focusedToolInteraction = await editCard.locator(":scope > summary").evaluate((summary) => {
+    const disclosure = summary.querySelector<HTMLElement>(".activity-rail-disclosure");
+    if (disclosure === null) throw new Error("missing tool disclosure");
+    const summaryBounds = summary.getBoundingClientRect();
+    const disclosureBounds = disclosure.getBoundingClientRect();
+    const interaction = getComputedStyle(summary, "::before");
+    return {
+      backgroundColor: interaction.backgroundColor,
+      disclosureRight: disclosureBounds.right - summaryBounds.left,
+      interactionLeft: Number.parseFloat(interaction.left),
+      summaryBackground: getComputedStyle(summary).backgroundColor,
+    };
+  });
+  expect(focusedToolInteraction.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(focusedToolInteraction.summaryBackground).toBe("rgba(0, 0, 0, 0)");
+  expect(focusedToolInteraction.interactionLeft)
+    .toBeGreaterThanOrEqual(focusedToolInteraction.disclosureRight - 2);
   await expect(editCard.getByLabel("Live tool output")).toContainText("updated src/app.ts");
   await expect(editCard.locator(".tool-inline-diff")).toBeVisible();
   await expect(editCard.locator(".tool-meta")).toHaveText("2s");
@@ -1457,8 +1715,9 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
 
   await editCard.locator(":scope > summary").click();
   await page.mouse.move(0, 0);
-  await expect(editCard.locator(":scope > summary"))
-    .not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect.poll(() => editCard.locator(":scope > summary").evaluate(
+    (summary) => getComputedStyle(summary, "::before").backgroundColor,
+  )).not.toBe("rgba(0, 0, 0, 0)");
   await expect(editCard.getByLabel("Live tool output")).toHaveCount(0);
   await expect(editCard.locator(".tool-inline-diff")).toHaveCount(0);
   await activityGroup.locator(":scope > summary").click();
@@ -1471,15 +1730,28 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   await expect(visibleThought.locator(
     '.thinking-rail-icon [data-font-awesome-icon="brain"]',
   )).toHaveCount(1);
+  const visibleThoughtAlignment = await visibleThought.evaluate((thought) => {
+    const icon = thought.querySelector<HTMLElement>(":scope > .thinking-rail-icon");
+    const title = thought.querySelector<HTMLElement>(":scope > .thinking-header > strong");
+    if (icon === null || title === null) throw new Error("missing visible thought header");
+    const iconBounds = icon.getBoundingClientRect();
+    const titleBounds = title.getBoundingClientRect();
+    return Math.abs(
+      iconBounds.top + iconBounds.height / 2 - (titleBounds.top + titleBounds.height / 2),
+    );
+  });
+  expect(visibleThoughtAlignment).toBeLessThanOrEqual(0.75);
   await expect(page.getByRole("button", { name: "Collapse thought process" })).toHaveCount(0);
   await expect(page.locator(".thinking-card")).toHaveCount(0);
 
-  const agentCard = page.locator(".agent-turn-card").first();
-  await agentCard.getByRole("button", { name: "Collapse agent message" }).click();
+  await agentCard.getByRole("button", { name: "Collapse turn 7" }).click();
   await expect(agentCard.locator(":scope > .message-body")).toHaveCount(0);
-  await expect(agentCard.locator(".agent-collapsed-preview")).toContainText("I'll update it.");
-  await agentCard.getByRole("button", { name: "Expand agent message" }).click();
-  const assistantCopy = agentCard.getByRole("button", { name: "Copy assistant output" });
+  await expect(agentCard.locator(".agent-collapsed-preview")).toContainText("Build the migration");
+  await expect(agentCard.locator(".turn-header-status")).toHaveCount(0);
+  await expect(agentCard.locator(".turn-context-usage")).toBeVisible();
+  await agentCard.getByRole("button", { name: "Expand turn 7" }).click();
+  const responseNode = agentCard.locator(".turn-response-node").last();
+  const assistantCopy = responseNode.getByRole("button", { name: "Copy assistant response" });
   await expect(assistantCopy).toHaveCount(1);
   await expect(agentCard.getByRole("button", { name: /raw assistant output/i })).toHaveCount(0);
   await page.evaluate(() => {
@@ -1494,13 +1766,13 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       },
     });
   });
-  await agentCard.hover();
-  await expect(agentCard.locator(".agent-copy-action")).toHaveCSS("opacity", "1");
+  await responseNode.hover();
+  await expect(responseNode.locator(".agent-copy-action")).toHaveCSS("opacity", "1");
   await assistantCopy.click();
   await expect.poll(() => page.evaluate(() =>
     (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
       .__trouveCopiedMarkdown
-  )).toBe("I'll update it.\n\nDone.");
+  )).toBe("Done.");
   await agentCard.locator(".agent-text-block").first().click({ button: "right" });
   const messageMenu = page.getByRole("menu", { name: "Message actions" });
   await expect(messageMenu).toBeVisible();
@@ -1510,14 +1782,13 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   await expect.poll(() => page.evaluate(() =>
     (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
       .__trouveCopiedMarkdown
-  )).toBe("I'll update it.\n\nDone.");
-  const agentDisclosure = agentCard.getByRole("button", { name: "Collapse agent message" });
-  await agentDisclosure.focus();
-  await agentDisclosure.press("Shift+F10");
+  )).toBe("I'll update it.");
+  await assistantCopy.focus();
+  await assistantCopy.press("Shift+F10");
   await expect(messageMenu).toBeVisible();
   await messageMenu.press("Escape");
   await expect(messageMenu).toHaveCount(0);
-  await expect(agentDisclosure).toBeFocused();
+  await expect(assistantCopy).toBeFocused();
   await agentCard.locator(".agent-text-block").first().evaluate((block) => {
     const paragraph = block
       .querySelector("trouve-markdown-view")
@@ -1656,6 +1927,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
 
   const geometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
+    const turnTimeline = group.closest<HTMLElement>(".turn-timeline");
     const summary = group.querySelector<HTMLElement>(":scope > summary");
     if (summary === null) throw new Error("missing combined activity summary");
     const disclosure = summary.querySelector<HTMLElement>(".activity-rail-disclosure");
@@ -1663,13 +1935,13 @@ test("the Chat preference adds one disclosure around the standard activity timel
     const prose = timeline?.nextElementSibling
       ?.querySelector<HTMLElement>("trouve-markdown-view")
       ?.shadowRoot?.querySelector<HTMLElement>("p");
-    if (timeline === null || disclosure === null
+    if (timeline === null || turnTimeline === null || disclosure === null
       || label === null || prose === null || prose === undefined) {
       throw new Error("missing combined activity geometry");
     }
-    const timelineBounds = timeline.getBoundingClientRect();
+    const timelineBounds = turnTimeline.getBoundingClientRect();
     const disclosureBounds = disclosure.getBoundingClientRect();
-    const rail = getComputedStyle(timeline, "::before");
+    const rail = getComputedStyle(turnTimeline, "::before");
     const railCenter = timelineBounds.left
       + Number.parseFloat(rail.left)
       + Number.parseFloat(rail.width) / 2;
@@ -1700,6 +1972,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
   await page.mouse.move(0, 0);
   const expandedGeometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
+    const turnTimeline = group.closest<HTMLElement>(".turn-timeline");
     const summary = group.querySelector<HTMLElement>(":scope > summary");
     const body = group.querySelector<HTMLElement>(":scope > .activity-group-body");
     const nestedTimeline = body?.querySelector<HTMLElement>(
@@ -1717,40 +1990,32 @@ test("the Chat preference adds one disclosure around the standard activity timel
       ":scope > .activity-rail-disclosure",
     );
     const toolCard = toolDisclosure?.closest<HTMLElement>(".tool-card");
-    const lastToolCard = nestedTimeline?.querySelector<HTMLElement>(
-      ":scope > .tool-card:last-child",
-    );
-    if (timeline === null || summary === null || body === null
+    if (timeline === null || turnTimeline === null || summary === null || body === null
       || nestedTimeline === null || nestedTimeline === undefined
       || thought === null || thought === undefined
       || thoughtIcon === null || thoughtIcon === undefined
       || toolDisclosure === null || toolDisclosure === undefined
       || toolStatus === null || toolStatus === undefined
       || groupDisclosure === null || groupDisclosure === undefined
-      || toolCard === null || toolCard === undefined
-      || lastToolCard === null || lastToolCard === undefined) {
+      || toolCard === null || toolCard === undefined) {
       throw new Error("missing expanded combined activity geometry");
     }
-    const outerRail = getComputedStyle(timeline, "::before");
+    const outerRail = getComputedStyle(turnTimeline, "::before");
     const nestedRail = getComputedStyle(nestedTimeline, "::before");
-    const timelineBounds = timeline.getBoundingClientRect();
+    const timelineBounds = turnTimeline.getBoundingClientRect();
     const thoughtIconBounds = thoughtIcon.getBoundingClientRect();
     const toolDisclosureBounds = toolDisclosure.getBoundingClientRect();
     const toolStatusBounds = toolStatus.getBoundingClientRect();
     const groupDisclosureBounds = groupDisclosure.getBoundingClientRect();
     const toolCardBounds = toolCard.getBoundingClientRect();
-    const lastToolCardBounds = lastToolCard.getBoundingClientRect();
     const branch = getComputedStyle(toolCard, "::before");
     const branchLeft = toolCardBounds.left + Number.parseFloat(branch.left);
     const branchRight = branchLeft + Number.parseFloat(branch.width);
     const outerRailCenter = timelineBounds.left
       + Number.parseFloat(outerRail.left)
       + Number.parseFloat(outerRail.width) / 2;
-    const outerRailBottom = timelineBounds.top
-      + Number.parseFloat(outerRail.top)
-      + Number.parseFloat(outerRail.height);
     return {
-      railDisplay: getComputedStyle(timeline, "::before").display,
+      railDisplay: outerRail.display,
       nestedRailDisplay: nestedRail.display,
       timelineGap: getComputedStyle(timeline).rowGap,
       nestedTimelineGap: getComputedStyle(nestedTimeline).rowGap,
@@ -1769,8 +2034,6 @@ test("the Chat preference adds one disclosure around the standard activity timel
       branchStartsAtRail: Math.abs(branchLeft - outerRailCenter),
       branchEndsAtDisclosure: Math.abs(branchRight - toolDisclosureBounds.left),
       inlineStatusAfterRail: toolStatusBounds.left - outerRailCenter,
-      railTailAfterFinalTool: outerRailBottom
-        - (lastToolCardBounds.top + lastToolCardBounds.height / 2),
       summaryBackground: getComputedStyle(summary).backgroundColor,
       bodyPaddingLeft: getComputedStyle(body).paddingLeft,
       nestedMarginLeft: getComputedStyle(nestedTimeline).marginLeft,
@@ -1789,7 +2052,6 @@ test("the Chat preference adds one disclosure around the standard activity timel
   expect(expandedGeometry.branchStartsAtRail).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.branchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.inlineStatusAfterRail).toBeGreaterThan(20);
-  expect(Math.abs(expandedGeometry.railTailAfterFinalTool)).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
   expect(expandedGeometry.bodyPaddingLeft).toBe("0px");
   expect(expandedGeometry.nestedMarginLeft).toBe("0px");
@@ -1801,10 +2063,32 @@ test("the Chat preference adds one disclosure around the standard activity timel
   )).toHaveCount(1);
 });
 
+test("disabling sequential tool grouping renders subordinate activity at the top level", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    localStorage.setItem("trouve.chat.v1", JSON.stringify({
+      collapseSequentialToolCalls: false,
+      collapseThinkingWithTools: true,
+      collapseCompactionWithTools: true,
+    }));
+  });
+  await page.goto("/");
+  await replayHistory(page);
+
+  const historicalAgent = page.locator(".agent-turn-card").first();
+  await expect(historicalAgent.locator(".activity-group")).toHaveCount(0);
+  expect(await historicalAgent.locator(".tool-card").count()).toBeGreaterThan(1);
+  await expect(historicalAgent.locator(".thinking-output")).toBeVisible();
+});
+
 test("the Chat preference persists across a frontend reload", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/settings/chat");
 
+  const sequentialPreference = page.getByRole("checkbox", {
+    name: "Collapse sequential tool calls.",
+  });
+  await expect(sequentialPreference).toBeChecked();
   const preference = page.getByRole("checkbox", {
     name: "Collapse thinking output with tool calls.",
   });
@@ -1820,11 +2104,15 @@ test("the Chat preference persists across a frontend reload", async ({ page }) =
   await expect.poll(() => page.evaluate(() =>
     localStorage.getItem("trouve.chat.v1")
   )).toBe(JSON.stringify({
+    collapseSequentialToolCalls: true,
     collapseThinkingWithTools: true,
     collapseCompactionWithTools: true,
   }));
 
   await page.reload();
+  await expect(page.getByRole("checkbox", {
+    name: "Collapse sequential tool calls.",
+  })).toBeChecked();
   await expect(page.getByRole("checkbox", {
     name: "Collapse thinking output with tool calls.",
   })).toBeChecked();
@@ -1915,14 +2203,14 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
   await expect(agent.locator('.tool-card[data-call-id="legacy_compaction"]')).toHaveCount(0);
   await expect(agent.locator(".context-compaction-marker.completed"))
     .toContainText("Context compacted");
-  const topLevelKinds = await agent.locator(":scope > .message-body > *").evaluateAll(
+  const topLevelKinds = (await agent.locator(":scope > .message-body > *").evaluateAll(
     (elements) => elements.map((element) =>
       element.classList.contains("agent-activity-timeline")
         ? "timeline"
         : element.classList.contains("context-compaction-marker")
           ? "compaction"
           : "other"),
-  );
+  )).filter((kind) => kind !== "other");
   expect(topLevelKinds.slice(0, 3)).toEqual(["timeline", "compaction", "timeline"]);
 
   const timelines = agent.locator(":scope > .message-body > .agent-activity-timeline");
@@ -1942,6 +2230,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     const before = marker.previousElementSibling;
     const after = marker.nextElementSibling;
     const symbol = marker.querySelector<HTMLElement>(".context-compaction-symbol");
+    const turnTimeline = marker.closest<HTMLElement>(".turn-timeline");
     const beforeNested = before?.querySelector<HTMLElement>(".activity-group-timeline");
     const afterNested = after?.querySelector<HTMLElement>(".activity-group-timeline");
     const beforeTool = beforeNested?.querySelector<HTMLElement>(":scope > .tool-card");
@@ -1953,7 +2242,8 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       ":scope > summary > .activity-rail-disclosure",
     );
     if (!(before instanceof HTMLElement) || !(after instanceof HTMLElement)
-      || symbol === null || beforeNested === null || beforeNested === undefined
+      || symbol === null || turnTimeline === null
+      || beforeNested === null || beforeNested === undefined
       || afterNested === null || afterNested === undefined
       || beforeTool === null || beforeTool === undefined
       || afterTool === null || afterTool === undefined
@@ -1976,6 +2266,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     const beforeRail = segment(before, "::before");
     const bridge = segment(marker as HTMLElement, "::before");
     const afterRail = segment(after, "::before");
+    const outerRail = segment(turnTimeline, "::before");
     const branch = (tool: HTMLElement, disclosure: HTMLElement) => {
       const bounds = tool.getBoundingClientRect();
       const style = getComputedStyle(tool, "::before");
@@ -1991,22 +2282,19 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     const afterBranch = branch(afterTool, afterDisclosure);
     const symbolBounds = symbol.getBoundingClientRect();
     return {
-      beforeGap: Math.abs(beforeRail.bottom - bridge.top),
-      afterGap: Math.abs(bridge.bottom - afterRail.top),
-      centerDrift: Math.max(
-        Math.abs(beforeRail.center - bridge.center),
-        Math.abs(bridge.center - afterRail.center),
-        Math.abs(
-          symbolBounds.left + symbolBounds.width / 2 - bridge.center,
-        ),
+      centerDrift: Math.abs(
+        symbolBounds.left + symbolBounds.width / 2 - outerRail.center,
       ),
+      outerRailDisplay: outerRail.display,
+      beforeRailDisplay: beforeRail.display,
+      afterRailDisplay: afterRail.display,
       bridgeDisplay: bridge.display,
       beforeNestedRail: getComputedStyle(beforeNested, "::before").display,
       afterNestedRail: getComputedStyle(afterNested, "::before").display,
       beforeBranchDisplay: beforeBranch.display,
       afterBranchDisplay: afterBranch.display,
-      beforeBranchStartsAtRail: Math.abs(beforeBranch.left - beforeRail.center),
-      afterBranchStartsAtRail: Math.abs(afterBranch.left - afterRail.center),
+      beforeBranchStartsAtRail: Math.abs(beforeBranch.left - outerRail.center),
+      afterBranchStartsAtRail: Math.abs(afterBranch.left - outerRail.center),
       beforeBranchEndsAtDisclosure: Math.abs(
         beforeBranch.right - beforeBranch.disclosureLeft,
       ),
@@ -2015,10 +2303,11 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       ),
     };
   });
-  expect(connection.beforeGap).toBeLessThanOrEqual(0.25);
-  expect(connection.afterGap).toBeLessThanOrEqual(0.25);
   expect(connection.centerDrift).toBeLessThanOrEqual(0.25);
-  expect(connection.bridgeDisplay).not.toBe("none");
+  expect(connection.outerRailDisplay).not.toBe("none");
+  expect(connection.beforeRailDisplay).toBe("none");
+  expect(connection.afterRailDisplay).toBe("none");
+  expect(connection.bridgeDisplay).toBe("none");
   expect(connection.beforeNestedRail).toBe("none");
   expect(connection.afterNestedRail).toBe("none");
   expect(connection.beforeBranchDisplay).not.toBe("none");
@@ -2168,13 +2457,22 @@ test("context compaction is an animated durable boundary between tool groups", a
   await expect(running.getByText("Compacting context", { exact: true })).toBeVisible();
   await expect(agent.locator(".activity-group")).toHaveCount(1);
   await expect(agent.locator(".activity-group .context-compaction-marker")).toHaveCount(0);
-  expect(await running.locator(".trouve-icon-spin").evaluate(
+  expect(await running.locator(".context-compaction-spinner").evaluate(
+    (element) => getComputedStyle(element).animationName,
+  )).not.toBe("none");
+  const runningContextDial = agent.locator(".turn-context-usage.compacting");
+  await expect(runningContextDial).toHaveAttribute(
+    "aria-label",
+    "Context compaction in progress",
+  );
+  await expect(runningContextDial.locator(".context-dial-glyph")).toHaveCount(0);
+  expect(await runningContextDial.locator(".context-dial-value").evaluate(
     (element) => getComputedStyle(element).animationName,
   )).not.toBe("none");
 
-  // Active compaction keeps the containing Agent card open until its
+  // Active compaction keeps the containing Turn open until its
   // terminal state arrives.
-  await expect(agent.getByRole("button", { name: "Collapse agent message" }))
+  await expect(agent.getByRole("button", { name: "Collapse turn 10" }))
     .toHaveAttribute("aria-disabled", "true");
 
   await emitBatch(page, [
@@ -2184,6 +2482,17 @@ test("context compaction is an animated durable boundary between tool groups", a
       messages_compacted: 24,
     }),
     threadEvent(36, {
+      type: "turn.usage_updated",
+      turn: 10,
+      usage: {
+        input_tokens: 25_000,
+        output_tokens: 1_000,
+        cached_input_tokens: 0,
+        context_input_tokens: 25_000,
+        context_window: 128_000,
+      },
+    }),
+    threadEvent(37, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_1",
@@ -2191,7 +2500,7 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "third" },
       requires_approval: false,
     }),
-    threadEvent(37, {
+    threadEvent(38, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_2",
@@ -2204,6 +2513,13 @@ test("context compaction is an animated durable boundary between tool groups", a
   const marker = agent.locator(".context-compaction-marker.completed");
   await expect(marker).toContainText("Context compacted");
   await expect(marker).toContainText("24 earlier transcript messages summarized");
+  await expect(agent.locator(".turn-context-usage")).not.toHaveClass(/compacting/u);
+  await expect(agent.locator(".turn-context-usage")).toHaveAttribute(
+    "aria-label",
+    "Context: 25000 / 128000 tokens (20%)",
+  );
+  await expect(agent.locator(".turn-context-usage .context-dial-value"))
+    .toHaveAttribute("stroke-dasharray", "20 100");
   await expect(marker).toHaveClass(/timeline-connect-before/u);
   await expect(marker).toHaveClass(/timeline-connect-after/u);
   const completedMarkerStyle = await marker.evaluate((element) => {
@@ -2224,14 +2540,14 @@ test("context compaction is an animated durable boundary between tool groups", a
     ruleContent: '\"\"',
     ruleHeight: "1px",
   });
-  const topLevelKinds = await agent.locator(":scope > .message-body > *").evaluateAll(
+  const topLevelKinds = (await agent.locator(":scope > .message-body > *").evaluateAll(
     (elements) => elements.map((element) =>
       element.classList.contains("agent-activity-timeline")
         ? "timeline"
         : element.classList.contains("context-compaction-marker")
           ? "compaction"
           : "other"),
-  );
+  )).filter((kind) => kind !== "other");
   expect(topLevelKinds.slice(0, 3)).toEqual(["timeline", "compaction", "timeline"]);
   await expect(agent.locator(":scope > .message-body > .agent-activity-timeline"))
     .toHaveCount(2);
@@ -2337,9 +2653,7 @@ test("the Chat preference collapses context compaction into one tool activity ru
   const markerAlignment = await marker.evaluate((element) => {
     const nestedTimeline = element.parentElement;
     const agent = element.closest(".agent-turn-card");
-    const timeline = agent?.querySelector<HTMLElement>(
-      ":scope > .message-body > .agent-activity-timeline",
-    );
+    const timeline = agent?.querySelector<HTMLElement>(":scope > .turn-timeline");
     const symbol = element.querySelector<HTMLElement>(".context-compaction-symbol");
     if (nestedTimeline === null || timeline === null || timeline === undefined
       || symbol === null) {
@@ -2420,7 +2734,7 @@ test("standalone tool headers align their timeline node and disclosure controls"
     const disclosure = summary?.querySelector<HTMLElement>(".activity-rail-disclosure");
     const status = summary?.querySelector<HTMLElement>(".tool-inline-status");
     const title = summary?.querySelector<HTMLElement>(":scope > strong");
-    const timeline = card.parentElement;
+    const timeline = card.closest<HTMLElement>(".turn-timeline");
     if (summary === null || summary === undefined || disclosure === null
       || disclosure === undefined || status === null || status === undefined
       || title === null || title === undefined || timeline === null) {
@@ -2508,12 +2822,14 @@ test("thought completion clears stale activity while standalone and grouped tool
   ]);
 
   const agent = page.locator(".agent-turn-card").last();
-  await expect(agent.locator(".agent-activity")).toContainText("Thinking…");
+  const transientActivity = agent.locator(":scope > .turn-activity-footer > .agent-activity");
+  await expect(transientActivity).toContainText("Thinking…");
+  await expect(agent.locator(":scope > .turn-timeline > .agent-activity")).toHaveCount(0);
   await emit(page, threadEvent(73, {
     type: "assistant.thinking_completed",
     turn: 14,
   }));
-  await expect(agent.locator(".agent-activity")).toContainText("Processing…");
+  await expect(transientActivity).toContainText("Processing…");
 
   await emitBatch(page, [
     threadEvent(74, {
@@ -3017,7 +3333,7 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
     const attachments = body.querySelector<HTMLElement>(".attachment-list")?.getBoundingClientRect();
     return attachments === undefined ? Number.NaN : attachments.left - contentLeft;
   });
-  expect(Math.abs(attachmentInset - 10)).toBeLessThanOrEqual(1);
+  expect(Math.abs(attachmentInset)).toBeLessThanOrEqual(1);
   for (const callId of [
     "call_layout_command",
     "call_layout_todos",
@@ -3119,14 +3435,13 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
     decision: "approve",
   }));
   const longAgentMessage = page.locator(".agent-turn-card").last();
-  await longAgentMessage.getByRole("button", { name: "Collapse agent message" }).click();
-  await expect(longAgentMessage.getByRole("button", { name: "Expand agent message" })).toBeVisible();
+  const longTurnNumber = await longAgentMessage.locator(":scope > .turn-header strong").textContent();
+  const turnNumber = longTurnNumber?.replace(/^Turn\s+/u, "") ?? "";
+  await longAgentMessage.getByRole("button", { name: `Collapse turn ${turnNumber}` }).click();
+  await expect(longAgentMessage.getByRole("button", { name: `Expand turn ${turnNumber}` })).toBeVisible();
   await expect(longAgentMessage.locator(".agent-collapsed-preview")).toBeVisible();
   await page.getByRole("button", { name: "Use full history" }).focus();
   await page.keyboard.press("Enter");
-  const longUserMessage = page.locator(".user-message").last();
-  await longUserMessage.getByRole("button", { name: "Collapse your message" }).click();
-  await expect(longUserMessage.locator(".message-collapsed-preview")).toBeVisible();
   expect(await horizontalOverflowFindings(page), "resolved and collapsed chat overflow").toEqual([]);
 });
 
@@ -3413,7 +3728,7 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
   const historyMode = page.getByRole("button", { name: "Use full history" });
   await historyMode.focus();
   await historyMode.press("Enter");
-  await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeGreaterThan(400);
+  await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeGreaterThan(200);
   await page.getByRole("button", { name: "Use windowed history" }).press("Enter");
   await expect.poll(() => page.locator("[data-virtual-id]").count()).toBeLessThan(50);
 });
@@ -3801,6 +4116,23 @@ test("queued prompts drag by the full row and adjacent drops always move", async
   const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
   await source.dispatchEvent("pointerdown");
   await source.dispatchEvent("dragstart", { dataTransfer });
+  const dragImage = page.locator(".queue-drag-image");
+  await expect(dragImage).toHaveCount(1);
+  await expect(dragImage).toContainText("2. Second queued prompt");
+  const dragImageGeometry = await dragImage.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return {
+      width: bounds.width,
+      height: bounds.height,
+      whiteSpace: style.whiteSpace,
+      overflow: style.overflow,
+    };
+  });
+  expect(dragImageGeometry.width).toBeLessThanOrEqual(320);
+  expect(dragImageGeometry.height).toBe(32);
+  expect(dragImageGeometry.whiteSpace).toBe("nowrap");
+  expect(dragImageGeometry.overflow).toBe("hidden");
   await target.dispatchEvent("dragover", {
     clientX: dragProbeBounds.x + Math.min(120, dragProbeBounds.width - 2),
     clientY: dragProbeBounds.y + dragProbeBounds.height - 2,
@@ -3822,6 +4154,7 @@ test("queued prompts drag by the full row and adjacent drops always move", async
   expect(placeholderStyle.height).toBeGreaterThanOrEqual(24);
   await source.dispatchEvent("dragend", { dataTransfer });
   await dataTransfer.dispose();
+  await expect(dragImage).toHaveCount(0);
   await expect(placeholder).toHaveCount(0);
 
   const targetBounds = await target.boundingBox();

@@ -4,6 +4,8 @@ import {
 } from "../state/reactivity.js";
 
 export interface ChatPreferences {
+  /** Summarize consecutive tool calls inside collapsible activity groups. */
+  readonly collapseSequentialToolCalls: boolean;
   /** Include thinking output in the collapsible runs formed around tool calls. */
   readonly collapseThinkingWithTools: boolean;
   /** Include context-compaction boundaries in collapsible tool-activity runs. */
@@ -11,8 +13,24 @@ export interface ChatPreferences {
 }
 
 export const DEFAULT_CHAT_PREFERENCES: ChatPreferences = Object.freeze({
+  collapseSequentialToolCalls: true,
   collapseThinkingWithTools: false,
   collapseCompactionWithTools: false,
+});
+
+/** Collapse preferences as applied by the transcript renderer. Subordinate
+ * options remain persisted while the master grouping option is off, but they
+ * cannot change presentation until sequential grouping is enabled again. */
+export const effectiveChatCollapsePreferences = (
+  preferences: ChatPreferences,
+): ChatPreferences => Object.freeze({
+  collapseSequentialToolCalls: preferences.collapseSequentialToolCalls,
+  collapseThinkingWithTools:
+    preferences.collapseSequentialToolCalls
+    && preferences.collapseThinkingWithTools,
+  collapseCompactionWithTools:
+    preferences.collapseSequentialToolCalls
+    && preferences.collapseCompactionWithTools,
 });
 
 const STORAGE_KEY = "trouve.chat.v1";
@@ -26,6 +44,10 @@ export const normalizeChatPreferences = (
   value: Partial<ChatPreferences>,
   fallback: ChatPreferences = DEFAULT_CHAT_PREFERENCES,
 ): ChatPreferences => Object.freeze({
+  collapseSequentialToolCalls:
+    typeof value.collapseSequentialToolCalls === "boolean"
+      ? value.collapseSequentialToolCalls
+      : fallback.collapseSequentialToolCalls,
   collapseThinkingWithTools:
     typeof value.collapseThinkingWithTools === "boolean"
       ? value.collapseThinkingWithTools

@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 9;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 10;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -252,14 +252,27 @@ impl Default for GeneralPreferences {
 
 /// Chat transcript presentation remains client-owned and does not affect the
 /// durable thread view shared through the harness protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChatPreferences {
+    /// Summarize consecutive tool calls inside collapsible activity groups.
+    #[serde(default = "default_true")]
+    pub collapse_sequential_tool_calls: bool,
     /// Include thinking output in collapsible tool-activity groups.
     #[serde(default)]
     pub collapse_thinking_with_tools: bool,
     /// Include context-compaction boundaries in collapsible tool-activity groups.
     #[serde(default)]
     pub collapse_compaction_with_tools: bool,
+}
+
+impl Default for ChatPreferences {
+    fn default() -> Self {
+        Self {
+            collapse_sequential_tool_calls: true,
+            collapse_thinking_with_tools: false,
+            collapse_compaction_with_tools: false,
+        }
+    }
 }
 
 /// Notification policy remains frontend-owned. The native host persists the

@@ -873,6 +873,9 @@ export const chatPreferencesFromHost = (
   preferences: HostPreferences,
   fallback: ChatPreferences = DEFAULT_CHAT_PREFERENCES,
 ): ChatPreferences => Object.freeze({
+  collapseSequentialToolCalls:
+    preferences.chat?.collapse_sequential_tool_calls ??
+    fallback.collapseSequentialToolCalls,
   collapseThinkingWithTools:
     preferences.chat?.collapse_thinking_with_tools ??
     fallback.collapseThinkingWithTools,
@@ -936,6 +939,7 @@ export const withHostChatPreferences = (
 ): HostPreferences => ({
   ...preferences,
   chat: {
+    collapse_sequential_tool_calls: chat.collapseSequentialToolCalls,
     collapse_thinking_with_tools: chat.collapseThinkingWithTools,
     collapse_compaction_with_tools: chat.collapseCompactionWithTools,
   },

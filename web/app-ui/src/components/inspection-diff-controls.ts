@@ -4,12 +4,6 @@ export interface ClipboardTextWriter {
   writeText(text: string): Promise<void>;
 }
 
-export type DiffFileAction =
-  | { readonly kind: "select"; readonly index: number }
-  | { readonly kind: "expand" }
-  | { readonly kind: "collapse" }
-  | { readonly kind: "toggle" };
-
 export type CheckpointAvailability = "unknown" | "available";
 
 export interface CheckpointHints {
@@ -61,36 +55,4 @@ export const copyRawDiffToClipboard = async (
   } catch {
     return "failed";
   }
-};
-
-/** Return the selected/focusable changed-file index for listbox navigation. */
-export const changedFileIndexForKey = (
-  key: string,
-  currentIndex: number,
-  fileCount: number,
-): number | undefined => {
-  if (fileCount <= 0) return undefined;
-  const current = Math.min(Math.max(currentIndex, 0), fileCount - 1);
-  if (key === "ArrowUp") return Math.max(0, current - 1);
-  if (key === "ArrowDown") return Math.min(fileCount - 1, current + 1);
-  if (key === "Home") return 0;
-  if (key === "End") return fileCount - 1;
-  return undefined;
-};
-
-/** Keyboard behavior for the expandable changed-file headers. */
-export const diffFileActionForKey = (
-  key: string,
-  currentIndex: number,
-  fileCount: number,
-  expanded: boolean,
-): DiffFileAction | undefined => {
-  const nextIndex = changedFileIndexForKey(key, currentIndex, fileCount);
-  if (nextIndex !== undefined) return { kind: "select", index: nextIndex };
-  if (key === "ArrowLeft" && expanded) return { kind: "collapse" };
-  if (key === "ArrowRight" && !expanded) return { kind: "expand" };
-  if (key === "Enter" || key === " " || key === "Spacebar") {
-    return { kind: "toggle" };
-  }
-  return undefined;
 };

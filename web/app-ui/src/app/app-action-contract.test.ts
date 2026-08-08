@@ -149,9 +149,9 @@ const SURFACES: readonly CallbackSurface[] = [
     ],
   },
   {
-    description: "MCP settings and effective session MCP view",
+    description: "MCP settings and the effective session overview",
     callbacks: [
-      "refresh-session-mcp",
+      "refresh-session-info",
       "mcp-refresh",
       "mcp-saved",
       "mcp-deleted",
@@ -169,8 +169,8 @@ const SURFACES: readonly CallbackSurface[] = [
         ],
       },
       {
-        path: "../components/session-mcp-panel.ts",
-        markers: ["Effective MCP servers", "#load()"],
+        path: "../components/session-info-panel.ts",
+        markers: ["Session overview", "#refreshAll()", "sessionMcpServers"],
       },
     ],
   },
@@ -254,6 +254,7 @@ const SURFACES: readonly CallbackSurface[] = [
   {
     description: "chat presentation preference",
     callbacks: [
+      "collapse-sequential-tool-calls-toggled",
       "collapse-thinking-with-tools-toggled",
       "collapse-compaction-with-tools-toggled",
     ],
@@ -261,6 +262,7 @@ const SURFACES: readonly CallbackSurface[] = [
       {
         path: "../components/settings-screen.ts",
         markers: [
+          "collapseSequentialToolCalls",
           "collapseThinkingWithTools",
           "collapseCompactionWithTools",
           "setChatPreferences",
@@ -270,6 +272,7 @@ const SURFACES: readonly CallbackSurface[] = [
         path: "../components/thread-screen.ts",
         markers: [
           "#renderVisibleThinking",
+          "collapseSequentialToolCalls",
           "collapseThinkingWithTools",
           "collapseCompactionWithTools",
         ],
@@ -478,11 +481,15 @@ const SURFACES: readonly CallbackSurface[] = [
   },
   {
     description: "diff and checkpoint restore",
-    callbacks: ["diff-file-toggled", "undo-turn", "redo-turn"],
+    callbacks: ["diff-file-selected", "undo-turn", "redo-turn"],
     evidence: [
       {
         path: "../components/inspection-workspace.ts",
-        markers: ["#renderDiff", "#toggleDiffFile", "restoreSessionCheckpoint"],
+        markers: [
+          "#renderDiff",
+          "#activateDiffFileTreeRow",
+          "restoreSessionCheckpoint",
+        ],
       },
     ],
   },
@@ -585,7 +592,7 @@ describe("Lit application action contract", () => {
   it("keeps every established action mapped exactly once", () => {
     const callbacks = SURFACES.flatMap((surface) => surface.callbacks);
     expect(new Set(callbacks).size).toBe(callbacks.length);
-    expect(callbacks).toHaveLength(149);
+    expect(callbacks).toHaveLength(150);
   });
 
   for (const surface of SURFACES) {

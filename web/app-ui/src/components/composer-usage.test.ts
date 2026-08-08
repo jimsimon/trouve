@@ -42,12 +42,26 @@ describe("composer usage presentation", () => {
     expect(context.percent).toBe(35);
   });
 
-  it("falls back to the catalog window and clamps a full dial", () => {
-    const context = composerContextUsage({ input_tokens: 250_000 }, 200_000, true);
+  it("falls back to the catalog window and clamps a full determinate dial", () => {
+    const context = composerContextUsage({ input_tokens: 250_000 }, 200_000, false);
     expect(context.fill).toBe(1);
     expect(context.percent).toBe(100);
-    expect(context.compacting).toBe(true);
+    expect(context.compacting).toBe(false);
     expect(context.label).toContain("250000 / 200000");
+  });
+
+  it("replaces stale context usage with an indeterminate compaction state", () => {
+    const context = composerContextUsage({
+      input_tokens: 250_000,
+      context_input_tokens: 180_000,
+      context_window: 200_000,
+    }, undefined, true);
+    expect(context.fill).toBe(0);
+    expect(context.percent).toBe(0);
+    expect(context.usedTokens).toBe(180_000);
+    expect(context.windowTokens).toBe(200_000);
+    expect(context.compacting).toBe(true);
+    expect(context.label).toBe("Context compaction in progress");
   });
 
   it("treats an explicitly reported zero window as authoritative", () => {

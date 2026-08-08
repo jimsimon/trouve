@@ -21,11 +21,11 @@ import {
   checkpointAvailabilityDescription,
   checkpointHintsAfterRestore,
   copyRawDiffToClipboard,
-  diffFileActionForKey,
   initialCheckpointHints,
   type ClipboardTextWriter,
 } from "./inspection-diff-controls.js";
 import {
+  fileTreeDirectoriesForPaths,
   InspectionFileTreeModel,
   type FileTreeRow,
 } from "./inspection-file-tree.js";
@@ -73,7 +73,11 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #diffFiles: readonly ParsedDiffFile[] = [];
   #selectedDiff = 0;
   #diffMode: DiffMode = "unified";
-  #collapsedDiffPaths = new Set<string>();
+  readonly #diffFileTree = new InspectionFileTreeModel();
+  #diffTreeDirectories = new Set<string>();
+  #diffTreeExpanded = new Set<string>();
+  #diffTreeInitialized = false;
+  #diffTreeCollapsed = false;
   #fileTreeGeneration = 0;
   #fileGeneration = 0;
   readonly #fileTree = new InspectionFileTreeModel();
@@ -174,7 +178,11 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.#diffFiles = [];
       this.#selectedDiff = 0;
       this.#diffMode = "unified";
-      this.#collapsedDiffPaths.clear();
+      this.#diffFileTree.clear();
+      this.#diffTreeDirectories.clear();
+      this.#diffTreeExpanded.clear();
+      this.#diffTreeInitialized = false;
+      this.#diffTreeCollapsed = false;
       this.#fileTree.clear();
       this.#file = undefined;
       this.#fileTargetPath = "";
@@ -219,13 +227,31 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #renderDiff() {
     const additions = this.#diffFiles.reduce((total, file) => total + file.additions, 0);
     const deletions = this.#diffFiles.reduce((total, file) => total + file.deletions, 0);
+    const selectedFile = this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0];
+    const diffFilesByPath = new Map(this.#diffFiles.map((file) => [file.path, file]));
     return html`
       <section
-        class="inspection-split diff-inspection"
+        class=${`inspection-split diff-inspection ${
+          this.#diffTreeCollapsed ? "diff-tree-collapsed" : ""
+        } ${this.#diffFiles.length === 0 ? "diff-empty-inspection" : ""}`}
         aria-busy=${this.#refreshing || this.#restorePending !== "" ? "true" : "false"}
       >
         <header class="inspection-summary diff-summary">
           <span class="visually-hidden">${this.#diffFiles.length} file${this.#diffFiles.length === 1 ? "" : "s"} changed, ${additions} additions, ${deletions} deletions</span>
+          ${selectedFile === undefined
+            ? nothing
+            : html`<button
+                type="button"
+                aria-expanded=${this.#diffTreeCollapsed ? "false" : "true"}
+                aria-controls="session-diff-file-tree"
+                aria-label=${this.#diffTreeCollapsed ? "Show changed files" : "Hide changed files"}
+                title=${this.#diffTreeCollapsed ? "Show changed files" : "Hide changed files"}
+                @click=${() => {
+                  this.#diffTreeCollapsed = !this.#diffTreeCollapsed;
+                  this.requestUpdate();
+                }}
+              >${fontAwesomeIcon("folder-tree")}</button>
+              <strong title=${selectedFile.path}>${selectedFile.path}</strong>`}
           <span class="checkpoint-actions" role="group" aria-label="Diff actions">
             <button
               type="button"
@@ -261,36 +287,22 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               ? nothing
               : html`<button
                   type="button"
-                  title="Copy diff"
+                  aria-label="Copy complete diff"
+                  title="Copy complete diff"
                   @click=${() => void this.#copyRawDiff()}
                 >${fontAwesomeIcon("copy")} copy diff</button>`}
-            ${this.#diffFiles.length === 0
+            ${selectedFile === undefined
               ? nothing
               : html`<button
-                  class="diff-mode-additive"
                   type="button"
-                  aria-label=${this.#diffMode === "split" ? "Use unified diff view" : "Use split diff view"}
-                  title=${this.#diffMode === "split" ? "Use unified diff view" : "Use split diff view"}
-                  @click=${() => {
-                    this.#diffMode = this.#diffMode === "split" ? "unified" : "split";
-                    this.requestUpdate();
-                  }}
-                >${this.#diffMode === "split" ? "Unified view" : "Split view"}</button>`}
-            ${this.#diffMode !== "split"
-              ? nothing
-              : html`<label class="split-diff-file-picker">
-                  <span class="visually-hidden">File shown in split diff</span>
-                  <select
-                    aria-label="File shown in split diff"
-                    .value=${String(this.#selectedDiff)}
-                    @change=${(event: Event) => {
-                      this.#selectedDiff = Number((event.currentTarget as HTMLSelectElement).value);
-                      this.requestUpdate();
-                    }}
-                  >${this.#diffFiles.map((file, index) => html`
-                    <option value=${index}>${file.path} (+${file.additions} −${file.deletions})</option>
-                  `)}</select>
-                </label>`}
+                  aria-label=${`Copy raw diff for ${selectedFile.path}`}
+                  title=${`Copy raw diff for ${selectedFile.path}`}
+                  @click=${() => void this.#copyFileDiff(selectedFile)}
+                >${fontAwesomeIcon(
+                  this.#copiedDiffPath === selectedFile.path && !this.#copyFeedbackIsError
+                    ? "check"
+                    : "copy",
+                )}</button>`}
             <button
               class="diff-refresh-action"
               type="button"
@@ -320,73 +332,68 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
         </header>
         ${this.#diffFiles.length === 0
           ? html`<div class="diff-empty" role="status" aria-label="No changes"></div>`
-          : this.#diffMode === "split"
-            ? this.#renderSplitDiff()
-          : html`<div class="unified-diff-list" role="list" aria-label="Changed files">
-              ${this.#diffFiles.map((file, index) => {
-                const expanded = !this.#collapsedDiffPaths.has(file.path);
-                return html`
-                  <section class="unified-diff-file" role="listitem">
-                    <header class="unified-diff-file-header">
-                      <button
-                        type="button"
-                        aria-expanded=${expanded ? "true" : "false"}
-                        tabindex=${index === this.#selectedDiff ? 0 : -1}
-                        class="diff-file-option"
-                        @focus=${() => { this.#selectedDiff = index; }}
-                        @keydown=${(event: KeyboardEvent) => this.#navigateDiffFiles(event, index)}
-                        @click=${() => this.#toggleDiffFile(index)}
-                      >
-                        ${fontAwesomeIcon(expanded ? "caret-down" : "caret-right", {
-                          className: "diff-file-disclosure",
-                        })}
-                        <strong>${file.path}</strong>
-                        <small>(+${file.additions} −${file.deletions})</small>
-                      </button>
-                      <button
-                        type="button"
-                        class="diff-file-copy"
-                        aria-label=${`Copy raw diff for ${file.path}`}
-                        title=${`Copy raw diff for ${file.path}`}
-                        @click=${() => void this.#copyFileDiff(file)}
-                      >${fontAwesomeIcon(this.#copiedDiffPath === file.path ? "check" : "copy")}</button>
-                    </header>
-                    ${expanded
-                      ? file.binary
-                        ? html`<div class="diff-binary-state" role="status">Binary file changed.</div>`
-                        : html`<div class="unified-diff-rows" role="table" aria-label=${`Diff for ${file.path}`}>
-                          ${file.rows.map((row) => row.kind === "hunk"
-                            ? html`<div class="unified-diff-row hunk" role="row">
-                                <span class="diff-old-number" role="cell"></span>
-                                <span class="diff-new-number" role="cell"></span>
-                                <span class="diff-mark" aria-hidden="true"></span>
-                                <code role="cell">${row.text}</code>
-                              </div>`
-                            : html`<div class=${`unified-diff-row ${row.kind}`} role="row">
-                                <span class="diff-old-number" role="cell">${row.oldNumber ?? ""}</span>
-                                <span class="diff-new-number" role="cell">${row.newNumber ?? ""}</span>
-                                <span class="diff-mark" aria-hidden="true">${row.kind === "add" ? "+" : row.kind === "delete" ? "−" : " "}</span>
-                                <code role="cell">${row.text}</code>
-                              </div>`)}
-                        </div>`
-                      : nothing}
-                  </section>
-                `;
-              })}
-            </div>`}
+          : html`
+              <div
+                id="session-diff-file-tree"
+                class="inspection-file-list file-tree diff-file-tree"
+                role="tree"
+                aria-label="Changed files"
+              >
+                ${this.#diffFileTree.rows.map((row) => {
+                  const file = row.isDirectory
+                    ? undefined
+                    : diffFilesByPath.get(row.path);
+                  const selected = file !== undefined && file.path === selectedFile?.path;
+                  return html`<button
+                    type="button"
+                    role="treeitem"
+                    aria-level=${row.level}
+                    aria-posinset=${row.positionInSet}
+                    aria-setsize=${row.setSize}
+                    aria-expanded=${row.isDirectory ? String(row.expanded) : nothing}
+                    aria-selected=${row.isDirectory ? nothing : selected ? "true" : "false"}
+                    tabindex=${this.#diffFileTree.activePath === row.path ? 0 : -1}
+                    data-diff-file-path=${row.path}
+                    class=${`file-row file-tree-item diff-file-tree-item ${selected ? "selected" : ""}`}
+                    style=${`--file-tree-indent:${row.depth * 15}px`}
+                    title=${row.path}
+                    @focus=${() => this.#diffFileTree.setActive(row.path)}
+                    @keydown=${(event: KeyboardEvent) => this.#navigateDiffFileTree(event, row.path)}
+                    @click=${() => this.#activateDiffFileTreeRow(row.path)}
+                  >
+                    <span class="file-tree-label">
+                      ${row.isDirectory
+                        ? fontAwesomeIcon(row.expanded ? "caret-down" : "caret-right", {
+                            className: "file-tree-disclosure",
+                          })
+                        : html`<span class="file-tree-disclosure"></span>`}
+                      ${fontAwesomeIcon(
+                        row.isDirectory ? row.expanded ? "folder-open" : "folder" : "file-lines",
+                        { className: "file-tree-icon" },
+                      )}
+                      <span class="file-tree-name">${row.name}</span>
+                      ${file === undefined
+                        ? nothing
+                        : html`<small class="diff-tree-change-count">+${file.additions} −${file.deletions}</small>`}
+                    </span>
+                  </button>`;
+                })}
+              </div>
+              ${selectedFile === undefined
+                ? html`<div class="screen-empty diff-view-state"><span>Select a changed file to view its diff.</span></div>`
+                : this.#renderSelectedDiff(selectedFile)}
+            `}
       </section>
     `;
   }
 
-  #renderSplitDiff() {
-    const file = this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0];
-    if (file === undefined) return nothing;
+  #renderSelectedDiff(file: ParsedDiffFile) {
     if (file.binary) {
-      return html`<div class="screen-empty split-diff-widget" role="status"><span>Binary file changed.</span></div>`;
+      return html`<div class="screen-empty diff-view-state" role="status"><span>Binary file changed.</span></div>`;
     }
     return html`
       <trouve-diff-view
-        class="inspection-widget split-diff-widget"
+        class="inspection-widget diff-view-shell"
         .original=${file.original}
         .modified=${file.modified}
         .originalLineNumbers=${file.originalLineNumbers}
@@ -402,60 +409,103 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     `;
   }
 
-  #navigateDiffFiles(event: KeyboardEvent, currentIndex: number): void {
+  #navigateDiffFileTree(event: KeyboardEvent, currentPath: string): void {
     if (event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
-    const file = this.#diffFiles[currentIndex];
-    if (file === undefined) return;
-    const action = diffFileActionForKey(
-      event.key,
-      currentIndex,
-      this.#diffFiles.length,
-      currentIndex === this.#selectedDiff &&
-        !this.#collapsedDiffPaths.has(file.path),
-    );
+    const action = this.#diffFileTree.actionForKey(event.key, currentPath);
     if (action === undefined) return;
     event.preventDefault();
     event.stopPropagation();
+    if (action.kind === "focus") {
+      this.#diffFileTree.setActive(action.path);
+      this.#focusDiffFileTreePath(action.path);
+      return;
+    }
     if (action.kind === "expand") {
-      this.#setDiffExpanded(currentIndex, true);
+      this.#diffFileTree.expand(action.path);
+      this.#diffTreeExpanded.add(action.path);
+      this.#restoreDiffTreeExpansions();
+      this.#diffFileTree.setActive(action.path);
+      this.#focusDiffFileTreePath(action.path);
       return;
     }
     if (action.kind === "collapse") {
-      this.#setDiffExpanded(currentIndex, false);
+      this.#diffTreeExpanded.delete(action.path);
+      this.#diffFileTree.collapse(action.path);
+      this.#focusDiffFileTreePath(action.path);
       return;
     }
-    if (action.kind === "toggle") {
-      this.#setDiffExpanded(
-        currentIndex,
-        this.#collapsedDiffPaths.has(file.path),
-      );
+    this.#activateDiffFileTreeRow(action.path);
+  }
+
+  #activateDiffFileTreeRow(path: string): void {
+    const row = this.#diffFileTree.row(path);
+    if (row === undefined) return;
+    this.#diffFileTree.setActive(path);
+    if (row.isDirectory) {
+      const result = this.#diffFileTree.toggle(path);
+      if (result === "expanded") {
+        this.#diffTreeExpanded.add(path);
+        this.#restoreDiffTreeExpansions();
+        this.#diffFileTree.setActive(path);
+      } else if (result === "collapsed") {
+        this.#diffTreeExpanded.delete(path);
+      }
+      this.requestUpdate();
       return;
     }
-    const nextIndex = action.index;
-    this.#selectedDiff = nextIndex;
-    const nextFile = this.#diffFiles[nextIndex];
-    if (nextFile !== undefined) this.#collapsedDiffPaths.delete(nextFile.path);
+    const index = this.#diffFiles.findIndex((file) => file.path === path);
+    if (index < 0) return;
+    this.#selectedDiff = index;
+    if (globalThis.matchMedia?.(MOBILE_FILES_QUERY).matches === true) {
+      this.#diffTreeCollapsed = true;
+    }
+    this.requestUpdate();
+  }
+
+  #focusDiffFileTreePath(path: string): void {
     this.requestUpdate();
     void this.updateComplete.then(() => {
-      if (!this.isConnected || this.#selectedDiff !== nextIndex) return;
-      this.querySelectorAll<HTMLButtonElement>(".diff-file-option")[nextIndex]?.focus();
+      if (
+        !this.isConnected ||
+        this.panel !== "diff" ||
+        this.#diffFileTree.activePath !== path
+      ) return;
+      const target = [...this.querySelectorAll<HTMLButtonElement>(".diff-file-tree-item")]
+        .find((candidate) => candidate.dataset["diffFilePath"] === path);
+      target?.focus();
     });
   }
 
-  #toggleDiffFile(index: number): void {
-    const file = this.#diffFiles[index];
-    if (file === undefined) return;
-    this.#selectedDiff = index;
-    this.#setDiffExpanded(index, this.#collapsedDiffPaths.has(file.path));
+  #restoreDiffTreeExpansions(): void {
+    const directories = [...this.#diffTreeExpanded].sort(
+      (left, right) => left.split("/").length - right.split("/").length,
+    );
+    for (const directory of directories) this.#diffFileTree.expand(directory);
   }
 
-  #setDiffExpanded(index: number, expanded: boolean): void {
-    const file = this.#diffFiles[index];
-    if (file === undefined) return;
-    this.#selectedDiff = index;
-    if (expanded) this.#collapsedDiffPaths.delete(file.path);
-    else this.#collapsedDiffPaths.add(file.path);
-    this.requestUpdate();
+  #syncDiffFileTree(): void {
+    const directories = fileTreeDirectoriesForPaths(
+      this.#diffFiles.map((file) => file.path),
+    );
+    const nextDirectoryPaths = new Set(
+      [...directories.keys()].filter((path) => path !== "."),
+    );
+    const expanded = this.#diffTreeInitialized
+      ? new Set([
+          ...[...this.#diffTreeExpanded].filter((path) => nextDirectoryPaths.has(path)),
+          ...[...nextDirectoryPaths].filter((path) => !this.#diffTreeDirectories.has(path)),
+        ])
+      : new Set(nextDirectoryPaths);
+    this.#diffFileTree.clear();
+    for (const [directory, entries] of directories) {
+      this.#diffFileTree.resolveDirectory(directory, entries);
+    }
+    this.#diffTreeDirectories = nextDirectoryPaths;
+    this.#diffTreeExpanded = expanded;
+    this.#diffTreeInitialized = true;
+    this.#restoreDiffTreeExpansions();
+    const selected = this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0];
+    if (selected !== undefined) this.#diffFileTree.setActive(selected.path);
   }
 
   async #copyRawDiff(): Promise<void> {
@@ -654,7 +704,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                     row.isDirectory ? row.expanded ? "folder-open" : "folder" : "file-lines",
                     { className: "file-tree-icon" },
                   )}
-                  <span>${row.name}</span>
+                  <span class="file-tree-name">${row.name}</span>
                 </span>
               </button>
               ${this.#renderDirectoryState(row)}
@@ -930,11 +980,8 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
           this.#selectedDiff,
           nextFiles,
         );
-        const nextPaths = new Set(nextFiles.map((file) => file.path));
-        this.#collapsedDiffPaths = new Set(
-          [...this.#collapsedDiffPaths].filter((path) => nextPaths.has(path)),
-        );
         this.#diffFiles = nextFiles;
+        this.#syncDiffFileTree();
         this.#diffText = response.diff;
         shouldRender = true;
       }

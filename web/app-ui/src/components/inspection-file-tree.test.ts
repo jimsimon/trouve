@@ -2,7 +2,34 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { InspectionFileTreeModel } from "./inspection-file-tree.js";
+import {
+  fileTreeDirectoriesForPaths,
+  InspectionFileTreeModel,
+} from "./inspection-file-tree.js";
+
+describe("fileTreeDirectoriesForPaths", () => {
+  it("projects only the directories and files represented by the supplied paths", () => {
+    const directories = fileTreeDirectoriesForPaths([
+      "src/app/main.ts",
+      "src/app/theme.css",
+      "README.md",
+      "docs/guide.md",
+    ]);
+
+    expect(directories.get(".")).toEqual([
+      { name: "src", is_dir: true },
+      { name: "README.md", is_dir: false },
+      { name: "docs", is_dir: true },
+    ]);
+    expect(directories.get("src")).toEqual([{ name: "app", is_dir: true }]);
+    expect(directories.get("src/app")).toEqual([
+      { name: "main.ts", is_dir: false },
+      { name: "theme.css", is_dir: false },
+    ]);
+    expect(directories.get("docs")).toEqual([{ name: "guide.md", is_dir: false }]);
+    expect(directories.has("unrelated")).toBe(false);
+  });
+});
 
 describe("InspectionFileTreeModel", () => {
   it("sorts and flattens only lazily loaded expanded directories", () => {
@@ -168,11 +195,13 @@ describe("files inspection component contract", () => {
     "utf8",
   );
 
-  it("wires the existing directory/file endpoints alongside the established unified diff", () => {
+  it("wires the worktree endpoints alongside the diff-only file projection", () => {
     expect(component).toContain("services.protocol.sessionFiles(sessionId, path)");
     expect(component).toContain("services.protocol.sessionFile(sessionId, path)");
     expect(component).toContain("<trouve-code-view");
-    expect(component).toContain('class="unified-diff-list"');
+    expect(component).toContain('id="session-diff-file-tree"');
+    expect(component).toContain("fileTreeDirectoriesForPaths(");
+    expect(component).toContain("<trouve-diff-view");
     expect(component).toContain('{ className: "file-tree-icon" }');
   });
 
@@ -200,17 +229,19 @@ describe("files inspection component contract", () => {
     expect(component).toContain('const MOBILE_FILES_QUERY = "(max-width: 760px)"');
     expect(component).toContain("globalThis.matchMedia?.(MOBILE_FILES_QUERY).matches === true");
     expect(component).toContain("this.#fileTreeCollapsed = true");
+    expect(component).toContain("this.#diffTreeCollapsed = true");
     expect(styles).toContain(".files-inspection:not(.file-tree-collapsed) > .file-view-shell");
     expect(styles).toContain(".files-inspection.file-tree-collapsed > .file-view-shell");
+    expect(styles).toContain(".diff-inspection:not(.diff-tree-collapsed) > .diff-view-shell");
+    expect(styles).toContain(".diff-inspection.diff-tree-collapsed > .diff-view-shell");
   });
 
-  it("keeps the unified diff as default and exposes the desktop split enhancement", () => {
+  it("keeps unified as the selected-file default and preserves split mode", () => {
     expect(component).toContain('#diffMode: DiffMode = "unified"');
-    expect(component).toContain('class="diff-mode-additive"');
-    expect(component).toContain('class="split-diff-file-picker"');
     expect(component).toContain("<trouve-diff-view");
     expect(component).toContain('@trouve-diff-mode-change=');
     expect(component).toContain("Binary file changed.");
-    expect(styles).toContain(".diff-mode-additive { display: none; }");
+    expect(component).not.toContain('class="split-diff-file-picker"');
+    expect(styles).not.toContain(".diff-mode-additive");
   });
 });
