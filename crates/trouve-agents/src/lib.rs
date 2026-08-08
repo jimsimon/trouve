@@ -74,6 +74,19 @@ pub struct BackendTurn {
     pub mcp_servers: Vec<McpServerLaunch>,
 }
 
+/// Additional user input for the vendor turn currently running in a resumed
+/// backend session. The engine serializes this with durable transcript output
+/// before acknowledging the steering request.
+#[derive(Debug)]
+pub struct BackendSteer {
+    /// Vendor-side thread/session id that owns the active turn.
+    pub session: String,
+    pub prompt: String,
+    /// Image attachments resolved to local files; non-image attachments are
+    /// already represented by paths in `prompt`.
+    pub attachments: Vec<TurnAttachment>,
+}
+
 /// One prompt attachment, resolved to a stored file the backend process can
 /// read (the server and vendor CLIs share a filesystem).
 #[derive(Debug, Clone)]
@@ -133,6 +146,8 @@ pub enum BackendEvent {
     TextDelta(String),
     /// Reasoning ("thinking") text, where the vendor harness exposes it.
     ThinkingDelta(String),
+    /// The vendor harness explicitly closed its current thinking item.
+    ThinkingCompleted,
     ToolStarted {
         call_id: String,
         tool: String,
@@ -168,6 +183,23 @@ pub enum BackendEvent {
     CommandsUpdated {
         commands: Vec<trouve_protocol::CommandInfo>,
     },
+    /// The vendor harness replaced its current plan. Unlike a tool call,
+    /// this is durable thread state and should not render as transcript
+    /// activity; the core publishes the canonical todo snapshot separately.
+    TodosUpdated {
+        todos: Vec<trouve_protocol::TodoItem>,
+    },
+    /// Usage for the most recently completed model request while the vendor
+    /// turn is still running. Final turn aggregates arrive in `Completed`.
+    UsageUpdated {
+        usage: Usage,
+    },
+    /// The vendor harness began compacting its own conversation context.
+    CompactionStarted,
+    /// The vendor harness finished compacting its own conversation context.
+    CompactionCompleted,
+    /// The vendor harness finished a compaction item unsuccessfully.
+    CompactionFailed,
     Completed {
         usage: Usage,
     },
@@ -181,6 +213,7 @@ impl std::fmt::Debug for BackendEvent {
             }
             Self::TextDelta(t) => write!(f, "TextDelta({t:?})"),
             Self::ThinkingDelta(t) => write!(f, "ThinkingDelta({t:?})"),
+            Self::ThinkingCompleted => f.write_str("ThinkingCompleted"),
             Self::ToolStarted { call_id, tool, .. } => {
                 write!(f, "ToolStarted({call_id}, {tool})")
             }
@@ -201,6 +234,13 @@ impl std::fmt::Debug for BackendEvent {
             Self::CommandsUpdated { commands } => {
                 write!(f, "CommandsUpdated({} commands)", commands.len())
             }
+            Self::TodosUpdated { todos } => {
+                write!(f, "TodosUpdated({} todos)", todos.len())
+            }
+            Self::UsageUpdated { usage } => write!(f, "UsageUpdated({usage:?})"),
+            Self::CompactionStarted => f.write_str("CompactionStarted"),
+            Self::CompactionCompleted => f.write_str("CompactionCompleted"),
+            Self::CompactionFailed => f.write_str("CompactionFailed"),
             Self::Completed { usage } => write!(f, "Completed({usage:?})"),
         }
     }
@@ -249,11 +289,10 @@ pub trait AgentBackend: Send + Sync {
     /// the vendor cannot report current availability.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Models available to the current account. Catalog-covered backends use
-    /// vendor output only as an id allowlist and rebuild metadata/settings
-    /// from models.dev. Explicit adapters own uncatalogued integrations such
-    /// as Cursor-only models. Implementations should cache availability; the
-    /// default falls back to the canonical snapshot.
+    /// Models available for this backend. Catalog-covered backends use their
+    /// canonical static roster; explicit adapters own integrations that cannot
+    /// be catalogued, notably Cursor-only models discovered through Cursor's
+    /// CLI. The default returns the canonical snapshot.
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models()
     }
@@ -267,6 +306,20 @@ pub trait AgentBackend: Send + Sync {
     /// nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
+    }
+
+    /// Whether this backend can append user input to an active turn without
+    /// cancelling it or starting another turn.
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    /// Append user guidance to the active turn in `steer.session`.
+    async fn steer_turn(&self, _steer: BackendSteer) -> Result<(), BackendError> {
+        Err(BackendError::Protocol(format!(
+            "{} does not support steering active turns",
+            self.id()
+        )))
     }
 
     /// Start the vendor's own login flow (spawns the vendor CLI).
@@ -577,7 +630,18 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         Ok(BackendEvent::CommandsUpdated { commands }) => {
             serde_json::to_string(commands).map_or(0, |json| json.len())
         }
-        Ok(BackendEvent::Completed { .. }) => std::mem::size_of::<Usage>(),
+        Ok(BackendEvent::TodosUpdated { todos }) => {
+            serde_json::to_string(todos).map_or(0, |json| json.len())
+        }
+        Ok(BackendEvent::UsageUpdated { .. } | BackendEvent::Completed { .. }) => {
+            std::mem::size_of::<Usage>()
+        }
+        Ok(
+            BackendEvent::ThinkingCompleted
+            | BackendEvent::CompactionStarted
+            | BackendEvent::CompactionCompleted
+            | BackendEvent::CompactionFailed,
+        ) => 0,
         Err(error) => error.to_string().len(),
     }
 }

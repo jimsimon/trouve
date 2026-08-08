@@ -1,0 +1,70 @@
+name: Web frontend qualification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * 2"
+  push:
+    branches: [main]
+    paths:
+      - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-desktop-host/**"
+      - "web/app-ui/**"
+      - ".github/workflows/web-frontend-qualification.yml"
+  pull_request:
+    paths:
+      - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-desktop-host/**"
+      - "web/app-ui/**"
+      - ".github/workflows/web-frontend-qualification.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-frontend-qualification-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  servo-nested-workspace:
+    name: Servo nested-workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Keep this list aligned with the Debian-like dependencies published in
+      # the Servo Book. The qualification harness links Servo directly even
+      # though these CI tests do not open a native window.
+      - name: Install Servo build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential ca-certificates ccache clang cmake curl g++ git gperf
+          gstreamer1.0-libav gstreamer1.0-plugins-bad
+          gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+          gstreamer1.0-plugins-ugly gstreamer1.0-tools libclang-dev
+          libdbus-1-dev libegl1-mesa-dev libfreetype6-dev libges-1.0-dev
+          libgl1-mesa-dri libgles2-mesa-dev libglib2.0-dev
+          libgstreamer-plugins-bad1.0-dev
+          libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev
+          libgstrtspserver-1.0-dev libharfbuzz-dev liblzma-dev libudev-dev
+          libunwind-dev libvulkan1 libx11-dev libxcb-render0-dev
+          libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          libxkbcommon-x11-0 libxkbcommon-x11-dev libxkbcommon0 libxmu-dev
+          libxmu6 llvm-dev m4 pkg-config xorg-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: crates/trouve-servo-embed-preview -> target
+          cache-on-failure: true
+      - name: Verify isolated dependency graph
+        run: >-
+          cargo metadata
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --no-deps --format-version 1 > /dev/null
+      - name: Compile and run Servo harness tests
+        run: >-
+          cargo test
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked

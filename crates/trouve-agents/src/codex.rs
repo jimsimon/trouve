@@ -10,8 +10,8 @@
 //! - `thread/start` / `thread/resume` → `{ result: { thread: { id } } }`
 //! - `turn/start { threadId, input: [{type:"text",text}] }` then notifications:
 //!   `item/agentMessage/delta`, `item/started`, `item/completed`,
-//!   `item/commandExecution/outputDelta`, `thread/tokenUsage/updated`,
-//!   `turn/completed`
+//!   `item/commandExecution/outputDelta`, `turn/plan/updated`,
+//!   `thread/tokenUsage/updated`, `turn/completed`
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`
@@ -26,13 +26,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use trouve_protocol::{ModelInfo, Usage};
+use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
+    BackendStatus, BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -42,13 +42,7 @@ pub struct CodexBackend {
     command: String,
     server: Mutex<Option<Arc<AppServer>>>,
     catalog: Arc<ModelsDevCatalog>,
-    /// Account-visible ids from `model/list`, cached for [`MODELS_TTL`].
-    /// Model metadata is rebuilt from `catalog` on every read.
-    models_cache: Mutex<Option<(std::time::Instant, Vec<String>)>>,
 }
-
-/// How long a fetched vendor model list stays fresh.
-const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Codex's two sandbox spellings: `thread/start` uses the kebab-case mode,
 /// while `turn/start` uses the camel-case policy discriminator.
@@ -76,7 +70,6 @@ impl CodexBackend {
             command: command.unwrap_or_else(|| "codex".into()),
             server: Mutex::new(None),
             catalog: Arc::new(ModelsDevCatalog::embedded()),
-            models_cache: Mutex::new(None),
         }
     }
 
@@ -93,19 +86,6 @@ impl CodexBackend {
             model.output_price_per_mtok = None;
         }
         models
-    }
-
-    fn catalog_models_for_ids<I, S>(&self, ids: I) -> Vec<ModelInfo>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        Self::without_usage_pricing(self.catalog.provider_models_for_ids(
-            "openai",
-            &self.id,
-            ids,
-            OptionsDialect::CodexCli,
-        ))
     }
 
     async fn server(&self) -> Result<Arc<AppServer>, BackendError> {
@@ -129,49 +109,14 @@ impl AgentBackend for CodexBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // The app-server cannot be consulted offline, so the refreshable
-        // models.dev roster is the last-known availability fallback.
+        // Codex is a distinct serving surface: its static trouve-owned
+        // provider inherits shared metadata from models.dev and owns the
+        // OAuth roster, context limits, defaults, and reasoning levels.
         Self::without_usage_pricing(self.catalog.provider_models(
-            "openai",
+            "openai-codex",
             &self.id,
             OptionsDialect::CodexCli,
         ))
-    }
-
-    async fn list_models(&self) -> Vec<ModelInfo> {
-        let stale = {
-            let cache = self.models_cache.lock().await;
-            if let Some((at, ids)) = cache.as_ref()
-                && at.elapsed() < MODELS_TTL
-            {
-                return self.catalog_models_for_ids(ids);
-            }
-            cache.as_ref().map(|(_, ids)| ids.clone())
-        };
-        let fetched = async {
-            let server = self.server().await?;
-            server.request("model/list", json!({})).await
-        }
-        .await;
-        match fetched {
-            Ok(result) => {
-                let Some(ids) = parse_available_model_ids(&result) else {
-                    return stale
-                        .as_ref()
-                        .map(|ids| self.catalog_models_for_ids(ids))
-                        .unwrap_or_else(|| self.models());
-                };
-                *self.models_cache.lock().await = Some((std::time::Instant::now(), ids.clone()));
-                self.catalog_models_for_ids(&ids)
-            }
-            Err(e) => {
-                tracing::debug!("codex model/list failed: {e}; using stale/models.dev list");
-                stale
-                    .as_ref()
-                    .map(|ids| self.catalog_models_for_ids(ids))
-                    .unwrap_or_else(|| self.models())
-            }
-        }
     }
 
     fn status(&self) -> BackendStatus {
@@ -201,6 +146,22 @@ impl AgentBackend for CodexBackend {
                 note: format!("could not read usage from the Codex app-server: {e}"),
             },
         })
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        let server = self.server().await?;
+        let mut input = Vec::with_capacity(1 + steer.attachments.len());
+        if !steer.prompt.is_empty() {
+            input.push(json!({ "type": "text", "text": steer.prompt }));
+        }
+        for attachment in steer.attachments {
+            input.push(json!({ "type": "localImage", "path": attachment.path }));
+        }
+        server.steer_turn(&steer.session, input).await
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
@@ -398,17 +359,33 @@ fn agent_message_delta(
     }
 }
 
-/// Extract the account-visible ids from `model/list`. Display names,
-/// capabilities, defaults, context limits, and option schemas deliberately do
-/// not cross this boundary; models.dev owns those fields.
-fn parse_available_model_ids(result: &Value) -> Option<Vec<String>> {
-    let data = result["data"].as_array()?;
-    Some(
-        data.iter()
-            .filter(|entry| entry["hidden"].as_bool() != Some(true))
-            .filter_map(|entry| entry["id"].as_str().map(String::from))
-            .collect(),
-    )
+/// Translate Codex's authoritative plan replacement into trouve's canonical
+/// todo snapshot. App-server plan steps do not carry ids, so use their content
+/// plus duplicate occurrence as a deterministic identity that survives plan
+/// reordering and normal status-only updates.
+fn codex_plan_todos(params: &Value) -> Option<Vec<TodoItem>> {
+    let mut occurrences = HashMap::<String, usize>::new();
+    params
+        .get("plan")?
+        .as_array()?
+        .iter()
+        .map(|step| {
+            let content = step.get("step")?.as_str()?.to_string();
+            let occurrence = occurrences.entry(content.clone()).or_default();
+            *occurrence += 1;
+            let status = match step.get("status")?.as_str()? {
+                "pending" => TodoStatus::Pending,
+                "inProgress" => TodoStatus::InProgress,
+                "completed" => TodoStatus::Completed,
+                _ => return None,
+            };
+            Some(TodoItem {
+                id: format!("codex-plan:{}:{content}:{occurrence}", content.len()),
+                content,
+                status,
+            })
+        })
+        .collect()
 }
 
 fn thread_id_of(result: &Value) -> Result<String, BackendError> {
@@ -489,6 +466,15 @@ fn turn_stream(
                                 let _ = tx.send(Ok(event)).await;
                             }
                         }
+                        "turn/plan/updated" => {
+                            if let Some(todos) = codex_plan_todos(&params) {
+                                let _ = tx.send(Ok(BackendEvent::TodosUpdated { todos })).await;
+                            } else {
+                                tracing::warn!(
+                                    "codex: ignoring malformed turn/plan/updated notification"
+                                );
+                            }
+                        }
                         // Raw reasoning is only exposed by some models (notably
                         // open-source models). Summary deltas are deliberately not
                         // used as thinking; they are section headings, while
@@ -510,7 +496,9 @@ fn turn_stream(
                             {
                                 commentary_messages.insert(id.to_string());
                             }
-                            if !matches!(
+                            if ty == "contextCompaction" {
+                                let _ = tx.send(Ok(BackendEvent::CompactionStarted)).await;
+                            } else if !matches!(
                                 ty,
                                 "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
                             ) {
@@ -538,20 +526,33 @@ fn turn_stream(
                         "item/completed" => {
                             let item = &params["item"];
                             let ty = item["type"].as_str().unwrap_or("");
-                            if ty == "reasoning"
+                            let raw_reasoning_streamed = ty == "reasoning"
                                 && item["id"]
                                     .as_str()
-                                    .is_none_or(|id| !streamed_raw_reasoning.contains(id))
+                                    .is_some_and(|id| streamed_raw_reasoning.remove(id));
+                            let mut thinking_emitted = raw_reasoning_streamed;
+                            if ty == "reasoning"
+                                && !raw_reasoning_streamed
                                 && let Some(text) = completed_raw_reasoning_text(item)
                             {
+                                thinking_emitted = true;
                                 let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
                             }
-                            if ty == "agentMessage"
-                                && let Some(id) = item["id"].as_str()
-                            {
-                                commentary_messages.remove(id);
+                            let commentary_completed = ty == "agentMessage"
+                                && item["id"]
+                                    .as_str()
+                                    .is_some_and(|id| commentary_messages.remove(id));
+                            if thinking_emitted || commentary_completed {
+                                let _ = tx.send(Ok(BackendEvent::ThinkingCompleted)).await;
                             }
-                            if !matches!(
+                            if ty == "contextCompaction" {
+                                let event = if item["status"].as_str() == Some("failed") {
+                                    BackendEvent::CompactionFailed
+                                } else {
+                                    BackendEvent::CompactionCompleted
+                                };
+                                let _ = tx.send(Ok(event)).await;
+                            } else if !matches!(
                                 ty,
                                 "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
                             ) {
@@ -566,17 +567,24 @@ fn turn_stream(
                             }
                         }
                         "thread/tokenUsage/updated" => {
-                            // One update per model call. The input span of the
-                            // newest call is the whole conversation context, so
-                            // it replaces; output is per-call, so it accumulates
-                            // across the calls of a multi-step turn.
+                            // One update per model call. Aggregate its billing
+                            // counters for the final turn usage, but retain the
+                            // newest call's authoritative context measurement.
+                            // Publish the per-call value immediately so clients
+                            // follow a vendor-owned compaction without waiting
+                            // for the turn to end.
                             let u = parse_usage(&params);
-                            usage.input_tokens = u.input_tokens;
-                            usage.cached_input_tokens = u.cached_input_tokens;
+                            usage.input_tokens += u.input_tokens;
+                            usage.cached_input_tokens += u.cached_input_tokens;
                             usage.output_tokens += u.output_tokens;
+                            usage.context_input_tokens = u.context_input_tokens;
+                            if let Some(cost) = u.cost_usd {
+                                usage.cost_usd = Some(usage.cost_usd.unwrap_or(0.0) + cost);
+                            }
                             if let Some(n) = u.context_window {
                                 usage.context_window = Some(n);
                             }
+                            let _ = tx.send(Ok(BackendEvent::UsageUpdated { usage: u })).await;
                         }
                         "turn/completed" => {
                             // Record terminal state without awaiting. Once the
@@ -870,8 +878,9 @@ fn parse_usage(params: &Value) -> Usage {
         .get("tokenUsage")
         .or_else(|| params.get("usage"))
         .unwrap_or(params);
-    // The model's real context window rides along at the tokenUsage level;
-    // `model/list` never reports it, so this is the only source of truth.
+    // The turn's effective runtime context window rides along at the
+    // tokenUsage level. Preserve it in usage even though the model catalog
+    // separately advertises the serving surface's maximum.
     let context_window = u
         .get("modelContextWindow")
         .or_else(|| u.get("model_context_window"))
@@ -888,14 +897,30 @@ fn parse_usage(params: &Value) -> Usage {
         }
         0
     };
+    let provider_input_tokens = get(&["inputTokens", "input_tokens", "promptTokens"]);
+    // Codex's own compaction trigger and clients use `last.totalTokens`, not
+    // `last.inputTokens`, as the amount occupying the effective context
+    // window. Older app-server builds omitted it, so retain the input-total
+    // fallback for compatibility.
+    let provider_context_tokens = get(&["totalTokens", "total_tokens"]);
+    let cached_input_tokens = get(&[
+        "cachedInputTokens",
+        "cached_input_tokens",
+        "cacheReadTokens",
+    ]);
     Usage {
-        input_tokens: get(&["inputTokens", "input_tokens", "promptTokens"]),
+        // Codex follows the OpenAI Responses shape: inputTokens includes its
+        // cached subset. Normalize to trouve's mutually exclusive billing
+        // counters, while preserving Codex's total-token measurement for the
+        // current context.
+        input_tokens: provider_input_tokens.saturating_sub(cached_input_tokens),
         output_tokens: get(&["outputTokens", "output_tokens", "completionTokens"]),
-        cached_input_tokens: get(&[
-            "cachedInputTokens",
-            "cached_input_tokens",
-            "cacheReadTokens",
-        ]),
+        cached_input_tokens,
+        context_input_tokens: Some(if provider_context_tokens > 0 {
+            provider_context_tokens
+        } else {
+            provider_input_tokens
+        }),
         cost_usd: None,
         context_window,
     }
@@ -2401,6 +2426,40 @@ impl AppServer {
         }
     }
 
+    /// Append input to the exact turn currently active on a Codex thread.
+    /// `expectedTurnId` makes a completion/replacement race fail closed
+    /// instead of steering whichever turn happens to run next.
+    async fn steer_turn(&self, thread_id: &str, input: Vec<Value>) -> Result<(), BackendError> {
+        let expected_turn_id = self
+            .active_turns
+            .lock()
+            .await
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "turn/steer: no active turn on Codex thread {thread_id}"
+                ))
+            })?;
+        let response = self
+            .request(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "input": input,
+                    "expectedTurnId": expected_turn_id,
+                }),
+            )
+            .await?;
+        let returned_turn_id = turn_id_of(&response)?;
+        if returned_turn_id != expected_turn_id {
+            return Err(BackendError::Protocol(format!(
+                "turn/steer returned turn {returned_turn_id}, expected {expected_turn_id}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn notify(&self, method: &str, params: Value) {
         let _ = self
             .write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
@@ -3603,6 +3662,32 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_codex_plan_replacements_as_todos() {
+        let todos = codex_plan_todos(&json!({
+            "plan": [
+                { "step": "Inspect", "status": "completed" },
+                { "step": "Implement", "status": "inProgress" },
+                { "step": "Verify", "status": "pending" },
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(todos.len(), 3);
+        assert_eq!(todos[0].id, "codex-plan:7:Inspect:1");
+        assert_eq!(todos[0].status, TodoStatus::Completed);
+        assert_eq!(todos[1].content, "Implement");
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+        assert_eq!(todos[2].status, TodoStatus::Pending);
+        assert_eq!(codex_plan_todos(&json!({ "plan": [] })), Some(vec![]));
+        assert!(
+            codex_plan_todos(&json!({
+                "plan": [{ "step": "Unknown", "status": "blocked" }]
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn turn_disables_reasoning_summaries() {
         let mut params = json!({ "threadId": "thread-1", "input": [] });
         apply_reasoning_options(&mut params, Some("high"));
@@ -3637,6 +3722,63 @@ mod tests {
             agent_message_delta(&legacy, &commentary),
             Some(BackendEvent::TextDelta(text)) if text == "Legacy response."
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steer_turn_targets_the_exact_active_codex_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-steer");
+        let request_marker = std::path::PathBuf::from(format!("{}.request", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r request
+printf '%s\n' "$request" > "$0.request"
+echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-1"}}}'
+cat > /dev/null
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        assert!(matches!(
+            server
+                .steer_turn("thread-1", vec![json!({ "type": "text", "text": "early" })])
+                .await,
+            Err(BackendError::Protocol(message)) if message.contains("no active turn")
+        ));
+        server
+            .active_turns
+            .lock()
+            .await
+            .insert("thread-1".into(), "turn-1".into());
+        server
+            .steer_turn(
+                "thread-1",
+                vec![
+                    json!({ "type": "text", "text": "Focus on the regression." }),
+                    json!({ "type": "localImage", "path": "/tmp/screenshot.png" }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(request_marker).unwrap()).unwrap();
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(request["params"]["threadId"], "thread-1");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-1");
+        assert_eq!(
+            request["params"]["input"],
+            json!([
+                { "type": "text", "text": "Focus on the regression." },
+                { "type": "localImage", "path": "/tmp/screenshot.png" },
+            ])
+        );
     }
 
     #[tokio::test]
@@ -4219,6 +4361,95 @@ sleep 10
         futures::pin_mut!(stream);
         route_tx
             .try_send(ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": { "id": "compact-1", "type": "contextCompaction" }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "compact-1",
+                        "type": "contextCompaction",
+                        "status": "completed"
+                    }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "thread/tokenUsage/updated".into(),
+                params: json!({
+                    "threadId": "root",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 1200,
+                            "cachedInputTokens": 1000,
+                            "outputTokens": 50,
+                            "totalTokens": 1250
+                        },
+                        "modelContextWindow": 272000
+                    }
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionStarted))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionCompleted))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::UsageUpdated { usage }))
+                if usage.input_tokens == 200
+                    && usage.cached_input_tokens == 1000
+                    && usage.context_input_tokens == Some(1250)
+                    && usage.context_window == Some(272000)
+        ));
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": { "id": "compact-2", "type": "contextCompaction" }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "compact-2",
+                        "type": "contextCompaction",
+                        "status": "failed"
+                    }
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionStarted))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CompactionFailed))
+        ));
+        route_tx
+            .try_send(ServerMsg::Notification {
                 method: "turn/completed".into(),
                 params: json!({
                     "threadId": "root",
@@ -4577,8 +4808,9 @@ cat > /dev/null
             },
         });
         let u = parse_usage(&params);
-        assert_eq!(u.input_tokens, 1200);
+        assert_eq!(u.input_tokens, 200);
         assert_eq!(u.cached_input_tokens, 1000);
+        assert_eq!(u.context_input_tokens, Some(1250));
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.context_window, Some(272000));
 
@@ -4586,6 +4818,7 @@ cat > /dev/null
         let flat = json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } });
         let u = parse_usage(&flat);
         assert_eq!(u.input_tokens, 7);
+        assert_eq!(u.context_input_tokens, Some(7));
         assert_eq!(u.output_tokens, 3);
         assert_eq!(u.context_window, None);
     }
@@ -4619,26 +4852,12 @@ cat > /dev/null
         assert!(health.note.contains("logged in"));
     }
 
-    #[test]
-    fn model_list_only_contributes_visible_ids() {
-        let result = json!({ "data": [
-            {
-                "id": "gpt-5.6",
-                "displayName": "Vendor Override",
-                "hidden": false,
-                "supportedReasoningEfforts": [{"reasoningEffort": "vendor-only"}],
-            },
-            { "id": "secret", "hidden": true },
-        ]});
-        assert_eq!(
-            parse_available_model_ids(&result),
-            Some(vec!["gpt-5.6".into()])
-        );
-        assert_eq!(parse_available_model_ids(&json!({})), None);
-        assert_eq!(
-            parse_available_model_ids(&json!({"data": []})),
-            Some(vec![])
-        );
+    #[tokio::test]
+    async fn listing_models_is_static_and_does_not_spawn_app_server() {
+        let backend = CodexBackend::new("codex", Some("definitely-not-a-command".into()));
+        let models = backend.list_models().await;
+        assert_eq!(models.len(), 7);
+        assert!(backend.server.lock().await.is_none());
     }
 
     #[test]
@@ -4650,27 +4869,44 @@ cat > /dev/null
     }
 
     #[test]
-    fn models_dev_owns_codex_metadata_and_settings() {
+    fn trouve_catalog_owns_codex_roster_metadata_and_settings() {
         let backend = CodexBackend::new("codex", None);
-        let models = backend.catalog_models_for_ids(["gpt-5.6", "vendor-only"]);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "codex/gpt-5.6");
-        assert_eq!(models[0].display_name, "GPT-5.6");
-        assert_eq!(models[0].context_window, 1_050_000);
-        assert_eq!(models[0].input_price_per_mtok, None);
+        let models = backend.models();
+        assert_eq!(models.len(), 7);
+        let sol = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.display_name, "GPT-5.6 Sol");
+        assert_eq!(sol.context_window, 500_000);
+        assert_eq!(sol.input_price_per_mtok, None);
+        assert_eq!(sol.output_price_per_mtok, None);
         assert_eq!(
-            models[0]
-                .options_schema
+            sol.options_schema
                 .pointer("/properties/reasoning_effort/enum")
                 .unwrap(),
-            &json!(["none", "low", "medium", "high", "xhigh", "max"])
+            &json!(["low", "medium", "high", "xhigh", "max", "ultra"])
         );
         assert_eq!(
-            models[0]
-                .options_schema
+            sol.options_schema
                 .pointer("/properties/reasoning_effort/default")
                 .and_then(Value::as_str),
-            Some("medium")
+            Some("low")
+        );
+
+        let gpt_55 = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.5")
+            .unwrap();
+        assert_eq!(gpt_55.context_window, 400_000);
+        let luna = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(
+            luna.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
         );
     }
 }

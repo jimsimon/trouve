@@ -1,0 +1,400 @@
+import { ContextConsumer } from "@lit/context";
+import { css, html, LitElement, nothing } from "lit";
+
+import { appServicesContext } from "../contexts/app-contexts.js";
+import type {
+  ProtocolModeInfo,
+  ProtocolModelInfo,
+  ProtocolProvidersResponse,
+  ProtocolUpsertModeRequest,
+} from "../services/protocol-client.js";
+import {
+  modelOptionLabel,
+  modelSelectorLabel,
+} from "./model-option-controls.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
+
+type PermissionMode = "ask" | "allow_list" | "yolo";
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+
+const thinkingOptions = (model: ProtocolModelInfo | undefined): readonly string[] => {
+  const schema = asRecord(model?.options_schema);
+  const properties = asRecord(schema?.["properties"]);
+  for (const key of ["thinking_level", "effort"]) {
+    const property = asRecord(properties?.[key]);
+    const values = property?.["enum"];
+    if (Array.isArray(values) && values.every((value) => typeof value === "string")) {
+      return values as string[];
+    }
+  }
+  return [];
+};
+
+const splitTools = (value: string): string[] =>
+  value.split(/[\n,]/u).map((tool) => tool.trim()).filter(Boolean);
+
+export class TrouveModeSettings extends LitElement {
+  static override styles = css`
+    :host { display: block; color: var(--trouve-text); font: var(--trouve-font-size, 13px)/1.35 var(--trouve-font-sans, system-ui); }
+    h2, h3, p { margin-block: 0; }
+    h2 { color: var(--trouve-text-hi); font-size: 16px; } h3 { color: var(--trouve-text-hi); font-size: 13px; }
+    h3.section-subtitle { font-size: 14px; }
+    .stack { display: grid; gap: 12px; }
+    .card, .mode-editor { display: grid; gap: 8px; padding: 12px; border: 0; border-radius: 7px; background: var(--trouve-surface); }
+    .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .grow { flex: 1 1 12rem; min-width: 0; }
+    .identity-row > label { flex: 1 1 12rem; }
+    .identity-row > .mode-id-field { flex: 0 0 150px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    label { display: grid; gap: 4px; color: var(--trouve-muted); }
+    label > span { font-size: 0.82rem; font-weight: 600; }
+    button, input, select, textarea { box-sizing: border-box; font: inherit; color: var(--trouve-text); border: 1px solid var(--trouve-border); border-radius: 5px; background: var(--trouve-control-bg, var(--trouve-surface)); }
+    input, select, textarea { width: 100%; min-height: 30px; padding: 4px 8px; }
+    textarea { min-height: 82px; resize: vertical; }
+    button { min-height: 30px; padding: 4px 9px; cursor: pointer; }
+    button.primary { color: var(--trouve-on-accent, white); border-color: var(--trouve-primary-border, var(--trouve-accent)); background: var(--trouve-primary-bg, var(--trouve-accent)); }
+    button.primary:hover:not(:disabled) { background: var(--trouve-primary-hover, var(--trouve-primary-bg)); }
+    button.danger { color: var(--trouve-err); }
+    button:disabled { cursor: default; opacity: 0.55; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--trouve-focus, var(--trouve-accent)); outline-offset: 2px; }
+    .meta, .status { color: var(--trouve-muted); font-size: 0.83rem; }
+    .status { min-height: 1.4em; } .status.error { color: var(--trouve-err); }
+    .defaults-form { display: grid; gap: 8px; }
+    .defaults-form > .row > label:first-child { flex: 1 1 100%; }
+    .permission-default { width: 150px; }
+    .modes-copy { color: var(--trouve-muted); font-size: 11px; }
+    .no-models { display: flex; align-items: center; gap: 10px; border-radius: 6px; padding: 10px; color: var(--trouve-warn); background: var(--trouve-surface); font-size: 12px; }
+    .no-models span { min-width: 0; flex: 1; }
+    .mode-list { height: 320px; overflow: auto; border-radius: 7px; background: var(--trouve-surface); }
+    .mode-row { box-sizing: border-box; height: 52px; display: grid; grid-template-columns: minmax(0, 1fr) 190px auto; align-items: center; gap: 8px; padding: 0 6px 0 10px; }
+    .mode-row-copy { min-width: 0; line-height: 1.2; }
+    .mode-row-copy > span { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .mode-row-copy strong, .mode-row-copy small, .mode-row-copy p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mode-row-copy strong { color: var(--trouve-text-hi); font-size: 13px; }
+    .mode-row-copy small, .mode-row-copy p { color: var(--trouve-muted); font-size: 11px; }
+    .mode-row-copy p { margin-top: 2px; }
+    .mode-row-defaults { display: grid; gap: 3px; }
+    .mode-row-defaults select { min-height: 28px; }
+    .mode-row-actions { display: flex; gap: 5px; }
+    .mode-default-grid { grid-template-columns: 150px minmax(0, 1fr) 190px; align-items: end; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+    @media (max-width: 620px) {
+      .grid, .mode-default-grid { grid-template-columns: 1fr; }
+      .row > button { flex: 1 1 auto; }
+      .mode-list { height: auto; max-height: 420px; }
+      .mode-row { height: auto; min-height: 68px; grid-template-columns: minmax(0, 1fr); align-items: stretch; padding: 8px; }
+      .mode-row-actions { justify-content: end; }
+    }
+  `;
+
+  readonly #services = new ContextConsumer(this, {
+    context: appServicesContext,
+    subscribe: true,
+  });
+  #providers: ProtocolProvidersResponse | undefined;
+  #models: readonly ProtocolModelInfo[] = [];
+  #modes: readonly ProtocolModeInfo[] = [];
+  #busy = false;
+  #message = "";
+  #error = false;
+  #editingModeId = "";
+  #defaultModelDraft = "";
+  #defaultThinkingDraft = "";
+  #modeFormModelId = "";
+  #modeFormThinkingDraft: string | undefined;
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    queueMicrotask(() => void this.#load());
+  }
+
+  async #load(): Promise<void> {
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined) return;
+    this.#busy = true;
+    this.#message = "Loading modes and models…";
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      [this.#providers, this.#models, this.#modes] = await Promise.all([
+        protocol.providers(),
+        protocol.models(),
+        protocol.modeInfos(),
+      ]);
+      this.#defaultModelDraft = this.#providers.default_model ?? "";
+      this.#defaultThinkingDraft = this.#providers.default_thinking_level ?? "";
+      this.#message = "";
+    } catch {
+      this.#message = "Modes and model defaults could not be loaded.";
+      this.#error = true;
+    } finally {
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  async #saveDefaults(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined || this.#busy) return;
+    const data = new FormData(event.currentTarget as HTMLFormElement);
+    const model = String(data.get("model") ?? "");
+    const permission = String(data.get("permission_mode") ?? "ask") as PermissionMode;
+    const thinking = String(data.get("thinking") ?? "");
+    if (model === "" || !["ask", "allow_list", "yolo"].includes(permission)) return;
+    this.#busy = true;
+    this.#message = "Saving defaults…";
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      await Promise.all([
+        protocol.setDefaultModel({
+          model,
+          ...(thinking === "" ? {} : { default_thinking_level: thinking }),
+        }),
+        protocol.setDefaultPermissionMode({ permission_mode: permission }),
+      ]);
+      await this.#load();
+      this.#message = "Defaults saved for new threads.";
+      this.requestUpdate();
+    } catch {
+      this.#message = "Defaults could not be saved.";
+      this.#error = true;
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  async #saveMode(event: SubmitEvent, existing?: ProtocolModeInfo): Promise<void> {
+    event.preventDefault();
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined || this.#busy) return;
+    const form = event.currentTarget as HTMLFormElement;
+    const data = new FormData(form);
+    const id = String(data.get("id") ?? existing?.mode.id ?? "").trim();
+    const displayName = String(data.get("display_name") ?? "").trim();
+    const systemPrompt = String(data.get("system_prompt") ?? "").trim();
+    const permission = String(data.get("default_permission_mode") ?? "");
+    if (!/^[a-z0-9][a-z0-9_-]*$/u.test(id) || displayName === "") {
+      this.#message = "Mode IDs use lowercase letters, digits, underscore, or dash; a display name is required.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
+    const request: ProtocolUpsertModeRequest = {
+      display_name: displayName,
+      system_prompt: systemPrompt,
+      allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
+      read_only: data.get("read_only") === "on",
+      default_model: String(data.get("default_model") ?? "") || null,
+      default_permission_mode: permission === "" ? null : permission as PermissionMode,
+      default_thinking_level: String(data.get("default_thinking_level") ?? "") || null,
+    };
+    this.#busy = true;
+    this.#message = `Saving ${id}…`;
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      await protocol.upsertMode(id, request);
+      if (existing === undefined) form.reset();
+      this.#editingModeId = "";
+      this.#modeFormModelId = "";
+      this.#modeFormThinkingDraft = undefined;
+      await this.#load();
+      this.#message = `Saved mode ${id}.`;
+      this.requestUpdate();
+    } catch {
+      this.#message = `Mode ${id} could not be saved.`;
+      this.#error = true;
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  async #resetMode(info: ProtocolModeInfo): Promise<void> {
+    const verb = info.origin === "custom" ? "Delete" : "Reset";
+    if (!globalThis.confirm(`${verb} mode “${info.mode.display_name}”?`)) return;
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined || this.#busy) return;
+    this.#busy = true;
+    this.requestUpdate();
+    try {
+      await protocol.deleteMode(info.mode.id);
+      const success = info.origin === "custom"
+        ? `Deleted mode ${info.mode.id}.`
+        : `Reset mode ${info.mode.id} to its built-in definition.`;
+      await this.#load();
+      this.#message = success;
+      this.requestUpdate();
+    } catch {
+      this.#message = `Mode ${info.mode.id} could not be ${info.origin === "custom" ? "deleted" : "reset"}.`;
+      this.#error = true;
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  #modeForm(info?: ProtocolModeInfo) {
+    const mode = info?.mode;
+    const readOnly = info?.origin === "workspace";
+    const selectedModelId = this.#modeFormModelId || mode?.default_model || this.#providers?.default_model || "";
+    const editorThinking = thinkingOptions(
+      this.#models.find((candidate) => candidate.id === selectedModelId),
+    );
+    return html`
+      <form class="mode-editor" @submit=${(event: SubmitEvent) => void this.#saveMode(event, info)}>
+        <div class="row"><h3 class="grow">${mode === undefined ? "Add mode" : `Edit mode \"${mode.id}\"`}</h3></div>
+        <div class="row identity-row">
+          ${mode === undefined ? html`<label class="mode-id-field"><span class="visually-hidden">Mode ID</span><input name="id" required placeholder="id (e.g. docs)" /></label>` : html`<input type="hidden" name="id" .value=${mode.id} />`}
+          <label><span class="visually-hidden">Display name</span><input name="display_name" required placeholder="display name" .value=${mode?.display_name ?? ""} ?disabled=${readOnly} /></label>
+        </div>
+        <label><span>System prompt (appended to the base prompt):</span><textarea name="system_prompt" .value=${mode?.system_prompt ?? ""} ?disabled=${readOnly}></textarea></label>
+        <label><span class="visually-hidden">Allowed tools</span><input name="allowed_tools" placeholder="allowed tools, comma-separated (empty = all tools)" .value=${(mode?.allowed_tools ?? []).join(", ")} ?disabled=${readOnly} /></label>
+        <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
+        <div class="grid mode-default-grid">
+          <label><span>Default permissions</span><select name="default_permission_mode" .value=${mode?.default_permission_mode ?? ""} ?disabled=${readOnly}><option value="">Global default</option><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
+          <label><span>Default model</span><select name="default_model" .value=${this.#modeFormModelId || mode?.default_model || ""} ?disabled=${readOnly || this.#models.length === 0} @change=${(event: Event) => {
+            this.#modeFormModelId = (event.currentTarget as HTMLSelectElement).value;
+            const options = thinkingOptions(this.#models.find((candidate) => candidate.id === this.#modeFormModelId));
+            const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
+            this.#modeFormThinkingDraft = options.includes(current) ? current : "";
+            this.requestUpdate();
+          }}><option value="">Global default</option>${this.#models.map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
+          ${editorThinking.length === 0
+            ? html`<input type="hidden" name="default_thinking_level" value="" />`
+            : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
+        </div>
+        ${readOnly
+          ? html`<p class="meta">Workspace modes are managed by the repository’s .agents configuration.</p>`
+          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add mode" : "Save mode"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); }}>Cancel</button></div>`}
+      </form>
+    `;
+  }
+
+  async #updateModeDefaults(
+    info: ProtocolModeInfo,
+    update: { readonly model?: string | null; readonly thinking?: string | null },
+  ): Promise<void> {
+    if (info.origin === "workspace" || this.#busy) return;
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined) return;
+    const mode = info.mode;
+    this.#busy = true;
+    this.#message = `Saving ${mode.id}…`;
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      await protocol.upsertMode(mode.id, {
+        display_name: mode.display_name,
+        system_prompt: mode.system_prompt,
+        allowed_tools: [...(mode.allowed_tools ?? [])],
+        ...(mode.read_only === undefined ? {} : { read_only: mode.read_only }),
+        default_permission_mode: mode.default_permission_mode ?? null,
+        default_model: update.model === undefined ? mode.default_model ?? null : update.model,
+        default_thinking_level: update.thinking === undefined
+          ? mode.default_thinking_level ?? null
+          : update.thinking,
+      });
+      await this.#load();
+      this.#message = `Saved mode ${mode.id}.`;
+      this.requestUpdate();
+    } catch {
+      this.#message = `Mode ${mode.id} could not be saved.`;
+      this.#error = true;
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  #modeRow(info: ProtocolModeInfo) {
+    const mode = info.mode;
+    const modelId = mode.default_model ?? "";
+    const thinkingModel = this.#models.find((model) => model.id === (modelId || this.#providers?.default_model));
+    const thinking = thinkingOptions(thinkingModel);
+    const readOnly = info.origin === "workspace";
+    return html`
+      <article class="mode-row">
+        <div class="mode-row-copy">
+          <span><strong>${mode.display_name}</strong><small>${mode.id}${info.origin === "builtin" ? "" : ` · ${info.origin}`}${mode.read_only ? " · read-only" : ""}</small></span>
+          <p title=${mode.system_prompt}>${mode.system_prompt}</p>
+        </div>
+        <div class="mode-row-defaults">
+          <select
+            aria-label=${`Default model for ${mode.display_name}`}
+            .value=${modelId}
+            ?disabled=${readOnly || this.#busy || this.#models.length === 0}
+            @change=${(event: Event) => void this.#updateModeDefaults(info, {
+              model: (event.currentTarget as HTMLSelectElement).value || null,
+              thinking: null,
+            })}
+          ><option value="">Global default</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}</option>`)}</select>
+          ${thinking.length === 0
+            ? nothing
+            : html`<select
+                aria-label=${`Default thinking level for ${mode.display_name}`}
+                .value=${mode.default_thinking_level ?? ""}
+                ?disabled=${readOnly || this.#busy}
+                @change=${(event: Event) => void this.#updateModeDefaults(info, {
+                  thinking: (event.currentTarget as HTMLSelectElement).value || null,
+                })}
+              ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
+        </div>
+        <div class="mode-row-actions">
+          ${readOnly ? nothing : html`<button type="button" @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
+          ${info.origin === "customized" || info.origin === "custom"
+            ? html`<button class="danger" type="button" ?disabled=${this.#busy} @click=${() => void this.#resetMode(info)}>${info.origin === "custom" ? "Remove" : "Reset"}</button>`
+            : nothing}
+        </div>
+      </article>
+    `;
+  }
+
+  override render() {
+    const selected = this.#models.find((model) => model.id === (this.#defaultModelDraft || this.#providers?.default_model));
+    const thinking = thinkingOptions(selected);
+    return html`
+      <div class="stack">
+        <h2>Modes &amp; Models</h2>
+        ${this.#models.length === 0 && !this.#busy
+          ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
+          : nothing}
+        <form class="defaults-form" @submit=${(event: SubmitEvent) => void this.#saveDefaults(event)}>
+          <p class="meta">Global default model — used by new threads whose mode has no default of its own.</p>
+          <div class="row">
+            <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || this.#models.length === 0} @change=${(event: Event) => {
+              this.#defaultModelDraft = (event.currentTarget as HTMLSelectElement).value;
+              const options = thinkingOptions(this.#models.find((model) => model.id === this.#defaultModelDraft));
+              if (!options.includes(this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
+              this.requestUpdate();
+            }}><option value="" disabled>Choose model</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
+          </div>
+          ${thinking.length === 0
+            ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
+            : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
+          <div class="row"><button type="submit" ?disabled=${this.#busy || this.#models.length === 0}>Set defaults</button></div>
+          <p class="meta">Global default permissions — used by new threads whose mode has no default of its own.</p>
+          <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
+        </form>
+        <h3 class="section-subtitle">Modes</h3>
+        <p class="modes-copy">A mode combines a prompt, tool policy, permissions, model, and thinking defaults. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.</p>
+        <section class="mode-list" aria-label="Modes">${this.#modes.map((info) => this.#modeRow(info))}</section>
+        ${this.#editingModeId === ""
+          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add mode</button></div>`
+          : this.#editingModeId === "__new__"
+            ? this.#modeForm()
+            : this.#modeForm(this.#modes.find((info) => info.mode.id === this.#editingModeId))}
+        ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
+      </div>
+    `;
+  }
+}
+
+customElements.define("trouve-mode-settings", TrouveModeSettings);
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "trouve-mode-settings": TrouveModeSettings;
+  }
+}

@@ -1,0 +1,191 @@
+{
+  "events": [
+    {
+      "cursor": 1,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:00Z",
+      "type": "turn.started",
+      "turn": 7,
+      "mode": "code",
+      "model": "openai/gpt-fixture"
+    },
+    {
+      "cursor": 2,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:01Z",
+      "type": "user.message",
+      "turn": 7,
+      "content": "Build the migration",
+      "attachments": []
+    },
+    {
+      "cursor": 3,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:02Z",
+      "type": "assistant.thinking",
+      "turn": 7,
+      "text": "first "
+    },
+    {
+      "cursor": 4,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:03Z",
+      "type": "assistant.thinking",
+      "turn": 7,
+      "text": "thought"
+    },
+    {
+      "cursor": 5,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:04Z",
+      "type": "assistant.delta",
+      "turn": 7,
+      "text": "Working now"
+    },
+    {
+      "cursor": 6,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:05Z",
+      "type": "assistant.message",
+      "turn": 7,
+      "content": "Working now."
+    },
+    {
+      "cursor": 7,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:06Z",
+      "type": "tool.requested",
+      "turn": 7,
+      "call_id": "call_fixture",
+      "tool": "write_file",
+      "args": { "path": "src/app.ts" },
+      "requires_approval": true
+    },
+    {
+      "cursor": 8,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:06Z",
+      "type": "approval.requested",
+      "turn": 7,
+      "call_id": "call_fixture"
+    },
+    {
+      "cursor": 9,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:06Z",
+      "type": "approval.resolved",
+      "call_id": "call_fixture",
+      "decision": "approve"
+    },
+    {
+      "cursor": 10,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:06Z",
+      "type": "tool.started",
+      "call_id": "call_fixture"
+    },
+    {
+      "cursor": 11,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:07Z",
+      "type": "tool.output",
+      "call_id": "call_fixture",
+      "chunk": "created src/app.ts\n"
+    },
+    {
+      "cursor": 12,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:07Z",
+      "type": "tool.completed",
+      "call_id": "call_fixture",
+      "status": "ok",
+      "result": { "bytes_written": 3 }
+    },
+    {
+      "cursor": 13,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:07Z",
+      "type": "question.requested",
+      "turn": 7,
+      "request_id": "question_fixture",
+      "title": "Target",
+      "questions": [
+        {
+          "id": "target",
+          "prompt": "Ship where?",
+          "options": [{ "id": "pwa", "label": "PWA" }],
+          "allow_multiple": false
+        }
+      ]
+    },
+    {
+      "cursor": 14,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:08Z",
+      "type": "question.resolved",
+      "request_id": "question_fixture",
+      "answers": [
+        {
+          "question_id": "target",
+          "selected_option_ids": ["pwa"]
+        }
+      ]
+    },
+    {
+      "cursor": 15,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:08Z",
+      "type": "thread.commands_updated",
+      "commands": [{ "name": "review", "description": "Review changes" }]
+    },
+    {
+      "cursor": 16,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:08Z",
+      "type": "thread.todos_updated",
+      "todos": [{ "id": "todo_fixture", "content": "Wire UI", "status": "in_progress" }]
+    },
+    {
+      "cursor": 17,
+      "scope": { "thread": "th_fixture" },
+      "ts": "2026-08-01T12:00:09Z",
+      "type": "turn.completed",
+      "turn": 7,
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "cached_input_tokens": 2,
+        "cost_usd": 0.001,
+        "context_window": 128000
+      },
+      "checkpoint_id": "cp_fixture"
+    }
+  ],
+  "expected": {
+    "cursor": 17,
+    "turn_running": false,
+    "thinking": false,
+    "pending_approvals": [],
+    "pending_questions": [],
+    "item_kinds": ["turn-status", "user", "thinking", "assistant", "tool", "questions"],
+    "turn_state": "completed",
+    "assistant_text": "Working now.",
+    "thinking_text": "first thought",
+    "thinking_complete": true,
+    "tool_status": "ok",
+    "tool_result": { "bytes_written": 3 },
+    "tool_output": "created src/app.ts\n",
+    "tool_output_omitted": false,
+    "question_resolution": "answered",
+    "command_names": ["review"],
+    "todo_statuses": ["in_progress"],
+    "turn_duration_ms": 9000,
+    "last_usage": {
+      "input_tokens": 10,
+      "output_tokens": 4,
+      "cached_input_tokens": 2,
+      "cost_usd": 0.001,
+      "context_window": 128000
+    }
+  }
+}

@@ -89,6 +89,103 @@ fn init_repo(dir: &Path) {
     run(&["commit", "-m", "init"]);
 }
 
+#[tokio::test]
+async fn session_diff_manifest_and_selected_file_patch_are_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::create_dir(repo.join("docs")).unwrap();
+    std::fs::write(repo.join("docs/setup guide.md"), "old guide\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "docs/setup guide.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "add guide"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = session["id"].as_str().unwrap();
+    let worktree = Path::new(session["worktree_path"].as_str().unwrap());
+    std::fs::write(
+        worktree.join("docs/setup guide.md"),
+        "new guide\nextra line\n",
+    )
+    .unwrap();
+
+    let summary: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/summary"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary["files"][0]["path"], "docs/setup guide.md");
+    assert_eq!(summary["additions"], 2);
+    assert_eq!(summary["deletions"], 1);
+
+    let selected: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "docs/setup guide.md")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(selected["path"], "docs/setup guide.md");
+    assert!(selected["diff"].as_str().unwrap().contains("+extra line"));
+
+    let invalid = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "../README.md")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
 async fn wait_for_event(
     client: &reqwest::Client,
     url: &str,
@@ -282,11 +379,13 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     let worktree = session["worktree_path"].as_str().unwrap().to_string();
+    let branch = session["branch"].as_str().unwrap();
+    let short_id = branch.strip_prefix("trouve/").unwrap();
+    assert_eq!(short_id.len(), 6);
     assert!(
-        session["branch"]
-            .as_str()
-            .unwrap()
-            .starts_with("trouve/test-session")
+        short_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
     );
     assert!(Path::new(&worktree).join("README.md").exists());
 
@@ -357,7 +456,16 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         completed["checkpoint_id"].is_string(),
         "mutating turn must checkpoint"
     );
+    let checkpoint_id = completed["checkpoint_id"].as_str().unwrap().to_string();
     assert_eq!(completed["usage"]["input_tokens"], 30);
+    assert_eq!(completed["usage"]["context_input_tokens"], 20);
+    let live_usage = events
+        .iter()
+        .filter(|event| event["type"] == "turn.usage_updated")
+        .collect::<Vec<_>>();
+    assert_eq!(live_usage.len(), 2);
+    assert_eq!(live_usage[0]["usage"]["context_input_tokens"], 10);
+    assert_eq!(live_usage[1]["usage"]["context_input_tokens"], 20);
     assert!(
         events
             .iter()
@@ -393,14 +501,25 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
             .iter()
             .any(|item| item["kind"] == "assistant" && item["content"] == "Writing the file.")
     );
+    let folded_tool = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        .expect("completed tool call in folded view");
     assert!(
-        view["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        folded_tool["duration_ms"].is_u64(),
+        "folded tool calls retain server-measured execution time"
     );
     assert_eq!(view["turn_running"], false);
+    assert_eq!(view["last_usage"]["context_input_tokens"], 20);
+    let folded_turn = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "turn_status" && item["turn"] == 1)
+        .expect("completed turn in folded view");
+    assert_eq!(folded_turn["state"]["checkpoint_id"], checkpoint_id);
     let total_items = view["total_items"].as_u64().unwrap();
     assert!(total_items > 1);
     let tail: serde_json::Value = client
@@ -458,6 +577,54 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     })
     .await;
     assert!(tail.iter().all(|e| e["cursor"].as_u64().unwrap() > mid));
+
+    // A checkpoint fork starts a distinct session/worktree at the exact
+    // post-turn tree and carries the source thread's effective settings.
+    let fork: serde_json::Value = client
+        .post(format!("{base}/checkpoints/{checkpoint_id}/fork"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_session_id = fork["session"]["id"].as_str().unwrap();
+    let fork_worktree = fork["session"]["worktree_path"].as_str().unwrap();
+    assert_ne!(fork_session_id, session["id"]);
+    assert_eq!(fork["thread"]["session_id"], fork_session_id);
+    assert_eq!(fork["thread"]["model"], thread["model"]);
+    assert_eq!(fork["thread"]["model_options"], thread["model_options"]);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(fork_worktree).join("hello.txt")).unwrap(),
+        "hi\n"
+    );
+    let resp = client
+        .delete(format!("{base}/sessions/{fork_session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // An exact restore also resets uncheckpointed terminal/editor drift when
+    // the checkpoint is already the undo stack's current position.
+    std::fs::write(Path::new(&worktree).join("hello.txt"), "drift\n").unwrap();
+    let resp = client
+        .post(format!("{base}/checkpoints/{checkpoint_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&worktree).join("hello.txt")).unwrap(),
+        "hi\n"
+    );
+    let restored = wait_for_event(
+        &client,
+        &format!("{base}/sessions/{}/events", session["id"].as_str().unwrap()),
+        |event| event["type"] == "checkpoint.restored" && event["checkpoint_id"] == checkpoint_id,
+    )
+    .await;
+    assert_eq!(restored.last().unwrap()["direction"], "exact");
 
     // Undo restores the pre-turn state.
     let session_id = session["id"].as_str().unwrap();
@@ -778,6 +945,29 @@ async fn compaction_summarizes_transcript_near_context_window() {
         .find(|e| e["type"] == "thread.compaction_completed")
         .expect("compaction completes");
     assert!(completed["messages_compacted"].as_u64().unwrap() >= 2);
+
+    // The folded transcript retains the boundary after completion instead
+    // of reducing it to the snapshot's transient `compacting` flag.
+    let view: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let marker = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "compaction")
+        .expect("completed compaction remains in the folded transcript");
+    assert_eq!(marker["turn"], 2);
+    assert_eq!(marker["state"]["state"], "completed");
+    assert_eq!(
+        marker["state"]["messages_compacted"],
+        completed["messages_compacted"]
+    );
 }
 
 #[tokio::test]
@@ -850,6 +1040,22 @@ async fn session_and_thread_updates_and_provider_config() {
     let session_id = session["id"].as_str().unwrap();
     assert_eq!(session["archived"], false);
 
+    // The web/PWA bootstrap projection is an atomic snapshot paired with a
+    // resume cursor after its transactionally emitted replacement event.
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let summary = &summaries["summaries"][0];
+    assert_eq!(summary["session_id"], session_id);
+    assert_eq!(summary["workspace_id"], ws_id);
+    assert_eq!(summary["archived"], false);
+    assert!(summaries["cursor"].as_u64().unwrap() > summary["latest_cursor"].as_u64().unwrap());
+
     // Rename + archive via PATCH.
     let updated: serde_json::Value = client
         .patch(format!("{base}/sessions/{session_id}"))
@@ -862,6 +1068,15 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     assert_eq!(updated["title"], "Renamed");
     assert_eq!(updated["archived"], true);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summaries["summaries"][0]["archived"], true);
 
     // Thread creation succeeds even with an unconfigured model (validation
     // is deferred to send time), then PATCH switches mode/model.
@@ -1054,6 +1269,24 @@ async fn session_and_thread_updates_and_provider_config() {
             .iter()
             .any(|p| p["id"] == "openrouter")
     );
+
+    // Deletion commits its relational cleanup and durable summary tombstone
+    // together, so a following bootstrap cannot resurrect the session.
+    let response = client
+        .delete(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(summaries["summaries"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1570,6 +1803,243 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
     }
 }
 
+/// Holds a vendor turn open until its native steering method is called, then
+/// completes. This exercises the real HTTP endpoint, engine turn registry,
+/// backend capability, durable event ordering, and folded thread view.
+struct SteerableBackend {
+    steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl SteerableBackend {
+    fn new() -> Self {
+        Self {
+            steers: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for SteerableBackend {
+    fn id(&self) -> &str {
+        "steerable-agent"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "steerable-agent/model".into(),
+            display_name: "Steerable Agent".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(
+        &self,
+        steer: trouve_agents::BackendSteer,
+    ) -> Result<(), trouve_agents::BackendError> {
+        self.steers.lock().unwrap().push((
+            steer.session,
+            steer.prompt,
+            steer
+                .attachments
+                .into_iter()
+                .map(|attachment| attachment.path.display().to_string())
+                .collect(),
+        ));
+        let release =
+            self.release.lock().await.take().ok_or_else(|| {
+                trouve_agents::BackendError::Protocol("no active fake turn".into())
+            })?;
+        let _ = release.send(());
+        Ok(())
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        _turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.release.lock().await = Some(release_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            use trouve_agents::BackendEvent as E;
+            let _ = tx
+                .send(Ok(E::SessionStarted {
+                    session_id: "steerable-vendor-session".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(E::ThinkingDelta("Initial direction.".into())))
+                .await;
+            if release_rx.await.is_err() {
+                return;
+            }
+            let _ = tx.send(Ok(E::ThinkingCompleted)).await;
+            let _ = tx.send(Ok(E::TextDelta("Steering applied.".into()))).await;
+            let _ = tx
+                .send(Ok(E::Completed {
+                    usage: Usage::default(),
+                }))
+                .await;
+        });
+        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+            rx.poll_recv(cx)
+        })))
+    }
+}
+
+#[tokio::test]
+async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(SteerableBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("steerable-agent", backend.clone())
+            .with_default_model("steerable-agent/model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin the implementation."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking"
+    })
+    .await;
+    assert!(
+        before
+            .iter()
+            .any(|event| { event["type"] == "turn.started" && event["supports_steering"] == true })
+    );
+
+    let steered = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({
+            "content": "Prioritize the layout regression.",
+            "attachments": [{
+                "name": "reference.png",
+                "mime": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    let thinking_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.thinking")
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let response_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.delta")
+        .unwrap();
+    assert!(thinking_index < steering_index && steering_index < response_index);
+    let steering = &events[steering_index];
+    assert_eq!(steering["content"], "Prioritize the layout regression.");
+    assert_eq!(steering["attachments"][0]["name"], "reference.png");
+
+    let view: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["turn_steerable"]["1"], true);
+    assert!(view["items"].as_array().unwrap().iter().any(|item| {
+        item["kind"] == "steered" && item["content"] == "Prioritize the layout regression."
+    }));
+
+    let received = backend.steers.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0, "steerable-vendor-session");
+    assert_eq!(received[0].1, "Prioritize the layout regression.");
+    assert_eq!(received[0].2.len(), 1);
+    assert!(Path::new(&received[0].2[0]).exists());
+}
+
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
 /// writes a file to the worktree when approved, and completes with usage.
 /// Records the vendor session id it was resumed with, per turn.
@@ -1636,6 +2106,20 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
                     }))
                     .await;
             }
+            let _ = tx.send(Ok(E::CompactionStarted)).await;
+            let _ = tx.send(Ok(E::CompactionCompleted)).await;
+            let _ = tx
+                .send(Ok(E::UsageUpdated {
+                    usage: Usage {
+                        input_tokens: 12,
+                        output_tokens: 3,
+                        cached_input_tokens: 28,
+                        context_input_tokens: Some(40),
+                        context_window: Some(100_000),
+                        ..Default::default()
+                    },
+                }))
+                .await;
             let _ = tx.send(Ok(E::TextDelta("Working on it. ".into()))).await;
             let (ok_tx, ok_rx) = tokio::sync::oneshot::channel();
             let _ = tx
@@ -1671,6 +2155,8 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
                     usage: Usage {
                         input_tokens: 40,
                         output_tokens: 9,
+                        context_input_tokens: Some(40),
+                        context_window: Some(100_000),
                         ..Default::default()
                     },
                 }))
@@ -1799,6 +2285,18 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         "backend turn must checkpoint"
     );
     assert_eq!(completed["usage"]["input_tokens"], 40);
+    assert_eq!(completed["usage"]["context_input_tokens"], 40);
+    assert!(events.iter().any(|e| e["type"] == "turn.usage_updated"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "thread.compaction_started")
+    );
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "thread.compaction_completed" && e["messages_compacted"] == 0
+        })
+    );
     assert!(
         events
             .iter()
@@ -2121,6 +2619,196 @@ async fn prompt_submitted_during_cancellation_starts_next_turn() {
 }
 
 #[tokio::test]
+async fn selected_queued_prompt_interrupts_the_active_turn_and_runs_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("gated", Arc::new(GatedProvider { gate: gate.clone() }))
+            .with_default_model("gated/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Priority queue"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    for content in ["interrupt me", "ordinary follow-up", "send this now"] {
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue.len(), 2);
+    let selected_id = queue[1]["id"].as_str().unwrap();
+
+    let accepted: serde_json::Value = client
+        .post(format!("{base}/queue/{selected_id}/dispatch"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["thread_id"], thread_id);
+    assert_eq!(accepted["turn"], 0);
+    assert_eq!(accepted["queued"], true);
+
+    // The interrupted stream consumes no permit. The selected prompt gets
+    // the first one, then normal queue draining resumes with the older item.
+    gate.add_permits(2);
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.completed" && event["turn"] == 3,
+        ),
+    )
+    .await
+    .expect("selected queued prompt never ran after interrupting the active turn");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "turn.cancelled" && event["turn"] == 1)
+    );
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "user.message")
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        user_messages,
+        ["interrupt me", "send this now", "ordinary follow-up"]
+    );
+
+    // The same prompt-specific endpoint also starts an explicitly paused
+    // idle queue without relying on a separate reorder request.
+    for content in [
+        "pause again",
+        "older paused prompt",
+        "selected paused prompt",
+    ] {
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let response = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.cancelled" && event["turn"] == 4,
+        ),
+    )
+    .await
+    .expect("second turn never reached its cancelled state");
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let selected_id = queue[1]["id"].as_str().unwrap();
+    let accepted: serde_json::Value = client
+        .post(format!("{base}/queue/{selected_id}/dispatch"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["turn"], 5);
+    assert_eq!(accepted["queued"], false);
+
+    gate.add_permits(2);
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.completed" && event["turn"] == 6,
+        ),
+    )
+    .await
+    .expect("selected prompt never started from the paused idle queue");
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "user.message")
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        user_messages,
+        [
+            "interrupt me",
+            "send this now",
+            "ordinary follow-up",
+            "pause again",
+            "selected paused prompt",
+            "older paused prompt",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn queued_prompts_crud_and_in_order_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -2194,7 +2882,22 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     let first = send("one").await;
     assert_eq!(first["turn"], 1);
     assert_eq!(first["queued"], false);
-    let second = send("two").await;
+    let second: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({
+            "content": "two",
+            "attachments": [{
+                "name": "before.png",
+                "mime": "image/png",
+                "data": "YmVmb3Jl"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(second["queued"], true);
     assert_eq!(second["turn"], 0);
     send("three").await;
@@ -2222,17 +2925,56 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     assert_eq!(queue.len(), 2);
     assert_eq!(queue[0]["content"], "two");
     assert_eq!(queue[1]["content"], "three");
+    assert_eq!(queue[0]["attachments"][0]["name"], "before.png");
     let id_two = queue[0]["id"].as_str().unwrap().to_string();
     let id_three = queue[1]["id"].as_str().unwrap().to_string();
 
-    // Edit a queued prompt.
+    // Old clients send only content; omitted attachment fields preserve the
+    // prompt's stored files.
     let resp = client
         .patch(format!("{base}/queue/{id_two}"))
-        .json(&serde_json::json!({"content": "two v2"}))
+        .json(&serde_json::json!({"content": "two v1"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"][0]["name"], "before.png");
+
+    // New clients can remove retained files and append fresh uploads in the
+    // same edit without re-uploading attachments that remain selected.
+    let resp = client
+        .patch(format!("{base}/queue/{id_two}"))
+        .json(&serde_json::json!({
+            "content": "two v2",
+            "retained_attachment_ids": [],
+            "attachments": [{
+                "name": "after.png",
+                "mime": "image/png",
+                "data": "YWZ0ZXI="
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(queue[0]["attachments"][0]["name"], "after.png");
 
     // Reorder: "three" now runs before "two v2". A stale id set conflicts.
     let resp = client
@@ -2939,6 +3681,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "prompt": "run",
             "workspace_id": workspace["id"],
             "permission_mode": "yolo",
+            "thinking_level": "high",
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -2949,6 +3692,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .await
         .unwrap();
     assert_eq!(automation["permission_mode"], "yolo");
+    assert_eq!(automation["thinking_level"], "high");
     let automation_id = automation["id"].as_str().unwrap();
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
@@ -2998,6 +3742,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["permission_mode"], "yolo");
+    assert_eq!(threads[0]["model_options"]["thinking_level"], "high");
 }
 
 /// Session naming settings persist through the protocol, and missing model
@@ -3032,6 +3777,7 @@ async fn session_title_settings_and_fallback() {
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], false);
     assert_eq!(settings["title_model_load_behavior"], "auto");
     assert_eq!(settings["title_model_resource_policy"], "cpu_ram_only");
     assert_eq!(settings["title_model"]["state"], "not_installed");
@@ -3039,6 +3785,7 @@ async fn session_title_settings_and_fallback() {
     let response = client
         .put(format!("{base}/config/git-worktrees"))
         .json(&serde_json::json!({
+            "derive_branch_name_from_session_title": true,
             "title_model_load_behavior": "off",
             "title_model_resource_policy": "gpu_cpu_ram"
         }))
@@ -3051,8 +3798,25 @@ async fn session_title_settings_and_fallback() {
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], true);
     assert_eq!(settings["title_model_load_behavior"], "off");
     assert_eq!(settings["title_model_resource_policy"], "gpu_cpu_ram");
+
+    // Requests from clients predating the additive branch-naming option must
+    // preserve an explicit opt-in rather than resetting it to the default.
+    let settings: serde_json::Value = client
+        .put(format!("{base}/config/git-worktrees"))
+        .json(&serde_json::json!({
+            "title_model_load_behavior": "off",
+            "title_model_resource_policy": "gpu_cpu_ram"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], true);
     let response = client
         .delete(format!("{base}/config/git-worktrees/title-model/install"))
         .send()
@@ -3068,6 +3832,11 @@ async fn session_title_settings_and_fallback() {
         std::fs::read_to_string(&config_file)
             .unwrap()
             .contains("title_model_resource_policy = \"gpu_cpu_ram\"")
+    );
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("derive_branch_name_from_session_title = true")
     );
     assert!(
         engine
@@ -4602,4 +5371,47 @@ async fn provider_login_callback_endpoint_validates_requests() {
         .await
         .unwrap();
     assert_eq!(absent.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_projection_returns_cached_state_with_a_resume_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let expected_cursor = store
+        .append_event(
+            trouve_protocol::Scope::Server,
+            trouve_protocol::Event::GithubPullRequestsUpdated {
+                pull_requests: trouve_protocol::GithubPrList {
+                    viewer: "octocat".into(),
+                    host: "github.com".into(),
+                    prs: Vec::new(),
+                },
+            },
+        )
+        .unwrap()
+        .cursor;
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let response = reqwest::get(format!("http://{addr}/v1/server-projection"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(trouve_protocol::EVENT_CURSOR_HEADER)
+            .unwrap(),
+        expected_cursor.to_string().as_str()
+    );
+    let projection: trouve_protocol::ServerProjection = response.json().await.unwrap();
+    assert_eq!(projection.github_pull_requests.len(), 1);
+    assert_eq!(projection.github_pull_requests[0].cursor, expected_cursor);
+    assert!(projection.session_pull_requests.is_empty());
 }

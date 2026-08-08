@@ -1,6 +1,6 @@
 # 0017 — Server-owned session title model with heuristic fallback
 
-Status: Accepted (2026-07)
+Status: Superseded by 0029
 
 ## Context
 

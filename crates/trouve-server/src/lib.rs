@@ -26,20 +26,22 @@ use trouve_protocol::{
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
-    EVENT_CURSOR_HEADER, ErrorBody, FileContent, GenerateSessionTitleRequest,
-    GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus, GithubIntegration, GithubPrList,
-    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
-    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
+    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
+    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo, ProviderInfo,
+    ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
+    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, ThreadViewQuery, ThreadViewSnapshot,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SteerAccepted, SteerTurnRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -94,25 +96,31 @@ impl IntoResponse for ApiError {
         list_workspaces,
         close_workspace,
         workspace_branches,
+        server_projection,
         refresh_github_prs,
         generate_session_title,
         create_session,
         list_sessions,
+        session_summaries,
         get_session,
         update_session,
         delete_session,
         undo_session,
         redo_session,
+        restore_checkpoint,
+        fork_checkpoint,
         create_thread,
         list_threads,
         get_thread,
         get_thread_view,
         update_thread,
         send_message,
+        steer_turn,
         get_attachment,
         list_queue,
         reorder_queue,
         dispatch_queue,
+        dispatch_queued_prompt,
         update_queued_prompt,
         delete_queued_prompt,
         cancel_turn,
@@ -156,6 +164,8 @@ impl IntoResponse for ApiError {
         session_usage,
         session_mcp_servers,
         session_diff,
+        session_diff_summary,
+        session_file_diff,
         session_files,
         session_paths,
         session_file,
@@ -170,6 +180,9 @@ impl IntoResponse for ApiError {
         create_session_pr,
         merge_session_pr,
         list_session_prs,
+        get_session_pr_detail,
+        get_session_pr_file_diff,
+        act_on_session_pr,
         get_github_integration,
         add_github_host,
         remove_github_host,
@@ -207,6 +220,14 @@ impl IntoResponse for ApiError {
         BranchList,
         CreateSessionRequest,
         Session,
+        ForkCheckpointResponse,
+        SessionSummariesSnapshot,
+        ServerProjection,
+        trouve_protocol::GithubPrHostProjection,
+        trouve_protocol::SessionPrProjection,
+        trouve_protocol::SessionSummary,
+        trouve_protocol::SessionAttention,
+        trouve_protocol::SessionOutcome,
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
@@ -217,6 +238,8 @@ impl IntoResponse for ApiError {
         trouve_protocol::ThreadTurnState,
         UpdateThreadRequest,
         SendMessageRequest,
+        SteerTurnRequest,
+        SteerAccepted,
         TurnAccepted,
         QueuedPrompt,
         UpdateQueuedPromptRequest,
@@ -255,6 +278,9 @@ impl IntoResponse for ApiError {
         GeneratedSessionTitle,
         UsageSummary,
         SessionDiff,
+        SessionDiffFileSummary,
+        SessionDiffSummary,
+        SessionFileDiff,
         DirEntry,
         FileContent,
         OpenTerminalRequest,
@@ -262,6 +288,28 @@ impl IntoResponse for ApiError {
         TerminalInputRequest,
         TerminalResizeRequest,
         PrInfo,
+        PrDetail,
+        PrDetailSection,
+        PrFileDiff,
+        PrActionRequest,
+        trouve_protocol::PrActor,
+        trouve_protocol::PrAutoMerge,
+        trouve_protocol::PrCapabilities,
+        trouve_protocol::PrComment,
+        trouve_protocol::PrCommentKind,
+        trouve_protocol::PrCommit,
+        trouve_protocol::PrFile,
+        trouve_protocol::PrLabel,
+        trouve_protocol::PrMergeQueueEntry,
+        trouve_protocol::PrMergeQueueStatus,
+        trouve_protocol::PrMilestone,
+        trouve_protocol::PrReactionSummary,
+        trouve_protocol::PrReview,
+        trouve_protocol::PrReviewDetail,
+        trouve_protocol::PrReviewThread,
+        trouve_protocol::PrStack,
+        trouve_protocol::PrStackEntry,
+        trouve_protocol::CheckRun,
         trouve_protocol::FirstPartyCodeReview,
         GithubPrList,
         CreatePrRequest,
@@ -470,9 +518,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::delete(close_workspace),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
+        .route("/v1/server-projection", get(server_projection))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/session-title", post(generate_session_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
+        .route("/v1/session-summaries", get(session_summaries))
         .route(
             "/v1/sessions/{id}",
             get(get_session)
@@ -481,10 +531,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/undo", post(undo_session))
         .route("/v1/sessions/{id}/redo", post(redo_session))
+        .route("/v1/checkpoints/{id}/restore", post(restore_checkpoint))
+        .route("/v1/checkpoints/{id}/fork", post(fork_checkpoint))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/usage", get(session_usage))
         .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
         .route("/v1/sessions/{id}/diff", get(session_diff))
+        .route("/v1/sessions/{id}/diff/summary", get(session_diff_summary))
+        .route("/v1/sessions/{id}/diff/file", get(session_file_diff))
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/paths", get(session_paths))
         .route("/v1/sessions/{id}/file", get(session_file))
@@ -503,6 +557,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/pr/merge", post(merge_session_pr))
         .route("/v1/sessions/{id}/prs", get(list_session_prs))
+        .route("/v1/sessions/{id}/prs/{number}", get(get_session_pr_detail))
+        .route(
+            "/v1/sessions/{id}/prs/{number}/file",
+            get(get_session_pr_file_diff),
+        )
+        .route(
+            "/v1/sessions/{id}/prs/{number}/actions",
+            post(act_on_session_pr),
+        )
         .route("/v1/integrations/github", get(get_github_integration))
         .route("/v1/integrations/github/hosts", post(add_github_host))
         .route(
@@ -637,9 +700,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/view", get(get_thread_view))
         .route("/v1/threads/{id}/messages", post(send_message))
+        .route("/v1/threads/{id}/steer", post(steer_turn))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route("/v1/queue/{id}/dispatch", post(dispatch_queued_prompt))
         .route("/v1/threads/{id}/cancel", post(cancel_turn))
         .route(
             "/v1/queue/{id}",
@@ -999,12 +1064,30 @@ async fn workspace_branches(
     Ok(Json(engine.workspace_branches(&id).await?))
 }
 
+#[utoipa::path(get, path = "/v1/server-projection",
+    responses(
+        (status = 200, body = ServerProjection,
+            headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot"))),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn server_projection(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, projection) = engine.server_projection_snapshot()?;
+    Ok((
+        [(EVENT_CURSOR_HEADER, cursor.to_string())],
+        Json(projection),
+    ))
+}
+
 #[utoipa::path(post, path = "/v1/github/prs/refresh",
+    params(("force" = Option<bool>, Query, description = "Bypass the automatic-refresh freshness window for an explicit user refresh")),
     responses((status = 204), (status = 400, body = ErrorBody)))]
 async fn refresh_github_prs(
     State(engine): State<Arc<Engine>>,
+    Query(query): Query<RefreshGithubPrsQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.refresh_github_prs().await?;
+    engine.refresh_github_prs(query.force).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1039,6 +1122,17 @@ async fn list_sessions(
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<Vec<Session>>, ApiError> {
     Ok(Json(engine.list_sessions(q.workspace_id.as_deref())?))
+}
+
+#[utoipa::path(get, path = "/v1/session-summaries",
+    responses(
+        (status = 200, body = SessionSummariesSnapshot),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn session_summaries(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<SessionSummariesSnapshot>, ApiError> {
+    Ok(Json(engine.session_summaries_snapshot()?))
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}", params(("id" = String, Path,)),
@@ -1089,6 +1183,26 @@ async fn redo_session(
 ) -> Result<StatusCode, ApiError> {
     engine.redo(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/restore", params(("id" = String, Path,)),
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn restore_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.restore_checkpoint_by_id(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/fork", params(("id" = String, Path,)),
+    responses((status = 200, body = ForkCheckpointResponse), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn fork_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<ForkCheckpointResponse>, ApiError> {
+    Ok(Json(engine.fork_checkpoint(&id).await?))
 }
 
 #[utoipa::path(post, path = "/v1/threads", request_body = CreateThreadRequest,
@@ -1182,6 +1296,21 @@ async fn send_message(
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
+#[utoipa::path(post, path = "/v1/threads/{id}/steer",
+    params(("id" = String, Path,)), request_body = SteerTurnRequest,
+    responses((status = 202, body = SteerAccepted),
+              (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn steer_turn(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<SteerTurnRequest>,
+) -> Result<(StatusCode, Json<SteerAccepted>), ApiError> {
+    let accepted = engine.steer_turn(&id, req.content, req.attachments).await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
 /// Raw bytes of a stored prompt attachment, with its uploaded MIME type.
 #[utoipa::path(get, path = "/v1/attachments/{id}", params(("id" = String, Path,)),
     responses((status = 200, body = String), (status = 404, body = ErrorBody)))]
@@ -1249,6 +1378,22 @@ async fn dispatch_queue(
     ))
 }
 
+/// Move one queued prompt to the front and dispatch it immediately. An
+/// active turn is interrupted; its terminal event is persisted before the
+/// selected prompt starts as the next turn.
+#[utoipa::path(post, path = "/v1/queue/{id}/dispatch", params(("id" = String, Path,)),
+    responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn dispatch_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(engine.dispatch_queued_prompt(&id)?),
+    ))
+}
+
 #[utoipa::path(post, path = "/v1/threads/{id}/cancel", params(("id" = String, Path,)),
     responses((status = 204), (status = 400, body = ErrorBody)))]
 async fn cancel_turn(
@@ -1267,7 +1412,7 @@ async fn update_queued_prompt(
     Path(id): Path<String>,
     Json(req): Json<UpdateQueuedPromptRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.update_queued_prompt(&id, &req.content)?;
+    engine.update_queued_prompt(&id, req)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1637,6 +1782,7 @@ async fn set_git_worktree_settings(
         .set_git_worktree_settings(
             req.title_model_load_behavior,
             req.title_model_resource_policy,
+            req.derive_branch_name_from_session_title,
         )
         .await?;
     let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
@@ -1742,6 +1888,39 @@ async fn session_diff(
     Ok(Json(SessionDiff {
         diff: engine.session_diff(&id).await?,
     }))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/diff/summary",
+    params(("id" = String, Path,)),
+    responses(
+        (status = 200, body = SessionDiffSummary),
+        (status = 404, body = ErrorBody),
+        (status = 413, body = ErrorBody),
+    ))]
+async fn session_diff_summary(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionDiffSummary>, ApiError> {
+    Ok(Json(engine.session_diff_summary(&id).await?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/diff/file",
+    params(
+        ("id" = String, Path,),
+        ("path" = String, Query, description = "Changed worktree-relative path"),
+    ),
+    responses(
+        (status = 200, body = SessionFileDiff),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 413, body = ErrorBody),
+    ))]
+async fn session_file_diff(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<SessionFileDiff>, ApiError> {
+    Ok(Json(engine.session_file_diff(&id, &q.path).await?))
 }
 
 #[derive(Deserialize)]
@@ -1962,6 +2141,76 @@ async fn list_session_prs(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<PrInfo>>, ApiError> {
     Ok(Json(engine.session_prs(&id).await?))
+}
+
+#[derive(Deserialize)]
+struct PrDetailQuery {
+    section: Option<PrDetailSection>,
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/prs/{number}",
+    params(
+        ("id" = String, Path,),
+        ("number" = u64, Path,),
+        ("section" = Option<PrDetailSection>, Query, description = "Optional lazy PR-page section; omitted loads every section for older clients")
+    ),
+    responses(
+        (status = 200, body = PrDetail),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_session_pr_detail(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Query(query): Query<PrDetailQuery>,
+) -> Result<Json<PrDetail>, ApiError> {
+    Ok(Json(
+        engine.session_pr_detail(&id, number, query.section).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PrFileQuery {
+    path: String,
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/prs/{number}/file",
+    params(
+        ("id" = String, Path,),
+        ("number" = u64, Path,),
+        ("path" = String, Query, description = "Exact changed-file path returned by PrDetail")
+    ),
+    responses(
+        (status = 200, body = PrFileDiff),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_session_pr_file_diff(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Query(query): Query<PrFileQuery>,
+) -> Result<Json<PrFileDiff>, ApiError> {
+    Ok(Json(
+        engine
+            .session_pr_file_diff(&id, number, &query.path)
+            .await?,
+    ))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/prs/{number}/actions",
+    params(("id" = String, Path,), ("number" = u64, Path,)),
+    request_body = PrActionRequest,
+    responses(
+        (status = 200, body = PrDetail),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn act_on_session_pr(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Json(action): Json<PrActionRequest>,
+) -> Result<Json<PrDetail>, ApiError> {
+    Ok(Json(engine.act_on_session_pr(&id, number, &action).await?))
 }
 
 #[derive(Deserialize)]

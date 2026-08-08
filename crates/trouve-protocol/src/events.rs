@@ -32,6 +32,65 @@ pub struct EventEnvelope {
     pub event: Event,
 }
 
+/// Aggregate user attention required anywhere in a session. This projection
+/// prevents clients from retaining every background thread history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAttention {
+    None,
+    Approval,
+    Question,
+    Both,
+}
+
+/// Aggregate execution outcome for the session inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// A fresh session-level notification edge derived from a durable thread
+/// event. Clients apply their own notification preferences and foreground
+/// suppression; this type only preserves the native event category without
+/// requiring one background SSE follower per thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNotificationKind {
+    TurnCompleted,
+    TurnFailed,
+    ApprovalRequested,
+    QuestionRequested,
+}
+
+/// Durable server projection used by desktop and PWA session lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub archived: bool,
+    pub active: bool,
+    pub attention: SessionAttention,
+    pub outcome: SessionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_thread_id: Option<ThreadId>,
+    /// Cursor of the durable source event that produced this state.
+    pub latest_cursor: u64,
+    /// Timestamp of that source event.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Atomic session-summary snapshot plus the server-scope cursor after which a
+/// client resumes the existing durable event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionSummariesSnapshot {
+    pub summaries: Vec<SessionSummary>,
+    pub cursor: u64,
+}
+
 /// Permission decision for an approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -88,11 +147,20 @@ pub struct CommandInfo {
 /// Token/cost usage for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
+    /// Non-cached input tokens. This counter is mutually exclusive with
+    /// `cached_input_tokens`, even when the upstream provider reports an
+    /// inclusive input total.
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cached/read tokens where the provider reports them.
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Provider-authoritative model-visible tokens for the most recent
+    /// request. Unlike the aggregate turn counters above, this is the current
+    /// context-size measurement used for context-window presentation and
+    /// compaction decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_input_tokens: Option<u64>,
     /// Estimated cost in USD, when list pricing for the model is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
@@ -131,7 +199,20 @@ pub enum Event {
         turn: u64,
         mode: String,
         model: String,
+        /// Effective provider-native thinking/reasoning selection for this
+        /// turn after inherited defaults and model schema normalization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_level: Option<String>,
+        /// Whether the backend running this exact turn accepts additional
+        /// user input without cancelling or starting another turn.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_steering: bool,
     },
+    /// Live usage from the most recently completed model request in a running
+    /// turn. This replaces the thread's context-usage snapshot without
+    /// completing the turn; `turn.completed` still carries final aggregates.
+    #[serde(rename = "turn.usage_updated")]
+    TurnUsageUpdated { turn: u64, usage: Usage },
     #[serde(rename = "turn.completed")]
     TurnCompleted {
         turn: u64,
@@ -155,6 +236,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
     },
+    /// Additional user input accepted by the backend while `turn` was still
+    /// running. This belongs on the active turn's timeline and does not start
+    /// or queue another turn.
+    #[serde(rename = "turn.steered")]
+    TurnSteered {
+        turn: u64,
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
+    },
     /// Streamed model output. Replaying all deltas of a turn reproduces the
     /// final message exactly.
     #[serde(rename = "assistant.delta")]
@@ -163,6 +254,11 @@ pub enum Event {
     /// exposes it. Display-only: never part of the provider transcript.
     #[serde(rename = "assistant.thinking")]
     AssistantThinking { turn: u64, text: String },
+    /// The provider explicitly closed the current streamed thinking item.
+    /// This boundary can arrive before the next visible assistant or tool
+    /// event, so clients must not infer it from subsequent output alone.
+    #[serde(rename = "assistant.thinking_completed")]
+    AssistantThinkingCompleted { turn: u64 },
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },
@@ -234,9 +330,15 @@ pub enum Event {
     #[serde(rename = "thread.compaction_completed")]
     CompactionCompleted {
         turn: u64,
-        /// Provider-transcript messages folded into the summary.
+        /// Provider-transcript messages folded into the summary. Zero means
+        /// an external harness reported the boundary without a message count.
         messages_compacted: u64,
     },
+    /// A provider-owned compaction item terminated unsuccessfully. This is a
+    /// distinct terminal edge so clients can clear their busy state even when
+    /// the vendor turn continues producing ordinary output.
+    #[serde(rename = "thread.compaction_failed")]
+    CompactionFailed { turn: u64 },
 
     // --- session scope ----------------------------------------------------
     #[serde(rename = "checkpoint.created")]
@@ -349,6 +451,35 @@ pub enum Event {
         workspace_id: WorkspaceId,
         active: bool,
     },
+    /// The server restarted while this session still had process-owned turn
+    /// state. Clients clear running/approval/question UI from the replacement
+    /// summary; those responders cannot survive the process that owned them.
+    #[serde(rename = "session.recovered")]
+    SessionRecovered {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    },
+    /// Transactionally derived aggregate state. `summary: null` is the
+    /// durable tombstone for a deleted session.
+    #[serde(rename = "session.summary_updated")]
+    SessionSummaryUpdated {
+        session_id: SessionId,
+        #[serde(default)]
+        #[schema(required = true, nullable = true)]
+        summary: Option<SessionSummary>,
+    },
+    /// Compact durable edge for notifications about inactive/background
+    /// threads. It is appended transactionally after the replacement session
+    /// summary produced by the same source event.
+    #[serde(rename = "session.notification")]
+    SessionNotification {
+        session_id: SessionId,
+        thread_id: ThreadId,
+        kind: SessionNotificationKind,
+        /// Optional native-equivalent failure excerpt or question subtitle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// A scheduled automation ran (or failed to). Clients refetch the
     /// automations list — and the sessions list when it succeeded, since a
     /// run creates a session.
@@ -377,7 +508,7 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
-    /// The persisted Git & Worktrees settings or the session-title model's
+    /// The persisted session-naming settings or the session-title model's
     /// install/load state changed. Carries a full replacement snapshot so
     /// replay and reconnect reconstruct the settings UI exactly.
     #[serde(rename = "settings.git_worktrees_updated")]
@@ -395,6 +526,9 @@ pub enum Event {
 pub enum RestoreDirection {
     Undo,
     Redo,
+    /// Jump directly to a named checkpoint rather than taking a relative
+    /// undo-stack step.
+    Exact,
 }
 
 #[cfg(test)]
@@ -449,6 +583,32 @@ mod tests {
     }
 
     #[test]
+    fn session_summary_tombstone_serializes_explicit_null() {
+        let value = serde_json::to_value(Event::SessionSummaryUpdated {
+            session_id: "se_deleted".into(),
+            summary: None,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session.summary_updated");
+        assert!(value.get("summary").is_some());
+        assert!(value["summary"].is_null());
+    }
+
+    #[test]
+    fn session_notification_serializes_optional_detail() {
+        let value = serde_json::to_value(Event::SessionNotification {
+            session_id: "se_1".into(),
+            thread_id: "th_1".into(),
+            kind: SessionNotificationKind::TurnFailed,
+            detail: Some("provider unavailable".into()),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session.notification");
+        assert_eq!(value["kind"], "turn_failed");
+        assert_eq!(value["detail"], "provider unavailable");
+    }
+
+    #[test]
     fn github_pull_request_snapshot_roundtrips() {
         let event = Event::GithubPullRequestsUpdated {
             pull_requests: crate::GithubPrList {
@@ -473,6 +633,7 @@ mod tests {
     fn git_worktree_settings_event_uses_namespaced_tag() {
         let event = Event::GitWorktreeSettingsUpdated {
             settings: crate::GitWorktreeSettings {
+                derive_branch_name_from_session_title: false,
                 title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
                 title_model_resource_policy: crate::TitleModelResourcePolicy::CpuRamOnly,
                 title_model: crate::TitleModelStatus {
@@ -488,6 +649,10 @@ mod tests {
         };
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "settings.git_worktrees_updated");
+        assert_eq!(
+            value["settings"]["derive_branch_name_from_session_title"],
+            false
+        );
         assert_eq!(value["settings"]["title_model_load_behavior"], "off");
         assert_eq!(
             value["settings"]["title_model_resource_policy"],
@@ -541,11 +706,60 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "gpt-x".into(),
+                thinking_level: Some("high".into()),
+                supports_steering: true,
             },
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cursor, 42);
         assert_eq!(back.scope, Scope::Thread("th_1".into()));
+        assert!(matches!(
+            back.event,
+            Event::TurnStarted {
+                thinking_level: Some(level),
+                supports_steering: true,
+                ..
+            } if level == "high"
+        ));
+    }
+
+    #[test]
+    fn historical_turn_started_defaults_additive_turn_capabilities() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "turn.started",
+            "turn": 1,
+            "mode": "code",
+            "model": "gpt-x"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::TurnStarted {
+                thinking_level: None,
+                supports_steering: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn steered_event_omits_empty_attachments_and_roundtrips() {
+        let event = Event::TurnSteered {
+            turn: 9,
+            content: "Focus on the failing test.".into(),
+            attachments: Vec::new(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "turn.steered");
+        assert!(value.get("attachments").is_none());
+        assert!(matches!(
+            serde_json::from_value::<Event>(value).unwrap(),
+            Event::TurnSteered {
+                turn: 9,
+                content,
+                attachments,
+            } if content == "Focus on the failing test." && attachments.is_empty()
+        ));
     }
 }

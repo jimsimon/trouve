@@ -15,14 +15,20 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, ThreadViewSnapshot,
+    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
+    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadViewSnapshot,
     Workspace,
 };
 use trouve_thread_view::ThreadProjection;
 
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Version 2 retains server-measured per-tool execution durations. Treat the
+// projection as a rebuildable cache so existing databases are upgraded by
+// folding their durable event history again, without a storage migration.
+// v3 retains the checkpoint id on completed folded turns so cached histories
+// expose exact restore/fork actions after an upgrade.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -123,6 +129,27 @@ CREATE TABLE IF NOT EXISTS thread_view_cache (
   schema_version INTEGER NOT NULL,
   state TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_summaries (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 0,
+  last_outcome TEXT NOT NULL DEFAULT 'idle',
+  latest_thread_id TEXT,
+  latest_cursor INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS session_summaries_workspace
+  ON session_summaries (workspace_id, archived, updated_at, session_id);
+CREATE TABLE IF NOT EXISTS session_summary_attention (
+  kind TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  thread_id TEXT NOT NULL,
+  PRIMARY KEY (kind, item_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS session_summary_attention_session
+  ON session_summary_attention (session_id, kind);
 CREATE TABLE IF NOT EXISTS spawned_threads (
   child_thread_id TEXT PRIMARY KEY REFERENCES threads(id),
   parent_thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -135,6 +162,7 @@ CREATE TABLE IF NOT EXISTS automations (
   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
   mode TEXT,
   model TEXT,
+  thinking_level TEXT,
   permission_mode TEXT NOT NULL DEFAULT 'ask',
   schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -377,6 +405,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
+    "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
     "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
@@ -463,6 +492,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_code_review_collapse_pending(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    migrate_session_summary_projection(conn)?;
     Ok(())
 }
 
@@ -590,6 +620,486 @@ fn migrate_code_review_finding_publication_status(conn: &mut Connection) -> Resu
     Ok(())
 }
 
+struct SessionSummaryChange {
+    session_id: String,
+    summary: Option<SessionSummary>,
+    notification: Option<Event>,
+}
+
+/// Build the projection once for existing databases. Afterwards the sole
+/// event-writer transaction updates it and appends its durable replacement.
+fn migrate_session_summary_projection(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "session-summary-projection-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM session_summary_attention", [])?;
+        tx.execute("DELETE FROM session_summaries", [])?;
+        tx.execute(
+            "INSERT INTO session_summaries
+               (session_id, workspace_id, archived, active, last_outcome,
+                latest_thread_id, latest_cursor, updated_at)
+             SELECT id, workspace_id, archived, 0, 'idle', NULL, 0, created_at
+             FROM sessions",
+            [],
+        )?;
+
+        let mut after = 0u64;
+        loop {
+            let rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT cursor, scope_kind, scope_id, ts, payload
+                     FROM events WHERE cursor > ?1 ORDER BY cursor LIMIT 512",
+                )?;
+                let mapped = stmt.query_map([after as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (cursor, kind, id, timestamp, payload) in &rows {
+                after = *cursor;
+                let Ok(event) = serde_json::from_str::<Event>(payload) else {
+                    continue;
+                };
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+                    continue;
+                };
+                let scope = scope_from_cols(kind, id.clone());
+                let _ = project_session_summary(
+                    &tx,
+                    &scope,
+                    &event,
+                    *cursor,
+                    ts.with_timezone(&chrono::Utc),
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+            params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+    }
+
+    recover_interrupted_session_summaries(conn)
+}
+
+/// Process-owned turns and response channels do not survive restart. Record
+/// recovery as durable source + replacement events so a resumed stream sees
+/// the same cleared state as a fresh projection snapshot.
+fn recover_interrupted_session_summaries(conn: &Connection) -> Result<()> {
+    let interrupted = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, workspace_id FROM session_summaries AS summary
+             WHERE active != 0 OR EXISTS (
+               SELECT 1 FROM session_summary_attention AS attention
+               WHERE attention.session_id = summary.session_id
+             )
+             ORDER BY session_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now();
+    let events = interrupted
+        .into_iter()
+        .map(|(session_id, workspace_id)| {
+            let event = Event::SessionRecovered {
+                session_id,
+                workspace_id,
+            };
+            Ok(PendingEvent {
+                scope: Scope::Server,
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = insert_event_batch(conn, events.iter(), events.len())?;
+    Ok(())
+}
+
+fn ensure_session_summary(
+    conn: &Connection,
+    session_id: &str,
+    cursor: u64,
+    ts: &chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_summaries
+           (session_id, workspace_id, archived, active, last_outcome,
+            latest_thread_id, latest_cursor, updated_at)
+         SELECT id, workspace_id, archived, 0, 'idle', NULL, ?2, ?3
+         FROM sessions WHERE id = ?1",
+        params![session_id, cursor as i64, ts.to_rfc3339()],
+    )?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_summaries WHERE session_id = ?1)",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn session_for_thread(conn: &Connection, thread_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT session_id FROM threads WHERE id = ?1",
+        [thread_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn clear_thread_attention(conn: &Connection, thread_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_summary_attention WHERE thread_id = ?1",
+        [thread_id],
+    )?;
+    Ok(())
+}
+
+fn touch_session_summary(
+    conn: &Connection,
+    session_id: &str,
+    thread_id: Option<&str>,
+    cursor: u64,
+    ts: &chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE session_summaries
+         SET latest_thread_id = COALESCE(?2, latest_thread_id),
+             latest_cursor = ?3,
+             updated_at = ?4
+         WHERE session_id = ?1",
+        params![session_id, thread_id, cursor as i64, ts.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn project_session_summary(
+    conn: &Connection,
+    scope: &Scope,
+    event: &Event,
+    cursor: u64,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<SessionSummaryChange>> {
+    let (session_id, thread_id) = match event {
+        Event::SessionSummaryUpdated { .. } => return Ok(None),
+        Event::SessionDeleted { session_id, .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention WHERE session_id = ?1",
+                [session_id],
+            )?;
+            conn.execute(
+                "DELETE FROM session_summaries WHERE session_id = ?1",
+                [session_id],
+            )?;
+            return Ok(Some(SessionSummaryChange {
+                session_id: session_id.clone(),
+                summary: None,
+                notification: None,
+            }));
+        }
+        Event::SessionCreated { session_id, .. }
+        | Event::SessionUpdated { session_id, .. }
+        | Event::SessionActivity { session_id, .. }
+        | Event::SessionRecovered { session_id, .. } => (session_id.clone(), None),
+        Event::ThreadCreated {
+            session_id,
+            thread_id,
+        }
+        | Event::ThreadUpdated {
+            session_id,
+            thread_id,
+        } => (session_id.clone(), Some(thread_id.clone())),
+        Event::TurnStarted { .. }
+        | Event::TurnCompleted { .. }
+        | Event::TurnFailed { .. }
+        | Event::TurnCancelled { .. }
+        | Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ToolCompleted { .. }
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. } => {
+            let Scope::Thread(thread_id) = scope else {
+                return Ok(None);
+            };
+            let Some(session_id) = session_for_thread(conn, thread_id)? else {
+                return Ok(None);
+            };
+            (session_id, Some(thread_id.clone()))
+        }
+        _ => return Ok(None),
+    };
+
+    if !ensure_session_summary(conn, &session_id, cursor, &ts)? {
+        return Ok(None);
+    }
+
+    match event {
+        Event::SessionUpdated { .. } => {
+            conn.execute(
+                "UPDATE session_summaries
+                 SET archived = COALESCE(
+                     (SELECT archived FROM sessions WHERE id = ?1), archived)
+                 WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::SessionActivity { active, .. } => {
+            conn.execute(
+                "UPDATE session_summaries SET active = ?2 WHERE session_id = ?1",
+                params![session_id, i64::from(*active)],
+            )?;
+        }
+        Event::SessionRecovered { .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention WHERE session_id = ?1",
+                [&session_id],
+            )?;
+            conn.execute(
+                "UPDATE session_summaries
+                 SET active = 0, last_outcome = 'failed'
+                 WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::ThreadCreated { .. } => {
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnStarted { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnCompleted { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'succeeded' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnFailed { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'failed' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnCancelled { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::ApprovalRequested { call_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_summary_attention
+                       (kind, item_id, session_id, thread_id)
+                     VALUES ('approval', ?1, ?2, ?3)",
+                    params![call_id, session_id, thread_id],
+                )?;
+            }
+        }
+        Event::ApprovalResolved { call_id, .. } | Event::ToolCompleted { call_id, .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention
+                 WHERE kind = 'approval' AND item_id = ?1 AND session_id = ?2",
+                params![call_id, session_id],
+            )?;
+        }
+        Event::QuestionRequested { request_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_summary_attention
+                       (kind, item_id, session_id, thread_id)
+                     VALUES ('question', ?1, ?2, ?3)",
+                    params![request_id, session_id, thread_id],
+                )?;
+            }
+        }
+        Event::QuestionResolved { request_id, .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention
+                 WHERE kind = 'question' AND item_id = ?1 AND session_id = ?2",
+                params![request_id, session_id],
+            )?;
+        }
+        _ => {}
+    }
+
+    let notification = session_notification_event(event, &session_id, thread_id.as_deref());
+    touch_session_summary(conn, &session_id, thread_id.as_deref(), cursor, &ts)?;
+    Ok(
+        session_summary(conn, &session_id)?.map(|summary| SessionSummaryChange {
+            session_id,
+            summary: Some(summary),
+            notification,
+        }),
+    )
+}
+
+const SESSION_NOTIFICATION_DETAIL_CHARS: usize = 120;
+
+fn compact_session_notification_detail(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut chars = value.chars();
+    let mut compact = chars
+        .by_ref()
+        .take(SESSION_NOTIFICATION_DETAIL_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        compact.push('…');
+    }
+    Some(compact)
+}
+
+fn session_notification_event(
+    source: &Event,
+    session_id: &str,
+    thread_id: Option<&str>,
+) -> Option<Event> {
+    let thread_id = thread_id?;
+    let (kind, detail) = match source {
+        Event::TurnCompleted { .. } => (
+            trouve_protocol::SessionNotificationKind::TurnCompleted,
+            None,
+        ),
+        Event::TurnFailed { error, .. } => (
+            trouve_protocol::SessionNotificationKind::TurnFailed,
+            compact_session_notification_detail(error),
+        ),
+        Event::ApprovalRequested { .. } => (
+            trouve_protocol::SessionNotificationKind::ApprovalRequested,
+            None,
+        ),
+        Event::QuestionRequested { title, .. } => (
+            trouve_protocol::SessionNotificationKind::QuestionRequested,
+            title
+                .as_deref()
+                .and_then(compact_session_notification_detail),
+        ),
+        _ => return None,
+    };
+    Some(Event::SessionNotification {
+        session_id: session_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        kind,
+        detail,
+    })
+}
+
+fn session_summary(conn: &Connection, session_id: &str) -> Result<Option<SessionSummary>> {
+    let row = conn
+        .query_row(
+            "SELECT workspace_id, archived, active, last_outcome,
+                    latest_thread_id, latest_cursor, updated_at
+             FROM session_summaries WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((workspace_id, archived, active, last_outcome, latest_thread_id, cursor, ts)) = row
+    else {
+        return Ok(None);
+    };
+    let (approval, question) = conn.query_row(
+        "SELECT
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE session_id = ?1 AND kind = 'approval'),
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE session_id = ?1 AND kind = 'question')",
+        [session_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )?;
+    let attention = match (approval, question) {
+        (false, false) => SessionAttention::None,
+        (true, false) => SessionAttention::Approval,
+        (false, true) => SessionAttention::Question,
+        (true, true) => SessionAttention::Both,
+    };
+    let active = active != 0;
+    let outcome = if active {
+        SessionOutcome::Running
+    } else {
+        match last_outcome.as_str() {
+            "idle" => SessionOutcome::Idle,
+            "succeeded" => SessionOutcome::Succeeded,
+            "failed" => SessionOutcome::Failed,
+            // A downgrade may encounter a newer additive outcome literal.
+            // Keep the writer transaction available and expose the neutral
+            // state until a known event replaces the projection value.
+            _ => SessionOutcome::Idle,
+        }
+    };
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&ts)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    Ok(Some(SessionSummary {
+        session_id: session_id.to_string(),
+        workspace_id,
+        archived: archived != 0,
+        active,
+        attention,
+        outcome,
+        latest_thread_id,
+        latest_cursor: cursor as u64,
+        updated_at,
+    }))
+}
+
 /// Upgrade untouched default policies to automatic routing while preserving
 /// customized persona selections as Core policies. Record the migration so a
 /// later user choice to return to Core remains respected.
@@ -687,8 +1197,8 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
 
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
-    let permission_mode: String = r.get(6)?;
-    let schedule_json: String = r.get(7)?;
+    let permission_mode: String = r.get(7)?;
+    let schedule_json: String = r.get(8)?;
     Ok(trouve_protocol::Automation {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -696,6 +1206,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         workspace_id: r.get(3)?,
         mode: r.get(4)?,
         model: r.get(5)?,
+        thinking_level: r.get(6)?,
         permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
@@ -705,12 +1216,12 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
                 days: vec![],
             },
         ),
-        enabled: r.get(8)?,
-        next_run_at: r.get(9)?,
-        last_run_at: r.get(10)?,
-        last_session_id: r.get(11)?,
-        last_error: r.get(12)?,
-        created_at: r.get(13)?,
+        enabled: r.get(9)?,
+        next_run_at: r.get(10)?,
+        last_run_at: r.get(11)?,
+        last_session_id: r.get(12)?,
+        last_error: r.get(13)?,
+        created_at: r.get(14)?,
     })
 }
 
@@ -1480,6 +1991,24 @@ struct PendingEvent {
     /// there instead of poisoning a whole batch.
     payload: String,
     event: Event,
+    /// Optional relational mutation that must commit immediately before this
+    /// source event and its derived projection update.
+    mutation: Option<StoreMutation>,
+}
+
+enum StoreMutation {
+    Insert {
+        session: Box<Session>,
+        initial_checkpoint: Box<CheckpointRow>,
+    },
+    Update {
+        id: String,
+        title: Option<String>,
+        archived: Option<bool>,
+    },
+    Delete {
+        id: String,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
@@ -1585,11 +2114,11 @@ fn spawn_event_writer(
                 }
                 let wait_started = std::time::Instant::now();
                 let (inserted, wait, elapsed) = {
-                    let mut conn = conn.lock().unwrap();
+                    let conn = conn.lock().unwrap();
                     let wait = wait_started.elapsed();
                     let started = std::time::Instant::now();
                     let inserted = insert_event_batch(
-                        &mut conn,
+                        &conn,
                         requests.iter().flat_map(|request| request.events.iter()),
                         event_count,
                     );
@@ -1613,20 +2142,25 @@ fn spawn_event_writer(
                     );
                 }
                 match inserted {
-                    Ok(cursors) => {
-                        let mut cursors = cursors.into_iter();
+                    Ok(inserted) => {
+                        // Publish every committed source and derived event in
+                        // exact cursor order before resolving append callers.
+                        for envelope in inserted.published {
+                            let _ = events_tx.send(envelope.clone());
+                            let (kind, id) = scope_cols(&envelope.scope);
+                            let scoped_sender = scoped_events
+                                .lock()
+                                .unwrap()
+                                .get(&(kind.to_owned(), id))
+                                .cloned();
+                            if let Some(sender) = scoped_sender {
+                                let _ = sender.send(envelope);
+                            }
+                        }
+
+                        let mut cursors = inserted.source_cursors.into_iter();
                         for request in requests {
                             let mut envelopes = Vec::with_capacity(request.events.len());
-                            // One caller batch has one scope, so resolve its
-                            // live sender without re-locking for every event.
-                            let scoped_sender = request.events.first().and_then(|event| {
-                                let (kind, id) = scope_cols(&event.scope);
-                                scoped_events
-                                    .lock()
-                                    .unwrap()
-                                    .get(&(kind.to_owned(), id))
-                                    .cloned()
-                            });
                             for event in request.events {
                                 let envelope = EventEnvelope {
                                     cursor: cursors.next().expect("one cursor per inserted event"),
@@ -1634,12 +2168,6 @@ fn spawn_event_writer(
                                     ts: event.ts,
                                     event: event.event,
                                 };
-                                // Nobody listening is fine; a caller that gave
-                                // up waiting is too.
-                                let _ = events_tx.send(envelope.clone());
-                                if let Some(sender) = &scoped_sender {
-                                    let _ = sender.send(envelope.clone());
-                                }
                                 envelopes.push(envelope);
                             }
                             request.reply.send(Ok(envelopes));
@@ -1662,39 +2190,208 @@ fn spawn_event_writer(
 
 /// Insert a batch in queue order under one transaction, returning the
 /// assigned cursors. All-or-nothing: on error the transaction rolls back.
+struct InsertedEventBatch {
+    source_cursors: Vec<u64>,
+    published: Vec<EventEnvelope>,
+}
+
+fn insert_session_row(conn: &Connection, session: &Session) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions
+           (id, workspace_id, title, branch, worktree_path, base_ref, archived, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            session.id,
+            session.workspace_id,
+            session.title,
+            session.branch,
+            session.worktree_path,
+            session.base_ref,
+            session.archived,
+            session.created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_initial_checkpoint_row(
+    conn: &Connection,
+    checkpoint: &CheckpointRow,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO checkpoints
+           (id, session_id, thread_id, turn, seq, commit_hash, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            checkpoint.id,
+            checkpoint.session_id,
+            checkpoint.thread_id,
+            checkpoint.turn as i64,
+            checkpoint.seq,
+            checkpoint.commit_hash,
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_session_row(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    archived: Option<bool>,
+) -> Result<()> {
+    if let Some(title) = title {
+        conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+    }
+    if let Some(archived) = archived {
+        conn.execute(
+            "UPDATE sessions SET archived = ?2 WHERE id = ?1",
+            params![id, archived],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
+         OR (scope_kind = 'thread' AND scope_id IN
+             (SELECT id FROM threads WHERE session_id = ?1))",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM messages WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM backend_sessions WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM queued_prompts WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
+    conn.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM attachments WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM spawned_threads
+         WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
+            OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn apply_store_mutation(
+    conn: &Connection,
+    mutation: &StoreMutation,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    match mutation {
+        StoreMutation::Insert {
+            session,
+            initial_checkpoint,
+        } => {
+            insert_session_row(conn, session)?;
+            insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
+        }
+        StoreMutation::Update {
+            id,
+            title,
+            archived,
+        } => update_session_row(conn, id, title.as_deref(), *archived)?,
+        StoreMutation::Delete { id } => delete_session_rows(conn, id)?,
+    }
+    Ok(())
+}
+
 fn insert_event_batch<'a>(
-    conn: &mut Connection,
+    conn: &Connection,
     batch: impl IntoIterator<Item = &'a PendingEvent>,
     event_count: usize,
-) -> Result<Vec<u64>> {
-    let tx = conn.transaction()?;
-    let mut cursors = Vec::with_capacity(event_count);
+) -> Result<InsertedEventBatch> {
+    let tx = conn.unchecked_transaction()?;
+    let mut source_cursors = Vec::with_capacity(event_count);
+    let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
-    {
-        let mut stmt = tx.prepare_cached(
+    for event in batch {
+        if let Some(mutation) = event.mutation.as_ref() {
+            apply_store_mutation(&tx, mutation, event.ts)?;
+        }
+        let (kind, id) = scope_cols(&event.scope);
+        tx.execute(
             "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, id, event.ts.to_rfc3339(), event.payload],
         )?;
-        for event in batch {
-            let (kind, id) = scope_cols(&event.scope);
-            stmt.execute(params![kind, id, event.ts.to_rfc3339(), event.payload])?;
-            let cursor = tx.last_insert_rowid() as u64;
-            cursors.push(cursor);
-            if let Scope::Thread(thread_id) = &event.scope {
-                thread_events.push((
-                    thread_id.clone(),
-                    EventEnvelope {
-                        cursor,
-                        scope: event.scope.clone(),
-                        ts: event.ts,
-                        event: event.event.clone(),
-                    },
-                ));
+        let source_cursor = tx.last_insert_rowid() as u64;
+        source_cursors.push(source_cursor);
+        let source = EventEnvelope {
+            cursor: source_cursor,
+            scope: event.scope.clone(),
+            ts: event.ts,
+            event: event.event.clone(),
+        };
+        if let Scope::Thread(thread_id) = &event.scope {
+            thread_events.push((thread_id.clone(), source.clone()));
+        }
+        published.push(source);
+
+        if let Some(change) =
+            project_session_summary(&tx, &event.scope, &event.event, source_cursor, event.ts)?
+        {
+            let derived = Event::SessionSummaryUpdated {
+                session_id: change.session_id,
+                summary: change.summary,
+            };
+            let payload = serde_json::to_string(&derived)?;
+            tx.execute(
+                "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                 VALUES ('server', '', ?1, ?2)",
+                params![event.ts.to_rfc3339(), payload],
+            )?;
+            published.push(EventEnvelope {
+                cursor: tx.last_insert_rowid() as u64,
+                scope: Scope::Server,
+                ts: event.ts,
+                event: derived,
+            });
+            if let Some(notification) = change.notification {
+                let payload = serde_json::to_string(&notification)?;
+                tx.execute(
+                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                     VALUES ('server', '', ?1, ?2)",
+                    params![event.ts.to_rfc3339(), payload],
+                )?;
+                published.push(EventEnvelope {
+                    cursor: tx.last_insert_rowid() as u64,
+                    scope: Scope::Server,
+                    ts: event.ts,
+                    event: notification,
+                });
             }
         }
     }
     update_thread_view_caches(&tx, &thread_events)?;
     tx.commit()?;
-    Ok(cursors)
+    Ok(InsertedEventBatch {
+        source_cursors,
+        published,
+    })
 }
 
 fn update_thread_view_caches(
@@ -1793,9 +2490,34 @@ fn serialize_events(scope: Scope, events: Vec<Event>) -> Result<Vec<PendingEvent
                 ts: now,
                 payload: serde_json::to_string(&event)?,
                 event,
+                mutation: None,
             })
         })
         .collect()
+}
+
+fn serialize_lifecycle_events(
+    events: Vec<(Scope, Event)>,
+    mutation: StoreMutation,
+) -> Result<Vec<PendingEvent>> {
+    let now = chrono::Utc::now();
+    let mut pending = events
+        .into_iter()
+        .map(|(scope, event)| {
+            Ok(PendingEvent {
+                scope,
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = pending
+        .first_mut()
+        .context("a lifecycle mutation requires at least one source event")?;
+    first.mutation = Some(mutation);
+    Ok(pending)
 }
 
 impl Store {
@@ -1862,17 +2584,21 @@ impl Store {
     /// other on the connection mutex. This call still waits for durability:
     /// it returns once the batch containing this event has committed.
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
+        let mut envelopes = self.append_pending_events(serialize_events(scope, vec![event])?)?;
+        Ok(envelopes.pop().expect("single append returns one event"))
+    }
+
+    fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
-                events: serialize_events(scope, vec![event])?,
+                events,
                 reply: AppendReply::Sync(reply),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
-        let mut envelopes = reply_rx
+        reply_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))??;
-        Ok(envelopes.pop().expect("single append returns one event"))
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
     }
 
     /// Persist a same-scope batch without blocking a Tokio worker thread.
@@ -2027,6 +2753,38 @@ impl Store {
         Ok((projection.cursor, snapshot))
     }
 
+    /// Atomic session-summary snapshot. The cursor and rows share one SQLite
+    /// read transaction, so an update is either present in both or replayed
+    /// from `/v1/events` after this cursor—never missed between two reads.
+    pub fn session_summaries_snapshot(&self) -> Result<SessionSummariesSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let cursor = tx
+            .query_row(
+                "SELECT MAX(cursor) FROM events
+                 WHERE scope_kind = 'server' AND scope_id = ''",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(0) as u64;
+        let session_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id FROM session_summaries
+                 ORDER BY archived, updated_at DESC, session_id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut summaries = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if let Some(summary) = session_summary(&tx, &session_id)? {
+                summaries.push(summary);
+            }
+        }
+        tx.commit()?;
+        Ok(SessionSummariesSnapshot { summaries, cursor })
+    }
+
     /// Read at most `limit` persisted rows in `(after, through]`.
     ///
     /// The fixed upper cursor gives callers a stable replay snapshot while a
@@ -2123,13 +2881,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Most recently persisted account PR snapshot for `host`.
+    /// Most recently persisted account PR snapshot event for `host`.
     ///
     /// The scan runs newest-first in bounded pages and stops at the first
     /// matching host. Payloads are decoded after releasing the SQLite
     /// connection mutex so a cold or missing host cannot block unrelated
     /// store operations for the full server history.
-    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+    pub fn latest_github_pr_snapshot_event(&self, host: &str) -> Result<Option<EventEnvelope>> {
         const PAGE_SIZE: usize = 64;
 
         let mut before = i64::MAX;
@@ -2137,12 +2895,16 @@ impl Store {
             let page = {
                 let conn = self.conn.lock().unwrap();
                 let mut stmt = conn.prepare(
-                    "SELECT cursor, payload FROM events
+                    "SELECT cursor, ts, payload FROM events
                      WHERE scope_kind = 'server' AND scope_id = '' AND cursor < ?1
                      ORDER BY cursor DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![before, PAGE_SIZE as i64], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 let mut page = Vec::new();
                 for row in rows {
@@ -2150,25 +2912,41 @@ impl Store {
                 }
                 page
             };
-            let Some((oldest, _)) = page.last() else {
+            let Some((oldest, _, _)) = page.last() else {
                 return Ok(None);
             };
             before = *oldest;
             let exhausted = page.len() < PAGE_SIZE;
-            for (_, payload) in page {
-                let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
-                    serde_json::from_str::<Event>(&payload)
-                else {
+            for (cursor, ts, payload) in page {
+                let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                    continue;
+                };
+                let Event::GithubPullRequestsUpdated { pull_requests } = &event else {
                     continue;
                 };
                 if pull_requests.host.eq_ignore_ascii_case(host) {
-                    return Ok(Some(pull_requests));
+                    return Ok(Some(EventEnvelope {
+                        cursor: cursor as u64,
+                        scope: Scope::Server,
+                        ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                        event,
+                    }));
                 }
             }
             if exhausted {
                 return Ok(None);
             }
         }
+    }
+
+    /// Most recently persisted account PR replacement payload for `host`.
+    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+        Ok(self
+            .latest_github_pr_snapshot_event(host)?
+            .and_then(|envelope| match envelope.event {
+                Event::GithubPullRequestsUpdated { pull_requests } => Some(pull_requests),
+                _ => None,
+            }))
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -2280,13 +3058,24 @@ impl Store {
     // --- sessions -----------------------------------------------------------
 
     pub fn insert_session(&self, s: &Session) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO sessions (id, workspace_id, title, branch, worktree_path, base_ref, archived, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![s.id, s.workspace_id, s.title, s.branch, s.worktree_path, s.base_ref,
-                    s.archived, s.created_at.to_rfc3339()],
-        )?;
-        Ok(())
+        insert_session_row(&self.conn.lock().unwrap(), s)
+    }
+
+    /// Persist a newly created session, its pristine checkpoint, and every
+    /// initial lifecycle event in the event writer's one transaction.
+    pub(crate) fn insert_session_with_lifecycle(
+        &self,
+        session: &Session,
+        initial_checkpoint: &CheckpointRow,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events(serialize_lifecycle_events(
+            events,
+            StoreMutation::Insert {
+                session: Box::new(session.clone()),
+                initial_checkpoint: Box::new(initial_checkpoint.clone()),
+            },
+        )?)
     }
 
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
@@ -2336,63 +3125,55 @@ impl Store {
         title: Option<&str>,
         archived: Option<bool>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(title) = title {
-            conn.execute(
-                "UPDATE sessions SET title = ?2 WHERE id = ?1",
-                params![id, title],
-            )?;
-        }
-        if let Some(archived) = archived {
-            conn.execute(
-                "UPDATE sessions SET archived = ?2 WHERE id = ?1",
-                params![id, archived],
-            )?;
-        }
-        Ok(())
+        update_session_row(&self.conn.lock().unwrap(), id, title, archived)
+    }
+
+    /// Rename/archive and append the lifecycle source event atomically.
+    pub(crate) fn update_session_with_event(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        archived: Option<bool>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::Update {
+                id: id.to_string(),
+                title: title.map(str::to_owned),
+                archived,
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         // One transaction so a failure can't leave a half-deleted session.
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
-             OR (scope_kind = 'thread' AND scope_id IN (SELECT id FROM threads WHERE session_id = ?1))",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM backend_sessions WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM queued_prompts WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
-        tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
-        // attachments and spawned_threads both FK to threads(id); with
-        // foreign_keys=ON, deleting threads while these rows exist fails the
-        // whole transaction. Any session that ever took an attachment or used
-        // spawn_thread/spawn_session hit this, leaving a session the engine
-        // had already removed from disk still present in the DB.
-        tx.execute(
-            "DELETE FROM attachments WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM spawned_threads WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
-             OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        delete_session_rows(&tx, id)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Delete relational/session-scoped state and append the server tombstone
+    /// source event atomically before any filesystem cleanup begins.
+    pub(crate) fn delete_session_with_event(
+        &self,
+        id: &str,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::Delete { id: id.to_string() },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     // --- threads ------------------------------------------------------------
@@ -2652,11 +3433,19 @@ impl Store {
     }
 
     /// Returns false when the prompt no longer exists (already dispatched).
-    pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
+    pub fn update_queued_prompt(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        let attachments_json = serde_json::to_string(attachments)?;
         let n = conn.execute(
-            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1 AND claimed = 0",
-            params![id, content],
+            "UPDATE queued_prompts
+             SET content = ?2, attachments = ?3
+             WHERE id = ?1 AND claimed = 0",
+            params![id, content, attachments_json],
         )?;
         Ok(n > 0)
     }
@@ -2698,6 +3487,64 @@ impl Store {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Move one visible prompt to the front in a single transaction and,
+    /// when requested, claim it for an idle dispatcher. Returns `None` when
+    /// the prompt no longer exists or another dispatcher already claimed it.
+    pub fn prioritize_queued_prompt(
+        &self,
+        id: &str,
+        claim: bool,
+    ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some(mut prompt) = tx
+            .query_row(
+                "SELECT thread_id, content, attachments, created_at
+                 FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| {
+                    Ok(trouve_protocol::QueuedPrompt {
+                        id: id.to_string(),
+                        thread_id: row.get(0)?,
+                        position: 0,
+                        content: row.get(1)?,
+                        attachments: parse_attachments(&row.get::<_, String>(2)?),
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM queued_prompts
+                 WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
+            )?;
+            let rows = stmt.query_map(params![prompt.thread_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ordered = std::iter::once(id.to_string())
+            .chain(ids.into_iter().filter(|candidate| candidate != id));
+        for (index, candidate) in ordered.enumerate() {
+            tx.execute(
+                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1 AND claimed = 0",
+                params![candidate, index as i64],
+            )?;
+        }
+        if claim {
+            tx.execute(
+                "UPDATE queued_prompts SET claimed = 1 WHERE id = ?1 AND claimed = 0",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        prompt.position = 0;
+        Ok(Some(prompt))
     }
 
     /// Hide and return the front prompt while a dispatcher prepares its
@@ -2825,9 +3672,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations (id, name, prompt, workspace_id, mode, model,
-                                      permission_mode, schedule, enabled, next_run_at,
-                                      last_run_at, last_session_id, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      thinking_level, permission_mode, schedule, enabled,
+                                      next_run_at, last_run_at, last_session_id, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 a.id,
                 a.name,
@@ -2835,6 +3682,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -2854,8 +3702,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
-                    model = ?6, permission_mode = ?7, schedule = ?8, enabled = ?9,
-                    next_run_at = ?10
+                    model = ?6, thinking_level = ?7, permission_mode = ?8, schedule = ?9,
+                    enabled = ?10, next_run_at = ?11
              WHERE id = ?1",
             params![
                 a.id,
@@ -2864,6 +3712,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -2917,8 +3766,8 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                    next_run_at, last_run_at, last_session_id, last_error, created_at
+            "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                    schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
              FROM automations ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_automation)?;
@@ -2933,8 +3782,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                        next_run_at, last_run_at, last_session_id, last_error, created_at
+                "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                        schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
                  FROM automations WHERE id = ?1",
                 params![id],
                 row_to_automation,
@@ -5797,11 +6646,10 @@ impl Store {
     // --- usage accounting -------------------------------------------------------
 
     /// Record a turn's usage. `usage` totals are summed across the turn's
-    /// requests (correct for billing); `context_input_tokens` is the input
-    /// size of the turn's *last* request — the only meaningful proxy for the
-    /// current context size, since summing per-iteration inputs over a
-    /// multi-tool turn inflates the figure many-fold and spuriously trips
-    /// compaction.
+    /// requests (correct for billing); `context_input_tokens` is the
+    /// provider-authoritative context size for the turn's *last* request.
+    /// Summing per-iteration inputs over a multi-tool turn inflates the figure
+    /// many-fold and spuriously trips compaction.
     pub fn record_usage(
         &self,
         session_id: &str,
@@ -5829,9 +6677,10 @@ impl Store {
     }
 
     /// Context size (in tokens) of the thread's most recent turn: the last
-    /// request's input, used by the compaction trigger and the UI usage
-    /// indicator. Older rows recorded before this column existed report 0
-    /// (the caller falls back to a character estimate).
+    /// request's provider-authoritative measurement, used by the compaction
+    /// trigger and the UI usage indicator. Older rows recorded before this
+    /// column existed report 0 (the caller falls back to a character
+    /// estimate).
     pub fn last_input_tokens(&self, thread_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -5919,6 +6768,18 @@ impl Store {
             "SELECT id, session_id, thread_id, turn, seq, commit_hash FROM checkpoints
              WHERE session_id = ?1 AND seq = ?2",
             params![session_id, seq],
+            row_to_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn checkpoint(&self, checkpoint_id: &str) -> Result<Option<CheckpointRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, session_id, thread_id, turn, seq, commit_hash FROM checkpoints
+             WHERE id = ?1",
+            params![checkpoint_id],
             row_to_checkpoint,
         )
         .optional()
@@ -6034,6 +6895,8 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,
@@ -6470,6 +7333,381 @@ mod tests {
 
         let tail = store.events_after(&scope, all[0].cursor).unwrap();
         assert_eq!(tail.len(), 2);
+    }
+
+    #[test]
+    fn session_summary_projection_is_transactional_resumable_and_tombstoned() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_summary");
+
+        let created = store
+            .append_event(
+                Scope::Server,
+                Event::SessionCreated {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let initial = store.session_summaries_snapshot().unwrap();
+        assert_eq!(initial.summaries.len(), 1);
+        assert_eq!(initial.summaries[0].latest_cursor, created.cursor);
+        assert!(
+            initial.cursor > created.cursor,
+            "the derived update follows its source"
+        );
+        assert_eq!(initial.summaries[0].outcome, SessionOutcome::Idle);
+
+        store
+            .append_event(
+                Scope::Server,
+                Event::ThreadCreated {
+                    thread_id: "th_summary".into(),
+                    session_id: "se_q".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::TurnStarted {
+                    turn: 1,
+                    mode: "code".into(),
+                    model: "p/m".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                    active: true,
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::ApprovalRequested {
+                    turn: 1,
+                    call_id: "call_1".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::QuestionRequested {
+                    turn: 1,
+                    request_id: "question_1".into(),
+                    title: Some("Choose".into()),
+                    questions: vec![trouve_protocol::Question {
+                        id: "choice".into(),
+                        prompt: "Continue?".into(),
+                        options: Vec::new(),
+                        allow_multiple: false,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let waiting = store.session_summaries_snapshot().unwrap();
+        assert_eq!(waiting.summaries[0].attention, SessionAttention::Both);
+        assert_eq!(waiting.summaries[0].outcome, SessionOutcome::Running);
+        assert!(waiting.summaries[0].active);
+        assert_eq!(
+            waiting.summaries[0].latest_thread_id.as_deref(),
+            Some("th_summary")
+        );
+
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::ApprovalResolved {
+                    call_id: "call_1".into(),
+                    decision: trouve_protocol::ApprovalDecision::Approve,
+                },
+            )
+            .unwrap();
+        let question_only = store.session_summaries_snapshot().unwrap();
+        assert_eq!(
+            question_only.summaries[0].attention,
+            SessionAttention::Question
+        );
+
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "expected test failure".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                    active: false,
+                },
+            )
+            .unwrap();
+        let failed = store.session_summaries_snapshot().unwrap();
+        assert_eq!(failed.summaries[0].attention, SessionAttention::None);
+        assert_eq!(failed.summaries[0].outcome, SessionOutcome::Failed);
+        assert!(!failed.summaries[0].active);
+
+        // A client that starts replay after the snapshot cursor observes the
+        // complete replacement summary and cannot lose this concurrent edit.
+        store
+            .update_session_with_event(
+                "se_q",
+                None,
+                Some(true),
+                Event::SessionUpdated {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let resumed = store.events_after(&Scope::Server, failed.cursor).unwrap();
+        assert!(resumed.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::SessionSummaryUpdated {
+                summary: Some(summary),
+                ..
+            } if summary.archived
+        )));
+
+        store
+            .delete_session_with_event(
+                "se_q",
+                Event::SessionDeleted {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let deleted = store.session_summaries_snapshot().unwrap();
+        assert!(deleted.summaries.is_empty());
+        assert!(
+            store
+                .events_after(&Scope::Server, failed.cursor)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(
+                    &envelope.event,
+                    Event::SessionSummaryUpdated {
+                        session_id,
+                        summary: None,
+                    } if session_id == "se_q"
+                ))
+        );
+    }
+
+    #[test]
+    fn session_notification_edges_preserve_native_category_detail_and_order() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_notice");
+
+        store
+            .append_event(
+                Scope::Thread("th_notice".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: format!("  {}tail  ", "界".repeat(120)),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_notice".into()),
+                Event::QuestionRequested {
+                    turn: 2,
+                    request_id: "question_notice".into(),
+                    title: Some("  Choose a deployment target  ".into()),
+                    questions: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let events = store.events_after(&Scope::Server, 0).unwrap();
+        let notifications = events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                Event::SessionNotification {
+                    session_id,
+                    thread_id,
+                    kind,
+                    detail,
+                } => Some((
+                    envelope.cursor,
+                    session_id.as_str(),
+                    thread_id.as_str(),
+                    *kind,
+                    detail.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].1, "se_q");
+        assert_eq!(notifications[0].2, "th_notice");
+        assert_eq!(
+            notifications[0].3,
+            trouve_protocol::SessionNotificationKind::TurnFailed
+        );
+        assert_eq!(
+            notifications[0].4,
+            Some(format!("{}…", "界".repeat(120)).as_str())
+        );
+        assert_eq!(
+            notifications[1].3,
+            trouve_protocol::SessionNotificationKind::QuestionRequested
+        );
+        assert_eq!(notifications[1].4, Some("Choose a deployment target"));
+
+        for (notification_cursor, ..) in notifications {
+            let summary_cursor = events
+                .iter()
+                .rev()
+                .find(|envelope| {
+                    envelope.cursor < notification_cursor
+                        && matches!(envelope.event, Event::SessionSummaryUpdated { .. })
+                })
+                .map(|envelope| envelope.cursor)
+                .expect("notification follows a replacement summary");
+            assert_eq!(notification_cursor, summary_cursor + 1);
+        }
+    }
+
+    #[test]
+    fn reopening_persists_recovery_and_clears_process_owned_attention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("recovery.db");
+        let before_restart = {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_recovery");
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionActivity {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                        active: true,
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread("th_recovery".into()),
+                    Event::ApprovalRequested {
+                        turn: 1,
+                        call_id: "call_crashed".into(),
+                    },
+                )
+                .unwrap();
+            let snapshot = store.session_summaries_snapshot().unwrap();
+            assert!(snapshot.summaries[0].active);
+            assert_eq!(snapshot.summaries[0].attention, SessionAttention::Approval);
+            snapshot.cursor
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let recovered = reopened.session_summaries_snapshot().unwrap();
+        assert!(recovered.cursor > before_restart);
+        assert_eq!(recovered.summaries.len(), 1);
+        assert!(!recovered.summaries[0].active);
+        assert_eq!(recovered.summaries[0].attention, SessionAttention::None);
+        assert_eq!(recovered.summaries[0].outcome, SessionOutcome::Failed);
+
+        let replay = reopened
+            .events_after(&Scope::Server, before_restart)
+            .unwrap();
+        assert!(matches!(
+            replay.first().map(|envelope| &envelope.event),
+            Some(Event::SessionRecovered { session_id, .. }) if session_id == "se_q"
+        ));
+        assert!(matches!(
+            replay.get(1).map(|envelope| &envelope.event),
+            Some(Event::SessionSummaryUpdated {
+                summary: Some(summary),
+                ..
+            }) if !summary.active
+                && summary.attention == SessionAttention::None
+                && summary.outcome == SessionOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn lifecycle_mutation_rolls_back_when_its_event_transaction_fails() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_workspace(&Workspace {
+                id: "ws_atomic".into(),
+                name: "atomic".into(),
+                path: "/tmp/atomic".into(),
+            })
+            .unwrap();
+        let session = Session {
+            id: "se_atomic".into(),
+            workspace_id: "ws_atomic".into(),
+            title: "Atomic".into(),
+            branch: "trouve/atomic".into(),
+            worktree_path: "/tmp/atomic-worktree".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let invalid_checkpoint = CheckpointRow {
+            id: "cp_atomic".into(),
+            session_id: "se_missing".into(),
+            thread_id: None,
+            turn: 0,
+            seq: 0,
+            commit_hash: "deadbeef".into(),
+        };
+
+        assert!(
+            store
+                .insert_session_with_lifecycle(
+                    &session,
+                    &invalid_checkpoint,
+                    vec![(
+                        Scope::Server,
+                        Event::SessionCreated {
+                            session_id: session.id.clone(),
+                            workspace_id: session.workspace_id.clone(),
+                        },
+                    )],
+                )
+                .is_err()
+        );
+        assert!(store.session(&session.id).unwrap().is_none());
+        assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
+        assert!(
+            store
+                .session_summaries_snapshot()
+                .unwrap()
+                .summaries
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7067,8 +8305,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_1");
         seed_thread(&store, "th_2");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_queue_edit".into(),
+            name: "layout.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4,
+        };
         let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
-        let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
+        let b = store
+            .enqueue_prompt("th_1", "second", std::slice::from_ref(&attachment))
+            .unwrap();
         let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
         let tool_free = store
             .enqueue_prompt_with_tools("th_2", "other thread", &[], false)
@@ -7084,7 +8330,14 @@ mod tests {
         assert_eq!(store.queued_prompt_thread(&a.id).unwrap().unwrap(), "th_1");
 
         // Edit and delete.
-        assert!(store.update_queued_prompt(&b.id, "second v2").unwrap());
+        assert!(
+            store
+                .update_queued_prompt(&b.id, "second v2", std::slice::from_ref(&attachment))
+                .unwrap()
+        );
+        let edited = store.queued_prompts("th_1").unwrap();
+        assert_eq!(edited[1].content, "second v2");
+        assert_eq!(edited[1].attachments, [attachment]);
         assert!(store.delete_queued_prompt(&a.id).unwrap());
         assert!(!store.delete_queued_prompt(&a.id).unwrap());
 
@@ -7117,6 +8370,62 @@ mod tests {
 
         // The other thread's queue is untouched.
         assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queued_prompt_priority_can_remain_visible_or_be_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_priority");
+        let first = store.enqueue_prompt("th_priority", "first", &[]).unwrap();
+        let second = store.enqueue_prompt("th_priority", "second", &[]).unwrap();
+        let third = store.enqueue_prompt("th_priority", "third", &[]).unwrap();
+
+        let prioritized = store
+            .prioritize_queued_prompt(&third.id, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prioritized.position, 0);
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first", "second"]
+        );
+
+        let claimed = store
+            .prioritize_queued_prompt(&second.id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.content, "second");
+        assert!(
+            store
+                .prioritize_queued_prompt(&second.id, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first"]
+        );
+
+        assert!(store.release_queued_prompt(&second.id).unwrap());
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str(), third.id.as_str(), first.id.as_str()]
+        );
     }
 
     #[test]
@@ -7154,6 +8463,7 @@ mod tests {
             workspace_id: "ws_1".into(),
             mode: Some("code".into()),
             model: None,
+            thinking_level: Some("high".into()),
             permission_mode: PermissionMode::Yolo,
             schedule: trouve_protocol::AutomationSchedule {
                 kind: "weekly".into(),
@@ -7174,6 +8484,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].schedule, auto.schedule);
         assert_eq!(listed[0].mode.as_deref(), Some("code"));
+        assert_eq!(listed[0].thinking_level.as_deref(), Some("high"));
         assert_eq!(listed[0].permission_mode, PermissionMode::Yolo);
 
         // Edit: rename + disable clears the next fire time.
@@ -7181,12 +8492,14 @@ mod tests {
         edited.name = "Morning triage".into();
         edited.enabled = false;
         edited.next_run_at = None;
+        edited.thinking_level = Some("max".into());
         edited.permission_mode = PermissionMode::AllowList;
         assert!(store.update_automation(&edited).unwrap());
         let got = store.automation("auto_1").unwrap().unwrap();
         assert_eq!(got.name, "Morning triage");
         assert!(!got.enabled);
         assert!(got.next_run_at.is_none());
+        assert_eq!(got.thinking_level.as_deref(), Some("max"));
         assert_eq!(got.permission_mode, PermissionMode::AllowList);
 
         // A run records its outcome without touching the definition.
@@ -7348,6 +8661,10 @@ mod tests {
             store.checkpoint_at("se_1", 1).unwrap().unwrap().commit_hash,
             "c1b"
         );
+        let checkpoint = store.checkpoint("cp_new").unwrap().unwrap();
+        assert_eq!(checkpoint.session_id, "se_1");
+        assert_eq!(checkpoint.turn, 9);
+        assert_eq!(checkpoint.seq, 1);
     }
 
     #[test]

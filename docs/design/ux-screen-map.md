@@ -1,8 +1,11 @@
 # UX screen map
 
 The shared information architecture and screen inventory for every trouve
-client (Slint desktop/mobile now, web later). `trouve-client-core` view
-models encode this structure once; rendering layers differ, screens don't.
+client. The Lit/Wry desktop is the product frontend, and the same Lit
+application supplies the initial mobile PWA. The Servo-first embedder remains
+a qualification preview, not a second product UI. `trouve-client-core` and
+protocol fixtures define shared semantics while rendering layers adapt layout
+without redesigning the experience (ADR 0028).
 
 ## Design principles
 
@@ -18,6 +21,10 @@ models encode this structure once; rendering layers differ, screens don't.
    (command, output, exit status), never spinners. Users must be able to
    audit what ran — non-negotiable given the no-OS-sandbox decision
    (ADR 0004).
+5. **Visual continuity is product behavior.** The Lit frontend preserves
+   Trouve's themes, semantic colors, typography, density, layout,
+   information hierarchy, and core interactions. Ordinary web control chrome
+   may vary where the same intent and Trouve styling remain recognizable.
 
 ## Information architecture
 
@@ -39,22 +46,32 @@ signal and the sort key of every session list.
   branch names. Desktop: column 1. Mobile: home screen.
 - **S2 Session detail** — active thread chat + thread tabs. Desktop:
   column 2. Mobile: full-screen view.
-- **S3 Inspection panel** — tabs: terminal, GitHub (phase 5), diff, plan,
-  files. Desktop: column 3. Mobile: reachable from session detail.
+- **S3 Inspection panel** — tabs: terminal, diff, plan, files, Pull request.
+  The Pull request tab covers the session branch's PR status and available
+  lifecycle actions. Desktop: column 3. Mobile: reachable from session detail.
 - **S4 Diff review** — session branch vs base; per-file list; unified or
   split (desktop only).
-- **S5 Settings** — providers, integrations, MCP servers, skills,
-  look & feel (design-token themes), agent modes, git/worktrees.
+- **S5 Settings** — `/settings/<section>` shell with Appearance, Workspaces,
+  Providers, Vendor CLIs, Local models, Modes, Git & worktrees, MCP,
+  Integrations, Notifications, Capabilities, and About. Appearance retains the
+  existing design-token themes and visual preview; capability-dependent
+  sections report unavailable operations instead of implying support.
 - **S6 First-run / provider onboarding** — API key entry or OAuth login
   (device code must render well on mobile: show code, open browser).
-- **S7 About** — version, licenses, `AboutSlint` attribution (license
-  requirement).
+- **S7 About** — `/settings/about`; frontend, server, protocol, deployment,
+  connectivity, version, and licenses.
+- **S8 Code-review dashboard** — `/reviews`; App health, recent review jobs,
+  execution limits, GitHub App configuration, repository review policy and
+  routing, and built-in/custom reviewer administration.
+- **S9 Automations** — `/automations`; list, create, edit, run, and delete
+  server-scheduled prompts that execute in fresh sessions, including template,
+  workspace, schedule, mode, model, and permission configuration.
 
 ## Desktop layout (three columns, keyboard-driven)
 
-```
+```text
 ┌───────────┬──────────────────────────────┬───────────────────────┐
-│ nav       │ thread tabs  [+]             │ term │ diff │ plan │… │
+│ nav       │ thread tabs  [+]             │term│diff│plan│file│PR │
 │ workspace │ mode ▾  model ▾  options ▾   │                       │
 │ switcher  │──────────────────────────────│   inspection tab      │
 │           │ chat stream:                 │   content             │
@@ -86,39 +103,83 @@ signal and the sort key of every session list.
 - Status bar always shows the permission mode; YOLO renders in warning
   color everywhere it appears.
 
-## Mobile layout (stack navigation, monitor-first)
+## Mobile PWA layout (stack navigation, monitor-first)
 
-- **Home** = S1 sorted by needs-attention; pull to refresh; push
-  notification on approval blocks (mobile phase).
+- **Home** = S1 sorted by needs-attention; pull to refresh; push notification
+  on approval blocks where the installed PWA and deployment advertise that
+  capability.
 - **Session view** = S2 full-screen; tool cards tap-to-expand; approval
   prompts as bottom sheets with large approve/deny targets.
 - **Diff review** = S4 as per-file list → single-file unified diff (no
   side-by-side on narrow screens). Read and approve only.
 - Composer: text + quick-reply chips ("continue", "explain", "undo").
+- **Code review, automations, and settings** = S8, S9, and S5 as full-screen
+  routes using the same responsive panels and controls as desktop.
 
 ## Mobile-first discipline (applies to desktop now)
 
 Every screen composes from stackable panels — the three desktop columns are
 three panels that collapse to a stack. Touch-target sizing, no hover-only
 affordances, needs-attention inbox as the home concept. This is what makes
-the mobile phase a layout adaptation, not a redesign.
+the mobile PWA a layout adaptation, not a redesign. Themes, semantic colors,
+typography, component language, and status hierarchy remain shared with the
+desktop frontend.
+
+The PWA is the initial mobile solution. Native or embedded mobile alternatives
+will be evaluated later using measured adoption, workflow, platform, and
+capability evidence; they are not a prerequisite for the initial delivery.
+
+## Lit functional port and remaining gates
+
+The Lit application now implements the named screens and the existing Slint
+`AppWindow` callback contract across the exact-nightly Servo embedder, the
+default system-webview host, and the responsive PWA. The desktop hosts
+expose the versioned typed capability boundary for preferences, pickers,
+clipboard, validated local-file and HTTPS opening, notifications, attention,
+sleep, and window/lifecycle state. The PWA uses browser capability adapters
+and retains explicit fallbacks or explanations where the browser cannot
+provide the equivalent operation.
+
+This functional closure supports the staged default in ADR 0027; it is not a
+claim that desktop qualification is complete. Native and browser notification paths are
+wired, including preference gating, event-derived summaries, focused-session
+suppression, activation routing, and a user-initiated test; dependable PWA
+background delivery remains a publication gate. Promotion still requires the
+platform, accessibility, security, memory, widget, visual-parity,
+offline-packaging, rollback, and soak gates in
+[ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md). Slint remains the
+explicit rollback while those gates and the Wry rollout are completed.
 
 ## Key workflows
 
-1. **New session**: workspace → prompt → run (mode/model/permissions
-   optional; defaults make it two actions). Worktree + branch created
-   automatically.
+1. **New session**: choose a workspace and write the initial prompt, optionally
+   attaching files → generate the session title from that prompt, with a
+   bounded prompt-derived fallback if generation is unavailable → choose the
+   base branch and whether to fetch its upstream before worktree creation →
+   choose optional mode, model, permission, and model-derived thinking value →
+   create the session worktree and branch → create its first thread → send the
+   prompt with its attachments. Defaults keep the visible flow short; failures
+   after session creation leave the created session available and report which
+   later step did not complete.
 2. **New thread**: one action from an open session (tab "+" / palette);
-   inherits worktree, picks its own mode/model. Canonical flow: plan thread
-   → code thread → review thread on one branch.
+   opens a provisional, cancelable form before any server mutation; inherits
+   the worktree and chooses mode, model, thinking, and permission, with an
+   optional initial prompt and bounded file/paste attachments. Canonical flow:
+   plan thread → code thread → review thread on one branch.
 3. **Approval loop**: prompt inline in chat and as a notification; show
    exactly what will run; "always allow" is the ask → allow-list migration
    path; resolving from any client updates all (SSE).
 4. **Diff review & apply**: turn/session ends → review S4 → accept or
    revert (checkpoint undo/redo backs this).
-5. **PR flow (phase 5)**: session branch → PR with generated description →
-   full lifecycle in the GitHub tab; PR comments flow back into a thread.
+5. **PR flow**: session branch → Pull request inspection tab → inspect current
+   status and use the lifecycle actions the server reports as available.
 6. **Provider onboarding**: S6 on first run and from settings.
+7. **Automated code review**: `/reviews` → inspect App/job health → tune
+   execution settings → configure repositories and reviewer routing/personas →
+   monitor or act on review jobs.
+8. **Automation administration**: `/automations` → start from a template or a
+   blank automation → select workspace, schedule, prompt, and run defaults →
+   save, run on demand, or delete with confirmation.
 
 ## Component patterns (shared vocabulary)
 
@@ -128,6 +189,6 @@ the mobile phase a layout adaptation, not a redesign.
 - **Approval prompt**: renders the allow-list key it would create (e.g.
   `shell:cargo`), three actions, keyboard/tap parity.
 - **Status chips**: one component for session state, turn state, tool
-  state, CI state (phase 5) — consistent colors.
+  state, and CI state — consistent colors.
 - **Markdown stream**: renders incrementally from `assistant.delta` events;
   code blocks use the same highlight tokens as the file viewer.

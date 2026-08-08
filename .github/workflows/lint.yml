@@ -18,7 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Linux native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,6 +37,10 @@ jobs:
         run: python3 -m unittest scripts/test_sync_versions.py
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
+      - name: Rust dependency licenses, notices, and SBOM
+        run: >-
+          python3 scripts/generate_rust_third_party_notices.py
+          --check --sbom target/compliance/rust-sbom.cdx.json
       - name: benchmark gate tests
         run: python3 -m unittest benchmarks/test_compare_benchmarks.py
       # The test-with-model job in test.yml runs ignored tests from these two
@@ -53,10 +59,55 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: npm/package-lock.json
+          cache-dependency-path: |
+            npm/package-lock.json
+            web/app-ui/package-lock.json
       - name: review UI tests
         working-directory: web/review-ui
         run: npm test
+      - name: app UI install
+        working-directory: web/app-ui
+        run: npm ci
+      - name: app UI checks
+        working-directory: web/app-ui
+        run: |
+          npm run generate:protocol
+          git diff --exit-code -- src/generated
+          npm run format:check
+          npm run lint
+          npm run typecheck
+          npm test
+          npm run verify:notices
+          npm run build
+          npm run build:pwa
+          npm run verify:build-modes
+          npm run generate:sbom
+      - name: Install Playwright browsers
+        working-directory: web/app-ui
+        run: ./node_modules/.bin/playwright install --with-deps chromium firefox webkit
+      - name: App UI browser, accessibility, and visual checks
+        working-directory: web/app-ui
+        run: npm run test:browser
+      - name: Upload frontend compliance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-ui-compliance
+          path: |
+            web/app-ui/THIRD_PARTY_NOTICES.md
+            web/app-ui/dist/npm-sbom.cdx.json
+            target/compliance/rust-sbom.cdx.json
+          if-no-files-found: error
+      - name: Wry product and comparison targets
+        run: |
+          cargo check -p trouve-app --bin trouve
+          cargo check -p trouve-app --features web-preview --bin trouve-web-preview
+        env:
+          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
+      - name: Servo nested-workspace dependency graph
+        run: >-
+          cargo metadata
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --no-deps --format-version 1 > /dev/null
       # npm/ is an npm workspace; one install links the local packages
       # (search-plugin -> search-core) and installs all dev dependencies.
       - name: npm typecheck
