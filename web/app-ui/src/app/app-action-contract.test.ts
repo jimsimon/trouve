@@ -138,6 +138,7 @@ const SURFACES: readonly CallbackSurface[] = [
       {
         path: "../components/management-settings-panels.ts",
         markers: [
+          "derive_branch_name_from_session_title",
           "title_model_load_behavior",
           "title_model_resource_policy",
           "async #install(cancel:",
@@ -447,7 +448,8 @@ const SURFACES: readonly CallbackSurface[] = [
         markers: [
           "updateQueuedPrompt",
           "deleteQueuedPrompt",
-          "#moveQueued",
+          "#queueRowKeyDown",
+          "#commitQueueKeyboardReorder",
           "#dispatchQueue",
           "#sendQueuedNow",
         ],

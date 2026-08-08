@@ -106,6 +106,7 @@ const gitWorktreeSettingsEvent = (cursor: number, state: string): KnownIngressEv
     ts: `2026-08-01T12:03:${String(cursor).padStart(2, "0")}Z`,
     type: "settings.git_worktrees_updated",
     settings: {
+      derive_branch_name_from_session_title: false,
       title_model_load_behavior: "auto",
       title_model_resource_policy: "adaptive",
       title_model: {
@@ -256,6 +257,7 @@ describe("ProtocolIngress", () => {
           }],
           session_pull_requests: [{ session_id: "se_1", prs: [linkedPr] }],
           git_worktree_settings: {
+            derive_branch_name_from_session_title: false,
             title_model_load_behavior: "auto",
             title_model_resource_policy: "adaptive",
             title_model: {
@@ -304,6 +306,7 @@ describe("ProtocolIngress", () => {
         }],
         session_pull_requests: [],
         git_worktree_settings: {
+          derive_branch_name_from_session_title: false,
           title_model_load_behavior: "auto",
           title_model_resource_policy: "adaptive",
           title_model: {
@@ -365,6 +368,7 @@ describe("ProtocolIngress", () => {
         return {
           cursor: 12,
           value: {
+            derive_branch_name_from_session_title: false,
             title_model_load_behavior: "auto",
             title_model_resource_policy: "adaptive",
             title_model: {

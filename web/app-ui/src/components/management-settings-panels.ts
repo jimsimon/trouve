@@ -69,6 +69,23 @@ const panelStyles = css`
   .badge { border-radius: 999px; padding: 2px 7px; background: var(--trouve-control-bg); font-size: 0.78rem; }
   .naming-card { padding: 14px; border: 0; gap: 10px; }
   .naming-card hr { width: 100%; height: 1px; margin: 0; border: 0; background: var(--trouve-border); }
+  .check-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    color: var(--trouve-text);
+    cursor: pointer;
+  }
+  .check-row input[type="checkbox"] {
+    width: 16px;
+    min-height: 16px;
+    margin: 0;
+    padding: 0;
+    accent-color: var(--trouve-accent);
+  }
+  .check-row > span { font-size: 12px; }
+  code { color: var(--trouve-text-mid); font: 0.95em var(--trouve-font-mono, monospace); }
   .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .visually-hidden-focusable { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; padding: 0; clip: rect(0, 0, 0, 0); }
   .visually-hidden-focusable:focus-visible { position: static; width: auto; height: 30px; min-height: 30px; overflow: visible; padding: 4px 9px; clip: auto; }
@@ -246,6 +263,7 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
   #busy = false;
   #message = "";
   #error = false;
+  #draftDeriveBranchName: boolean | undefined;
   #draftLoadBehavior: TitleModelLoadBehavior | undefined;
   #draftResourcePolicy: TitleModelResourcePolicy | undefined;
 
@@ -258,7 +276,7 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined) return;
     this.#busy = true;
-    this.#message = "Loading Git and worktree settings…";
+    this.#message = "Loading session naming settings…";
     this.#error = false;
     this.requestUpdate();
     try {
@@ -282,6 +300,8 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     if (protocol === undefined || this.#busy) return;
     const current = this.#currentSettings();
     const data = new FormData(event.currentTarget as HTMLFormElement);
+    const deriveBranchName = this.#draftDeriveBranchName ??
+      data.has("derive_branch_name");
     const submittedBehavior = data.get("load_behavior");
     const submittedResources = data.get("resource_policy");
     const behavior = this.#draftLoadBehavior ?? (
@@ -303,13 +323,14 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       const snapshot = await protocol.setGitWorktreeSettingsSnapshot({
+        derive_branch_name_from_session_title: deriveBranchName,
         title_model_load_behavior: behavior,
         title_model_resource_policy: resources,
       });
       this.#store.value?.replaceGitWorktreeSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
       this.#clearDraft();
-      this.#message = "Git and worktree settings saved.";
+      this.#message = "Session naming settings saved.";
     } catch {
       this.#clearDraft();
       this.#message = genericFailure("Saving settings");
@@ -330,10 +351,12 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     const form = (event.currentTarget as HTMLSelectElement).form;
     const behaviorSelect = form?.elements.namedItem("load_behavior");
     const resourceSelect = form?.elements.namedItem("resource_policy");
+    const deriveBranchName = form?.elements.namedItem("derive_branch_name");
     if (
       form === null ||
       !(behaviorSelect instanceof HTMLSelectElement) ||
       !(resourceSelect instanceof HTMLSelectElement) ||
+      !(deriveBranchName instanceof HTMLInputElement) ||
       !isTitleModelLoadBehavior(behaviorSelect.value) ||
       !isTitleModelResourcePolicy(resourceSelect.value)
     ) return;
@@ -341,11 +364,20 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     // makes the selected option and its explanation update in the same frame.
     this.#draftLoadBehavior = behaviorSelect.value;
     this.#draftResourcePolicy = resourceSelect.value;
+    this.#draftDeriveBranchName = deriveBranchName.checked;
     this.requestUpdate();
     form.requestSubmit();
   }
 
+  #branchNamingChanged(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    this.#draftDeriveBranchName = input.checked;
+    this.requestUpdate();
+    input.form?.requestSubmit();
+  }
+
   #clearDraft(): void {
+    this.#draftDeriveBranchName = undefined;
     this.#draftLoadBehavior = undefined;
     this.#draftResourcePolicy = undefined;
   }
@@ -374,16 +406,30 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     const model = settings?.title_model;
     const total = model?.install_total ?? 0;
     const value = model?.install_bytes ?? 0;
+    const deriveBranchName = this.#draftDeriveBranchName ??
+      settings?.derive_branch_name_from_session_title ?? false;
     const behavior = this.#draftLoadBehavior ??
       settings?.title_model_load_behavior ?? "auto";
     const resources = this.#draftResourcePolicy ??
       settings?.title_model_resource_policy ?? "adaptive";
     return html`
       <div class="stack">
-        <h2>Git &amp; Worktrees</h2>
-        <p class="meta">Session names become branch names too, so trouve derives a concise title before creating the session worktree.</p>
+        <h2>Session naming</h2>
+        <p class="meta">trouve derives a concise title for each session before creating its worktree.</p>
         <form class="card naming-card" @submit=${(event: SubmitEvent) => void this.#save(event)}>
-          <h3>Session naming</h3>
+          <label class="check-row">
+            <input
+              name="derive_branch_name"
+              type="checkbox"
+              .checked=${deriveBranchName}
+              ?disabled=${this.#busy}
+              @change=${this.#branchNamingChanged}
+            />
+            <span>Use session names in branch names</span>
+          </label>
+          <p class="meta">Off by default: new branches use a compact name such as <code>trouve/abc123</code>. Turn this on to use names such as <code>trouve/session-name-abc123</code>. Existing branches are not renamed.</p>
+          <hr />
+          <h3>Optional naming model</h3>
           <label><span class="visually-hidden">Load behavior</span><select name="load_behavior" .value=${behavior} ?disabled=${this.#busy} @change=${this.#selectionChanged}>
               ${TITLE_MODEL_LOAD_OPTIONS.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
             </select></label>

@@ -52,6 +52,7 @@ describe("ProtocolClient", () => {
       github_pull_requests: [],
       session_pull_requests: [],
       git_worktree_settings: {
+        derive_branch_name_from_session_title: false,
         title_model_load_behavior: "auto",
         title_model_resource_policy: "adaptive",
         title_model: {
@@ -340,6 +341,40 @@ describe("ProtocolClient", () => {
     expect(requests.every((request) => request.headers.get("content-type") === null)).toBe(true);
   });
 
+  it("restores and forks exact checkpoints through protected generated routes", async () => {
+    const requests: Request[] = [];
+    const thread = {
+      id: "th_fork",
+      session_id: session.id,
+      model: "openai/gpt-5.6",
+      mode: "code",
+      permission_mode: "ask",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      return request.url.endsWith("/restore")
+        ? new Response(null, { status: 204 })
+        : Response.json({ session, thread });
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await expect(client.restoreCheckpoint("cp/slash")).resolves.toBeUndefined();
+    await expect(client.forkCheckpoint("cp/slash")).resolves.toEqual({ session, thread });
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/v1/checkpoints/cp%2Fslash/restore",
+      "/v1/checkpoints/cp%2Fslash/fork",
+    ]);
+    expect(requests.every(
+      (request) => request.headers.get("x-trouve-host-csrf") === "ephemeral-token",
+    )).toBe(true);
+  });
+
   it("generates a validated session title through a protected protocol mutation", async () => {
     const requests: Request[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
@@ -370,6 +405,7 @@ describe("ProtocolClient", () => {
 
   it("pairs Git and worktree settings with a validated server cursor", async () => {
     const settings = {
+      derive_branch_name_from_session_title: false,
       title_model_load_behavior: "auto",
       title_model_resource_policy: "adaptive",
       title_model: {
@@ -433,12 +469,14 @@ describe("ProtocolClient", () => {
     await expect(client.listQueue("th_1")).resolves.toEqual([queued]);
     await expect(client.reorderQueue("th_1", ["qp_1"])).resolves.toEqual([queued]);
     await expect(client.dispatchQueue("th_1")).resolves.toMatchObject({ turn: 3 });
+    await expect(client.dispatchQueuedPrompt("qp_1")).resolves.toMatchObject({ turn: 3 });
     await expect(client.deleteQueuedPrompt("qp_1")).resolves.toBeUndefined();
 
     expect(requests.map((request) => request.method)).toEqual([
       "PATCH",
       "GET",
       "PUT",
+      "POST",
       "POST",
       "DELETE",
     ]);
@@ -450,6 +488,7 @@ describe("ProtocolClient", () => {
     });
     expect(requests[1]?.url).toContain("/v1/threads/th_1/queue");
     expect(requests[2]?.url).toContain("/v1/threads/th_1/queue");
+    expect(requests[4]?.url).toContain("/v1/queue/qp_1/dispatch");
     expect(
       requests.filter((request) => request.method !== "GET").every(
         (request) => request.headers.get("x-trouve-host-csrf") === "ephemeral-token",
@@ -723,13 +762,16 @@ describe("ProtocolClient", () => {
 });
 
 describe("protocol compatibility", () => {
-  it("accepts the required minor and forward-compatible 2.x minors", () => {
+  it("accepts the supported 2.x and 3.x protocol generations", () => {
     expect(() => assertProtocolCompatibility("2.9")).not.toThrow();
     expect(() => assertProtocolCompatibility("2.19")).not.toThrow();
+    expect(() => assertProtocolCompatibility("3.0")).not.toThrow();
+    expect(() => assertProtocolCompatibility("3.14")).not.toThrow();
+    expect(() => assertProtocolCompatibility("3.99")).not.toThrow();
   });
 
   it("rejects older, malformed, and new-major servers", () => {
-    for (const version of ["2.8", "2.3", "2.2", "3.0", "unknown", ""]) {
+    for (const version of ["2.8", "2.3", "1.99", "4.0", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

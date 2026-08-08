@@ -39,9 +39,19 @@ impl ThreadProjection {
         self.ensure_indexes();
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnStarted { turn, model, .. } => {
+            Event::TurnStarted {
+                turn,
+                model,
+                thinking_level,
+                ..
+            } => {
                 self.snapshot.turn_running = true;
                 self.snapshot.turn_models.insert(*turn, model.clone());
+                if let Some(thinking_level) = thinking_level {
+                    self.snapshot
+                        .turn_thinking_levels
+                        .insert(*turn, thinking_level.clone());
+                }
                 self.snapshot.turn_started_at.insert(*turn, envelope.ts);
                 let idx = self.push(ThreadViewItem::TurnStatus {
                     turn: *turn,
@@ -113,6 +123,9 @@ impl ThreadProjection {
                     self.indexes.open_thinking.insert(*turn, idx);
                     self.indexes.latest_thinking = Some(idx);
                 }
+            }
+            Event::AssistantThinkingCompleted { .. } => {
+                self.finish_thinking();
             }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
@@ -296,7 +309,11 @@ impl ThreadProjection {
             Event::TurnUsageUpdated { usage, .. } => {
                 self.snapshot.last_usage = Some(usage.clone());
             }
-            Event::TurnCompleted { turn, usage, .. } => {
+            Event::TurnCompleted {
+                turn,
+                usage,
+                checkpoint_id,
+            } => {
                 self.finish_turn(*turn, envelope.ts);
                 self.snapshot.last_usage = Some(usage.clone());
                 if let Some(&idx) = self.indexes.turns.get(turn) {
@@ -304,6 +321,7 @@ impl ThreadProjection {
                         turn: *turn,
                         state: ThreadTurnState::Completed {
                             usage: usage.clone(),
+                            checkpoint_id: checkpoint_id.clone(),
                         },
                     };
                 }
@@ -598,6 +616,7 @@ mod tests {
                 turn: 7,
                 mode: "code".into(),
                 model: "codex/gpt-5.6-sol".into(),
+                thinking_level: Some("max".into()),
             },
         ));
         let usage = trouve_protocol::Usage {
@@ -619,12 +638,85 @@ mod tests {
 
         assert!(projection.snapshot.turn_running);
         assert_eq!(projection.snapshot.last_usage, Some(usage));
+        assert_eq!(
+            projection
+                .snapshot
+                .turn_thinking_levels
+                .get(&7)
+                .map(String::as_str),
+            Some("max")
+        );
         assert!(matches!(
             projection.snapshot.items.first(),
             Some(ThreadViewItem::TurnStatus {
                 state: ThreadTurnState::Running,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn completed_turn_retains_its_checkpoint_id() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 2,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            20,
+            Event::TurnCompleted {
+                turn: 2,
+                usage: trouve_protocol::Usage::default(),
+                checkpoint_id: Some("cp_after_2".into()),
+            },
+        ));
+
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 2,
+                state: ThreadTurnState::Completed {
+                    checkpoint_id: Some(checkpoint_id),
+                    ..
+                },
+            }) if checkpoint_id == "cp_after_2"
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_completion_closes_without_followup_output() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "Waiting for the next event.".into(),
+            },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        // Exercise the durable-cache rebuild path: the completion edge must
+        // find and close the previously streamed thought after replay too.
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        projection.apply(&envelope(
+            2,
+            25,
+            Event::AssistantThinkingCompleted { turn: 4 },
+        ));
+
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Thinking { complete: true, .. })
         ));
     }
 

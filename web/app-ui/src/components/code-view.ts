@@ -81,6 +81,16 @@ export const loadCodeMirrorExtensions = async (options: {
     { tag: [tags.typeName, tags.className, tags.namespace], color: "var(--trouve-syn-type)" },
     { tag: tags.invalid, color: "var(--trouve-err)", textDecoration: "underline wavy" },
   ]);
+  const selectedText = view.Decoration.mark({ class: "cm-trouve-selectedText" });
+  const selectedTextDecorations = view.EditorView.outerDecorations.compute(
+    ["selection"],
+    (state) => view.Decoration.set(
+      state.selection.ranges
+        .filter((range) => !range.empty)
+        .map((range) => selectedText.range(range.from, range.to)),
+      true,
+    ),
+  );
   const extensions: Extension[] = [
     EditorState.readOnly.of(true),
     view.EditorView.editable.of(false),
@@ -92,6 +102,7 @@ export const loadCodeMirrorExtensions = async (options: {
         }),
     view.highlightActiveLineGutter(),
     view.drawSelection(),
+    selectedTextDecorations,
     view.rectangularSelection(),
     view.crosshairCursor(),
     view.highlightSpecialChars(),
@@ -129,7 +140,15 @@ export const loadCodeMirrorExtensions = async (options: {
         backgroundColor: "var(--trouve-hover-bg)",
       },
       ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
-        backgroundColor: "var(--trouve-selection-bg)",
+        // CodeMirror's base focused-selection selector carries an extra
+        // light/dark class. `!important` keeps the semantic theme token
+        // authoritative instead of falling back to its pale lavender default.
+        backgroundColor: "var(--trouve-selection-bg) !important",
+      },
+      ".cm-trouve-selectedText, .cm-trouve-selectedText *": {
+        // Syntax spans remain nested inside the outer selection decoration.
+        // A single contrast-checked foreground keeps every token readable.
+        color: "var(--trouve-selection-fg) !important",
       },
       ".cm-cursor": { borderLeftColor: "var(--trouve-text-hi)" },
       ".tok-keyword, .tok-operatorKeyword": { color: "var(--trouve-syn-keyword)" },

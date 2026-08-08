@@ -35,6 +35,18 @@ describe("session list component contract", () => {
     expect(component).toContain("Status: ${sessionStatusText(session)}");
   });
 
+  it("keeps navigation sessions to one line without rendering branch names", () => {
+    expect(component).toContain('<span class="session-copy">');
+    expect(component).toContain("<strong>${session.title}</strong>");
+    expect(component).not.toContain("session.branch");
+    expect(component).not.toContain("<small>");
+    expect(styles).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
+    expect(styles).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
+    expect(styles).toMatch(
+      /\.session-copy strong \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
+    );
+  });
+
   it("uses the attention, error, unread, busy, and idle presentations", () => {
     expect(component).toContain("sessionIndicatorPresentation(session)");
     const idle: SessionIndicatorFields = {

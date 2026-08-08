@@ -16,6 +16,8 @@ export type ProtocolEventEnvelope =
   ProtocolComponents["schemas"]["EventEnvelope"];
 export type ProtocolScope = ProtocolComponents["schemas"]["Scope"];
 export type ProtocolSession = ProtocolComponents["schemas"]["Session"];
+export type ProtocolForkCheckpointResponse =
+  ProtocolComponents["schemas"]["ForkCheckpointResponse"];
 export type ProtocolCreateSessionRequest =
   ProtocolComponents["schemas"]["CreateSessionRequest"];
 export type ProtocolGeneratedSessionTitle =
@@ -71,6 +73,10 @@ export type ProtocolResolveQuestionRequest =
 export type ProtocolSessionDiff = ProtocolComponents["schemas"]["SessionDiff"];
 export type ProtocolRestoreDirection =
   ProtocolComponents["schemas"]["RestoreDirection"];
+export type ProtocolRelativeRestoreDirection = Exclude<
+  ProtocolRestoreDirection,
+  "exact"
+>;
 export type ProtocolDirEntry = ProtocolComponents["schemas"]["DirEntry"];
 export type ProtocolFileContent = ProtocolComponents["schemas"]["FileContent"];
 export type ProtocolTerminalInfo = ProtocolComponents["schemas"]["TerminalInfo"];
@@ -164,6 +170,7 @@ export type ProtocolIngressEvent =
 interface ProtocolValidators {
   readonly session: ValidateFunction;
   readonly sessions: ValidateFunction;
+  readonly forkCheckpointResponse: ValidateFunction;
   readonly generatedSessionTitle: ValidateFunction;
   readonly summaries: ValidateFunction;
   readonly workspace: ValidateFunction;
@@ -238,6 +245,7 @@ const validateResponse = async <T>(
   name:
     | "Session"
     | "Session[]"
+    | "ForkCheckpointResponse"
     | "GeneratedSessionTitle"
     | "SessionSummariesSnapshot"
     | "Workspace"
@@ -338,7 +346,14 @@ export class ProtocolClientError extends Error {
   }
 }
 
+// Protocol 2.9 is the oldest event/API surface supported by the web client.
+// The 3.0 break changed code-review routing semantics rather than the client
+// transport, so this client deliberately supports both generations. Keep this
+// range independent from the current server protocol so a Vite refresh can
+// continue to use an already-running desktop server while optional events
+// roll out.
 export const MINIMUM_PROTOCOL_VERSION = "2.9";
+const MAXIMUM_PROTOCOL_MAJOR = 3;
 
 export const assertProtocolCompatibility = (version: string): void => {
   const match = /^(\d+)\.(\d+)$/.exec(version);
@@ -347,10 +362,17 @@ export const assertProtocolCompatibility = (version: string): void => {
   const minor = Number(match?.[2]);
   const minimumMajor = Number(minimum[1]);
   const minimumMinor = Number(minimum[2]);
-  if (major !== minimumMajor || !Number.isSafeInteger(minor) || minor < minimumMinor) {
+  const olderThanMinimum =
+    major < minimumMajor || (major === minimumMajor && minor < minimumMinor);
+  if (
+    !Number.isSafeInteger(major) ||
+    !Number.isSafeInteger(minor) ||
+    olderThanMinimum ||
+    major > MAXIMUM_PROTOCOL_MAJOR
+  ) {
     throw new ProtocolClientError(
       "incompatible-protocol",
-      `server protocol ${version || "unknown"} is incompatible; expected ${MINIMUM_PROTOCOL_VERSION} or newer ${minimumMajor}.x`,
+      `server protocol ${version || "unknown"} is incompatible; expected ${MINIMUM_PROTOCOL_VERSION} or newer through ${MAXIMUM_PROTOCOL_MAJOR}.x`,
     );
   }
 };
@@ -1149,7 +1171,7 @@ export class ProtocolClient {
   async gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
     return this.#validatedJson(
       "/v1/config/git-worktrees",
-      "Git and worktree settings",
+      "Session naming settings",
       "GitWorktreeSettings",
       (loaded) => loaded.gitWorktreeSettings,
     );
@@ -1160,7 +1182,7 @@ export class ProtocolClient {
   > {
     return this.#validatedCursorJson(
       "/v1/config/git-worktrees",
-      "Git and worktree settings",
+      "Session naming settings",
       "GitWorktreeSettings",
       (loaded) => loaded.gitWorktreeSettings,
     );
@@ -1171,7 +1193,7 @@ export class ProtocolClient {
   ): Promise<ProtocolGitWorktreeSettings> {
     return this.#validatedMutation(
       "/v1/config/git-worktrees",
-      "save Git and worktree settings",
+      "save session naming settings",
       "PUT",
       "GitWorktreeSettings",
       (loaded) => loaded.gitWorktreeSettings,
@@ -1184,7 +1206,7 @@ export class ProtocolClient {
   ): Promise<ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>> {
     return this.#validatedCursorMutation(
       "/v1/config/git-worktrees",
-      "save Git and worktree settings",
+      "save session naming settings",
       "PUT",
       "GitWorktreeSettings",
       (loaded) => loaded.gitWorktreeSettings,
@@ -1522,6 +1544,32 @@ export class ProtocolClient {
     );
   }
 
+  async dispatchQueuedPrompt(promptId: string): Promise<ProtocolTurnAccepted> {
+    let result;
+    try {
+      result = await this.#client.POST("/v1/queue/{id}/dispatch", {
+        params: { path: { id: promptId } },
+        headers: this.#mutationHeaders(),
+      });
+    } catch {
+      throw new ProtocolClientError(
+        "request-failed",
+        "dispatch queued prompt request failed",
+      );
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "dispatch queued prompt request failed",
+      );
+    }
+    return validateResponse<ProtocolTurnAccepted>(
+      "TurnAccepted",
+      result.data,
+      (loaded) => loaded.turnAccepted,
+    );
+  }
+
   async sendMessage(
     threadId: string,
     request: ProtocolSendMessageRequest,
@@ -1650,12 +1698,40 @@ export class ProtocolClient {
 
   async restoreSessionCheckpoint(
     sessionId: string,
-    direction: ProtocolRestoreDirection,
+    direction: ProtocolRelativeRestoreDirection,
   ): Promise<void> {
     await this.#mutation(
       `/v1/sessions/${encodeURIComponent(sessionId)}/${encodeURIComponent(direction)}`,
       "session checkpoint restore",
       "POST",
+    );
+  }
+
+  async restoreCheckpoint(checkpointId: string): Promise<void> {
+    await this.#mutation(
+      `/v1/checkpoints/${encodeURIComponent(checkpointId)}/restore`,
+      "checkpoint restore",
+      "POST",
+    );
+  }
+
+  async forkCheckpoint(checkpointId: string): Promise<ProtocolForkCheckpointResponse> {
+    let result;
+    try {
+      result = await this.#client.POST("/v1/checkpoints/{id}/fork", {
+        params: { path: { id: checkpointId } },
+        headers: this.#mutationHeaders(),
+      });
+    } catch {
+      throw new ProtocolClientError("request-failed", "checkpoint fork request failed");
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError("request-failed", "checkpoint fork request failed");
+    }
+    return validateResponse<ProtocolForkCheckpointResponse>(
+      "ForkCheckpointResponse",
+      result.data,
+      (loaded) => loaded.forkCheckpointResponse,
     );
   }
 

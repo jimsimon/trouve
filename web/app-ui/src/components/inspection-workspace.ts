@@ -8,7 +8,7 @@ import {
 } from "../contexts/app-contexts.js";
 import type {
   ProtocolFileContent,
-  ProtocolRestoreDirection,
+  ProtocolRelativeRestoreDirection,
 } from "../services/protocol-client.js";
 import { prepareUnifiedDiffOffThread } from "../services/content-worker-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
@@ -58,7 +58,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #diffRequestActive = false;
   #diffLoaded = false;
   #refreshing = false;
-  #restorePending: ProtocolRestoreDirection | "" = "";
+  #restorePending: ProtocolRelativeRestoreDirection | "" = "";
   #notice = "";
   #noticeIsError = false;
   #copyFeedback = "";
@@ -105,8 +105,24 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     return this.sessionId || this.#sessionScope.value?.sessionId || "";
   }
 
+  readonly #checkpointRestored = (event: Event): void => {
+    const detail = (event as CustomEvent<{ readonly sessionId?: string }>).detail;
+    if (detail?.sessionId !== this.#effectiveSessionId || !this.isConnected) return;
+    if (this.panel === "diff") {
+      void this.#refreshDiff({ silent: false, force: true });
+      return;
+    }
+    const selectedPath = this.#file?.path ?? this.#fileTargetPath;
+    void this.#loadRootDirectory(true).then(() => {
+      if (selectedPath !== "" && this.panel === "files" && this.isConnected) {
+        void this.#loadFile(selectedPath);
+      }
+    });
+  };
+
   override connectedCallback(): void {
     super.connectedCallback();
+    globalThis.addEventListener("trouve-checkpoint-restored", this.#checkpointRestored);
     this.#diffRefreshTimer ??= globalThis.setInterval(() => {
       if (
         this.panel !== "diff" ||
@@ -176,6 +192,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   }
 
   override disconnectedCallback(): void {
+    globalThis.removeEventListener("trouve-checkpoint-restored", this.#checkpointRestored);
     this.#generation += 1;
     this.#fileTreeGeneration += 1;
     this.#fileGeneration += 1;
@@ -943,7 +960,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     }
   }
 
-  async #restoreCheckpoint(direction: ProtocolRestoreDirection): Promise<void> {
+  async #restoreCheckpoint(direction: ProtocolRelativeRestoreDirection): Promise<void> {
     const services = this.#services.value;
     if (
       services === undefined ||

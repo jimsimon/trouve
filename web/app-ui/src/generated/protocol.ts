@@ -106,6 +106,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/checkpoints/{id}/fork": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["fork_checkpoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/checkpoints/{id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["restore_checkpoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/clis": {
         parameters: {
             query?: never;
@@ -924,6 +956,27 @@ export interface paths {
         options?: never;
         head?: never;
         patch: operations["update_queued_prompt"];
+        trace?: never;
+    };
+    "/v1/queue/{id}/dispatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move one queued prompt to the front and dispatch it immediately. An
+         *     active turn is interrupted; its terminal event is persisted before the
+         *     selected prompt starts as the next turn.
+         */
+        post: operations["dispatch_queued_prompt"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/server-projection": {
@@ -2257,7 +2310,10 @@ export interface components {
              *     remote commit. Refs without an upstream are used as-is.
              */
             fetch_latest?: boolean;
-            /** @description Human-readable title; also used to derive the branch slug. */
+            /**
+             * @description Human-readable title. When title-derived branch naming is enabled,
+             *     this is also used to derive the branch slug.
+             */
             title?: string | null;
             workspace_id: components["schemas"]["String"];
         };
@@ -2297,6 +2353,11 @@ export interface components {
         } | {
             mode: string;
             model: string;
+            /**
+             * @description Effective provider-native thinking/reasoning selection for this
+             *     turn after inherited defaults and model schema normalization.
+             */
+            thinking_level?: string | null;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
@@ -2348,6 +2409,11 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "assistant.thinking";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "assistant.thinking_completed";
         } | {
             content: string;
             /** Format: int64 */
@@ -2616,7 +2682,15 @@ export interface components {
             status: string;
             summary: string;
         };
-        /** @description Ask the server to derive the title used to create a session and branch. */
+        /**
+         * @description A new session and its initial thread, both created from an existing
+         *     turn checkpoint.
+         */
+        ForkCheckpointResponse: {
+            session: components["schemas"]["Session"];
+            thread: components["schemas"]["Thread"];
+        };
+        /** @description Ask the server to derive a concise title for a new session. */
         GenerateSessionTitleRequest: {
             prompt: string;
         };
@@ -2625,8 +2699,13 @@ export interface components {
             source: string;
             title: string;
         };
-        /** @description Global settings shown under Settings → Git & Worktrees. */
+        /** @description Global session-naming settings shown under Settings → Sessions & Chat. */
         GitWorktreeSettings: {
+            /**
+             * @description Whether new session branches include a slug derived from the session
+             *     title. False uses the compact `trouve/<short-id>` form.
+             */
+            derive_branch_name_from_session_title?: boolean;
             title_model: components["schemas"]["TitleModelStatus"];
             title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
             title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
@@ -3181,7 +3260,7 @@ export interface components {
             request_id: components["schemas"]["String"];
         };
         /** @enum {string} */
-        RestoreDirection: "undo" | "redo";
+        RestoreDirection: "undo" | "redo" | "exact";
         /** @description Repository-specific changes layered over a reusable reviewer profile. */
         ReviewerOverride: {
             /**
@@ -3266,7 +3345,10 @@ export interface components {
              */
             archived?: boolean;
             base_ref: string;
-            /** @description Branch dedicated to this session (`trouve/<slug>`). */
+            /**
+             * @description Branch dedicated to this session. New sessions default to
+             *     `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
+             */
             branch: string;
             /** Format: date-time */
             created_at: string;
@@ -3383,8 +3465,10 @@ export interface components {
         SetDefaultPermissionModeRequest: {
             permission_mode: components["schemas"]["PermissionMode"];
         };
-        /** @description Update Settings → Git & Worktrees. */
+        /** @description Update the Session Naming section under Settings → Sessions & Chat. */
         SetGitWorktreeSettingsRequest: {
+            /** @description Omitted by older clients to preserve the current branch-naming mode. */
+            derive_branch_name_from_session_title?: boolean | null;
             title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
             title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
         };
@@ -3488,6 +3572,7 @@ export interface components {
             /** @enum {string} */
             state: "running";
         } | {
+            checkpoint_id?: null | components["schemas"]["String"];
             /** @enum {string} */
             state: "completed";
             usage: components["schemas"]["Usage"];
@@ -3609,6 +3694,9 @@ export interface components {
             };
             turn_running?: boolean;
             turn_started_at?: {
+                [key: string]: string;
+            };
+            turn_thinking_levels?: {
                 [key: string]: string;
             };
         };
@@ -4107,6 +4195,78 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    fork_checkpoint: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForkCheckpointResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_checkpoint: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             404: {
                 headers: {
@@ -5852,6 +6012,43 @@ export interface operations {
                 content?: never;
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    dispatch_queued_prompt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TurnAccepted"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

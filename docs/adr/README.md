@@ -26,7 +26,7 @@ sequentially.
 | [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Accepted |
 | [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Accepted |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
-| [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Accepted |
+| [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Superseded by 0029 |
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
 | [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
@@ -38,3 +38,4 @@ sequentially.
 | [0026](0026-desktop-frontend-asset-sources.md) | Desktop frontend asset sources | Accepted |
 | [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Superseded by 0028 |
 | [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Accepted |
+| [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |

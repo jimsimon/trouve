@@ -94,7 +94,7 @@ pub struct ServerInfo {
     pub online: bool,
 }
 
-// --- Git & Worktrees settings -------------------------------------------
+// --- session naming settings --------------------------------------------
 
 /// When the dedicated session-title model should occupy memory.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -149,24 +149,31 @@ pub struct TitleModelStatus {
     pub install_total: u64,
 }
 
-/// Global settings shown under Settings → Git & Worktrees.
+/// Global session-naming settings shown under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GitWorktreeSettings {
+    /// Whether new session branches include a slug derived from the session
+    /// title. False uses the compact `trouve/<short-id>` form.
+    #[serde(default)]
+    pub derive_branch_name_from_session_title: bool,
     pub title_model_load_behavior: TitleModelLoadBehavior,
     #[serde(default)]
     pub title_model_resource_policy: TitleModelResourcePolicy,
     pub title_model: TitleModelStatus,
 }
 
-/// Update Settings → Git & Worktrees.
+/// Update the Session Naming section under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetGitWorktreeSettingsRequest {
+    /// Omitted by older clients to preserve the current branch-naming mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive_branch_name_from_session_title: Option<bool>,
     pub title_model_load_behavior: TitleModelLoadBehavior,
     #[serde(default)]
     pub title_model_resource_policy: TitleModelResourcePolicy,
 }
 
-/// Ask the server to derive the title used to create a session and branch.
+/// Ask the server to derive a concise title for a new session.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GenerateSessionTitleRequest {
     pub prompt: String,
@@ -201,7 +208,8 @@ pub struct Workspace {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
     pub workspace_id: WorkspaceId,
-    /// Human-readable title; also used to derive the branch slug.
+    /// Human-readable title. When title-derived branch naming is enabled,
+    /// this is also used to derive the branch slug.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Base ref the session branch is created from (default: workspace HEAD).
@@ -223,7 +231,8 @@ pub struct Session {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
-    /// Branch dedicated to this session (`trouve/<slug>`).
+    /// Branch dedicated to this session. New sessions default to
+    /// `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
     pub branch: String,
     /// Absolute path of the session worktree.
     pub worktree_path: String,
@@ -237,6 +246,14 @@ pub struct Session {
     #[serde(default)]
     pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A new session and its initial thread, both created from an existing
+/// turn checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ForkCheckpointResponse {
+    pub session: Session,
+    pub thread: Thread,
 }
 
 /// Partial session update (rename / archive). Omitted fields are unchanged.
@@ -379,8 +396,16 @@ pub enum ThreadToolStatus {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ThreadTurnState {
     Running,
-    Completed { usage: crate::Usage },
-    Failed { error: String },
+    Completed {
+        usage: crate::Usage,
+        /// Checkpoint created after this turn. Older retained snapshots may
+        /// omit it, in which case checkpoint actions are unavailable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<crate::CheckpointId>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -424,6 +449,8 @@ pub struct ThreadViewSnapshot {
     pub thinking: bool,
     #[serde(default)]
     pub turn_models: std::collections::BTreeMap<u64, String>,
+    #[serde(default)]
+    pub turn_thinking_levels: std::collections::BTreeMap<u64, String>,
     #[serde(default)]
     pub turn_started_at: std::collections::BTreeMap<u64, chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -2245,6 +2272,18 @@ mod tests {
             request.title_model_resource_policy,
             TitleModelResourcePolicy::CpuRamOnly
         );
+        assert_eq!(request.derive_branch_name_from_session_title, None);
+
+        let historical: GitWorktreeSettings = serde_json::from_value(serde_json::json!({
+            "title_model_load_behavior": "auto",
+            "title_model": {
+                "state": "not_installed",
+                "runtime_installed": false,
+                "model_downloaded": false
+            }
+        }))
+        .unwrap();
+        assert!(!historical.derive_branch_name_from_session_title);
     }
 
     #[test]

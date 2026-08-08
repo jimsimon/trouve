@@ -126,8 +126,13 @@ pub enum ToolCallStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnState {
     Running,
-    Completed { usage: Usage },
-    Failed { error: String },
+    Completed {
+        usage: Usage,
+        checkpoint_id: Option<String>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +172,9 @@ pub struct ThreadViewModel {
     /// The model that ran each turn ("cursor/claude-fable-5"), from
     /// turn.started — shown in the agent card header.
     pub turn_models: HashMap<u64, String>,
+    /// The effective provider-native thinking selection for each turn, from
+    /// turn.started — shown alongside the model in the agent card header.
+    pub turn_thinking_levels: HashMap<u64, String>,
     /// When each turn started (the turn.started envelope timestamp);
     /// paired with the completion envelope to compute wall-clock duration.
     pub turn_started_at: HashMap<u64, chrono::DateTime<chrono::Utc>>,
@@ -196,6 +204,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
             turn_models: snapshot.turn_models.into_iter().collect(),
+            turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
             turn_started_at: snapshot.turn_started_at.into_iter().collect(),
             turn_duration_ms: snapshot.turn_duration_ms.into_iter().collect(),
             commands: snapshot.commands,
@@ -271,7 +280,13 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 state: match state {
                     ThreadTurnState::Running => TurnState::Running,
-                    ThreadTurnState::Completed { usage } => TurnState::Completed { usage },
+                    ThreadTurnState::Completed {
+                        usage,
+                        checkpoint_id,
+                    } => TurnState::Completed {
+                        usage,
+                        checkpoint_id,
+                    },
                     ThreadTurnState::Failed { error } => TurnState::Failed { error },
                 },
             },
@@ -305,16 +320,21 @@ impl ThreadViewModel {
 
     /// Close the trailing open thinking block (any non-thinking output ends
     /// it; a later thinking delta starts a fresh block).
-    fn finish_thinking(&mut self) {
+    fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
-        if let Some(ChatItem::Thinking { complete, .. }) = self
-            .items
-            .iter_mut()
-            .rev()
-            .find(|i| matches!(i, ChatItem::Thinking { .. }))
-        {
+        let idx = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Thinking {
+                    complete: false,
+                    ..
+                }
+            )
+        })?;
+        if let ChatItem::Thinking { complete, .. } = &mut self.items[idx] {
             *complete = true;
         }
+        Some(idx)
     }
 
     fn fail_open_compaction(&mut self, turn: u64) -> Option<usize> {
@@ -349,9 +369,18 @@ impl ThreadViewModel {
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnStarted { turn, model, .. } => {
+            Event::TurnStarted {
+                turn,
+                model,
+                thinking_level,
+                ..
+            } => {
                 self.turn_running = true;
                 self.turn_models.insert(*turn, model.clone());
+                if let Some(thinking_level) = thinking_level {
+                    self.turn_thinking_levels
+                        .insert(*turn, thinking_level.clone());
+                }
                 self.turn_started_at.insert(*turn, envelope.ts);
                 self.items.push(ChatItem::TurnStatus {
                     turn: *turn,
@@ -455,6 +484,7 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
+            Event::AssistantThinkingCompleted { .. } => self.finish_thinking(),
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
@@ -685,7 +715,11 @@ impl ThreadViewModel {
                 self.last_usage = Some(usage.clone());
                 None
             }
-            Event::TurnCompleted { turn, usage, .. } => {
+            Event::TurnCompleted {
+                turn,
+                usage,
+                checkpoint_id,
+            } => {
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
@@ -700,6 +734,7 @@ impl ThreadViewModel {
                         turn: *turn,
                         state: TurnState::Completed {
                             usage: usage.clone(),
+                            checkpoint_id: checkpoint_id.clone(),
                         },
                     };
                 }
@@ -889,17 +924,28 @@ mod tests {
             turn: 1,
             mode: "code".into(),
             model: "m".into(),
+            thinking_level: None,
         });
         started.ts = start;
         vm.apply(&started);
         let mut completed = env(Event::TurnCompleted {
             turn: 1,
             usage: Usage::default(),
-            checkpoint_id: None,
+            checkpoint_id: Some("cp_after_1".into()),
         });
         completed.ts = start + chrono::Duration::milliseconds(12_400);
         vm.apply(&completed);
         assert_eq!(vm.turn_duration_ms.get(&1), Some(&12_400));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::TurnStatus {
+                turn: 1,
+                state: TurnState::Completed {
+                    checkpoint_id: Some(checkpoint_id),
+                    ..
+                },
+            }) if checkpoint_id == "cp_after_1"
+        ));
     }
 
     #[test]
@@ -935,6 +981,7 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "m".into(),
+                thinking_level: None,
             },
             Event::UserMessage {
                 turn: 1,
@@ -1033,6 +1080,7 @@ mod tests {
             turn: 1,
             mode: "code".into(),
             model: "m".into(),
+            thinking_level: None,
         }));
         assert!(vm.turn_running);
         assert!(!vm.compacting);
@@ -1236,6 +1284,7 @@ mod tests {
             turn: 1,
             mode: "code".into(),
             model: "m".into(),
+            thinking_level: None,
         }));
         assert!(vm.turn_running);
         vm.apply(&env(Event::TurnCancelled { turn: 1 }));
@@ -1303,6 +1352,7 @@ mod tests {
             turn: 1,
             mode: "code".into(),
             model: "m".into(),
+            thinking_level: None,
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
@@ -1340,6 +1390,24 @@ mod tests {
             .filter(|i| matches!(i, ChatItem::Thinking { .. }))
             .count();
         assert_eq!(thinking_blocks, 2);
+    }
+
+    #[test]
+    fn explicit_thinking_completion_clears_the_live_phase() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "Waiting.".into(),
+        }));
+        assert!(vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        assert_eq!(changed, Some(0));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.first(),
+            Some(ChatItem::Thinking { complete: true, .. })
+        ));
     }
 
     #[test]
@@ -1416,6 +1484,7 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "m".into(),
+                thinking_level: None,
             },
             Event::UserMessage {
                 turn: 1,
@@ -1454,6 +1523,7 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "test/model".into(),
+                thinking_level: Some("max".into()),
             },
             Event::UserMessage {
                 turn: 1,
@@ -1511,6 +1581,11 @@ mod tests {
         assert_eq!(projected.turn_running, client.turn_running);
         assert_eq!(projected.thinking, client.thinking);
         assert_eq!(projected.turn_models, client.turn_models);
+        assert_eq!(projected.turn_thinking_levels, client.turn_thinking_levels);
+        assert_eq!(
+            client.turn_thinking_levels.get(&1).map(String::as_str),
+            Some("max")
+        );
         assert_eq!(projected.turn_duration_ms, client.turn_duration_ms);
     }
 }

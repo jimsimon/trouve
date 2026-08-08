@@ -199,6 +199,10 @@ pub enum Event {
         turn: u64,
         mode: String,
         model: String,
+        /// Effective provider-native thinking/reasoning selection for this
+        /// turn after inherited defaults and model schema normalization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_level: Option<String>,
     },
     /// Live usage from the most recently completed model request in a running
     /// turn. This replaces the thread's context-usage snapshot without
@@ -236,6 +240,11 @@ pub enum Event {
     /// exposes it. Display-only: never part of the provider transcript.
     #[serde(rename = "assistant.thinking")]
     AssistantThinking { turn: u64, text: String },
+    /// The provider explicitly closed the current streamed thinking item.
+    /// This boundary can arrive before the next visible assistant or tool
+    /// event, so clients must not infer it from subsequent output alone.
+    #[serde(rename = "assistant.thinking_completed")]
+    AssistantThinkingCompleted { turn: u64 },
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },
@@ -485,7 +494,7 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
-    /// The persisted Git & Worktrees settings or the session-title model's
+    /// The persisted session-naming settings or the session-title model's
     /// install/load state changed. Carries a full replacement snapshot so
     /// replay and reconnect reconstruct the settings UI exactly.
     #[serde(rename = "settings.git_worktrees_updated")]
@@ -503,6 +512,9 @@ pub enum Event {
 pub enum RestoreDirection {
     Undo,
     Redo,
+    /// Jump directly to a named checkpoint rather than taking a relative
+    /// undo-stack step.
+    Exact,
 }
 
 #[cfg(test)]
@@ -607,6 +619,7 @@ mod tests {
     fn git_worktree_settings_event_uses_namespaced_tag() {
         let event = Event::GitWorktreeSettingsUpdated {
             settings: crate::GitWorktreeSettings {
+                derive_branch_name_from_session_title: false,
                 title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
                 title_model_resource_policy: crate::TitleModelResourcePolicy::CpuRamOnly,
                 title_model: crate::TitleModelStatus {
@@ -622,6 +635,10 @@ mod tests {
         };
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "settings.git_worktrees_updated");
+        assert_eq!(
+            value["settings"]["derive_branch_name_from_session_title"],
+            false
+        );
         assert_eq!(value["settings"]["title_model_load_behavior"], "off");
         assert_eq!(
             value["settings"]["title_model_resource_policy"],
@@ -675,11 +692,37 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "gpt-x".into(),
+                thinking_level: Some("high".into()),
             },
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cursor, 42);
         assert_eq!(back.scope, Scope::Thread("th_1".into()));
+        assert!(matches!(
+            back.event,
+            Event::TurnStarted {
+                thinking_level: Some(level),
+                ..
+            } if level == "high"
+        ));
+    }
+
+    #[test]
+    fn historical_turn_started_defaults_thinking_level() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "turn.started",
+            "turn": 1,
+            "mode": "code",
+            "model": "gpt-x"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::TurnStarted {
+                thinking_level: None,
+                ..
+            }
+        ));
     }
 }

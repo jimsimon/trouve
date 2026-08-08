@@ -133,6 +133,8 @@ pub enum BackendEvent {
     TextDelta(String),
     /// Reasoning ("thinking") text, where the vendor harness exposes it.
     ThinkingDelta(String),
+    /// The vendor harness explicitly closed its current thinking item.
+    ThinkingCompleted,
     ToolStarted {
         call_id: String,
         tool: String,
@@ -168,6 +170,12 @@ pub enum BackendEvent {
     CommandsUpdated {
         commands: Vec<trouve_protocol::CommandInfo>,
     },
+    /// The vendor harness replaced its current plan. Unlike a tool call,
+    /// this is durable thread state and should not render as transcript
+    /// activity; the core publishes the canonical todo snapshot separately.
+    TodosUpdated {
+        todos: Vec<trouve_protocol::TodoItem>,
+    },
     /// Usage for the most recently completed model request while the vendor
     /// turn is still running. Final turn aggregates arrive in `Completed`.
     UsageUpdated {
@@ -192,6 +200,7 @@ impl std::fmt::Debug for BackendEvent {
             }
             Self::TextDelta(t) => write!(f, "TextDelta({t:?})"),
             Self::ThinkingDelta(t) => write!(f, "ThinkingDelta({t:?})"),
+            Self::ThinkingCompleted => f.write_str("ThinkingCompleted"),
             Self::ToolStarted { call_id, tool, .. } => {
                 write!(f, "ToolStarted({call_id}, {tool})")
             }
@@ -211,6 +220,9 @@ impl std::fmt::Debug for BackendEvent {
             }
             Self::CommandsUpdated { commands } => {
                 write!(f, "CommandsUpdated({} commands)", commands.len())
+            }
+            Self::TodosUpdated { todos } => {
+                write!(f, "TodosUpdated({} todos)", todos.len())
             }
             Self::UsageUpdated { usage } => write!(f, "UsageUpdated({usage:?})"),
             Self::CompactionStarted => f.write_str("CompactionStarted"),
@@ -591,11 +603,15 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         Ok(BackendEvent::CommandsUpdated { commands }) => {
             serde_json::to_string(commands).map_or(0, |json| json.len())
         }
+        Ok(BackendEvent::TodosUpdated { todos }) => {
+            serde_json::to_string(todos).map_or(0, |json| json.len())
+        }
         Ok(BackendEvent::UsageUpdated { .. } | BackendEvent::Completed { .. }) => {
             std::mem::size_of::<Usage>()
         }
         Ok(
-            BackendEvent::CompactionStarted
+            BackendEvent::ThinkingCompleted
+            | BackendEvent::CompactionStarted
             | BackendEvent::CompactionCompleted
             | BackendEvent::CompactionFailed,
         ) => 0,

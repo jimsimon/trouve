@@ -56,6 +56,10 @@ pub struct Config {
     /// Unset preserves the historical CPU-only behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
+    /// Whether new session branches include a slug derived from the session
+    /// title. Unset means compact `trouve/<short-id>` branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive_branch_name_from_session_title: Option<bool>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
     /// "Sign in with GitHub" on github.com. Unset uses the built-in shared
     /// Trouve app (`github::DEFAULT_CLIENT_ID`); set it to route sign-in
@@ -275,6 +279,7 @@ mod tests {
         cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
         cfg.title_model_resource_policy =
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
+        cfg.derive_branch_name_from_session_title = Some(true);
         cfg.code_review_max_parallel_reviews = Some(4);
         cfg.code_review_timeout_seconds = Some(1_200);
         cfg.code_review_reviewer_timeout_seconds = Some(720);
@@ -289,6 +294,7 @@ mod tests {
             cfg.title_model_resource_policy,
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
         );
+        assert_eq!(cfg.derive_branch_name_from_session_title, Some(true));
         assert_eq!(cfg.code_review_max_parallel_reviews, Some(4));
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));

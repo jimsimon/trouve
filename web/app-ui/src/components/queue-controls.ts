@@ -19,6 +19,7 @@ export interface QueueControlStateInput {
 export interface QueueControlState {
   readonly mutationsDisabled: boolean;
   readonly dispatchDisabled: boolean;
+  readonly sendNowDisabled: boolean;
 }
 
 export const queueControlState = (
@@ -30,6 +31,7 @@ export const queueControlState = (
     mutationsDisabled,
     dispatchDisabled:
       mutationsDisabled || input.turnRunning || input.queueLength === 0,
+    sendNowDisabled: mutationsDisabled || input.queueLength === 0,
   };
 };
 
@@ -75,12 +77,22 @@ export const droppedQueueIds = (
   return ids.every((id, index) => id === queue[index]?.id) ? undefined : ids;
 };
 
-export const prioritizedQueueIds = (
+/** Preserve the pointer's before/after intent unless that edge would leave an
+ * adjacent row in its current position. In that case the opposite edge is the
+ * only meaningful interpretation of dropping on the target row. */
+export const effectiveQueueDropPlacement = (
   queue: readonly QueueItemIdentity[],
-  index: number,
-): readonly string[] | undefined => {
-  if (!Number.isInteger(index) || index < 0 || index >= queue.length) return undefined;
-  return [queue[index]!.id, ...queue.filter((_, candidate) => candidate !== index).map(({ id }) => id)];
+  sourceId: string,
+  targetId: string,
+  preferred: QueueDropPlacement,
+): QueueDropPlacement | undefined => {
+  if (droppedQueueIds(queue, sourceId, targetId, preferred) !== undefined) {
+    return preferred;
+  }
+  const alternate = preferred === "before" ? "after" : "before";
+  return droppedQueueIds(queue, sourceId, targetId, alternate) === undefined
+    ? undefined
+    : alternate;
 };
 
 export type QueueFocusAfterDelete =

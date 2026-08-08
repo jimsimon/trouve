@@ -17,6 +17,7 @@ export const FONT_AWESOME_CODEPOINTS = Object.freeze({
   "arrow-up-right-from-square": 0xf08e,
   "arrows-rotate": 0xf021,
   ban: 0xf05e,
+  brain: 0xf5dc,
   "caret-down": 0xf0d7,
   "caret-right": 0xf0da,
   "caret-up": 0xf0d8,

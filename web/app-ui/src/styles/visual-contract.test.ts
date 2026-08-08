@@ -11,6 +11,22 @@ const numberFrom = (source: string, expression: RegExp, label: string): number =
   return Number(value);
 };
 
+const relativeLuminance = (hex: string): number => {
+  const channels = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  if (channels === null) throw new Error(`expected a six-digit hex color, received ${hex}`);
+  const linear = channels.slice(1).map((channel) => {
+    const value = Number.parseInt(channel!, 16) / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0]! + 0.7152 * linear[1]! + 0.0722 * linear[2]!;
+};
+
+const contrastRatio = (foreground: string, background: string): number => {
+  const first = relativeLuminance(foreground);
+  const second = relativeLuminance(background);
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
+};
+
 describe("Trouve visual contract", () => {
   const desktopHost = read("../../../../crates/trouve-app/src/web_preview.rs");
   const tokens = read("./tokens.css");
@@ -22,6 +38,7 @@ describe("Trouve visual contract", () => {
   const icons = read("../components/font-awesome-icon.ts");
   const imagePreview = read("../components/image-preview.ts");
   const attachments = read("../services/attachments.ts");
+  const codeView = read("../components/code-view.ts");
   const thread = read("../components/thread-screen.ts");
   const markdown = read("../components/markdown-view.ts");
   const newThread = read("../components/new-thread-setup.ts");
@@ -84,7 +101,7 @@ describe("Trouve visual contract", () => {
   it("defines every Trouve semantic variable used by shared visual components", () => {
     const visualSources = [
       app,
-      read("../components/code-view.ts"),
+      codeView,
       read("../components/markdown-view.ts"),
       read("../components/terminal-view.ts"),
       read("../components/management-settings-panels.ts"),
@@ -120,6 +137,32 @@ describe("Trouve visual contract", () => {
     for (const palette of palettes) expect([...palette.roles].sort()).toEqual(contract);
   });
 
+  it("keeps Files-view selections readable in every product theme", () => {
+    expect(codeView).toContain('view.EditorView.outerDecorations.compute(\n    ["selection"]');
+    expect(codeView).toContain('backgroundColor: "var(--trouve-selection-bg) !important"');
+    expect(codeView).toContain('color: "var(--trouve-selection-fg) !important"');
+
+    const palettes = [...themes.matchAll(
+      /(?:^:root,\n)?\[data-theme="([^"]+)"\] \{\n([\s\S]*?)\n\}/gmu,
+    )].map((match) => ({
+      name: match[1]!,
+      roles: new Map(
+        [...match[2]!.matchAll(/(--trouve-[a-z0-9-]+):\s*(#[0-9a-f]{6});/gi)]
+          .map((role) => [role[1]!, role[2]!] as const),
+      ),
+    }));
+    for (const palette of palettes) {
+      const background = palette.roles.get("--trouve-selection");
+      const foreground = palette.roles.get("--trouve-selection-fg");
+      expect(background, `${palette.name} selection background`).toBeDefined();
+      expect(foreground, `${palette.name} selection foreground`).toBeDefined();
+      expect(
+        contrastRatio(foreground!, background!),
+        `${palette.name} selected text contrast`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   it("keeps the established desktop navigation hierarchy and density", () => {
     expect(shell).not.toContain('class="brand-row"');
     expect(shell).not.toContain(">Inbox</button>");
@@ -137,9 +180,35 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain("#toggleWorkspace");
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
-    expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*52px/s);
+    expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
+    expect(app).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.session-copy strong \{[^}]*font-size:\s*13px/s);
-    expect(app).toMatch(/\.session-copy small \{[^}]*font-size:\s*11px/s);
+    expect(app).not.toContain(".session-copy small");
+  });
+
+  it("renders an outlined destination slot for every reorderable drag surface", () => {
+    expect(shell).toContain('data-drop-placeholder="workspace"');
+    expect(thread).toContain('data-drop-placeholder="queue"');
+    expect(pullRequests).toContain('data-drop-placeholder="pull-request-group"');
+    expect(review).toContain('data-drop-placeholder="code-review-group"');
+
+    expect(app).toMatch(
+      /\.workspace-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
+    );
+    expect(app).toMatch(
+      /\.queue-panel li\.queue-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
+    );
+    expect(pullRequests).toMatch(
+      /\.group-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
+    );
+    expect(review).toMatch(
+      /\.review-group-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
+    );
+
+    expect(app).not.toContain(".workspace-group.drop-before::before");
+    expect(app).not.toContain('li[data-queue-drop="before"]::before');
+    expect(pullRequests).not.toContain(".group-card.drop-target");
+    expect(review).not.toContain(".review-job-group.drop-before");
   });
 
   it("renders settings, automations, and pull requests as dedicated full-window screens", () => {
@@ -160,9 +229,9 @@ describe("Trouve visual contract", () => {
   it("keeps the established settings hierarchy and centered 170/640 geometry", () => {
     for (const section of [
       '"general"',
+      '"chat"',
       '"providers"',
       '"modes"',
-      '"git-worktrees"',
       '"mcp"',
       '"integrations"',
       '"appearance"',
@@ -172,6 +241,8 @@ describe("Trouve visual contract", () => {
       expect(settings).toContain(section);
     }
     expect(settings).toContain("Modes & Models");
+    expect(settings).toContain("Sessions & Chat");
+    expect(settings).not.toContain('return "Git & Worktrees"');
     expect(settings).toContain("MCP Servers");
     expect(app).toMatch(/\.settings-screen \{[^}]*grid-template-rows:\s*44px minmax\(0, 1fr\)/s);
     expect(app).toMatch(/\.settings-layout \{[^}]*width:\s*810px[^}]*grid-template-columns:\s*170px 640px/s);
@@ -293,7 +364,7 @@ describe("Trouve visual contract", () => {
     );
     expect(app).toMatch(/\.chat-scroll-indicator\[data-scrollable\] \{[^}]*opacity:\s*1/s);
     expect(app).toMatch(/\.message \{[^}]*margin:\s*0 0 10px/s);
-    expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*8px 0 6px/s);
+    expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*-2px 0 8px/s);
     expect(app).toMatch(
       /\.agent-activity \{[^}]*margin:\s*4px 0 10px/s,
     );
@@ -319,13 +390,13 @@ describe("Trouve visual contract", () => {
       /\.activity-group-body \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*padding:\s*3px 0 6px/s,
     );
     expect(app).toMatch(
-      /\.activity-group-timeline \{[^}]*width:\s*calc\(100% \+ 4px\)[^}]*max-width:\s*none[^}]*gap:\s*2px[^}]*margin-inline-start:\s*-4px/s,
+      /\.activity-group-timeline \{[^}]*width:\s*100%[^}]*max-width:\s*100%[^}]*gap:\s*6px[^}]*margin-inline-start:\s*0/s,
     );
     expect(app).toMatch(
       /\.tool-card \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*visible/s,
     );
     expect(app).toMatch(
-      /\.tool-card summary \{[^}]*position:\s*relative[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*hidden/s,
+      /\.tool-card summary \{[^}]*position:\s*relative[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow:\s*visible/s,
     );
     expect(app).toMatch(
       /\.tool-card pre \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap/s,
@@ -358,17 +429,17 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(
       /\.agent-activity-timeline\.single-activity::before \{[^}]*inset-block:\s*6px/s,
     );
-    expect(app).toMatch(
+    expect(app).not.toMatch(
       /\.agent-activity-timeline\.has-expanded-group::before \{[^}]*display:\s*none/s,
     );
     expect(app).toMatch(
-      /\.agent-activity-timeline > \.activity-group > summary \.disclosure-icon \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*translateY\(-50%\)/s,
-    );
-    expect(app).toMatch(
-      /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before, \.agent-activity-timeline > \.thinking-card::before, \.agent-activity-timeline > \.thinking-output::before \{[^}]*width:\s*var\(--trouve-chat-timeline-node-size\)[^}]*height:\s*var\(--trouve-chat-timeline-node-size\)[^}]*border-radius:\s*50%[^}]*background:\s*var\(--trouve-text-faint\)/s,
-    );
-    expect(app).toMatch(
       /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before \{[^}]*display:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.thinking-rail-icon \{[^}]*inset-block-start:\s*10px[^}]*inset-inline-start:\s*-18px[^}]*width:\s*11px[^}]*height:\s*11px[^}]*color:\s*var\(--trouve-text-faint\)[^}]*background:\s*var\(--trouve-win-bg\)/s,
+    );
+    expect(app).toMatch(
+      /\.thinking-rail-icon \.trouve-icon \{[^}]*--trouve-icon-width:\s*11px/s,
     );
     expect(app).toMatch(
       /\.tool-status \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-win-bg\)[^}]*transform:\s*translateY\(-50%\)/s,
@@ -384,9 +455,6 @@ describe("Trouve visual contract", () => {
     );
     expect(app).toMatch(
       /\.context-compaction-marker\.timeline-connect-before \.context-compaction-symbol, \.context-compaction-marker\.timeline-connect-after \.context-compaction-symbol \{[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-1\.5px[^}]*translateY\(-50%\)/s,
-    );
-    expect(app).toMatch(
-      /\.agent-activity-timeline > \.activity-group\.error::before[^}]*background:\s*var\(--trouve-err\)/s,
     );
     expect(app).toMatch(
       /\.agent-activity-timeline \+ \.agent-text-block \{[^}]*margin-block-start:\s*6px/s,
@@ -410,6 +478,8 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain('class="message-body turn-body-stream agent-body-stream"');
     expect(thread).toContain("agent-activity-timeline");
     expect(thread).toContain('activityRows.length === 1 ? "single-activity" : ""');
+    expect(thread).toContain("activity-group-status");
+    expect(thread).toContain('className: "disclosure-icon tool-disclosure"');
     expect(thread).toContain('class="turn-markdown"');
     expect(thread).toContain('class="agent-copy-action"');
     expect(thread).toContain('"Copy assistant output"');

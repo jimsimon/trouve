@@ -26,20 +26,21 @@ use trouve_protocol::{
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
-    EVENT_CURSOR_HEADER, ErrorBody, FileContent, GenerateSessionTitleRequest,
-    GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus, GithubIntegration, GithubPrList,
-    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
-    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
-    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
-    SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
+    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
+    ServerInfo, ServerProjection, Session, SessionDiff, SessionSummariesSnapshot,
+    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, ThreadViewQuery, ThreadViewSnapshot,
+    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -105,6 +106,8 @@ impl IntoResponse for ApiError {
         delete_session,
         undo_session,
         redo_session,
+        restore_checkpoint,
+        fork_checkpoint,
         create_thread,
         list_threads,
         get_thread,
@@ -115,6 +118,7 @@ impl IntoResponse for ApiError {
         list_queue,
         reorder_queue,
         dispatch_queue,
+        dispatch_queued_prompt,
         update_queued_prompt,
         delete_queued_prompt,
         cancel_turn,
@@ -209,6 +213,7 @@ impl IntoResponse for ApiError {
         BranchList,
         CreateSessionRequest,
         Session,
+        ForkCheckpointResponse,
         SessionSummariesSnapshot,
         ServerProjection,
         trouve_protocol::GithubPrHostProjection,
@@ -492,6 +497,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/undo", post(undo_session))
         .route("/v1/sessions/{id}/redo", post(redo_session))
+        .route("/v1/checkpoints/{id}/restore", post(restore_checkpoint))
+        .route("/v1/checkpoints/{id}/fork", post(fork_checkpoint))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/usage", get(session_usage))
         .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
@@ -651,6 +658,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route("/v1/queue/{id}/dispatch", post(dispatch_queued_prompt))
         .route("/v1/threads/{id}/cancel", post(cancel_turn))
         .route(
             "/v1/queue/{id}",
@@ -1129,6 +1137,26 @@ async fn redo_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/restore", params(("id" = String, Path,)),
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn restore_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.restore_checkpoint_by_id(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/fork", params(("id" = String, Path,)),
+    responses((status = 200, body = ForkCheckpointResponse), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn fork_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<ForkCheckpointResponse>, ApiError> {
+    Ok(Json(engine.fork_checkpoint(&id).await?))
+}
+
 #[utoipa::path(post, path = "/v1/threads", request_body = CreateThreadRequest,
     responses((status = 200, body = Thread), (status = 400, body = ErrorBody)))]
 async fn create_thread(
@@ -1284,6 +1312,22 @@ async fn dispatch_queue(
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
         }),
+    ))
+}
+
+/// Move one queued prompt to the front and dispatch it immediately. An
+/// active turn is interrupted; its terminal event is persisted before the
+/// selected prompt starts as the next turn.
+#[utoipa::path(post, path = "/v1/queue/{id}/dispatch", params(("id" = String, Path,)),
+    responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn dispatch_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(engine.dispatch_queued_prompt(&id)?),
     ))
 }
 
@@ -1675,6 +1719,7 @@ async fn set_git_worktree_settings(
         .set_git_worktree_settings(
             req.title_model_load_behavior,
             req.title_model_resource_policy,
+            req.derive_branch_name_from_session_title,
         )
         .await?;
     let (cursor, settings) = engine.git_worktree_settings_snapshot()?;

@@ -107,13 +107,13 @@ pub use requests::*;
 // the snapshot's event cursor so clients can skip redundant history (additive).
 // 1.12: failed code-review personas can be retried independently while
 // retaining successful reviewer task outputs (additive).
-// 1.13: Git & Worktrees settings persist the title-model load behavior;
+// 1.13: session-naming settings persist the title-model load behavior;
 // title-model status/install endpoints and POST /v1/session-title provide
 // synchronous model-assisted naming with a deterministic fallback, while
 // settings.git_worktrees_updated carries lifecycle snapshots (additive).
 // 1.14: cancelling a missing title-model installation returns Not Found,
 // matching the managed CLI installation lifecycle (additive).
-// 1.15: Git & Worktrees settings responses include the corresponding server
+// 1.15: session-naming settings responses include the corresponding server
 // event cursor so clients can order snapshots against SSE replay (additive).
 // 1.16: code-review repositories and jobs expose Core/Auto/Thorough persona
 // routing, semantic-routing and include/exclude controls, durable per-batch
@@ -124,7 +124,7 @@ pub use requests::*;
 // 1.19: code-review repositories and jobs expose coordinator thinking,
 // repository reviewer overrides can select a thinking setting, and canonical
 // settings accept fixed token budgets advertised by older models (additive).
-// 1.20: Git & Worktrees settings expose a persisted session-title compute
+// 1.20: session-naming settings expose a persisted session-title compute
 // resource policy spanning adaptive, mixed GPU/CPU, GPU-only, and CPU-only
 // placement (additive).
 // 1.21: the code-review dashboard response includes the server event cursor
@@ -178,12 +178,25 @@ pub use requests::*;
 // and append new attachment uploads without re-uploading unchanged files
 // (additive).
 // 3.8: GET /v1/server-projection bootstraps account PR snapshots, durable
-// session-to-PR associations, and Git & Worktrees settings at a server cursor
+// session-to-PR associations, and session-naming settings at a server cursor
 // so clients no longer replay the complete server event log on startup
 // (additive).
 // 3.9: failed provider-owned context compactions emit an explicit terminal
 // lifecycle edge so clients can clear compaction state immediately (additive).
-pub const PROTOCOL_VERSION: &str = "3.9";
+// 3.10: POST /v1/queue/{id}/dispatch atomically prioritizes one queued prompt,
+// interrupts an active turn, and resumes with that selected prompt (additive).
+// 3.11: turn.started and folded thread snapshots expose the effective
+// thinking level selected for each turn (additive).
+// 3.12: completed folded turns retain their checkpoint id, and checkpoint-
+// targeted restore/fork endpoints make turn-boundary actions explicit
+// (additive).
+// 3.13: session-naming settings can opt new sessions into title-derived
+// branch names; compact short-id branch names are otherwise the default
+// (additive).
+// 3.14: assistant.thinking_completed preserves provider-owned thinking-item
+// boundaries even when no ordinary output event immediately follows
+// (additive).
+pub const PROTOCOL_VERSION: &str = "3.14";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

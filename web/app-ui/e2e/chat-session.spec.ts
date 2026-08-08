@@ -82,7 +82,7 @@ const history: readonly FixtureEvent[] = [
     type: "turn.completed",
     turn: 7,
     usage: { input_tokens: 20, output_tokens: 8, cost_usd: 0.002 },
-    checkpoint_id: null,
+    checkpoint_id: "cp_turn_7",
   }),
 ];
 
@@ -191,6 +191,7 @@ const installEventStream = async (page: Page): Promise<void> => {
 
 interface ProtocolFixtureOptions {
   readonly sentMessages?: Array<Record<string, unknown>>;
+  readonly dispatchedQueuePromptIds?: string[];
   readonly messageDelayMs?: number;
   readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
   readonly threadViewFixture?: ThreadViewFixtureLoader;
@@ -198,12 +199,14 @@ interface ProtocolFixtureOptions {
   readonly additionalThreads?: readonly Record<string, unknown>[];
   readonly additionalSessions?: readonly Record<string, unknown>[];
   readonly additionalSessionSummaries?: readonly Record<string, unknown>[];
+  readonly restoredCheckpointIds?: string[];
 }
 
 const installProtocolFixtures = async (
   page: Page,
   {
     sentMessages = [],
+    dispatchedQueuePromptIds = [],
     messageDelayMs = 0,
     beforeMessageResponse,
     threadViewFixture,
@@ -211,6 +214,7 @@ const installProtocolFixtures = async (
     additionalThreads = [],
     additionalSessions = [],
     additionalSessionSummaries = [],
+    restoredCheckpointIds = [],
   }: ProtocolFixtureOptions = {},
 ): Promise<void> => {
   let messageCount = 0;
@@ -234,6 +238,21 @@ const installProtocolFixtures = async (
       return;
     }
     if (key === "POST /v1/threads/th_fixture/cancel") {
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    const queuedPromptDispatchMatch = /^\/v1\/queue\/([^/]+)\/dispatch$/u.exec(url.pathname);
+    if (request.method() === "POST" && queuedPromptDispatchMatch !== null) {
+      dispatchedQueuePromptIds.push(queuedPromptDispatchMatch[1]!);
+      await route.fulfill({
+        status: 202,
+        json: { thread_id: "th_fixture", turn: 0, queued: true },
+      });
+      return;
+    }
+    const checkpointRestoreMatch = /^\/v1\/checkpoints\/([^/]+)\/restore$/u.exec(url.pathname);
+    if (request.method() === "POST" && checkpointRestoreMatch !== null) {
+      restoredCheckpointIds.push(checkpointRestoreMatch[1]!);
       await route.fulfill({ status: 204 });
       return;
     }
@@ -327,6 +346,7 @@ const installProtocolFixtures = async (
           github_pull_requests: [],
           session_pull_requests: [],
           git_worktree_settings: {
+            derive_branch_name_from_session_title: false,
             title_model: {
               model_downloaded: false,
               runtime_installed: false,
@@ -344,7 +364,7 @@ const installProtocolFixtures = async (
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "2.15",
+        protocol_version: "3.14",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -582,6 +602,179 @@ test.beforeEach(async ({ page }, testInfo) => {
   await installEventStream(page);
 });
 
+test("the TODO pane follows the thread's durable todo snapshot", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop owns the inspection layout");
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+
+  const todoSwitch = page.locator(".inspection-todo-switch button");
+  await expect(todoSwitch).toHaveCount(0);
+
+  await emit(page, threadEvent(16, {
+    type: "thread.todos_updated",
+    todos: [
+      { id: "inspect", content: "Inspect the adapter", status: "completed" },
+      { id: "publish", content: "Publish the todo snapshot", status: "in_progress" },
+    ],
+  }));
+
+  await expect(todoSwitch).toHaveText(/Todos\s+1\/2 complete/);
+  await todoSwitch.click();
+  const plan = page.locator("trouve-todo-plan-panel");
+  await expect(plan.getByText("Thread todos", { exact: true })).toBeVisible();
+  await expect(plan.locator("[data-todo-id=inspect]")).toContainText("Inspect the adapter");
+  await expect(plan.locator("[data-todo-id=publish]")).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
+
+  await emit(page, threadEvent(17, { type: "thread.todos_updated", todos: [] }));
+  await expect(todoSwitch).toHaveCount(0);
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("turn separators retain Slint's even vertical spacing", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Start the next turn",
+      attachments: [],
+    }),
+  ]);
+
+  const rule = page.locator(".turn-rule").last();
+  await expect(rule).toBeVisible();
+  const geometry = await rule.evaluate((element) => {
+    const previous = [...document.querySelectorAll<HTMLElement>(".agent-turn-card")].at(-1);
+    const user = element.parentElement?.querySelector<HTMLElement>(".user-message");
+    if (previous === undefined || user === null || user === undefined) {
+      throw new Error("missing adjacent turn geometry");
+    }
+    const previousBounds = previous.getBoundingClientRect();
+    const ruleBounds = element.getBoundingClientRect();
+    const userBounds = user.getBoundingClientRect();
+    return {
+      above: ruleBounds.top - previousBounds.bottom,
+      below: userBounds.top - ruleBounds.bottom,
+    };
+  });
+  expect(geometry.above).toBe(8);
+  expect(geometry.below).toBe(8);
+});
+
+test("turn separators expose exact restore and session-fork actions", async ({ page }) => {
+  const restoredCheckpointIds: string[] = [];
+  await installProtocolFixtures(page, { restoredCheckpointIds });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Start the next turn",
+      attachments: [],
+    }),
+  ]);
+
+  const rule = page.locator(".turn-rule").last();
+  const restore = rule.getByRole("button", {
+    name: "Restore after turn 7 once the current turn finishes",
+  });
+  await expect(restore).toBeDisabled();
+  await expect(rule.getByRole("button", {
+    name: "Fork a new session from the checkpoint after turn 7",
+  })).toBeVisible();
+
+  await emit(page, threadEvent(18, {
+    type: "turn.completed",
+    turn: 8,
+    usage: { input_tokens: 2, output_tokens: 1 },
+    checkpoint_id: "cp_turn_8",
+  }));
+  const enabledRestore = rule.getByRole("button", {
+    name: "Restore files to the checkpoint after turn 7",
+  });
+  await expect(enabledRestore).toBeEnabled();
+  await enabledRestore.click();
+  await expect.poll(() => restoredCheckpointIds).toEqual(["cp_turn_7"]);
+});
+
+test("the Agent header shows live token usage and elapsed time", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  const startedAt = new Date(Date.now() - 65_000).toISOString();
+  await emitBatch(page, [
+    {
+      ...threadEvent(16, {
+        type: "turn.started",
+        turn: 8,
+        mode: "code",
+        model: "test/model",
+        thinking_level: "max",
+      }),
+      ts: startedAt,
+    },
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Show progress while this turn runs",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "assistant.thinking",
+      turn: 8,
+      text: "Still working",
+    }),
+    threadEvent(19, {
+      type: "turn.usage_updated",
+      turn: 8,
+      usage: { input_tokens: 900, output_tokens: 42, cost_usd: 0.01 },
+    }),
+  ]);
+
+  const metadata = page.locator(".agent-turn-card").last().locator(".turn-metadata");
+  await expect(page.locator(".agent-turn-card").last().locator(".agent-model-label"))
+    .toHaveText("(test/model · Max)");
+  await expect(metadata).toContainText("900 in / 42 out tokens");
+  await expect(metadata).toContainText(/1m \d{2}s/u);
+  const first = await metadata.textContent();
+  await expect.poll(() => metadata.textContent(), { timeout: 3_000 }).not.toBe(first);
+  await emit(page, {
+    ...threadEvent(20, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 1_000, output_tokens: 50, cost_usd: 0.012 },
+      checkpoint_id: null,
+    }),
+    ts: new Date().toISOString(),
+  });
+  await expect(metadata).toContainText("1000 in / 50 out tokens");
+  const completed = await metadata.textContent();
+  await page.waitForTimeout(1_100);
+  expect(await metadata.textContent()).toBe(completed);
+});
+
 test("model picker escapes the composer control strip", async ({ page }) => {
   await page.setViewportSize({ width: 780, height: 620 });
   await installProtocolFixtures(page);
@@ -630,6 +823,38 @@ test("model picker escapes the composer control strip", async ({ page }) => {
 
   await popup.getByRole("searchbox", { name: "Search models" }).press("Escape");
   await expect(popup).toHaveCount(0);
+});
+
+test("subscription status uses hover help without a click disclosure", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.route("**/v1/subscriptions", async (route) => {
+    await route.fulfill({
+      json: [{
+        provider_id: "test",
+        status: "ok",
+        plan: "pro",
+        windows: [{ label: "Weekly", used_percent: 57, resets: "resets Monday" }],
+        credits: "",
+        note: "",
+      }],
+    });
+  });
+  await page.goto("/");
+  await replayHistory(page);
+
+  const status = page.locator(".composer .model-health-pill");
+  await expect(page.locator(".composer .subscription-option > span")).toHaveText(
+    "Subscription",
+  );
+  await expect(status).toContainText("Pro · 57% used");
+  await expect(status).toHaveAttribute("title", /Weekly: 57% used · resets Monday/u);
+  await expect(status).toHaveAttribute("tabindex", "0");
+  await expect(status.locator("summary")).toHaveCount(0);
+  await expect(page.locator(".model-health-detail")).toHaveCount(0);
+
+  await status.click();
+  await expect(status).toBeFocused();
+  await expect(page.locator(".model-health-detail")).toHaveCount(0);
 });
 
 test("new-thread model choices do not wait for subscription health", async ({ page }) => {
@@ -1053,13 +1278,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   );
   const groupNodeStyle = await activityGroup.evaluate((group) => {
     const style = getComputedStyle(group, "::before");
-    return {
-      backgroundColor: style.backgroundColor,
-      borderRadius: style.borderRadius,
-      display: style.display,
-      height: style.height,
-      width: style.width,
-    };
+    return { display: style.display };
   });
   const groupDisclosureStyle = await activityGroup.locator(
     ":scope > summary .disclosure-icon",
@@ -1079,6 +1298,27 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       width: style.width,
     };
   });
+  const groupStatusGeometry = await activityGroup.evaluate((group) => {
+    const timeline = group.parentElement;
+    const status = group.querySelector<HTMLElement>(
+      ":scope > summary > .activity-group-status",
+    );
+    if (timeline === null || status === null) {
+      throw new Error("missing grouped activity status geometry");
+    }
+    const timelineBounds = timeline.getBoundingClientRect();
+    const rail = getComputedStyle(timeline, "::before");
+    const statusBounds = status.getBoundingClientRect();
+    const railCenter = timelineBounds.left
+      + Number.parseFloat(rail.left)
+      + Number.parseFloat(rail.width) / 2;
+    return {
+      display: getComputedStyle(status).display,
+      statusToRail: Math.abs(
+        statusBounds.left + statusBounds.width / 2 - railCenter,
+      ),
+    };
+  });
   const groupedBodyBackground = await activityGroup.locator(".activity-group-body").evaluate(
     (body) => getComputedStyle(body).backgroundColor,
   );
@@ -1089,7 +1329,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       ? Number.NaN
       : Math.round(second.top - first.bottom);
   });
-  expect(groupedHeaderStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(groupedHeaderStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
   expect(groupedHeaderStyle.backgroundImage).toBe("none");
   expect(groupedHeaderStyle.borderLeftWidth).toBe("0px");
   expect(groupedHeaderStyle.borderTopWidth).toBe("0px");
@@ -1099,17 +1339,15 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   expect(toolCardStyle.borderTopWidth).toBe("0px");
   expect(toolCardStyle.borderRadius).toBe("0px");
   expect(groupNodeStyle.display).toBe("none");
-  expect(groupNodeStyle.width).toBe("7px");
-  expect(groupNodeStyle.height).toBe("7px");
-  expect(groupNodeStyle.borderRadius).toBe("50%");
-  expect(groupNodeStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
-  expect(groupDisclosureStyle.position).toBe("absolute");
+  expect(groupDisclosureStyle.position).toBe("static");
   expect(groupDisclosureStyle.width).toBe("10px");
-  expect(timelineRailStyle.display).toBe("none");
+  expect(timelineRailStyle.display).not.toBe("none");
   expect(timelineRailStyle.width).toBe("1px");
   expect(timelineRailStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(groupStatusGeometry.display).not.toBe("none");
+  expect(groupStatusGeometry.statusToRail).toBeLessThanOrEqual(0.25);
   expect(groupedBodyBackground).toBe("rgba(0, 0, 0, 0)");
-  expect(groupedToolGap).toBe(2);
+  expect(groupedToolGap).toBe(6);
   await expect(page.getByLabel("Live tool output")).toHaveCount(0);
 
   const editCard = page.locator('.tool-card[data-call-id="call_edit"]');
@@ -1134,7 +1372,9 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   await expect(visibleThought.getByText("Thought", { exact: true })).toBeVisible();
   await expect(visibleThought.locator(".thinking-body")).toContainText("Compare both frontends");
   await expect(visibleThought.getByRole("button", { name: /thought process/i })).toHaveCount(1);
-  await expect(visibleThought.locator('[data-font-awesome-icon="brain"]')).toHaveCount(0);
+  await expect(visibleThought.locator(
+    '.thinking-rail-icon [data-font-awesome-icon="brain"]',
+  )).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Collapse thought process" })).toHaveCount(0);
   await expect(page.locator(".thinking-card")).toHaveCount(0);
 
@@ -1320,33 +1560,37 @@ test("the Chat preference adds one disclosure around the standard activity timel
     const summary = group.querySelector<HTMLElement>(":scope > summary");
     if (summary === null) throw new Error("missing combined activity summary");
     const disclosure = summary.querySelector<HTMLElement>(".disclosure-icon");
+    const status = summary.querySelector<HTMLElement>(".activity-group-status");
     const label = summary.querySelector<HTMLElement>("strong");
     const prose = timeline?.nextElementSibling
       ?.querySelector<HTMLElement>("trouve-markdown-view")
       ?.shadowRoot?.querySelector<HTMLElement>("p");
-    if (timeline === null || disclosure === null
+    if (timeline === null || disclosure === null || status === null
       || label === null || prose === null || prose === undefined) {
       throw new Error("missing combined activity geometry");
     }
     const timelineBounds = timeline.getBoundingClientRect();
     const disclosureBounds = disclosure.getBoundingClientRect();
+    const statusBounds = status.getBoundingClientRect();
     const rail = getComputedStyle(timeline, "::before");
     const railCenter = timelineBounds.left
       + Number.parseFloat(rail.left)
       + Number.parseFloat(rail.width) / 2;
     return {
-      disclosureToRail: Math.abs(
-        disclosureBounds.left + disclosureBounds.width / 2 - railCenter,
+      statusToRail: Math.abs(
+        statusBounds.left + statusBounds.width / 2 - railCenter,
       ),
+      disclosureAfterRail: disclosureBounds.left - railCenter,
       groupNodeDisplay: getComputedStyle(group, "::before").display,
       labelToProse: label.getBoundingClientRect().left
         - prose.getBoundingClientRect().left,
       railHeight: Number.parseFloat(rail.height),
     };
   });
-  expect(geometry.disclosureToRail).toBeLessThanOrEqual(1);
+  expect(geometry.statusToRail).toBeLessThanOrEqual(0.25);
+  expect(geometry.disclosureAfterRail).toBeGreaterThan(10);
   expect(geometry.groupNodeDisplay).toBe("none");
-  expect(geometry.labelToProse).toBeLessThanOrEqual(20);
+  expect(geometry.labelToProse).toBeLessThanOrEqual(40);
   expect(geometry.railHeight).toBeGreaterThan(10);
 
   await combinedGroup.locator(":scope > summary").click();
@@ -1358,6 +1602,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
     name: /^(?:Collapse|Expand) thought process$/u,
   }))
     .toHaveCount(0);
+  await page.mouse.move(0, 0);
   const expandedGeometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
     const summary = group.querySelector<HTMLElement>(":scope > summary");
@@ -1366,24 +1611,30 @@ test("the Chat preference adds one disclosure around the standard activity timel
       ":scope > .activity-group-timeline",
     );
     const thought = nestedTimeline?.querySelector<HTMLElement>(":scope > .thinking-output");
+    const thoughtIcon = thought?.querySelector<HTMLElement>(":scope > .thinking-rail-icon");
     const toolStatus = nestedTimeline?.querySelector<HTMLElement>(
       ":scope > .tool-card .tool-status",
+    );
+    const groupStatus = summary?.querySelector<HTMLElement>(
+      ":scope > .activity-group-status",
     );
     const toolCard = toolStatus?.closest<HTMLElement>(".tool-card");
     if (timeline === null || summary === null || body === null
       || nestedTimeline === null || nestedTimeline === undefined
       || thought === null || thought === undefined
+      || thoughtIcon === null || thoughtIcon === undefined
       || toolStatus === null || toolStatus === undefined
+      || groupStatus === null || groupStatus === undefined
       || toolCard === null || toolCard === undefined) {
       throw new Error("missing expanded combined activity geometry");
     }
     const outerRail = getComputedStyle(timeline, "::before");
     const nestedRail = getComputedStyle(nestedTimeline, "::before");
-    const thoughtNode = getComputedStyle(thought, "::before");
     const timelineBounds = timeline.getBoundingClientRect();
     const nestedTimelineBounds = nestedTimeline.getBoundingClientRect();
-    const thoughtBounds = thought.getBoundingClientRect();
+    const thoughtIconBounds = thoughtIcon.getBoundingClientRect();
     const toolStatusBounds = toolStatus.getBoundingClientRect();
+    const groupStatusBounds = groupStatus.getBoundingClientRect();
     const nestedRailCenter = nestedTimelineBounds.left
       + Number.parseFloat(nestedRail.left)
       + Number.parseFloat(nestedRail.width) / 2;
@@ -1395,12 +1646,17 @@ test("the Chat preference adds one disclosure around the standard activity timel
       nestedRailDisplay: nestedRail.display,
       nestedRailHeight: Number.parseFloat(nestedRail.height),
       nestedRailIndent: nestedRailCenter - outerRailCenter,
-      thoughtNodeDisplay: thoughtNode.display,
-      thoughtNodeToRail: Math.abs(
-        thoughtBounds.left
-          + Number.parseFloat(thoughtNode.left)
-          + Number.parseFloat(thoughtNode.width) / 2
-          - nestedRailCenter,
+      railWidthMatches: outerRail.width === nestedRail.width,
+      railColorMatches: outerRail.backgroundColor === nestedRail.backgroundColor,
+      railOpacityMatches: outerRail.opacity === nestedRail.opacity,
+      timelineGap: getComputedStyle(timeline).rowGap,
+      nestedTimelineGap: getComputedStyle(nestedTimeline).rowGap,
+      groupStatusToRail: Math.abs(
+        groupStatusBounds.left + groupStatusBounds.width / 2 - outerRailCenter,
+      ),
+      thoughtIconDisplay: getComputedStyle(thoughtIcon).display,
+      thoughtIconToRail: Math.abs(
+        thoughtIconBounds.left + thoughtIconBounds.width / 2 - nestedRailCenter,
       ),
       toolStatusToRail: Math.abs(
         toolStatusBounds.left + toolStatusBounds.width / 2 - nestedRailCenter,
@@ -1411,17 +1667,23 @@ test("the Chat preference adds one disclosure around the standard activity timel
       nestedMarginLeft: getComputedStyle(nestedTimeline).marginLeft,
     };
   });
-  expect(expandedGeometry.railDisplay).toBe("none");
+  expect(expandedGeometry.railDisplay).not.toBe("none");
   expect(expandedGeometry.nestedRailDisplay).not.toBe("none");
   expect(expandedGeometry.nestedRailHeight).toBeGreaterThan(10);
-  expect(expandedGeometry.nestedRailIndent).toBe(16);
-  expect(expandedGeometry.thoughtNodeDisplay).not.toBe("none");
-  expect(expandedGeometry.thoughtNodeToRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.nestedRailIndent).toBe(20);
+  expect(expandedGeometry.railWidthMatches).toBe(true);
+  expect(expandedGeometry.railColorMatches).toBe(true);
+  expect(expandedGeometry.railOpacityMatches).toBe(true);
+  expect(expandedGeometry.timelineGap).toBe("6px");
+  expect(expandedGeometry.nestedTimelineGap).toBe("6px");
+  expect(expandedGeometry.groupStatusToRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.thoughtIconDisplay).not.toBe("none");
+  expect(expandedGeometry.thoughtIconToRail).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.toolStatusToRail).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.duplicateToolNodeDisplay).toBe("none");
-  expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(expandedGeometry.summaryBackground).toBe("rgba(0, 0, 0, 0)");
   expect(expandedGeometry.bodyPaddingLeft).toBe("0px");
-  expect(expandedGeometry.nestedMarginLeft).toBe("-4px");
+  expect(expandedGeometry.nestedMarginLeft).toBe("0px");
 });
 
 test("the Chat preference persists across a frontend reload", async ({ page }) => {
@@ -1613,8 +1875,8 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
   expect(connection.bridgeDisplay).not.toBe("none");
   expect(connection.beforeNestedRail).not.toBe("none");
   expect(connection.afterNestedRail).not.toBe("none");
-  expect(connection.beforeNestedIndent).toBe(16);
-  expect(connection.afterNestedIndent).toBe(16);
+  expect(connection.beforeNestedIndent).toBe(20);
+  expect(connection.afterNestedIndent).toBe(20);
 });
 
 test("running activity groups retain explicit disclosure state as tools arrive", async ({
@@ -2029,11 +2291,15 @@ test("standalone tool headers align their timeline node and disclosure controls"
         statusBounds.left + statusBounds.width / 2 - railCenter,
       ),
       duplicateNodeDisplay: getComputedStyle(card, "::before").display,
+      summaryOverflow: getComputedStyle(summary).overflow,
+      statusOutsideSummary: statusBounds.left < summary.getBoundingClientRect().left,
     };
   });
 
   const collapsedAlignment = await alignment();
   expect(collapsedAlignment.duplicateNodeDisplay).toBe("none");
+  expect(collapsedAlignment.summaryOverflow).toBe("visible");
+  expect(collapsedAlignment.statusOutsideSummary).toBe(true);
   expect(collapsedAlignment.titleFontSize).toBe("11px");
   expect(collapsedAlignment.titleFontWeight).toBe("600");
   expect(collapsedAlignment.statusWidth).toBe(10);
@@ -2052,6 +2318,98 @@ test("standalone tool headers align their timeline node and disclosure controls"
     expandedAlignment.title,
     expandedAlignment.statusToRail,
   )).toBeLessThanOrEqual(0.25);
+});
+
+test("thought completion clears stale activity while standalone and grouped tools share one rail", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(70, {
+      type: "turn.started",
+      turn: 14,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }),
+    threadEvent(71, {
+      type: "user.message",
+      turn: 14,
+      content: "Keep every activity on one rail",
+      attachments: [],
+    }),
+    threadEvent(72, {
+      type: "assistant.thinking",
+      turn: 14,
+      text: "Waiting for a provider boundary.",
+    }),
+  ]);
+
+  const agent = page.locator(".agent-turn-card").last();
+  await expect(agent.locator(".agent-activity")).toContainText("Thinking…");
+  await emit(page, threadEvent(73, {
+    type: "assistant.thinking_completed",
+    turn: 14,
+  }));
+  await expect(agent.locator(".agent-activity")).toContainText("Processing…");
+
+  await emitBatch(page, [
+    threadEvent(74, {
+      type: "tool.requested",
+      turn: 14,
+      call_id: "before_group",
+      tool: "commandExecution",
+      args: { command: "printf first" },
+      requires_approval: false,
+    }),
+    threadEvent(75, { type: "tool.started", call_id: "before_group" }),
+    threadEvent(76, {
+      type: "tool.completed",
+      call_id: "before_group",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(77, {
+      type: "assistant.thinking",
+      turn: 14,
+      text: "Starting a command group.",
+    }),
+    threadEvent(78, {
+      type: "assistant.thinking_completed",
+      turn: 14,
+    }),
+    threadEvent(79, {
+      type: "tool.requested",
+      turn: 14,
+      call_id: "group_one",
+      tool: "commandExecution",
+      args: { command: "printf one" },
+      requires_approval: false,
+    }),
+    threadEvent(80, {
+      type: "tool.completed",
+      call_id: "group_one",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(81, {
+      type: "tool.requested",
+      turn: 14,
+      call_id: "group_two",
+      tool: "commandExecution",
+      args: { command: "sleep 1" },
+      requires_approval: false,
+    }),
+  ]);
+
+  const timeline = agent.locator(":scope > .message-body > .agent-activity-timeline");
+  await expect(timeline).toHaveCount(1);
+  await expect(timeline.locator(
+    ':scope > .tool-card[data-call-id="before_group"]',
+  )).toBeVisible();
+  await expect(timeline.locator(":scope > .activity-group")).toContainText("2 commands");
+  await expect(agent.locator(".agent-activity")).toContainText("Running commands…");
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
@@ -2869,14 +3227,20 @@ test("long chat history keeps a bounded DOM with an accessible full-history fall
     const jump = viewport.querySelector<HTMLElement>(".follow-tail");
     if (jump === null) throw new Error("missing jump-to-latest control");
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 1_000 }));
-    // WebKit includes the sticky control in scrollHeight even though it is
-    // visually overlaid. Stop at the transcript tail, not after the control.
-    viewport.scrollTop = Math.max(
+    const transcriptTail = Math.max(
       0,
       viewport.scrollHeight
         - viewport.clientHeight
         - jump.getBoundingClientRect().height,
     );
+    // One wheel tick can produce several native scroll events. The first one
+    // must not consume the gesture intent before the final event reaches the
+    // transcript tail.
+    viewport.scrollTop = Math.max(0, transcriptTail - 100);
+    viewport.dispatchEvent(new Event("scroll"));
+    // WebKit includes the sticky control in scrollHeight even though it is
+    // visually overlaid. Stop at the transcript tail, not after the control.
+    viewport.scrollTop = transcriptTail;
     viewport.dispatchEvent(new Event("scroll"));
   });
   await expect(page.getByRole("log", { name: "Conversation" })).toHaveAttribute(
@@ -3180,6 +3544,212 @@ test("keeps a nested thought anchored when history extends the same agent turn",
             - expected.offset,
         );
   }, anchor)).toBeLessThanOrEqual(2);
+});
+
+test("a queued prompt can interrupt the active turn and run next", async ({ page }) => {
+  const dispatchedQueuePromptIds: string[] = [];
+  await installProtocolFixtures(page, { dispatchedQueuePromptIds });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "assistant.delta",
+      turn: 8,
+      text: "Still working",
+    }),
+    threadEvent(18, {
+      type: "thread.queue_updated",
+      prompts: [{
+        id: "qp_1",
+        thread_id: "th_fixture",
+        content: "Run this one immediately",
+        position: 0,
+        created_at: "2026-08-04T08:00:19Z",
+        attachments: [],
+      }],
+    }),
+  ]);
+
+  const sendNow = page.getByRole("button", {
+    name: "Send this queued prompt now and stop the current turn",
+  });
+  await expect(sendNow).toBeEnabled();
+  await sendNow.click();
+
+  await expect.poll(() => dispatchedQueuePromptIds).toEqual(["qp_1"]);
+  await expect(page.locator("wa-button.composer-submit")).toHaveText("Stopping…");
+});
+
+test("queued prompts drag by the full row and adjacent drops always move", async ({ page }) => {
+  const prompts = [
+    {
+      id: "qp_first",
+      thread_id: "th_fixture",
+      content: "First queued prompt",
+      position: 0,
+      created_at: "2026-08-04T08:00:19Z",
+      attachments: [],
+    },
+    {
+      id: "qp_second",
+      thread_id: "th_fixture",
+      content: "Second queued prompt",
+      position: 1,
+      created_at: "2026-08-04T08:00:20Z",
+      attachments: [],
+    },
+  ];
+  const submittedOrders: string[][] = [];
+  await installProtocolFixtures(page);
+  await page.route("**/v1/threads/th_fixture/queue", async (route) => {
+    if (route.request().method() !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const { ids } = route.request().postDataJSON() as { readonly ids: string[] };
+    submittedOrders.push(ids);
+    await route.fulfill({
+      json: ids.map((id, position) => ({
+        ...prompts.find((prompt) => prompt.id === id)!,
+        position,
+      })),
+    });
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emit(page, threadEvent(16, {
+    type: "thread.queue_updated",
+    prompts,
+  }));
+
+  const rows = page.locator(".queue-panel li[data-queue-id]");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.first()).toHaveAttribute("draggable", "true");
+  await expect(page.locator(".queue-grip")).toHaveCount(0);
+
+  const source = rows.filter({ hasText: "Second queued prompt" });
+  const target = rows.filter({ hasText: "First queued prompt" });
+  const dragProbeBounds = await target.boundingBox();
+  if (dragProbeBounds === null) throw new Error("missing queued prompt row geometry");
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+  await source.dispatchEvent("pointerdown");
+  await source.dispatchEvent("dragstart", { dataTransfer });
+  await target.dispatchEvent("dragover", {
+    clientX: dragProbeBounds.x + Math.min(120, dragProbeBounds.width - 2),
+    clientY: dragProbeBounds.y + dragProbeBounds.height - 2,
+    dataTransfer,
+  });
+
+  const placeholder = page.locator('[data-drop-placeholder="queue"]');
+  await expect(placeholder).toBeVisible();
+  const placeholderStyle = await placeholder.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      borderStyle: style.borderTopStyle,
+      borderWidth: style.borderTopWidth,
+      height: element.getBoundingClientRect().height,
+    };
+  });
+  expect(placeholderStyle.borderStyle).toBe("dashed");
+  expect(Number.parseFloat(placeholderStyle.borderWidth)).toBeGreaterThanOrEqual(1);
+  expect(placeholderStyle.height).toBeGreaterThanOrEqual(24);
+  await source.dispatchEvent("dragend", { dataTransfer });
+  await dataTransfer.dispose();
+  await expect(placeholder).toHaveCount(0);
+
+  const targetBounds = await target.boundingBox();
+  if (targetBounds === null) throw new Error("missing queued prompt row geometry");
+  await source.locator("p").dragTo(target, {
+    targetPosition: {
+      x: Math.min(120, targetBounds.width - 2),
+      y: targetBounds.height - 2,
+    },
+  });
+
+  await expect.poll(() => submittedOrders).toEqual([["qp_second", "qp_first"]]);
+  await expect(rows.nth(0)).toContainText("Second queued prompt");
+  await expect(rows.nth(1)).toContainText("First queued prompt");
+});
+
+test("queued prompts reorder from the keyboard without visible move arrows", async ({ page }) => {
+  const prompts = [
+    {
+      id: "qp_first",
+      thread_id: "th_fixture",
+      content: "First queued prompt",
+      position: 0,
+      created_at: "2026-08-04T08:00:19Z",
+      attachments: [],
+    },
+    {
+      id: "qp_second",
+      thread_id: "th_fixture",
+      content: "Second queued prompt",
+      position: 1,
+      created_at: "2026-08-04T08:00:20Z",
+      attachments: [],
+    },
+  ];
+  const submittedOrders: string[][] = [];
+  await installProtocolFixtures(page);
+  await page.route("**/v1/threads/th_fixture/queue", async (route) => {
+    if (route.request().method() !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const { ids } = route.request().postDataJSON() as { readonly ids: string[] };
+    submittedOrders.push(ids);
+    await route.fulfill({
+      json: ids.map((id, position) => ({
+        ...prompts.find((prompt) => prompt.id === id)!,
+        position,
+      })),
+    });
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emit(page, threadEvent(16, {
+    type: "thread.queue_updated",
+    prompts,
+  }));
+
+  const rows = page.locator(".queue-panel li[data-queue-id]");
+  const first = page.locator('[data-queue-id="qp_first"]');
+  const status = page.locator(".queue-panel > p[role=status]");
+  await expect(page.locator('[data-queue-action="earlier"]')).toHaveCount(0);
+  await expect(page.locator('[data-queue-action="later"]')).toHaveCount(0);
+  await expect(first).toHaveAttribute("tabindex", "0");
+  await expect(first).toHaveAttribute(
+    "aria-keyshortcuts",
+    "Space Enter ArrowUp ArrowDown Home End Escape",
+  );
+
+  await first.focus();
+  await first.press("Space");
+  await expect(first).toHaveAttribute("data-keyboard-reordering", "true");
+  await expect(first.locator(".queue-reorder-badge")).toHaveText("Reordering");
+  await expect(status).toContainText("Picked up queued prompt 1 of 2.");
+  await first.press("End");
+  await expect(rows.nth(1)).toHaveAttribute("data-queue-id", "qp_first");
+  await expect(status).toContainText("Queued prompt moved to position 2 of 2.");
+  await first.press("Escape");
+  await expect(rows.nth(0)).toHaveAttribute("data-queue-id", "qp_first");
+  await expect(first).not.toHaveAttribute("data-keyboard-reordering", "true");
+  expect(submittedOrders).toEqual([]);
+
+  await first.press("Space");
+  await first.press("End");
+  await first.press("Space");
+  await expect.poll(() => submittedOrders).toEqual([["qp_second", "qp_first"]]);
+  await expect(rows.nth(1)).toHaveAttribute("data-queue-id", "qp_first");
+  await expect(first).toBeFocused();
+  await expect(status).toContainText("Queued prompt dropped at position 2 of 2.");
 });
 
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {

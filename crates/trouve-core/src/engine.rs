@@ -14,9 +14,9 @@ use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
-    TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
-    Workspace,
+    ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
+    Thread, ToolStatus, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -58,6 +58,16 @@ const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
 const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+
+fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
+    let id = session_id.strip_prefix("se_").unwrap_or(session_id);
+    let short_id = id.get(..6).unwrap_or(id);
+    if derive_from_session_title {
+        format!("trouve/{}-{short_id}", git::slugify(title))
+    } else {
+        format!("trouve/{short_id}")
+    }
+}
 
 fn positive_limit_from_env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -372,6 +382,47 @@ fn normalize_thinking_option(
     if let Some(selected) = selected {
         options.insert(key.into(), serde_json::Value::String(selected));
     }
+}
+
+fn thinking_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(if *value { "on" } else { "off" }.into()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Return the effective thinking selection that will be handed to the
+/// provider. Explicit normalized options win; otherwise the advertised model
+/// default describes the behavior obtained by omitting the option.
+fn resolved_thinking_level(
+    options: &serde_json::Map<String, serde_json::Value>,
+    model: Option<&trouve_protocol::ModelInfo>,
+) -> Option<String> {
+    THINKING_OPTION_KEYS
+        .iter()
+        .find_map(|key| options.get(*key).and_then(thinking_value))
+        .or_else(|| {
+            options
+                .get("thinking_budget_tokens")
+                .and_then(thinking_value)
+        })
+        .or_else(|| {
+            model
+                .and_then(thinking_option_property)
+                .and_then(|(_, property, _)| property.get("default"))
+                .and_then(thinking_value)
+        })
+        .or_else(|| {
+            model
+                .and_then(|model| {
+                    model
+                        .options_schema
+                        .pointer("/properties/thinking_budget_tokens/default")
+                })
+                .and_then(thinking_value)
+        })
 }
 
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
@@ -751,6 +802,9 @@ impl Engine {
             data_dir.clone(),
             config.title_model_load_behavior.unwrap_or_default(),
             config.title_model_resource_policy.unwrap_or_default(),
+            config
+                .derive_branch_name_from_session_title
+                .unwrap_or(false),
             &local_manager,
             store.clone(),
         ));
@@ -2666,6 +2720,7 @@ impl Engine {
         &self,
         behavior: trouve_protocol::TitleModelLoadBehavior,
         resources: trouve_protocol::TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: Option<bool>,
     ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
         if resources == trouve_protocol::TitleModelResourcePolicy::GpuOnly
             && self.hardware().await.gpus.is_empty()
@@ -2675,14 +2730,18 @@ impl Engine {
             ));
         }
         let _transition = self.title_model_behavior_transition.lock().await;
+        let derive_branch_name_from_session_title = derive_branch_name_from_session_title
+            .unwrap_or_else(|| self.title_model.derive_branch_name_from_session_title());
         {
             let mut config = self.config.lock().unwrap();
             config.title_model_load_behavior = Some(behavior);
             config.title_model_resource_policy = Some(resources);
+            config.derive_branch_name_from_session_title =
+                Some(derive_branch_name_from_session_title);
             self.persist_config(&config);
         }
         self.title_model
-            .set_configuration(behavior, resources)
+            .set_configuration(behavior, resources, derive_branch_name_from_session_title)
             .await;
         Ok(self.git_worktree_settings())
     }
@@ -4141,9 +4200,11 @@ impl Engine {
         let repo = PathBuf::from(&ws.path);
         let title = req.title.unwrap_or_else(|| "New session".into());
         let session_id = new_id("se");
-        let slug = git::slugify(&title);
-        // Session id suffix keeps branches unique across same-titled sessions.
-        let branch = format!("trouve/{slug}-{}", &session_id[3..9]);
+        let branch = session_branch_name(
+            &title,
+            &session_id,
+            self.title_model.derive_branch_name_from_session_title(),
+        );
         let base_ref = match req.base_ref {
             Some(r) => r,
             None => {
@@ -4660,6 +4721,91 @@ impl Engine {
             .await
     }
 
+    /// Restore the worktree to one exact turn checkpoint rather than taking
+    /// a relative step through the session's undo stack.
+    pub async fn restore_checkpoint_by_id(&self, checkpoint_id: &str) -> Result<(), EngineError> {
+        let cp = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        let session = self.get_session(&cp.session_id)?;
+        let lock = self.session_lock(&session.id);
+        let _guard = lock.write().await;
+
+        let latest = self
+            .store
+            .latest_checkpoint_seq(&session.id)?
+            .ok_or_else(|| EngineError::BadRequest("session has no checkpoints".into()))?;
+        let cp = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .filter(|current| current.session_id == session.id)
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        if cp.seq < 0 || cp.seq > latest {
+            return Err(EngineError::NotFound(format!(
+                "checkpoint {checkpoint_id} is no longer available"
+            )));
+        }
+        self.restore_checkpoint_row(&session, cp, latest, RestoreDirection::Exact)
+            .await
+    }
+
+    /// Create a new session whose worktree starts at one exact turn
+    /// checkpoint. The initial thread inherits the source thread's current
+    /// mode, model, model options, and permission policy.
+    pub async fn fork_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<ForkCheckpointResponse, EngineError> {
+        let checkpoint = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        let source_session = self.get_session(&checkpoint.session_id)?;
+        let source_thread_id = checkpoint.thread_id.as_deref().ok_or_else(|| {
+            EngineError::BadRequest("the session-start checkpoint has no source thread".into())
+        })?;
+        let source_thread = self.get_thread(source_thread_id)?;
+        if source_thread.session_id != source_session.id {
+            return Err(EngineError::Internal(anyhow!(
+                "checkpoint {checkpoint_id} references a thread outside its session"
+            )));
+        }
+
+        let session = self
+            .create_session(CreateSessionRequest {
+                workspace_id: source_session.workspace_id,
+                title: Some(format!(
+                    "{} (fork after turn {})",
+                    source_session.title, checkpoint.turn
+                )),
+                base_ref: Some(source_session.base_ref),
+                checkout_ref: Some(checkpoint.commit_hash),
+                fetch_latest: false,
+            })
+            .await?;
+        let thread = match self.create_thread(CreateThreadRequest {
+            session_id: session.id.clone(),
+            mode: Some(source_thread.mode),
+            model: Some(source_thread.model),
+            model_options: source_thread.model_options,
+            permission_mode: Some(source_thread.permission_mode),
+        }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Err(cleanup_error) = self.delete_session(&session.id).await {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        "failed to clean up checkpoint fork after thread creation failed: {cleanup_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(ForkCheckpointResponse { session, thread })
+    }
+
     async fn restore_checkpoint(
         &self,
         session_id: &str,
@@ -4677,6 +4823,11 @@ impl Engine {
         let target = match direction {
             RestoreDirection::Undo => current - 1,
             RestoreDirection::Redo => current + 1,
+            RestoreDirection::Exact => {
+                return Err(EngineError::BadRequest(
+                    "an exact restore requires a checkpoint id".into(),
+                ));
+            }
         };
         if target < 0 || target > latest {
             return Err(EngineError::BadRequest(format!(
@@ -4684,6 +4835,7 @@ impl Engine {
                 match direction {
                     RestoreDirection::Undo => "undo",
                     RestoreDirection::Redo => "redo",
+                    RestoreDirection::Exact => "restore",
                 }
             )));
         }
@@ -4691,20 +4843,36 @@ impl Engine {
             .store
             .checkpoint_at(session_id, target)?
             .ok_or_else(|| EngineError::NotFound(format!("checkpoint seq {target}")))?;
+        self.restore_checkpoint_row(&session, cp, latest, direction)
+            .await?;
+        Ok(())
+    }
+
+    async fn restore_checkpoint_row(
+        &self,
+        session: &Session,
+        checkpoint: CheckpointRow,
+        latest: i64,
+        direction: RestoreDirection,
+    ) -> Result<(), EngineError> {
         let wt = PathBuf::from(&session.worktree_path);
-        let commit = cp.commit_hash.clone();
+        let commit = checkpoint.commit_hash.clone();
         tokio::task::spawn_blocking(move || git::restore(&wt, &commit))
             .await
             .map_err(|e| EngineError::Internal(anyhow!(e)))?
             .map_err(EngineError::Internal)?;
         self.store.set_undo_pos(
-            session_id,
-            if target == latest { None } else { Some(target) },
+            &session.id,
+            if checkpoint.seq == latest {
+                None
+            } else {
+                Some(checkpoint.seq)
+            },
         )?;
         self.store.append_event(
-            Scope::Session(session_id.to_string()),
+            Scope::Session(session.id.clone()),
             Event::CheckpointRestored {
-                checkpoint_id: cp.id,
+                checkpoint_id: checkpoint.id,
                 direction,
             },
         )?;
@@ -4939,6 +5107,90 @@ impl Engine {
         self.emit_queue(thread_id)
     }
 
+    /// Prioritize one queued prompt and run it next. If a turn still owns the
+    /// thread, interrupt that turn and explicitly resume the dispatcher after
+    /// its terminal event; otherwise claim and start the selected prompt now.
+    pub fn dispatch_queued_prompt(
+        self: &Arc<Self>,
+        prompt_id: &str,
+    ) -> Result<TurnAccepted, EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let activity_publication = self.session_activity_publication.lock().unwrap();
+        let mut active = self.active_threads.lock().unwrap();
+        if self
+            .deleting_sessions
+            .lock()
+            .unwrap()
+            .contains(&thread.session_id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
+
+        let turn_running = active.contains_key(&thread_id);
+        let turn_cancel = if turn_running {
+            Some(
+                self.turn_cancels
+                    .lock()
+                    .unwrap()
+                    .get(&thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::Conflict(format!(
+                            "thread {thread_id} is between interruptible turns"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let prompt = self
+            .store
+            .prioritize_queued_prompt(prompt_id, !turn_running)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        if turn_running {
+            // The dispatcher owns the active-thread claim until it publishes
+            // the cancelled turn. Mark the explicit resume before tripping
+            // the token so it will claim the newly prioritized prompt next.
+            self.resume_after_cancel
+                .lock()
+                .unwrap()
+                .insert(thread_id.clone());
+            if let Err(error) = self.emit_queue(&thread_id) {
+                self.resume_after_cancel.lock().unwrap().remove(&thread_id);
+                return Err(error);
+            }
+            drop(active);
+            drop(activity_publication);
+            turn_cancel
+                .expect("an active thread must have an interrupt token")
+                .cancel();
+            return Ok(TurnAccepted {
+                thread_id,
+                turn: 0,
+                queued: true,
+            });
+        }
+
+        let session_woke = !active.values().any(|session| *session == thread.session_id);
+        active.insert(thread_id.clone(), thread.session_id.clone());
+        let cancel = self.register_cancel(&thread_id);
+        drop(active);
+        let turn =
+            self.launch_claimed_prompt(thread, prompt, session_woke, cancel, activity_publication)?;
+        Ok(TurnAccepted {
+            thread_id,
+            turn,
+            queued: false,
+        })
+    }
+
     /// Start draining the thread's queue if it's idle — the "Send now"
     /// affordance. Deliberately never called automatically at startup: a
     /// crash may have cut a turn short, and running the queue on top of
@@ -4951,7 +5203,7 @@ impl Engine {
         let activity_publication = self.session_activity_publication.lock().unwrap();
         // Claim the thread and take the queue front atomically so two
         // concurrent sends can't both start a dispatcher.
-        let (prompt, session_woke) = {
+        let (prompt, session_woke, cancel) = {
             let mut active = self.active_threads.lock().unwrap();
             if self
                 .deleting_sessions
@@ -4989,11 +5241,28 @@ impl Engine {
             };
             let was_active = active.values().any(|s| *s == thread.session_id);
             active.insert(thread_id.to_string(), thread.session_id.clone());
-            (p, !was_active)
+            let cancel = self.register_cancel(thread_id);
+            (p, !was_active, cancel)
         };
+        self.launch_claimed_prompt(thread, prompt, session_woke, cancel, activity_publication)
+            .map(Some)
+    }
+
+    /// Complete setup for a prompt already claimed under the active-thread
+    /// lock and launch its queue-draining task.
+    fn launch_claimed_prompt(
+        self: &Arc<Self>,
+        thread: Thread,
+        prompt: trouve_protocol::QueuedPrompt,
+        session_woke: bool,
+        cancel: tokio_util::sync::CancellationToken,
+        activity_publication: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<u64, EngineError> {
+        let thread_id = thread.id.clone();
         if session_woke && let Err(error) = self.emit_session_activity(&thread.session_id, true) {
             let prompt_release = self.store.release_queued_prompt(&prompt.id);
-            self.active_threads.lock().unwrap().remove(thread_id);
+            self.active_threads.lock().unwrap().remove(&thread_id);
+            self.clear_cancel(&thread_id);
             drop(activity_publication);
             prompt_release?;
             return Err(error);
@@ -5001,22 +5270,21 @@ impl Engine {
         drop(activity_publication);
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
-        if let Err(e) = self.emit_queue(thread_id) {
+        if let Err(e) = self.emit_queue(&thread_id) {
             let _ = self.store.release_queued_prompt(&prompt.id);
-            self.release_thread(thread_id)?;
+            self.clear_cancel(&thread_id);
+            self.release_thread(&thread_id)?;
             return Err(e);
         }
-        let turn = match self.store.next_turn(thread_id) {
+        let turn = match self.store.next_turn(&thread_id) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.store.release_queued_prompt(&prompt.id);
-                self.release_thread(thread_id)?;
+                self.clear_cancel(&thread_id);
+                self.release_thread(&thread_id)?;
                 return Err(e.into());
             }
         };
-        // Register cancellation before returning from dispatch so an
-        // immediate cancel cannot race the spawned turn task.
-        let cancel = self.register_cancel(thread_id);
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
@@ -5027,7 +5295,7 @@ impl Engine {
                 tracing::error!("turn dispatcher for {thread_id} retained its claim: {error:#}");
             }
         });
-        Ok(Some(turn))
+        Ok(turn)
     }
 
     /// Run `content` as `turn`, then keep pulling queued prompts until the
@@ -5043,11 +5311,11 @@ impl Engine {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
-        let mut first_cancel = Some(first_cancel);
+        let mut turn_cancel = Some(first_cancel);
         loop {
-            let cancel = first_cancel
+            let cancel = turn_cancel
                 .take()
-                .unwrap_or_else(|| self.register_cancel(&thread.id));
+                .expect("an active queue prompt must have a cancellation token");
             let result =
                 std::panic::AssertUnwindSafe(self.run_turn(&thread, turn, &prompt, cancel.clone()))
                     .catch_unwind()
@@ -5081,7 +5349,7 @@ impl Engine {
             self.turn_scheduler
                 .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
-            if let Err(e) = result {
+            let resume_after_failure = if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 self.store
                     .append_event(
@@ -5094,13 +5362,17 @@ impl Engine {
                     .with_context(|| {
                         format!("persisting failure for turn {turn} of {}", thread.id)
                     })?;
-                self.clear_cancel(&thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
-                self.release_thread(&thread.id)?;
-                return Ok(());
-            }
-            if cancelled {
+                let resume = self.finish_interrupted_turn(&thread.id)?;
+                if !resume {
+                    return Ok(());
+                }
+                true
+            } else {
+                false
+            };
+            if !resume_after_failure && cancelled {
                 // A user-cancelled turn normally pauses the queue (like a
                 // failure, but not an error). A prompt submitted after the
                 // cancel request is itself an explicit resume, though.
@@ -5116,28 +5388,37 @@ impl Engine {
                     })?;
                 // Decide atomically with releasing the active claim so a
                 // racing send cannot be stranded between the two.
-                let resume = self.finish_cancelled_turn(&thread.id)?;
+                let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
                 }
-            } else {
-                self.clear_cancel(&thread.id);
             }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
-            let next = {
+            let (next, next_cancel) = {
                 let _activity_publication = self.session_activity_publication.lock().unwrap();
-                let (next, idle_session) = {
+                let (next, next_cancel, idle_session) = {
                     let mut active = self.active_threads.lock().unwrap();
+                    if !resume_after_failure && !cancelled {
+                        self.clear_cancel(&thread.id);
+                    }
                     match self.store.claim_queued_prompt(&thread.id) {
-                        Ok(Some(p)) => (Some(p), None),
-                        _ => (None, Self::remove_thread_claim(&mut active, &thread.id)),
+                        Ok(Some(prompt)) => {
+                            let cancel = self.register_cancel(&thread.id);
+                            (Some(prompt), Some(cancel), None)
+                        }
+                        _ => (
+                            None,
+                            None,
+                            Self::remove_thread_claim(&mut active, &thread.id),
+                        ),
                     }
                 };
                 self.publish_idle_or_restore(&thread.id, idle_session)?;
-                next
+                (next, next_cancel)
             };
             let Some(next) = next else { return Ok(()) };
+            turn_cancel = next_cancel;
             let _ = self.emit_queue(&thread.id);
             // Thread settings may have changed between turns.
             if let Ok(t) = self.get_thread(&thread.id) {
@@ -5214,16 +5495,19 @@ impl Engine {
         self.resume_after_cancel.lock().unwrap().remove(thread_id);
     }
 
-    /// Finish a cancelled turn while coordinating with sends that may be
+    /// Finish a cancelled or failed turn while coordinating with dispatches
     /// waiting on the same active-thread claim. Returns true when one of
-    /// those sends requested that the queue continue draining.
-    fn finish_cancelled_turn(&self, thread_id: &str) -> Result<bool, EngineError> {
+    /// those dispatches requested that the queue continue draining.
+    fn finish_interrupted_turn(&self, thread_id: &str) -> Result<bool, EngineError> {
         // Lock ordering matches `dispatch_queue`: activity publication,
         // active thread, cancel token, then resume marker.
         let _activity_publication = self.session_activity_publication.lock().unwrap();
         let (resume, idle_session) = {
             let mut active = self.active_threads.lock().unwrap();
-            let resume = self.resume_after_cancel.lock().unwrap().contains(thread_id);
+            let mut cancels = self.turn_cancels.lock().unwrap();
+            let mut resumes = self.resume_after_cancel.lock().unwrap();
+            let resume = resumes.remove(thread_id);
+            cancels.remove(thread_id);
             let idle_session = if resume {
                 None
             } else {
@@ -5232,7 +5516,6 @@ impl Engine {
             (resume, idle_session)
         };
         self.publish_idle_or_restore(thread_id, idle_session)?;
-        self.clear_cancel(thread_id);
         Ok(resume)
     }
 
@@ -5373,10 +5656,9 @@ impl Engine {
             .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog = provider.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
+        let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
+        normalize_thinking_option(&mut model_options, selected_model);
+        let thinking_level = resolved_thinking_level(&model_options, selected_model);
 
         self.store.append_event(
             scope.clone(),
@@ -5384,6 +5666,7 @@ impl Engine {
                 turn,
                 mode: mode.id.clone(),
                 model: thread.model.clone(),
+                thinking_level,
             },
         )?;
         // Show the prompt in the UI before any slow pre-turn work:
@@ -6207,6 +6490,11 @@ impl Engine {
         tools_enabled: bool,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let model_catalog = backend.list_models().await;
+        let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
+        normalize_thinking_option(&mut model_options, selected_model);
+        let thinking_level = resolved_thinking_level(&model_options, selected_model);
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -6244,6 +6532,7 @@ impl Engine {
                 turn,
                 mode: mode.id.clone(),
                 model: thread.model.clone(),
+                thinking_level,
             },
         )?;
         self.store.append_event(
@@ -6307,12 +6596,6 @@ impl Engine {
             Some(digest) => format!("{digest}\n\n{content}"),
             None => content,
         };
-        let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = backend.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
         let backend_turn = BackendTurn {
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
@@ -6415,6 +6698,9 @@ impl Engine {
                     }
                     persisted.push(Event::AssistantThinking { turn, text: delta });
                 }
+                BackendEvent::ThinkingCompleted => {
+                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                }
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
@@ -6462,6 +6748,15 @@ impl Engine {
                 }
                 BackendEvent::CommandsUpdated { commands } => {
                     persisted.push(Event::CommandsUpdated { commands });
+                }
+                BackendEvent::TodosUpdated { todos } => {
+                    // Vendor-native plans are authoritative replacements just
+                    // like todo_write results, but they are not transcript
+                    // tool calls. Persist the thread snapshot and publish the
+                    // existing durable event so every client sees the pane.
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    self.store.update_thread_todos(&thread.id, &todos)?;
+                    persisted.push(Event::TodosUpdated { todos });
                 }
                 BackendEvent::UsageUpdated { usage } => {
                     persisted.push(Event::TurnUsageUpdated { turn, usage });
@@ -8311,7 +8606,7 @@ pub fn spawn_session_spec() -> ToolSpec {
                 },
                 "title": {
                     "type": "string",
-                    "description": "Session title (also names the branch); derived from the prompt when omitted."
+                    "description": "Session title; derived from the prompt when omitted. It also contributes to the branch name when title-derived branch naming is enabled."
                 },
                 "mode": {
                     "type": "string",
@@ -8821,6 +9116,18 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_branches_default_to_short_ids_and_can_include_title_slugs() {
+        assert_eq!(
+            session_branch_name("Fix the Login Bug", "se_abc123def456", false),
+            "trouve/abc123"
+        );
+        assert_eq!(
+            session_branch_name("Fix the Login Bug", "se_abc123def456", true),
+            "trouve/fix-the-login-bug-abc123"
+        );
+    }
 
     fn projection_pr(number: u64, workspace_id: &str, head: &str) -> trouve_protocol::PrInfo {
         trouve_protocol::PrInfo {
@@ -9747,6 +10054,10 @@ mod tests {
             options.get("reasoning_effort"),
             Some(&serde_json::json!("high"))
         );
+        assert_eq!(
+            resolved_thinking_level(&options, Some(&model)).as_deref(),
+            Some("high")
+        );
         assert!(!options.contains_key("thinking_level"));
 
         // A global token the selected model does not offer falls back to
@@ -9757,6 +10068,11 @@ mod tests {
         assert_eq!(
             options.get("reasoning_effort"),
             Some(&serde_json::json!("medium"))
+        );
+        assert_eq!(
+            resolved_thinking_level(&serde_json::Map::new(), Some(&model)).as_deref(),
+            Some("medium"),
+            "omitting an option uses the model schema default"
         );
 
         let fixed_model = trouve_protocol::ModelInfo {
@@ -9780,6 +10096,10 @@ mod tests {
         assert_eq!(
             options.get("thinking_budget_tokens"),
             Some(&serde_json::json!(16384))
+        );
+        assert_eq!(
+            resolved_thinking_level(&options, Some(&fixed_model)).as_deref(),
+            Some("16384")
         );
 
         // No thinking enum means the inherited option is not sent.
@@ -9890,6 +10210,7 @@ mod tests {
             engine.set_git_worktree_settings(
                 trouve_protocol::TitleModelLoadBehavior::Always,
                 trouve_protocol::TitleModelResourcePolicy::GpuOnly,
+                None,
             ),
         )
         .await

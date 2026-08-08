@@ -35,18 +35,18 @@ mod tests {
 
     #[test]
     fn accepts_current_and_newer_compatible_protocols() {
-        ensure_compatible_protocol("3.9", "3.9").unwrap();
-        ensure_compatible_protocol("3.99", "3.9").unwrap();
+        ensure_compatible_protocol("3.14", "3.14").unwrap();
+        ensure_compatible_protocol("3.99", "3.14").unwrap();
     }
 
     #[test]
     fn rejects_older_other_major_and_malformed_protocols() {
-        for server in ["3.8", "2.99", "4.0", "unknown", "3.9.1"] {
-            let error = ensure_compatible_protocol(server, "3.9")
+        for server in ["3.13", "2.99", "4.0", "unknown", "3.14.1"] {
+            let error = ensure_compatible_protocol(server, "3.14")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(server));
-            assert!(error.contains("3.9 or newer 3.x"));
+            assert!(error.contains("3.14 or newer 3.x"));
         }
     }
 }

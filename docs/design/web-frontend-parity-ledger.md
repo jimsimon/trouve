@@ -243,7 +243,7 @@ full-access error treatment, and Slint-style tail-follow recovery: reaching
 the rendered bottom manually now dismisses “Jump to latest” and resumes live
 following even while virtual row measurements are converging. It also aligns
 subscription meter thresholds and labels, the Vendor CLI uninstall action,
-the informational type scale in Git & Worktrees, Integrations, and Appearance,
+the informational type scale in Sessions & Chat, Integrations, and Appearance,
 and the GitHub Enterprise add-form baseline.
 
 The same pass closes the initial responsive implementation gaps: Files is a
@@ -299,7 +299,7 @@ xterm input/resize are examples.
 | 14 | Providers and onboarding | Provider presets and custom endpoints, secret entry, reset/validation, health and models, API-key and OAuth/device/callback login, polling, cancellation, failure/expiry, delete, and vendor CLI install/update/cancel/uninstall lifecycle. | [provider settings](../../web/app-ui/src/components/provider-settings.ts), [CLI settings](../../web/app-ui/src/components/cli-settings.ts) | Live provider matrices, secret redaction audit, OAuth interruption/expiry, onboarding screenshots, keyboard/mobile/AT evidence. |
 | 15 | Modes and models | Data-driven modes, per-mode provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [mode settings](../../web/app-ui/src/components/mode-settings-panel.ts), [model picker](../../web/app-ui/src/components/model-picker.ts), [model option controls](../../web/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
 | 16 | Local models | Enabled/status/hardware state, llama.cpp runtime install/update/cancel/uninstall, server start/stop/restart controls, installed model management, download progress/cancel/delete, catalog search, GPU/CPU/too-large fit filters, and manual model addition. | [local model settings](../../web/app-ui/src/components/local-model-settings.ts) | Live runtime/download/disk/concurrency failures, remote-host wording on devices, progress screenshots, memory and AT evidence. |
-| 17 | Git and worktrees | Workspace/branch management represented by the current frontend plus Git/title-model status, resource/install progress, cancellation, warnings, and protocol-backed configuration. No web client bypasses the protocol or session-owned worktree boundary. | [workspace settings](../../web/app-ui/src/components/workspace-settings.ts), [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts) | Dirty/conflict/remote/failure fixtures exposed by the server, destructive confirmations, visual hierarchy, and live worktree soak. |
+| 17 | Session naming | Short or title-derived branch naming plus title-model status, resource/install progress, cancellation, warnings, and protocol-backed configuration. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
 | 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
 | 19 | Integrations | GitHub.com and enterprise host add/remove, configuration status, login/device/callback flows, polling/cancel, disconnect, health/errors, validated navigation, and integration deep links from PR surfaces. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts) | Live multi-host OAuth and re-auth, PWA redirect origins, cancellation/expiry, security and visual/AT evidence. |
 | 20 | About and licensing | Frontend/server/protocol/deployment/connectivity/version data, packaged dependency notices, conditional Slint attribution while shipped, and desktop/PWA capability/revision information. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [generated host schema](../../web/app-ui/src/generated/host.ts) | Packaged offline artifact inspection, final inventories, platform/version screenshots, link and compliance review. |
@@ -997,12 +997,13 @@ remains open.
 **Qualification state:** Core preview workflow exists; every promotion gate
 remains open.
 
-### 17. Git and worktrees — partial
+### 17. Session naming — partial
 
 **Current functional preview coverage**
 
-- The current settings panel exposes the session-title model resource policy,
-  install/cancel actions, and related load/status presentation.
+- The Sessions & Chat settings panel exposes the default short-branch policy,
+  the opt-in title-derived branch policy, the session-title model resource
+  policy, install/cancel actions, and related load/status presentation.
 - Settings operations use the protocol client rather than direct filesystem,
   git, or worktree access.
 
@@ -1014,16 +1015,15 @@ remains open.
 
 **Missing parity and qualification work**
 
-- Add identity/defaults, worktree policy and status, dirty/conflict/error
-  states, remote/default branch, cleanup, confirmation, recovery, and the
-  complete title-model resource lifecycle.
-- Preserve Slint form grouping, density, field ordering, warning hierarchy,
-  destructive confirmations, and status colors in every theme.
-- Ensure every effect stays a protocol operation against session-owned
+- Complete title-model resource failure, recovery, and concurrent transition
+  fixtures without conflating naming policy with general Git configuration.
+- Preserve form density, field ordering, warning hierarchy, and status colors
+  in every theme.
+- Ensure every naming effect stays a protocol operation against session-owned
   worktrees; neither desktop bridge nor PWA may expose direct git/filesystem
   escape hatches.
-- Test keyboard/forms, screen readers, validation, dirty/conflict recovery,
-  concurrent session changes, restart, desktop/PWA wording, and long paths.
+- Test keyboard/forms, screen readers, validation, concurrent setting changes,
+  restart persistence, desktop/PWA wording, and long generated titles.
 
 **Qualification state:** Unqualified.
 

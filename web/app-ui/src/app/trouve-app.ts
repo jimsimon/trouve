@@ -1462,6 +1462,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
   }
 
+  readonly #keepWorkspaceDropActive = (event: DragEvent): void => {
+    if (this.#draggedWorkspaceId === "") return;
+    event.preventDefault();
+    if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "move";
+  };
+
   #dropWorkspace(event: DragEvent, targetId: string): void {
     event.preventDefault();
     const workspaceId = this.#draggedWorkspaceId;
@@ -2159,8 +2165,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           .filter((workspaceId) => !knownWorkspaceIds.has(workspaceId)),
       ),
     ];
-    const selectedInspection =
+    const activeView =
+      route.kind === "session" && route.threadId !== undefined
+        ? this.#store.threadView(route.threadId)
+        : undefined;
+    const requestedInspection =
       route.kind === "session" ? (route.inspection ?? "diff") : "diff";
+    // Never leave an empty TODO surface mounted while the route correction
+    // scheduled in updated() propagates through history/router signals.
+    const selectedInspection = requestedInspection === "plan" &&
+        (activeView === undefined || activeView.todos.length === 0)
+      ? "diff"
+      : requestedInspection;
     const liveSessionIds = new Set(sessions.map((session) => session.id));
     for (const sessionId of this.#terminalSessionIds) {
       if (!liveSessionIds.has(sessionId)) this.#terminalSessionIds.delete(sessionId);
@@ -2171,10 +2187,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const selectedInspectionIndex = selectedInspection === "plan"
       ? -1
       : INSPECTION_PANELS.indexOf(selectedInspection);
-    const activeView =
-      route.kind === "session" && route.threadId !== undefined
-        ? this.#store.threadView(route.threadId)
-        : undefined;
     const activeThread =
       route.kind === "session" && route.threadId !== undefined
         ? this.#store.thread(route.threadId)
@@ -2291,11 +2303,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           ${orderedWorkspaces.map(
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
+              const dropTarget = this.#workspaceDropTarget === workspace.id;
+              const placeholder = html`<div
+                class="workspace-drop-placeholder"
+                data-drop-placeholder="workspace"
+                aria-hidden="true"
+                @dragover=${this.#keepWorkspaceDropActive}
+                @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
+              ></div>`;
               return html`
+                ${dropTarget && !this.#workspaceDropAfter ? placeholder : nothing}
                 <section
-                  class="workspace-group ${this.#workspaceDropTarget === workspace.id
-                    ? this.#workspaceDropAfter ? "drop-after" : "drop-before"
-                    : ""}"
+                  class="workspace-group"
                   aria-labelledby=${`workspace-${index}`}
                   @dragover=${(event: DragEvent) => this.#dragOverWorkspace(event, workspace.id)}
                   @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
@@ -2370,6 +2389,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>
                 </section>
+                ${dropTarget && this.#workspaceDropAfter ? placeholder : nothing}
               `;
             },
           )}

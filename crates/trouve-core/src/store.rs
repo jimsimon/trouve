@@ -26,7 +26,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Version 2 retains server-measured per-tool execution durations. Treat the
 // projection as a rebuildable cache so existing databases are upgraded by
 // folding their durable event history again, without a storage migration.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 2;
+// v3 retains the checkpoint id on completed folded turns so cached histories
+// expose exact restore/fork actions after an upgrade.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -3487,6 +3489,64 @@ impl Store {
         Ok(true)
     }
 
+    /// Move one visible prompt to the front in a single transaction and,
+    /// when requested, claim it for an idle dispatcher. Returns `None` when
+    /// the prompt no longer exists or another dispatcher already claimed it.
+    pub fn prioritize_queued_prompt(
+        &self,
+        id: &str,
+        claim: bool,
+    ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some(mut prompt) = tx
+            .query_row(
+                "SELECT thread_id, content, attachments, created_at
+                 FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| {
+                    Ok(trouve_protocol::QueuedPrompt {
+                        id: id.to_string(),
+                        thread_id: row.get(0)?,
+                        position: 0,
+                        content: row.get(1)?,
+                        attachments: parse_attachments(&row.get::<_, String>(2)?),
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM queued_prompts
+                 WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
+            )?;
+            let rows = stmt.query_map(params![prompt.thread_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ordered = std::iter::once(id.to_string())
+            .chain(ids.into_iter().filter(|candidate| candidate != id));
+        for (index, candidate) in ordered.enumerate() {
+            tx.execute(
+                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1 AND claimed = 0",
+                params![candidate, index as i64],
+            )?;
+        }
+        if claim {
+            tx.execute(
+                "UPDATE queued_prompts SET claimed = 1 WHERE id = ?1 AND claimed = 0",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        prompt.position = 0;
+        Ok(Some(prompt))
+    }
+
     /// Hide and return the front prompt while a dispatcher prepares its
     /// durable turn start. The row is deleted only after the user message is
     /// persisted; setup failures release it back to the visible queue.
@@ -6714,6 +6774,18 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn checkpoint(&self, checkpoint_id: &str) -> Result<Option<CheckpointRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, session_id, thread_id, turn, seq, commit_hash FROM checkpoints
+             WHERE id = ?1",
+            params![checkpoint_id],
+            row_to_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn latest_checkpoint_seq(&self, session_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
@@ -6823,6 +6895,7 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "test/model".into(),
+                thinking_level: None,
             },
             Event::UserMessage {
                 turn: 1,
@@ -7300,6 +7373,7 @@ mod tests {
                     turn: 1,
                     mode: "code".into(),
                     model: "p/m".into(),
+                    thinking_level: None,
                 },
             )
             .unwrap();
@@ -8297,6 +8371,62 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_priority_can_remain_visible_or_be_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_priority");
+        let first = store.enqueue_prompt("th_priority", "first", &[]).unwrap();
+        let second = store.enqueue_prompt("th_priority", "second", &[]).unwrap();
+        let third = store.enqueue_prompt("th_priority", "third", &[]).unwrap();
+
+        let prioritized = store
+            .prioritize_queued_prompt(&third.id, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prioritized.position, 0);
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first", "second"]
+        );
+
+        let claimed = store
+            .prioritize_queued_prompt(&second.id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.content, "second");
+        assert!(
+            store
+                .prioritize_queued_prompt(&second.id, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first"]
+        );
+
+        assert!(store.release_queued_prompt(&second.id).unwrap());
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str(), third.id.as_str(), first.id.as_str()]
+        );
+    }
+
+    #[test]
     fn queued_prompts_survive_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("q.db");
@@ -8529,6 +8659,10 @@ mod tests {
             store.checkpoint_at("se_1", 1).unwrap().unwrap().commit_hash,
             "c1b"
         );
+        let checkpoint = store.checkpoint("cp_new").unwrap().unwrap();
+        assert_eq!(checkpoint.session_id, "se_1");
+        assert_eq!(checkpoint.turn, 9);
+        assert_eq!(checkpoint.seq, 1);
     }
 
     #[test]

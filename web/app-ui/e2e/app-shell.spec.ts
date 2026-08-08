@@ -71,6 +71,17 @@ const installFixtureEventSource = async (page: Page): Promise<void> => {
 };
 
 const installProtocolFixtures = async (page: Page): Promise<void> => {
+  let namingSettings = {
+    derive_branch_name_from_session_title: false,
+    title_model_load_behavior: "auto",
+    title_model_resource_policy: "cpu_ram_only",
+    title_model: {
+      state: "not_installed",
+      detail: "Built-in naming rules are active.",
+      runtime_installed: false,
+      model_downloaded: false,
+    },
+  };
   await page.route("**/v1/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -79,7 +90,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "2.9",
+        protocol_version: "3.14",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -161,6 +172,22 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       await route.fulfill({ status: 204 });
       return;
     }
+    if (key === "GET /v1/config/git-worktrees") {
+      await route.fulfill({
+        headers: { "x-trouve-event-cursor": "6" },
+        json: namingSettings,
+      });
+      return;
+    }
+    if (key === "PUT /v1/config/git-worktrees") {
+      const update = request.postDataJSON() as Partial<typeof namingSettings>;
+      namingSettings = { ...namingSettings, ...update };
+      await route.fulfill({
+        headers: { "x-trouve-event-cursor": "7" },
+        json: namingSettings,
+      });
+      return;
+    }
     if (key === "GET /v1/server-projection") {
       // Exercise the cursor-zero compatibility path; the fixture EventSource
       // supplies the durable GitHub projection used by these shell tests.
@@ -185,6 +212,20 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
 test.beforeEach(async ({ page }) => {
   await installFixtureEventSource(page);
   await installProtocolFixtures(page);
+});
+
+test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  const row = page.locator(".session-row").filter({ hasText: "Protocol ingress" });
+  await expect(row).toBeVisible();
+  await expect(row).not.toContainText("feature");
+  await expect(row.locator(".session-copy small")).toHaveCount(0);
+  await expect(row).toHaveCSS("height", "34px");
+  await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
 });
 
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
@@ -362,10 +403,18 @@ test("the responsive dashboard remains available from the mobile PWA layout", as
   )).toEqual([]);
 });
 
-test("Chat settings default thoughts to visible and persist the grouping opt-in", async ({ page }) => {
+test("Sessions & Chat settings preserve grouping and branch-naming choices", async ({ page }) => {
   await page.goto("/settings/chat");
 
-  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sessions & Chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Git & Worktrees", exact: true }))
+    .toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Session naming", exact: true }))
+    .toBeVisible();
+  const branchNames = page.getByLabel("Use session names in branch names");
+  await expect(branchNames).not.toBeChecked();
+  await expect(page.getByText(/new branches use a compact name such as trouve\/abc123/u))
+    .toBeVisible();
   const toggle = page.getByLabel("Collapse thinking output with tool calls.");
   await expect(toggle).not.toBeChecked();
   await expect(page.getByText(
@@ -383,6 +432,15 @@ test("Chat settings default thoughts to visible and persist the grouping opt-in"
   await expect(toggle).toBeChecked();
   await page.getByText("Collapse context compaction with tool calls.", { exact: true }).click();
   await expect(compactionToggle).toBeChecked();
+  const branchUpdate = page.waitForRequest((request) =>
+    request.method() === "PUT" &&
+    new URL(request.url()).pathname === "/v1/config/git-worktrees"
+  );
+  await branchNames.click();
+  await expect(branchNames).toBeChecked();
+  await expect((await branchUpdate).postDataJSON()).toMatchObject({
+    derive_branch_name_from_session_title: true,
+  });
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
     .toContain('"collapseThinkingWithTools":true');
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
@@ -391,19 +449,20 @@ test("Chat settings default thoughts to visible and persist the grouping opt-in"
   await page.reload();
   await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
+  await expect(page.getByLabel("Use session names in branch names")).toBeChecked();
 });
 
 test("Settings reopens the last screen until the app restarts", async ({ page }) => {
   await page.goto("/settings/general");
 
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await page.getByRole("button", { name: "Sessions & Chat", exact: true }).click();
   await expect(page).toHaveURL(/\/settings\/chat$/u);
-  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sessions & Chat", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /Close/u }).click();
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await expect(page).toHaveURL(/\/settings\/chat$/u);
-  await expect(page.getByRole("heading", { name: "Chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sessions & Chat", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /Close/u }).click();
   await page.reload();

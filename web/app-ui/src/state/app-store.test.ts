@@ -332,6 +332,7 @@ describe("AppStore", () => {
       }],
       session_pull_requests: [{ session_id: "se_1", prs: [linked] }],
       git_worktree_settings: {
+        derive_branch_name_from_session_title: false,
         title_model_load_behavior: "auto",
         title_model_resource_policy: "adaptive",
         title_model: {
@@ -581,6 +582,7 @@ describe("AppStore", () => {
   it("orders title-model settings snapshots against delayed SSE replay", () => {
     const store = new AppStore();
     const settings = (state: string) => ({
+      derive_branch_name_from_session_title: false,
       title_model_load_behavior: "auto" as const,
       title_model_resource_policy: "adaptive" as const,
       title_model: {

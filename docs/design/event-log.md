@@ -74,7 +74,7 @@ or appears after its cursor; there is no snapshot/stream race window.
 `GET /v1/server-projection` supplies the durable replacement state not carried
 by `SessionSummary`: the newest cached account PR list per configured GitHub
 host, the branch- and `session.pr_opened`-derived PR associations for every
-session, and Git & Worktrees settings. Each host slice retains its source event
+session, and session-naming settings. Each host slice retains its source event
 cursor and timestamp, and the response carries the current server cursor in
 `x-trouve-event-cursor`. Clients fetch it after the session-summary boundary,
 apply it before opening SSE, and still resume at the earlier session-summary
@@ -122,12 +122,17 @@ Thread scope:
 - `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
   capacity was acquired; background review work uses a lane that reserves
   capacity for interactive desktop turns
-- `turn.started` `{turn, mode, model}` / `turn.usage_updated` `{turn, usage}`
+- `turn.started` `{turn, mode, model, thinking_level?}` (the effective
+  provider-native thinking selection for that turn) / `turn.usage_updated`
+  `{turn, usage}`
   (live current-context replacement without ending the turn) /
   `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
   `{turn, error}`
 - `user.message` `{turn, content}`
 - `assistant.delta` `{turn, text}` — streamed model output
+- `assistant.thinking` `{turn, text}` — streamed display-only model reasoning /
+  `assistant.thinking_completed` `{turn}` — the provider explicitly closed
+  the current thinking item, even when no visible output follows immediately
 - `assistant.message` `{turn, content}` — folded final text for the turn
 - `tool.requested` `{turn, call_id, tool, args, requires_approval}`
 - `approval.requested` `{turn, call_id}` / `approval.resolved` `{call_id,
@@ -146,7 +151,7 @@ Thread scope:
 Session scope:
 
 - `checkpoint.created` `{checkpoint_id, turn, thread_id, ref}`
-- `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo)
+- `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo/exact)
 - `worktree.created` / `worktree.removed` `{path, branch}`
 
 Server scope:
@@ -233,8 +238,12 @@ here is uploaded except the deliberately published review result.
 
 ## Relationship to checkpoints and audit
 
-- `turn.completed` references the checkpoint created for that turn; undo
-  emits `checkpoint.restored` rather than deleting events — the log records
-  what happened, the worktree reflects the restore.
+- `turn.completed` references the checkpoint created for that turn, and the
+  folded `ThreadTurnState::Completed` retains that id so clients can offer
+  turn-boundary restore/fork actions after replay. Relative undo/redo and
+  checkpoint-targeted restore emit `checkpoint.restored` rather than deleting
+  events — the log records what happened, while the worktree reflects the
+  restore. Forking creates a normal new session/thread lifecycle at the named
+  checkpoint and does not copy the source transcript.
 - The audit view is a filter over the log (`tool.*`, `approval.*`), not a
   separate store.

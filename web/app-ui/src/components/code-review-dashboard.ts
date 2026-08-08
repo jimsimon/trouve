@@ -227,8 +227,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
     }
     .job-groups { display: grid; gap: 14px; padding: 14px; }
     .review-job-group { position: relative; min-width: 0; border-radius: var(--trouve-radius-sm); }
-    .review-job-group.drop-before { box-shadow: inset 0 3px var(--trouve-accent); }
-    .review-job-group.drop-after { box-shadow: inset 0 -3px var(--trouve-accent); }
+    .review-group-drop-placeholder { min-height: 42px; border: 1px dashed var(--trouve-accent); border-radius: var(--trouve-radius-sm); background: var(--trouve-accent-veil); }
     .group-header { margin-bottom: 6px; }
     .group-header h3 { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .group-count { color: var(--trouve-text-dim); font-size: 10px; white-space: nowrap; }
@@ -577,52 +576,62 @@ export class TrouveCodeReviewDashboard extends LitElement {
           ? html`<div class="empty-state"><strong>No review jobs yet</strong><p>Jobs will appear after an installed repository receives or requests a review.</p></div>`
           : groups.length === 0
             ? html`<div class="empty-state"><strong>No matching review jobs</strong><p>Choose another status to see recent review activity.</p><button type="button" @click=${() => { this.#filter = "all"; this.requestUpdate(); }}>Show all jobs</button></div>`
-            : html`<div class="job-groups">${groups.map((group, index) => html`
-                <section
-                  class=${`review-job-group ${this.#dropTarget === group.repository
-                    ? this.#dropAfter ? "drop-after" : "drop-before"
-                    : ""}`}
-                  data-review-group=${group.repository}
-                  aria-label=${`${group.repository} review jobs`}
-                  @dragover=${(event: DragEvent) => this.#dragOverGroup(event, group.repository)}
+            : html`<div class="job-groups">${groups.map((group, index) => {
+                const dropTarget = this.#dropTarget === group.repository;
+                const placeholder = html`<div
+                  class="review-group-drop-placeholder"
+                  data-drop-placeholder="code-review-group"
+                  aria-hidden="true"
+                  @dragover=${this.#keepGroupDropActive}
                   @drop=${(event: DragEvent) => this.#dropGroup(event, group.repository, visibleRepositories)}
-                >
-                  <header class="group-header">
-                    <h3 title=${group.repository}>${group.repository}</h3>
-                    <span class="group-count">${group.jobs.length} job${group.jobs.length === 1 ? "" : "s"}${group.activeCount > 0 ? ` · ${group.activeCount} active` : ""}</span>
-                    <span class="group-order-controls" role="group" aria-label=${`Position of ${group.repository}, ${index + 1} of ${groups.length}`}>
-                      <button
-                        class="group-grip"
-                        type="button"
-                        data-group-order-control="grip"
-                        .draggable=${groups.length > 1}
-                        aria-label=${`Reorder ${group.repository}. Position ${index + 1} of ${groups.length}. Use Up and Down arrow keys or drag.`}
-                        title="Drag to reorder, or use Up and Down arrow keys"
-                        @keydown=${(event: KeyboardEvent) => this.#groupOrderKeyDown(event, group.repository, visibleRepositories)}
-                        @dragstart=${(event: DragEvent) => this.#startGroupDrag(event, group.repository)}
-                        @dragend=${this.#endGroupDrag}
-                      >${fontAwesomeIcon("grip-vertical")}</button>
-                      <button
-                        type="button"
-                        data-group-order-control="up"
-                        aria-label=${`Move ${group.repository} up`}
-                        title="Move repository group up"
-                        ?disabled=${index === 0}
-                        @click=${() => this.#moveGroup(group.repository, -1, visibleRepositories, "up")}
-                      >${fontAwesomeIcon("arrow-up")}</button>
-                      <button
-                        type="button"
-                        data-group-order-control="down"
-                        aria-label=${`Move ${group.repository} down`}
-                        title="Move repository group down"
-                        ?disabled=${index + 1 === groups.length}
-                        @click=${() => this.#moveGroup(group.repository, 1, visibleRepositories, "down")}
-                      >${fontAwesomeIcon("arrow-down")}</button>
-                    </span>
-                  </header>
-                  <div class="job-list">${group.jobs.map((job) => this.#renderJob(job))}</div>
-                </section>
-              `)}</div>`}
+                ></div>`;
+                return html`
+                  ${dropTarget && !this.#dropAfter ? placeholder : nothing}
+                  <section
+                    class="review-job-group"
+                    data-review-group=${group.repository}
+                    aria-label=${`${group.repository} review jobs`}
+                    @dragover=${(event: DragEvent) => this.#dragOverGroup(event, group.repository)}
+                    @drop=${(event: DragEvent) => this.#dropGroup(event, group.repository, visibleRepositories)}
+                  >
+                    <header class="group-header">
+                      <h3 title=${group.repository}>${group.repository}</h3>
+                      <span class="group-count">${group.jobs.length} job${group.jobs.length === 1 ? "" : "s"}${group.activeCount > 0 ? ` · ${group.activeCount} active` : ""}</span>
+                      <span class="group-order-controls" role="group" aria-label=${`Position of ${group.repository}, ${index + 1} of ${groups.length}`}>
+                        <button
+                          class="group-grip"
+                          type="button"
+                          data-group-order-control="grip"
+                          .draggable=${groups.length > 1}
+                          aria-label=${`Reorder ${group.repository}. Position ${index + 1} of ${groups.length}. Use Up and Down arrow keys or drag.`}
+                          title="Drag to reorder, or use Up and Down arrow keys"
+                          @keydown=${(event: KeyboardEvent) => this.#groupOrderKeyDown(event, group.repository, visibleRepositories)}
+                          @dragstart=${(event: DragEvent) => this.#startGroupDrag(event, group.repository)}
+                          @dragend=${this.#endGroupDrag}
+                        >${fontAwesomeIcon("grip-vertical")}</button>
+                        <button
+                          type="button"
+                          data-group-order-control="up"
+                          aria-label=${`Move ${group.repository} up`}
+                          title="Move repository group up"
+                          ?disabled=${index === 0}
+                          @click=${() => this.#moveGroup(group.repository, -1, visibleRepositories, "up")}
+                        >${fontAwesomeIcon("arrow-up")}</button>
+                        <button
+                          type="button"
+                          data-group-order-control="down"
+                          aria-label=${`Move ${group.repository} down`}
+                          title="Move repository group down"
+                          ?disabled=${index + 1 === groups.length}
+                          @click=${() => this.#moveGroup(group.repository, 1, visibleRepositories, "down")}
+                        >${fontAwesomeIcon("arrow-down")}</button>
+                      </span>
+                    </header>
+                    <div class="job-list">${group.jobs.map((job) => this.#renderJob(job))}</div>
+                  </section>
+                  ${dropTarget && this.#dropAfter ? placeholder : nothing}
+                `;
+              })}</div>`}
       </section>
     `;
   }
@@ -802,6 +811,12 @@ export class TrouveCodeReviewDashboard extends LitElement {
     this.requestUpdate();
   }
 
+  readonly #keepGroupDropActive = (event: DragEvent): void => {
+    if (this.#draggedGroup === "") return;
+    event.preventDefault();
+    if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "move";
+  };
+
   #dropGroup(
     event: DragEvent,
     targetRepository: string,
@@ -813,14 +828,12 @@ export class TrouveCodeReviewDashboard extends LitElement {
       return;
     }
     event.preventDefault();
-    const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    const after = event.clientY >= bounds.top + bounds.height / 2;
     this.#commitGroupOrder(
       reorderReviewGroup(
         this.#groupOrder,
         repository,
         targetRepository,
-        after,
+        this.#dropAfter,
       ),
       repository,
       visibleRepositories,

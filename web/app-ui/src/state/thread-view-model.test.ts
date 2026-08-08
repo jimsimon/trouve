@@ -90,6 +90,7 @@ describe("ThreadViewModel", () => {
           state: {
             state: "completed",
             usage: { input_tokens: 20, output_tokens: 5 },
+            checkpoint_id: "cp_snapshot_7",
           },
         },
         {
@@ -109,6 +110,7 @@ describe("ThreadViewModel", () => {
       pending_approvals: ["call_snapshot"],
       last_usage: { input_tokens: 20, output_tokens: 5 },
       turn_models: { "7": "openai/gpt-5.6" },
+      turn_thinking_levels: { "7": "high" },
       turn_started_at: { "7": "2026-08-01T12:00:00Z" },
       turn_duration_ms: { "7": 4_000 },
       commands: [{ name: "review", description: "Review changes" }],
@@ -127,7 +129,11 @@ describe("ThreadViewModel", () => {
       turnRunning: false,
     });
     expect(view.items).toMatchObject([
-      { id: "snapshot:40", kind: "turn-status", state: { kind: "completed" } },
+      {
+        id: "snapshot:40",
+        kind: "turn-status",
+        state: { kind: "completed", checkpointId: "cp_snapshot_7" },
+      },
       { id: "snapshot:41", kind: "assistant", content: "Final folded answer" },
       {
         id: "snapshot:42",
@@ -136,6 +142,7 @@ describe("ThreadViewModel", () => {
       },
     ]);
     expect(view.turnModels.get(7)).toBe("openai/gpt-5.6");
+    expect(view.turnThinkingLevels.get(7)).toBe("high");
     expect(view.turnDurationMs.get(7)).toBe(4_000);
   });
 
@@ -232,7 +239,13 @@ describe("ThreadViewModel", () => {
   it("folds a streamed turn into stable user, assistant, and terminal status items", () => {
     const vm = new ThreadViewModel();
     const events = [
-      envelope(1, { type: "turn.started", turn: 1, mode: "code", model: "openai/gpt-5.6" }),
+      envelope(1, {
+        type: "turn.started",
+        turn: 1,
+        mode: "code",
+        model: "openai/gpt-5.6",
+        thinking_level: "max",
+      }),
       envelope(2, { type: "user.message", turn: 1, content: "Build it", attachments: [] }),
       envelope(3, { type: "assistant.thinking", turn: 1, text: "first " }),
       envelope(4, { type: "assistant.thinking", turn: 1, text: "thought" }),
@@ -245,7 +258,7 @@ describe("ThreadViewModel", () => {
           type: "turn.completed",
           turn: 1,
           usage: { input_tokens: 10, output_tokens: 4 },
-          checkpoint_id: null,
+          checkpoint_id: "cp_after_1",
         },
         "2026-08-01T12:00:08Z",
       ),
@@ -255,14 +268,37 @@ describe("ThreadViewModel", () => {
     expect(vm.cursor).toBe(8);
     expect(vm.lastUsageCursor).toBe(8);
     expect(vm.turnRunning).toBe(false);
+    expect(vm.turnThinkingLevels.get(1)).toBe("max");
     expect(vm.thinking).toBe(false);
     expect(vm.items).toMatchObject([
-      { kind: "turn-status", state: { kind: "completed" } },
+      {
+        kind: "turn-status",
+        state: { kind: "completed", checkpointId: "cp_after_1" },
+      },
       { kind: "user", content: "Build it" },
       { kind: "thinking", content: "first thought", complete: true },
       { kind: "assistant", content: "Working now.", complete: true },
     ]);
     expect(vm.turnDurationMs.get(1)).toBe(7_000);
+  });
+
+  it("closes the live thinking phase on its explicit provider boundary", () => {
+    const vm = new ThreadViewModel();
+    expect(vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      text: "Waiting for another event.",
+    }))).toBe(true);
+    expect(vm.thinking).toBe(true);
+
+    expect(vm.apply(envelope(2, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+    }))).toBe(true);
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", content: "Waiting for another event.", complete: true },
+    ]);
   });
 
   it("applies live context usage without completing the running turn", () => {
@@ -289,8 +325,38 @@ describe("ThreadViewModel", () => {
     expect(vm.lastUsageCursor).toBe(2);
     expect(vm.lastUsage?.context_input_tokens).toBe(90_000);
     expect(vm.items).toMatchObject([
-      { kind: "turn-status", state: { kind: "running" } },
+      {
+        kind: "turn-status",
+        state: {
+          kind: "running",
+          startedAt: "2026-08-01T12:00:01Z",
+          usage: {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            context_input_tokens: 90_000,
+          },
+        },
+      },
     ]);
+  });
+
+  it("restores live usage and start time on a running snapshot turn", () => {
+    const view = ThreadViewModel.fromSnapshot(17, {
+      items: [{ kind: "turn_status", turn: 3, state: { state: "running" } }],
+      turn_running: true,
+      last_usage: { input_tokens: 40, output_tokens: 12 },
+      turn_started_at: { "3": "2026-08-01T12:00:00Z" },
+    });
+
+    expect(view.items).toMatchObject([{
+      kind: "turn-status",
+      turn: 3,
+      state: {
+        kind: "running",
+        startedAt: "2026-08-01T12:00:00Z",
+        usage: { input_tokens: 40, output_tokens: 12 },
+      },
+    }]);
   });
 
   it("attaches bridged approvals to tool cards and keeps denials terminal", () => {

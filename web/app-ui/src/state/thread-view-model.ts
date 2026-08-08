@@ -27,8 +27,16 @@ export type ToolCallStatus =
   | "aborted";
 
 export type TurnState =
-  | { readonly kind: "running" }
-  | { readonly kind: "completed"; readonly usage: Usage }
+  | {
+      readonly kind: "running";
+      readonly startedAt?: string;
+      readonly usage?: Usage;
+    }
+  | {
+      readonly kind: "completed";
+      readonly usage: Usage;
+      readonly checkpointId?: string;
+    }
   | { readonly kind: "failed"; readonly error: string }
   | { readonly kind: "cancelled" };
 
@@ -118,6 +126,7 @@ export class ThreadViewModel {
   readonly pendingApprovals: string[] = [];
   readonly pendingQuestions: string[] = [];
   readonly turnModels = new Map<number, string>();
+  readonly turnThinkingLevels = new Map<number, string>();
   readonly turnStartedAt = new Map<number, string>();
   readonly turnDurationMs = new Map<number, number>();
 
@@ -166,6 +175,7 @@ export class ThreadViewModel {
       ...(snapshot.pending_questions ?? []),
     );
     replaceNumericMap(this.turnModels, snapshot.turn_models);
+    replaceNumericMap(this.turnThinkingLevels, snapshot.turn_thinking_levels);
     replaceNumericMap(this.turnStartedAt, snapshot.turn_started_at);
     replaceNumericMap(this.turnDurationMs, snapshot.turn_duration_ms);
     this.cursor = cursor;
@@ -180,6 +190,19 @@ export class ThreadViewModel {
     this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
     this.compacting = snapshot.compacting ?? false;
     this.turnRunning = snapshot.turn_running ?? false;
+    if (this.turnRunning) {
+      const runningTurn = this.#findLast(
+        (item) => item.kind === "turn-status" && item.state.kind === "running",
+      );
+      if (runningTurn?.kind === "turn-status") {
+        const startedAt = this.turnStartedAt.get(runningTurn.turn);
+        runningTurn.state = {
+          kind: "running",
+          ...(startedAt === undefined ? {} : { startedAt }),
+          ...(this.lastUsage === undefined ? {} : { usage: this.lastUsage }),
+        };
+      }
+    }
     this.thinking = snapshot.thinking ?? false;
     this.commands = [...(snapshot.commands ?? [])];
     this.queue = [...(snapshot.queue ?? [])];
@@ -276,7 +299,13 @@ export class ThreadViewModel {
             state = { kind: "running" };
             break;
           case "completed":
-            state = { kind: "completed", usage: item.state.usage };
+            state = {
+              kind: "completed",
+              usage: item.state.usage,
+              ...(item.state.checkpoint_id == null
+                ? {}
+                : { checkpointId: item.state.checkpoint_id }),
+            };
             break;
           case "failed":
             state = { kind: "failed", error: item.state.error };
@@ -310,12 +339,17 @@ export class ThreadViewModel {
       case "turn.started":
         this.turnRunning = true;
         this.turnModels.set(envelope.turn, envelope.model);
+        if (envelope.thinking_level == null) {
+          this.turnThinkingLevels.delete(envelope.turn);
+        } else {
+          this.turnThinkingLevels.set(envelope.turn, envelope.thinking_level);
+        }
         this.turnStartedAt.set(envelope.turn, envelope.ts);
         this.appendItem({
           id: `turn:${envelope.turn}`,
           kind: "turn-status",
           turn: envelope.turn,
-          state: { kind: "running" },
+          state: { kind: "running", startedAt: envelope.ts },
         });
         return true;
       case "thread.compaction_started":
@@ -399,6 +433,8 @@ export class ThreadViewModel {
         }
         return true;
       }
+      case "assistant.thinking_completed":
+        return this.finishThinking();
       case "assistant.delta": {
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
@@ -523,10 +559,20 @@ export class ThreadViewModel {
         if (questions !== undefined) questions.answers = envelope.answers ?? null;
         return questions !== undefined;
       }
-      case "turn.usage_updated":
+      case "turn.usage_updated": {
         this.lastUsage = envelope.usage;
         this.lastUsageCursor = envelope.cursor;
+        const runningTurn = this.#findLast(
+          (item) =>
+            item.kind === "turn-status" &&
+            item.turn === envelope.turn &&
+            item.state.kind === "running",
+        );
+        if (runningTurn?.kind === "turn-status" && runningTurn.state.kind === "running") {
+          runningTurn.state = { ...runningTurn.state, usage: envelope.usage };
+        }
         return true;
+      }
       case "turn.completed":
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
@@ -538,6 +584,9 @@ export class ThreadViewModel {
         return this.replaceRunningTurn(envelope.turn, {
           kind: "completed",
           usage: envelope.usage,
+          ...(envelope.checkpoint_id == null
+            ? {}
+            : { checkpointId: envelope.checkpoint_id }),
         });
       case "turn.failed":
         this.turnRunning = false;
@@ -621,10 +670,15 @@ export class ThreadViewModel {
     );
   }
 
-  private finishThinking(): void {
+  private finishThinking(): boolean {
+    const wasThinking = this.thinking;
     this.thinking = false;
-    const item = this.#findLast((candidate) => candidate.kind === "thinking");
-    if (item?.kind === "thinking") item.complete = true;
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && !candidate.complete,
+    );
+    if (item?.kind !== "thinking") return wasThinking;
+    item.complete = true;
+    return true;
   }
 
   private recordTurnDuration(turn: number, endedAt: string): void {

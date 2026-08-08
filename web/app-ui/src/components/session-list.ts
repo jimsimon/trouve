@@ -212,7 +212,6 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         : fontAwesomeIcon(indicator.icon)}</span>`}
                   <span class="session-copy">
                     <strong>${session.title}</strong>
-                    <small>${session.branch}${session.archived ? " · Archived" : ""}</small>
                     <span class="session-status-text visually-hidden">Status: ${sessionStatusText(session)}</span>
                   </span>
                 </button>

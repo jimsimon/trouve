@@ -331,6 +331,16 @@ impl ProtocolClient {
         .await
     }
 
+    /// Prioritize and dispatch one queued prompt, interrupting the active
+    /// turn first when the thread is busy.
+    pub async fn dispatch_queued_prompt(&self, prompt_id: &str) -> Result<TurnAccepted> {
+        self.post_json(
+            &format!("/queue/{prompt_id}/dispatch"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Interrupt the turn currently running on a thread.
     pub async fn cancel_turn(&self, thread_id: &str) -> Result<()> {
         self.post_empty(&format!("/threads/{thread_id}/cancel"))
@@ -382,6 +392,19 @@ impl ProtocolClient {
     pub async fn redo(&self, session_id: &str) -> Result<()> {
         self.post_empty(&format!("/sessions/{session_id}/redo"))
             .await
+    }
+
+    pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<()> {
+        self.post_empty(&format!("/checkpoints/{checkpoint_id}/restore"))
+            .await
+    }
+
+    pub async fn fork_checkpoint(&self, checkpoint_id: &str) -> Result<ForkCheckpointResponse> {
+        self.post_json(
+            &format!("/checkpoints/{checkpoint_id}/fork"),
+            &serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -634,12 +657,14 @@ impl ProtocolClient {
         &self,
         title_model_load_behavior: TitleModelLoadBehavior,
         title_model_resource_policy: TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: Option<bool>,
     ) -> Result<(u64, GitWorktreeSettings)> {
         let path = "/config/git-worktrees";
         let response = self
             .http
             .put(format!("{}{path}", self.base))
             .json(&SetGitWorktreeSettingsRequest {
+                derive_branch_name_from_session_title,
                 title_model_load_behavior,
                 title_model_resource_policy,
             })

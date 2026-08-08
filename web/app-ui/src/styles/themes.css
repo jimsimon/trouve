@@ -42,6 +42,7 @@
   --trouve-primary-hover: #3f6db3;
   --trouve-primary-border: #4f7dc3;
   --trouve-selection: #3d5a80;
+  --trouve-selection-fg: #ffffff;
   --trouve-accent-bg: #2b3d55;
   --trouve-accent-dim: #24344a;
   --trouve-accent-veil: #2b3d5533;
@@ -104,6 +105,7 @@
   --trouve-primary-hover: #245489;
   --trouve-primary-border: #1d4f89;
   --trouve-selection: #b3cde8;
+  --trouve-selection-fg: #17181a;
   --trouve-accent-bg: #d6e4f5;
   --trouve-accent-dim: #e2ecf8;
   --trouve-accent-veil: #306eae33;
@@ -166,6 +168,7 @@
   --trouve-primary-hover: #3a6db1;
   --trouve-primary-border: #6fa3dc;
   --trouve-selection: #2f5a8e;
+  --trouve-selection-fg: #ffffff;
   --trouve-accent-bg: #23364e;
   --trouve-accent-dim: #1c2c40;
   --trouve-accent-veil: #2b3d554d;
@@ -228,6 +231,7 @@
   --trouve-primary-hover: #3f6db3;
   --trouve-primary-border: #4f7dc3;
   --trouve-selection: #3d5a80;
+  --trouve-selection-fg: #ffffff;
   --trouve-accent-bg: #2b3d55;
   --trouve-accent-dim: #24344a;
   --trouve-accent-veil: #2b3d5533;
@@ -290,6 +294,7 @@
   --trouve-primary-hover: #245489;
   --trouve-primary-border: #1d4f89;
   --trouve-selection: #b3cde8;
+  --trouve-selection-fg: #17181a;
   --trouve-accent-bg: #d6e4f5;
   --trouve-accent-dim: #e2ecf8;
   --trouve-accent-veil: #306eae33;

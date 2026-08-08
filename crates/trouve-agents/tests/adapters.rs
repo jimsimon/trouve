@@ -876,6 +876,7 @@ IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"threadId":"thr-1","itemId":"c1","delta":"a.txt\n"}}'
 echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/plan/updated","params":{"threadId":"thr-1","turnId":"turn-1","explanation":"Implementation plan","plan":[{"step":"Inspect the adapter","status":"completed"},{"step":"Publish the todo snapshot","status":"inProgress"},{"step":"Verify the pane","status":"pending"}]}}'
 echo '{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr-1","tokenUsage":{"inputTokens":11,"outputTokens":4}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
 cat > /dev/null
@@ -888,12 +889,14 @@ cat > /dev/null
     .await;
 
     let mut thinking = Vec::new();
+    let mut thinking_completed = 0;
     let mut saw_text = false;
     let mut saw_tool_started = false;
     let mut saw_tool_output = false;
     let mut saw_tool_completed = false;
     let mut saw_compaction_started = false;
     let mut saw_compaction_completed = false;
+    let mut todos = None;
     let mut sessions = Vec::new();
     let mut live_usage = None;
     let mut usage = None;
@@ -901,6 +904,7 @@ cat > /dev/null
         match ev.unwrap() {
             BackendEvent::SessionStarted { session_id } => sessions.push(session_id),
             BackendEvent::ThinkingDelta(t) => thinking.push(t),
+            BackendEvent::ThinkingCompleted => thinking_completed += 1,
             BackendEvent::TextDelta(t) => saw_text |= t == "Hello",
             BackendEvent::ToolStarted { call_id, .. } => saw_tool_started |= call_id == "c1",
             BackendEvent::ToolOutput { call_id, .. } => saw_tool_output |= call_id == "c1",
@@ -921,6 +925,7 @@ cat > /dev/null
             BackendEvent::Completed { usage: u } => usage = Some(u),
             BackendEvent::CompactionStarted => saw_compaction_started = true,
             BackendEvent::CompactionCompleted => saw_compaction_completed = true,
+            BackendEvent::TodosUpdated { todos: updated } => todos = Some(updated),
             BackendEvent::QuestionsNeeded { .. }
             | BackendEvent::CommandsUpdated { .. }
             | BackendEvent::CompactionFailed => {}
@@ -933,6 +938,7 @@ cat > /dev/null
             .iter()
             .any(|text| text == "Checking the workspace.")
     );
+    assert_eq!(thinking_completed, 2);
     assert_eq!(
         thinking
             .iter()
@@ -943,6 +949,13 @@ cat > /dev/null
     );
     assert!(saw_text && saw_tool_started && saw_tool_output && saw_tool_completed);
     assert!(saw_compaction_started && saw_compaction_completed);
+    let todos = todos.expect("Codex plan update");
+    assert_eq!(todos.len(), 3);
+    assert_eq!(todos[0].id, "codex-plan:19:Inspect the adapter:1");
+    assert_eq!(todos[0].status, trouve_protocol::TodoStatus::Completed);
+    assert_eq!(todos[1].content, "Publish the todo snapshot");
+    assert_eq!(todos[1].status, trouve_protocol::TodoStatus::InProgress);
+    assert_eq!(todos[2].status, trouve_protocol::TodoStatus::Pending);
     assert_eq!(
         live_usage.expect("live usage").context_input_tokens,
         Some(11)

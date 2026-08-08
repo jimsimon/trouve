@@ -22,14 +22,12 @@ import "./local-model-settings.js";
 import "./management-settings-panels.js";
 import "./mode-settings-panel.js";
 import "./provider-settings.js";
-import "./workspace-settings.js";
 
 const SETTINGS_SECTIONS = [
   "general",
   "chat",
   "providers",
   "modes",
-  "git-worktrees",
   "mcp",
   "integrations",
   "appearance",
@@ -43,7 +41,8 @@ const SETTINGS_ALIASES: Readonly<Record<string, SettingsSection>> = {
   "local-models": "providers",
   "provider-api": "providers",
   "modes-models": "modes",
-  workspaces: "git-worktrees",
+  "git-worktrees": "chat",
+  workspaces: "chat",
   "mcp-servers": "mcp",
   capabilities: "about",
 };
@@ -54,8 +53,8 @@ const settingsSection = (value: string): SettingsSection =>
     : SETTINGS_ALIASES[value] ?? "general";
 
 const sectionLabel = (section: SettingsSection): string => {
+  if (section === "chat") return "Sessions & Chat";
   if (section === "modes") return "Modes & Models";
-  if (section === "git-worktrees") return "Git & Worktrees";
   if (section === "mcp") return "MCP Servers";
   return `${section[0]?.toUpperCase()}${section.slice(1)}`;
 };
@@ -301,43 +300,43 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                 : active === "chat"
                   ? html`
                       <div class="settings-section">
-                        <h1 id="settings-title">Chat</h1>
-                        <label class="settings-toggle-row" for="settings-collapse-thinking">
-                          <input
-                            id="settings-collapse-thinking"
-                            type="checkbox"
-                            .checked=${chatPreferences.collapseThinkingWithTools}
-                            @change=${(event: Event) => services.setChatPreferences({
-                              collapseThinkingWithTools:
-                                (event.currentTarget as HTMLInputElement).checked,
-                            })}
-                          />
-                          <span class="toggle-state">${chatPreferences.collapseThinkingWithTools ? "On" : "Off"}</span>
-                          <span>Collapse thinking output with tool calls.</span>
-                        </label>
-                        <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
-                        <label class="settings-toggle-row" for="settings-collapse-compaction">
-                          <input
-                            id="settings-collapse-compaction"
-                            type="checkbox"
-                            .checked=${chatPreferences.collapseCompactionWithTools}
-                            @change=${(event: Event) => services.setChatPreferences({
-                              collapseCompactionWithTools:
-                                (event.currentTarget as HTMLInputElement).checked,
-                            })}
-                          />
-                          <span class="toggle-state">${chatPreferences.collapseCompactionWithTools ? "On" : "Off"}</span>
-                          <span>Collapse context compaction with tool calls.</span>
-                        </label>
-                        <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
+                        <h1 id="settings-title">Sessions &amp; Chat</h1>
+                        <div class="settings-subsection">
+                          <h2>Chat output</h2>
+                          <label class="settings-toggle-row" for="settings-collapse-thinking">
+                            <input
+                              id="settings-collapse-thinking"
+                              type="checkbox"
+                              .checked=${chatPreferences.collapseThinkingWithTools}
+                              @change=${(event: Event) => services.setChatPreferences({
+                                collapseThinkingWithTools:
+                                  (event.currentTarget as HTMLInputElement).checked,
+                              })}
+                            />
+                            <span class="toggle-state">${chatPreferences.collapseThinkingWithTools ? "On" : "Off"}</span>
+                            <span>Collapse thinking output with tool calls.</span>
+                          </label>
+                          <p class="settings-note">When off, thought output stays visible at the top level and separates the collapsible tool-call groups on either side.</p>
+                          <label class="settings-toggle-row" for="settings-collapse-compaction">
+                            <input
+                              id="settings-collapse-compaction"
+                              type="checkbox"
+                              .checked=${chatPreferences.collapseCompactionWithTools}
+                              @change=${(event: Event) => services.setChatPreferences({
+                                collapseCompactionWithTools:
+                                  (event.currentTarget as HTMLInputElement).checked,
+                              })}
+                            />
+                            <span class="toggle-state">${chatPreferences.collapseCompactionWithTools ? "On" : "Off"}</span>
+                            <span>Collapse context compaction with tool calls.</span>
+                          </label>
+                          <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
+                        </div>
+                        <trouve-git-worktree-settings></trouve-git-worktree-settings>
                       </div>
                     `
                 : active === "modes"
                   ? html`<trouve-mode-settings></trouve-mode-settings>`
-                : active === "git-worktrees"
-                  ? routeSection === "workspaces"
-                    ? html`<trouve-workspace-settings></trouve-workspace-settings>`
-                    : html`<trouve-git-worktree-settings></trouve-git-worktree-settings>`
                 : active === "mcp"
                   ? html`<trouve-mcp-settings></trouve-mcp-settings>`
                 : active === "integrations"

@@ -74,11 +74,16 @@ const protocolSchemas = asRecord(asRecord(protocolDocument.components)?.schemas)
 // JSON object keys are always strings. utoipa currently describes the keys of
 // Rust maps keyed by u64 as integer-valued `propertyNames`, which rejects the
 // wire representation (for example `{ "7": "openai/gpt-5.6" }`). Normalize
-// those three thread-snapshot maps only in the runtime validator until the
+// those thread-snapshot maps only in the runtime validator until the
 // upstream schema generator can express numeric string keys directly.
 const threadViewSnapshot = asRecord(protocolSchemas?.ThreadViewSnapshot);
 const threadViewProperties = asRecord(threadViewSnapshot?.properties);
-for (const name of ["turn_models", "turn_started_at", "turn_duration_ms"]) {
+for (const name of [
+  "turn_models",
+  "turn_thinking_levels",
+  "turn_started_at",
+  "turn_duration_ms",
+]) {
   const property = asRecord(threadViewProperties?.[name]);
   const propertyNames = asRecord(property?.propertyNames);
   if (propertyNames?.type === "integer") {
@@ -125,6 +130,7 @@ if (new Set(knownEventTypes).size !== knownEventTypes.length) {
 const protocolValidators = {
   session: componentRef(protocolSchemaId, "Session"),
   sessions: componentArray(protocolSchemaId, "Session"),
+  forkCheckpointResponse: componentRef(protocolSchemaId, "ForkCheckpointResponse"),
   generatedSessionTitle: componentRef(protocolSchemaId, "GeneratedSessionTitle"),
   summaries: componentRef(protocolSchemaId, "SessionSummariesSnapshot"),
   workspace: componentRef(protocolSchemaId, "Workspace"),

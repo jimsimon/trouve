@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.9"
+    "version": "3.14"
   },
   "paths": {
     "/v1/approvals": {
@@ -274,6 +274,95 @@
         "responses": {
           "202": {
             "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/checkpoints/{id}/fork": {
+      "post": {
+        "tags": [],
+        "operationId": "fork_checkpoint",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkCheckpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/checkpoints/{id}/restore": {
+      "post": {
+        "tags": [],
+        "operationId": "restore_checkpoint",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
@@ -2421,6 +2510,55 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/queue/{id}/dispatch": {
+      "post": {
+        "tags": [],
+        "summary": "Move one queued prompt to the front and dispatch it immediately. An\nactive turn is interrupted; its terminal event is persisted before the\nselected prompt starts as the next turn.",
+        "operationId": "dispatch_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -6089,7 +6227,7 @@
               "string",
               "null"
             ],
-            "description": "Human-readable title; also used to derive the branch slug."
+            "description": "Human-readable title. When title-derived branch naming is enabled,\nthis is also used to derive the branch slug."
           },
           "workspace_id": {
             "$ref": "#/components/schemas/String"
@@ -6217,6 +6355,13 @@
               },
               "model": {
                 "type": "string"
+              },
+              "thinking_level": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Effective provider-native thinking/reasoning selection for this\nturn after inherited defaults and model schema normalization."
               },
               "turn": {
                 "type": "integer",
@@ -6412,6 +6557,27 @@
                 "type": "string",
                 "enum": [
                   "assistant.thinking"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The provider explicitly closed the current streamed thinking item.\nThis boundary can arrive before the next visible assistant or tool\nevent, so clients must not infer it from subsequent output alone.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.thinking_completed"
                 ]
               }
             }
@@ -7419,7 +7585,7 @@
           },
           {
             "type": "object",
-            "description": "The persisted Git & Worktrees settings or the session-title model's\ninstall/load state changed. Carries a full replacement snapshot so\nreplay and reconnect reconstruct the settings UI exactly.",
+            "description": "The persisted session-naming settings or the session-title model's\ninstall/load state changed. Carries a full replacement snapshot so\nreplay and reconnect reconstruct the settings UI exactly.",
             "required": [
               "settings",
               "type"
@@ -7543,9 +7709,25 @@
           }
         }
       },
+      "ForkCheckpointResponse": {
+        "type": "object",
+        "description": "A new session and its initial thread, both created from an existing\nturn checkpoint.",
+        "required": [
+          "session",
+          "thread"
+        ],
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/Session"
+          },
+          "thread": {
+            "$ref": "#/components/schemas/Thread"
+          }
+        }
+      },
       "GenerateSessionTitleRequest": {
         "type": "object",
-        "description": "Ask the server to derive the title used to create a session and branch.",
+        "description": "Ask the server to derive a concise title for a new session.",
         "required": [
           "prompt"
         ],
@@ -7573,12 +7755,16 @@
       },
       "GitWorktreeSettings": {
         "type": "object",
-        "description": "Global settings shown under Settings → Git & Worktrees.",
+        "description": "Global session-naming settings shown under Settings → Sessions & Chat.",
         "required": [
           "title_model_load_behavior",
           "title_model"
         ],
         "properties": {
+          "derive_branch_name_from_session_title": {
+            "type": "boolean",
+            "description": "Whether new session branches include a slug derived from the session\ntitle. False uses the compact `trouve/<short-id>` form."
+          },
           "title_model": {
             "$ref": "#/components/schemas/TitleModelStatus"
           },
@@ -8760,7 +8946,8 @@
         "type": "string",
         "enum": [
           "undo",
-          "redo"
+          "redo",
+          "exact"
         ]
       },
       "ReviewerOverride": {
@@ -8975,7 +9162,7 @@
           },
           "branch": {
             "type": "string",
-            "description": "Branch dedicated to this session (`trouve/<slug>`)."
+            "description": "Branch dedicated to this session. New sessions default to\n`trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`."
           },
           "created_at": {
             "type": "string",
@@ -9204,11 +9391,18 @@
       },
       "SetGitWorktreeSettingsRequest": {
         "type": "object",
-        "description": "Update Settings → Git & Worktrees.",
+        "description": "Update the Session Naming section under Settings → Sessions & Chat.",
         "required": [
           "title_model_load_behavior"
         ],
         "properties": {
+          "derive_branch_name_from_session_title": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Omitted by older clients to preserve the current branch-naming mode."
+          },
           "title_model_load_behavior": {
             "$ref": "#/components/schemas/TitleModelLoadBehavior"
           },
@@ -9495,6 +9689,17 @@
               "state"
             ],
             "properties": {
+              "checkpoint_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String",
+                    "description": "Checkpoint created after this turn. Older retained snapshots may\nomit it, in which case checkpoint actions are unavailable."
+                  }
+                ]
+              },
               "state": {
                 "type": "string",
                 "enum": [
@@ -9879,6 +10084,17 @@
             "additionalProperties": {
               "type": "string",
               "format": "date-time"
+            },
+            "propertyNames": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "turn_thinking_levels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
             },
             "propertyNames": {
               "type": "integer",

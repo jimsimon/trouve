@@ -43,9 +43,21 @@ describe("thread composer and queue integration", () => {
     expect(screen).toContain('data-queue-action="send-now"');
     expect(screen).toContain('data-queue-action="dispatch"');
     expect(screen).toContain("#sendQueuedNow");
+    expect(screen).toContain("dispatchQueuedPrompt(promptId)");
+    expect(screen).toContain("Send now and stop current turn");
     expect(screen).toContain("#focusQueueControlNow");
     expect(screen).toContain("Your edit is still available.");
     expect(screen).toContain("The prompts remain queued.");
-    expect(screen).toContain("The prompt was moved first, but the queue could not be started.");
+  });
+
+  it("reorders queued prompts from the focusable row without move buttons", () => {
+    expect(screen).toContain("#queueRowKeyDown");
+    expect(screen).toContain("#commitQueueKeyboardReorder");
+    expect(screen).toContain('aria-describedby=${keyboardFocusable ? "queue-reorder-instructions"');
+    expect(screen).toContain('aria-keyshortcuts=${keyboardFocusable');
+    expect(screen).toContain("Press Space or Enter to pick up this queued prompt");
+    expect(screen).toContain('data-keyboard-reordering=${keyboardActive ? "true"');
+    expect(screen).not.toContain('data-queue-action="earlier"');
+    expect(screen).not.toContain('data-queue-action="later"');
   });
 });

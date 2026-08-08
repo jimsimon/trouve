@@ -37,6 +37,7 @@ import type {
   CompactionState,
   QueuedPrompt,
   ThreadChatItem,
+  TurnState,
 } from "../state/thread-view-model.js";
 import { TOOL_OUTPUT_OMITTED_MESSAGE } from "../state/tool-output.js";
 import {
@@ -102,13 +103,13 @@ import {
 } from "./font-awesome-icon.js";
 import {
   droppedQueueIds,
-  prioritizedQueueIds,
+  effectiveQueueDropPlacement,
   queueControlState,
   queueFocusAfterDelete,
   queuePreview,
-  reorderedQueueIds,
   type QueueDropPlacement,
 } from "./queue-controls.js";
+import "./turn-metadata.js";
 import {
   advanceQuestionWizard,
   canAdvanceQuestionWizard,
@@ -132,6 +133,10 @@ import type {
   NewThreadSetupSubmitEvent,
 } from "./new-thread-setup.js";
 import {
+  checkpointBoundaryBeforeTurn,
+  type TurnCheckpointBoundary,
+} from "./turn-checkpoint-actions.js";
+import {
   Virtualizer,
   type VirtualItem,
   type VirtualWindow,
@@ -153,6 +158,7 @@ const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
 const CHAT_TAIL_EPSILON_PX = 2;
 const CHAT_POSITION_SETTLE_MS = 140;
 const CHAT_SCROLL_CORRECTION_SETTLE_MS = 240;
+const CHAT_SCROLL_INTENT_SETTLE_MS = 240;
 const CHAT_TAIL_CONVERGENCE_FRAMES = 3;
 const CHAT_SCROLL_INDICATOR_INSET_PX = 3;
 const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
@@ -237,6 +243,23 @@ const threadTabLabel = (
   return `${mode} · ${shortModelName(thread.model)}`;
 };
 
+const agentTurnLabels = (
+  models: ReadonlyMap<number, string> | undefined,
+  thinkingLevels: ReadonlyMap<number, string> | undefined,
+): ReadonlyMap<number, string> => {
+  const labels = new Map<number, string>();
+  for (const [turn, model] of models ?? []) {
+    const thinkingLevel = thinkingLevels?.get(turn);
+    labels.set(
+      turn,
+      thinkingLevel === undefined
+        ? model
+        : `${model} · ${modelOptionLabel(thinkingLevel)}`,
+    );
+  }
+  return labels;
+};
+
 const threadTodoProgress = (
   todos: readonly { readonly status: string }[] | undefined,
 ): string => {
@@ -276,6 +299,8 @@ const toolStatusIcon = (
     denied: "ban",
     aborted: "xmark",
   } as const)[status];
+
+type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "error";
 
 export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   static override properties = {
@@ -332,6 +357,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #scrollCorrectionResumeAt = 0;
   #followTailControlHeight = 0;
   #chatScrollIntent = false;
+  #chatScrollIntentTimer: ReturnType<typeof setTimeout> | undefined;
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
@@ -340,9 +366,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #queueEditReturnDraft: ComposerDraft | undefined;
   #queueBusy = "";
   #queueError = "";
+  #queueStatus = "";
   #queueDragId = "";
   #queueDropId = "";
   #queueDropPlacement: QueueDropPlacement = "before";
+  #queueKeyboardDragId = "";
+  #queueKeyboardOrder: readonly string[] = [];
+  #checkpointAction = "";
+  #checkpointErrorId = "";
+  #checkpointError = "";
   #pendingAttachments: PendingAttachment[] = [];
   #attachmentPending = false;
   #attachmentGeneration = 0;
@@ -452,9 +484,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#queueEditReturnDraft = undefined;
       this.#queueBusy = "";
       this.#queueError = "";
+      this.#queueStatus = "";
       this.#queueDragId = "";
       this.#queueDropId = "";
       this.#queueDropPlacement = "before";
+      this.#queueKeyboardDragId = "";
+      this.#queueKeyboardOrder = [];
+      this.#checkpointAction = "";
+      this.#checkpointErrorId = "";
+      this.#checkpointError = "";
       this.#usageGeneration += 1;
       this.#sessionUsage = undefined;
       this.#usageRequestKey = "";
@@ -496,7 +534,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#viewportHeight = 0;
       this.#followTailControlHeight = 0;
       this.#scrollCorrectionResumeAt = 0;
-      this.#chatScrollIntent = false;
+      this.#clearChatScrollIntent();
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#threadProvider.setValue({ threadId: this.threadId });
@@ -519,9 +557,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#queueEditReturnDraft = undefined;
       this.#queueBusy = "";
       this.#queueError = "";
+      this.#queueStatus = "";
       this.#queueDragId = "";
       this.#queueDropId = "";
       this.#queueDropPlacement = "before";
+      this.#queueKeyboardDragId = "";
+      this.#queueKeyboardOrder = [];
       this.#pendingStartTurn = undefined;
       this.#cancelRequestedTurn = undefined;
       this.#messageRequest = undefined;
@@ -733,7 +774,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
-    this.#chatScrollIntent = false;
+    this.#clearChatScrollIntent();
     this.#markdownContextMenu = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     super.disconnectedCallback();
@@ -769,6 +810,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threads = store.threadsForSession(this.sessionId);
     const thread = this.threadId === "" ? undefined : store.thread(this.threadId);
     const view = this.threadId === "" ? undefined : store.threadView(this.threadId);
+    const turnLabels = agentTurnLabels(
+      view?.turnModels,
+      view?.turnThinkingLevels,
+    );
     this.#reconcileTurnAcknowledgements(view?.items ?? [], view?.turnRunning ?? false);
     const selectedThreadIndex = threads.findIndex((candidate) => candidate.id === this.threadId);
     const selectedTabIndex = this.#newThreadSetupOpen
@@ -890,7 +935,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         turnControls.effectiveTurnRunning,
         view?.thinking ?? false,
         view?.compacting ?? false,
-        view?.turnModels ?? new Map<number, string>(),
+        turnLabels,
         view?.turnDurationMs ?? new Map<number, number>(),
         turnControls.activityLabel,
         view?.hasOlder ?? false,
@@ -1100,13 +1145,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 </div>
                 ${selectedModelHealth === undefined
                   ? nothing
-                  : html`<details class=${`model-health-pill tone-${selectedModelHealth.tone}`}>
-                      <summary title=${selectedModelHealth.detail}>
+                  : html`<div class="composer-option subscription-option">
+                      <span>Subscription</span>
+                      <div
+                        class=${`model-health-pill tone-${selectedModelHealth.tone}`}
+                        tabindex="0"
+                        title=${selectedModelHealth.detail}
+                        aria-label=${`Subscription status: ${selectedModelHealth.summary}. ${selectedModelHealth.detail}`}
+                      >
                         <span class=${`model-health-dot tone-${selectedModelHealth.tone}`} aria-hidden="true"></span>
                         <span>${selectedModelHealth.summary}</span>
-                      </summary>
-                      <pre class="model-health-detail">${selectedModelHealth.detail}</pre>
-                    </details>`}
+                      </div>
+                    </div>`}
                 ${modelControls.thinking === undefined
                   ? nothing
                   : html`
@@ -1638,6 +1688,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     turnDurationMs,
                     presentation,
                     unit.id === nestedActivityUnitId ? activityLabel : undefined,
+                    effectiveTurnRunning,
                   )}</div>`;
               })}</div>`}
           ${!window.followingTail && virtualItems.length > 0
@@ -1655,10 +1706,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     turnDurationMs: ReadonlyMap<number, number>,
     presentation: ChatPresentationIndex,
     activityLabel: string | undefined,
+    checkpointRestoreDisabled: boolean,
   ) {
     if (unit.kind === "user") {
       return html`
-        ${unit.divider ? html`<div class="turn-rule" aria-hidden="true"></div>` : nothing}
+        ${unit.divider
+          ? this.#renderTurnRule(
+              unit.item.turn,
+              presentation,
+              checkpointRestoreDisabled,
+            )
+          : nothing}
         ${this.#renderItem(unit.item, turnModels, turnDurationMs, presentation)}
       `;
     }
@@ -1672,6 +1730,110 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       presentation,
       activityLabel,
     );
+  }
+
+  #renderTurnRule(
+    nextTurn: number,
+    presentation: ChatPresentationIndex,
+    turnRunning: boolean,
+  ) {
+    const boundary = checkpointBoundaryBeforeTurn(nextTurn, presentation.turnStates);
+    if (boundary === undefined) {
+      return html`<div class="turn-rule" role="separator"></div>`;
+    }
+    const busy = this.#checkpointAction !== "";
+    const restoreBusy = this.#checkpointAction === `restore:${boundary.checkpointId}`;
+    const forkBusy = this.#checkpointAction === `fork:${boundary.checkpointId}`;
+    const error = this.#checkpointErrorId === boundary.checkpointId
+      ? this.#checkpointError
+      : "";
+    const restoreLabel = turnRunning
+      ? `Restore after turn ${boundary.turn} once the current turn finishes`
+      : `Restore files to the checkpoint after turn ${boundary.turn}`;
+    return html`
+      <div
+        class="turn-rule with-checkpoint-actions"
+        role="separator"
+        aria-label=${`Turn ${boundary.turn} checkpoint`}
+      >
+        <span class="turn-rule-actions" aria-label=${`Actions after turn ${boundary.turn}`}>
+          ${error === ""
+            ? nothing
+            : html`<span class="turn-rule-action-error" role="alert">${error}</span>`}
+          <button
+            type="button"
+            aria-label=${restoreLabel}
+            title=${restoreLabel}
+            ?disabled=${busy || turnRunning}
+            @click=${() => void this.#restoreTurnCheckpoint(boundary)}
+          >${fontAwesomeIcon(restoreBusy ? "spinner" : "rotate-left", {
+            spin: restoreBusy,
+          })}</button>
+          <button
+            type="button"
+            aria-label=${`Fork a new session from the checkpoint after turn ${boundary.turn}`}
+            title=${`Fork a new session from the checkpoint after turn ${boundary.turn}`}
+            ?disabled=${busy}
+            @click=${() => void this.#forkTurnCheckpoint(boundary)}
+          >${fontAwesomeIcon(forkBusy ? "spinner" : "code-branch", {
+            spin: forkBusy,
+          })}</button>
+        </span>
+      </div>
+    `;
+  }
+
+  async #restoreTurnCheckpoint(boundary: TurnCheckpointBoundary): Promise<void> {
+    const services = this.#services.value;
+    if (services === undefined || this.#checkpointAction !== "") return;
+    this.#checkpointAction = `restore:${boundary.checkpointId}`;
+    this.#checkpointErrorId = "";
+    this.#checkpointError = "";
+    this.requestUpdate();
+    try {
+      await services.protocol.restoreCheckpoint(boundary.checkpointId);
+      globalThis.dispatchEvent(new CustomEvent("trouve-checkpoint-restored", {
+        detail: { sessionId: this.sessionId },
+      }));
+    } catch {
+      this.#checkpointErrorId = boundary.checkpointId;
+      this.#checkpointError = "Could not restore this checkpoint.";
+    } finally {
+      this.#checkpointAction = "";
+      this.requestUpdate();
+    }
+  }
+
+  async #forkTurnCheckpoint(boundary: TurnCheckpointBoundary): Promise<void> {
+    const services = this.#services.value;
+    const store = this.#store.value;
+    if (services === undefined || store === undefined || this.#checkpointAction !== "") return;
+    this.#checkpointAction = `fork:${boundary.checkpointId}`;
+    this.#checkpointErrorId = "";
+    this.#checkpointError = "";
+    this.requestUpdate();
+    try {
+      const fork = await services.protocol.forkCheckpoint(boundary.checkpointId);
+      store.upsertSessionMetadata(fork.session);
+      store.upsertThread(fork.thread);
+      store.markSessionRead(fork.session.id);
+      const route = readSignal(services.router.route);
+      services.router.navigate({
+        kind: "session",
+        workspaceId: fork.session.workspace_id,
+        sessionId: fork.session.id,
+        threadId: fork.thread.id,
+        ...(route.kind === "session" && route.inspection !== undefined
+          ? { inspection: route.inspection }
+          : {}),
+      });
+    } catch {
+      this.#checkpointErrorId = boundary.checkpointId;
+      this.#checkpointError = "Could not fork this checkpoint.";
+    } finally {
+      this.#checkpointAction = "";
+      this.requestUpdate();
+    }
   }
 
   #renderAgentCard(
@@ -1695,9 +1857,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     );
     const open = compactionRunning || (this.#messageDisclosure.get(unit.id) ?? true);
     const turnState = presentation.turnStates.get(unit.turn);
-    const metadata = turnState?.kind === "completed"
-      ? formatTurnMetadata(turnState.usage, turnDurationMs.get(unit.turn))
-      : "";
     const preview = collapsedChatPreview(joined);
     return html`
       <article
@@ -1725,9 +1884,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             ${open
               ? html`<span class="agent-header-spacer"></span>`
               : html`<small class="agent-collapsed-preview">${preview}</small>`}
-            ${metadata === ""
-              ? nothing
-              : html`<small class="turn-metadata">${metadata}</small>`}
+            ${this.#renderAgentTurnMetadata(
+              turnState,
+              turnDurationMs.get(unit.turn),
+            )}
           </button>
           ${joined === ""
             ? nothing
@@ -1754,6 +1914,29 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : nothing}
       </article>
     `;
+  }
+
+  #renderAgentTurnMetadata(
+    turnState: TurnState | undefined,
+    completedDurationMs: number | undefined,
+  ) {
+    if (turnState?.kind !== "running" && turnState?.kind !== "completed") {
+      return nothing;
+    }
+    if (
+      turnState.kind === "running" &&
+      turnState.startedAt === undefined &&
+      turnState.usage === undefined
+    ) return nothing;
+    const running = turnState.kind === "running";
+    return html`<small class="turn-metadata">
+      <trouve-turn-metadata
+        .usage=${turnState.usage}
+        .running=${running}
+        .startedAt=${running ? turnState.startedAt ?? "" : ""}
+        .durationMs=${running ? undefined : completedDurationMs}
+      ></trouve-turn-metadata>
+    </small>`;
   }
 
   #renderActivityRow(label: string) {
@@ -1993,6 +2176,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         class=${`message thinking-output ${item.complete ? "complete" : "running"}`}
         data-chat-anchor-id=${`item:${item.id}`}
       >
+        <span class="thinking-rail-icon" aria-hidden="true">
+          ${fontAwesomeIcon("brain")}
+        </span>
         <header class="thinking-header">
           <strong>${item.complete ? "Thought" : "Thinking"}</strong>
           <span class="thinking-header-spacer"></span>
@@ -2045,6 +2231,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         : active
           ? "active"
           : "complete";
+    const status: ActivityGroupStatus = failed
+      ? "error"
+      : needsApproval
+        ? "awaiting-approval"
+        : active
+          ? "running"
+          : "ok";
     const open = this.#activityGroupOpen(unit, items);
     return html`
       <details
@@ -2056,8 +2249,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           @click=${(event: Event) =>
             this.#toggleActivityGroup(event, key, open, needsApproval)}
         >
+          <span class=${`tool-status activity-group-status ${status}`} aria-hidden="true">
+            ${fontAwesomeIcon(toolStatusIcon(status), {
+              className: "tool-status-icon",
+              spin: status === "running",
+            })}
+          </span>
           ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
-            className: "disclosure-icon",
+            className: "disclosure-icon tool-disclosure",
           })}
           <strong>${activityGroupSummary(items)}</strong>
         </summary>
@@ -2146,11 +2345,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (queue.length === 0) return nothing;
     const queueMutationBusy = this.#queueBusy !== ""
       || (this.#queueEditId !== "" && this.#attachmentPending);
+    const keyboardReordering = this.#queueKeyboardStateValid(queue);
+    const orderedQueue = this.#keyboardOrderedQueue(queue);
     const controls = queueControlState({
       threadAvailable: this.threadId !== "",
       queueLength: queue.length,
       turnRunning,
-      busy: queueMutationBusy,
+      busy: queueMutationBusy || keyboardReordering,
       connectivityBlocked,
     });
     return html`
@@ -2167,64 +2368,115 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 @click=${this.#dispatchQueue}
               >Send now</button>`}
         </header>
+        <p id="queue-reorder-instructions" class="visually-hidden">
+          Press Space or Enter to pick up this queued prompt. Then use Arrow Up,
+          Arrow Down, Home, or End to choose its position. Press Space or Enter
+          again to drop it, or Escape to cancel.
+        </p>
+        <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+          ${this.#queueStatus}
+        </p>
         <ol>
           ${repeat(
-            queue,
+            orderedQueue,
             (prompt) => prompt.id,
-            (prompt, index) => html`
-              <li
-                data-queue-id=${prompt.id}
-                data-queue-drop=${this.#queueDropId === prompt.id ? this.#queueDropPlacement : ""}
-                @dragover=${(event: DragEvent) => this.#dragQueueOver(event, prompt.id)}
+            (prompt, index) => {
+              const dropTarget = this.#queueDropId === prompt.id;
+              const keyboardActive = keyboardReordering
+                && this.#queueKeyboardDragId === prompt.id;
+              const keyboardEnabled = !queueMutationBusy
+                && !connectivityBlocked
+                && orderedQueue.length > 1;
+              const keyboardFocusable = keyboardActive
+                || (keyboardEnabled && !keyboardReordering);
+              const placeholder = html`<li
+                class="queue-drop-placeholder"
+                data-drop-placeholder="queue"
+                aria-hidden="true"
+                @dragover=${this.#keepQueueDropActive}
                 @drop=${(event: DragEvent) => void this.#dropQueued(event, queue, prompt.id)}
-              >
-                <div class="queue-row">
-                  <span
-                    class="queue-grip"
-                    draggable=${!controls.mutationsDisabled && queue.length > 1 ? "true" : "false"}
-                    aria-label="Drag to reorder queued prompt"
-                    title="Drag to reorder"
-                    @dragstart=${(event: DragEvent) => this.#startQueueDrag(
-                      event,
-                      prompt.id,
-                      controls.mutationsDisabled || queue.length < 2,
-                    )}
-                    @dragend=${this.#endQueueDrag}
-                  >${fontAwesomeIcon("grip-vertical")}</span>
-                  <span class="queue-index" aria-hidden="true">${index + 1}.</span>
-                  <p title=${prompt.content}>${queuePreview(prompt.content)}</p>
-                  ${prompt.attachments === undefined || prompt.attachments.length === 0
-                    ? nothing
-                    : html`<span
-                        class="queue-attachment-badge"
-                        role="img"
-                        aria-label=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
-                        title=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
-                      >${fontAwesomeIcon("paperclip")}${prompt.attachments.length}</span>`}
-                  <div class="queue-actions" aria-label=${`Actions for queued prompt ${index + 1}`}>
-                    ${turnRunning
+              ></li>`;
+              return html`
+                ${dropTarget && this.#queueDropPlacement === "before"
+                  ? placeholder
+                  : nothing}
+                <li
+                  data-queue-id=${prompt.id}
+                  data-keyboard-reordering=${keyboardActive ? "true" : nothing}
+                  tabindex=${keyboardFocusable ? "0" : nothing}
+                  aria-label=${keyboardFocusable
+                    ? `${queuePreview(prompt.content)}. Position ${index + 1} of ${orderedQueue.length}.${keyboardActive
+                      ? " Reordering."
+                      : " Ready to reorder."}`
+                    : nothing}
+                  aria-describedby=${keyboardFocusable ? "queue-reorder-instructions" : nothing}
+                  aria-keyshortcuts=${keyboardFocusable
+                    ? "Space Enter ArrowUp ArrowDown Home End Escape"
+                    : nothing}
+                  draggable=${!controls.mutationsDisabled && queue.length > 1 ? "true" : "false"}
+                  @keydown=${(event: KeyboardEvent) => this.#queueRowKeyDown(
+                    event,
+                    orderedQueue,
+                    index,
+                    queueMutationBusy || connectivityBlocked,
+                  )}
+                  @pointerdown=${this.#prepareQueueRowDrag}
+                  @dragstart=${(event: DragEvent) => this.#startQueueDrag(
+                    event,
+                    prompt.id,
+                    controls.mutationsDisabled || queue.length < 2,
+                  )}
+                  @dragend=${this.#endQueueDrag}
+                  @dragover=${(event: DragEvent) => this.#dragQueueOver(event, queue, prompt.id)}
+                  @drop=${(event: DragEvent) => void this.#dropQueued(event, queue, prompt.id)}
+                >
+                  <div class="queue-row">
+                    <span class="queue-index" aria-hidden="true">${index + 1}.</span>
+                    <p title=${prompt.content}>${queuePreview(prompt.content)}</p>
+                    ${keyboardActive
+                      ? html`<span class="queue-reorder-badge">Reordering</span>`
+                      : nothing}
+                    ${prompt.attachments === undefined || prompt.attachments.length === 0
                       ? nothing
-                      : html`<button type="button" data-queue-action="send-now" aria-label="Send this queued prompt now" title="Send now" ?disabled=${controls.dispatchDisabled} @click=${() => this.#sendQueuedNow(queue, index)}>${fontAwesomeIcon("play")}</button>`}
-                    <button type="button" data-queue-action="earlier" aria-label="Run earlier" title="Run earlier" ?disabled=${index === 0 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, -1)}>${fontAwesomeIcon("arrow-up")}</button>
-                    <button type="button" data-queue-action="later" aria-label="Run later" title="Run later" ?disabled=${index === queue.length - 1 || controls.mutationsDisabled} @click=${() => this.#moveQueued(queue, index, 1)}>${fontAwesomeIcon("arrow-down")}</button>
-                    <button
-                      type="button"
-                      data-queue-action="edit"
-                      aria-label=${this.#queueEditId === prompt.id
-                        ? "Queued prompt is being edited"
-                        : "Edit queued prompt"}
-                      title=${this.#queueEditId === prompt.id ? "Editing" : "Edit"}
-                      ?disabled=${controls.mutationsDisabled
-                        || this.#requestPending
-                        || this.#attachmentPending
-                        || (this.#queueEditId !== "" && this.#queueEditId !== prompt.id)}
-                      @click=${() => this.#startQueueEdit(prompt)}
-                    >${fontAwesomeIcon("pen")}</button>
-                    <button class="danger" type="button" data-queue-action="delete" aria-label="Remove from queue" title="Remove from queue" ?disabled=${controls.mutationsDisabled} @click=${() => this.#deleteQueued(queue, prompt.id)}>${fontAwesomeIcon("trash-can")}</button>
+                      : html`<span
+                          class="queue-attachment-badge"
+                          role="img"
+                          aria-label=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
+                          title=${`${prompt.attachments.length} attachment${prompt.attachments.length === 1 ? "" : "s"}`}
+                        >${fontAwesomeIcon("paperclip")}${prompt.attachments.length}</span>`}
+                    <div class="queue-actions" aria-label=${`Actions for queued prompt ${index + 1}`}>
+                      <button
+                        type="button"
+                        data-queue-action="send-now"
+                        aria-label=${turnRunning
+                          ? "Send this queued prompt now and stop the current turn"
+                          : "Send this queued prompt now"}
+                        title=${turnRunning ? "Send now and stop current turn" : "Send now"}
+                        ?disabled=${controls.sendNowDisabled}
+                        @click=${() => this.#sendQueuedNow(prompt.id)}
+                      >${fontAwesomeIcon("play")}</button>
+                      <button
+                        type="button"
+                        data-queue-action="edit"
+                        aria-label=${this.#queueEditId === prompt.id
+                          ? "Queued prompt is being edited"
+                          : "Edit queued prompt"}
+                        title=${this.#queueEditId === prompt.id ? "Editing" : "Edit"}
+                        ?disabled=${controls.mutationsDisabled
+                          || this.#requestPending
+                          || this.#attachmentPending
+                          || (this.#queueEditId !== "" && this.#queueEditId !== prompt.id)}
+                        @click=${() => this.#startQueueEdit(prompt)}
+                      >${fontAwesomeIcon("pen")}</button>
+                      <button class="danger" type="button" data-queue-action="delete" aria-label="Remove from queue" title="Remove from queue" ?disabled=${controls.mutationsDisabled} @click=${() => this.#deleteQueued(queue, prompt.id)}>${fontAwesomeIcon("trash-can")}</button>
+                    </div>
                   </div>
-                </div>
-              </li>
-            `,
+                </li>
+                ${dropTarget && this.#queueDropPlacement === "after"
+                  ? placeholder
+                  : nothing}
+              `;
+            },
           )}
         </ol>
         ${this.#queueError === ""
@@ -2425,23 +2677,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     // The sticky jump control is an overlay visually, but WebKit retains its
     // border-box in normal flow and includes it in scrollHeight. Its height is
     // cached after rendering so this hot path never forces synchronous layout.
-    const tailGap = Math.max(
-      0,
-      viewport.scrollHeight
-        - this.#followTailControlHeight
-        - viewport.clientHeight
-        - viewport.scrollTop,
-    );
+    const tailGap = this.#chatTailGap(viewport);
     const atTail = tailGap <= CHAT_TAIL_EPSILON_PX;
-    const userInitiated = this.#chatScrollIntent;
-    this.#chatScrollIntent = false;
-    if (
-      (
-        this.#programmaticScrollFrame !== undefined
-        || this.#tailConvergenceFrame !== undefined
-      )
-      && !userInitiated
-    ) {
+    const programmaticScroll = this.#programmaticScrollFrame !== undefined
+      || this.#tailConvergenceFrame !== undefined;
+    // Native scrollbar interaction is not required to dispatch pointer events
+    // into the page. A scroll that reaches the real transcript tail while no
+    // app-owned correction is active is therefore user intent as well.
+    const userInitiated = this.#chatScrollIntent || (atTail && !programmaticScroll);
+    if (userInitiated) this.#retainChatScrollIntent();
+    if (programmaticScroll && !userInitiated) {
       // Row measurement and tail corrections already updated the virtualizer.
       // Ignore their resulting DOM events instead of treating them as another
       // user scroll and starting a render/persistence loop.
@@ -2504,8 +2749,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   };
 
   readonly #chatScrollEnded = (event: Event): void => {
-    this.#syncChatScrollIndicatorPosition(event.currentTarget as HTMLElement);
+    const viewport = event.currentTarget as HTMLElement;
+    if (
+      viewport.dataset["threadId"] === this.threadId
+      && this.#restoredScrollThreadId === this.threadId
+    ) {
+      this.#resumeFollowTailAtDomEnd(viewport);
+    }
+    this.#syncChatScrollIndicatorPosition(viewport);
     this.#flushScheduledChatPosition();
+    this.#clearChatScrollIntent();
   };
 
   readonly #chatScrollIntended = (event: Event): void => {
@@ -2520,8 +2773,59 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && target.closest("button, a, input, textarea, select, summary") !== null
       ) return;
     }
-    this.#chatScrollIntent = true;
+    this.#retainChatScrollIntent();
   };
+
+  #retainChatScrollIntent(): void {
+    this.#chatScrollIntent = true;
+    if (this.#chatScrollIntentTimer !== undefined) {
+      clearTimeout(this.#chatScrollIntentTimer);
+    }
+    // `scrollend` closes the gesture in supporting engines. The timer keeps
+    // pointer clicks without a scroll from misclassifying a later layout
+    // correction and covers engines that do not dispatch `scrollend`.
+    this.#chatScrollIntentTimer = setTimeout(() => {
+      this.#chatScrollIntentTimer = undefined;
+      this.#chatScrollIntent = false;
+    }, CHAT_SCROLL_INTENT_SETTLE_MS);
+  }
+
+  #clearChatScrollIntent(): void {
+    this.#chatScrollIntent = false;
+    if (this.#chatScrollIntentTimer === undefined) return;
+    clearTimeout(this.#chatScrollIntentTimer);
+    this.#chatScrollIntentTimer = undefined;
+  }
+
+  #chatTailGap(viewport: HTMLElement): number {
+    return Math.max(
+      0,
+      viewport.scrollHeight
+        - this.#followTailControlHeight
+        - viewport.clientHeight
+        - viewport.scrollTop,
+    );
+  }
+
+  #resumeFollowTailAtDomEnd(viewport: HTMLElement): void {
+    const before = this.#virtualizer.window();
+    if (
+      before.followingTail
+      || this.#chatTailGap(viewport) > CHAT_TAIL_EPSILON_PX
+    ) return;
+    this.#cancelProgrammaticScrollWindow();
+    this.#cancelTailConvergence();
+    this.#virtualizer.setViewport(
+      viewport.scrollTop,
+      viewport.clientHeight,
+      { userInitiated: true, atTail: true },
+    );
+    const after = this.#virtualizer.window();
+    this.#cancelScheduledChatPosition();
+    this.#scheduleTailConvergence();
+    this.#emitChatPosition();
+    if (!sameVirtualRenderWindow(before, after)) this.#scheduleScrollRender();
+  }
 
   #setChatScrollTop(viewport: HTMLElement, scrollTop: number): void {
     if (Math.abs(viewport.scrollTop - scrollTop) <= 0.5) return;
@@ -2630,6 +2934,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #followTail = (): void => {
     this.#cancelScheduledChatPosition();
+    this.#clearChatScrollIntent();
     this.#clearHistoryAnchorStabilizer();
     this.#scrollCorrectionResumeAt = 0;
     this.#virtualizer.enableFollowTail();
@@ -2779,10 +3084,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.#ensureMarkdown();
         const open = this.#messageDisclosure.get(item.id) ?? true;
         const turnState = presentation.turnStates.get(item.turn);
-        const metadata = presentation.lastAssistantIds.has(item.id)
-          && turnState?.kind === "completed"
-          ? formatTurnMetadata(turnState.usage, turnDurationMs.get(item.turn))
-          : "";
         return html`
           <article
             class="message turn-card assistant-message"
@@ -2805,9 +3106,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 ${turnModels.get(item.turn) === undefined
                   ? nothing
                   : html`<small class="agent-model-label">(${turnModels.get(item.turn)})</small>`}
-                ${metadata === ""
-                  ? nothing
-                  : html`<small class="turn-metadata">${metadata}</small>`}
+                ${presentation.lastAssistantIds.has(item.id)
+                  ? this.#renderAgentTurnMetadata(
+                      turnState,
+                      turnDurationMs.get(item.turn),
+                    )
+                  : nothing}
               </button>
               ${item.content === ""
                 ? nothing
@@ -2843,6 +3147,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             class=${`message thinking-card ${item.complete ? "complete" : "running"}`}
             data-chat-anchor-id=${`item:${item.id}`}
           >
+            <span class="thinking-rail-icon" aria-hidden="true">
+              ${fontAwesomeIcon("brain")}
+            </span>
             <header class="thinking-header">
               <button
                 class="message-disclosure"
@@ -3938,26 +4245,142 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
-  async #moveQueued(
+  #keyboardOrderedQueue(queue: readonly QueuedPrompt[]): readonly QueuedPrompt[] {
+    if (!this.#queueKeyboardStateValid(queue)) return queue;
+    const byId = new Map(queue.map((prompt) => [prompt.id, prompt]));
+    const ordered = this.#queueKeyboardOrder.map((id) => byId.get(id));
+    return ordered.every((prompt): prompt is QueuedPrompt => prompt !== undefined)
+      ? ordered
+      : queue;
+  }
+
+  #queueKeyboardStateValid(queue: readonly QueuedPrompt[]): boolean {
+    if (
+      this.#queueKeyboardDragId === ""
+      || this.#queueKeyboardOrder.length !== queue.length
+      || !this.#queueKeyboardOrder.includes(this.#queueKeyboardDragId)
+    ) return false;
+    const queueIds = new Set(queue.map(({ id }) => id));
+    return this.#queueKeyboardOrder.every((id) => queueIds.has(id));
+  }
+
+  #queueRowKeyDown(
+    event: KeyboardEvent,
     queue: readonly QueuedPrompt[],
     index: number,
-    delta: -1 | 1,
-  ): Promise<void> {
+    disabled: boolean,
+  ): void {
+    if (
+      event.target !== event.currentTarget
+      || event.altKey
+      || event.ctrlKey
+      || event.metaKey
+      || event.isComposing
+    ) return;
+    const prompt = queue[index];
+    if (prompt === undefined) return;
+    if (
+      this.#queueKeyboardDragId !== ""
+      && !this.#queueKeyboardStateValid(queue)
+    ) {
+      this.#queueKeyboardDragId = "";
+      this.#queueKeyboardOrder = [];
+      this.#queueStatus = "The queue changed, so reordering was canceled.";
+    }
+    const pickOrDrop = event.key === " " || event.key === "Enter";
+    if (this.#queueKeyboardDragId === "") {
+      if (!pickOrDrop || disabled || queue.length < 2) return;
+      event.preventDefault();
+      this.#queueKeyboardDragId = prompt.id;
+      this.#queueKeyboardOrder = queue.map(({ id }) => id);
+      this.#queueStatus = `Picked up queued prompt ${index + 1} of ${queue.length}.`;
+      this.requestUpdate();
+      void this.updateComplete.then(() => this.#focusQueueRowNow(prompt.id));
+      return;
+    }
+    if (this.#queueKeyboardDragId !== prompt.id) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      this.#cancelQueueKeyboardReorder(prompt.id);
+      return;
+    }
+    if (pickOrDrop) {
+      event.preventDefault();
+      if (!disabled) void this.#commitQueueKeyboardReorder();
+      return;
+    }
+    const current = this.#queueKeyboardOrder.indexOf(prompt.id);
+    if (current < 0) return;
+    const destination = event.key === "ArrowUp"
+      ? current - 1
+      : event.key === "ArrowDown"
+        ? current + 1
+        : event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? this.#queueKeyboardOrder.length - 1
+            : undefined;
+    if (destination === undefined) return;
+    event.preventDefault();
+    if (destination < 0 || destination >= this.#queueKeyboardOrder.length) {
+      this.#queueStatus = `Queued prompt is already at position ${current + 1} of ${queue.length}.`;
+      this.requestUpdate();
+      return;
+    }
+    const next = [...this.#queueKeyboardOrder];
+    next.splice(current, 1);
+    next.splice(destination, 0, prompt.id);
+    this.#queueKeyboardOrder = next;
+    this.#queueStatus = `Queued prompt moved to position ${destination + 1} of ${next.length}.`;
+    this.requestUpdate();
+    void this.updateComplete.then(() => this.#focusQueueRowNow(prompt.id));
+  }
+
+  #cancelQueueKeyboardReorder(promptId: string): void {
+    this.#queueKeyboardDragId = "";
+    this.#queueKeyboardOrder = [];
+    this.#queueStatus = "Queue reordering canceled.";
+    this.requestUpdate();
+    void this.updateComplete.then(() => this.#focusQueueRowNow(promptId));
+  }
+
+  async #commitQueueKeyboardReorder(): Promise<void> {
     const services = this.#services.value;
     const store = this.#store.value;
-    const ids = reorderedQueueIds(queue, index, delta);
-    const promptId = queue[index]?.id;
+    const promptId = this.#queueKeyboardDragId;
+    const ids = [...this.#queueKeyboardOrder];
     if (
-      services === undefined ||
-      store === undefined ||
-      this.threadId === "" ||
-      ids === undefined ||
-      promptId === undefined ||
-      this.#queueBusy !== "" ||
-      this.#connectivityBlocked()
+      services === undefined
+      || store === undefined
+      || this.threadId === ""
+      || promptId === ""
+      || ids.length < 2
+      || this.#queueBusy !== ""
+      || this.#connectivityBlocked()
     ) return;
     const threadId = this.threadId;
     const generation = this.#threadInteractionGeneration;
+    const current = store.threadView(threadId).queue.map(({ id }) => id);
+    const currentIds = new Set(current);
+    if (
+      current.length !== ids.length
+      || ids.some((id) => !currentIds.has(id))
+    ) {
+      this.#queueKeyboardDragId = "";
+      this.#queueKeyboardOrder = [];
+      this.#queueStatus = "The queue changed, so reordering was canceled.";
+      this.requestUpdate();
+      void this.updateComplete.then(() => this.#focusQueueRowNow(promptId));
+      return;
+    }
+    if (ids.every((id, position) => id === current[position])) {
+      this.#queueKeyboardDragId = "";
+      this.#queueKeyboardOrder = [];
+      this.#queueStatus = "Queued prompt was dropped without changing its position.";
+      this.requestUpdate();
+      void this.updateComplete.then(() => this.#focusQueueRowNow(promptId));
+      return;
+    }
     this.#queueBusy = promptId;
     this.#queueError = "";
     this.requestUpdate();
@@ -3968,25 +4391,46 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         threadId,
         reordered,
       );
+      const position = reordered.findIndex((prompt) => prompt.id === promptId);
+      this.#queueStatus = position < 0
+        ? "Queue order updated."
+        : `Queued prompt dropped at position ${position + 1} of ${reordered.length}.`;
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
         this.#queueError = "Queue order could not be changed.";
       }
     } finally {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
+        this.#queueKeyboardDragId = "";
+        this.#queueKeyboardOrder = [];
         this.#queueBusy = "";
         this.requestUpdate();
         await this.updateComplete;
-        this.#focusQueueControlNow(promptId, delta < 0 ? "earlier" : "later");
+        this.#focusQueueRowNow(promptId);
       }
     }
   }
 
+  readonly #prepareQueueRowDrag = (event: PointerEvent): void => {
+    const row = event.currentTarget as HTMLElement;
+    const target = event.target;
+    row.dataset["queueDragBlocked"] = target instanceof Element
+      && target.closest("[data-queue-action]") !== null
+      ? "true"
+      : "false";
+  };
+
   #startQueueDrag(event: DragEvent, promptId: string, disabled: boolean): void {
-    if (disabled) {
+    const row = event.currentTarget as HTMLElement;
+    const blocked = row.dataset["queueDragBlocked"] === "true";
+    delete row.dataset["queueDragBlocked"];
+    if (disabled || blocked) {
       event.preventDefault();
       return;
     }
+    this.#queueKeyboardDragId = "";
+    this.#queueKeyboardOrder = [];
+    this.#queueStatus = "";
     this.#queueDragId = promptId;
     this.#queueDropId = "";
     if (event.dataTransfer !== null) {
@@ -3995,21 +4439,38 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
-  #dragQueueOver(event: DragEvent, targetId: string): void {
+  #dragQueueOver(
+    event: DragEvent,
+    queue: readonly QueuedPrompt[],
+    targetId: string,
+  ): void {
     if (this.#queueDragId === "" || this.#queueDragId === targetId || this.#queueBusy !== "") {
       return;
     }
     event.preventDefault();
     if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "move";
     const row = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    const placement: QueueDropPlacement = event.clientY >= row.top + row.height / 2
+    const preferred: QueueDropPlacement = event.clientY >= row.top + row.height / 2
       ? "after"
       : "before";
+    const placement = effectiveQueueDropPlacement(
+      queue,
+      this.#queueDragId,
+      targetId,
+      preferred,
+    );
+    if (placement === undefined) return;
     if (this.#queueDropId === targetId && this.#queueDropPlacement === placement) return;
     this.#queueDropId = targetId;
     this.#queueDropPlacement = placement;
     this.requestUpdate();
   }
+
+  readonly #keepQueueDropActive = (event: DragEvent): void => {
+    if (this.#queueDragId === "") return;
+    event.preventDefault();
+    if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "move";
+  };
 
   async #dropQueued(
     event: DragEvent,
@@ -4100,46 +4561,39 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   };
 
-  async #sendQueuedNow(queue: readonly QueuedPrompt[], index: number): Promise<void> {
+  async #sendQueuedNow(promptId: string): Promise<void> {
     const services = this.#services.value;
     const store = this.#store.value;
-    const ids = prioritizedQueueIds(queue, index);
-    const promptId = queue[index]?.id;
     if (
       services === undefined
       || store === undefined
       || this.threadId === ""
-      || ids === undefined
-      || promptId === undefined
       || this.#queueBusy !== ""
-      || store.threadView(this.threadId).turnRunning
       || this.#connectivityBlocked()
     ) return;
     const threadId = this.threadId;
     const generation = this.#threadInteractionGeneration;
+    const view = store.threadView(threadId);
+    const runningTurn = view.turnRunning
+      ? (this.#latestRunningTurn(view.items) ?? -1)
+      : undefined;
+    const markedCancellation = runningTurn !== undefined
+      && this.#cancelRequestedTurn === undefined;
+    if (markedCancellation) this.#cancelRequestedTurn = runningTurn;
     this.#queueBusy = promptId;
     this.#queueError = "";
     this.requestUpdate();
-    let reordered = false;
     let dispatched = false;
     try {
-      if (index > 0) {
-        const reorderedQueue = await services.protocol.reorderQueue(threadId, ids);
-        if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
-        store.replaceThreadQueue(
-          threadId,
-          reorderedQueue,
-        );
-        reordered = true;
-      }
-      await services.protocol.dispatchQueue(threadId);
+      await services.protocol.dispatchQueuedPrompt(promptId);
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
       dispatched = true;
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
-        this.#queueError = reordered
-          ? "The prompt was moved first, but the queue could not be started."
-          : "This prompt could not be sent now. It remains queued.";
+        if (markedCancellation && this.#cancelRequestedTurn === runningTurn) {
+          this.#cancelRequestedTurn = undefined;
+        }
+        this.#queueError = "This prompt could not be sent now. It remains queued.";
       }
     } finally {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
@@ -4168,6 +4622,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       return;
     }
     roots[0]?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }
+
+  #focusQueueRowNow(promptId: string): void {
+    [...this.querySelectorAll<HTMLElement>("[data-queue-id]")]
+      .find((element) => element.dataset["queueId"] === promptId)
+      ?.focus();
   }
 
   #focusComposerNow(): void {

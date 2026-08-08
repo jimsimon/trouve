@@ -10,8 +10,8 @@
 //! - `thread/start` / `thread/resume` → `{ result: { thread: { id } } }`
 //! - `turn/start { threadId, input: [{type:"text",text}] }` then notifications:
 //!   `item/agentMessage/delta`, `item/started`, `item/completed`,
-//!   `item/commandExecution/outputDelta`, `thread/tokenUsage/updated`,
-//!   `turn/completed`
+//!   `item/commandExecution/outputDelta`, `turn/plan/updated`,
+//!   `thread/tokenUsage/updated`, `turn/completed`
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use trouve_protocol::{ModelInfo, Usage};
+use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
@@ -343,6 +343,35 @@ fn agent_message_delta(
     }
 }
 
+/// Translate Codex's authoritative plan replacement into trouve's canonical
+/// todo snapshot. App-server plan steps do not carry ids, so use their content
+/// plus duplicate occurrence as a deterministic identity that survives plan
+/// reordering and normal status-only updates.
+fn codex_plan_todos(params: &Value) -> Option<Vec<TodoItem>> {
+    let mut occurrences = HashMap::<String, usize>::new();
+    params
+        .get("plan")?
+        .as_array()?
+        .iter()
+        .map(|step| {
+            let content = step.get("step")?.as_str()?.to_string();
+            let occurrence = occurrences.entry(content.clone()).or_default();
+            *occurrence += 1;
+            let status = match step.get("status")?.as_str()? {
+                "pending" => TodoStatus::Pending,
+                "inProgress" => TodoStatus::InProgress,
+                "completed" => TodoStatus::Completed,
+                _ => return None,
+            };
+            Some(TodoItem {
+                id: format!("codex-plan:{}:{content}:{occurrence}", content.len()),
+                content,
+                status,
+            })
+        })
+        .collect()
+}
+
 fn thread_id_of(result: &Value) -> Result<String, BackendError> {
     result["thread"]["id"]
         .as_str()
@@ -421,6 +450,15 @@ fn turn_stream(
                                 let _ = tx.send(Ok(event)).await;
                             }
                         }
+                        "turn/plan/updated" => {
+                            if let Some(todos) = codex_plan_todos(&params) {
+                                let _ = tx.send(Ok(BackendEvent::TodosUpdated { todos })).await;
+                            } else {
+                                tracing::warn!(
+                                    "codex: ignoring malformed turn/plan/updated notification"
+                                );
+                            }
+                        }
                         // Raw reasoning is only exposed by some models (notably
                         // open-source models). Summary deltas are deliberately not
                         // used as thinking; they are section headings, while
@@ -472,18 +510,24 @@ fn turn_stream(
                         "item/completed" => {
                             let item = &params["item"];
                             let ty = item["type"].as_str().unwrap_or("");
-                            if ty == "reasoning"
+                            let raw_reasoning_streamed = ty == "reasoning"
                                 && item["id"]
                                     .as_str()
-                                    .is_none_or(|id| !streamed_raw_reasoning.contains(id))
+                                    .is_some_and(|id| streamed_raw_reasoning.remove(id));
+                            let mut thinking_emitted = raw_reasoning_streamed;
+                            if ty == "reasoning"
+                                && !raw_reasoning_streamed
                                 && let Some(text) = completed_raw_reasoning_text(item)
                             {
+                                thinking_emitted = true;
                                 let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
                             }
-                            if ty == "agentMessage"
-                                && let Some(id) = item["id"].as_str()
-                            {
-                                commentary_messages.remove(id);
+                            let commentary_completed = ty == "agentMessage"
+                                && item["id"]
+                                    .as_str()
+                                    .is_some_and(|id| commentary_messages.remove(id));
+                            if thinking_emitted || commentary_completed {
+                                let _ = tx.send(Ok(BackendEvent::ThinkingCompleted)).await;
                             }
                             if ty == "contextCompaction" {
                                 let event = if item["status"].as_str() == Some("failed") {
@@ -3564,6 +3608,32 @@ mod tests {
         assert_eq!(
             completed_raw_reasoning_text(&json!({ "type": "reasoning" })),
             None
+        );
+    }
+
+    #[test]
+    fn normalizes_codex_plan_replacements_as_todos() {
+        let todos = codex_plan_todos(&json!({
+            "plan": [
+                { "step": "Inspect", "status": "completed" },
+                { "step": "Implement", "status": "inProgress" },
+                { "step": "Verify", "status": "pending" },
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(todos.len(), 3);
+        assert_eq!(todos[0].id, "codex-plan:7:Inspect:1");
+        assert_eq!(todos[0].status, TodoStatus::Completed);
+        assert_eq!(todos[1].content, "Implement");
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+        assert_eq!(todos[2].status, TodoStatus::Pending);
+        assert_eq!(codex_plan_todos(&json!({ "plan": [] })), Some(vec![]));
+        assert!(
+            codex_plan_todos(&json!({
+                "plan": [{ "step": "Unknown", "status": "blocked" }]
+            }))
+            .is_none()
         );
     }
 

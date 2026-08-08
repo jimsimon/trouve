@@ -193,10 +193,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
       padding: 12px;
       background: var(--trouve-surface);
     }
-    .group-card.drop-target {
-      border-color: var(--trouve-accent);
-      box-shadow: inset 0 0 0 1px var(--trouve-accent);
-    }
+    .group-drop-placeholder { min-height: 66px; border: 1px dashed var(--trouve-accent); border-radius: 8px; background: var(--trouve-accent-veil); }
     .group-header { display: flex; align-items: center; gap: 8px; min-width: 0; }
     .group-toggle {
       display: grid;
@@ -621,12 +618,19 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
 
   #renderGroup(group: PullRequestGroup) {
     const dropTarget = this.#dropTarget === group.key;
+    const placeholder = html`<div
+      class="group-drop-placeholder"
+      data-drop-placeholder="pull-request-group"
+      aria-hidden="true"
+      @dragover=${this.#keepDropActive}
+      @drop=${(event: DragEvent) => this.#drop(event, group.key)}
+    ></div>`;
     return html`
+      ${dropTarget && !this.#dropAfter ? placeholder : nothing}
       <section
-        class="group-card ${dropTarget ? "drop-target" : ""}"
+        class="group-card"
         data-group-key=${group.key}
         @dragover=${(event: DragEvent) => this.#dragOver(event, group.key)}
-        @dragleave=${(event: DragEvent) => this.#dragLeave(event, group.key)}
         @drop=${(event: DragEvent) => this.#drop(event, group.key)}
       >
         <header class="group-header">
@@ -678,6 +682,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
             ? html`<div class="empty-group">${group.emptyText}</div>`
             : html`<div class="pr-list">${group.pullRequests.map((row) => this.#renderRow(row))}</div>`}
       </section>
+      ${dropTarget && this.#dropAfter ? placeholder : nothing}
     `;
   }
 
@@ -901,13 +906,11 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     this.requestUpdate();
   }
 
-  #dragLeave(event: DragEvent, target: PullRequestGroupKey): void {
-    if (this.#dropTarget !== target) return;
-    const related = event.relatedTarget;
-    if (related instanceof Node && (event.currentTarget as HTMLElement).contains(related)) return;
-    this.#dropTarget = undefined;
-    this.requestUpdate();
-  }
+  readonly #keepDropActive = (event: DragEvent): void => {
+    if (this.#draggedGroup === undefined) return;
+    event.preventDefault();
+    if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "move";
+  };
 
   #drop(event: DragEvent, target: PullRequestGroupKey): void {
     event.preventDefault();

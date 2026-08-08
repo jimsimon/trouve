@@ -48,11 +48,11 @@ export class TrouveComponentGallery extends LitElement {
             <p class="gallery-label">Session navigation</p>
             <button class="session-row selected">
               <span class="session-indicator busy" aria-hidden="true"></span>
-              <span class="session-copy"><strong>Preserve existing UX</strong><small>trouve/web-frontend</small></span>
+              <span class="session-copy"><strong>Preserve existing UX</strong></span>
             </button>
             <button class="session-row">
               <span class="session-indicator approval">${fontAwesomeIcon("triangle-exclamation")}</span>
-              <span class="session-copy"><strong>Approval needed</strong><small>trouve/protocol</small></span>
+              <span class="session-copy"><strong>Approval needed</strong></span>
             </button>
           </div>
           <div>

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   droppedQueueIds,
-  prioritizedQueueIds,
+  effectiveQueueDropPlacement,
   queueControlState,
   queueFocusAfterDelete,
   queuePreview,
@@ -19,36 +19,50 @@ describe("queue controls", () => {
       turnRunning: true,
       busy: false,
       connectivityBlocked: false,
-    })).toEqual({ mutationsDisabled: false, dispatchDisabled: true });
+    })).toEqual({
+      mutationsDisabled: false,
+      dispatchDisabled: true,
+      sendNowDisabled: false,
+    });
     expect(queueControlState({
       threadAvailable: true,
       queueLength: 3,
       turnRunning: false,
       busy: false,
       connectivityBlocked: false,
-    })).toEqual({ mutationsDisabled: false, dispatchDisabled: false });
+    })).toEqual({
+      mutationsDisabled: false,
+      dispatchDisabled: false,
+      sendNowDisabled: false,
+    });
     expect(queueControlState({
       threadAvailable: true,
       queueLength: 3,
       turnRunning: false,
       busy: true,
       connectivityBlocked: false,
-    })).toEqual({ mutationsDisabled: true, dispatchDisabled: true });
+    })).toEqual({
+      mutationsDisabled: true,
+      dispatchDisabled: true,
+      sendNowDisabled: true,
+    });
     expect(queueControlState({
       threadAvailable: true,
       queueLength: 3,
       turnRunning: false,
       busy: false,
       connectivityBlocked: true,
-    })).toEqual({ mutationsDisabled: true, dispatchDisabled: true });
+    })).toEqual({
+      mutationsDisabled: true,
+      dispatchDisabled: true,
+      sendNowDisabled: true,
+    });
   });
 
-  it("builds complete reorder and send-now orders without mutating the input", () => {
+  it("builds complete reorder orders without mutating the input", () => {
     expect(reorderedQueueIds(queue, 1, -1)).toEqual(["two", "one", "three"]);
     expect(reorderedQueueIds(queue, 1, 1)).toEqual(["one", "three", "two"]);
     expect(reorderedQueueIds(queue, 0, -1)).toBeUndefined();
-    expect(prioritizedQueueIds(queue, 2)).toEqual(["three", "one", "two"]);
-    expect(prioritizedQueueIds(queue, 9)).toBeUndefined();
     expect(queue.map(({ id }) => id)).toEqual(["one", "two", "three"]);
   });
 
@@ -67,6 +81,14 @@ describe("queue controls", () => {
     expect(droppedQueueIds(queue, "missing", "two", "before")).toBeUndefined();
     expect(droppedQueueIds(queue, "two", "two", "after")).toBeUndefined();
     expect(queue.map(({ id }) => id)).toEqual(["one", "two", "three"]);
+  });
+
+  it("turns an adjacent no-op edge into a meaningful row drop", () => {
+    expect(effectiveQueueDropPlacement(queue, "two", "one", "after")).toBe("before");
+    expect(effectiveQueueDropPlacement(queue, "two", "three", "before")).toBe("after");
+    expect(effectiveQueueDropPlacement(queue, "one", "three", "before")).toBe("before");
+    expect(effectiveQueueDropPlacement(queue, "missing", "one", "before"))
+      .toBeUndefined();
   });
 
   it("recovers focus to the next row, previous row, or composer", () => {
