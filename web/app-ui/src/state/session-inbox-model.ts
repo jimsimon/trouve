@@ -21,6 +21,46 @@ export interface WorkspaceSessionGroups<T extends InboxSessionOrderFields> {
   readonly archivedExpanded: boolean;
 }
 
+export interface SessionAgePresentation {
+  readonly compact: string;
+  readonly label: string;
+}
+
+export const sessionAgePresentation = (
+  updatedAt: string,
+  now: number,
+): SessionAgePresentation | undefined => {
+  const updated = Date.parse(updatedAt);
+  if (!Number.isFinite(updated) || !Number.isFinite(now)) return undefined;
+  const minutes = Math.max(0, Math.floor((now - updated) / 60_000));
+  if (minutes < 1) return { compact: "now", label: "Updated just now" };
+  if (minutes < 60) {
+    return {
+      compact: `${minutes}m`,
+      label: `Updated ${minutes} minute${minutes === 1 ? "" : "s"} ago`,
+    };
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return {
+      compact: `${hours}h`,
+      label: `Updated ${hours} hour${hours === 1 ? "" : "s"} ago`,
+    };
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 365) {
+    return {
+      compact: `${days}d`,
+      label: `Updated ${days} day${days === 1 ? "" : "s"} ago`,
+    };
+  }
+  const years = Math.floor(days / 365);
+  return {
+    compact: `${years}y`,
+    label: `Updated ${years} year${years === 1 ? "" : "s"} ago`,
+  };
+};
+
 const compareText = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 

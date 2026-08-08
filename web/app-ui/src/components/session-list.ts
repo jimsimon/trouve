@@ -7,6 +7,7 @@ import type { SessionListItem } from "../state/app-store.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   groupWorkspaceSessions,
+  sessionAgePresentation,
   sessionStatusText,
 } from "../state/session-inbox-model.js";
 import { sessionIndicatorPresentation } from "../state/session-indicator-model.js";
@@ -91,6 +92,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const currentRoute = route === undefined ? undefined : readSignal(route);
     const selectedSessionId =
       currentRoute?.kind === "session" ? currentRoute.sessionId : undefined;
+    const now = Date.now();
     const groups = groupWorkspaceSessions(sessions, {
       workspaceId: this.workspaceId,
       selectedSessionId,
@@ -107,7 +109,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
               ${repeat(
                 groups.active,
                 (session) => session.id,
-                (session) => this.#renderSession(session, selectedSessionId),
+                (session) => this.#renderSession(session, selectedSessionId, now),
               )}
             </ol>
           `}
@@ -135,7 +137,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                 ${repeat(
                   groups.archived,
                   (session) => session.id,
-                  (session) => this.#renderSession(session, selectedSessionId),
+                  (session) => this.#renderSession(session, selectedSessionId, now),
                 )}
               </ol>
             </section>
@@ -182,6 +184,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   #renderSession(
     session: SessionListItem,
     selectedSessionId: string | undefined,
+    now: number,
   ) {
     const selected = session.id === selectedSessionId;
     const store = this.#store.value;
@@ -191,9 +194,13 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
       selected,
     );
     const indicator = sessionIndicatorPresentation(session);
+    const age = sessionAgePresentation(session.updatedAt, now);
     return html`
       <li class="session-entry">
-        <div class="session-row-wrap ${selected ? "selected" : ""}">
+        <div
+          class="session-row-wrap ${selected ? "selected" : ""}"
+          data-actions-open=${this.#menuSessionId === session.id}
+        >
                 <button
                   type="button"
                   class="session-row ${selected ? "selected" : ""}"
@@ -217,6 +224,14 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                     <strong>${session.title}</strong>
                     <span class="session-status-text visually-hidden">Status: ${sessionStatusText(session)}</span>
                   </span>
+                  ${age === undefined
+                    ? nothing
+                    : html`<time
+                        class="session-age"
+                        datetime=${session.updatedAt}
+                        title=${age.label}
+                        aria-label=${age.label}
+                      >${age.compact}</time>`}
                 </button>
                 <button
                   class="session-menu-button"

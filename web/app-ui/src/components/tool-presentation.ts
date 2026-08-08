@@ -30,9 +30,11 @@ export interface ToolPresentation {
   readonly todos: readonly ToolTodoRow[];
 }
 
-/** Compact execution facts shown beside the tool title. A positive provider
- * duration is authoritative; zero is commonly a provider placeholder, so a
- * server/event measurement supplies the fallback. */
+/** Compact execution duration shown beside the tool title. A positive
+ * provider duration is authoritative; zero is commonly a provider
+ * placeholder, so a server/event measurement supplies the fallback. The
+ * status glyph communicates success or failure without repeating an exit
+ * code in the collapsed row. */
 export const toolExecutionMetadata = (
   resultValue: unknown,
   measuredDurationMs?: number,
@@ -49,7 +51,6 @@ export const toolExecutionMetadata = (
     }
     return undefined;
   };
-  const exitCode = firstNumber(["exit_code", "exitCode"]);
   const reportedDurationMs = firstNumber([
     "duration_ms",
     "durationMs",
@@ -65,7 +66,6 @@ export const toolExecutionMetadata = (
     ? reportedDurationMs
     : validMeasuredDurationMs;
   const parts: string[] = [];
-  if (exitCode !== undefined) parts.push(`exit ${exitCode}`);
   if (durationMs !== undefined && Number.isFinite(durationMs)) {
     const milliseconds = Math.max(0, Math.floor(durationMs));
     if (milliseconds === 0) {

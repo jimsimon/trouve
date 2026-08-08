@@ -2319,7 +2319,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   @dragover=${(event: DragEvent) => this.#dragOverWorkspace(event, workspace.id)}
                   @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
                 >
-                  <header class="workspace-row">
+                  <header
+                    class="workspace-row"
+                    data-controls-visible=${
+                      this.#workspaceActionMenuId === workspace.id
+                      || this.#draggedWorkspaceId === workspace.id
+                    }
+                  >
                     <button
                       class="workspace-toggle"
                       type="button"

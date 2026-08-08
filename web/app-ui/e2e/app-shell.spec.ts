@@ -226,6 +226,38 @@ test("session navigation uses compact one-line rows without branch names", async
   await expect(row.locator(".session-copy small")).toHaveCount(0);
   await expect(row).toHaveCSS("height", "34px");
   await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
+  const wrapper = row.locator("..");
+  const age = row.locator(".session-age");
+  const actions = wrapper.getByRole("button", { name: "Actions for Protocol ingress" });
+  await expect(age).toHaveText(/^(?:now|\d+[mhdy])$/u);
+  if (testInfo.project.name.startsWith("mobile")) {
+    await expect(age).toHaveCSS("opacity", "0");
+    await expect(actions).toHaveCSS("opacity", "1");
+  } else {
+    await expect(age).toHaveCSS("opacity", "1");
+    await expect(actions).toHaveCSS("opacity", "0");
+    await wrapper.hover();
+    await expect(age).toHaveCSS("opacity", "0");
+    await expect(actions).toHaveCSS("opacity", "1");
+    await page.mouse.move(0, 0);
+    await actions.focus();
+    await expect(age).toHaveCSS("opacity", "0");
+    await expect(actions).toHaveCSS("opacity", "1");
+
+    const workspace = page.locator(".workspace-row").filter({ hasText: "trouve" }).first();
+    const workspaceOrder = workspace.locator(".workspace-order-controls");
+    const workspaceActions = workspace.locator(".workspace-actions-wrap");
+    await page.mouse.move(0, 0);
+    await expect(workspaceOrder).toHaveCSS("opacity", "0");
+    await expect(workspaceActions).toHaveCSS("opacity", "0");
+    await workspace.hover();
+    await expect(workspaceOrder).toHaveCSS("opacity", "1");
+    await expect(workspaceActions).toHaveCSS("opacity", "1");
+    await page.mouse.move(0, 0);
+    await workspaceOrder.getByRole("button").focus();
+    await expect(workspaceOrder).toHaveCSS("opacity", "1");
+    await expect(workspaceActions).toHaveCSS("opacity", "1");
+  }
 });
 
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
@@ -249,6 +281,7 @@ test("background session updates preserve command-palette scrolling", async ({ p
   await expect(palettePrBadge).toHaveAttribute("title", /#42 · Ready to merge/u);
   await expect(palettePrBadge.locator('[data-font-awesome-icon="code-pull-request"]'))
     .toBeVisible();
+  await expect(navigationPrBadge.locator(".trouve-icon")).toHaveCSS("font-size", "15px");
   expect(await palettePrBadge.evaluate((element) => getComputedStyle(element).color))
     .toBe(await navigationPrBadge.evaluate((element) => getComputedStyle(element).color));
   await expect(palette.locator(".command-palette-copy small").filter({ hasText: "Current" }))

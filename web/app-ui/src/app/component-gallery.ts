@@ -63,7 +63,18 @@ export class TrouveComponentGallery extends LitElement {
               <p>The generated tokens remain authoritative.</p>
               <div class="agent-activity-timeline">
                 <details class="tool-card tool-ok" open>
-                  <summary>${fontAwesomeIcon("check")}<strong>theme parity</strong><small>5 palettes</small></summary>
+                  <summary>
+                    <span class="activity-rail-disclosure ok" aria-hidden="true">
+                      ${fontAwesomeIcon("caret-down", {
+                        className: "activity-rail-disclosure-icon",
+                      })}
+                    </span>
+                    <strong>theme parity</strong>
+                    <span class="tool-inline-status ok" aria-hidden="true">
+                      ${fontAwesomeIcon("check", { className: "tool-status-icon" })}
+                    </span>
+                    <small>5 palettes</small>
+                  </summary>
                   <pre>generated CSS matches theme.rs</pre>
                 </details>
               </div>

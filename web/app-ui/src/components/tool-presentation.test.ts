@@ -99,15 +99,15 @@ describe("tool presentation", () => {
     expect(unicodeDetail).not.toContain("�");
   });
 
-  it("surfaces provider or event-derived exit and duration metadata", () => {
+  it("surfaces provider or event-derived duration without redundant exit metadata", () => {
     expect(toolExecutionMetadata({ exit_code: 3, elapsed_ms: 65_432 }, 9_000))
-      .toBe("exit 3 · 1m 05s");
+      .toBe("1m 05s");
     expect(toolExecutionMetadata({ metadata: { exitCode: 0 } }, 812))
-      .toBe("exit 0 · 812ms");
+      .toBe("812ms");
     expect(toolExecutionMetadata({ exit_code: 0, duration_ms: 0 }, 50))
-      .toBe("exit 0 · 50ms");
+      .toBe("50ms");
     expect(toolExecutionMetadata({ exit_code: 0, duration_ms: 0 }))
-      .toBe("exit 0");
+      .toBe("");
     expect(toolExecutionMetadata({}, 0)).toBe("<1ms");
     expect(toolExecutionMetadata({ code: 404 })).toBe("");
     expect(toolExecutionMetadata(null)).toBe("");

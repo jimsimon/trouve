@@ -647,7 +647,7 @@ test("the TODO pane follows the thread's durable todo snapshot", async ({
   await expect(page.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
 });
 
-test("turn separators retain Slint's even vertical spacing", async ({ page }) => {
+test("turn separators retain even, comfortable vertical spacing", async ({ page }) => {
   await installProtocolFixtures(page);
   await page.goto("/");
   await replayHistory(page);
@@ -682,8 +682,8 @@ test("turn separators retain Slint's even vertical spacing", async ({ page }) =>
       below: userBounds.top - ruleBounds.bottom,
     };
   });
-  expect(geometry.above).toBe(8);
-  expect(geometry.below).toBe(8);
+  expect(geometry.above).toBe(14);
+  expect(geometry.below).toBe(14);
 });
 
 test("turn separators expose exact restore and session-fork actions", async ({ page }) => {
@@ -714,6 +714,22 @@ test("turn separators expose exact restore and session-fork actions", async ({ p
   await expect(rule.getByRole("button", {
     name: "Fork a new session from the checkpoint after turn 7",
   })).toBeVisible();
+  const actionGeometry = await restore.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const icon = element.querySelector<HTMLElement>(".trouve-icon")?.getBoundingClientRect();
+    return {
+      width: bounds.width,
+      height: bounds.height,
+      iconWidth: icon?.width ?? 0,
+      iconHeight: icon?.height ?? 0,
+    };
+  });
+  expect(actionGeometry).toEqual({
+    width: 24,
+    height: 24,
+    iconWidth: 15,
+    iconHeight: 12,
+  });
 
   await emit(page, threadEvent(18, {
     type: "turn.completed",
@@ -1271,6 +1287,8 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   const activityGroup = page.locator(".activity-group");
   await expect(activityGroup.getByText("Edited 1 file, read 1 file", { exact: true })).toBeVisible();
   await expect(activityGroup.locator(".activity-group-body")).toHaveCount(0);
+  await expect(activityGroup.locator(":scope > summary"))
+    .toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
   await expect(page.locator(".agent-text-block > trouve-markdown-view").first())
     .toContainText("I'll update it.");
   const agentBodyGeometry = await activityGroup.evaluate((group) => {
@@ -1349,7 +1367,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
     return { display: style.display };
   });
   const groupDisclosureStyle = await activityGroup.locator(
-    ":scope > summary .disclosure-icon",
+    ":scope > summary .activity-rail-disclosure",
   ).evaluate((icon) => {
     const style = getComputedStyle(icon);
     return {
@@ -1366,24 +1384,24 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       width: style.width,
     };
   });
-  const groupStatusGeometry = await activityGroup.evaluate((group) => {
+  const groupDisclosureGeometry = await activityGroup.evaluate((group) => {
     const timeline = group.parentElement;
-    const status = group.querySelector<HTMLElement>(
-      ":scope > summary > .activity-group-status",
+    const disclosure = group.querySelector<HTMLElement>(
+      ":scope > summary > .activity-rail-disclosure",
     );
-    if (timeline === null || status === null) {
-      throw new Error("missing grouped activity status geometry");
+    if (timeline === null || disclosure === null) {
+      throw new Error("missing grouped activity disclosure geometry");
     }
     const timelineBounds = timeline.getBoundingClientRect();
     const rail = getComputedStyle(timeline, "::before");
-    const statusBounds = status.getBoundingClientRect();
+    const disclosureBounds = disclosure.getBoundingClientRect();
     const railCenter = timelineBounds.left
       + Number.parseFloat(rail.left)
       + Number.parseFloat(rail.width) / 2;
     return {
-      display: getComputedStyle(status).display,
-      statusToRail: Math.abs(
-        statusBounds.left + statusBounds.width / 2 - railCenter,
+      display: getComputedStyle(disclosure).display,
+      disclosureToRail: Math.abs(
+        disclosureBounds.left + disclosureBounds.width / 2 - railCenter,
       ),
     };
   });
@@ -1397,7 +1415,7 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
       ? Number.NaN
       : Math.round(second.top - first.bottom);
   });
-  expect(groupedHeaderStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(groupedHeaderStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
   expect(groupedHeaderStyle.backgroundImage).toBe("none");
   expect(groupedHeaderStyle.borderLeftWidth).toBe("0px");
   expect(groupedHeaderStyle.borderTopWidth).toBe("0px");
@@ -1407,22 +1425,29 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   expect(toolCardStyle.borderTopWidth).toBe("0px");
   expect(toolCardStyle.borderRadius).toBe("0px");
   expect(groupNodeStyle.display).toBe("none");
-  expect(groupDisclosureStyle.position).toBe("static");
-  expect(groupDisclosureStyle.width).toBe("10px");
+  expect(groupDisclosureStyle.position).toBe("absolute");
+  expect(groupDisclosureStyle.width).toBe("12px");
   expect(timelineRailStyle.display).not.toBe("none");
   expect(timelineRailStyle.width).toBe("1px");
   expect(timelineRailStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
-  expect(groupStatusGeometry.display).not.toBe("none");
-  expect(groupStatusGeometry.statusToRail).toBeLessThanOrEqual(0.25);
+  expect(groupDisclosureGeometry.display).not.toBe("none");
+  expect(groupDisclosureGeometry.disclosureToRail).toBeLessThanOrEqual(0.25);
+  await expect(activityGroup.locator(".activity-group-status")).toHaveCount(0);
   expect(groupedBodyBackground).toBe("rgba(0, 0, 0, 0)");
   expect(groupedToolGap).toBe(6);
   await expect(page.getByLabel("Live tool output")).toHaveCount(0);
 
   const editCard = page.locator('.tool-card[data-call-id="call_edit"]');
   await editCard.locator(":scope > summary").click();
+  await page.mouse.move(0, 0);
+  await expect(editCard.locator(":scope > summary"))
+    .not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
   await expect(editCard.getByLabel("Live tool output")).toContainText("updated src/app.ts");
   await expect(editCard.locator(".tool-inline-diff")).toBeVisible();
-  await expect(editCard.locator(".tool-meta")).toContainText("exit 0 · 2s");
+  await expect(editCard.locator(".tool-meta")).toHaveText("2s");
+  await expect(editCard.locator(
+    ':scope > summary .tool-inline-status [data-font-awesome-icon="check"]',
+  )).toHaveCount(1);
 
   await editCard.getByRole("button", { name: "Show raw tool output" }).click();
   await expect(editCard.getByLabel("Raw tool data")).toContainText('"old_string"');
@@ -1431,6 +1456,9 @@ test("chat cards unmount collapsed output and expose response copy actions", asy
   await expect(editCard.locator(".tool-inline-diff")).toBeVisible();
 
   await editCard.locator(":scope > summary").click();
+  await page.mouse.move(0, 0);
+  await expect(editCard.locator(":scope > summary"))
+    .not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
   await expect(editCard.getByLabel("Live tool output")).toHaveCount(0);
   await expect(editCard.locator(".tool-inline-diff")).toHaveCount(0);
   await activityGroup.locator(":scope > summary").click();
@@ -1596,8 +1624,8 @@ test("the Chat preference adds one disclosure around the standard activity timel
     threadEvent(24, {
       type: "tool.completed",
       call_id: "collapsed_thinking_2",
-      status: "ok",
-      result: { exit_code: 0 },
+      status: "error",
+      result: { exit_code: 1 },
     }),
     threadEvent(25, {
       type: "assistant.message",
@@ -1621,42 +1649,41 @@ test("the Chat preference adds one disclosure around the standard activity timel
     "Ran 2 commands, thought 1 time",
     { exact: true },
   )).toBeVisible();
+  await expect(combinedGroup).toHaveClass(/warning/u);
+  await expect(combinedGroup.getByText("Group status: Mixed results", { exact: true }))
+    .toBeAttached();
   await expect(combinedGroup.locator(".activity-group-body")).toHaveCount(0);
 
   const geometry = await combinedGroup.evaluate((group) => {
     const timeline = group.parentElement;
     const summary = group.querySelector<HTMLElement>(":scope > summary");
     if (summary === null) throw new Error("missing combined activity summary");
-    const disclosure = summary.querySelector<HTMLElement>(".disclosure-icon");
-    const status = summary.querySelector<HTMLElement>(".activity-group-status");
+    const disclosure = summary.querySelector<HTMLElement>(".activity-rail-disclosure");
     const label = summary.querySelector<HTMLElement>("strong");
     const prose = timeline?.nextElementSibling
       ?.querySelector<HTMLElement>("trouve-markdown-view")
       ?.shadowRoot?.querySelector<HTMLElement>("p");
-    if (timeline === null || disclosure === null || status === null
+    if (timeline === null || disclosure === null
       || label === null || prose === null || prose === undefined) {
       throw new Error("missing combined activity geometry");
     }
     const timelineBounds = timeline.getBoundingClientRect();
     const disclosureBounds = disclosure.getBoundingClientRect();
-    const statusBounds = status.getBoundingClientRect();
     const rail = getComputedStyle(timeline, "::before");
     const railCenter = timelineBounds.left
       + Number.parseFloat(rail.left)
       + Number.parseFloat(rail.width) / 2;
     return {
-      statusToRail: Math.abs(
-        statusBounds.left + statusBounds.width / 2 - railCenter,
+      disclosureToRail: Math.abs(
+        disclosureBounds.left + disclosureBounds.width / 2 - railCenter,
       ),
-      disclosureAfterRail: disclosureBounds.left - railCenter,
       groupNodeDisplay: getComputedStyle(group, "::before").display,
       labelToProse: label.getBoundingClientRect().left
         - prose.getBoundingClientRect().left,
       railHeight: Number.parseFloat(rail.height),
     };
   });
-  expect(geometry.statusToRail).toBeLessThanOrEqual(0.25);
-  expect(geometry.disclosureAfterRail).toBeGreaterThan(10);
+  expect(geometry.disclosureToRail).toBeLessThanOrEqual(0.25);
   expect(geometry.groupNodeDisplay).toBe("none");
   expect(geometry.labelToProse).toBeLessThanOrEqual(40);
   expect(geometry.railHeight).toBeGreaterThan(10);
@@ -1680,78 +1707,98 @@ test("the Chat preference adds one disclosure around the standard activity timel
     );
     const thought = nestedTimeline?.querySelector<HTMLElement>(":scope > .thinking-output");
     const thoughtIcon = thought?.querySelector<HTMLElement>(":scope > .thinking-rail-icon");
+    const toolDisclosure = nestedTimeline?.querySelector<HTMLElement>(
+      ":scope > .tool-card .activity-rail-disclosure",
+    );
     const toolStatus = nestedTimeline?.querySelector<HTMLElement>(
-      ":scope > .tool-card .tool-status",
+      ":scope > .tool-card .tool-inline-status",
     );
-    const groupStatus = summary?.querySelector<HTMLElement>(
-      ":scope > .activity-group-status",
+    const groupDisclosure = summary?.querySelector<HTMLElement>(
+      ":scope > .activity-rail-disclosure",
     );
-    const toolCard = toolStatus?.closest<HTMLElement>(".tool-card");
+    const toolCard = toolDisclosure?.closest<HTMLElement>(".tool-card");
+    const lastToolCard = nestedTimeline?.querySelector<HTMLElement>(
+      ":scope > .tool-card:last-child",
+    );
     if (timeline === null || summary === null || body === null
       || nestedTimeline === null || nestedTimeline === undefined
       || thought === null || thought === undefined
       || thoughtIcon === null || thoughtIcon === undefined
+      || toolDisclosure === null || toolDisclosure === undefined
       || toolStatus === null || toolStatus === undefined
-      || groupStatus === null || groupStatus === undefined
-      || toolCard === null || toolCard === undefined) {
+      || groupDisclosure === null || groupDisclosure === undefined
+      || toolCard === null || toolCard === undefined
+      || lastToolCard === null || lastToolCard === undefined) {
       throw new Error("missing expanded combined activity geometry");
     }
     const outerRail = getComputedStyle(timeline, "::before");
     const nestedRail = getComputedStyle(nestedTimeline, "::before");
     const timelineBounds = timeline.getBoundingClientRect();
-    const nestedTimelineBounds = nestedTimeline.getBoundingClientRect();
     const thoughtIconBounds = thoughtIcon.getBoundingClientRect();
+    const toolDisclosureBounds = toolDisclosure.getBoundingClientRect();
     const toolStatusBounds = toolStatus.getBoundingClientRect();
-    const groupStatusBounds = groupStatus.getBoundingClientRect();
-    const nestedRailCenter = nestedTimelineBounds.left
-      + Number.parseFloat(nestedRail.left)
-      + Number.parseFloat(nestedRail.width) / 2;
+    const groupDisclosureBounds = groupDisclosure.getBoundingClientRect();
+    const toolCardBounds = toolCard.getBoundingClientRect();
+    const lastToolCardBounds = lastToolCard.getBoundingClientRect();
+    const branch = getComputedStyle(toolCard, "::before");
+    const branchLeft = toolCardBounds.left + Number.parseFloat(branch.left);
+    const branchRight = branchLeft + Number.parseFloat(branch.width);
     const outerRailCenter = timelineBounds.left
       + Number.parseFloat(outerRail.left)
       + Number.parseFloat(outerRail.width) / 2;
+    const outerRailBottom = timelineBounds.top
+      + Number.parseFloat(outerRail.top)
+      + Number.parseFloat(outerRail.height);
     return {
       railDisplay: getComputedStyle(timeline, "::before").display,
       nestedRailDisplay: nestedRail.display,
-      nestedRailHeight: Number.parseFloat(nestedRail.height),
-      nestedRailIndent: nestedRailCenter - outerRailCenter,
-      railWidthMatches: outerRail.width === nestedRail.width,
-      railColorMatches: outerRail.backgroundColor === nestedRail.backgroundColor,
-      railOpacityMatches: outerRail.opacity === nestedRail.opacity,
       timelineGap: getComputedStyle(timeline).rowGap,
       nestedTimelineGap: getComputedStyle(nestedTimeline).rowGap,
-      groupStatusToRail: Math.abs(
-        groupStatusBounds.left + groupStatusBounds.width / 2 - outerRailCenter,
+      nestedTimelinePaddingLeft: getComputedStyle(nestedTimeline).paddingLeft,
+      groupDisclosureToRail: Math.abs(
+        groupDisclosureBounds.left + groupDisclosureBounds.width / 2 - outerRailCenter,
       ),
       thoughtIconDisplay: getComputedStyle(thoughtIcon).display,
       thoughtIconToRail: Math.abs(
-        thoughtIconBounds.left + thoughtIconBounds.width / 2 - nestedRailCenter,
+        thoughtIconBounds.left + thoughtIconBounds.width / 2 - outerRailCenter,
       ),
-      toolStatusToRail: Math.abs(
-        toolStatusBounds.left + toolStatusBounds.width / 2 - nestedRailCenter,
+      toolDisclosureToRail: Math.abs(
+        toolDisclosureBounds.left + toolDisclosureBounds.width / 2 - outerRailCenter,
       ),
-      duplicateToolNodeDisplay: getComputedStyle(toolCard, "::before").display,
+      branchDisplay: branch.display,
+      branchStartsAtRail: Math.abs(branchLeft - outerRailCenter),
+      branchEndsAtDisclosure: Math.abs(branchRight - toolDisclosureBounds.left),
+      inlineStatusAfterRail: toolStatusBounds.left - outerRailCenter,
+      railTailAfterFinalTool: outerRailBottom
+        - (lastToolCardBounds.top + lastToolCardBounds.height / 2),
       summaryBackground: getComputedStyle(summary).backgroundColor,
       bodyPaddingLeft: getComputedStyle(body).paddingLeft,
       nestedMarginLeft: getComputedStyle(nestedTimeline).marginLeft,
     };
   });
   expect(expandedGeometry.railDisplay).not.toBe("none");
-  expect(expandedGeometry.nestedRailDisplay).not.toBe("none");
-  expect(expandedGeometry.nestedRailHeight).toBeGreaterThan(10);
-  expect(expandedGeometry.nestedRailIndent).toBe(20);
-  expect(expandedGeometry.railWidthMatches).toBe(true);
-  expect(expandedGeometry.railColorMatches).toBe(true);
-  expect(expandedGeometry.railOpacityMatches).toBe(true);
+  expect(expandedGeometry.nestedRailDisplay).toBe("none");
   expect(expandedGeometry.timelineGap).toBe("6px");
   expect(expandedGeometry.nestedTimelineGap).toBe("6px");
-  expect(expandedGeometry.groupStatusToRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.nestedTimelinePaddingLeft).toBe("0px");
+  expect(expandedGeometry.groupDisclosureToRail).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.thoughtIconDisplay).not.toBe("none");
   expect(expandedGeometry.thoughtIconToRail).toBeLessThanOrEqual(0.25);
-  expect(expandedGeometry.toolStatusToRail).toBeLessThanOrEqual(0.25);
-  expect(expandedGeometry.duplicateToolNodeDisplay).toBe("none");
-  expect(expandedGeometry.summaryBackground).toBe("rgba(0, 0, 0, 0)");
+  expect(expandedGeometry.toolDisclosureToRail).toBeGreaterThan(10);
+  expect(expandedGeometry.branchDisplay).not.toBe("none");
+  expect(expandedGeometry.branchStartsAtRail).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.branchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.inlineStatusAfterRail).toBeGreaterThan(20);
+  expect(Math.abs(expandedGeometry.railTailAfterFinalTool)).toBeLessThanOrEqual(0.25);
+  expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
   expect(expandedGeometry.bodyPaddingLeft).toBe("0px");
   expect(expandedGeometry.nestedMarginLeft).toBe("0px");
+  await expect(combinedGroup.locator(
+    '.tool-card[data-call-id="collapsed_thinking_1"] .tool-inline-status [data-font-awesome-icon="check"]',
+  )).toHaveCount(1);
+  await expect(combinedGroup.locator(
+    '.tool-card[data-call-id="collapsed_thinking_2"] .tool-inline-status [data-font-awesome-icon="xmark"]',
+  )).toHaveCount(1);
 });
 
 test("the Chat preference persists across a frontend reload", async ({ page }) => {
@@ -1897,9 +1944,21 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     const symbol = marker.querySelector<HTMLElement>(".context-compaction-symbol");
     const beforeNested = before?.querySelector<HTMLElement>(".activity-group-timeline");
     const afterNested = after?.querySelector<HTMLElement>(".activity-group-timeline");
+    const beforeTool = beforeNested?.querySelector<HTMLElement>(":scope > .tool-card");
+    const afterTool = afterNested?.querySelector<HTMLElement>(":scope > .tool-card");
+    const beforeDisclosure = beforeTool?.querySelector<HTMLElement>(
+      ":scope > summary > .activity-rail-disclosure",
+    );
+    const afterDisclosure = afterTool?.querySelector<HTMLElement>(
+      ":scope > summary > .activity-rail-disclosure",
+    );
     if (!(before instanceof HTMLElement) || !(after instanceof HTMLElement)
       || symbol === null || beforeNested === null || beforeNested === undefined
-      || afterNested === null || afterNested === undefined) {
+      || afterNested === null || afterNested === undefined
+      || beforeTool === null || beforeTool === undefined
+      || afterTool === null || afterTool === undefined
+      || beforeDisclosure === null || beforeDisclosure === undefined
+      || afterDisclosure === null || afterDisclosure === undefined) {
       throw new Error("missing connected compaction timeline geometry");
     }
     const segment = (element: HTMLElement, pseudo: string) => {
@@ -1917,8 +1976,19 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     const beforeRail = segment(before, "::before");
     const bridge = segment(marker as HTMLElement, "::before");
     const afterRail = segment(after, "::before");
-    const beforeNestedRail = segment(beforeNested, "::before");
-    const afterNestedRail = segment(afterNested, "::before");
+    const branch = (tool: HTMLElement, disclosure: HTMLElement) => {
+      const bounds = tool.getBoundingClientRect();
+      const style = getComputedStyle(tool, "::before");
+      const left = bounds.left + Number.parseFloat(style.left);
+      return {
+        display: style.display,
+        left,
+        right: left + Number.parseFloat(style.width),
+        disclosureLeft: disclosure.getBoundingClientRect().left,
+      };
+    };
+    const beforeBranch = branch(beforeTool, beforeDisclosure);
+    const afterBranch = branch(afterTool, afterDisclosure);
     const symbolBounds = symbol.getBoundingClientRect();
     return {
       beforeGap: Math.abs(beforeRail.bottom - bridge.top),
@@ -1931,20 +2001,32 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
         ),
       ),
       bridgeDisplay: bridge.display,
-      beforeNestedRail: beforeNestedRail.display,
-      afterNestedRail: afterNestedRail.display,
-      beforeNestedIndent: beforeNestedRail.center - beforeRail.center,
-      afterNestedIndent: afterNestedRail.center - afterRail.center,
+      beforeNestedRail: getComputedStyle(beforeNested, "::before").display,
+      afterNestedRail: getComputedStyle(afterNested, "::before").display,
+      beforeBranchDisplay: beforeBranch.display,
+      afterBranchDisplay: afterBranch.display,
+      beforeBranchStartsAtRail: Math.abs(beforeBranch.left - beforeRail.center),
+      afterBranchStartsAtRail: Math.abs(afterBranch.left - afterRail.center),
+      beforeBranchEndsAtDisclosure: Math.abs(
+        beforeBranch.right - beforeBranch.disclosureLeft,
+      ),
+      afterBranchEndsAtDisclosure: Math.abs(
+        afterBranch.right - afterBranch.disclosureLeft,
+      ),
     };
   });
   expect(connection.beforeGap).toBeLessThanOrEqual(0.25);
   expect(connection.afterGap).toBeLessThanOrEqual(0.25);
   expect(connection.centerDrift).toBeLessThanOrEqual(0.25);
   expect(connection.bridgeDisplay).not.toBe("none");
-  expect(connection.beforeNestedRail).not.toBe("none");
-  expect(connection.afterNestedRail).not.toBe("none");
-  expect(connection.beforeNestedIndent).toBe(20);
-  expect(connection.afterNestedIndent).toBe(20);
+  expect(connection.beforeNestedRail).toBe("none");
+  expect(connection.afterNestedRail).toBe("none");
+  expect(connection.beforeBranchDisplay).not.toBe("none");
+  expect(connection.afterBranchDisplay).not.toBe("none");
+  expect(connection.beforeBranchStartsAtRail).toBeLessThanOrEqual(0.25);
+  expect(connection.afterBranchStartsAtRail).toBeLessThanOrEqual(0.25);
+  expect(connection.beforeBranchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
+  expect(connection.afterBranchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
 });
 
 test("running activity groups retain explicit disclosure state as tools arrive", async ({
@@ -2253,9 +2335,14 @@ test("the Chat preference collapses context compaction into one tool activity ru
   await expect(marker).toHaveClass(/nested-timeline-marker/u);
   await expect(group.locator(".tool-card")).toHaveCount(2);
   const markerAlignment = await marker.evaluate((element) => {
-    const timeline = element.parentElement;
+    const nestedTimeline = element.parentElement;
+    const agent = element.closest(".agent-turn-card");
+    const timeline = agent?.querySelector<HTMLElement>(
+      ":scope > .message-body > .agent-activity-timeline",
+    );
     const symbol = element.querySelector<HTMLElement>(".context-compaction-symbol");
-    if (timeline === null || symbol === null) {
+    if (nestedTimeline === null || timeline === null || timeline === undefined
+      || symbol === null) {
       throw new Error("missing nested compaction timeline geometry");
     }
     const timelineBounds = timeline.getBoundingClientRect();
@@ -2268,10 +2355,12 @@ test("the Chat preference collapses context compaction into one tool activity ru
       centerDrift: Math.abs(
         symbolBounds.left + symbolBounds.width / 2 - railCenter,
       ),
+      nestedRailDisplay: getComputedStyle(nestedTimeline, "::before").display,
       horizontalOverflow: element.scrollWidth - element.clientWidth,
     };
   });
   expect(markerAlignment.centerDrift).toBeLessThanOrEqual(0.25);
+  expect(markerAlignment.nestedRailDisplay).toBe("none");
   expect(markerAlignment.horizontalOverflow).toBeLessThanOrEqual(0);
 });
 
@@ -2328,8 +2417,8 @@ test("standalone tool headers align their timeline node and disclosure controls"
   await expect(tool).toBeVisible();
   const alignment = async () => await tool.evaluate((card) => {
     const summary = card.querySelector<HTMLElement>(":scope > summary");
-    const disclosure = summary?.querySelector<HTMLElement>(".tool-disclosure");
-    const status = summary?.querySelector<HTMLElement>(".tool-status");
+    const disclosure = summary?.querySelector<HTMLElement>(".activity-rail-disclosure");
+    const status = summary?.querySelector<HTMLElement>(".tool-inline-status");
     const title = summary?.querySelector<HTMLElement>(":scope > strong");
     const timeline = card.parentElement;
     if (summary === null || summary === undefined || disclosure === null
@@ -2347,6 +2436,8 @@ test("standalone tool headers align their timeline node and disclosure controls"
       return bounds.top + bounds.height / 2;
     };
     const statusBounds = status.getBoundingClientRect();
+    const disclosureBounds = disclosure.getBoundingClientRect();
+    const titleBounds = title.getBoundingClientRect();
     const statusCenter = center(status);
     return {
       disclosure: Math.abs(center(disclosure) - statusCenter),
@@ -2355,28 +2446,30 @@ test("standalone tool headers align their timeline node and disclosure controls"
       titleFontWeight: getComputedStyle(title).fontWeight,
       statusWidth: statusBounds.width,
       statusHeight: statusBounds.height,
-      statusToRail: Math.abs(
-        statusBounds.left + statusBounds.width / 2 - railCenter,
+      disclosureToRail: Math.abs(
+        disclosureBounds.left + disclosureBounds.width / 2 - railCenter,
       ),
+      statusAfterTitle: statusBounds.left - titleBounds.right,
       duplicateNodeDisplay: getComputedStyle(card, "::before").display,
       summaryOverflow: getComputedStyle(summary).overflow,
-      statusOutsideSummary: statusBounds.left < summary.getBoundingClientRect().left,
+      disclosureOutsideSummary: disclosureBounds.left < summary.getBoundingClientRect().left,
     };
   });
 
   const collapsedAlignment = await alignment();
   expect(collapsedAlignment.duplicateNodeDisplay).toBe("none");
   expect(collapsedAlignment.summaryOverflow).toBe("visible");
-  expect(collapsedAlignment.statusOutsideSummary).toBe(true);
+  expect(collapsedAlignment.disclosureOutsideSummary).toBe(true);
   expect(collapsedAlignment.titleFontSize).toBe("11px");
   expect(collapsedAlignment.titleFontWeight).toBe("600");
-  expect(collapsedAlignment.statusWidth).toBe(10);
-  expect(collapsedAlignment.statusHeight).toBe(10);
+  expect(collapsedAlignment.statusWidth).toBe(12);
+  expect(collapsedAlignment.statusHeight).toBe(12);
   expect(Math.max(
     collapsedAlignment.disclosure,
     collapsedAlignment.title,
-    collapsedAlignment.statusToRail,
+    collapsedAlignment.disclosureToRail,
   )).toBeLessThanOrEqual(0.25);
+  expect(collapsedAlignment.statusAfterTitle).toBeGreaterThanOrEqual(5);
   await tool.locator(":scope > summary").click();
   await expect(tool).toHaveAttribute("open", "");
   const expandedAlignment = await alignment();
@@ -2384,7 +2477,7 @@ test("standalone tool headers align their timeline node and disclosure controls"
   expect(Math.max(
     expandedAlignment.disclosure,
     expandedAlignment.title,
-    expandedAlignment.statusToRail,
+    expandedAlignment.disclosureToRail,
   )).toBeLessThanOrEqual(0.25);
 });
 

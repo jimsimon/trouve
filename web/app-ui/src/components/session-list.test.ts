@@ -38,6 +38,8 @@ describe("session list component contract", () => {
   it("keeps navigation sessions to one line without rendering branch names", () => {
     expect(component).toContain('<span class="session-copy">');
     expect(component).toContain("<strong>${session.title}</strong>");
+    expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
+    expect(component).toContain('class="session-age"');
     expect(component).not.toContain("session.branch");
     expect(component).not.toContain("<small>");
     expect(styles).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
@@ -45,6 +47,20 @@ describe("session list component contract", () => {
     expect(styles).toMatch(
       /\.session-copy strong \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
     );
+  });
+
+  it("keeps ages visible while revealing row actions only on interaction", () => {
+    expect(component).toContain("data-actions-open=${this.#menuSessionId === session.id}");
+    expect(styles).toMatch(
+      /@media \(hover: hover\) and \(pointer: fine\) \{[^}]*\.session-menu-button \{[^}]*opacity:\s*0[^}]*pointer-events:\s*none/s,
+    );
+    expect(styles).toContain(".session-row-wrap:hover .session-menu-button");
+    expect(styles).toContain(".session-row-wrap:focus-within .session-menu-button");
+    expect(styles).toContain(".session-row-wrap:hover .session-age");
+    expect(styles).toMatch(
+      /\.session-copy strong \{[^}]*color:\s*var\(--trouve-text-mid\)/s,
+    );
+    expect(styles).toContain(".session-row-wrap.selected .session-copy strong");
   });
 
   it("uses the attention, error, unread, busy, and idle presentations", () => {

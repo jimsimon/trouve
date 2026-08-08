@@ -175,6 +175,7 @@ describe("Trouve visual contract", () => {
     expect(automations).toBeLessThan(settings);
     expect(settings).toBeLessThan(workspaces);
     expect(shell).toContain('class="workspace-row"');
+    expect(shell).toContain("data-controls-visible=${");
     expect(shell).toContain('class="workspace-toggle"');
     expect(shell).toContain('class="workspace-new-session"');
     expect(shell).toContain("#toggleWorkspace");
@@ -183,6 +184,10 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.session-copy strong \{[^}]*font-size:\s*13px/s);
+    expect(app).toMatch(/\.session-copy strong \{[^}]*color:\s*var\(--trouve-text-mid\)/s);
+    expect(app).toMatch(/\.session-age \{[^}]*font-size:\s*11px/s);
+    expect(app).toContain(".workspace-row:hover .workspace-order-controls");
+    expect(app).toContain(".workspace-row:focus-within .workspace-actions-wrap");
     expect(app).not.toContain(".session-copy small");
   });
 
@@ -364,7 +369,10 @@ describe("Trouve visual contract", () => {
     );
     expect(app).toMatch(/\.chat-scroll-indicator\[data-scrollable\] \{[^}]*opacity:\s*1/s);
     expect(app).toMatch(/\.message \{[^}]*margin:\s*0 0 10px/s);
-    expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*-2px 0 8px/s);
+    expect(app).toMatch(/\.turn-rule \{[^}]*margin:\s*4px 0 14px/s);
+    expect(app).toMatch(
+      /\.turn-rule-actions button \{[^}]*width:\s*24px[^}]*height:\s*24px[^}]*font-size:\s*12px/s,
+    );
     expect(app).toMatch(
       /\.agent-activity \{[^}]*margin:\s*4px 0 10px/s,
     );
@@ -429,6 +437,12 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(
       /\.agent-activity-timeline\.single-activity::before \{[^}]*inset-block:\s*6px/s,
     );
+    expect(app).toMatch(
+      /\.agent-activity-timeline\.ends-with-expanded-tool-group::before \{[^}]*inset-block-end:\s*20\.5px/s,
+    );
+    expect(app).toMatch(
+      /@media \(max-width: 760px\)[\s\S]*\.agent-activity-timeline\.ends-with-expanded-tool-group::before \{[^}]*inset-block-end:\s*26px/s,
+    );
     expect(app).not.toMatch(
       /\.agent-activity-timeline\.has-expanded-group::before \{[^}]*display:\s*none/s,
     );
@@ -436,13 +450,34 @@ describe("Trouve visual contract", () => {
       /\.agent-activity-timeline > \.activity-group::before, \.agent-activity-timeline > \.tool-card::before \{[^}]*display:\s*none/s,
     );
     expect(app).toMatch(
-      /\.thinking-rail-icon \{[^}]*inset-block-start:\s*10px[^}]*inset-inline-start:\s*-18px[^}]*width:\s*11px[^}]*height:\s*11px[^}]*color:\s*var\(--trouve-text-faint\)[^}]*background:\s*var\(--trouve-win-bg\)/s,
+      /\.thinking-rail-icon \{[^}]*inset-block-start:\s*10px[^}]*inset-inline-start:\s*-18\.5px[^}]*width:\s*12px[^}]*height:\s*12px[^}]*color:\s*var\(--trouve-text-faint\)[^}]*background:\s*var\(--trouve-win-bg\)/s,
     );
     expect(app).toMatch(
-      /\.thinking-rail-icon \.trouve-icon \{[^}]*--trouve-icon-width:\s*11px/s,
+      /\.thinking-rail-icon \.trouve-icon \{[^}]*--trouve-icon-width:\s*12px/s,
     );
     expect(app).toMatch(
-      /\.tool-status \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-17\.5px[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-win-bg\)[^}]*transform:\s*translateY\(-50%\)/s,
+      /\.activity-rail-disclosure \{[^}]*position:\s*absolute[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-18\.5px[^}]*width:\s*12px[^}]*height:\s*12px[^}]*background:\s*var\(--trouve-win-bg\)[^}]*transform:\s*translateY\(-50%\)/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-timeline > \.tool-card::before \{[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-12\.5px[^}]*width:\s*20\.5px[^}]*background:\s*var\(--trouve-border-strong\)/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-timeline \{[^}]*padding-inline-start:\s*0/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-timeline::before \{[^}]*display:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group-timeline > \.tool-card > summary > \.activity-rail-disclosure \{[^}]*position:\s*static[^}]*transform:\s*none/s,
+    );
+    expect(app).toMatch(
+      /\.activity-group > summary:focus \{[^}]*background:\s*var\(--trouve-accent-bg\)/s,
+    );
+    expect(app).toMatch(
+      /\.tool-card summary:focus \{[^}]*background:\s*var\(--trouve-accent-bg\)/s,
+    );
+    expect(app).toMatch(
+      /\.tool-inline-status \{[^}]*width:\s*12px[^}]*height:\s*12px[^}]*display:\s*inline-grid/s,
     );
     expect(app).toMatch(
       /\.tool-card summary > strong \{[^}]*font-size:\s*11px[^}]*font-weight:\s*600/s,
@@ -478,8 +513,11 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain('class="message-body turn-body-stream agent-body-stream"');
     expect(thread).toContain("agent-activity-timeline");
     expect(thread).toContain('activityRows.length === 1 ? "single-activity" : ""');
-    expect(thread).toContain("activity-group-status");
-    expect(thread).toContain('className: "disclosure-icon tool-disclosure"');
+    expect(thread).toContain('"ends-with-expanded-tool-group"');
+    expect(thread).not.toContain("activity-group-status");
+    expect(thread).toContain('class="activity-rail-disclosure"');
+    expect(thread).toContain('className: "activity-rail-disclosure-icon"');
+    expect(thread).toContain('class="tool-inline-status ${item.status}"');
     expect(thread).toContain('class="turn-markdown"');
     expect(thread).toContain('class="agent-copy-action"');
     expect(thread).toContain('"Copy assistant output"');

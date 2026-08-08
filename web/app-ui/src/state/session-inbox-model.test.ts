@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   groupWorkspaceSessions,
   inboxRecoverySession,
+  sessionAgePresentation,
   sessionStatusText,
   sortInboxSessions,
   type InboxSessionOrderFields,
@@ -23,6 +24,31 @@ const session = (
 });
 
 describe("session inbox model", () => {
+  it("formats stable compact session ages with accessible labels", () => {
+    const now = Date.parse("2026-08-08T12:00:00Z");
+    expect(sessionAgePresentation("2026-08-08T11:59:31Z", now)).toEqual({
+      compact: "now",
+      label: "Updated just now",
+    });
+    expect(sessionAgePresentation("2026-08-08T11:59:00Z", now)).toEqual({
+      compact: "1m",
+      label: "Updated 1 minute ago",
+    });
+    expect(sessionAgePresentation("2026-08-08T08:00:00Z", now)).toEqual({
+      compact: "4h",
+      label: "Updated 4 hours ago",
+    });
+    expect(sessionAgePresentation("2026-07-27T12:00:00Z", now)).toEqual({
+      compact: "12d",
+      label: "Updated 12 days ago",
+    });
+    expect(sessionAgePresentation("2024-08-08T12:00:00Z", now)).toEqual({
+      compact: "2y",
+      label: "Updated 2 years ago",
+    });
+    expect(sessionAgePresentation("not-a-date", now)).toBeUndefined();
+  });
+
   it("sorts visible sessions by attention, outcome urgency, recency, and stable ID", () => {
     const sessions = [
       session("succeeded", { outcome: "succeeded", updatedAt: "2026-08-01T12:09:00Z" }),

@@ -300,7 +300,16 @@ const toolStatusIcon = (
     aborted: "xmark",
   } as const)[status];
 
-type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "error";
+type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "mixed" | "error";
+
+const activityGroupStatusLabel = (status: ActivityGroupStatus): string =>
+  ({
+    "awaiting-approval": "Approval needed",
+    running: "Running",
+    ok: "Completed",
+    mixed: "Mixed results",
+    error: "Failed",
+  } as const)[status];
 
 export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   static override properties = {
@@ -2019,6 +2028,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     let activityRows: Array<{
       readonly content: unknown;
       readonly expandedGroup: boolean;
+      readonly endsWithExpandedToolGroup: boolean;
     }> = [];
     const flushActivityRows = (activityConnectedToCompaction = false): void => {
       if (activityRows.length === 0) return;
@@ -2028,6 +2038,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         activityRows.length === 1 ? "single-activity" : ""
       } ${activityRows.some(({ expandedGroup }) => expandedGroup)
         ? "has-expanded-group"
+        : ""} ${!activityConnectedToCompaction
+          && activityRows.at(-1)?.endsWithExpandedToolGroup === true
+        ? "ends-with-expanded-tool-group"
         : ""} ${compactionConnected ? "compaction-connected-timeline" : ""}`;
       rows.push(html`<div class=${timelineClass}>${
         activityRows.map(({ content }) => content)
@@ -2110,6 +2123,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         activityRows.push({
           content: this.#renderVisibleThinking(item),
           expandedGroup: false,
+          endsWithExpandedToolGroup: false,
         });
         index += 1;
         continue;
@@ -2152,10 +2166,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           activityRows.push({
             content: this.#renderItem(only, turnModels, turnDurationMs, presentation),
             expandedGroup: false,
+            endsWithExpandedToolGroup: false,
           });
         }
         continue;
       }
+      const expandedGroup = this.#activityGroupOpen(unit, run);
+      const finalGroupedItem = run.at(-1);
+      const endsWithCollapsedTool = finalGroupedItem?.kind === "tool"
+        && !isContextCompactionTool(finalGroupedItem)
+        && finalGroupedItem.status !== "awaiting-approval"
+        && !(this.#toolDisclosure.get(finalGroupedItem.callId) ?? false);
       activityRows.push({
         content: this.#renderActivityGroup(
           unit,
@@ -2164,7 +2185,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           turnDurationMs,
           presentation,
         ),
-        expandedGroup: this.#activityGroupOpen(unit, run),
+        expandedGroup,
+        endsWithExpandedToolGroup: expandedGroup && endsWithCollapsedTool,
       });
     }
     flushActivityRows();
@@ -2228,14 +2250,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         : item.kind === "tool"
           && (item.status === "error" || item.status === "denied" || item.status === "aborted")
     );
-    const tone = failed
+    const succeeded = items.some((item) =>
+      item.kind === "compaction"
+        ? item.state.kind === "completed"
+        : item.kind === "tool" && item.status === "ok"
+    );
+    const mixed = failed && succeeded;
+    const tone = mixed
+      ? "warning"
+      : failed
       ? "error"
       : needsApproval
         ? "warning"
         : active
           ? "active"
           : "complete";
-    const status: ActivityGroupStatus = failed
+    const status: ActivityGroupStatus = mixed
+      ? "mixed"
+      : failed
       ? "error"
       : needsApproval
         ? "awaiting-approval"
@@ -2253,16 +2285,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           @click=${(event: Event) =>
             this.#toggleActivityGroup(event, key, open, needsApproval)}
         >
-          <span class=${`tool-status activity-group-status ${status}`} aria-hidden="true">
-            ${fontAwesomeIcon(toolStatusIcon(status), {
-              className: "tool-status-icon",
-              spin: status === "running",
+          <span class="activity-rail-disclosure" aria-hidden="true">
+            ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
+              className: "activity-rail-disclosure-icon",
             })}
           </span>
-          ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
-            className: "disclosure-icon tool-disclosure",
-          })}
           <strong>${activityGroupSummary(items)}</strong>
+          <small class="visually-hidden">Group status: ${activityGroupStatusLabel(status)}</small>
         </summary>
         ${open
           ? html`<div class="activity-group-body">
@@ -3221,16 +3250,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               @click=${(event: Event) =>
                 this.#toggleToolDisclosure(event, item.callId, approvalRequired)}
             >
-              ${fontAwesomeIcon(toolOpen ? "caret-down" : "caret-right", {
-                className: "tool-disclosure",
-              })}
-              <span class="tool-status ${item.status}" aria-hidden="true">
+              <span class=${`activity-rail-disclosure ${item.status}`} aria-hidden="true">
+                ${fontAwesomeIcon(toolOpen ? "caret-down" : "caret-right", {
+                  className: "activity-rail-disclosure-icon",
+                })}
+              </span>
+              <strong>${toolPresentation.title}</strong>
+              <span class="tool-inline-status ${item.status}" aria-hidden="true">
                 ${fontAwesomeIcon(toolStatusIcon(item.status), {
                   className: "tool-status-icon",
                   spin: item.status === "running",
                 })}
               </span>
-              <strong>${toolPresentation.title}</strong>
               ${toolPresentation.subject === ""
                 ? nothing
                 : toolPresentation.filePath === ""
