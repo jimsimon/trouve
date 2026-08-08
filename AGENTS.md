@@ -50,10 +50,13 @@ These are load-bearing. Do not violate them without a new ADR.
 3. **Every side effect goes through `ToolExecutor`.** File edits, shell,
    git, MCP calls — one chokepoint for permissions, audit, and (later)
    sandboxed executors. Never spawn a process or write a file from the agent
-   loop directly.
+   loop directly. Vendor harnesses use the full tool bridge by default;
+   unavoidable vendor-native tools are disabled or confined read-only, and
+   approval-only fallbacks hold an engine mutation lease (ADR 0030).
 4. **Sessions own worktrees.** Agent file operations happen in the session's
    git worktree, never in the user's checkout. Threads share the session
-   worktree; worktree mutations are serialized.
+   worktree; read-only tools may overlap, but mutation-capable tool calls are
+   exclusive per session (ADR 0030).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
    deliberately with a version bump.

@@ -313,7 +313,12 @@ impl AgentBackend for ClaudeBackend {
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         self.start_reaper();
-        let proc_ = self.proc_for(&turn).await?;
+        let cancel = turn.cancel.clone();
+        let proc_ = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            proc_ = self.proc_for(&turn) => proc_?,
+        };
         let pool = self.pool.clone();
         let thread_id = turn.thread_id.clone();
         let prompt = turn.prompt.clone();
@@ -335,7 +340,15 @@ impl AgentBackend for ClaudeBackend {
 
         let stream = async_stream(move |tx| async move {
             // Exclusive claim on the process for this turn.
-            let mut lines = proc_.lines.lock().await;
+            let mut lines = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    pool.remove(&thread_id, &proc_).await;
+                    proc_.kill().await;
+                    return;
+                }
+                lines = proc_.lines.lock() => lines,
+            };
             proc_.touch();
 
             let msg = json!({
@@ -345,14 +358,19 @@ impl AgentBackend for ClaudeBackend {
                     "content": content,
                 }
             });
-            let sent = {
-                let mut stdin = proc_.stdin.lock().await;
-                async {
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    pool.remove(&thread_id, &proc_).await;
+                    proc_.kill().await;
+                    return;
+                }
+                sent = async {
+                    let mut stdin = proc_.stdin.lock().await;
                     stdin.write_all(msg.to_string().as_bytes()).await?;
                     stdin.write_all(b"\n").await?;
                     stdin.flush().await
-                }
-                .await
+                } => sent,
             };
             if let Err(e) = sent {
                 // Likely the process died between turns; keep reading — the
@@ -362,7 +380,19 @@ impl AgentBackend for ClaudeBackend {
             }
 
             let mut completed = false;
-            while let Some(line) = lines.recv().await {
+            loop {
+                let line = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        pool.remove(&thread_id, &proc_).await;
+                        proc_.kill().await;
+                        return;
+                    }
+                    line = lines.recv() => match line {
+                        Some(line) => line,
+                        None => break,
+                    },
+                };
                 let Ok(ev) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -386,7 +416,12 @@ impl AgentBackend for ClaudeBackend {
                 }
                 let is_result = ev["type"].as_str() == Some("result");
                 for out in events {
-                    if tx.send(Ok(out)).await.is_err() {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => false,
+                        sent = tx.send(Ok(out)) => sent.is_ok(),
+                    };
+                    if !sent {
                         // Consumer dropped mid-turn (cancel): the CLI has no
                         // per-turn abort in this mode, so kill the process.
                         // The transcript is on disk; next turn resumes it.
@@ -1023,6 +1058,7 @@ mod tests {
 
     fn turn(model: &str, key: &str, value: &str) -> BackendTurn {
         BackendTurn {
+            cancel: Default::default(),
             thread_id: "thread".into(),
             worktree: std::env::temp_dir(),
             session: None,

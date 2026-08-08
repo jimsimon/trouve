@@ -12,7 +12,7 @@ use futures::StreamExt;
 use trouve_core::Engine;
 use trouve_core::config::Config;
 use trouve_core::store::{NewCodeReviewJob, NewCodeReviewTask, Store};
-use trouve_protocol::Usage;
+use trouve_protocol::{Event, Scope, Usage};
 use trouve_providers::{
     EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
 };
@@ -2462,6 +2462,194 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// Backend whose startup owns an explicit cancellation-cleanup boundary.
+/// It does not return from `run_turn` until the test acknowledges cleanup,
+/// mirroring a vendor request that must be interrupted before the next turn.
+struct CancellationAckBackend {
+    entered: Arc<tokio::sync::Semaphore>,
+    cleanup_started: Arc<tokio::sync::Semaphore>,
+    cleanup_release: Arc<tokio::sync::Semaphore>,
+}
+
+impl CancellationAckBackend {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            cleanup_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            cleanup_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for CancellationAckBackend {
+    fn id(&self) -> &str {
+        "cancellation-ack"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "cancellation-ack/model".into(),
+            display_name: "Cancellation acknowledgement".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        self.entered.add_permits(1);
+        turn.cancel.cancelled().await;
+        self.cleanup_started.add_permits(1);
+        self.cleanup_release
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        Err(trouve_agents::BackendError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn cancellation_terminal_event_waits_for_backend_cleanup_acknowledgement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(CancellationAckBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("cancellation-ack", backend.clone())
+            .with_default_model("cancellation-ack/model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Cancel ack"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "begin"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.entered.clone().acquire_owned(),
+    )
+    .await
+    .expect("backend startup should begin")
+    .unwrap()
+    .forget();
+
+    let cancelled = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), reqwest::StatusCode::NO_CONTENT);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.cleanup_started.clone().acquire_owned(),
+    )
+    .await
+    .expect("backend should observe cancellation")
+    .unwrap()
+    .forget();
+
+    let before_ack = store
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .unwrap();
+    assert!(
+        !before_ack
+            .iter()
+            .any(|event| matches!(event.event, Event::TurnCancelled { .. })),
+        "turn.cancelled must not overtake vendor cleanup"
+    );
+
+    backend.cleanup_release.add_permits(1);
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.cancelled",
+    )
+    .await;
+    assert!(events.iter().any(|event| event["type"] == "turn.cancelled"));
+    let after_ack = store
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .unwrap();
+    assert_eq!(
+        after_ack
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCancelled { .. }
+                        | Event::TurnCompleted { .. }
+                        | Event::TurnFailed { .. }
+                )
+            })
+            .count(),
+        1,
+        "a cancelled turn must have exactly one terminal event"
+    );
 }
 
 /// Echoes the last user message, but holds each reply until the test grants

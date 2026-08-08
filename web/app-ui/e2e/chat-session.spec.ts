@@ -4134,10 +4134,34 @@ test("keeps a nested thought anchored when history extends the same agent turn",
             - expected.offset,
         );
   }, anchor)).toBeLessThanOrEqual(2);
-  // Let the 500 ms CHAT_HISTORY_ANCHOR_SETTLE_MS correction window expire,
-  // then prove the released off-screen page cannot move the preserved anchor.
+  // Let the old fixed correction window elapse, then model worker-backed
+  // Markdown finishing late inside the same virtual turn. The nested anchor
+  // must remain fixed even though the virtualizer sees only its parent row
+  // change height.
   await page.waitForTimeout(600);
   expect(await viewport.evaluate((element, expected) => {
+    const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .find((candidate) => candidate.dataset["chatAnchorId"] === expected.id);
+    return row === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.abs(
+          row.getBoundingClientRect().top
+            - element.getBoundingClientRect().top
+            - expected.offset,
+        );
+  }, anchor)).toBeLessThanOrEqual(2);
+  await viewport.evaluate((element, expected) => {
+    const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+      .find((candidate) => candidate.dataset["chatAnchorId"] === expected.id);
+    if (row === undefined || row.parentElement === null) {
+      throw new Error("missing delayed-layout history anchor");
+    }
+    const delayedContent = document.createElement("div");
+    delayedContent.dataset["historyDelayedContent"] = "";
+    delayedContent.style.height = "180px";
+    row.parentElement.insertBefore(delayedContent, row);
+  }, anchor);
+  await expect.poll(() => viewport.evaluate((element, expected) => {
     const row = [...element.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
       .find((candidate) => candidate.dataset["chatAnchorId"] === expected.id);
     return row === undefined

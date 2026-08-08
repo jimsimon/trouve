@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use trouve_providers::ToolSpec;
 
 /// Prefix for MCP tool names: `mcp__<server>__<tool>`.
@@ -46,6 +47,9 @@ pub const TOOL_PREFIX: &str = "mcp__";
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Upper bound on spawning + handshaking a server.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Health probes are deliberately shorter than turn-time lazy connection
+/// setup so a broken settings entry gets prompt feedback.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One entry under `mcpServers` in `.mcp.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,7 +287,7 @@ struct Pipes {
 
 /// A live connection to one MCP server process.
 pub struct McpConnection {
-    _child: Child,
+    child: Mutex<Child>,
     pipes: Mutex<Pipes>,
     next_id: AtomicI64,
     tools: Vec<ToolSpec>,
@@ -298,6 +302,30 @@ impl McpConnection {
         config: &McpServerConfig,
         logs: Option<&McpLogStore>,
     ) -> Result<Self> {
+        Self::connect_controlled(
+            server,
+            config,
+            logs,
+            &CancellationToken::new(),
+            CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Connect with cancellation and a caller-selected handshake deadline.
+    /// Once the child has spawned, every unsuccessful exit explicitly kills
+    /// and reaps it before returning; `kill_on_drop` remains only a panic or
+    /// runtime-shutdown fallback.
+    async fn connect_controlled(
+        server: &str,
+        config: &McpServerConfig,
+        logs: Option<&McpLogStore>,
+        cancel: &CancellationToken,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        if cancel.is_cancelled() {
+            bail!("MCP server '{server}' connection cancelled");
+        }
         let mut command = tokio::process::Command::new(&config.command);
         command
             .args(&config.args)
@@ -329,28 +357,48 @@ impl McpConnection {
         }
 
         let mut connection = Self {
-            _child: child,
+            child: Mutex::new(child),
             pipes: Mutex::new(Pipes { stdin, stdout }),
             next_id: AtomicI64::new(1),
             tools: Vec::new(),
         };
 
-        connection
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "trouve", "version": env!("CARGO_PKG_VERSION")},
-                }),
-            )
-            .await
-            .with_context(|| format!("initializing MCP server '{server}'"))?;
-        connection
-            .notify("notifications/initialized", json!({}))
-            .await?;
-
-        let listed = connection.request("tools/list", json!({})).await?;
+        let handshake = async {
+            connection
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "trouve", "version": env!("CARGO_PKG_VERSION")},
+                    }),
+                )
+                .await
+                .with_context(|| format!("initializing MCP server '{server}'"))?;
+            connection
+                .notify("notifications/initialized", json!({}))
+                .await?;
+            connection.request("tools/list", json!({})).await
+        };
+        let listed = match tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow::anyhow!(
+                "MCP server '{server}' connection cancelled"
+            )),
+            result = tokio::time::timeout(connect_timeout, handshake) => match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "MCP server '{server}' timed out after {}s during connect",
+                    connect_timeout.as_secs()
+                )),
+            },
+        } {
+            Ok(listed) => listed,
+            Err(error) => {
+                connection.terminate().await;
+                return Err(error);
+            }
+        };
         let tools = listed
             .get("tools")
             .and_then(|t| t.as_array())
@@ -374,6 +422,26 @@ impl McpConnection {
             })
             .collect();
         Ok(connection)
+    }
+
+    /// Terminate and reap the stdio server. This is idempotent and may be
+    /// called while a request is blocked in the pipe mutex; killing the child
+    /// wakes that request with EOF while `wait` provides the cleanup
+    /// acknowledgement required before a turn can publish cancellation.
+    async fn terminate(&self) {
+        let mut child = self.child.lock().await;
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if let Err(error) = child.start_kill() {
+                    tracing::warn!("failed to terminate MCP server: {error}");
+                }
+            }
+            Err(error) => tracing::warn!("failed to inspect MCP server process: {error}"),
+        }
+        if let Err(error) = child.wait().await {
+            tracing::warn!("failed to reap MCP server process: {error}");
+        }
     }
 
     pub fn tools(&self) -> &[ToolSpec] {
@@ -459,20 +527,29 @@ impl McpConnection {
 /// afterwards; stderr and lifecycle lines land in `logs`.
 pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -> Result<usize> {
     logs.push(server, format!("health check: spawning {}", config.command));
-    let connection = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        McpConnection::connect(server, config, Some(logs)),
+    let connection = McpConnection::connect_controlled(
+        server,
+        config,
+        Some(logs),
+        &CancellationToken::new(),
+        PROBE_TIMEOUT,
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out after 10s during the MCP handshake"))?;
-    match &connection {
-        Ok(c) => logs.push(
-            server,
-            format!("health check: ok ({} tools)", c.tools().len()),
-        ),
-        Err(e) => logs.push(server, format!("health check: failed: {e:#}")),
+    .await;
+    match connection {
+        Ok(connection) => {
+            logs.push(
+                server,
+                format!("health check: ok ({} tools)", connection.tools().len()),
+            );
+            let count = connection.tools().len();
+            connection.terminate().await;
+            Ok(count)
+        }
+        Err(error) => {
+            logs.push(server, format!("health check: failed: {error:#}"));
+            Err(error)
+        }
     }
-    Ok(connection?.tools().len())
 }
 
 /// Lazily-connected MCP servers, keyed by (worktree, server name).
@@ -503,6 +580,7 @@ impl McpManager {
         workspace_root: Option<&Path>,
         worktree: &Path,
         server: &str,
+        cancel: &CancellationToken,
     ) -> Result<std::sync::Arc<McpConnection>> {
         let key = (worktree.to_string_lossy().to_string(), server.to_string());
         // Look up the config outside the connections lock so a slow spawn or
@@ -522,25 +600,35 @@ impl McpManager {
                 return Ok(existing.clone());
             }
         }
-        let connection = match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            McpConnection::connect(server, &config, Some(&self.logs)),
-        )
-        .await
-        {
-            Ok(res) => std::sync::Arc::new(res?),
-            Err(_) => bail!(
-                "MCP server '{server}' timed out after {}s during connect",
-                CONNECT_TIMEOUT.as_secs()
-            ),
-        };
+        let connection = std::sync::Arc::new(
+            McpConnection::connect_controlled(
+                server,
+                &config,
+                Some(&self.logs),
+                cancel,
+                CONNECT_TIMEOUT,
+            )
+            .await?,
+        );
         self.logs.push(
             server,
             format!("connected ({} tools)", connection.tools().len()),
         );
-        let mut connections = self.connections.lock().await;
-        // Another caller may have connected while we spawned; keep theirs.
-        Ok(connections.entry(key).or_insert(connection).clone())
+        let (selected, duplicate) = {
+            let mut connections = self.connections.lock().await;
+            // Another caller may have connected while we spawned; keep
+            // theirs, but explicitly reap our redundant child.
+            if let Some(existing) = connections.get(&key) {
+                (existing.clone(), Some(connection))
+            } else {
+                connections.insert(key, connection.clone());
+                (connection, None)
+            }
+        };
+        if let Some(duplicate) = duplicate {
+            duplicate.terminate().await;
+        }
+        Ok(selected)
     }
 
     /// Drop a single cached connection (killing its child process). The next
@@ -548,7 +636,10 @@ impl McpManager {
     /// server doesn't stay permanently broken in the cache.
     async fn evict(&self, worktree: &Path, server: &str) {
         let key = (worktree.to_string_lossy().to_string(), server.to_string());
-        self.connections.lock().await.remove(&key);
+        let connection = self.connections.lock().await.remove(&key);
+        if let Some(connection) = connection {
+            connection.terminate().await;
+        }
     }
 
     /// Drop every cached connection for a worktree (killing their child
@@ -556,10 +647,20 @@ impl McpManager {
     /// leak for the lifetime of the process.
     pub async fn evict_worktree(&self, worktree: &Path) {
         let prefix = worktree.to_string_lossy().to_string();
-        self.connections
-            .lock()
-            .await
-            .retain(|(wt, _), _| wt != &prefix);
+        let removed = {
+            let mut connections = self.connections.lock().await;
+            let keys = connections
+                .keys()
+                .filter(|(worktree, _)| worktree == &prefix)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| connections.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for connection in removed {
+            connection.terminate().await;
+        }
     }
 
     /// All MCP tool specs visible from this worktree. Connection failures
@@ -569,12 +670,16 @@ impl McpManager {
         config_dir: Option<&Path>,
         workspace_root: Option<&Path>,
         worktree: &Path,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<ToolSpec> {
         let mut specs = Vec::new();
         // Only trusted (user-config) servers are spawned; repo-scoped ones
         // are noted so the user understands why their tools aren't offered.
         let trusted = trusted_configs(config_dir, workspace_root, worktree);
         for name in discover_configs(config_dir, workspace_root, worktree).keys() {
+            if cancel.is_cancelled() {
+                break;
+            }
             if !trusted.contains_key(name) {
                 self.logs.push(
                     name,
@@ -583,10 +688,12 @@ impl McpManager {
                 );
                 continue;
             }
-            match self
-                .connection(config_dir, workspace_root, worktree, name)
-                .await
-            {
+            // `connection` owns cancellation cleanup once it has spawned a
+            // child. Do not race and drop that future from the outside.
+            let connection = self
+                .connection(config_dir, workspace_root, worktree, name, cancel)
+                .await;
+            match connection {
                 Ok(connection) => specs.extend(connection.tools().iter().cloned()),
                 Err(e) => {
                     self.logs.push(name, format!("unavailable: {e:#}"));
@@ -605,13 +712,29 @@ impl McpManager {
         worktree: &Path,
         name: &str,
         args: &Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(bool, Value)> {
         let (server, tool) =
             split_tool_name(name).with_context(|| format!("malformed MCP tool name: {name}"))?;
+        if cancel.is_cancelled() {
+            bail!("MCP tool call cancelled");
+        }
+        // `connection` owns cancellation cleanup once it has spawned a
+        // child. Do not race and drop that future from the outside.
         let connection = self
-            .connection(config_dir, workspace_root, worktree, server)
+            .connection(config_dir, workspace_root, worktree, server, cancel)
             .await?;
-        let result = connection.call_tool(tool, args).await;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // A cancelled JSON-RPC request leaves the newline stream
+                // desynchronized. Evicting the cached connection kills the
+                // child and makes the next call handshake from a clean state.
+                self.evict(worktree, server).await;
+                bail!("MCP tool call cancelled")
+            }
+            result = connection.call_tool(tool, args) => result,
+        };
         if result.is_err() {
             // The connection may be dead or desynced (closed stream, timeout
             // mid-response); drop it so the next call reconnects instead of
@@ -880,8 +1003,9 @@ for line in sys.stdin:
         .unwrap();
 
         let manager = McpManager::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let specs = manager
-            .specs(Some(config_dir.path()), None, tmp.path())
+            .specs(Some(config_dir.path()), None, tmp.path(), &cancel)
             .await;
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "mcp__fake__echo");
@@ -893,6 +1017,7 @@ for line in sys.stdin:
                 tmp.path(),
                 "mcp__fake__echo",
                 &json!({"text": "hi"}),
+                &cancel,
             )
             .await
             .unwrap();
@@ -912,12 +1037,175 @@ for line in sys.stdin:
             .unwrap(),
         )
         .unwrap();
-        assert!(manager.specs(None, None, repo.path()).await.is_empty());
         assert!(
             manager
-                .call(None, None, repo.path(), "mcp__repo__echo", &json!({}))
+                .specs(None, None, repo.path(), &cancel)
+                .await
+                .is_empty()
+        );
+        assert!(
+            manager
+                .call(
+                    None,
+                    None,
+                    repo.path(),
+                    "mcp__repo__echo",
+                    &json!({}),
+                    &cancel,
+                )
                 .await
                 .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid(path: &Path) -> u32 {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path)
+                    && let Ok(pid) = pid.trim().parse()
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake MCP server did not publish its pid")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_trusted_test_server(config_dir: &Path, script_path: &Path, pid_path: &Path) {
+        std::fs::write(
+            user_config_path(config_dir),
+            serde_json::to_string(&json!({"mcpServers": {"fake": {
+                "command": "python3",
+                "args": [script_path.to_string_lossy(), pid_path.to_string_lossy()],
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_during_handshake_reaps_the_mcp_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("hanging_handshake.py");
+        let pid_path = tmp.path().join("handshake.pid");
+        std::fs::write(
+            &script_path,
+            r#"
+import os, sys, time
+with open(sys.argv[1], "w") as pid_file:
+    pid_file.write(str(os.getpid()))
+    pid_file.flush()
+for _line in sys.stdin:
+    time.sleep(3600)
+"#,
+        )
+        .unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        write_trusted_test_server(config_dir.path(), &script_path, &pid_path);
+
+        let manager = Arc::new(McpManager::default());
+        let cancel = CancellationToken::new();
+        let call = {
+            let manager = manager.clone();
+            let cancel = cancel.clone();
+            let config_dir = config_dir.path().to_path_buf();
+            let worktree = tmp.path().to_path_buf();
+            tokio::spawn(async move {
+                manager
+                    .call(
+                        Some(&config_dir),
+                        None,
+                        &worktree,
+                        "mcp__fake__echo",
+                        &json!({}),
+                        &cancel,
+                    )
+                    .await
+            })
+        };
+        let pid = wait_for_pid(&pid_path).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("cancelled MCP handshake did not acknowledge cleanup")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "MCP handshake process was still present after cancellation returned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_during_tool_call_reaps_the_mcp_process() {
+        let script = r#"
+import json, os, sys, time
+pid_path = sys.argv[1]
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        out = {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        out = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}}
+    elif method == "tools/call":
+        with open(pid_path, "w") as pid_file:
+            pid_file.write(str(os.getpid()))
+            pid_file.flush()
+        while True:
+            time.sleep(1)
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("hanging_call.py");
+        let pid_path = tmp.path().join("call.pid");
+        std::fs::write(&script_path, script).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        write_trusted_test_server(config_dir.path(), &script_path, &pid_path);
+
+        let manager = Arc::new(McpManager::default());
+        let cancel = CancellationToken::new();
+        let call = {
+            let manager = manager.clone();
+            let cancel = cancel.clone();
+            let config_dir = config_dir.path().to_path_buf();
+            let worktree = tmp.path().to_path_buf();
+            tokio::spawn(async move {
+                manager
+                    .call(
+                        Some(&config_dir),
+                        None,
+                        &worktree,
+                        "mcp__fake__echo",
+                        &json!({}),
+                        &cancel,
+                    )
+                    .await
+            })
+        };
+        let pid = wait_for_pid(&pid_path).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("cancelled MCP tool did not acknowledge cleanup")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "MCP tool process was still present after cancellation returned"
         );
     }
 }

@@ -15,7 +15,10 @@ mod shell;
 mod todo;
 mod web;
 
-pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
+pub use search::{
+    VENDOR_SEARCH_GUIDANCE, VENDOR_TOOL_BRIDGE_GUIDANCE, gc_index_store_in_background,
+    warm_index_in_background,
+};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,6 +32,9 @@ use trouve_providers::ToolSpec;
 /// the session worktree.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCtx {
+    /// Cancellation for the turn that owns this call. Long-running tools
+    /// must finish process/protocol cleanup before returning from it.
+    pub cancel: tokio_util::sync::CancellationToken,
     pub worktree: PathBuf,
     /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
     /// tool tests that do not exercise thread state.
@@ -126,6 +132,10 @@ pub trait ToolExecutor: Send + Sync {
     async fn specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec>;
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
+    /// Execute one call. Long-running implementations must observe
+    /// `ctx.cancel` and return only after any owned process or protocol
+    /// request is stopped/reaped; the engine retains the session execution
+    /// lane until this future acknowledges that cleanup.
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
     /// Create an engine-owned worktree checkpoint through the same trusted
     /// execution boundary as other Git mutations.
@@ -256,6 +266,7 @@ impl ToolExecutor for LocalToolExecutor {
                     ctx.config_dir.as_deref(),
                     ctx.workspace_root.as_deref(),
                     &ctx.worktree,
+                    &ctx.cancel,
                 )
                 .await,
         );
@@ -283,6 +294,7 @@ impl ToolExecutor for LocalToolExecutor {
                     &ctx.worktree,
                     name,
                     args,
+                    &ctx.cancel,
                 )
                 .await
             {

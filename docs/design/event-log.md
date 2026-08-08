@@ -139,6 +139,9 @@ Thread scope:
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
   `tool.completed` `{call_id, status, result}`
+  Multiple call ids may be live concurrently. Cursor order reflects actual
+  request/start/output/completion timing and is not required to match the
+  provider transcript's tool-call order; `call_id` is the correlation key.
 - `question.requested` `{turn, request_id, title?, questions}` /
   `question.resolved` `{request_id, answers?}`
 - `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts

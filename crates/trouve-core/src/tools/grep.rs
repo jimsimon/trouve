@@ -39,6 +39,9 @@ impl Tool for Grep {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("search cancelled");
+        }
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: pattern");
         };
@@ -59,10 +62,12 @@ impl Tool for Grep {
             Err(e) => return ToolResult::error(format!("invalid pattern: {e}")),
         };
         let worktree = ctx.worktree.clone();
+        let cancel = ctx.cancel.clone();
         // The walker is synchronous; run it off the async threads.
-        let matches = tokio::task::spawn_blocking(move || search(&worktree, &root, &regex))
-            .await
-            .unwrap_or_else(|e| Err(format!("search panicked: {e}")));
+        let matches =
+            tokio::task::spawn_blocking(move || search(&worktree, &root, &regex, &cancel))
+                .await
+                .unwrap_or_else(|e| Err(format!("search panicked: {e}")));
         match matches {
             Ok((matches, truncated)) => ToolResult::ok(json!({
                 "matches": matches,
@@ -77,6 +82,7 @@ fn search(
     worktree: &std::path::Path,
     root: &std::path::Path,
     regex: &Regex,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Vec<Value>, bool), String> {
     let mut matches = Vec::new();
     let mut truncated = false;
@@ -87,6 +93,9 @@ fn search(
         .require_git(false)
         .build();
     'outer: for entry in walker {
+        if cancel.is_cancelled() {
+            return Err("search cancelled".into());
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -103,6 +112,9 @@ fn search(
             continue; // binary or unreadable
         };
         for (i, line) in text.lines().enumerate() {
+            if cancel.is_cancelled() {
+                return Err("search cancelled".into());
+            }
             if regex.is_match(line) {
                 if matches.len() >= MAX_RESULTS {
                     truncated = true;

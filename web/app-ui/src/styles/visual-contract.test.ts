@@ -181,6 +181,7 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain("#toggleWorkspace");
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
+    expect(app).toMatch(/\.workspace-toggle > span \{[^}]*inset-inline-start:\s*3px/s);
     expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.session-copy strong \{[^}]*font-size:\s*13px/s);

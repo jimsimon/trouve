@@ -43,6 +43,11 @@ pub enum BackendPermission {
 /// Everything a backend needs to run one turn.
 #[derive(Debug)]
 pub struct BackendTurn {
+    /// Cooperative cancellation for every phase of this vendor turn. An
+    /// adapter must not finish its stream after observing cancellation until
+    /// any vendor request/process cleanup that protects a replacement turn is
+    /// complete.
+    pub cancel: tokio_util::sync::CancellationToken,
     pub thread_id: String,
     /// Session worktree the vendor agent operates in.
     pub worktree: PathBuf,
@@ -79,6 +84,8 @@ pub struct BackendTurn {
 /// before acknowledging the steering request.
 #[derive(Debug)]
 pub struct BackendSteer {
+    /// Cancels an in-flight steering request with its owning turn.
+    pub cancel: tokio_util::sync::CancellationToken,
     /// Vendor-side thread/session id that owns the active turn.
     pub session: String,
     pub prompt: String,
@@ -121,16 +128,16 @@ pub struct McpServerLaunch {
 
 /// Streamable-HTTP MCP server the vendor agent connects to in order to
 /// reach trouve (the engine's internal per-thread MCP endpoint). Always
-/// used for approval prompting in Ask mode; optionally also replaces the
-/// vendor's built-in tools with trouve's.
+/// used for approval prompting in Ask mode; normally also supplies every
+/// mutation-capable tool so the engine can enforce worktree serialization.
 #[derive(Debug, Clone)]
 pub struct McpBridgeConfig {
     /// Full endpoint URL, thread-scoped, with the tool/approval surface
     /// selected via query parameters.
     pub url: String,
-    /// When true the bridge serves trouve's ToolExecutor tools and the
-    /// vendor's built-ins are disabled; when false it only serves the
-    /// approval-prompt gate.
+    /// When true the bridge serves trouve's ToolExecutor tools and vendor
+    /// mutations are disabled or sandbox-confined; when false it only serves
+    /// the approval-prompt gate.
     pub bridge_tools: bool,
     /// Vendor built-in tools to disable while the bridge supplies tools.
     pub disallowed_tools: Vec<String>,
@@ -200,9 +207,100 @@ pub enum BackendEvent {
     CompactionCompleted,
     /// The vendor harness finished a compaction item unsuccessfully.
     CompactionFailed,
+    /// A vendor-native collaborator became part of this turn. The session
+    /// ids are vendor thread ids: core maps them onto durable trouve threads
+    /// and persists the mapping so the collaborator can be resumed directly.
+    CollaboratorStarted {
+        session_id: String,
+        parent_session_id: String,
+        prompt: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+    },
+    /// One event produced by a vendor-native collaborator. Keeping the child
+    /// vocabulary separate prevents a nested collaborator from accidentally
+    /// completing or mutating its parent's turn.
+    CollaboratorEvent {
+        session_id: String,
+        turn_id: Option<String>,
+        event: BackendCollaboratorEvent,
+    },
     Completed {
         usage: Usage,
     },
+}
+
+/// Stream events scoped to one vendor-native collaborator.
+pub enum BackendCollaboratorEvent {
+    TurnStarted,
+    UserMessage(String),
+    TextDelta(String),
+    ThinkingDelta(String),
+    ThinkingCompleted,
+    ToolStarted {
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+    ToolOutput {
+        call_id: String,
+        chunk: String,
+    },
+    ToolCompleted {
+        call_id: String,
+        ok: bool,
+        result: serde_json::Value,
+    },
+    ApprovalNeeded {
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    },
+    TodosUpdated {
+        todos: Vec<trouve_protocol::TodoItem>,
+    },
+    UsageUpdated {
+        usage: Usage,
+    },
+    CompactionStarted,
+    CompactionCompleted,
+    CompactionFailed,
+    Completed {
+        usage: Usage,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl std::fmt::Debug for BackendCollaboratorEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TurnStarted => f.write_str("TurnStarted"),
+            Self::UserMessage(text) => write!(f, "UserMessage({text:?})"),
+            Self::TextDelta(text) => write!(f, "TextDelta({text:?})"),
+            Self::ThinkingDelta(text) => write!(f, "ThinkingDelta({text:?})"),
+            Self::ThinkingCompleted => f.write_str("ThinkingCompleted"),
+            Self::ToolStarted { call_id, tool, .. } => {
+                write!(f, "ToolStarted({call_id}, {tool})")
+            }
+            Self::ToolOutput { call_id, .. } => write!(f, "ToolOutput({call_id})"),
+            Self::ToolCompleted { call_id, ok, .. } => {
+                write!(f, "ToolCompleted({call_id}, ok={ok})")
+            }
+            Self::ApprovalNeeded { call_id, tool, .. } => {
+                write!(f, "ApprovalNeeded({call_id}, {tool})")
+            }
+            Self::TodosUpdated { todos } => write!(f, "TodosUpdated({} todos)", todos.len()),
+            Self::UsageUpdated { usage } => write!(f, "UsageUpdated({usage:?})"),
+            Self::CompactionStarted => f.write_str("CompactionStarted"),
+            Self::CompactionCompleted => f.write_str("CompactionCompleted"),
+            Self::CompactionFailed => f.write_str("CompactionFailed"),
+            Self::Completed { usage } => write!(f, "Completed({usage:?})"),
+            Self::Failed { error } => write!(f, "Failed({error:?})"),
+        }
+    }
 }
 
 impl std::fmt::Debug for BackendEvent {
@@ -241,6 +339,14 @@ impl std::fmt::Debug for BackendEvent {
             Self::CompactionStarted => f.write_str("CompactionStarted"),
             Self::CompactionCompleted => f.write_str("CompactionCompleted"),
             Self::CompactionFailed => f.write_str("CompactionFailed"),
+            Self::CollaboratorStarted { session_id, .. } => {
+                write!(f, "CollaboratorStarted({session_id})")
+            }
+            Self::CollaboratorEvent {
+                session_id, event, ..
+            } => {
+                write!(f, "CollaboratorEvent({session_id}, {event:?})")
+            }
             Self::Completed { usage } => write!(f, "Completed({usage:?})"),
         }
     }
@@ -248,6 +354,8 @@ impl std::fmt::Debug for BackendEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
+    #[error("turn cancelled")]
+    Cancelled,
     #[error("{0} is not installed (or not on PATH)")]
     NotInstalled(String),
     #[error("not logged in: {0}")]
@@ -580,6 +688,72 @@ fn merge_backend_event(
             current.push_str(&next);
             BackendMerge::Merged(added)
         }
+        (
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: current_session,
+                turn_id: current_turn,
+                event: BackendCollaboratorEvent::TextDelta(current),
+            }),
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: next_session,
+                turn_id: next_turn,
+                event: BackendCollaboratorEvent::TextDelta(next),
+            }),
+        ) if current_session == &next_session
+            && current_turn == &next_turn
+            && current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: current_session,
+                turn_id: current_turn,
+                event: BackendCollaboratorEvent::ThinkingDelta(current),
+            }),
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: next_session,
+                turn_id: next_turn,
+                event: BackendCollaboratorEvent::ThinkingDelta(next),
+            }),
+        ) if current_session == &next_session
+            && current_turn == &next_turn
+            && current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: current_session,
+                turn_id: current_turn,
+                event:
+                    BackendCollaboratorEvent::ToolOutput {
+                        call_id: current_id,
+                        chunk: current,
+                    },
+            }),
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: next_session,
+                turn_id: next_turn,
+                event:
+                    BackendCollaboratorEvent::ToolOutput {
+                        call_id: next_id,
+                        chunk: next,
+                    },
+            }),
+        ) if current_session == &next_session
+            && current_turn == &next_turn
+            && current_id == &next_id
+            && current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
         (_, incoming) => BackendMerge::Separate(incoming),
     }
 }
@@ -594,7 +768,51 @@ fn backend_event_window(event: &Result<BackendEvent, BackendError>) -> Option<Du
         Ok(BackendEvent::ToolOutput { chunk, .. }) if chunk.len() < COALESCED_CHUNK_MAX_BYTES => {
             Some(TOOL_OUTPUT_COALESCE_WINDOW)
         }
+        Ok(BackendEvent::CollaboratorEvent {
+            event:
+                BackendCollaboratorEvent::TextDelta(text)
+                | BackendCollaboratorEvent::ThinkingDelta(text),
+            ..
+        }) if text.len() < COALESCED_CHUNK_MAX_BYTES => Some(TEXT_COALESCE_WINDOW),
+        Ok(BackendEvent::CollaboratorEvent {
+            event: BackendCollaboratorEvent::ToolOutput { chunk, .. },
+            ..
+        }) if chunk.len() < COALESCED_CHUNK_MAX_BYTES => Some(TOOL_OUTPUT_COALESCE_WINDOW),
         _ => None,
+    }
+}
+
+fn backend_collaborator_event_size(event: &BackendCollaboratorEvent) -> usize {
+    match event {
+        BackendCollaboratorEvent::TurnStarted => 0,
+        BackendCollaboratorEvent::UserMessage(text)
+        | BackendCollaboratorEvent::TextDelta(text)
+        | BackendCollaboratorEvent::ThinkingDelta(text) => text.len(),
+        BackendCollaboratorEvent::ThinkingCompleted
+        | BackendCollaboratorEvent::CompactionStarted
+        | BackendCollaboratorEvent::CompactionCompleted
+        | BackendCollaboratorEvent::CompactionFailed => 0,
+        BackendCollaboratorEvent::ToolStarted {
+            call_id,
+            tool,
+            args,
+        } => call_id.len() + tool.len() + args.to_string().len(),
+        BackendCollaboratorEvent::ToolOutput { call_id, chunk } => call_id.len() + chunk.len(),
+        BackendCollaboratorEvent::ToolCompleted {
+            call_id, result, ..
+        } => call_id.len() + result.to_string().len(),
+        BackendCollaboratorEvent::ApprovalNeeded {
+            call_id,
+            tool,
+            args,
+            ..
+        } => call_id.len() + tool.len() + args.to_string().len(),
+        BackendCollaboratorEvent::TodosUpdated { todos } => {
+            serde_json::to_string(todos).map_or(0, |json| json.len())
+        }
+        BackendCollaboratorEvent::UsageUpdated { .. }
+        | BackendCollaboratorEvent::Completed { .. } => std::mem::size_of::<Usage>(),
+        BackendCollaboratorEvent::Failed { error } => error.len(),
     }
 }
 
@@ -635,6 +853,28 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         }
         Ok(BackendEvent::UsageUpdated { .. } | BackendEvent::Completed { .. }) => {
             std::mem::size_of::<Usage>()
+        }
+        Ok(BackendEvent::CollaboratorStarted {
+            session_id,
+            parent_session_id,
+            prompt,
+            model,
+            thinking_level,
+        }) => {
+            session_id.len()
+                + parent_session_id.len()
+                + prompt.as_ref().map_or(0, String::len)
+                + model.as_ref().map_or(0, String::len)
+                + thinking_level.as_ref().map_or(0, String::len)
+        }
+        Ok(BackendEvent::CollaboratorEvent {
+            session_id,
+            turn_id,
+            event,
+        }) => {
+            session_id.len()
+                + turn_id.as_ref().map_or(0, String::len)
+                + backend_collaborator_event_size(event)
         }
         Ok(
             BackendEvent::ThinkingCompleted

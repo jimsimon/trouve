@@ -50,7 +50,7 @@ describe("Virtualizer", () => {
     ).toBe(90);
   });
 
-  it("preserves a stable visible anchor when items are prepended", () => {
+  it("preserves a stable visible anchor when items are prepended and the tail grows", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 0 });
     virtualizer.setViewport(0, 40);
     virtualizer.setItems(items(8));
@@ -59,10 +59,12 @@ describe("Virtualizer", () => {
       { id: "new-a" },
       { id: "new-b" },
       ...items(8),
+      { id: "new-tail", estimatedHeight: 200 },
     ]);
     expect(changed.delta).toBe(40);
     expect(changed.scrollTop).toBe(105);
     expect(virtualizer.window().items[0]?.item.id).toBe("item-3");
+    expect(virtualizer.window().totalHeight).toBe(400);
   });
 
   it("parks history after scrolling away and resumes following at the exact tail", () => {

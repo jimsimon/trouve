@@ -167,7 +167,6 @@ const CHAT_SCROLL_INDICATOR_INSET_PX = 3;
 const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
 const CHAT_HISTORY_PREFETCH_VIEWPORTS = 5;
 const CHAT_HISTORY_PREFETCH_MIN_PX = 2_400;
-const CHAT_HISTORY_ANCHOR_SETTLE_MS = 500;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -208,14 +207,7 @@ interface ChatDomAnchor {
   readonly offset: number;
 }
 
-interface ActiveChatDomAnchor extends ChatDomAnchor {
-  readonly scrollTop: number;
-}
-
 interface PendingHistoryPrepend {
-  readonly scrollTop: number;
-  readonly totalHeight: number;
-  readonly followingTail: boolean;
   readonly anchor: ChatDomAnchor | undefined;
 }
 
@@ -354,8 +346,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   readonly #historyWarmThreads = new Set<string>();
   #pendingHistoryPrepend: PendingHistoryPrepend | undefined;
   #historyAnchorToRestore: ChatDomAnchor | undefined;
-  #historyAnchorStabilizer: ActiveChatDomAnchor | undefined;
-  #historyAnchorSettleTimer: ReturnType<typeof setTimeout> | undefined;
+  #historyAnchorStabilizer: ChatDomAnchor | undefined;
   #virtualizer = new Virtualizer<VirtualChatItem>({
     estimatedHeight: 120,
     overscanPx: 1_200,
@@ -607,12 +598,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (!changed.has("threadId") && this.#pendingHistoryPrepend !== undefined) {
       const viewport = this.querySelector<HTMLElement>(".chat-stream");
       if (viewport !== null) {
-        const virtualWindow = this.#virtualizer.window();
+        const followingTail = this.#virtualizer.window().followingTail;
+        if (!followingTail) {
+          // Render can run after another native wheel frame. Synchronize the
+          // virtual anchor to the live viewport immediately before replacing
+          // the item list; setItems can then preserve the actual visible item
+          // instead of relying on a transcript-wide height delta.
+          this.#virtualizer.setViewport(
+            viewport.scrollTop,
+            viewport.clientHeight,
+            { userInitiated: true, atTail: false },
+          );
+        }
         this.#pendingHistoryPrepend = {
-          scrollTop: viewport.scrollTop,
-          totalHeight: virtualWindow.totalHeight,
-          followingTail: virtualWindow.followingTail,
-          anchor: virtualWindow.followingTail
+          anchor: followingTail
             ? undefined
             : this.#captureChatDomAnchor(viewport),
         };
@@ -743,9 +742,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (!followingTail && this.#historyAnchorStabilizer !== undefined) {
         // A single paged Agent turn can re-render many nested markdown blocks
         // after the parent update. Keep the exact visible thought/tool fixed
-        // through those pre-paint ResizeObserver deliveries.
+        // through every delayed ResizeObserver delivery. The anchor follows
+        // explicit reader scrolling and is cleared at the tail or on a thread
+        // change, so worker-backed Markdown cannot outlive a fixed timer and
+        // shift the parked viewport later.
         this.#correctHistoryAnchor(activeViewport);
-        this.#scheduleHistoryAnchorRelease();
       }
       this.#refreshChatScrollIndicator(activeViewport);
     });
@@ -1608,17 +1609,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const before = this.#pendingHistoryPrepend;
       this.#pendingHistoryPrepend = undefined;
       this.#historyAnchorToRestore = before.anchor;
-      if (!before.followingTail) {
-        const addedHeight = Math.max(
-          0,
-          this.#virtualizer.window().totalHeight - before.totalHeight,
-        );
-        this.#virtualizer.setViewport(
-          before.scrollTop + addedHeight,
-          this.#viewportHeight,
-          { userInitiated: true, atTail: false },
-        );
-      }
     }
     if (this.#restoredScrollThreadId !== this.threadId) {
       const bookmark = this.scrollBookmark;
@@ -2755,7 +2745,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const anchor = this.#historyAnchorToRestore;
     this.#historyAnchorToRestore = undefined;
     if (anchor === undefined) return;
-    this.#historyAnchorStabilizer = { ...anchor, scrollTop: viewport.scrollTop };
+    this.#historyAnchorStabilizer = anchor;
 
     const beforeMeasure = this.#virtualizer.window();
     for (const row of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
@@ -2774,7 +2764,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
 
     this.#correctHistoryAnchor(viewport);
-    this.#scheduleHistoryAnchorRelease();
   }
 
   #correctHistoryAnchor(viewport: HTMLElement): void {
@@ -2789,7 +2778,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
         .filter((element) => element.dataset["virtualId"] === virtualId);
     const element = candidates[0];
-    if (element === undefined) return;
+    if (element === undefined) {
+      // Fast scrolling can unmount the prior anchor before its scroll event is
+      // observed. Adopt the currently visible row so subsequent async layout
+      // still has an exact reference point.
+      this.#historyAnchorStabilizer = this.#captureChatDomAnchor(viewport);
+      return;
+    }
 
     const delta = element.getBoundingClientRect().top
       - viewport.getBoundingClientRect().top
@@ -2800,25 +2795,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       atTail: false,
     });
     const correctedScrollTop = this.#virtualizer.window().scrollTop;
-    this.#historyAnchorStabilizer = { ...anchor, scrollTop: correctedScrollTop };
     this.#setChatScrollTop(viewport, correctedScrollTop);
   }
 
-  #scheduleHistoryAnchorRelease(): void {
-    if (this.#historyAnchorSettleTimer !== undefined) {
-      clearTimeout(this.#historyAnchorSettleTimer);
-    }
-    this.#historyAnchorSettleTimer = setTimeout(() => {
-      this.#historyAnchorSettleTimer = undefined;
-      this.#historyAnchorStabilizer = undefined;
-    }, CHAT_HISTORY_ANCHOR_SETTLE_MS);
-  }
-
   #clearHistoryAnchorStabilizer(): void {
-    if (this.#historyAnchorSettleTimer !== undefined) {
-      clearTimeout(this.#historyAnchorSettleTimer);
-      this.#historyAnchorSettleTimer = undefined;
-    }
     this.#historyAnchorStabilizer = undefined;
   }
 
@@ -2914,14 +2894,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     if (atTail) {
       this.#clearHistoryAnchorStabilizer();
-    } else if (this.#historyAnchorStabilizer !== undefined) {
-      const anchor = this.#historyAnchorStabilizer;
-      this.#historyAnchorStabilizer = {
-        ...anchor,
-        offset: anchor.offset - (viewport.scrollTop - anchor.scrollTop),
-        scrollTop: viewport.scrollTop,
-      };
-      this.#scheduleHistoryAnchorRelease();
+    } else if (
+      this.#historyAnchorStabilizer !== undefined
+      && (userInitiated || !programmaticScroll)
+    ) {
+      // Follow the reader rather than retaining the item that was visible
+      // when the page request completed. Fast wheel/touch scrolling can move
+      // that item out of the virtual window before delayed Markdown and row
+      // measurements arrive.
+      this.#historyAnchorStabilizer = this.#captureChatDomAnchor(viewport)
+        ?? this.#historyAnchorStabilizer;
     }
     if (before.followingTail && atTail) return;
     this.#scrollCorrectionResumeAt = Date.now() + CHAT_SCROLL_CORRECTION_SETTLE_MS;
@@ -3222,9 +3204,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const virtualWindow = this.#virtualizer.window();
         const viewport = this.querySelector<HTMLElement>(".chat-stream");
         this.#pendingHistoryPrepend = {
-          scrollTop: viewport?.scrollTop ?? virtualWindow.scrollTop,
-          totalHeight: virtualWindow.totalHeight,
-          followingTail: virtualWindow.followingTail,
           anchor: virtualWindow.followingTail || viewport === null
             ? undefined
             : this.#captureChatDomAnchor(viewport),

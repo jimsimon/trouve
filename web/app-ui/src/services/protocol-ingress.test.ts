@@ -15,6 +15,7 @@ type KnownIngressEvent = Extract<ProtocolIngressEvent, { readonly kind: "known" 
 type Sessions = Awaited<ReturnType<ProtocolClient["sessions"]>>;
 type Session = Sessions[number];
 type Snapshot = Awaited<ReturnType<ProtocolClient["sessionSummaries"]>>;
+type Threads = Awaited<ReturnType<ProtocolClient["threads"]>>;
 
 const info: Awaited<ReturnType<ProtocolClient["serverInfo"]>> = {
   name: "trouve-server",
@@ -75,6 +76,33 @@ const activityEvent = (cursor: number, active: boolean): KnownIngressEvent => ({
     workspace_id: "ws_1",
     active,
   },
+});
+
+const threadLifecycleEvent = (
+  cursor: number,
+  type: "thread.created" | "thread.updated",
+  threadId: string,
+): KnownIngressEvent => ({
+  kind: "known",
+  cursor,
+  envelope: {
+    cursor,
+    scope: "server",
+    ts: `2026-08-01T12:02:${String(cursor).padStart(2, "0")}Z`,
+    type,
+    thread_id: threadId,
+    session_id: "se_1",
+  },
+});
+
+const thread = (id: string, spawned: boolean): Threads[number] => ({
+  id,
+  session_id: "se_1",
+  model: "codex/gpt-5.6-sol",
+  mode: "code",
+  permission_mode: "yolo",
+  created_at: "2026-08-01T12:03:00Z",
+  spawned,
 });
 
 const githubSnapshotEvent = (
@@ -516,6 +544,50 @@ describe("ProtocolIngress", () => {
     trailingRefresh.resolve([session("Latest")]);
     await vi.waitFor(() => expect(store.session("se_1")?.title).toBe("Latest"));
     expect(sessions).toHaveBeenCalledTimes(3);
+    ingress.stop();
+  });
+
+  it("refreshes durable child threads and discards an in-flight stale list", async () => {
+    const store = new AppStore();
+    const staleThreads = deferred<Threads>();
+    const currentThreads = deferred<Threads>();
+    let threadRequest = 0;
+    const threads = vi.fn(() => {
+      threadRequest += 1;
+      return threadRequest === 1 ? staleThreads.promise : currentThreads.promise;
+    });
+    let eventOptions: ServerEventOptions | undefined;
+    const fakeStream = stream();
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions: vi.fn(async () => [session("Current")]),
+      sessionSummaries: vi.fn(async () => ({ summaries: [summary], cursor: 10 })),
+      workspaces: vi.fn(async () => [workspace]),
+      threads,
+      serverEvents: vi.fn(async (options: ServerEventOptions) => {
+        eventOptions = options;
+        return fakeStream;
+      }),
+    };
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+    );
+    await ingress.start();
+
+    eventOptions?.onEvent(threadLifecycleEvent(11, "thread.created", "th_child"));
+    await vi.waitFor(() => expect(threads).toHaveBeenCalledTimes(1));
+    eventOptions?.onEvent(threadLifecycleEvent(12, "thread.updated", "th_child"));
+    staleThreads.resolve([thread("th_stale", false)]);
+    await vi.waitFor(() => expect(threads).toHaveBeenCalledTimes(2));
+    expect(store.threadsForSession("se_1")).toEqual([]);
+
+    currentThreads.resolve([thread("th_child", true)]);
+    await vi.waitFor(() => {
+      expect(store.threadsForSession("se_1")).toEqual([
+        expect.objectContaining({ id: "th_child", spawned: true }),
+      ]);
+    });
     ingress.stop();
   });
 

@@ -155,9 +155,10 @@ pub struct ProviderConfig {
     /// stub binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code only: disable the vendor's built-in tools and bridge
-    /// trouve's ToolExecutor in over MCP (full trouve tool/permission
-    /// fidelity), served from the engine's embedded HTTP MCP endpoint.
+    /// Claude Code and Codex: bridge trouve's ToolExecutor in over MCP for
+    /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
+    /// built-ins are confined to a read-only sandbox. Defaults to true for
+    /// those backends; explicit false retains the vendor-native fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
 }

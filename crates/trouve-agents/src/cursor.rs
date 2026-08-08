@@ -90,6 +90,9 @@ const SERVER_CAP: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the reaper scans the pool.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Live `cursor-agent acp` children keyed by worktree path.
 #[derive(Default)]
@@ -309,15 +312,28 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
-        let server = self.server_for(&turn.worktree).await?;
+        let cancel = turn.cancel.clone();
+        let server = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            server = self.server_for(&turn.worktree) => server?,
+        };
 
         // Resume the ACP session for this thread, or start a fresh one. A
         // failed load (e.g. server restarted and lost it) degrades to fresh.
         let mut fresh_session = false;
+        let known_session = match &turn.session {
+            Some(sid) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                known = server.knows_session(sid) => known,
+            },
+            None => false,
+        };
         let session_id = match &turn.session {
-            Some(sid) if server.knows_session(sid).await => sid.clone(),
+            Some(sid) if known_session => sid.clone(),
             Some(sid) => match server
-                .load_session(sid, &turn.worktree, &turn.mcp_servers)
+                .load_session(sid, &turn.worktree, &turn.mcp_servers, &cancel)
                 .await
             {
                 Ok(()) => sid.clone(),
@@ -325,14 +341,14 @@ impl AgentBackend for CursorBackend {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
                     server
-                        .new_session(&turn.worktree, &turn.mcp_servers)
+                        .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
                         .await?
                 }
             },
             None => {
                 fresh_session = true;
                 server
-                    .new_session(&turn.worktree, &turn.mcp_servers)
+                    .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
                     .await?
             }
         };
@@ -350,7 +366,11 @@ impl AgentBackend for CursorBackend {
         // the current model), so racing turns must not interleave their
         // set-model and prompt-start.
         let (route, prompt_rx) = {
-            let _config = server.config_lock.lock().await;
+            let _config = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                config = server.config_lock.lock() => config,
+            };
 
             // Keep Cursor in agent mode even for read-only turns. Cursor's
             // plan mode can stall before producing ACP events; trouve's
@@ -360,12 +380,18 @@ impl AgentBackend for CursorBackend {
                     "agent"
                 }
             };
-            if let Err(e) = server.set_config_option(&session_id, "mode", mode).await {
+            if let Err(e) = server
+                .set_config_option(&session_id, "mode", mode, &cancel)
+                .await
+            {
+                if matches!(e, BackendError::Cancelled) {
+                    return Err(e);
+                }
                 tracing::warn!("cursor set mode {mode} failed: {e}");
             }
 
             if !turn.model.is_empty() && !matches!(turn.model.as_str(), "auto" | "default") {
-                apply_model_config(&server, &session_id, &turn).await?;
+                apply_model_config(&server, &session_id, &turn, &cancel).await?;
             }
 
             // ACP image content blocks carry base64 data inline.
@@ -384,7 +410,7 @@ impl AgentBackend for CursorBackend {
             // Subscribe after session setup so a session/load's history
             // replay doesn't re-emit old text into the thread.
             let route = server.subscribe(&session_id).await;
-            let prompt_rx = server
+            let prompt_rx = match server
                 .request_deferred(
                     "session/prompt",
                     json!({
@@ -392,7 +418,14 @@ impl AgentBackend for CursorBackend {
                         "prompt": prompt_blocks,
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(prompt_rx) => prompt_rx,
+                Err(error) => {
+                    server.unsubscribe(&session_id).await;
+                    return Err(error);
+                }
+            };
             (route, prompt_rx)
         };
 
@@ -402,6 +435,7 @@ impl AgentBackend for CursorBackend {
             route,
             prompt_rx,
             fresh_session,
+            cancel,
         );
         Ok(stream.boxed())
     }
@@ -608,13 +642,14 @@ async fn apply_model_config(
     server: &AcpServer,
     session_id: &str,
     turn: &BackendTurn,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), BackendError> {
     // Threads from before the ACP migration may still store a variant id
     // like "claude-opus-4-8-high"; peel the level back off.
     let (base, legacy_level, legacy_fast) = split_variant(&turn.model);
 
     let result = server
-        .set_config_option(session_id, "model", base)
+        .set_config_option(session_id, "model", base, cancel)
         .await
         .map_err(|e| {
             BackendError::Protocol(format!(
@@ -663,7 +698,13 @@ async fn apply_model_config(
     // Unknown options are expected (effort vs reasoning depends on the
     // model); failures are logged, not fatal.
     for (key, value) in options {
-        if let Err(e) = server.set_config_option(session_id, &key, &value).await {
+        if let Err(e) = server
+            .set_config_option(session_id, &key, &value, cancel)
+            .await
+        {
+            if matches!(e, BackendError::Cancelled) {
+                return Err(e);
+            }
             tracing::debug!("cursor set_config_option {key}={value}: {e}");
         }
     }
@@ -688,6 +729,7 @@ fn turn_stream(
     mut route: RouteReceiver<ServerMsg>,
     mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
     fresh_session: bool,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
         if fresh_session {
@@ -698,10 +740,14 @@ fn turn_stream(
                 .await;
         }
         let mut client_gone = false;
+        let mut cancelled = false;
         let mut route_overloaded = false;
         let mut overload_signal = route.overload_signal();
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => {
+                cancelled = true;
+            }
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
@@ -714,7 +760,6 @@ fn turn_stream(
                                 // Receiver dropped (turn cancelled): stop cursor's
                                 // generation instead of letting it run headless.
                                 client_gone = true;
-                                server.notify("session/cancel", json!({ "sessionId": session_id })).await;
                                 break;
                             }
                         }
@@ -748,6 +793,28 @@ fn turn_stream(
                 }
             } => {}
         }
+        if cancelled || client_gone {
+            // ACP cancellation itself is only a notification. Treat the
+            // outstanding session/prompt response as the acknowledgement
+            // that Cursor has actually stopped this turn. If it never
+            // arrives, recycle the shared process before releasing the turn;
+            // otherwise a replacement prompt could race stale mutation.
+            if let Err(error) = server
+                .notify("session/cancel", json!({ "sessionId": session_id }))
+                .await
+            {
+                tracing::warn!("cursor cancellation transport cleanup failed: {error}");
+            } else if tokio::time::timeout(CANCEL_ACK_TIMEOUT, &mut prompt_rx)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "cursor did not acknowledge cancellation within {}s; recycling cursor-agent",
+                    CANCEL_ACK_TIMEOUT.as_secs(),
+                );
+                server.terminate().await;
+            }
+        }
         if route_overloaded {
             // Cursor supports per-session cancellation, so stop only this
             // overloaded turn while the shared ACP process keeps serving
@@ -756,7 +823,7 @@ fn turn_stream(
             let cancel_server = server.clone();
             let cancel_session_id = session_id.clone();
             tokio::spawn(async move {
-                cancel_server
+                let _ = cancel_server
                     .notify("session/cancel", json!({ "sessionId": cancel_session_id }))
                     .await;
             });
@@ -767,7 +834,7 @@ fn turn_stream(
                 ))))
                 .await;
         }
-        if client_gone {
+        if cancelled || client_gone {
             // Best effort; the vendor process keeps running for other threads.
             tracing::debug!("cursor turn for {session_id} cancelled by client");
         }
@@ -1264,8 +1331,9 @@ struct AcpServer {
     /// `cursor/ask_question` find their route here, and permission requests
     /// recover rawInput when cursor omits it.
     calls: Arc<Mutex<HashMap<String, (String, Value)>>>,
-    /// Held so the child (kill_on_drop) lives as long as the server handle.
-    _child: Child,
+    /// Held so the child (kill_on_drop) lives as long as the server handle;
+    /// mutable ownership also lets a blocked transport be terminated.
+    child: Mutex<Child>,
     closed: Arc<AtomicBool>,
     /// When the pool last handed this child to a turn; feeds idle reaping.
     last_used: std::sync::Mutex<Instant>,
@@ -1305,7 +1373,7 @@ impl AcpServer {
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
-            _child: child,
+            child: Mutex::new(child),
             closed: Arc::new(AtomicBool::new(false)),
             last_used: std::sync::Mutex::new(Instant::now()),
         };
@@ -1505,11 +1573,13 @@ impl AcpServer {
         &self,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String, BackendError> {
         let result = self
-            .request(
+            .request_cancellable(
                 "session/new",
                 json!({ "cwd": worktree, "mcpServers": acp_mcp_servers(mcp_servers) }),
+                cancel,
             )
             .await
             .map_err(auth_hint)?;
@@ -1526,14 +1596,16 @@ impl AcpServer {
         session_id: &str,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), BackendError> {
-        self.request(
+        self.request_cancellable(
             "session/load",
             json!({
                 "sessionId": session_id,
                 "cwd": worktree,
                 "mcpServers": acp_mcp_servers(mcp_servers),
             }),
+            cancel,
         )
         .await
         .map_err(auth_hint)?;
@@ -1550,22 +1622,59 @@ impl AcpServer {
         session_id: &str,
         config_id: &str,
         value: &str,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, BackendError> {
-        self.request(
+        self.request_cancellable(
             "session/set_config_option",
             json!({ "sessionId": session_id, "configId": config_id, "value": value }),
+            cancel,
         )
         .await
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
-        let rx = self.request_deferred(method, params).await?;
-        match rx.await {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
-            Err(_) => Err(BackendError::Protocol(format!(
-                "{method}: cursor-agent closed before responding"
-            ))),
+        self.request_cancellable(method, params, &tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    async fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        if let Err(error) = self
+            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            response = tokio::time::timeout(REQUEST_RESPONSE_TIMEOUT, rx) => match response {
+                Ok(response) => response.map_err(|_| BackendError::Protocol(format!(
+                    "{method}: cursor-agent closed before responding"
+                ))),
+                Err(_) => Err(BackendError::Protocol(format!(
+                    "{method}: no response within {}s",
+                    REQUEST_RESPONSE_TIMEOUT.as_secs()
+                ))),
+            },
+        };
+        if response.is_err() {
+            self.pending.lock().await.remove(&id);
+        }
+        match response? {
+            Ok(value) => Ok(value),
+            Err(error) => Err(BackendError::Protocol(format!("{method}: {error}"))),
         }
     }
 
@@ -1579,15 +1688,19 @@ impl AcpServer {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await?;
+        if let Err(error) = self
+            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await
+        {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
         Ok(rx)
     }
 
-    async fn notify(&self, method: &str, params: Value) {
-        let _ = self
-            .write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .await;
+    async fn notify(&self, method: &str, params: Value) -> Result<(), BackendError> {
+        self.write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await
     }
 
     async fn respond(&self, id: Value, result: Value) {
@@ -1609,8 +1722,33 @@ impl AcpServer {
         let mut stdin = self.stdin.lock().await;
         let mut line = serde_json::to_vec(&msg).expect("serializable");
         line.push(b'\n');
-        stdin.write_all(&line).await.map_err(BackendError::Io)?;
-        stdin.flush().await.map_err(BackendError::Io)
+        let result = tokio::time::timeout(TRANSPORT_WRITE_TIMEOUT, async {
+            stdin.write_all(&line).await?;
+            stdin.flush().await
+        })
+        .await;
+        drop(stdin);
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.terminate().await;
+                Err(BackendError::Io(error))
+            }
+            Err(_) => {
+                self.terminate().await;
+                Err(BackendError::Protocol(format!(
+                    "cursor-agent stdin blocked for {}s",
+                    TRANSPORT_WRITE_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn terminate(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        let _ = self.child.lock().await.kill().await;
+        self.pending.lock().await.clear();
+        self.routes.lock().await.clear();
     }
 
     async fn subscribe(&self, session_id: &str) -> RouteReceiver<ServerMsg> {

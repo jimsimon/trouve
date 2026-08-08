@@ -19,6 +19,7 @@ const MAX_JOB_BYTES: usize = 1024 * 1024;
 /// Hard lifetime cap for a background job; runaway processes die with it.
 const MAX_JOB_SECS: u64 = 3600;
 const MAX_JOBS: usize = 16;
+const CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn truncate_utf8(mut bytes: Vec<u8>) -> (String, bool) {
     let truncated = bytes.len() > MAX_CAPTURE_BYTES;
@@ -86,6 +87,17 @@ async fn terminate_process(
     #[cfg(not(unix))]
     let _ = pid;
     child.lock().await.start_kill()
+}
+
+async fn terminate_and_reap(
+    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    pid: Option<u32>,
+) {
+    let _ = terminate_process(child, pid).await;
+    let _ = tokio::time::timeout(CANCEL_REAP_TIMEOUT, async {
+        let _ = child.lock().await.wait().await;
+    })
+    .await;
 }
 
 impl JobRegistry {
@@ -198,6 +210,9 @@ impl Tool for Shell {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("command cancelled");
+        }
         let Some(command) = args.get("command").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: command");
         };
@@ -239,9 +254,17 @@ impl Tool for Shell {
             let child = child.clone();
             async move { child.lock().await.wait().await }
         };
-        match tokio::time::timeout(timeout, wait).await {
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                terminate_and_reap(&child, pid).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                ToolResult::error("command cancelled")
+            }
+            outcome = tokio::time::timeout(timeout, wait) => match outcome {
             Err(_) => {
-                let _ = terminate_process(&child, pid).await;
+                terminate_and_reap(&child, pid).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 ToolResult::error(format!("command timed out after {}s", timeout.as_secs()))
@@ -267,12 +290,16 @@ impl Tool for Shell {
                     "truncated": stdout_truncated || stderr_truncated,
                 }))
             }
+            },
         }
     }
 }
 
 impl Shell {
     async fn spawn_background(&self, ctx: &ToolCtx, command: &str) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("command cancelled");
+        }
         let mut command_process = tokio::process::Command::new("sh");
         command_process
             .arg("-c")
@@ -445,7 +472,15 @@ impl Tool for ShellOutput {
                         "new_output": "",
                     }));
                 }
-                None => tokio::time::sleep(Duration::from_millis(50)).await,
+                None => {
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => {
+                            return ToolResult::error("shell output wait cancelled");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
             }
         }
     }
@@ -559,6 +594,63 @@ mod tests {
             .run(&ctx, &json!({"command": "sleep 5", "timeout_secs": 1}))
             .await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_terminates_foreground_process_group_and_reaps_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let worktree = tmp.path().to_path_buf();
+        let running = tokio::spawn(async move {
+            shell
+                .run(
+                    &ctx,
+                    &json!({
+                        "command": "sleep 60 & child=$!; echo $child > child.pid; wait $child"
+                    }),
+                )
+                .await
+        });
+
+        let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(worktree.join("child.pid")) {
+                    break pid.trim().parse::<u32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("foreground command should start its child");
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("cancelled shell should acknowledge cleanup promptly")
+            .unwrap();
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            result.result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("cancelled"))
+        );
+        let descendant = std::fs::read_to_string(format!("/proc/{child_pid}/stat"));
+        assert!(
+            descendant.is_err()
+                || descendant
+                    .as_deref()
+                    .ok()
+                    .and_then(|stat| stat.rsplit_once(") "))
+                    .is_some_and(|(_, fields)| fields.starts_with('Z')),
+            "shell cancellation returned while its descendant was still running"
+        );
     }
 
     #[tokio::test]

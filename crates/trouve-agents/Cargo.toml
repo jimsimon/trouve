@@ -23,6 +23,7 @@ tar = "0.4"
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
 tracing.workspace = true
 trouve-protocol.workspace = true
 trouve-providers.workspace = true

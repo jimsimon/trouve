@@ -39,3 +39,5 @@ sequentially.
 | [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Superseded by 0028 |
 | [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Accepted |
 | [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |
+| [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Accepted |
+| [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |

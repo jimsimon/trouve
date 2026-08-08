@@ -6,12 +6,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
-use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendSteer, BackendTurn};
+use trouve_agents::{
+    AgentBackend, BackendCollaboratorEvent, BackendError, BackendEvent, BackendPermission,
+    BackendSteer, BackendTurn,
+};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
@@ -23,11 +26,24 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
+use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
+/// Bound native provider fan-out so a malformed or over-eager response cannot
+/// monopolize the runtime. Results are still written to the provider
+/// transcript in request order.
+const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+/// Production tools observe `ToolCtx::cancel` and clean up promptly. This
+/// bound prevents a third-party/custom executor that violates that contract
+/// from wedging the dispatcher forever.
+#[cfg(not(test))]
+const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
 /// Keep backend persistence efficient without making live SSE output feel
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
@@ -90,6 +106,94 @@ async fn flush_backend_event_batch(
         store
             .append_events_async(scope.clone(), std::mem::take(events))
             .await?;
+    }
+    Ok(())
+}
+
+struct BackendCollaboratorProjection {
+    thread: Thread,
+    turn: u64,
+    vendor_turn_id: Option<String>,
+    thinking_level: Option<String>,
+    last_user_message: Option<String>,
+    pending_prompt: Option<String>,
+    text: String,
+    segment: String,
+    usage: Usage,
+    tool_calls: HashMap<String, (String, serde_json::Value)>,
+    persisted: Vec<Event>,
+    terminal: bool,
+}
+
+struct BackendApprovalOutcome {
+    call_id: String,
+    responder: tokio::sync::oneshot::Sender<bool>,
+    approved: Result<bool>,
+    /// Held from approval until the vendor reports tool completion. This is
+    /// the fallback confinement mechanism for vendor protocols that cannot
+    /// replace their mutation tools with trouve's full MCP bridge.
+    mutation_permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+enum BackendLoopInput {
+    Event(Option<Result<BackendEvent, BackendError>>),
+    Approval(BackendApprovalOutcome),
+}
+
+/// Native collaborators are real, navigable threads while the vendor owns
+/// their current turn. Claiming them in the normal dispatcher registry makes
+/// messages queue instead of racing a second turn against the same vendor
+/// session. The parent dispatcher remains active for this guard's lifetime,
+/// so adding/removing child claims cannot change session activity by itself.
+struct BackendCollaboratorClaims<'a> {
+    active_threads: &'a Mutex<HashMap<String, String>>,
+    claimed: HashSet<String>,
+}
+
+impl<'a> BackendCollaboratorClaims<'a> {
+    fn new(active_threads: &'a Mutex<HashMap<String, String>>) -> Self {
+        Self {
+            active_threads,
+            claimed: HashSet::new(),
+        }
+    }
+
+    fn claim(&mut self, thread_id: &str, session_id: &str) {
+        if self.claimed.insert(thread_id.to_string()) {
+            self.active_threads
+                .lock()
+                .unwrap()
+                .insert(thread_id.to_string(), session_id.to_string());
+        }
+    }
+
+    fn release(&mut self, thread_id: &str) {
+        if self.claimed.remove(thread_id) {
+            self.active_threads.lock().unwrap().remove(thread_id);
+        }
+    }
+}
+
+impl Drop for BackendCollaboratorClaims<'_> {
+    fn drop(&mut self) {
+        let mut active = self.active_threads.lock().unwrap();
+        for thread_id in self.claimed.drain() {
+            active.remove(&thread_id);
+        }
+    }
+}
+
+async fn flush_backend_collaborator_batches(
+    store: &Store,
+    collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+) -> Result<()> {
+    for collaborator in collaborators.values_mut() {
+        flush_backend_event_batch(
+            store,
+            &Scope::Thread(collaborator.thread.id.clone()),
+            &mut collaborator.persisted,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -165,7 +269,12 @@ impl TurnScheduler {
             .clone()
     }
 
-    async fn acquire(&self, model: &str, background: bool) -> Result<TurnCapacityGuard> {
+    async fn acquire(
+        &self,
+        model: &str,
+        background: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<TurnCapacityGuard> {
         let started = Instant::now();
         let provider = self.provider(model);
         let cooldown = provider
@@ -175,41 +284,43 @@ impl TurnScheduler {
             .until
             .and_then(|until| until.checked_duration_since(Instant::now()));
         if let Some(cooldown) = cooldown {
-            tokio::time::sleep(cooldown).await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                _ = tokio::time::sleep(cooldown) => {}
+            }
         }
         let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
         if background {
-            permits.push(
-                self.background
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("background turn scheduler closed"))?,
-            );
-            permits.push(
-                provider
-                    .background
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("provider background scheduler closed"))?,
-            );
+            permits.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                permit = self.background.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("background turn scheduler closed"))?
+                }
+            });
+            permits.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                permit = provider.background.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
+                }
+            });
         }
-        permits.push(
-            self.all
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("turn scheduler closed"))?,
-        );
-        permits.push(
-            provider
-                .all
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("provider turn scheduler closed"))?,
-        );
+        permits.push(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = self.all.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("turn scheduler closed"))?
+            }
+        });
+        permits.push(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = provider.all.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
+            }
+        });
         Ok(TurnCapacityGuard {
             _permits: permits,
             wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -643,6 +754,10 @@ pub struct Engine {
     /// write guard. This lets review/plan work fan out without weakening the
     /// sessions-own-worktrees serialization invariant.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// Narrower execution lanes for tools operating on a session worktree.
+    /// Read-only tools may overlap; every potential mutation is exclusive.
+    /// Weak entries keep completed/deleted sessions from growing this map.
+    tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     /// Threads with a dispatcher currently running turns, mapped to their
     /// session. A thread in this map drains its own prompt queue; sends
     /// while present just enqueue. The session ids feed `Session.active`
@@ -1029,6 +1144,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
+            tool_execution_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -1165,8 +1281,8 @@ impl Engine {
         });
     }
 
-    /// Record the server's reachable base URL (enables the MCP tool bridge
-    /// for backends configured with `tool_bridge = true`).
+    /// Record the server's reachable base URL (enables the default MCP tool
+    /// bridge for supported vendor backends).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
     }
@@ -4527,6 +4643,17 @@ impl Engine {
             .clone()
     }
 
+    fn tool_execution_lock(&self, session_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self.tool_execution_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     // --- workspaces ---------------------------------------------------------
 
     pub fn register_workspace(
@@ -5291,6 +5418,7 @@ impl Engine {
         request_id: &str,
         title: Option<String>,
         questions: Vec<trouve_protocol::Question>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<Vec<trouve_protocol::QuestionAnswer>>> {
         let scope = Scope::Thread(thread_id.to_string());
         let rx = self.questions.request(request_id);
@@ -5303,7 +5431,16 @@ impl Engine {
                 questions,
             },
         )?;
-        let answers = rx.await.unwrap_or(None);
+        let answers = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Remove the pending sender so a late HTTP answer cannot
+                // target a turn that has already entered cleanup.
+                let _ = self.questions.resolve(request_id, None);
+                None
+            }
+            answers = rx => answers.unwrap_or(None),
+        };
         self.store.append_event(
             scope,
             Event::QuestionResolved {
@@ -6009,11 +6146,41 @@ impl Engine {
                     return Ok(());
                 }
             };
-            let outcome_error = result.as_ref().err().map(ToString::to_string);
-            self.turn_scheduler
-                .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
-            let resume_after_failure = if let Err(e) = result {
+            if !cancelled {
+                let outcome_error = result.as_ref().err().map(ToString::to_string);
+                self.turn_scheduler
+                    .record_outcome(&thread.model, outcome_error.as_deref());
+            }
+            // Cancellation wins a race with startup/stream errors only after
+            // run_turn has returned, which is the adapter/tool acknowledgement
+            // that its bounded cleanup is complete. Never publish both failed
+            // and cancelled terminal states for one turn.
+            if cancelled {
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        "turn {turn} of {} returned during cancellation cleanup: {error}",
+                        thread.id
+                    );
+                }
+                // A cancellation can arrive before run_turn consumes the
+                // claimed queue row. Remove it here as an idempotent fallback.
+                let _ = self.store.finish_queued_prompt(&prompt.id);
+                let _ = self.emit_queue(&thread.id);
+                self.store
+                    .append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnCancelled { turn },
+                    )
+                    .with_context(|| {
+                        format!("persisting cancellation for turn {turn} of {}", thread.id)
+                    })?;
+                let resume = self.finish_interrupted_turn(&thread.id)?;
+                if !resume {
+                    return Ok(());
+                }
+            }
+            let resume_after_failure = if !cancelled && let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 self.store
                     .append_event(
@@ -6036,27 +6203,6 @@ impl Engine {
             } else {
                 false
             };
-            if !resume_after_failure && cancelled {
-                // A user-cancelled turn normally pauses the queue (like a
-                // failure, but not an error). A prompt submitted after the
-                // cancel request is itself an explicit resume, though.
-                // Publish the terminal event before making that decision so
-                // a subsequent turn cannot overtake it in the event log.
-                self.store
-                    .append_event(
-                        Scope::Thread(thread.id.clone()),
-                        Event::TurnCancelled { turn },
-                    )
-                    .with_context(|| {
-                        format!("persisting cancellation for turn {turn} of {}", thread.id)
-                    })?;
-                // Decide atomically with releasing the active claim so a
-                // racing send cannot be stranded between the two.
-                let resume = self.finish_interrupted_turn(&thread.id)?;
-                if !resume {
-                    return Ok(());
-                }
-            }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
             let (next, next_cancel) = {
@@ -6183,10 +6329,10 @@ impl Engine {
         Ok(resume)
     }
 
-    /// Interrupt the turn currently running on a thread. Trips its
-    /// cancellation token, which stops the provider stream, in-flight tool
-    /// call, or approval wait at the next await point. No-op error when the
-    /// thread has no running turn.
+    /// Interrupt the turn currently running on a thread. The request only
+    /// trips its shared token; the dispatcher publishes `turn.cancelled`
+    /// after provider/tool cleanup acknowledges that no stale work can race
+    /// a replacement turn. No-op error when the thread has no running turn.
     pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
         match self.turn_cancels.lock().unwrap().get(thread_id) {
             Some(token) => {
@@ -6239,6 +6385,7 @@ impl Engine {
         let scope = Scope::Thread(thread.id.clone());
         let worktree = PathBuf::from(&session.worktree_path);
         let ctx = ToolCtx {
+            cancel: cancel.clone(),
             worktree: worktree.clone(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
@@ -6253,7 +6400,7 @@ impl Engine {
         let background = self.store.is_code_review_thread(&thread.id)?;
         let turn_capacity = self
             .turn_scheduler
-            .acquire(&thread.model, background)
+            .acquire(&thread.model, background, &cancel)
             .await?;
         if background
             && let Some(progress) = self
@@ -6285,11 +6432,19 @@ impl Engine {
             _read_guard = None;
             _write_guard = None;
         } else if mode.read_only {
-            _read_guard = Some(lock.read().await);
+            _read_guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                guard = lock.read() => guard,
+            });
             _write_guard = None;
         } else {
             _read_guard = None;
-            _write_guard = Some(lock.write().await);
+            _write_guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                guard = lock.write() => guard,
+            });
         }
         let _turn_capacity = turn_capacity;
 
@@ -6319,7 +6474,11 @@ impl Engine {
             .resolve_provider(&thread.model)
             .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = provider.list_models().await;
+        let model_catalog = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            models = provider.list_models() => models,
+        };
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let thinking_level = resolved_thinking_level(&model_options, selected_model);
@@ -6350,7 +6509,7 @@ impl Engine {
         // before this turn's user message joins it (the stored transcript —
         // the event above is display-only).
         if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name)
+            .maybe_compact(thread, turn, &provider, &model_name, &cancel)
             .await
         {
             // Compaction is best-effort; the turn proceeds with full history.
@@ -6375,12 +6534,14 @@ impl Engine {
         // served tools are added only when tools_enabled is true; tool-free
         // JSON-repair turns receive no tools.
         let mut specs: Vec<ToolSpec> = if tools_enabled {
-            self.executor
-                .specs(&ctx)
-                .await
-                .into_iter()
-                .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
-                .collect()
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                specs = self.executor.specs(&ctx) => specs,
+            }
+            .into_iter()
+            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .collect()
         } else {
             Vec::new()
         };
@@ -6408,7 +6569,11 @@ impl Engine {
         }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
-        let live_models = provider.list_models().await;
+        let live_models = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            models = provider.list_models() => models,
+        };
         let known_models = provider.models();
         let pricing_model = live_models
             .iter()
@@ -6462,10 +6627,17 @@ impl Engine {
             // dangling tool_use/tool_call, which would wedge the thread.
             let messages = sanitize_transcript(messages);
 
-            let mut stream = provider
-                .stream_chat(&model_name, &messages, &specs, &model_options)
-                .await
-                .map_err(|e| anyhow!("provider error: {e}"))?;
+            let stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                stream = provider.stream_chat(&model_name, &messages, &specs, &model_options) => {
+                    Some(stream.map_err(|e| anyhow!("provider error: {e}"))?)
+                }
+            };
+            let Some(mut stream) = stream else {
+                hit_iteration_limit = false;
+                break;
+            };
             stream = trouve_providers::coalesce_event_stream(stream);
 
             let mut text = String::new();
@@ -6560,6 +6732,7 @@ impl Engine {
                 );
                 tool_calls.clear();
             }
+            normalize_tool_call_ids(&mut tool_calls);
             if !text.is_empty() || !tool_calls.is_empty() {
                 self.store.append_message(
                     &thread.id,
@@ -6576,14 +6749,22 @@ impl Engine {
                 break;
             }
 
-            for call in tool_calls {
-                let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
-                    .await?;
+            // Providers may request independent calls in one response. Poll
+            // them concurrently, but collect in provider order so the
+            // transcript remains valid for APIs that require ordered
+            // tool-result blocks. Tool events retain their real start and
+            // completion ordering through the durable event log.
+            let results = self
+                .handle_tool_calls_parallel(
+                    &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
+                )
+                .await;
+            for (call_id, result) in results {
+                let (result_content, images) = result?;
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::ToolResult {
-                        call_id: call.id.clone(),
+                        call_id,
                         content: result_content,
                         images,
                     })?,
@@ -6595,7 +6776,7 @@ impl Engine {
         // tool-free provider pass over the last tool results so the user gets
         // a truthful model-authored progress report rather than a completed
         // turn whose transcript ends at a tool result.
-        if hit_iteration_limit {
+        if hit_iteration_limit && !cancel.is_cancelled() {
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
                 messages.push(serde_json::from_value(payload)?);
@@ -6608,13 +6789,24 @@ impl Engine {
             )));
             let mut final_text = String::new();
             let mut final_reasoning = Vec::new();
-            match provider
-                .stream_chat(&model_name, &messages, &[], &model_options)
-                .await
-            {
-                Ok(stream) => {
+            let final_stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                stream = provider.stream_chat(&model_name, &messages, &[], &model_options) => Some(stream),
+            };
+            match final_stream {
+                None => {}
+                Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    while let Some(event) = stream.next().await {
+                    loop {
+                        let event = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            event = stream.next() => match event {
+                                Some(event) => event,
+                                None => break,
+                            },
+                        };
                         match event {
                             Ok(ProviderEvent::TextDelta(delta)) => {
                                 final_text.push_str(&delta);
@@ -6653,7 +6845,10 @@ impl Engine {
                         }
                     }
                 }
-                Err(e) => tracing::warn!("iteration-limit summary failed: {e}"),
+                Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
+            }
+            if cancel.is_cancelled() {
+                return Ok(());
             }
             if final_text.trim().is_empty() {
                 final_text = format!(
@@ -6678,6 +6873,9 @@ impl Engine {
             )?;
         }
 
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         usage_total.context_input_tokens = Some(context_input_tokens);
         self.store.record_usage(
             &session.id,
@@ -6695,6 +6893,9 @@ impl Engine {
         } else {
             self.maybe_checkpoint(&session, thread, turn).await?
         };
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         self.store.append_event(
             scope,
             Event::TurnCompleted {
@@ -6713,11 +6914,10 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code always gets
-    /// the bridge (it carries the approval-prompt gate for Ask mode, and
-    /// optionally — `tool_bridge = true` — trouve's tools in place of
-    /// Claude's built-ins). Codex gets it too, for trouve's semantic search
-    /// and question tools; its approvals stay native app-server RPCs.
+    /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
+    /// the full bridge by default so mutation-capable work crosses the same
+    /// ToolExecutor and per-session execution lane as native provider calls.
+    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
     fn mcp_bridge_for(
         &self,
         model: &str,
@@ -6727,13 +6927,11 @@ impl Engine {
         let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
-            (pc.kind.clone(), pc.tool_bridge.unwrap_or(false))
+            (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
         if kind != "claude-cli" && kind != "codex-app-server" {
             return None;
         }
-        // Full tool bridging (vendor built-ins stand down) is Claude-only.
-        let bridge_tools = bridge_tools && kind == "claude-cli";
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -6758,9 +6956,9 @@ impl Engine {
         Some(trouve_agents::McpBridgeConfig {
             url,
             bridge_tools,
-            // Claude built-ins stand down; trouve's executor is the tool
-            // source (reads included, for full permission fidelity).
-            disallowed_tools: if bridge_tools {
+            // Claude built-ins stand down; Codex uses the same bridge while
+            // its remaining built-ins are confined by a read-only sandbox.
+            disallowed_tools: if bridge_tools && kind == "claude-cli" {
                 [
                     "Bash",
                     "Edit",
@@ -7084,7 +7282,15 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        let cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
         let ctx = ToolCtx {
+            cancel,
             worktree: PathBuf::from(&session.worktree_path),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
@@ -7130,6 +7336,470 @@ impl Engine {
             .collect())
     }
 
+    fn record_backend_collaborator_input(
+        &self,
+        collaborator: &mut BackendCollaboratorProjection,
+        content: String,
+    ) -> Result<()> {
+        if content.is_empty() || collaborator.last_user_message.as_deref() == Some(&content) {
+            return Ok(());
+        }
+        if !collaborator.segment.is_empty() {
+            collaborator.persisted.push(Event::AssistantMessage {
+                turn: collaborator.turn,
+                content: std::mem::take(&mut collaborator.segment),
+            });
+        }
+        let event = if collaborator.last_user_message.is_some() {
+            Event::TurnSteered {
+                turn: collaborator.turn,
+                content: content.clone(),
+                attachments: Vec::new(),
+            }
+        } else {
+            Event::UserMessage {
+                turn: collaborator.turn,
+                content: content.clone(),
+                attachments: Vec::new(),
+            }
+        };
+        collaborator.persisted.push(event);
+        self.store.append_message(
+            &collaborator.thread.id,
+            &serde_json::to_value(Message::User(content.clone()))?,
+        )?;
+        collaborator.last_user_message = Some(content);
+        Ok(())
+    }
+
+    fn begin_backend_collaborator_turn(
+        &self,
+        collaborator: &mut BackendCollaboratorProjection,
+        vendor_turn_id: Option<String>,
+        prompt: String,
+    ) -> Result<()> {
+        debug_assert!(collaborator.persisted.is_empty());
+        collaborator.turn = self.store.next_turn(&collaborator.thread.id)?;
+        collaborator.vendor_turn_id = vendor_turn_id;
+        collaborator.last_user_message = None;
+        collaborator.pending_prompt = None;
+        collaborator.text.clear();
+        collaborator.segment.clear();
+        collaborator.usage = Usage::default();
+        collaborator.tool_calls.clear();
+        collaborator.terminal = false;
+        self.store.append_event(
+            Scope::Thread(collaborator.thread.id.clone()),
+            Event::TurnStarted {
+                turn: collaborator.turn,
+                mode: collaborator.thread.mode.clone(),
+                model: collaborator.thread.model.clone(),
+                thinking_level: collaborator.thinking_level.clone(),
+                // The containing app-server turn owns native child steering.
+                supports_steering: false,
+            },
+        )?;
+        self.record_backend_collaborator_input(collaborator, prompt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_backend_collaborator(
+        &self,
+        session: &Session,
+        parent_thread: &Thread,
+        backend_id: &str,
+        vendor_session_id: String,
+        parent_vendor_session_id: &str,
+        prompt: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+        vendor_threads: &mut HashMap<String, String>,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let prompt = prompt.filter(|prompt| !prompt.is_empty());
+        if let Some(collaborator) = collaborators.get_mut(&vendor_session_id) {
+            if let Some(prompt) = prompt {
+                if collaborator.terminal {
+                    collaborator.pending_prompt = Some(prompt);
+                } else {
+                    self.record_backend_collaborator_input(collaborator, prompt)?;
+                }
+            }
+            return Ok(());
+        }
+        let parent_thread_id = vendor_threads
+            .get(parent_vendor_session_id)
+            .cloned()
+            .unwrap_or_else(|| parent_thread.id.clone());
+        let inherited_thread = collaborators
+            .values()
+            .find(|collaborator| collaborator.thread.id == parent_thread_id)
+            .map(|collaborator| collaborator.thread.clone())
+            .unwrap_or_else(|| parent_thread.clone());
+        let model = model
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| {
+                if model.contains('/') {
+                    model
+                } else {
+                    format!("{backend_id}/{model}")
+                }
+            })
+            .unwrap_or_else(|| inherited_thread.model.clone());
+        let mut model_options = if model == inherited_thread.model {
+            self.store.thread_model_options(&inherited_thread.id)?
+        } else {
+            serde_json::Map::new()
+        };
+        let mut thinking_level = thinking_level.filter(|level| !level.trim().is_empty());
+        if let Some(level) = thinking_level.as_ref() {
+            // The canonical inherited key keeps this useful even when the
+            // selected model advertises a differently named vendor option.
+            model_options.insert("thinking_level".into(), serde_json::json!(level));
+        }
+        thinking_level = thinking_level.or_else(|| {
+            THINKING_OPTION_KEYS.iter().find_map(|key| {
+                model_options
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+        let child = self
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                mode: Some(inherited_thread.mode.clone()),
+                model: Some(model),
+                model_options,
+                permission_mode: Some(inherited_thread.permission_mode),
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.store
+            .insert_spawned(&child.id, &parent_thread_id, "vendor")?;
+        // `create_thread` announces before parentage is inserted. Publish the
+        // adjacent update so clients refetch the now-authoritative `spawned`
+        // flag rather than racing the relationship write.
+        self.store.append_event(
+            Scope::Server,
+            Event::ThreadUpdated {
+                thread_id: child.id.clone(),
+                session_id: session.id.clone(),
+            },
+        )?;
+        self.store
+            .set_backend_session(&child.id, backend_id, &vendor_session_id)?;
+        vendor_threads.insert(vendor_session_id.clone(), child.id.clone());
+        let mut collaborator = BackendCollaboratorProjection {
+            thread: child,
+            turn: 0,
+            vendor_turn_id: None,
+            thinking_level,
+            last_user_message: None,
+            pending_prompt: None,
+            text: String::new(),
+            segment: String::new(),
+            usage: Usage::default(),
+            tool_calls: HashMap::new(),
+            persisted: Vec::new(),
+            terminal: true,
+        };
+        self.begin_backend_collaborator_turn(&mut collaborator, None, prompt.unwrap_or_default())?;
+        collaborators.insert(vendor_session_id, collaborator);
+        Ok(())
+    }
+
+    async fn finish_backend_collaborator(
+        &self,
+        session: &Session,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        outcome: Result<Usage, String>,
+    ) -> Result<()> {
+        if collaborator.terminal {
+            return Ok(());
+        }
+        if !collaborator.segment.is_empty() {
+            collaborator.persisted.push(Event::AssistantMessage {
+                turn: collaborator.turn,
+                content: std::mem::take(&mut collaborator.segment),
+            });
+        }
+        flush_backend_event_batch(
+            &self.store,
+            &Scope::Thread(collaborator.thread.id.clone()),
+            &mut collaborator.persisted,
+        )
+        .await?;
+        self.store.append_message(
+            &collaborator.thread.id,
+            &serde_json::to_value(Message::Assistant {
+                content: collaborator.text.clone(),
+                tool_calls: Vec::new(),
+                reasoning: Vec::new(),
+            })?,
+        )?;
+        match outcome {
+            Ok(mut usage) => {
+                let context_input_tokens = usage.context_input_tokens.unwrap_or_else(|| {
+                    usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                });
+                usage.context_input_tokens = Some(context_input_tokens);
+                collaborator.usage = usage.clone();
+                let seen = self.store.messages(&collaborator.thread.id)?.len() as u64;
+                self.store
+                    .mark_backend_seen(&collaborator.thread.id, backend_id, seen)?;
+                self.store.record_usage(
+                    &session.id,
+                    &collaborator.thread.id,
+                    collaborator.turn,
+                    &usage,
+                    context_input_tokens,
+                )?;
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnCompleted {
+                        turn: collaborator.turn,
+                        usage,
+                        checkpoint_id: None,
+                    },
+                )?;
+            }
+            Err(error) if error == "turn cancelled" => {
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnCancelled {
+                        turn: collaborator.turn,
+                    },
+                )?;
+            }
+            Err(error) => {
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnFailed {
+                        turn: collaborator.turn,
+                        error,
+                    },
+                )?;
+            }
+        }
+        collaborator.terminal = true;
+        Ok(())
+    }
+
+    async fn prepare_backend_collaborator_turn(
+        &self,
+        session: &Session,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        vendor_turn_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(vendor_turn_id) = vendor_turn_id else {
+            return Ok(());
+        };
+        match collaborator.vendor_turn_id.as_deref() {
+            Some(current) if current == vendor_turn_id => return Ok(()),
+            None if !collaborator.terminal => {
+                collaborator.vendor_turn_id = Some(vendor_turn_id.to_string());
+                return Ok(());
+            }
+            _ => {}
+        }
+        if !collaborator.terminal {
+            self.finish_backend_collaborator(
+                session,
+                backend_id,
+                collaborator,
+                Err("vendor collaborator started a replacement turn before completing the prior turn".into()),
+            )
+            .await?;
+        }
+        let prompt = collaborator.pending_prompt.take().unwrap_or_default();
+        self.begin_backend_collaborator_turn(collaborator, Some(vendor_turn_id.to_string()), prompt)
+    }
+
+    async fn persist_backend_collaborator_event(
+        &self,
+        session: &Session,
+        mode: &AgentMode,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        event: BackendCollaboratorEvent,
+    ) -> Result<()> {
+        if collaborator.terminal {
+            return Ok(());
+        }
+        let turn = collaborator.turn;
+        match event {
+            BackendCollaboratorEvent::TurnStarted => {}
+            BackendCollaboratorEvent::UserMessage(content) => {
+                self.record_backend_collaborator_input(collaborator, content)?;
+            }
+            BackendCollaboratorEvent::TextDelta(delta) => {
+                collaborator.text.push_str(&delta);
+                collaborator.segment.push_str(&delta);
+                collaborator
+                    .persisted
+                    .push(Event::AssistantDelta { turn, text: delta });
+            }
+            BackendCollaboratorEvent::ThinkingDelta(delta) => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                collaborator
+                    .persisted
+                    .push(Event::AssistantThinking { turn, text: delta });
+            }
+            BackendCollaboratorEvent::ThinkingCompleted => collaborator
+                .persisted
+                .push(Event::AssistantThinkingCompleted { turn }),
+            BackendCollaboratorEvent::ToolStarted {
+                call_id,
+                tool,
+                mut args,
+            } => {
+                collaborator
+                    .tool_calls
+                    .insert(call_id.clone(), (tool.clone(), args.clone()));
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                if !self.tool_card_exists(&collaborator.thread.id, turn, &call_id) {
+                    collaborator.persisted.push(Event::ToolRequested {
+                        turn,
+                        call_id: call_id.clone(),
+                        tool,
+                        args,
+                        requires_approval: false,
+                    });
+                }
+                collaborator.persisted.push(Event::ToolStarted { call_id });
+            }
+            BackendCollaboratorEvent::ToolOutput { call_id, chunk } => collaborator
+                .persisted
+                .push(Event::ToolOutput { call_id, chunk }),
+            BackendCollaboratorEvent::ToolCompleted {
+                call_id,
+                ok,
+                result,
+            } => {
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                let status = if ok {
+                    ToolStatus::Ok
+                } else {
+                    ToolStatus::Error
+                };
+                let todos = match collaborator.tool_calls.get(&call_id) {
+                    Some((tool, args)) => self.persist_todos_from_result(
+                        &collaborator.thread.id,
+                        tool,
+                        status,
+                        &result,
+                        Some(args),
+                    )?,
+                    None => None,
+                };
+                collaborator.persisted.push(Event::ToolCompleted {
+                    call_id,
+                    status,
+                    result,
+                });
+                if let Some(todos) = todos {
+                    collaborator.persisted.push(Event::TodosUpdated { todos });
+                }
+            }
+            BackendCollaboratorEvent::ApprovalNeeded {
+                call_id,
+                tool,
+                args,
+                responder,
+            } => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                let approved = self
+                    .gate_backend_approval(
+                        session,
+                        &collaborator.thread,
+                        turn,
+                        mode,
+                        &call_id,
+                        &tool,
+                        &args,
+                    )
+                    .await?;
+                let _ = responder.send(approved);
+            }
+            BackendCollaboratorEvent::TodosUpdated { todos } => {
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                self.store
+                    .update_thread_todos(&collaborator.thread.id, &todos)?;
+                collaborator.persisted.push(Event::TodosUpdated { todos });
+            }
+            BackendCollaboratorEvent::UsageUpdated { usage } => {
+                collaborator
+                    .persisted
+                    .push(Event::TurnUsageUpdated { turn, usage });
+            }
+            BackendCollaboratorEvent::CompactionStarted => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                collaborator
+                    .persisted
+                    .push(Event::CompactionStarted { turn });
+            }
+            BackendCollaboratorEvent::CompactionCompleted => {
+                collaborator.persisted.push(Event::CompactionCompleted {
+                    turn,
+                    messages_compacted: 0,
+                });
+            }
+            BackendCollaboratorEvent::CompactionFailed => {
+                collaborator
+                    .persisted
+                    .push(Event::CompactionFailed { turn });
+            }
+            BackendCollaboratorEvent::Completed { usage } => {
+                self.finish_backend_collaborator(session, backend_id, collaborator, Ok(usage))
+                    .await?;
+            }
+            BackendCollaboratorEvent::Failed { error } => {
+                self.finish_backend_collaborator(session, backend_id, collaborator, Err(error))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -7139,7 +7809,7 @@ impl Engine {
     /// and history, not as the model's context.
     #[allow(clippy::too_many_arguments)]
     async fn run_backend_turn(
-        &self,
+        self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
         turn: u64,
@@ -7156,7 +7826,11 @@ impl Engine {
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = backend.list_models().await;
+        let model_catalog = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            models = backend.list_models() => models,
+        };
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let thinking_level = resolved_thinking_level(&model_options, selected_model);
@@ -7255,6 +7929,23 @@ impl Engine {
             }
             instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
         }
+        let full_tool_bridge = mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_tools);
+        if full_tool_bridge {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(crate::tools::VENDOR_TOOL_BRIDGE_GUIDANCE);
+        }
+        // A full bridge already exposes user MCP servers through the local
+        // ToolExecutor. Mounting them directly as well would bypass trouve's
+        // permission and per-session concurrency gates.
+        let mcp_servers = if tools_enabled && !full_tool_bridge {
+            self.mcp_servers_for(session)?
+        } else {
+            Vec::new()
+        };
         // The digest decorates only the prompt sent to the vendor; the
         // stored transcript keeps the user's words alone.
         let prompt = match &handoff {
@@ -7262,6 +7953,7 @@ impl Engine {
             None => content,
         };
         let backend_turn = BackendTurn {
+            cancel: cancel.clone(),
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
@@ -7273,17 +7965,14 @@ impl Engine {
             permission,
             tool_free: !tools_enabled,
             mcp_bridge,
-            mcp_servers: if tools_enabled {
-                self.mcp_servers_for(session)?
-            } else {
-                Vec::new()
-            },
+            mcp_servers,
         };
 
-        let mut stream = backend
-            .run_turn(backend_turn)
-            .await
-            .map_err(|e| anyhow!("backend error: {e}"))?;
+        let mut stream = match backend.run_turn(backend_turn).await {
+            Ok(stream) => stream,
+            Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
+            Err(error) => return Err(anyhow!("backend error: {error}")),
+        };
 
         let mut steer_rx = None;
         let _steerer_guard = if supports_steering {
@@ -7327,26 +8016,32 @@ impl Engine {
         } else {
             HashSet::new()
         };
+        let mut vendor_threads = HashMap::<String, String>::new();
+        if let Some(vendor_session_id) = active_vendor_session.as_ref() {
+            vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
+        }
+        let mut collaborators = HashMap::<String, BackendCollaboratorProjection>::new();
+        let mut collaborator_claims = BackendCollaboratorClaims::new(&self.active_threads);
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
         let mut seen_tool_cards = HashSet::new();
+        let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
+        let mut backend_mutation_permits =
+            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let ev = tokio::select! {
+            let input = tokio::select! {
                 biased;
-                // Cancellation drops the backend stream, whose Drop kills the
-                // vendor process (kill_on_drop). We stop consuming and finish
-                // the turn with whatever streamed so far.
-                _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                     persist_deadline = None;
                     continue;
                 }
                 steer = receive_steer_command(
                     &mut steer_rx,
                     active_vendor_session.is_some(),
-                ) => {
+                ), if !cancel.is_cancelled() => {
                     let Some(command) = steer else {
                         steer_rx = None;
                         continue;
@@ -7368,6 +8063,7 @@ impl Engine {
                         .collect();
                     let backend_result = backend
                         .steer_turn(BackendSteer {
+                            cancel: cancel.clone(),
                             session: active_vendor_session
                                 .clone()
                                 .expect("steering branch requires a backend session"),
@@ -7406,21 +8102,67 @@ impl Engine {
                     }
                     continue;
                 }
-                ev = stream.next() => match ev {
-                    Some(ev) => ev,
-                    None => break,
-                },
-            };
-            let event = match ev {
-                Ok(event) => event,
-                Err(error) => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    return Err(anyhow!("backend stream error: {error}"));
+                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                    BackendLoopInput::Approval(
+                        approval.expect("non-empty approval queue must yield an outcome")
+                    )
                 }
+                event = stream.next() => BackendLoopInput::Event(event),
+            };
+            let event = match input {
+                BackendLoopInput::Event(None) => break,
+                BackendLoopInput::Approval(outcome) => {
+                    let BackendApprovalOutcome {
+                        call_id,
+                        responder,
+                        approved,
+                        mutation_permit,
+                    } = outcome;
+                    let approved = match approved {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            let _ = responder.send(false);
+                            return Err(error);
+                        }
+                    };
+                    if approved {
+                        if let Some(permit) = mutation_permit {
+                            backend_mutation_permits.insert(call_id.clone(), permit);
+                        }
+                        if responder.send(true).is_err() {
+                            backend_mutation_permits.remove(&call_id);
+                        }
+                    } else {
+                        let _ = responder.send(false);
+                    }
+                    continue;
+                }
+                BackendLoopInput::Event(Some(ev)) => match ev {
+                    Ok(event) => event,
+                    Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
+                    Err(error) => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        for collaborator in collaborators.values_mut() {
+                            if !collaborator.terminal {
+                                self.finish_backend_collaborator(
+                                    session,
+                                    backend_id,
+                                    collaborator,
+                                    Err(format!("parent backend stream failed: {error}")),
+                                )
+                                .await?;
+                            }
+                            collaborator_claims.release(&collaborator.thread.id);
+                        }
+                        return Err(anyhow!("backend stream error: {error}"));
+                    }
+                },
             };
             match event {
                 BackendEvent::SessionStarted { session_id } => {
                     active_vendor_session = Some(session_id.clone());
+                    vendor_threads.insert(session_id.clone(), thread.id.clone());
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
@@ -7525,11 +8267,105 @@ impl Engine {
                 BackendEvent::CompactionFailed => {
                     persisted.push(Event::CompactionFailed { turn });
                 }
+                BackendEvent::CollaboratorStarted {
+                    session_id,
+                    parent_session_id,
+                    prompt,
+                    model,
+                    thinking_level,
+                } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    let vendor_session_id = session_id.clone();
+                    self.start_backend_collaborator(
+                        session,
+                        thread,
+                        backend_id,
+                        session_id,
+                        &parent_session_id,
+                        prompt,
+                        model,
+                        thinking_level,
+                        &mut vendor_threads,
+                        &mut collaborators,
+                    )?;
+                    if let Some(collaborator) =
+                        collaborators
+                            .get(&vendor_session_id)
+                            .filter(|collaborator| {
+                                !collaborator.terminal || collaborator.pending_prompt.is_some()
+                            })
+                    {
+                        collaborator_claims.claim(&collaborator.thread.id, &session.id);
+                    }
+                }
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id,
+                    event,
+                } => {
+                    if !collaborators.contains_key(&session_id) {
+                        let parent_session_id = active_vendor_session
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.start_backend_collaborator(
+                            session,
+                            thread,
+                            backend_id,
+                            session_id.clone(),
+                            &parent_session_id,
+                            None,
+                            None,
+                            None,
+                            &mut vendor_threads,
+                            &mut collaborators,
+                        )?;
+                    }
+                    if let Some(collaborator) = collaborators.get(&session_id) {
+                        collaborator_claims.claim(&collaborator.thread.id, &session.id);
+                    }
+                    let completed_successfully =
+                        matches!(&event, BackendCollaboratorEvent::Completed { .. });
+                    let terminal_thread =
+                        if let Some(collaborator) = collaborators.get_mut(&session_id) {
+                            self.prepare_backend_collaborator_turn(
+                                session,
+                                backend_id,
+                                collaborator,
+                                turn_id.as_deref(),
+                            )
+                            .await?;
+                            self.persist_backend_collaborator_event(
+                                session,
+                                mode,
+                                backend_id,
+                                collaborator,
+                                event,
+                            )
+                            .await?;
+                            collaborator
+                                .terminal
+                                .then(|| collaborator.thread.id.clone())
+                        } else {
+                            None
+                        };
+                    if let Some(thread_id) = terminal_thread {
+                        collaborator_claims.release(&thread_id);
+                        if completed_successfully {
+                            self.dispatch_queue(&thread_id)
+                                .map_err(|error| anyhow!(error.to_string()))?;
+                        }
+                    }
+                }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
                     result,
                 } => {
+                    // The vendor has finished touching the worktree. Release
+                    // its exclusive lane before persistence/network-derived
+                    // bookkeeping so the next approved mutation can start.
+                    backend_mutation_permits.remove(&call_id);
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
@@ -7593,10 +8429,23 @@ impl Engine {
                         });
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    let approved = self
-                        .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
-                        .await?;
-                    let _ = responder.send(approved);
+                    pending_backend_approvals.push(self.pending_backend_approval(
+                        session.clone(),
+                        thread.clone(),
+                        turn,
+                        mode.clone(),
+                        call_id,
+                        tool,
+                        args,
+                        responder,
+                        cancel.clone(),
+                        // Full-bridge calls acquire the same lane inside
+                        // handle_tool_call; pre-acquiring here would make the
+                        // vendor wait on its own permit. Native Codex tools
+                        // are read-only under the full-bridge sandbox.
+                        !full_tool_bridge,
+                    ));
+                    continue;
                 }
                 BackendEvent::QuestionsNeeded {
                     request_id,
@@ -7612,7 +8461,14 @@ impl Engine {
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let answers = self
-                        .ask_user_questions(&thread.id, turn, &request_id, title, questions)
+                        .ask_user_questions(
+                            &thread.id,
+                            turn,
+                            &request_id,
+                            title,
+                            questions,
+                            &cancel,
+                        )
                         .await?;
                     let _ = responder.send(answers);
                 }
@@ -7631,19 +8487,43 @@ impl Engine {
                     }
                 }
             }
-            if persisted.is_empty() {
+            let collaborator_pending = collaborators
+                .values()
+                .any(|collaborator| !collaborator.persisted.is_empty());
+            if persisted.is_empty() && !collaborator_pending {
                 persist_deadline = None;
-            } else if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
+            } else if persisted.len()
+                + collaborators
+                    .values()
+                    .map(|collaborator| collaborator.persisted.len())
+                    .sum::<usize>()
+                >= BACKEND_EVENT_BATCH_MAX
+            {
                 flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                 persist_deadline = None;
             } else if persist_deadline.is_none() {
                 persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
             }
         }
-        // Drop the backend stream promptly so a cancelled turn kills the
-        // vendor process now rather than at end of scope.
+        // Adapters close only after cancellation cleanup has completed. The
+        // stream can now be dropped without racing a replacement vendor turn.
         drop(stream);
         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+
+        for collaborator in collaborators.values_mut() {
+            if !collaborator.terminal {
+                let reason = if cancel.is_cancelled() {
+                    "turn cancelled".to_string()
+                } else {
+                    "parent turn ended before collaborator completion".to_string()
+                };
+                self.finish_backend_collaborator(session, backend_id, collaborator, Err(reason))
+                    .await?;
+            }
+            collaborator_claims.release(&collaborator.thread.id);
+        }
 
         if cancel.is_cancelled() {
             if !segment.is_empty() {
@@ -7727,6 +8607,60 @@ impl Engine {
         Ok(())
     }
 
+    fn backend_tool_mutates(&self, tool: &str) -> bool {
+        // Bridged trouve tools have authoritative metadata. Vendor-native
+        // permission requests are conservatively mutations: vendors request
+        // approval specifically for actions with side effects.
+        crate::mcp::split_tool_name(tool)
+            .filter(|(server, _)| *server == "trouve")
+            .and_then(|(_, name)| self.executor.tool_mutates(name))
+            .unwrap_or(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pending_backend_approval(
+        self: &Arc<Self>,
+        session: Session,
+        thread: Thread,
+        turn: u64,
+        mode: AgentMode,
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+        responder: tokio::sync::oneshot::Sender<bool>,
+        cancel: tokio_util::sync::CancellationToken,
+        acquire_mutation_permit: bool,
+    ) -> futures::future::BoxFuture<'static, BackendApprovalOutcome> {
+        let engine = self.clone();
+        async move {
+            let mut approved = engine
+                .gate_backend_approval(&session, &thread, turn, &mode, &call_id, &tool, &args)
+                .await;
+            let mut mutation_permit = None;
+            if acquire_mutation_permit
+                && approved.as_ref().is_ok_and(|approved| *approved)
+                && engine.backend_tool_mutates(&tool)
+            {
+                let lock = engine.tool_execution_lock(&session.id);
+                match tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    permit = lock.write_owned() => Some(permit),
+                } {
+                    Some(permit) => mutation_permit = Some(permit),
+                    None => approved = Ok(false),
+                }
+            }
+            BackendApprovalOutcome {
+                call_id,
+                responder,
+                approved,
+                mutation_permit,
+            }
+        }
+        .boxed()
+    }
+
     /// Gate one backend approval request through trouve's permission layer:
     /// allow-list hits auto-approve, read-only modes deny, otherwise ask the
     /// user through the ApprovalHub (same endpoints as native tool calls).
@@ -7761,10 +8695,7 @@ impl Engine {
         // flag so read-only tools (code search) pass even in read-only
         // modes. Anything else the vendor asks about is treated as mutating
         // (it only asks for things it considers mutating).
-        let mutates = crate::mcp::split_tool_name(tool)
-            .filter(|(server, _)| *server == "trouve")
-            .and_then(|(_, name)| self.executor.tool_mutates(name))
-            .unwrap_or(true);
+        let mutates = self.backend_tool_mutates(tool);
         let decision = gate(
             thread.permission_mode,
             mode.read_only,
@@ -7812,7 +8743,12 @@ impl Engine {
                 // A cancelled turn must not hang on an unanswered approval.
                 let decision = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    _ = cancel.cancelled() => {
+                        // Remove the pending sender so a late HTTP approval
+                        // cannot target a turn that has entered cleanup.
+                        let _ = self.approvals.resolve(call_id, ApprovalDecision::Deny);
+                        ApprovalDecision::Deny
+                    },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
                 self.store.append_event(
@@ -7843,12 +8779,17 @@ impl Engine {
         turn: u64,
         provider: &Arc<dyn Provider>,
         model_name: &str,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
         // the static catalog doesn't; it is cached, so this is cheap. Never
         // compact against a guessed window: an early lossy summary is worse
         // than surfacing that the provider omitted the required metadata.
-        let live = provider.list_models().await;
+        let live = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            models = provider.list_models() => models,
+        };
         let known = provider.models();
         let Some(context_window) = live
             .iter()
@@ -7907,13 +8848,32 @@ impl Engine {
             "Summarize the conversation so far per your instructions.".into(),
         ));
 
-        let mut stream = provider
-            .stream_chat(model_name, &messages, &[], &serde_json::Map::new())
-            .await
-            .map_err(|e| anyhow!("compaction provider error: {e}"))?;
+        let empty_options = serde_json::Map::new();
+        let stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.store.append_event(scope, Event::CompactionFailed { turn })?;
+                return Ok(());
+            }
+            stream = provider.stream_chat(model_name, &messages, &[], &empty_options) => {
+                stream.map_err(|e| anyhow!("compaction provider error: {e}"))?
+            }
+        };
+        let mut stream = stream;
         stream = trouve_providers::coalesce_event_stream(stream);
         let mut summary = String::new();
-        while let Some(ev) = stream.next().await {
+        loop {
+            let ev = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.store.append_event(scope, Event::CompactionFailed { turn })?;
+                    return Ok(());
+                }
+                ev = stream.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                }
+            };
             if let ProviderEvent::TextDelta(delta) =
                 ev.map_err(|e| anyhow!("compaction stream error: {e}"))?
             {
@@ -7938,6 +8898,43 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_calls_parallel(
+        self: &Arc<Self>,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        mode: &AgentMode,
+        ctx: &ToolCtx,
+        calls: Vec<trouve_providers::ToolCallRequest>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Vec<(String, NativeToolCallResult)> {
+        let mut results =
+            futures::stream::iter(calls.into_iter().enumerate().map(|(index, call)| {
+                let engine = self.clone();
+                let session = session.clone();
+                let thread = thread.clone();
+                let mode = mode.clone();
+                let ctx = ctx.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let call_id = call.id.clone();
+                    let result = engine
+                        .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
+                        .await;
+                    (index, call_id, result)
+                }
+            }))
+            .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        results
+            .into_iter()
+            .map(|(_, call_id, result)| (call_id, result))
+            .collect()
     }
 
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
@@ -7968,7 +8965,14 @@ impl Engine {
             let result = match parse_question_args(&call.arguments) {
                 Ok((title, questions)) => {
                     let answers = self
-                        .ask_user_questions(&thread.id, turn, &call_id, title, questions.clone())
+                        .ask_user_questions(
+                            &thread.id,
+                            turn,
+                            &call_id,
+                            title,
+                            questions.clone(),
+                            cancel,
+                        )
                         .await?;
                     question_result_json(&questions, answers)
                 }
@@ -8085,7 +9089,14 @@ impl Engine {
                 // treat cancellation as a denial so the wait unblocks.
                 let decision = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    _ = cancel.cancelled() => {
+                        // Remove the pending sender so a late HTTP approval
+                        // cannot target a turn that has entered cleanup.
+                        let _ = self
+                            .approvals
+                            .resolve(&call_id, ApprovalDecision::Deny);
+                        ApprovalDecision::Deny
+                    },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
                 self.store.append_event(
@@ -8118,16 +9129,89 @@ impl Engine {
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolStarted {
-                call_id: call_id.clone(),
+        enum ExecutionPermit {
+            Read {
+                _guard: tokio::sync::OwnedRwLockReadGuard<()>,
             },
-        )?;
-        let mut outcome = self
-            .executor
-            .execute(ctx, &call.name, &call.arguments)
-            .await;
+            Write {
+                _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+            },
+        }
+        let execution_lock = self.tool_execution_lock(&session.id);
+        let permit = if mutates {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { _guard: permit }),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                permit = execution_lock.clone().read_owned() => Some(ExecutionPermit::Read { _guard: permit }),
+            }
+        };
+        let mut outcome = if let Some(permit) = permit {
+            // Retain the lane until the executor has acknowledged cancellation
+            // and cleaned up its process/protocol resources.
+            let mut permit = Some(permit);
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolStarted {
+                    call_id: call_id.clone(),
+                },
+            )?;
+            let executor = self.executor.clone();
+            let tool_ctx = ctx.clone();
+            let tool_name = call.name.clone();
+            let tool_arguments = call.arguments.clone();
+            let mut execute = Box::pin(async move {
+                executor
+                    .execute(&tool_ctx, &tool_name, &tool_arguments)
+                    .await
+            });
+            let outcome = tokio::select! {
+                biased;
+                result = &mut execute => result,
+                _ = cancel.cancelled() => {
+                    match tokio::time::timeout(TOOL_CANCEL_CLEANUP_TIMEOUT, &mut execute).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                tool = %call.name,
+                                call_id,
+                                "tool executor did not acknowledge cancellation within {}s",
+                                TOOL_CANCEL_CLEANUP_TIMEOUT.as_secs(),
+                            );
+                            // A custom executor may violate ToolCtx's cleanup
+                            // contract. Do not let it hold the turn terminal
+                            // state forever, but quarantine its execution lane
+                            // until it eventually returns so replacement work
+                            // cannot race a still-live mutation.
+                            let quarantine = permit
+                                .take()
+                                .expect("an executing tool owns its session lane");
+                            let tool = call.name.clone();
+                            let call_id = call_id.clone();
+                            tokio::spawn(async move {
+                                let _quarantine = quarantine;
+                                let _ = execute.await;
+                                tracing::warn!(
+                                    tool,
+                                    call_id,
+                                    "late tool cancellation cleanup completed; session lane released",
+                                );
+                            });
+                            ToolResult::error("tool cancellation cleanup timed out")
+                        }
+                    }
+                }
+            };
+            drop(permit);
+            outcome
+        } else {
+            ToolResult::error("tool call cancelled")
+        };
         // Peel vision content ("_images") out of the result: megabytes of
         // base64 must not land in the event log or the text transcript —
         // it becomes native image input on the tool-result message instead.
@@ -9133,6 +10217,25 @@ fn pr_evidence_from_events(
 /// reject — permanently wedging the thread. Synthesize an "interrupted"
 /// result for every tool call left unanswered, and drop empty assistant
 /// messages (they serialize to an empty content block Anthropic rejects).
+/// Provider call ids are transcript keys as well as UI/event identities.
+/// Preserve the first non-empty id and replace missing or duplicate ids
+/// before either the assistant message or concurrent execution observes
+/// them.
+fn normalize_tool_call_ids(calls: &mut [trouve_providers::ToolCallRequest]) {
+    let mut seen = HashSet::with_capacity(calls.len());
+    for call in calls {
+        if call.id.trim().is_empty() || !seen.insert(call.id.clone()) {
+            loop {
+                let id = new_id("call");
+                if seen.insert(id.clone()) {
+                    call.id = id;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut iter = messages.into_iter().peekable();
@@ -9864,6 +10967,68 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    struct BlockingToolExecutor {
+        started: tokio::sync::mpsc::UnboundedSender<String>,
+        releases: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for BlockingToolExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, name: &str) -> Option<bool> {
+            Some(name.starts_with("write_"))
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            self.started.send(name.to_string()).unwrap();
+            self.releases.acquire().await.unwrap().forget();
+            ToolResult::ok(serde_json::json!({ "tool": name }))
+        }
+    }
+
+    struct CancellationAwareToolExecutor {
+        started: Arc<tokio::sync::Semaphore>,
+        cleanup_started: Arc<tokio::sync::Semaphore>,
+        cleanup_release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CancellationAwareToolExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn execute(
+            &self,
+            ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            self.started.add_permits(1);
+            ctx.cancel.cancelled().await;
+            self.cleanup_started.add_permits(1);
+            self.cleanup_release
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap()
+                .forget();
+            ToolResult::error("tool cancelled after cleanup")
+        }
+    }
+
     #[test]
     fn session_branches_default_to_short_ids_and_can_include_title_slugs() {
         assert_eq!(
@@ -9873,6 +11038,456 @@ mod tests {
         assert_eq!(
             session_branch_name("Fix the Login Bug", "se_abc123def456", true),
             "trouve/fix-the-login-bug-abc123"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_resolves_and_removes_pending_user_questions() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_cancel_question".into(),
+            name: "cancel question".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_cancel_question".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Cancel question".into(),
+            branch: "trouve/cancel-question".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_cancel_question".into(),
+            session_id: session.id,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            let thread_id = thread.id.clone();
+            async move {
+                engine
+                    .ask_user_questions(
+                        &thread_id,
+                        1,
+                        "question-cancelled",
+                        None,
+                        Vec::new(),
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let requested = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::QuestionRequested { .. }));
+                if requested {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("question should enter its pending wait");
+
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("question wait should stop on cancellation")
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            engine.resolve_question("question-cancelled", None),
+            Err(EngineError::NotFound(_))
+        ));
+        assert!(
+            store
+                .events_after(&Scope::Thread(thread.id), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, Event::QuestionResolved { answers: None, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_collaborators_are_durable_resumable_spawned_threads() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_collaborator".into(),
+            name: "collaborator".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_collaborator".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Native collaborators".into(),
+            branch: "trouve/collab".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine =
+            Arc::new(Engine::new(store.clone(), data.path().into(), &config).with_config_dir(None));
+        let parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                mode: Some("code".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+            })
+            .unwrap();
+        store
+            .set_backend_session(&parent.id, "codex", "vendor-root")
+            .unwrap();
+
+        let mut vendor_threads = HashMap::from([("vendor-root".into(), parent.id.clone())]);
+        let mut collaborators = HashMap::new();
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                Some("Investigate the failing test".into()),
+                Some("gpt-5.6-terra".into()),
+                Some("high".into()),
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .unwrap();
+
+        let child_id = vendor_threads["vendor-child"].clone();
+        let child = engine.get_thread(&child_id).unwrap();
+        assert!(child.spawned);
+        assert_eq!(child.session_id, session.id);
+        assert_eq!(child.model, "codex/gpt-5.6-terra");
+        assert_eq!(child.permission_mode, trouve_protocol::PermissionMode::Yolo);
+        assert_eq!(
+            store.spawn_parent(&child.id).unwrap(),
+            Some(parent.id.clone())
+        );
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 0))
+        );
+        assert_eq!(
+            store.thread_model_options(&child.id).unwrap()["thinking_level"],
+            "high"
+        );
+
+        let mut claims = BackendCollaboratorClaims::new(&engine.active_threads);
+        claims.claim(&child.id, &session.id);
+        let accepted = engine
+            .send_message(&child.id, "Follow up when finished".into(), Vec::new())
+            .unwrap();
+        assert!(accepted.queued);
+        assert_eq!(store.queued_prompts(&child.id).unwrap().len(), 1);
+
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ThinkingDelta("Checking the suite.".into()),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ThinkingCompleted,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolStarted {
+                    call_id: "call-1".into(),
+                    tool: "shell".into(),
+                    args: serde_json::json!({ "command": "cargo test" }),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolOutput {
+                    call_id: "call-1".into(),
+                    chunk: "all green".into(),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolCompleted {
+                    call_id: "call-1".into(),
+                    ok: true,
+                    result: serde_json::json!({ "exit_code": 0 }),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TextDelta("The suite passes.".into()),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::Completed {
+                    usage: Usage {
+                        input_tokens: 7,
+                        cached_input_tokens: 2,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(projection.terminal);
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 2))
+        );
+
+        let events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::UserMessage { turn: 1, content, .. }
+                if content == "Investigate the failing test"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::AssistantThinking { turn: 1, text }
+                if text == "Checking the suite."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ToolCompleted { call_id, status: ToolStatus::Ok, .. }
+                if call_id == "call-1"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::AssistantMessage { turn: 1, content }
+                if content == "The suite passes."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            Event::TurnCompleted {
+                turn: 1,
+                checkpoint_id: None,
+                ..
+            }
+        )));
+        claims.release(&child.id);
+
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                Some("Run a follow-up check".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .unwrap();
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .prepare_backend_collaborator_turn(
+                &session,
+                "codex",
+                projection,
+                Some("vendor-child-turn-2"),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TurnStarted,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                Some("Also inspect the current protocol".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .unwrap();
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::UserMessage("Also inspect the current protocol".into()),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TextDelta("The follow-up passes.".into()),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::Completed {
+                    usage: Usage::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::UserMessage { turn: 2, content, .. } if content == "Run a follow-up check"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::TurnSteered { turn: 2, content, .. }
+                if content == "Also inspect the current protocol"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::TurnCompleted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 5))
+        );
+
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-grandchild".into(),
+                "vendor-child",
+                Some("Verify one more edge case".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .unwrap();
+        let grandchild_id = vendor_threads["vendor-grandchild"].clone();
+        assert_eq!(
+            store.spawn_parent(&grandchild_id).unwrap(),
+            Some(child.id.clone())
+        );
+        let grandchild = engine.get_thread(&grandchild_id).unwrap();
+        assert!(grandchild.spawned);
+        assert_eq!(grandchild.model, "codex/gpt-5.6-terra");
+        assert_eq!(
+            store.thread_model_options(&grandchild.id).unwrap()["thinking_level"],
+            "high"
         );
     }
 
@@ -10836,6 +12451,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_ids_are_non_empty_and_unique_before_execution() {
+        let mut calls = vec![
+            trouve_providers::ToolCallRequest {
+                id: String::new(),
+                name: "read_one".into(),
+                arguments: serde_json::json!({}),
+            },
+            trouve_providers::ToolCallRequest {
+                id: "provider-id".into(),
+                name: "read_two".into(),
+                arguments: serde_json::json!({}),
+            },
+            trouve_providers::ToolCallRequest {
+                id: "provider-id".into(),
+                name: "read_three".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        normalize_tool_call_ids(&mut calls);
+        assert!(calls.iter().all(|call| !call.id.is_empty()));
+        assert_eq!(calls[1].id, "provider-id");
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_ne!(calls[1].id, calls[2].id);
+    }
+
+    #[test]
     fn inherited_thinking_level_resolves_through_model_schema() {
         let mut inherited = serde_json::Map::new();
         inherit_thinking_option(&mut inherited, Some("low"), Some("high"));
@@ -11004,6 +12645,446 @@ mod tests {
         drop(second_reader);
         drop(first_reader);
         assert!(lock.try_write().is_ok());
+    }
+
+    #[test]
+    fn codex_and_claude_default_to_the_full_tool_bridge() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "claude".into(),
+            ProviderConfig {
+                kind: "claude-cli".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "claude-native".into(),
+            ProviderConfig {
+                kind: "claude-cli".into(),
+                tool_bridge: Some(false),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        let codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
+        assert!(codex.bridge_tools);
+        assert!(codex.url.contains("tools=1"));
+        assert!(codex.disallowed_tools.is_empty());
+
+        let claude = engine.mcp_bridge_for("claude/model", "th_1").unwrap();
+        assert!(claude.bridge_tools);
+        assert!(claude.disallowed_tools.iter().any(|tool| tool == "Edit"));
+
+        let native = engine
+            .mcp_bridge_for("claude-native/model", "th_1")
+            .unwrap();
+        assert!(!native.bridge_tools);
+        assert!(native.url.contains("tools=0"));
+    }
+
+    #[tokio::test]
+    async fn approved_vendor_mutation_waits_for_the_session_tool_lane() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let session = Session {
+            id: "se_vendor_lane".into(),
+            workspace_id: "ws_vendor_lane".into(),
+            title: "Vendor lane".into(),
+            branch: "trouve/vendor-lane".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let thread = Thread {
+            id: "th_vendor_lane".into(),
+            session_id: session.id.clone(),
+            mode: "code".into(),
+            model: "cursor/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let read_permit = engine.tool_execution_lock(&session.id).read_owned().await;
+        let (response, _response_rx) = tokio::sync::oneshot::channel();
+        let mut approval = engine.pending_backend_approval(
+            session,
+            thread,
+            1,
+            mode,
+            "vendor-call".into(),
+            "CommandExecution".into(),
+            serde_json::json!({}),
+            response,
+            tokio_util::sync::CancellationToken::new(),
+            true,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut approval)
+                .await
+                .is_err(),
+            "vendor mutation approval must not pass while a read permit is active"
+        );
+        drop(read_permit);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), approval)
+            .await
+            .expect("vendor mutation should acquire the lane after release");
+        assert_eq!(outcome.call_id, "vendor-call");
+        assert!(outcome.approved.unwrap());
+        assert!(outcome.mutation_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_tool_retains_execution_lane_until_cleanup_acknowledgement() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_cancel_tool".into(),
+            name: "cancel tool".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_cancel_tool".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Cancel tool".into(),
+            branch: "trouve/cancel-tool".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_cancel_tool".into(),
+            session_id: session.id.clone(),
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().into(), &Config::default()).with_executor(Arc::new(
+                CancellationAwareToolExecutor {
+                    started: started.clone(),
+                    cleanup_started: cleanup_started.clone(),
+                    cleanup_release: cleanup_release.clone(),
+                },
+            )),
+        );
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let call = trouve_providers::ToolCallRequest {
+            id: "call-cancel-tool".into(),
+            name: "write_test".into(),
+            arguments: serde_json::json!({}),
+        };
+        let execution = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .handle_tool_call(&session, &thread, 1, &mode, &ctx, &call, &cancel)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started.clone().acquire_owned(),
+        )
+        .await
+        .expect("tool should begin")
+        .unwrap()
+        .forget();
+
+        cancel.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_started.clone().acquire_owned(),
+        )
+        .await
+        .expect("tool should observe cancellation")
+        .unwrap()
+        .forget();
+        assert!(!execution.is_finished());
+        let lane = engine.tool_execution_lock(&session.id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), lane.read())
+                .await
+                .is_err(),
+            "mutation lane was released before tool cleanup completed"
+        );
+
+        cleanup_release.add_permits(1);
+        let (result, images) = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("tool call should finish after cleanup acknowledgement")
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("tool cancelled after cleanup"));
+        assert!(images.is_empty());
+
+        // A misbehaving executor that exceeds the bounded acknowledgement
+        // wait may no longer block the terminal turn state, but its mutation
+        // lane remains quarantined until the executor really returns.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let call = trouve_providers::ToolCallRequest {
+            id: "call-quarantine-tool".into(),
+            name: "write_test".into(),
+            arguments: serde_json::json!({}),
+        };
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let execution = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .handle_tool_call(&session, &thread, 2, &mode, &ctx, &call, &cancel)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started.clone().acquire_owned(),
+        )
+        .await
+        .expect("second tool should begin")
+        .unwrap()
+        .forget();
+        cancel.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_started.clone().acquire_owned(),
+        )
+        .await
+        .expect("second tool should enter cleanup")
+        .unwrap()
+        .forget();
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("engine should bound a non-acknowledging executor")
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("tool cancellation cleanup timed out"));
+        let lane = engine.tool_execution_lock(&session.id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), lane.read())
+                .await
+                .is_err(),
+            "timed-out mutation lane must remain quarantined"
+        );
+        cleanup_release.add_permits(1);
+        let _released = tokio::time::timeout(std::time::Duration::from_secs(1), lane.read())
+            .await
+            .expect("quarantined lane should release after late cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_tool_batches_overlap_reads_and_serialize_mutations() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_parallel_tools".into(),
+            name: "parallel tools".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_parallel_tools".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Parallel tools".into(),
+            branch: "trouve/parallel".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_parallel_tools".into(),
+            session_id: session.id.clone(),
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let releases = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().into(), &Config::default()).with_executor(Arc::new(
+                BlockingToolExecutor {
+                    started: started_tx,
+                    releases: releases.clone(),
+                },
+            )),
+        );
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let ctx = ToolCtx {
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let calls = |names: &[&str]| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| trouve_providers::ToolCallRequest {
+                    id: format!("call-{name}-{index}"),
+                    name: (*name).to_string(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let read_batch = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            async move {
+                engine
+                    .handle_tool_calls_parallel(
+                        &session,
+                        &thread,
+                        1,
+                        &mode,
+                        &ctx,
+                        calls(&["read_one", "read_two"]),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let mut started_reads = HashSet::new();
+        for _ in 0..2 {
+            started_reads.insert(
+                tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                    .await
+                    .expect("both read-only calls should start together")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            started_reads,
+            HashSet::from(["read_one".to_string(), "read_two".to_string()])
+        );
+        releases.add_permits(2);
+        assert!(
+            read_batch
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, result)| result.is_ok())
+        );
+
+        let write_batch = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            async move {
+                engine
+                    .handle_tool_calls_parallel(
+                        &session,
+                        &thread,
+                        2,
+                        &mode,
+                        &ctx,
+                        calls(&["write_one", "write_two"]),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let first_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("the first mutation should start")
+                .unwrap();
+        assert!(first_write.starts_with("write_"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "a second mutation must wait for the first"
+        );
+        releases.add_permits(1);
+        let second_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("the second mutation should start after release")
+                .unwrap();
+        assert!(second_write.starts_with("write_"));
+        assert_ne!(first_write, second_write);
+        releases.add_permits(1);
+        assert!(
+            write_batch
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, result)| result.is_ok())
+        );
     }
 
     #[tokio::test]

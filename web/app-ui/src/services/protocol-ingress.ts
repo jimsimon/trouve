@@ -143,6 +143,7 @@ export class ProtocolIngress {
   #metadataRefresh: Promise<void> | undefined;
   #metadataRefreshPending = false;
   #metadataRevision = 0;
+  readonly #threadRefreshes = new Map<string, boolean>();
   #serverReplayTimer: unknown;
 
   constructor(
@@ -206,6 +207,7 @@ export class ProtocolIngress {
     this.#projectionRefresh = undefined;
     this.#metadataRefresh = undefined;
     this.#metadataRefreshPending = false;
+    this.#threadRefreshes.clear();
     this.#discardServerReplay();
     this.#detachListeners();
     this.#stream?.close();
@@ -410,9 +412,39 @@ export class ProtocolIngress {
       return;
     }
     this.#onKnownEvent(event.envelope);
+    if (event.envelope.type === "thread.created" || event.envelope.type === "thread.updated") {
+      this.#scheduleThreadRefresh(event.envelope.session_id);
+    }
     if (this.#store.applyServerEvent(event.envelope)) {
       this.#metadataRevision += 1;
       this.#scheduleMetadataRefresh();
+    }
+  }
+
+  #scheduleThreadRefresh(sessionId: string): void {
+    const active = this.#threadRefreshes.has(sessionId);
+    this.#threadRefreshes.set(sessionId, active);
+    if (!active) void this.#refreshThreads(sessionId, this.#generation);
+  }
+
+  async #refreshThreads(sessionId: string, generation: number): Promise<void> {
+    while (this.#isCurrentGeneration(generation)) {
+      this.#threadRefreshes.set(sessionId, false);
+      try {
+        const threads = await this.#client.threads(sessionId);
+        if (!this.#isCurrentGeneration(generation)) return;
+        // A second lifecycle event landed while this request was in flight.
+        // Discard its stale response and fetch the final authoritative list.
+        if (this.#threadRefreshes.get(sessionId)) continue;
+        this.#store.replaceThreadsForSession(sessionId, threads);
+      } catch {
+        // Route ingress and the next lifecycle event both retry. Keep the
+        // currently rendered tabs intact when a metadata read is transiently
+        // unavailable.
+        if (this.#threadRefreshes.get(sessionId)) continue;
+      }
+      this.#threadRefreshes.delete(sessionId);
+      return;
     }
   }
 

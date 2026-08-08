@@ -107,7 +107,10 @@ impl Tool for WebFetch {
         false
     }
 
-    async fn run(&self, _ctx: &ToolCtx, args: &Value) -> ToolResult {
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("fetch cancelled");
+        }
         let Some(url) = args.get("url").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: url");
         };
@@ -130,7 +133,11 @@ impl Tool for WebFetch {
             if !matches!(current.scheme(), "http" | "https") {
                 return ToolResult::error("only http:// and https:// URLs are supported");
             }
-            let addrs = match checked_addrs(&current, self.allow_private).await {
+            let addrs = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => return ToolResult::error("fetch cancelled"),
+                result = checked_addrs(&current, self.allow_private) => result,
+            } {
                 Ok(a) => a,
                 Err(e) => return ToolResult::error(e),
             };
@@ -145,7 +152,11 @@ impl Tool for WebFetch {
                 Ok(c) => c,
                 Err(e) => return ToolResult::error(format!("http client: {e}")),
             };
-            let resp = match client.get(current.clone()).send().await {
+            let resp = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => return ToolResult::error("fetch cancelled"),
+                result = client.get(current.clone()).send() => result,
+            } {
                 Ok(r) => r,
                 Err(e) => return ToolResult::error(format!("fetch failed: {e}")),
             };
@@ -187,12 +198,25 @@ impl Tool for WebFetch {
         // Stream up to the byte cap instead of trusting Content-Length.
         let mut bytes: Vec<u8> = Vec::new();
         let mut resp = resp;
-        while let Ok(Some(chunk)) = resp.chunk().await {
-            if bytes.len() + chunk.len() > MAX_FETCH_BYTES {
-                bytes.extend_from_slice(&chunk[..MAX_FETCH_BYTES - bytes.len()]);
-                break;
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => return ToolResult::error("fetch cancelled"),
+                result = resp.chunk() => result,
+            };
+            match chunk {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > MAX_FETCH_BYTES {
+                        bytes.extend_from_slice(&chunk[..MAX_FETCH_BYTES - bytes.len()]);
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return ToolResult::error(format!("fetch body failed: {error}"));
+                }
             }
-            bytes.extend_from_slice(&chunk);
         }
 
         let is_html = content_type.contains("text/html")
@@ -211,9 +235,16 @@ impl Tool for WebFetch {
 
         let text = if is_html {
             // Blocking CPU-bound parse; keep it off the async threads.
-            match tokio::task::spawn_blocking(move || html2text::from_read(bytes.as_slice(), 100))
-                .await
-            {
+            let mut render =
+                tokio::task::spawn_blocking(move || html2text::from_read(bytes.as_slice(), 100));
+            match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    render.abort();
+                    return ToolResult::error("fetch cancelled");
+                }
+                result = &mut render => result,
+            } {
                 Ok(Ok(t)) => t,
                 Ok(Err(e)) => return ToolResult::error(format!("cannot render HTML: {e}")),
                 Err(e) => return ToolResult::error(format!("HTML render panicked: {e}")),
@@ -275,6 +306,43 @@ mod tests {
                 "unexpected error for {url}: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_a_pending_http_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(tokio::sync::Notify::new());
+        tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                accepted.notify_one();
+                std::future::pending::<()>().await;
+            }
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
+        let fetch = tokio::spawn(async move {
+            WebFetch {
+                allow_private: true,
+            }
+            .run(&ctx, &json!({"url": format!("http://{addr}/hang")}))
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), accepted.notified())
+            .await
+            .expect("test server should receive the request");
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), fetch)
+            .await
+            .expect("web fetch should acknowledge cancellation")
+            .unwrap();
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(result.result["error"], "fetch cancelled");
     }
 
     #[test]

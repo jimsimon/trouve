@@ -96,6 +96,17 @@ locating implementations, or understanding how something works.
   occurrence of an exact string before a rename) after `search` has located \
   the primary definition.";
 
+/// Full-bridge execution guidance. Vendor-native mutation tools are disabled
+/// (Claude) or confined to a read-only sandbox (Codex); the MCP bridge is the
+/// only supported path for side effects so the engine can serialize writes.
+pub const VENDOR_TOOL_BRIDGE_GUIDANCE: &str = "\
+## Tool execution
+
+Use tools from the `trouve` MCP server for every file edit, shell command, \
+git operation, or other side effect. Vendor-native mutation tools are not \
+available in this turn. Independent read-only tool calls may run in parallel; \
+trouve serializes mutation-capable calls within the session worktree.";
+
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks
 /// per repo internally, so sessions searching different repos don't

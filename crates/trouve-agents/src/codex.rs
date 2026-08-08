@@ -31,8 +31,9 @@ use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
-    AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
+    AgentBackend, BackendCollaboratorEvent, BackendError, BackendEvent, BackendEventStream,
+    BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn, async_stream,
+    binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -60,6 +61,32 @@ fn permission_settings(
         BackendPermission::ReadOnly => ("never", "read-only", "readOnly"),
         BackendPermission::Ask => ("untrusted", "danger-full-access", "dangerFullAccess"),
         BackendPermission::Yolo => ("never", "danger-full-access", "dangerFullAccess"),
+    }
+}
+
+fn sandbox_settings(
+    permission: BackendPermission,
+    full_tool_bridge: bool,
+) -> (&'static str, Value) {
+    let (_, permission_sandbox, permission_policy_type) = permission_settings(permission);
+    let (sandbox, policy_type) = if full_tool_bridge {
+        ("read-only", "readOnly")
+    } else {
+        (permission_sandbox, permission_policy_type)
+    };
+    let policy = if full_tool_bridge || matches!(permission, BackendPermission::ReadOnly) {
+        json!({ "type": policy_type, "networkAccess": true })
+    } else {
+        json!({ "type": policy_type })
+    };
+    (sandbox, policy)
+}
+
+fn approval_policy(permission: BackendPermission, full_tool_bridge: bool) -> &'static str {
+    if full_tool_bridge {
+        "never"
+    } else {
+        permission_settings(permission).0
     }
 }
 
@@ -153,7 +180,12 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
-        let server = self.server().await?;
+        let cancel = steer.cancel.clone();
+        let server = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            server = self.server() => server?,
+        };
         let mut input = Vec::with_capacity(1 + steer.attachments.len());
         if !steer.prompt.is_empty() {
             input.push(json!({ "type": "text", "text": steer.prompt }));
@@ -161,7 +193,7 @@ impl AgentBackend for CodexBackend {
         for attachment in steer.attachments {
             input.push(json!({ "type": "localImage", "path": attachment.path }));
         }
-        server.steer_turn(&steer.session, input).await
+        server.steer_turn(&steer.session, input, &cancel).await
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
@@ -169,7 +201,12 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
-        let server = self.server().await?;
+        let cancel = turn.cancel.clone();
+        let server = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            server = self.server() => server?,
+        };
 
         // Effort comes from the thread's model options; `@effort` model ids
         // from before the options split still resolve.
@@ -179,16 +216,20 @@ impl AgentBackend for CodexBackend {
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .or(id_effort);
-        let (approval_policy, sandbox, sandbox_policy_type) = permission_settings(turn.permission);
-        let sandbox_policy = if matches!(turn.permission, BackendPermission::ReadOnly) {
-            // Sandboxed read-only turns still need outbound access for
-            // fetches, remote inspection, and MCP servers.
-            json!({ "type": sandbox_policy_type, "networkAccess": true })
-        } else {
-            // dangerFullAccess has no networkAccess field: with no OS
-            // sandbox, network access is already unrestricted.
-            json!({ "type": sandbox_policy_type })
-        };
+        let full_tool_bridge = turn
+            .mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_tools);
+        // Full-bridge mutations are approved by trouve inside the MCP call.
+        // Asking Codex to approve them as well would duplicate prompts and
+        // could hold a vendor request open ahead of the engine's execution
+        // lane. Native Codex tools are read-only in this posture.
+        let approval_policy = approval_policy(turn.permission, full_tool_bridge);
+        // Codex currently has no app-server switch that removes all built-in
+        // tools. With the full bridge mounted, confine those built-ins to a
+        // read-only sandbox and route every mutation through trouve's MCP
+        // ToolExecutor instead.
+        let (sandbox, sandbox_policy) = sandbox_settings(turn.permission, full_tool_bridge);
 
         // Per-thread config overrides: request raw reasoning from models that
         // expose it and mount trouve/user MCP servers. Both thread/start and
@@ -214,21 +255,30 @@ impl AgentBackend for CodexBackend {
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request("thread/resume", with_config(json!({ "threadId": sid })))
+                    .request_cancellable(
+                        "thread/resume",
+                        with_config(json!({ "threadId": sid })),
+                        &cancel,
+                    )
                     .await;
                 match resumed {
                     Ok(v) => thread_id_of(&v)?,
+                    Err(BackendError::Cancelled) => return Err(BackendError::Cancelled),
                     Err(e) => {
                         tracing::warn!("codex thread/resume failed ({e}); starting fresh");
                         fresh_session = true;
-                        let v = server.request("thread/start", start_params.clone()).await?;
+                        let v = server
+                            .request_cancellable("thread/start", start_params.clone(), &cancel)
+                            .await?;
                         thread_id_of(&v)?
                     }
                 }
             }
             None => {
                 fresh_session = true;
-                let v = server.request("thread/start", start_params.clone()).await?;
+                let v = server
+                    .request_cancellable("thread/start", start_params.clone(), &cancel)
+                    .await?;
                 thread_id_of(&v)?
             }
         };
@@ -238,9 +288,20 @@ impl AgentBackend for CodexBackend {
         // disappeared. Await its interruption before starting a replacement;
         // otherwise Codex folds the new prompt into the old turn and its late
         // completion is misattributed to the replacement.
-        let lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+        let lifecycle = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => lifecycle,
+        };
         server.interrupt_active_turn(&codex_thread_id).await?;
-        let route = server.subscribe(&codex_thread_id).await?;
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        let route = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            route = server.subscribe(&codex_thread_id) => route?,
+        };
 
         // Mode instructions (which include the search-tool guidance when
         // the bridge is mounted) ride along in the first user message of a
@@ -271,7 +332,7 @@ impl AgentBackend for CodexBackend {
         }
         apply_reasoning_options(&mut turn_params, effort);
         let (codex_turn_id, cleanup) = match server
-            .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle)
+            .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle, &cancel)
             .await
         {
             Ok(started) => started,
@@ -287,6 +348,7 @@ impl AgentBackend for CodexBackend {
             route,
             fresh_session,
             cleanup,
+            cancel,
         );
         Ok(stream.boxed())
     }
@@ -359,6 +421,189 @@ fn agent_message_delta(
     }
 }
 
+#[derive(Default)]
+struct CollaboratorStreamState {
+    usage: Usage,
+    user_messages: HashSet<String>,
+    commentary_messages: HashSet<String>,
+    streamed_raw_reasoning: HashSet<String>,
+}
+
+fn add_usage(total: &mut Usage, current: &Usage) {
+    total.input_tokens += current.input_tokens;
+    total.cached_input_tokens += current.cached_input_tokens;
+    total.output_tokens += current.output_tokens;
+    total.context_input_tokens = current.context_input_tokens;
+    if let Some(cost) = current.cost_usd {
+        total.cost_usd = Some(total.cost_usd.unwrap_or(0.0) + cost);
+    }
+    if let Some(window) = current.context_window {
+        total.context_window = Some(window);
+    }
+}
+
+fn collaborator_user_message(item: &Value) -> Option<String> {
+    let text = item["content"]
+        .as_array()?
+        .iter()
+        .filter(|content| content["type"].as_str() == Some("text"))
+        .filter_map(|content| content["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// Translate one child-thread notification without allowing it to mutate the
+/// root turn's parser state or terminal lifecycle.
+fn collaborator_notification(
+    method: &str,
+    params: &Value,
+    state: &mut CollaboratorStreamState,
+) -> Vec<BackendCollaboratorEvent> {
+    let mut events = Vec::new();
+    match method {
+        "turn/started" => {
+            *state = CollaboratorStreamState::default();
+            events.push(BackendCollaboratorEvent::TurnStarted);
+        }
+        "item/agentMessage/delta" => {
+            let Some(delta) = params["delta"].as_str() else {
+                return events;
+            };
+            if params["itemId"]
+                .as_str()
+                .is_some_and(|id| state.commentary_messages.contains(id))
+            {
+                events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            } else {
+                events.push(BackendCollaboratorEvent::TextDelta(delta.into()));
+            }
+        }
+        "turn/plan/updated" => {
+            if let Some(todos) = codex_plan_todos(params) {
+                events.push(BackendCollaboratorEvent::TodosUpdated { todos });
+            }
+        }
+        "item/reasoning/textDelta" => {
+            if let Some(delta) = params["delta"].as_str() {
+                if let Some(id) = params["itemId"].as_str() {
+                    state.streamed_raw_reasoning.insert(id.to_string());
+                }
+                events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            }
+        }
+        "item/started" => {
+            let item = &params["item"];
+            let kind = item["type"].as_str().unwrap_or("");
+            if kind == "agentMessage"
+                && item["phase"].as_str() == Some("commentary")
+                && let Some(id) = item["id"].as_str()
+            {
+                state.commentary_messages.insert(id.to_string());
+            }
+            if kind == "userMessage"
+                && let Some(id) = item["id"].as_str()
+                && state.user_messages.insert(id.to_string())
+                && let Some(content) = collaborator_user_message(item)
+            {
+                events.push(BackendCollaboratorEvent::UserMessage(content));
+            }
+            if kind == "contextCompaction" {
+                events.push(BackendCollaboratorEvent::CompactionStarted);
+            } else if !matches!(
+                kind,
+                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+            ) {
+                events.push(BackendCollaboratorEvent::ToolStarted {
+                    call_id: item["id"].as_str().unwrap_or("").into(),
+                    tool: kind.into(),
+                    args: item.clone(),
+                });
+            }
+        }
+        "item/commandExecution/outputDelta" => {
+            if let (Some(call_id), Some(chunk)) =
+                (params["itemId"].as_str(), params["delta"].as_str())
+            {
+                events.push(BackendCollaboratorEvent::ToolOutput {
+                    call_id: call_id.into(),
+                    chunk: chunk.into(),
+                });
+            }
+        }
+        "item/completed" => {
+            let item = &params["item"];
+            let kind = item["type"].as_str().unwrap_or("");
+            if kind == "userMessage"
+                && let Some(id) = item["id"].as_str()
+                && state.user_messages.insert(id.to_string())
+                && let Some(content) = collaborator_user_message(item)
+            {
+                events.push(BackendCollaboratorEvent::UserMessage(content));
+            }
+            let raw_reasoning_streamed = kind == "reasoning"
+                && item["id"]
+                    .as_str()
+                    .is_some_and(|id| state.streamed_raw_reasoning.remove(id));
+            let mut thinking_emitted = raw_reasoning_streamed;
+            if kind == "reasoning"
+                && !raw_reasoning_streamed
+                && let Some(text) = completed_raw_reasoning_text(item)
+            {
+                thinking_emitted = true;
+                events.push(BackendCollaboratorEvent::ThinkingDelta(text));
+            }
+            let commentary_completed = kind == "agentMessage"
+                && item["id"]
+                    .as_str()
+                    .is_some_and(|id| state.commentary_messages.remove(id));
+            if thinking_emitted || commentary_completed {
+                events.push(BackendCollaboratorEvent::ThinkingCompleted);
+            }
+            if kind == "contextCompaction" {
+                events.push(if item["status"].as_str() == Some("failed") {
+                    BackendCollaboratorEvent::CompactionFailed
+                } else {
+                    BackendCollaboratorEvent::CompactionCompleted
+                });
+            } else if !matches!(
+                kind,
+                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+            ) {
+                events.push(BackendCollaboratorEvent::ToolCompleted {
+                    call_id: item["id"].as_str().unwrap_or("").into(),
+                    ok: item["status"].as_str() != Some("failed"),
+                    result: item.clone(),
+                });
+            }
+        }
+        "thread/tokenUsage/updated" => {
+            let usage = parse_usage(params);
+            add_usage(&mut state.usage, &usage);
+            events.push(BackendCollaboratorEvent::UsageUpdated { usage });
+        }
+        "turn/completed" => {
+            match params["turn"]["status"].as_str() {
+                Some("failed") => events.push(BackendCollaboratorEvent::Failed {
+                    error: params["turn"]["error"]["message"]
+                        .as_str()
+                        .unwrap_or("collaborator turn failed")
+                        .to_string(),
+                }),
+                Some("interrupted") => events.push(BackendCollaboratorEvent::Failed {
+                    error: "turn cancelled".into(),
+                }),
+                _ => events.push(BackendCollaboratorEvent::Completed {
+                    usage: state.usage.clone(),
+                }),
+            }
+            *state = CollaboratorStreamState::default();
+        }
+        _ => {}
+    }
+    events
+}
+
 /// Translate Codex's authoritative plan replacement into trouve's canonical
 /// todo snapshot. App-server plan steps do not carry ids, so use their content
 /// plus duplicate occurrence as a deterministic identity that survives plan
@@ -411,6 +656,7 @@ fn turn_stream(
     route: RouteSubscription,
     fresh_session: bool,
     cleanup: StartedTurnGuard,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
         let mut cleanup = cleanup;
@@ -436,9 +682,12 @@ fn turn_stream(
         // content already shown.
         let mut streamed_raw_reasoning = HashSet::new();
         let mut client_gone = false;
+        let mut cancelled = false;
         let mut route_overloaded = false;
         let mut route_closed = false;
         let mut terminal_params = None;
+        let mut announced_collaborators = HashSet::<(String, String)>::new();
+        let mut collaborator_states = HashMap::<String, CollaboratorStreamState>::new();
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
@@ -450,151 +699,183 @@ fn turn_stream(
                     tracing::warn!("codex: ignoring event for stale turn on {codex_thread_id}");
                     continue;
                 }
-                // Child notifications must be consumed from app-server's
-                // multiplexed transport, but they describe a separate Codex
-                // turn and must not alter or complete the parent's transcript.
-                // Child server requests still need the parent's approval
-                // handler below or the child agent can wait forever.
-                if !root_message && matches!(msg, ServerMsg::Notification { .. }) {
-                    continue;
-                }
                 match msg {
-                    ServerMsg::Notification { method, params } => match method.as_str() {
-                        "item/agentMessage/delta" => {
-                            if let Some(event) = agent_message_delta(&params, &commentary_messages)
+                    ServerMsg::Notification { method, params } => {
+                        let announcement_id =
+                            params["item"]["id"].as_str().unwrap_or("").to_string();
+                        for collaborator in collaborator_announcements(&params) {
+                            if announced_collaborators
+                                .insert((collaborator.session_id.clone(), announcement_id.clone()))
                             {
-                                let _ = tx.send(Ok(event)).await;
+                                let _ = tx
+                                    .send(Ok(BackendEvent::CollaboratorStarted {
+                                        session_id: collaborator.session_id,
+                                        parent_session_id: collaborator.parent_session_id,
+                                        prompt: collaborator.prompt,
+                                        model: collaborator.model,
+                                        thinking_level: collaborator.thinking_level,
+                                    }))
+                                    .await;
                             }
                         }
-                        "turn/plan/updated" => {
-                            if let Some(todos) = codex_plan_todos(&params) {
-                                let _ = tx.send(Ok(BackendEvent::TodosUpdated { todos })).await;
-                            } else {
-                                tracing::warn!(
-                                    "codex: ignoring malformed turn/plan/updated notification"
-                                );
+                        if !root_message {
+                            let Some(session_id) = params["threadId"].as_str() else {
+                                continue;
+                            };
+                            let state = collaborator_states
+                                .entry(session_id.to_string())
+                                .or_default();
+                            let turn_id = params_turn_id(&params).map(str::to_string);
+                            for event in collaborator_notification(&method, &params, state) {
+                                let _ = tx
+                                    .send(Ok(BackendEvent::CollaboratorEvent {
+                                        session_id: session_id.to_string(),
+                                        turn_id: turn_id.clone(),
+                                        event,
+                                    }))
+                                    .await;
                             }
+                            continue;
                         }
-                        // Raw reasoning is only exposed by some models (notably
-                        // open-source models). Summary deltas are deliberately not
-                        // used as thinking; they are section headings, while
-                        // agent-message commentary is the readable progress stream.
-                        "item/reasoning/textDelta" => {
-                            if let Some(d) = params["delta"].as_str() {
-                                if let Some(id) = params["itemId"].as_str() {
-                                    streamed_raw_reasoning.insert(id.to_string());
+                        match method.as_str() {
+                            "item/agentMessage/delta" => {
+                                if let Some(event) =
+                                    agent_message_delta(&params, &commentary_messages)
+                                {
+                                    let _ = tx.send(Ok(event)).await;
                                 }
-                                let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                             }
-                        }
-                        "item/started" => {
-                            let item = &params["item"];
-                            let ty = item["type"].as_str().unwrap_or("");
-                            if ty == "agentMessage"
-                                && item["phase"].as_str() == Some("commentary")
-                                && let Some(id) = item["id"].as_str()
-                            {
-                                commentary_messages.insert(id.to_string());
-                            }
-                            if ty == "contextCompaction" {
-                                let _ = tx.send(Ok(BackendEvent::CompactionStarted)).await;
-                            } else if !matches!(
-                                ty,
-                                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
-                            ) {
-                                let _ = tx
-                                    .send(Ok(BackendEvent::ToolStarted {
-                                        call_id: item["id"].as_str().unwrap_or("").into(),
-                                        tool: ty.into(),
-                                        args: item.clone(),
-                                    }))
-                                    .await;
-                            }
-                        }
-                        "item/commandExecution/outputDelta" => {
-                            if let (Some(id), Some(d)) =
-                                (params["itemId"].as_str(), params["delta"].as_str())
-                            {
-                                let _ = tx
-                                    .send(Ok(BackendEvent::ToolOutput {
-                                        call_id: id.into(),
-                                        chunk: d.into(),
-                                    }))
-                                    .await;
-                            }
-                        }
-                        "item/completed" => {
-                            let item = &params["item"];
-                            let ty = item["type"].as_str().unwrap_or("");
-                            let raw_reasoning_streamed = ty == "reasoning"
-                                && item["id"]
-                                    .as_str()
-                                    .is_some_and(|id| streamed_raw_reasoning.remove(id));
-                            let mut thinking_emitted = raw_reasoning_streamed;
-                            if ty == "reasoning"
-                                && !raw_reasoning_streamed
-                                && let Some(text) = completed_raw_reasoning_text(item)
-                            {
-                                thinking_emitted = true;
-                                let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
-                            }
-                            let commentary_completed = ty == "agentMessage"
-                                && item["id"]
-                                    .as_str()
-                                    .is_some_and(|id| commentary_messages.remove(id));
-                            if thinking_emitted || commentary_completed {
-                                let _ = tx.send(Ok(BackendEvent::ThinkingCompleted)).await;
-                            }
-                            if ty == "contextCompaction" {
-                                let event = if item["status"].as_str() == Some("failed") {
-                                    BackendEvent::CompactionFailed
+                            "turn/plan/updated" => {
+                                if let Some(todos) = codex_plan_todos(&params) {
+                                    let _ = tx.send(Ok(BackendEvent::TodosUpdated { todos })).await;
                                 } else {
-                                    BackendEvent::CompactionCompleted
-                                };
-                                let _ = tx.send(Ok(event)).await;
-                            } else if !matches!(
-                                ty,
-                                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
-                            ) {
-                                let failed = item["status"].as_str() == Some("failed");
-                                let _ = tx
-                                    .send(Ok(BackendEvent::ToolCompleted {
-                                        call_id: item["id"].as_str().unwrap_or("").into(),
-                                        ok: !failed,
-                                        result: item.clone(),
-                                    }))
-                                    .await;
+                                    tracing::warn!(
+                                        "codex: ignoring malformed turn/plan/updated notification"
+                                    );
+                                }
                             }
-                        }
-                        "thread/tokenUsage/updated" => {
-                            // One update per model call. Aggregate its billing
-                            // counters for the final turn usage, but retain the
-                            // newest call's authoritative context measurement.
-                            // Publish the per-call value immediately so clients
-                            // follow a vendor-owned compaction without waiting
-                            // for the turn to end.
-                            let u = parse_usage(&params);
-                            usage.input_tokens += u.input_tokens;
-                            usage.cached_input_tokens += u.cached_input_tokens;
-                            usage.output_tokens += u.output_tokens;
-                            usage.context_input_tokens = u.context_input_tokens;
-                            if let Some(cost) = u.cost_usd {
-                                usage.cost_usd = Some(usage.cost_usd.unwrap_or(0.0) + cost);
+                            // Raw reasoning is only exposed by some models (notably
+                            // open-source models). Summary deltas are deliberately not
+                            // used as thinking; they are section headings, while
+                            // agent-message commentary is the readable progress stream.
+                            "item/reasoning/textDelta" => {
+                                if let Some(d) = params["delta"].as_str() {
+                                    if let Some(id) = params["itemId"].as_str() {
+                                        streamed_raw_reasoning.insert(id.to_string());
+                                    }
+                                    let _ =
+                                        tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                                }
                             }
-                            if let Some(n) = u.context_window {
-                                usage.context_window = Some(n);
+                            "item/started" => {
+                                let item = &params["item"];
+                                let ty = item["type"].as_str().unwrap_or("");
+                                if ty == "agentMessage"
+                                    && item["phase"].as_str() == Some("commentary")
+                                    && let Some(id) = item["id"].as_str()
+                                {
+                                    commentary_messages.insert(id.to_string());
+                                }
+                                if ty == "contextCompaction" {
+                                    let _ = tx.send(Ok(BackendEvent::CompactionStarted)).await;
+                                } else if !matches!(
+                                    ty,
+                                    "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                                ) {
+                                    let _ = tx
+                                        .send(Ok(BackendEvent::ToolStarted {
+                                            call_id: item["id"].as_str().unwrap_or("").into(),
+                                            tool: ty.into(),
+                                            args: item.clone(),
+                                        }))
+                                        .await;
+                                }
                             }
-                            let _ = tx.send(Ok(BackendEvent::UsageUpdated { usage: u })).await;
+                            "item/commandExecution/outputDelta" => {
+                                if let (Some(id), Some(d)) =
+                                    (params["itemId"].as_str(), params["delta"].as_str())
+                                {
+                                    let _ = tx
+                                        .send(Ok(BackendEvent::ToolOutput {
+                                            call_id: id.into(),
+                                            chunk: d.into(),
+                                        }))
+                                        .await;
+                                }
+                            }
+                            "item/completed" => {
+                                let item = &params["item"];
+                                let ty = item["type"].as_str().unwrap_or("");
+                                let raw_reasoning_streamed = ty == "reasoning"
+                                    && item["id"]
+                                        .as_str()
+                                        .is_some_and(|id| streamed_raw_reasoning.remove(id));
+                                let mut thinking_emitted = raw_reasoning_streamed;
+                                if ty == "reasoning"
+                                    && !raw_reasoning_streamed
+                                    && let Some(text) = completed_raw_reasoning_text(item)
+                                {
+                                    thinking_emitted = true;
+                                    let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
+                                }
+                                let commentary_completed = ty == "agentMessage"
+                                    && item["id"]
+                                        .as_str()
+                                        .is_some_and(|id| commentary_messages.remove(id));
+                                if thinking_emitted || commentary_completed {
+                                    let _ = tx.send(Ok(BackendEvent::ThinkingCompleted)).await;
+                                }
+                                if ty == "contextCompaction" {
+                                    let event = if item["status"].as_str() == Some("failed") {
+                                        BackendEvent::CompactionFailed
+                                    } else {
+                                        BackendEvent::CompactionCompleted
+                                    };
+                                    let _ = tx.send(Ok(event)).await;
+                                } else if !matches!(
+                                    ty,
+                                    "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                                ) {
+                                    let failed = item["status"].as_str() == Some("failed");
+                                    let _ = tx
+                                        .send(Ok(BackendEvent::ToolCompleted {
+                                            call_id: item["id"].as_str().unwrap_or("").into(),
+                                            ok: !failed,
+                                            result: item.clone(),
+                                        }))
+                                        .await;
+                                }
+                            }
+                            "thread/tokenUsage/updated" => {
+                                // One update per model call. Aggregate its billing
+                                // counters for the final turn usage, but retain the
+                                // newest call's authoritative context measurement.
+                                // Publish the per-call value immediately so clients
+                                // follow a vendor-owned compaction without waiting
+                                // for the turn to end.
+                                let u = parse_usage(&params);
+                                usage.input_tokens += u.input_tokens;
+                                usage.cached_input_tokens += u.cached_input_tokens;
+                                usage.output_tokens += u.output_tokens;
+                                usage.context_input_tokens = u.context_input_tokens;
+                                if let Some(cost) = u.cost_usd {
+                                    usage.cost_usd = Some(usage.cost_usd.unwrap_or(0.0) + cost);
+                                }
+                                if let Some(n) = u.context_window {
+                                    usage.context_window = Some(n);
+                                }
+                                let _ = tx.send(Ok(BackendEvent::UsageUpdated { usage: u })).await;
+                            }
+                            "turn/completed" => {
+                                // Record terminal state without awaiting. Once the
+                                // event is dequeued, transport closure must not
+                                // cancel its lifecycle cleanup or publication.
+                                terminal_params = Some(params);
+                                break;
+                            }
+                            _ => {}
                         }
-                        "turn/completed" => {
-                            // Record terminal state without awaiting. Once the
-                            // event is dequeued, transport closure must not
-                            // cancel its lifecycle cleanup or publication.
-                            terminal_params = Some(params);
-                            break;
-                        }
-                        _ => {}
-                    },
+                    }
                     ServerMsg::Request { id, method, params } => {
                         // MCP tool-call permission elicitation (codex's rmcp
                         // client asks before every MCP tool call). The trouve
@@ -614,14 +895,40 @@ fn turn_stream(
                             // concurrent MCP approvals cannot overwrite the same
                             // empty ApprovalHub key.
                             let call_id = format!("codex-mcp-{}", json_rpc_id(&id));
-                            let _ = tx
-                                .send(Ok(BackendEvent::ApprovalNeeded {
+                            let approval = BackendCollaboratorEvent::ApprovalNeeded {
+                                call_id: call_id.clone(),
+                                tool: "mcpToolCall".into(),
+                                args: params.clone(),
+                                responder: ok_tx,
+                            };
+                            let event = if !root_message {
+                                params["threadId"].as_str().map(|session_id| {
+                                    BackendEvent::CollaboratorEvent {
+                                        session_id: session_id.to_string(),
+                                        turn_id: params_turn_id(&params).map(str::to_string),
+                                        event: approval,
+                                    }
+                                })
+                            } else {
+                                let BackendCollaboratorEvent::ApprovalNeeded {
                                     call_id,
-                                    tool: "mcpToolCall".into(),
-                                    args: params.clone(),
-                                    responder: ok_tx,
-                                }))
-                                .await;
+                                    tool,
+                                    args,
+                                    responder,
+                                } = approval
+                                else {
+                                    unreachable!()
+                                };
+                                Some(BackendEvent::ApprovalNeeded {
+                                    call_id,
+                                    tool,
+                                    args,
+                                    responder,
+                                })
+                            };
+                            if let Some(event) = event {
+                                let _ = tx.send(Ok(event)).await;
+                            }
                             let action = if ok_rx.await.unwrap_or(false) {
                                 "accept"
                             } else {
@@ -647,14 +954,31 @@ fn turn_stream(
                         };
                         let (ok_tx, ok_rx) = oneshot::channel();
                         let call_id = params["itemId"].as_str().unwrap_or("").to_string();
-                        let _ = tx
-                            .send(Ok(BackendEvent::ApprovalNeeded {
-                                call_id,
-                                tool: tool.into(),
-                                args: params.clone(),
-                                responder: ok_tx,
-                            }))
-                            .await;
+                        if !root_message {
+                            if let Some(session_id) = params["threadId"].as_str() {
+                                let _ = tx
+                                    .send(Ok(BackendEvent::CollaboratorEvent {
+                                        session_id: session_id.to_string(),
+                                        turn_id: params_turn_id(&params).map(str::to_string),
+                                        event: BackendCollaboratorEvent::ApprovalNeeded {
+                                            call_id,
+                                            tool: tool.into(),
+                                            args: params.clone(),
+                                            responder: ok_tx,
+                                        },
+                                    }))
+                                    .await;
+                            }
+                        } else {
+                            let _ = tx
+                                .send(Ok(BackendEvent::ApprovalNeeded {
+                                    call_id,
+                                    tool: tool.into(),
+                                    args: params.clone(),
+                                    responder: ok_tx,
+                                }))
+                                .await;
+                        }
                         let approved = ok_rx.await.unwrap_or(false);
                         // ReviewDecision: "decline" (vs "abort") lets the agent
                         // continue and explain instead of killing the turn.
@@ -666,6 +990,9 @@ fn turn_stream(
         };
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => {
+                cancelled = true;
+            }
             _ = tx.closed() => {
                 client_gone = true;
             }
@@ -705,9 +1032,13 @@ fn turn_stream(
             return;
         }
         let _cleanup_lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
-        if client_gone {
+        if cancelled || client_gone {
             server
-                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
+                .cleanup_active_turn_best_effort(
+                    &codex_thread_id,
+                    &codex_turn_id,
+                    if cancelled { "cancelled" } else { "abandoned" },
+                )
                 .await;
         } else if route_overloaded {
             let _ = tx
@@ -741,7 +1072,10 @@ fn turn_stream(
 
 /// Extract the vendor turn identity from every documented event shape.
 fn message_turn_id(message: &ServerMsg) -> Option<&str> {
-    let params = message_params(message);
+    params_turn_id(message_params(message))
+}
+
+fn params_turn_id(params: &Value) -> Option<&str> {
     params["turnId"]
         .as_str()
         .or_else(|| params["turn"]["id"].as_str())
@@ -769,15 +1103,94 @@ fn message_params(message: &ServerMsg) -> &Value {
 fn announced_child_threads(message: &ServerMsg) -> Vec<&str> {
     let item = &message_params(message)["item"];
     match item["type"].as_str() {
-        Some("collabAgentToolCall") => item["receiverThreadIds"]
-            .as_array()
+        Some("collabAgentToolCall") => {
+            let mut children: Vec<&str> = item["receiverThreadIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if let Some(states) = item["agentsStates"].as_object() {
+                children.extend(states.keys().map(String::as_str));
+            }
+            children.sort_unstable();
+            children.dedup();
+            children
+        }
+        Some("collabToolCall") => ["newThreadId", "receiverThreadId"]
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+            .filter_map(|key| item[key].as_str())
             .collect(),
         Some("subAgentActivity") => item["agentThreadId"].as_str().into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+struct CollaboratorAnnouncement {
+    session_id: String,
+    parent_session_id: String,
+    prompt: Option<String>,
+    model: Option<String>,
+    thinking_level: Option<String>,
+}
+
+/// Rich counterpart to `announced_child_threads`, used by the backend event
+/// bridge after routing has authenticated the parent/child relationship.
+fn collaborator_announcements(params: &Value) -> Vec<CollaboratorAnnouncement> {
+    let item = &params["item"];
+    let kind = item["type"].as_str().unwrap_or("");
+    if !matches!(
+        kind,
+        "collabAgentToolCall" | "collabToolCall" | "subAgentActivity"
+    ) {
+        return Vec::new();
+    }
+    let parent_session_id = item["senderThreadId"]
+        .as_str()
+        .or_else(|| params["threadId"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if parent_session_id.is_empty() {
+        return Vec::new();
+    }
+    let mut session_ids = match kind {
+        "collabAgentToolCall" => {
+            let mut ids: Vec<String> = item["receiverThreadIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            if let Some(states) = item["agentsStates"].as_object() {
+                ids.extend(states.keys().cloned());
+            }
+            ids
+        }
+        "collabToolCall" => ["newThreadId", "receiverThreadId"]
+            .into_iter()
+            .filter_map(|key| item[key].as_str().map(str::to_string))
+            .collect(),
+        "subAgentActivity" => item["agentThreadId"]
+            .as_str()
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    session_ids.sort_unstable();
+    session_ids.dedup();
+    session_ids
+        .into_iter()
+        .filter(|session_id| session_id != &parent_session_id)
+        .map(|session_id| CollaboratorAnnouncement {
+            session_id,
+            parent_session_id: parent_session_id.clone(),
+            prompt: item["prompt"].as_str().map(str::to_string),
+            model: item["model"].as_str().map(str::to_string),
+            thinking_level: item["reasoningEffort"].as_str().map(str::to_string),
+        })
+        .collect()
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -950,6 +1363,7 @@ const ROUTE_TOMBSTONE_BUDGET: usize = ROUTE_EVENT_BUDGET * 4;
 const UNKNOWN_BUFFER_BUDGET: usize = 64;
 const CANCELLED_START_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INTERRUPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1293,6 +1707,10 @@ struct BufferedRoute {
     messages: Vec<BufferedMessage>,
     request_overloaded: bool,
     announcement_overloaded: bool,
+    /// Child transcript arrived faster than ownership could be established.
+    /// Once the parent adopts it, fail closed rather than publishing a
+    /// durable collaborator thread with missing output.
+    notification_overloaded: bool,
     /// Turn identities for messages lost from an inactive root route. `None`
     /// means the loss was thread-scoped and therefore applies to whichever
     /// turn activates the route.
@@ -1498,10 +1916,9 @@ impl RoutingState {
             return;
         }
         if matches!(&message, ServerMsg::Request { .. }) {
-            // Unknown child transcript notifications are disposable once
-            // ownership is learned, but requests and nested ownership
-            // announcements are not. Prefer a request over an older ordinary
-            // notification when the buffer is full.
+            // Requests and nested ownership announcements must still win a
+            // full pre-ownership buffer. Remember any evicted transcript so
+            // adoption fails closed instead of projecting partial history.
             if let Some(index) = route.messages.iter().position(|buffered| {
                 matches!(buffered.message, ServerMsg::Notification { .. })
                     && (root_buffer || announced_child_threads(&buffered.message).is_empty())
@@ -1511,6 +1928,8 @@ impl RoutingState {
                     route
                         .root_overflowed_turns
                         .insert(message_turn_id(&removed.message).map(str::to_string));
+                } else {
+                    route.notification_overloaded = true;
                 }
                 route.messages.push(BufferedMessage {
                     message,
@@ -1535,6 +1954,7 @@ impl RoutingState {
                     && announced_child_threads(&buffered.message).is_empty()
             }) {
                 route.messages.remove(index);
+                route.notification_overloaded = true;
                 route.messages.push(BufferedMessage {
                     message,
                     root_generation,
@@ -1542,9 +1962,9 @@ impl RoutingState {
             } else {
                 route.announcement_overloaded = true;
             }
+        } else {
+            route.notification_overloaded = true;
         }
-        // Unknown-child transcript notifications are intentionally disposable;
-        // once adopted, child notifications are not forwarded to the parent.
     }
 
     fn descendant_ids(&self, root_thread_id: &str) -> Vec<String> {
@@ -1596,8 +2016,8 @@ impl RoutingState {
     }
 
     /// Route one message and learn descendant ownership only from the exact
-    /// active root turn. Known-child notifications are inspected for nested
-    /// announcements but never consume the parent's bounded event channel.
+    /// active root turn. Parent and authenticated descendant events share one
+    /// bounded channel so their transport order is preserved end to end.
     fn route_message(&mut self, message: ServerMsg) {
         let thread_id = message_thread_id(&message).unwrap_or("");
         if Self::child_key(thread_id, &message)
@@ -1745,8 +2165,12 @@ impl RoutingState {
                     None => message_generation == Some(root_generation),
                 }
             };
-            let forward = !child_message || matches!(&message, ServerMsg::Request { .. });
-            if forward {
+            let child_terminal = child_message
+                && matches!(
+                    &message,
+                    ServerMsg::Notification { method, .. } if method == "turn/completed"
+                );
+            {
                 let rejection = Self::decline_response(&message);
                 match tx.try_send(message) {
                     Ok(()) => {
@@ -1769,6 +2193,9 @@ impl RoutingState {
                         continue;
                     }
                 }
+            }
+            if child_terminal && let Some(owner) = self.owners.remove(&thread_id) {
+                self.retire_owner(thread_id.clone(), owner);
             }
 
             if can_announce_children {
@@ -1845,10 +2272,12 @@ impl RoutingState {
                             continue;
                         }
                         queue.extend(buffered_route.messages);
-                        // Notification-only overflow is harmless for a child;
-                        // those events are intentionally discarded above.
+                        // Any child overflow makes its durable projection
+                        // incomplete, so fail the owning stream closed after
+                        // draining the retained prefix.
                         if buffered_route.request_overloaded
                             || buffered_route.announcement_overloaded
+                            || buffered_route.notification_overloaded
                         {
                             overload_after_drain.push(tx.clone());
                         }
@@ -2407,29 +2836,78 @@ impl AppServer {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
+        self.request_with_cancel(method, params, None).await
+    }
+
+    async fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.request_with_cancel(method, params, Some(cancel)).await
+    }
+
+    async fn request_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Value, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        if let Err(error) = self
-            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await
-        {
+        let write =
+            self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        let written = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                result = write => result,
+            },
+            None => write.await,
+        };
+        if let Err(error) = written {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        match rx.await {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
-            Err(_) => Err(BackendError::Protocol(format!(
-                "{method}: app-server closed before responding"
-            ))),
+        let response = async {
+            match tokio::time::timeout(REQUEST_RESPONSE_TIMEOUT, rx).await {
+                Ok(response) => response.map_err(|_| {
+                    BackendError::Protocol(format!("{method}: app-server closed before responding"))
+                }),
+                Err(_) => Err(BackendError::Protocol(format!(
+                    "{method}: no response within {}s",
+                    REQUEST_RESPONSE_TIMEOUT.as_secs()
+                ))),
+            }
+        };
+        let response = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                response = response => response,
+            },
+            None => response.await,
+        };
+        if response.is_err() {
+            self.pending.lock().await.remove(&id);
+        }
+        match response? {
+            Ok(v) => Ok(v),
+            Err(e) => Err(BackendError::Protocol(format!("{method}: {e}"))),
         }
     }
 
     /// Append input to the exact turn currently active on a Codex thread.
     /// `expectedTurnId` makes a completion/replacement race fail closed
     /// instead of steering whichever turn happens to run next.
-    async fn steer_turn(&self, thread_id: &str, input: Vec<Value>) -> Result<(), BackendError> {
+    async fn steer_turn(
+        &self,
+        thread_id: &str,
+        input: Vec<Value>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), BackendError> {
         let expected_turn_id = self
             .active_turns
             .lock()
@@ -2442,13 +2920,14 @@ impl AppServer {
                 ))
             })?;
         let response = self
-            .request(
+            .request_cancellable(
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
                     "input": input,
                     "expectedTurnId": expected_turn_id,
                 }),
+                cancel,
             )
             .await?;
         let returned_turn_id = turn_id_of(&response)?;
@@ -2486,6 +2965,7 @@ impl AppServer {
         route_tx: &RouteSender<ServerMsg>,
         params: Value,
         lifecycle: TurnLifecycleGuard,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, StartedTurnGuard), BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -2500,22 +2980,46 @@ impl AppServer {
             lifecycle,
         );
         self.pending.lock().await.insert(id, tx);
-        if let Err(error) = self
-            .write_tracking(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": "turn/start",
-                    "params": params,
-                }),
-                Some(&write_started),
-            )
-            .await
-        {
+        let write = self.write_tracking(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "turn/start",
+                "params": params,
+            }),
+            Some(&write_started),
+        );
+        let written = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            result = write => result,
+        };
+        if let Err(error) = written {
             self.pending.lock().await.remove(&id);
+            drop(cleanup);
+            // The guard's Drop owns exact-turn recovery. Reacquiring the
+            // lifecycle is its acknowledgement that recovery/interrupt and
+            // route cleanup have finished.
+            drop(self.lock_turn_lifecycle(thread_id).await);
             return Err(error);
         }
-        let started = cleanup.wait_for_response().await?;
+        let started = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                drop(cleanup);
+                drop(self.lock_turn_lifecycle(thread_id).await);
+                return Err(BackendError::Cancelled);
+            }
+            response = cleanup.wait_for_response() => response,
+        };
+        let started = match started {
+            Ok(started) => started,
+            Err(error) => {
+                drop(cleanup);
+                drop(self.lock_turn_lifecycle(thread_id).await);
+                return Err(error);
+            }
+        };
         let turn_id = match turn_id_of(&started) {
             Ok(turn_id) => turn_id,
             Err(error) => {
@@ -2527,7 +3031,16 @@ impl AppServer {
         };
         cleanup.turn_id = Some(turn_id.clone());
         self.register_active_turn(thread_id, &turn_id).await;
-        self.activate_route(thread_id, &turn_id, route_tx).await?;
+        let activated = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            result = self.activate_route(thread_id, &turn_id, route_tx) => result,
+        };
+        if let Err(error) = activated {
+            drop(cleanup);
+            drop(self.lock_turn_lifecycle(thread_id).await);
+            return Err(error);
+        }
         // No await may follow this release: the active marker and route are
         // now atomically visible to the next lifecycle owner.
         cleanup.finish_startup();
@@ -2801,6 +3314,7 @@ mod tests {
 
     fn bare_turn() -> crate::BackendTurn {
         crate::BackendTurn {
+            cancel: Default::default(),
             thread_id: "th_1".into(),
             worktree: "/tmp".into(),
             session: None,
@@ -3043,15 +3557,14 @@ mod tests {
     }
 
     #[test]
-    fn child_notifications_never_fill_the_parent_route() {
+    fn child_notifications_preserve_parent_transport_order() {
         let mut routing = RoutingState::default();
         let (root_tx, mut root_rx) = route_channel();
         routing.subscribe("root", root_tx.clone());
         routing.activate_route("root", "root-turn", &root_tx);
         routing.route_message(spawn_notification("root", "root-turn", "child"));
-        assert!(root_rx.try_recv().is_ok());
 
-        for sequence in 0..=ROUTE_EVENT_BUDGET {
+        for sequence in 0..3 {
             routing.route_message(ServerMsg::Notification {
                 method: "item/agentMessage/delta".into(),
                 params: json!({
@@ -3061,20 +3574,29 @@ mod tests {
                 }),
             });
         }
+        routing.route_message(ServerMsg::Notification {
+            method: "thread/status/changed".into(),
+            params: json!({ "threadId": "root", "turnId": "root-turn" }),
+        });
 
-        assert!(root_rx.try_recv().is_err());
-        assert!(
-            root_tx
-                .try_send(ServerMsg::Notification {
-                    method: "thread/status/changed".into(),
-                    params: json!({ "threadId": "root" }),
-                })
-                .is_ok()
-        );
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Notification { method, .. }) if method == "item/started"
+        ));
+        for sequence in 0..3 {
+            let ServerMsg::Notification { params, .. } = root_rx.try_recv().unwrap() else {
+                panic!("collaborator notification should use the ordered turn route");
+            };
+            assert_eq!(params["delta"], sequence.to_string());
+        }
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Notification { method, .. }) if method == "thread/status/changed"
+        ));
     }
 
     #[tokio::test]
-    async fn notification_overflow_before_announcement_does_not_fail_parent() {
+    async fn notification_overflow_before_announcement_fails_projection_closed() {
         let mut routing = RoutingState::default();
         for sequence in 0..=ROUTE_EVENT_BUDGET {
             routing.route_message(ServerMsg::Notification {
@@ -3101,13 +3623,12 @@ mod tests {
             root_rx.recv().await,
             Some(ServerMsg::Request { id, .. }) if id == 9
         ));
-        assert!(
-            root_tx
-                .try_send(ServerMsg::Notification {
-                    method: "thread/status/changed".into(),
-                    params: json!({ "threadId": "root" }),
-                })
-                .is_ok()
+        assert_eq!(
+            root_tx.try_send(ServerMsg::Notification {
+                method: "thread/status/changed".into(),
+                params: json!({ "threadId": "root" }),
+            }),
+            Err(RouteSendError::Overloaded)
         );
     }
 
@@ -3139,13 +3660,12 @@ mod tests {
 
         assert!(root_rx.try_recv().is_ok());
         assert!(routing.owners.contains_key("grandchild"));
-        assert!(
-            root_tx
-                .try_send(ServerMsg::Notification {
-                    method: "thread/status/changed".into(),
-                    params: json!({ "threadId": "root" }),
-                })
-                .is_ok()
+        assert_eq!(
+            root_tx.try_send(ServerMsg::Notification {
+                method: "thread/status/changed".into(),
+                params: json!({ "threadId": "root" }),
+            }),
+            Err(RouteSendError::Overloaded)
         );
     }
 
@@ -3390,7 +3910,15 @@ mod tests {
         });
 
         routing.route_message(spawn_notification("root", "root-turn", "child"));
-        assert!(root_rx.try_recv().is_ok());
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Notification { method, params })
+                if method == "item/agentMessage/delta" && params["delta"] == "live"
+        ));
+        assert!(matches!(
+            root_rx.try_recv(),
+            Ok(ServerMsg::Notification { method, .. }) if method == "item/started"
+        ));
         assert_eq!(
             routing.owners["child"].child_turn_id.as_deref(),
             Some("child-turn")
@@ -3724,6 +4252,165 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn collaborator_announcements_preserve_parent_prompt_and_model_metadata() {
+        let params = json!({
+            "threadId": "root",
+            "item": {
+                "type": "collabAgentToolCall",
+                "tool": "spawnAgent",
+                "senderThreadId": "root",
+                "receiverThreadIds": ["child"],
+                "prompt": "Inspect the router",
+                "model": "gpt-5.6-sol",
+                "reasoningEffort": "max",
+                "agentsStates": { "child": { "status": "running" } }
+            }
+        });
+
+        let announcements = collaborator_announcements(&params);
+        assert_eq!(announcements.len(), 1);
+        let child = &announcements[0];
+        assert_eq!(child.session_id, "child");
+        assert_eq!(child.parent_session_id, "root");
+        assert_eq!(child.prompt.as_deref(), Some("Inspect the router"));
+        assert_eq!(child.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(child.thinking_level.as_deref(), Some("max"));
+
+        let current = json!({
+            "threadId": "root",
+            "item": {
+                "type": "collabToolCall",
+                "tool": "spawn_agent",
+                "senderThreadId": "root",
+                "newThreadId": "current-child",
+                "prompt": "Inspect the current protocol"
+            }
+        });
+        let announcements = collaborator_announcements(&current);
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].session_id, "current-child");
+        assert_eq!(announcements[0].parent_session_id, "root");
+        assert_eq!(
+            announcements[0].prompt.as_deref(),
+            Some("Inspect the current protocol")
+        );
+        assert_eq!(
+            announced_child_threads(&ServerMsg::Notification {
+                method: "item/started".into(),
+                params: current,
+            }),
+            vec!["current-child"]
+        );
+    }
+
+    #[test]
+    fn collaborator_parser_keeps_child_thinking_tools_and_completion_scoped() {
+        let mut state = CollaboratorStreamState::default();
+        assert!(matches!(
+            collaborator_notification(
+                "turn/started",
+                &json!({ "turn": { "id": "child-turn" } }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::TurnStarted]
+        ));
+        assert!(matches!(
+            collaborator_notification(
+                "item/started",
+                &json!({
+                    "item": {
+                        "id": "prompt",
+                        "type": "userMessage",
+                        "content": [{ "type": "text", "text": "Inspect the router" }]
+                    }
+                }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::UserMessage(text)] if text == "Inspect the router"
+        ));
+        assert!(
+            collaborator_notification(
+                "item/completed",
+                &json!({
+                    "item": {
+                        "id": "prompt",
+                        "type": "userMessage",
+                        "content": [{ "type": "text", "text": "Inspect the router" }]
+                    }
+                }),
+                &mut state,
+            )
+            .is_empty(),
+            "the completed item must not repeat its started user message"
+        );
+        assert!(
+            collaborator_notification(
+                "item/started",
+                &json!({
+                    "item": { "id": "thought", "type": "agentMessage", "phase": "commentary" }
+                }),
+                &mut state,
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            collaborator_notification(
+                "item/agentMessage/delta",
+                &json!({ "itemId": "thought", "delta": "Checking." }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::ThinkingDelta(text)] if text == "Checking."
+        ));
+        assert!(matches!(
+            collaborator_notification(
+                "item/started",
+                &json!({ "item": { "id": "command", "type": "commandExecution" } }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::ToolStarted { call_id, tool, .. }]
+                if call_id == "command" && tool == "commandExecution"
+        ));
+        collaborator_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 12,
+                        "cachedInputTokens": 3,
+                        "outputTokens": 4
+                    }
+                }
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            collaborator_notification(
+                "turn/completed",
+                &json!({ "turn": { "status": "completed" } }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::Completed { usage }]
+                if usage.input_tokens == 9
+                    && usage.cached_input_tokens == 3
+                    && usage.output_tokens == 4
+        ));
+        assert!(matches!(
+            collaborator_notification(
+                "turn/completed",
+                &json!({ "turn": { "status": "interrupted" } }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::Failed { error }] if error == "turn cancelled"
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn steer_turn_targets_the_exact_active_codex_turn() {
@@ -3747,7 +4434,11 @@ cat > /dev/null
         let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
         assert!(matches!(
             server
-                .steer_turn("thread-1", vec![json!({ "type": "text", "text": "early" })])
+                .steer_turn(
+                    "thread-1",
+                    vec![json!({ "type": "text", "text": "early" })],
+                    &Default::default(),
+                )
                 .await,
             Err(BackendError::Protocol(message)) if message.contains("no active turn")
         ));
@@ -3763,6 +4454,7 @@ cat > /dev/null
                     json!({ "type": "text", "text": "Focus on the regression." }),
                     json!({ "type": "localImage", "path": "/tmp/screenshot.png" }),
                 ],
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -3779,6 +4471,64 @@ cat > /dev/null
                 { "type": "localImage", "path": "/tmp/screenshot.png" },
             ])
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steer_turn_wait_is_cancellation_aware() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-steer-cancel");
+        let request_marker = std::path::PathBuf::from(format!("{}.request", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r request
+printf '%s\n' "$request" > "$0.request"
+sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        server
+            .active_turns
+            .lock()
+            .await
+            .insert("thread-1".into(), "turn-1".into());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let steering = tokio::spawn({
+            let server = server.clone();
+            let cancel = cancel.clone();
+            async move {
+                server
+                    .steer_turn(
+                        "thread-1",
+                        vec![json!({ "type": "text", "text": "new direction" })],
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !request_marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("steering request should reach Codex");
+
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), steering)
+                .await
+                .expect("steering wait should stop on cancellation")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        assert!(server.pending.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -4119,21 +4869,31 @@ cat > /dev/null
         };
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await.unwrap();
-        {
-            let start =
-                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
-            tokio::pin!(start);
-            tokio::select! {
-                _ = &mut start => panic!("turn/start unexpectedly completed"),
-                _ = async {
-                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        while !started_marker.exists() {
-                            tokio::task::yield_now().await;
-                        }
-                    }).await.expect("stub should receive turn/start");
-                } => {}
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let starting = tokio::spawn({
+            let server = server.clone();
+            let route_tx = route.tx.clone();
+            let cancel = cancel.clone();
+            async move {
+                server
+                    .start_turn(
+                        "root",
+                        &route_tx,
+                        json!({ "threadId": "root" }),
+                        lifecycle,
+                        &cancel,
+                    )
+                    .await
             }
-        }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started_marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stub should receive turn/start");
+        cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !interrupt_marker.exists() {
                 tokio::task::yield_now().await;
@@ -4161,6 +4921,10 @@ cat > /dev/null
             !acquired_marker.exists(),
             "replacement must not acquire lifecycle before interrupt completes"
         );
+        assert!(
+            !starting.is_finished(),
+            "cancelled turn/start returned before interrupt acknowledgement"
+        );
         std::fs::write(release_marker, b"").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -4175,6 +4939,13 @@ cat > /dev/null
         })
         .await
         .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), starting)
+                .await
+                .expect("cancelled startup should return after cleanup")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
         drop(
             tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
                 .await
@@ -4204,8 +4975,15 @@ sleep 10
         let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let result = server
-            .start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle)
+            .start_turn(
+                "root",
+                &route.tx,
+                json!({ "threadId": "root" }),
+                lifecycle,
+                &cancel,
+            )
             .await;
 
         assert!(matches!(result, Err(BackendError::Protocol(_))));
@@ -4239,9 +5017,15 @@ sleep 10
         let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
         {
-            let start =
-                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
+            let start = server.start_turn(
+                "root",
+                &route.tx,
+                json!({ "threadId": "root" }),
+                lifecycle,
+                &cancel,
+            );
             tokio::pin!(start);
             tokio::select! {
                 _ = &mut start => panic!("turn/start unexpectedly completed"),
@@ -4288,9 +5072,15 @@ sleep 10
         let lifecycle = server.lock_turn_lifecycle("root").await;
         let route = server.subscribe("root").await.unwrap();
         let stdin = server.stdin.lock().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
         {
-            let start =
-                server.start_turn("root", &route.tx, json!({ "threadId": "root" }), lifecycle);
+            let start = server.start_turn(
+                "root",
+                &route.tx,
+                json!({ "threadId": "root" }),
+                lifecycle,
+                &cancel,
+            );
             tokio::pin!(start);
             tokio::select! {
                 biased;
@@ -4357,6 +5147,7 @@ sleep 10
             route,
             false,
             cleanup,
+            Default::default(),
         );
         futures::pin_mut!(stream);
         route_tx
@@ -4746,6 +5537,24 @@ cat > /dev/null
             permission_settings(crate::BackendPermission::Yolo),
             ("never", "danger-full-access", "dangerFullAccess")
         );
+
+        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, true);
+        assert_eq!(
+            approval_policy(crate::BackendPermission::Ask, true),
+            "never"
+        );
+        assert_eq!(sandbox, "read-only");
+        assert_eq!(policy["type"], "readOnly");
+        assert_eq!(policy["networkAccess"], true);
+
+        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, false);
+        assert_eq!(
+            approval_policy(crate::BackendPermission::Ask, false),
+            "untrusted"
+        );
+        assert_eq!(sandbox, "danger-full-access");
+        assert_eq!(policy["type"], "dangerFullAccess");
+        assert!(policy["networkAccess"].is_null());
     }
 
     #[test]

@@ -33,6 +33,9 @@ impl Tool for Glob {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("glob cancelled");
+        }
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: pattern");
         };
@@ -56,10 +59,12 @@ impl Tool for Glob {
             Err(e) => return ToolResult::error(format!("invalid pattern: {e}")),
         };
         let worktree = ctx.worktree.clone();
+        let cancel = ctx.cancel.clone();
         // The walker is synchronous; run it off the async threads.
-        let found = tokio::task::spawn_blocking(move || search(&worktree, &root, &matcher))
-            .await
-            .unwrap_or_else(|e| Err(format!("glob walk panicked: {e}")));
+        let found =
+            tokio::task::spawn_blocking(move || search(&worktree, &root, &matcher, &cancel))
+                .await
+                .unwrap_or_else(|e| Err(format!("glob walk panicked: {e}")));
         match found {
             Ok((files, truncated)) => ToolResult::ok(json!({
                 "files": files,
@@ -74,6 +79,7 @@ fn search(
     worktree: &std::path::Path,
     root: &std::path::Path,
     matcher: &globset::GlobMatcher,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Vec<Value>, bool), String> {
     let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
@@ -81,6 +87,9 @@ fn search(
         .require_git(false)
         .build();
     for entry in walker {
+        if cancel.is_cancelled() {
+            return Err("glob cancelled".into());
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
