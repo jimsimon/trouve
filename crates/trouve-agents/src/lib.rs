@@ -74,6 +74,19 @@ pub struct BackendTurn {
     pub mcp_servers: Vec<McpServerLaunch>,
 }
 
+/// Additional user input for the vendor turn currently running in a resumed
+/// backend session. The engine serializes this with durable transcript output
+/// before acknowledging the steering request.
+#[derive(Debug)]
+pub struct BackendSteer {
+    /// Vendor-side thread/session id that owns the active turn.
+    pub session: String,
+    pub prompt: String,
+    /// Image attachments resolved to local files; non-image attachments are
+    /// already represented by paths in `prompt`.
+    pub attachments: Vec<TurnAttachment>,
+}
+
 /// One prompt attachment, resolved to a stored file the backend process can
 /// read (the server and vendor CLIs share a filesystem).
 #[derive(Debug, Clone)]
@@ -293,6 +306,20 @@ pub trait AgentBackend: Send + Sync {
     /// nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
+    }
+
+    /// Whether this backend can append user input to an active turn without
+    /// cancelling it or starting another turn.
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    /// Append user guidance to the active turn in `steer.session`.
+    async fn steer_turn(&self, _steer: BackendSteer) -> Result<(), BackendError> {
+        Err(BackendError::Protocol(format!(
+            "{} does not support steering active turns",
+            self.id()
+        )))
     }
 
     /// Start the vendor's own login flow (spawns the vendor CLI).

@@ -6,9 +6,11 @@ import {
   hostCapabilitiesContext,
   sessionContext,
 } from "../contexts/app-contexts.js";
-import type {
-  ProtocolFileContent,
-  ProtocolRelativeRestoreDirection,
+import {
+  ProtocolClientError,
+  type ProtocolFileContent,
+  type ProtocolRelativeRestoreDirection,
+  type ProtocolSessionDiffFileSummary,
 } from "../services/protocol-client.js";
 import { prepareUnifiedDiffOffThread } from "../services/content-worker-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
@@ -69,8 +71,14 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #checkpointHints = initialCheckpointHints();
   #diffRefreshTimer: ReturnType<typeof setInterval> | undefined;
   #error = "";
-  #diffText = "";
-  #diffFiles: readonly ParsedDiffFile[] = [];
+  #diffManifest = "";
+  #diffFiles: readonly ProtocolSessionDiffFileSummary[] = [];
+  #selectedDiffFile: ParsedDiffFile | undefined;
+  #selectedDiffText = "";
+  #diffFileLoadingPath = "";
+  #diffFileError = "";
+  #diffFileErrorPath = "";
+  #diffFileGeneration = 0;
   #selectedDiff = 0;
   #diffMode: DiffMode = "unified";
   readonly #diffFileTree = new InspectionFileTreeModel();
@@ -145,6 +153,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     if (this.#sessionScopeChanged) this.#observedSessionId = effectiveSessionId;
     if (changed.has("panel")) {
       this.#generation += 1;
+      this.#diffFileGeneration += 1;
       this.#copySequence += 1;
       this.#loading = false;
       this.#diffRequestActive = false;
@@ -157,6 +166,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     }
     if (this.#sessionScopeChanged) {
       this.#generation += 1;
+      this.#diffFileGeneration += 1;
       this.#fileTreeGeneration += 1;
       this.#fileGeneration += 1;
       this.#fileActionGeneration += 1;
@@ -174,8 +184,13 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.#clearCopyFeedbackTimer();
       this.#checkpointHints = initialCheckpointHints();
       this.#error = "";
-      this.#diffText = "";
+      this.#diffManifest = "";
       this.#diffFiles = [];
+      this.#selectedDiffFile = undefined;
+      this.#selectedDiffText = "";
+      this.#diffFileLoadingPath = "";
+      this.#diffFileError = "";
+      this.#diffFileErrorPath = "";
       this.#selectedDiff = 0;
       this.#diffMode = "unified";
       this.#diffFileTree.clear();
@@ -202,6 +217,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   override disconnectedCallback(): void {
     globalThis.removeEventListener("trouve-checkpoint-restored", this.#checkpointRestored);
     this.#generation += 1;
+    this.#diffFileGeneration += 1;
     this.#fileTreeGeneration += 1;
     this.#fileGeneration += 1;
     this.#fileActionGeneration += 1;
@@ -228,13 +244,22 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     const additions = this.#diffFiles.reduce((total, file) => total + file.additions, 0);
     const deletions = this.#diffFiles.reduce((total, file) => total + file.deletions, 0);
     const selectedFile = this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0];
+    const selectedPatch = this.#selectedDiffFile?.path === selectedFile?.path
+      ? this.#selectedDiffFile
+      : undefined;
     const diffFilesByPath = new Map(this.#diffFiles.map((file) => [file.path, file]));
     return html`
       <section
         class=${`inspection-split diff-inspection ${
           this.#diffTreeCollapsed ? "diff-tree-collapsed" : ""
         } ${this.#diffFiles.length === 0 ? "diff-empty-inspection" : ""}`}
-        aria-busy=${this.#refreshing || this.#restorePending !== "" ? "true" : "false"}
+        aria-busy=${
+          this.#refreshing ||
+          this.#restorePending !== "" ||
+          this.#diffFileLoadingPath !== ""
+            ? "true"
+            : "false"
+        }
       >
         <header class="inspection-summary diff-summary">
           <span class="visually-hidden">${this.#diffFiles.length} file${this.#diffFiles.length === 1 ? "" : "s"} changed, ${additions} additions, ${deletions} deletions</span>
@@ -283,23 +308,15 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
             >${this.#restorePending === "redo"
               ? "Redoing…"
               : html`${fontAwesomeIcon("rotate-right")} Redo`}</button>
-            ${this.#diffText === ""
+            ${selectedPatch === undefined
               ? nothing
               : html`<button
                   type="button"
-                  aria-label="Copy complete diff"
-                  title="Copy complete diff"
-                  @click=${() => void this.#copyRawDiff()}
-                >${fontAwesomeIcon("copy")} copy diff</button>`}
-            ${selectedFile === undefined
-              ? nothing
-              : html`<button
-                  type="button"
-                  aria-label=${`Copy raw diff for ${selectedFile.path}`}
-                  title=${`Copy raw diff for ${selectedFile.path}`}
-                  @click=${() => void this.#copyFileDiff(selectedFile)}
+                  aria-label=${`Copy raw diff for ${selectedPatch.path}`}
+                  title=${`Copy raw diff for ${selectedPatch.path}`}
+                  @click=${() => void this.#copyFileDiff(selectedPatch)}
                 >${fontAwesomeIcon(
-                  this.#copiedDiffPath === selectedFile.path && !this.#copyFeedbackIsError
+                  this.#copiedDiffPath === selectedPatch.path && !this.#copyFeedbackIsError
                     ? "check"
                     : "copy",
                 )}</button>`}
@@ -381,23 +398,42 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               </div>
               ${selectedFile === undefined
                 ? html`<div class="screen-empty diff-view-state"><span>Select a changed file to view its diff.</span></div>`
-                : this.#renderSelectedDiff(selectedFile)}
+                : this.#renderSelectedDiff(selectedFile, selectedPatch)}
             `}
       </section>
     `;
   }
 
-  #renderSelectedDiff(file: ParsedDiffFile) {
+  #renderSelectedDiff(
+    file: ProtocolSessionDiffFileSummary,
+    patch: ParsedDiffFile | undefined,
+  ) {
     if (file.binary) {
       return html`<div class="screen-empty diff-view-state" role="status"><span>Binary file changed.</span></div>`;
+    }
+    if (this.#diffFileLoadingPath === file.path) {
+      return html`<div class="screen-empty diff-view-state" role="status"><span>Loading ${file.path}…</span></div>`;
+    }
+    if (this.#diffFileErrorPath === file.path && this.#diffFileError !== "") {
+      return html`<div class="screen-empty diff-view-state" role="alert">
+        <strong>Unable to load ${file.path}</strong>
+        <span>${this.#diffFileError}</span>
+        <button type="button" @click=${() => void this.#loadDiffFile(file.path, {
+          force: true,
+          silent: false,
+        })}>Retry</button>
+      </div>`;
+    }
+    if (patch === undefined) {
+      return html`<div class="screen-empty diff-view-state" role="status"><span>No diff content is available for ${file.path}.</span></div>`;
     }
     return html`
       <trouve-diff-view
         class="inspection-widget diff-view-shell"
-        .original=${file.original}
-        .modified=${file.modified}
-        .originalLineNumbers=${file.originalLineNumbers}
-        .modifiedLineNumbers=${file.modifiedLineNumbers}
+        .original=${patch.original}
+        .modified=${patch.modified}
+        .originalLineNumbers=${patch.originalLineNumbers}
+        .modifiedLineNumbers=${patch.modifiedLineNumbers}
         .mode=${this.#diffMode}
         language=${languageForPath(file.path)}
         label=${file.path}
@@ -460,6 +496,11 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.#diffTreeCollapsed = true;
     }
     this.requestUpdate();
+    if (this.#diffFiles[index]?.binary === true) {
+      this.#clearSelectedDiff();
+    } else {
+      void this.#loadDiffFile(path, { force: false, silent: false });
+    }
   }
 
   #focusDiffFileTreePath(path: string): void {
@@ -508,11 +549,13 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     if (selected !== undefined) this.#diffFileTree.setActive(selected.path);
   }
 
-  async #copyRawDiff(): Promise<void> {
-    await this.#copyClipboardText(
-      this.#diffText,
-      "Raw diff copied to the clipboard.",
-    );
+  #clearSelectedDiff(): void {
+    this.#diffFileGeneration += 1;
+    this.#selectedDiffFile = undefined;
+    this.#selectedDiffText = "";
+    this.#diffFileLoadingPath = "";
+    this.#diffFileError = "";
+    this.#diffFileErrorPath = "";
   }
 
   async #copyFileDiff(file: ParsedDiffFile): Promise<void> {
@@ -970,22 +1013,30 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.requestUpdate();
     }
     try {
-      const response = await services.protocol.sessionDiff(sessionId);
+      const response = await services.protocol.sessionDiffSummary(sessionId);
       if (generation !== this.#generation || sessionId !== this.#effectiveSessionId) return false;
-      if (!this.#diffLoaded || response.diff !== this.#diffText) {
-        const nextFiles = await prepareUnifiedDiffOffThread(response.diff);
-        if (generation !== this.#generation || sessionId !== this.#effectiveSessionId) return false;
+      const nextManifest = JSON.stringify(response.files);
+      if (!this.#diffLoaded || nextManifest !== this.#diffManifest) {
         this.#selectedDiff = selectedDiffIndexAfterRefresh(
           this.#diffFiles,
           this.#selectedDiff,
-          nextFiles,
+          response.files,
         );
-        this.#diffFiles = nextFiles;
+        this.#diffFiles = response.files;
         this.#syncDiffFileTree();
-        this.#diffText = response.diff;
+        this.#diffManifest = nextManifest;
         shouldRender = true;
       }
       this.#diffLoaded = true;
+      const selected = this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0];
+      if (selected === undefined || selected.binary) {
+        this.#clearSelectedDiff();
+      } else {
+        await this.#loadDiffFile(selected.path, {
+          force: true,
+          silent: options.silent,
+        });
+      }
       return true;
     } catch {
       if (generation === this.#generation && !options.silent) {
@@ -1007,6 +1058,75 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     }
   }
 
+  async #loadDiffFile(
+    path: string,
+    options: { readonly force: boolean; readonly silent: boolean },
+  ): Promise<boolean> {
+    const services = this.#services.value;
+    const sessionId = this.#effectiveSessionId;
+    if (services === undefined || sessionId === "" || path === "") return false;
+    if (
+      options.force !== true &&
+      this.#selectedDiffFile?.path === path &&
+      this.#diffFileErrorPath !== path
+    ) return true;
+
+    const generation = ++this.#diffFileGeneration;
+    const previousForPath = this.#selectedDiffFile?.path === path;
+    const previousErrorForPath = this.#diffFileErrorPath === path;
+    const hasStableState = previousForPath || previousErrorForPath;
+    let shouldRender = !options.silent || !hasStableState;
+    if (!options.silent || !hasStableState) {
+      this.#diffFileLoadingPath = path;
+      this.#diffFileError = "";
+      this.#diffFileErrorPath = "";
+    }
+    if (shouldRender) this.requestUpdate();
+    try {
+      const response = await services.protocol.sessionFileDiff(sessionId, path);
+      if (
+        generation !== this.#diffFileGeneration ||
+        sessionId !== this.#effectiveSessionId ||
+        path !== (this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0])?.path
+      ) return false;
+      if (previousForPath && response.diff === this.#selectedDiffText) return true;
+      const parsed = (await prepareUnifiedDiffOffThread(response.diff))[0];
+      if (
+        generation !== this.#diffFileGeneration ||
+        sessionId !== this.#effectiveSessionId ||
+        path !== (this.#diffFiles[this.#selectedDiff] ?? this.#diffFiles[0])?.path
+      ) return false;
+      this.#selectedDiffFile = parsed === undefined
+        ? undefined
+        : { ...parsed, path: response.path };
+      this.#selectedDiffText = response.diff;
+      this.#diffFileError = "";
+      this.#diffFileErrorPath = "";
+      shouldRender = true;
+      return true;
+    } catch (error) {
+      if (
+        generation === this.#diffFileGeneration &&
+        sessionId === this.#effectiveSessionId &&
+        (!options.silent || !hasStableState)
+      ) {
+        this.#selectedDiffFile = undefined;
+        this.#selectedDiffText = "";
+        this.#diffFileError = error instanceof ProtocolClientError
+          ? error.message
+          : "The selected file diff request failed.";
+        this.#diffFileErrorPath = path;
+        shouldRender = true;
+      }
+      return false;
+    } finally {
+      if (generation === this.#diffFileGeneration) {
+        this.#diffFileLoadingPath = "";
+        if (shouldRender) this.requestUpdate();
+      }
+    }
+  }
+
   async #restoreCheckpoint(direction: ProtocolRelativeRestoreDirection): Promise<void> {
     const services = this.#services.value;
     if (
@@ -1016,7 +1136,9 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     ) return;
     const sessionId = this.#effectiveSessionId;
     this.#generation += 1;
+    this.#diffFileGeneration += 1;
     this.#diffRequestActive = false;
+    this.#diffFileLoadingPath = "";
     this.#loading = false;
     this.#refreshing = false;
     this.#restorePending = direction;

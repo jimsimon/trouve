@@ -7,9 +7,7 @@ import {
   sessionContext,
   type AppServices,
 } from "../contexts/app-contexts.js";
-import { prepareUnifiedDiffOffThread } from "../services/content-worker-client.js";
 import {
-  ProtocolClientError,
   type ProtocolMcpServerInfo,
   type ProtocolPrInfo,
 } from "../services/protocol-client.js";
@@ -30,17 +28,6 @@ export interface SessionDiffOverview {
   readonly deletions: number;
   readonly files: number;
 }
-
-export const summarizeSessionDiff = (
-  files: readonly {
-    readonly additions: number;
-    readonly deletions: number;
-  }[],
-): SessionDiffOverview => Object.freeze({
-  additions: files.reduce((total, file) => total + file.additions, 0),
-  deletions: files.reduce((total, file) => total + file.deletions, 0),
-  files: files.length,
-});
 
 export interface McpAvailability {
   readonly label: string;
@@ -167,7 +154,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
   #diffRequestActive = false;
   #resourcesRequestActive = false;
   #diffOverview: SessionDiffOverview | undefined;
-  #diffText = "";
+  #diffManifest = "";
   #mcpServers: readonly ProtocolMcpServerInfo[] = [];
   #diffError = "";
   #mcpError = "";
@@ -218,7 +205,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       this.#diffRequestActive = false;
       this.#resourcesRequestActive = false;
       this.#diffOverview = undefined;
-      this.#diffText = "";
+      this.#diffManifest = "";
       this.#mcpServers = [];
       this.#diffError = "";
       this.#mcpError = "";
@@ -270,7 +257,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
             title="Refresh session overview"
             aria-label="Refresh session overview"
             ?disabled=${refreshing}
-            @click=${() => void this.#refreshAll()}
+            @click=${() => void this.#refreshAll(true)}
           >${fontAwesomeIcon("arrows-rotate", { spin: refreshing })}</button>
         </header>
 
@@ -436,10 +423,10 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     `;
   }
 
-  async #refreshAll(): Promise<void> {
+  async #refreshAll(refreshGithub = false): Promise<void> {
     await Promise.all([
       this.#refreshDiff(false),
-      this.#refreshResources(),
+      this.#refreshResources(refreshGithub),
     ]);
   }
 
@@ -455,12 +442,16 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       this.requestUpdate();
     }
     try {
-      const response = await services.protocol.sessionDiff(sessionId);
-      if (this.#diffOverview !== undefined && response.diff === this.#diffText) return;
-      const files = await prepareUnifiedDiffOffThread(response.diff);
+      const response = await services.protocol.sessionDiffSummary(sessionId);
+      const manifest = JSON.stringify(response.files);
+      if (this.#diffOverview !== undefined && manifest === this.#diffManifest) return;
       if (generation !== this.#generation || sessionId !== this.#effectiveSessionId) return;
-      this.#diffOverview = summarizeSessionDiff(files);
-      this.#diffText = response.diff;
+      this.#diffOverview = {
+        additions: response.additions,
+        deletions: response.deletions,
+        files: response.files.length,
+      };
+      this.#diffManifest = manifest;
       this.#diffError = "";
       shouldRender = true;
     } catch {
@@ -475,7 +466,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     }
   }
 
-  async #refreshResources(): Promise<void> {
+  async #refreshResources(refreshGithub: boolean): Promise<void> {
     const services = this.#services.value;
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "" || this.#resourcesRequestActive) return;
@@ -484,23 +475,28 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     this.#mcpError = "";
     this.#prError = "";
     this.requestUpdate();
-    const [mcpResult, prResult] = await Promise.allSettled([
+    const mcpResult = await Promise.resolve(
       services.protocol.sessionMcpServers(sessionId),
-      services.protocol.sessionPrs(sessionId),
-    ]);
+    ).then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
     if (generation !== this.#generation || sessionId !== this.#effectiveSessionId) return;
     if (mcpResult.status === "fulfilled") {
       this.#mcpServers = mcpResult.value;
     } else {
       this.#mcpError = "The effective MCP configuration could not be loaded.";
     }
-    if (prResult.status === "fulfilled") {
-      this.#store.value?.replaceSessionPullRequests(sessionId, prResult.value);
-    } else if (
-      !(prResult.reason instanceof ProtocolClientError)
-      || ![400, 401, 403].includes(prResult.reason.status ?? 0)
-    ) {
-      this.#prError = "Pull requests could not be refreshed; showing the latest shared state.";
+    if (refreshGithub) {
+      try {
+        await services.protocol.refreshGithubPrs(true);
+        const projection = await services.protocol.serverProjectionSnapshot();
+        if (generation === this.#generation && sessionId === this.#effectiveSessionId) {
+          this.#store.value?.replaceServerProjection(projection.cursor, projection.value);
+        }
+      } catch {
+        this.#prError = "Pull requests could not be refreshed; showing the latest shared state.";
+      }
     }
     this.#resourcesRequestActive = false;
     this.requestUpdate();

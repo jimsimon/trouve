@@ -333,6 +333,11 @@ pub enum ThreadViewItem {
         content: String,
         attachments: Vec<Attachment>,
     },
+    Steered {
+        turn: u64,
+        content: String,
+        attachments: Vec<Attachment>,
+    },
     Assistant {
         turn: u64,
         content: String,
@@ -451,6 +456,10 @@ pub struct ThreadViewSnapshot {
     pub turn_models: std::collections::BTreeMap<u64, String>,
     #[serde(default)]
     pub turn_thinking_levels: std::collections::BTreeMap<u64, String>,
+    /// Per-turn native steering capability. False/absent is authoritative;
+    /// clients must not infer capability from provider or model names.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub turn_steerable: std::collections::BTreeMap<u64, bool>,
     #[serde(default)]
     pub turn_started_at: std::collections::BTreeMap<u64, chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -499,6 +508,24 @@ pub struct SendMessageRequest {
     /// then on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentUpload>,
+}
+
+/// Add user guidance to the turn currently running on a thread. The backend
+/// must advertise steering support for that exact turn.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SteerTurnRequest {
+    pub content: String,
+    /// Steering accepts the same attachment inputs as an ordinary prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
+}
+
+/// A steering message accepted by the active vendor turn. Durable display
+/// state follows as `turn.steered` on the thread event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SteerAccepted {
+    pub thread_id: ThreadId,
+    pub turn: u64,
 }
 
 /// One file uploaded with a prompt.
@@ -599,6 +626,31 @@ pub struct SessionDiff {
     pub diff: String,
 }
 
+/// Bounded metadata for one path changed against a session's base ref.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionDiffFileSummary {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
+}
+
+/// Lightweight changed-file manifest for a session. File patch content is
+/// intentionally excluded and loaded only after the user selects a path.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionDiffSummary {
+    pub files: Vec<SessionDiffFileSummary>,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// A bounded unified patch for exactly one selected session-relative path.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionFileDiff {
+    pub path: String,
+    pub diff: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DirEntry {
     pub name: String,
@@ -657,6 +709,13 @@ pub struct CheckRun {
     /// success / failure / … (None while running)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
+    /// GitHub page for the check run, when the provider exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -748,6 +807,16 @@ pub struct GithubPrList {
     pub prs: Vec<PrInfo>,
 }
 
+/// Controls an account-level GitHub pull-request refresh.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct RefreshGithubPrsQuery {
+    /// Bypass the server freshness window for an explicit user action. A
+    /// concurrent refresh that completed after this request began is still
+    /// reused rather than immediately repeated.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// Latest persisted account-level PR replacement for one GitHub host.
 /// The event cursor and timestamp let clients order this bootstrap state
 /// against newer SSE events without replaying the retained server history.
@@ -794,6 +863,500 @@ pub struct MergePrRequest {
     /// merge / squash / rebase (default: merge)
     #[serde(default)]
     pub method: Option<String>,
+}
+
+/// A GitHub account, bot, or team shown in pull-request collaboration UI.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrActor {
+    /// GraphQL node id. It is opaque to clients and only sent back in typed
+    /// pull-request actions.
+    pub id: String,
+    /// User/bot login or team slug.
+    pub login: String,
+    /// Human-readable name when GitHub exposes one.
+    #[serde(default)]
+    pub name: String,
+    /// user / bot / team / mannequin / unknown
+    pub kind: String,
+    #[serde(default)]
+    pub avatar_url: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrLabel {
+    pub id: String,
+    pub name: String,
+    /// Six-digit GitHub label color without a leading `#`.
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMilestone {
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReactionSummary {
+    /// GitHub reaction content (`THUMBS_UP`, `HEART`, ...).
+    pub content: String,
+    pub count: u64,
+    #[serde(default)]
+    pub viewer_has_reacted: bool,
+}
+
+/// A top-level PR conversation comment or one comment in a review thread.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrComment {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<u64>,
+    pub body: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_can_delete: bool,
+    #[serde(default)]
+    pub viewer_did_author: bool,
+    #[serde(default)]
+    pub reactions: Vec<PrReactionSummary>,
+    /// Review-comment-only context.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub diff_hunk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReviewDetail {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub state: String,
+    #[serde(default)]
+    pub body: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub commit_oid: String,
+    #[serde(default)]
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_can_delete: bool,
+    #[serde(default)]
+    pub viewer_did_author: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReviewThread {
+    pub id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default)]
+    pub diff_side: String,
+    #[serde(default)]
+    pub is_outdated: bool,
+    #[serde(default)]
+    pub is_resolved: bool,
+    #[serde(default)]
+    pub viewer_can_reply: bool,
+    #[serde(default)]
+    pub viewer_can_resolve: bool,
+    #[serde(default)]
+    pub viewer_can_unresolve: bool,
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrCommit {
+    pub oid: String,
+    pub abbreviated_oid: String,
+    pub message_headline: String,
+    #[serde(default)]
+    pub message_body: String,
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub change_type: String,
+    #[serde(default)]
+    pub viewer_viewed_state: String,
+}
+
+/// Lazily fetched before/after content for one file in a selected pull
+/// request. Large and binary blobs retain their metadata without crossing the
+/// protocol as unbounded text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrFileDiff {
+    pub path: String,
+    pub change_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_bytes: Option<u64>,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMergeQueueEntry {
+    pub id: String,
+    pub position: u64,
+    pub state: String,
+    pub enqueued_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_time_to_merge: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMergeQueueStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<PrMergeQueueEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrAutoMerge {
+    pub method: String,
+    pub enabled_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_by: Option<PrActor>,
+    #[serde(default)]
+    pub commit_title: String,
+    #[serde(default)]
+    pub commit_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrStackEntry {
+    pub position: u64,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub base: String,
+    pub head: String,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub merge_state_status: String,
+}
+
+/// GitHub's native pull-request stack, when the host supports the current
+/// GraphQL stack fields and this PR belongs to one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrStack {
+    pub id: String,
+    pub number: u64,
+    pub size: u64,
+    pub base: String,
+    #[serde(default)]
+    pub entries: Vec<PrStackEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrCapabilities {
+    #[serde(default)]
+    pub can_update: bool,
+    #[serde(default)]
+    pub can_close: bool,
+    #[serde(default)]
+    pub can_reopen: bool,
+    #[serde(default)]
+    pub can_assign: bool,
+    #[serde(default)]
+    pub can_label: bool,
+    #[serde(default)]
+    pub can_merge_as_admin: bool,
+    #[serde(default)]
+    pub can_update_branch: bool,
+    #[serde(default)]
+    pub can_enable_auto_merge: bool,
+    #[serde(default)]
+    pub can_disable_auto_merge: bool,
+    #[serde(default)]
+    pub did_author: bool,
+}
+
+/// Full collaboration state for one selected PR. Account/session summary
+/// projections remain compact; this is fetched lazily by the PR pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrDetailSection {
+    /// PR metadata, capabilities, checks, and sidebar choices.
+    Overview,
+    /// Description, issue comments, reviews, and review threads.
+    Conversation,
+    /// Commit history.
+    Commits,
+    /// Changed-file metadata. Individual file content remains separately lazy.
+    Files,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrDetail {
+    pub info: PrInfo,
+    /// Immutable base commit used with `info.head_sha` to load known files
+    /// without re-listing the pull request's changed-file connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// Pull-request GraphQL node id used by typed server-side mutations.
+    pub id: String,
+    pub viewer: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub reactions: Vec<PrReactionSummary>,
+    /// subscribed / unsubscribed / ignored
+    #[serde(default)]
+    pub viewer_subscription: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    pub commit_count: u64,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub active_lock_reason: String,
+    #[serde(default)]
+    pub maintainer_can_modify: bool,
+    pub capabilities: PrCapabilities,
+    /// Merge methods enabled by repository settings (`merge`, `squash`,
+    /// `rebase`).
+    #[serde(default)]
+    pub merge_methods: Vec<String>,
+    #[serde(default)]
+    pub default_merge_method: String,
+    #[serde(default)]
+    pub auto_merge_allowed: bool,
+    #[serde(default)]
+    pub labels: Vec<PrLabel>,
+    #[serde(default)]
+    pub available_labels: Vec<PrLabel>,
+    #[serde(default)]
+    pub assignees: Vec<PrActor>,
+    #[serde(default)]
+    pub assignable_users: Vec<PrActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<PrMilestone>,
+    #[serde(default)]
+    pub available_milestones: Vec<PrMilestone>,
+    #[serde(default)]
+    pub review_requests: Vec<PrActor>,
+    #[serde(default)]
+    pub reviews: Vec<PrReviewDetail>,
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+    #[serde(default)]
+    pub review_threads: Vec<PrReviewThread>,
+    #[serde(default)]
+    pub commits: Vec<PrCommit>,
+    #[serde(default)]
+    pub files: Vec<PrFile>,
+    pub merge_queue: PrMergeQueueStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<PrAutoMerge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<PrStack>,
+    /// True only when a safety cap prevented an unbounded GitHub connection
+    /// from being returned in full.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCommentKind {
+    Issue,
+    Review,
+}
+
+/// Typed PR-page actions. The server resolves every opaque target against the
+/// selected session PR before contacting GitHub; OAuth tokens and arbitrary
+/// GitHub API access never cross into the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PrActionRequest {
+    Update {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maintainer_can_modify: Option<bool>,
+    },
+    SetState {
+        /// draft / ready / close / reopen
+        state: String,
+    },
+    RequestReviewers {
+        #[serde(default)]
+        users: Vec<String>,
+        #[serde(default)]
+        bots: Vec<String>,
+        #[serde(default)]
+        teams: Vec<String>,
+        /// Replace the current request set instead of adding to it.
+        #[serde(default)]
+        replace: bool,
+    },
+    SubmitReview {
+        /// approve / request_changes / comment
+        event: String,
+        #[serde(default)]
+        body: String,
+    },
+    UpdateReview {
+        id: String,
+        body: String,
+    },
+    DeleteReview {
+        id: String,
+    },
+    DismissReview {
+        id: String,
+        message: String,
+    },
+    AddComment {
+        body: String,
+    },
+    UpdateComment {
+        id: String,
+        kind: PrCommentKind,
+        body: String,
+    },
+    DeleteComment {
+        id: String,
+        kind: PrCommentKind,
+    },
+    ReplyReviewThread {
+        thread_id: String,
+        body: String,
+    },
+    ResolveReviewThread {
+        thread_id: String,
+        resolved: bool,
+    },
+    AddReviewThread {
+        body: String,
+        path: String,
+        line: u64,
+        /// left / right
+        side: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_side: Option<String>,
+    },
+    SetFileViewed {
+        path: String,
+        viewed: bool,
+    },
+    UpdateBranch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    Merge {
+        /// merge / squash / rebase
+        method: String,
+        #[serde(default)]
+        commit_title: String,
+        #[serde(default)]
+        commit_message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    SetAutoMerge {
+        enabled: bool,
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        commit_title: String,
+        #[serde(default)]
+        commit_message: String,
+    },
+    SetMergeQueue {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    SetLabels {
+        #[serde(default)]
+        label_ids: Vec<String>,
+    },
+    SetAssignees {
+        #[serde(default)]
+        assignee_ids: Vec<String>,
+    },
+    SetMilestone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        milestone_id: Option<String>,
+    },
+    SetLock {
+        locked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SetSubscription {
+        /// subscribed / unsubscribed / ignored
+        state: String,
+    },
+    AddReaction {
+        subject_id: String,
+        content: String,
+    },
+    RemoveReaction {
+        subject_id: String,
+        content: String,
+    },
 }
 
 // --- subscription health -----------------------------------------------------

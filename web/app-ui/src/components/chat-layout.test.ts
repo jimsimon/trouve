@@ -65,6 +65,30 @@ describe("buildChatLayout", () => {
     });
   });
 
+  it("keeps steering in its active turn between the output it redirects", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u5", kind: "user", turn: 5, content: "Begin", attachments: [] },
+      { id: "x1", kind: "thinking", turn: 5, content: "Before", complete: true },
+      {
+        id: "st5",
+        kind: "steered",
+        turn: 5,
+        content: "Prioritize tests",
+        attachments: [],
+      },
+      { id: "x2", kind: "thinking", turn: 5, content: "After", complete: false },
+    ];
+
+    const layout = buildChatLayout(items);
+    expect(layout.units).toHaveLength(1);
+    expect(layout.units[0]).toMatchObject({
+      turn: 5,
+      prompt: { id: "u5" },
+      items: [{ id: "x1" }, { id: "st5" }, { id: "x2" }],
+    });
+    expect(layout.unitIdForItem.get("st5")).toBe("turn:5");
+  });
+
   it("associates the event-folded leading status with its turn", () => {
     const items: ThreadChatItem[] = [
       { id: "s7", kind: "turn-status", turn: 7, state: { kind: "completed", usage: { input_tokens: 2, output_tokens: 1 } } },

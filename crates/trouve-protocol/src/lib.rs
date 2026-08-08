@@ -196,7 +196,26 @@ pub use requests::*;
 // 3.14: assistant.thinking_completed preserves provider-owned thinking-item
 // boundaries even when no ordinary output event immediately follows
 // (additive).
-pub const PROTOCOL_VERSION: &str = "3.14";
+// 3.15: selected session pull requests expose lazy full-page collaboration
+// detail and typed actions for conversation, reviews, metadata, state,
+// merging, merge queues, auto-merge, and native PR stacks (additive).
+// 3.16: PR collaboration actions gain bot review requests, pending-review
+// management, review dismissal, and per-file viewed state (additive).
+// 3.17: selected PR files expose lazy, bounded before/after diff content so
+// large pull requests never require downloading one aggregate patch.
+// 3.18: session diff metadata and selected-file patches can be loaded
+// independently, so large worktrees no longer cross the protocol as one diff.
+// 3.19: selected PR detail can be requested by tab section, and exposes the
+// immutable base SHA so cached file lists can load content without another
+// changed-files query (additive).
+// 3.20: account PR refreshes accept an optional force flag so automatic
+// clients can share a server-side freshness window without weakening the
+// explicit user refresh action (additive).
+// 3.21: steerable turns advertise their capability, POST
+// /v1/threads/{id}/steer adds input to an active vendor turn, and the durable
+// turn.steered event/folded item preserves that input in the turn rail
+// (additive).
+pub const PROTOCOL_VERSION: &str = "3.21";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

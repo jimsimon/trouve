@@ -15,6 +15,7 @@ import type {
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   parseMcpCommandLine,
+  parseMcpConfigJson,
   sessionMcpCommandLine,
   sessionMcpEnvironmentLines,
 } from "./session-mcp-model.js";
@@ -105,6 +106,8 @@ const panelStyles = css`
   .mcp-scope { color: var(--trouve-accent); font-size: 10px; }
   .mcp-actions { display: flex; gap: 5px; }
   .mcp-form { border: 0; padding: 14px; }
+  .mcp-import textarea { min-height: 150px; font-family: var(--trouve-font-mono, monospace); }
+  .mcp-import input[type="file"] { padding: 3px; }
   .integration-host, .integration-add { border: 0; padding: 14px; }
   .integration-add-fields {
     display: grid;
@@ -476,6 +479,8 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
   #message = "";
   #error = false;
   #formOpen = false;
+  #importOpen = false;
+  #importJson = "";
   #formScope: "user" | "workspace" = "user";
   #editingServer: ProtocolMcpServerInfo | undefined;
 
@@ -586,6 +591,61 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     }
   }
 
+  async #loadImportFile(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (file === undefined) return;
+    try {
+      this.#importJson = await file.text();
+      this.#message = `Loaded ${file.name}. Review the JSON, then import it.`;
+      this.#error = false;
+    } catch {
+      this.#message = `Could not read ${file.name}.`;
+      this.#error = true;
+    }
+    this.requestUpdate();
+  }
+
+  async #import(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined || this.#busy) return;
+    const data = new FormData(event.currentTarget as HTMLFormElement);
+    const scope = String(data.get("scope") ?? "user");
+    const workspaceId = String(data.get("workspace_id") ?? "");
+    if (scope === "workspace" && workspaceId === "") {
+      this.#message = "Choose a workspace for the imported servers.";
+      this.#error = true;
+      this.requestUpdate();
+      return;
+    }
+    try {
+      const servers = parseMcpConfigJson(this.#importJson);
+      this.#busy = true;
+      this.#message = `Importing ${servers.length} MCP server${servers.length === 1 ? "" : "s"}…`;
+      this.#error = false;
+      this.requestUpdate();
+      for (const server of servers) {
+        await protocol.upsertMcpServer(server.name, {
+          scope,
+          command: server.command,
+          args: [...server.args],
+          env: { ...server.env },
+          ...(scope === "workspace" ? { workspace_id: workspaceId } : {}),
+        });
+      }
+      this.#importOpen = false;
+      this.#importJson = "";
+      await this.#load();
+      this.#message = `Imported ${servers.length} MCP server${servers.length === 1 ? "" : "s"}.`;
+    } catch (error) {
+      this.#message = error instanceof Error ? error.message : genericFailure("Importing MCP config");
+      this.#error = true;
+      this.#busy = false;
+    }
+    this.requestUpdate();
+  }
+
   async #showLogs(name: string): Promise<void> {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined) return;
@@ -640,7 +700,18 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
                 </article>
               `)}
         </section>
-        <div class="row"><button type="button" @click=${() => this.#openMcpForm("user")}>${fontAwesomeIcon("plus")} Add app-wide</button><button type="button" ?disabled=${workspaces.length === 0} @click=${() => this.#openMcpForm("workspace")}>${fontAwesomeIcon("plus")} Add to workspace</button></div>
+        <div class="row"><button type="button" @click=${() => this.#openMcpForm("user")}>${fontAwesomeIcon("plus")} Add app-wide</button><button type="button" ?disabled=${workspaces.length === 0} @click=${() => this.#openMcpForm("workspace")}>${fontAwesomeIcon("plus")} Add to workspace</button><button type="button" @click=${() => { this.#importOpen = !this.#importOpen; this.#message = ""; this.#error = false; this.requestUpdate(); }}>${fontAwesomeIcon("file-import")} Import JSON</button></div>
+        ${this.#importOpen ? html`<form class="card mcp-form mcp-import" @submit=${(event: SubmitEvent) => void this.#import(event)}>
+          <h3>Import MCP config</h3>
+          <p class="meta">Paste an existing <code>mcp.json</code>, Cursor/Claude <code>mcpServers</code> config, or VS Code <code>servers</code> config. Imported names replace matching servers in the selected scope. Only stdio servers are supported.</p>
+          <div class="grid">
+            <label><span>Import into</span><select name="scope" @change=${(event: Event) => { this.#formScope = (event.currentTarget as HTMLSelectElement).value === "workspace" ? "workspace" : "user"; this.requestUpdate(); }}><option value="user" ?selected=${this.#formScope === "user"}>App-wide</option><option value="workspace" ?selected=${this.#formScope === "workspace"}>Workspace</option></select></label>
+            ${this.#formScope === "workspace" ? html`<label><span>Workspace</span><select name="workspace_id" required><option value="">Choose workspace</option>${workspaces.map((workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`)}</select></label>` : html`<input name="workspace_id" type="hidden" value="" />`}
+          </div>
+          <label><span>Choose a JSON file</span><input type="file" accept=".json,application/json" @change=${(event: Event) => void this.#loadImportFile(event)} /></label>
+          <label><span>Config JSON</span><textarea required spellcheck="false" placeholder='{"mcpServers":{"docs":{"command":"npx","args":["-y","docs-mcp"]}}}' .value=${this.#importJson} @input=${(event: Event) => { this.#importJson = (event.currentTarget as HTMLTextAreaElement).value; }}></textarea></label>
+          <div class="row"><button class="primary" type="submit" ?disabled=${this.#busy || this.#importJson.trim() === ""}>Import servers</button><button type="button" @click=${() => { this.#importOpen = false; this.#importJson = ""; this.requestUpdate(); }}>Cancel</button></div>
+        </form>` : nothing}
         ${this.#formOpen ? html`<form class="card mcp-form" @submit=${(event: SubmitEvent) => void this.#save(event)}>
           <h3>${this.#editingServer === undefined ? "New" : "Edit"} ${this.#formScope === "user" ? "app-wide server (~/.config/trouve/mcp.json — every workspace)" : "workspace server (.agents/.mcp.json)"}</h3>
           <input name="scope" type="hidden" .value=${this.#formScope} />

@@ -25,4 +25,11 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("Use Up and Down arrow keys or drag.");
     expect(source).toContain("this.#workspaceOrder.move(workspaceId, offset)");
   });
+
+  it("refreshes durable pull-request projections in the background", () => {
+    expect(source).toContain("const GITHUB_REFRESH_INTERVAL_MS = 30_000");
+    expect(source).toContain("await this.#protocolClient.refreshGithubPrs()");
+    expect(source).toContain("this.#scheduleGithubRefresh()");
+    expect(source).toContain('globalThis.document?.visibilityState === "hidden"');
+  });
 });

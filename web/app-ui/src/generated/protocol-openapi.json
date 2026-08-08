@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.14"
+    "version": "3.21"
   },
   "paths": {
     "/v1/approvals": {
@@ -1432,6 +1432,17 @@
       "post": {
         "tags": [],
         "operationId": "refresh_github_prs",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "description": "Bypass the automatic-refresh freshness window for an explicit user refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "204": {
             "description": ""
@@ -2884,6 +2895,121 @@
         }
       }
     },
+    "/v1/sessions/{id}/diff/file": {
+      "get": {
+        "tags": [],
+        "operationId": "session_file_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Changed worktree-relative path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFileDiff"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/diff/summary": {
+      "get": {
+        "tags": [],
+        "operationId": "session_diff_summary",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDiffSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}/file": {
       "get": {
         "tags": [],
@@ -3224,6 +3350,208 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/prs/{number}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session_pr_detail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "section",
+            "in": "query",
+            "description": "Optional lazy PR-page section; omitted loads every section for older clients",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PrDetailSection"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/prs/{number}/actions": {
+      "post": {
+        "tags": [],
+        "operationId": "act_on_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/prs/{number}/file": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session_pr_file_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Exact changed-file path returned by PrDetail",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrFileDiff"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -4027,6 +4355,74 @@
         }
       }
     },
+    "/v1/threads/{id}/steer": {
+      "post": {
+        "tags": [],
+        "operationId": "steer_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SteerTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SteerAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/usage": {
       "get": {
         "tags": [],
@@ -4596,6 +4992,13 @@
           "status"
         ],
         "properties": {
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "conclusion": {
             "type": [
               "string",
@@ -4603,8 +5006,22 @@
             ],
             "description": "success / failure / … (None while running)"
           },
+          "details_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "GitHub page for the check run, when the provider exposes one."
+          },
           "name": {
             "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           },
           "status": {
             "type": "string",
@@ -6356,6 +6773,10 @@
               "model": {
                 "type": "string"
               },
+              "supports_steering": {
+                "type": "boolean",
+                "description": "Whether the backend running this exact turn accepts additional\nuser input without cancelling or starting another turn."
+              },
               "thinking_level": {
                 "type": [
                   "string",
@@ -6507,6 +6928,37 @@
                 "type": "string",
                 "enum": [
                   "user.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Additional user input accepted by the backend while `turn` was still\nrunning. This belongs on the active turn's timeline and does not start\nor queue another turn.",
+            "required": [
+              "turn",
+              "content",
+              "type"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                }
+              },
+              "content": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.steered"
                 ]
               }
             }
@@ -8475,6 +8927,1149 @@
           "yolo"
         ]
       },
+      "PrActionRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "update"
+                ]
+              },
+              "base": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "body": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "maintainer_can_modify": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "state",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_state"
+                ]
+              },
+              "state": {
+                "type": "string",
+                "description": "draft / ready / close / reopen"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "request_reviewers"
+                ]
+              },
+              "bots": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "replace": {
+                "type": "boolean",
+                "description": "Replace the current request set instead of adding to it."
+              },
+              "teams": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "users": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "event",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "submit_review"
+                ]
+              },
+              "body": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string",
+                "description": "approve / request_changes / comment"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "body",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "update_review"
+                ]
+              },
+              "body": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "delete_review"
+                ]
+              },
+              "id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "message",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "dismiss_review"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "body",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add_comment"
+                ]
+              },
+              "body": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "body",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "update_comment"
+                ]
+              },
+              "body": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/components/schemas/PrCommentKind"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "delete_comment"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/components/schemas/PrCommentKind"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread_id",
+              "body",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "reply_review_thread"
+                ]
+              },
+              "body": {
+                "type": "string"
+              },
+              "thread_id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread_id",
+              "resolved",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "resolve_review_thread"
+                ]
+              },
+              "resolved": {
+                "type": "boolean"
+              },
+              "thread_id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "body",
+              "path",
+              "line",
+              "side",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add_review_thread"
+                ]
+              },
+              "body": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "path": {
+                "type": "string"
+              },
+              "side": {
+                "type": "string",
+                "description": "left / right"
+              },
+              "start_line": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "start_side": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "viewed",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_file_viewed"
+                ]
+              },
+              "path": {
+                "type": "string"
+              },
+              "viewed": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "update_branch"
+                ]
+              },
+              "expected_head_sha": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "merge"
+                ]
+              },
+              "commit_message": {
+                "type": "string"
+              },
+              "commit_title": {
+                "type": "string"
+              },
+              "expected_head_sha": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "method": {
+                "type": "string",
+                "description": "merge / squash / rebase"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "enabled",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_auto_merge"
+                ]
+              },
+              "commit_message": {
+                "type": "string"
+              },
+              "commit_title": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "method": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "enabled",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_merge_queue"
+                ]
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "expected_head_sha": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_labels"
+                ]
+              },
+              "label_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_assignees"
+                ]
+              },
+              "assignee_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_milestone"
+                ]
+              },
+              "milestone_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "locked",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_lock"
+                ]
+              },
+              "locked": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "state",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_subscription"
+                ]
+              },
+              "state": {
+                "type": "string",
+                "description": "subscribed / unsubscribed / ignored"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "subject_id",
+              "content",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add_reaction"
+                ]
+              },
+              "content": {
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "subject_id",
+              "content",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "remove_reaction"
+                ]
+              },
+              "content": {
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "Typed PR-page actions. The server resolves every opaque target against the\nselected session PR before contacting GitHub; OAuth tokens and arbitrary\nGitHub API access never cross into the frontend."
+      },
+      "PrActor": {
+        "type": "object",
+        "description": "A GitHub account, bot, or team shown in pull-request collaboration UI.",
+        "required": [
+          "id",
+          "login",
+          "kind"
+        ],
+        "properties": {
+          "avatar_url": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "GraphQL node id. It is opaque to clients and only sent back in typed\npull-request actions."
+          },
+          "kind": {
+            "type": "string",
+            "description": "user / bot / team / mannequin / unknown"
+          },
+          "login": {
+            "type": "string",
+            "description": "User/bot login or team slug."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name when GitHub exposes one."
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PrAutoMerge": {
+        "type": "object",
+        "required": [
+          "method",
+          "enabled_at"
+        ],
+        "properties": {
+          "commit_message": {
+            "type": "string"
+          },
+          "commit_title": {
+            "type": "string"
+          },
+          "enabled_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "enabled_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrActor"
+              }
+            ]
+          },
+          "method": {
+            "type": "string"
+          }
+        }
+      },
+      "PrCapabilities": {
+        "type": "object",
+        "properties": {
+          "can_assign": {
+            "type": "boolean"
+          },
+          "can_close": {
+            "type": "boolean"
+          },
+          "can_disable_auto_merge": {
+            "type": "boolean"
+          },
+          "can_enable_auto_merge": {
+            "type": "boolean"
+          },
+          "can_label": {
+            "type": "boolean"
+          },
+          "can_merge_as_admin": {
+            "type": "boolean"
+          },
+          "can_reopen": {
+            "type": "boolean"
+          },
+          "can_update": {
+            "type": "boolean"
+          },
+          "can_update_branch": {
+            "type": "boolean"
+          },
+          "did_author": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PrComment": {
+        "type": "object",
+        "description": "A top-level PR conversation comment or one comment in a review thread.",
+        "required": [
+          "id",
+          "body",
+          "url",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "author": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrActor"
+              }
+            ]
+          },
+          "body": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "diff_hunk": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_edited_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "Review-comment-only context."
+          },
+          "reactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReactionSummary"
+            }
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "url": {
+            "type": "string"
+          },
+          "viewer_can_delete": {
+            "type": "boolean"
+          },
+          "viewer_can_update": {
+            "type": "boolean"
+          },
+          "viewer_did_author": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PrCommentKind": {
+        "type": "string",
+        "enum": [
+          "issue",
+          "review"
+        ]
+      },
+      "PrCommit": {
+        "type": "object",
+        "required": [
+          "oid",
+          "abbreviated_oid",
+          "message_headline",
+          "committed_at",
+          "url"
+        ],
+        "properties": {
+          "abbreviated_oid": {
+            "type": "string"
+          },
+          "author": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrActor"
+              }
+            ]
+          },
+          "committed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message_body": {
+            "type": "string"
+          },
+          "message_headline": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PrDetail": {
+        "type": "object",
+        "required": [
+          "info",
+          "id",
+          "viewer",
+          "created_at",
+          "updated_at",
+          "additions",
+          "deletions",
+          "changed_files",
+          "commit_count",
+          "capabilities",
+          "merge_queue"
+        ],
+        "properties": {
+          "active_lock_reason": {
+            "type": "string"
+          },
+          "additions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assignable_users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrActor"
+            }
+          },
+          "assignees": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrActor"
+            }
+          },
+          "auto_merge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrAutoMerge"
+              }
+            ]
+          },
+          "auto_merge_allowed": {
+            "type": "boolean"
+          },
+          "available_labels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrLabel"
+            }
+          },
+          "available_milestones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrMilestone"
+            }
+          },
+          "base_sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Immutable base commit used with `info.head_sha` to load known files\nwithout re-listing the pull request's changed-file connection."
+          },
+          "body": {
+            "type": "string"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/PrCapabilities"
+          },
+          "changed_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "comments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrComment"
+            }
+          },
+          "commit_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "commits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrCommit"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "default_merge_method": {
+            "type": "string"
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrFile"
+            }
+          },
+          "id": {
+            "type": "string",
+            "description": "Pull-request GraphQL node id used by typed server-side mutations."
+          },
+          "info": {
+            "$ref": "#/components/schemas/PrInfo"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrLabel"
+            }
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "maintainer_can_modify": {
+            "type": "boolean"
+          },
+          "merge_methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Merge methods enabled by repository settings (`merge`, `squash`,\n`rebase`)."
+          },
+          "merge_queue": {
+            "$ref": "#/components/schemas/PrMergeQueueStatus"
+          },
+          "milestone": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrMilestone"
+              }
+            ]
+          },
+          "reactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReactionSummary"
+            }
+          },
+          "review_decision": {
+            "type": "string"
+          },
+          "review_requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrActor"
+            }
+          },
+          "review_threads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReviewThread"
+            }
+          },
+          "reviews": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReviewDetail"
+            }
+          },
+          "stack": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrStack"
+              }
+            ]
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True only when a safety cap prevented an unbounded GitHub connection\nfrom being returned in full."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "viewer": {
+            "type": "string"
+          },
+          "viewer_subscription": {
+            "type": "string",
+            "description": "subscribed / unsubscribed / ignored"
+          }
+        }
+      },
+      "PrDetailSection": {
+        "type": "string",
+        "description": "Full collaboration state for one selected PR. Account/session summary\nprojections remain compact; this is fetched lazily by the PR pane.",
+        "enum": [
+          "overview",
+          "conversation",
+          "commits",
+          "files"
+        ]
+      },
+      "PrFile": {
+        "type": "object",
+        "required": [
+          "path",
+          "additions",
+          "deletions",
+          "change_type"
+        ],
+        "properties": {
+          "additions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "change_type": {
+            "type": "string"
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "viewer_viewed_state": {
+            "type": "string"
+          }
+        }
+      },
+      "PrFileDiff": {
+        "type": "object",
+        "description": "Lazily fetched before/after content for one file in a selected pull\nrequest. Large and binary blobs retain their metadata without crossing the\nprotocol as unbounded text.",
+        "required": [
+          "path",
+          "change_type"
+        ],
+        "properties": {
+          "binary": {
+            "type": "boolean"
+          },
+          "change_type": {
+            "type": "string"
+          },
+          "modified": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modified_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "notice": {
+            "type": "string"
+          },
+          "original": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "original_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
       "PrInfo": {
         "type": "object",
         "required": [
@@ -8602,6 +10197,128 @@
           }
         }
       },
+      "PrLabel": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "color": {
+            "type": "string",
+            "description": "Six-digit GitHub label color without a leading `#`."
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "PrMergeQueueEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "position",
+          "state",
+          "enqueued_at"
+        ],
+        "properties": {
+          "enqueued_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "estimated_time_to_merge": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "PrMergeQueueStatus": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "entry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrMergeQueueEntry"
+              }
+            ]
+          }
+        }
+      },
+      "PrMilestone": {
+        "type": "object",
+        "required": [
+          "id",
+          "number",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PrReactionSummary": {
+        "type": "object",
+        "required": [
+          "content",
+          "count"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "GitHub reaction content (`THUMBS_UP`, `HEART`, ...)."
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "viewer_has_reacted": {
+            "type": "boolean"
+          }
+        }
+      },
       "PrReview": {
         "type": "object",
         "required": [
@@ -8615,6 +10332,194 @@
           "state": {
             "type": "string",
             "description": "approved / changes_requested / commented / …"
+          }
+        }
+      },
+      "PrReviewDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "state",
+          "url"
+        ],
+        "properties": {
+          "author": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrActor"
+              }
+            ]
+          },
+          "body": {
+            "type": "string"
+          },
+          "commit_oid": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "submitted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "url": {
+            "type": "string"
+          },
+          "viewer_can_delete": {
+            "type": "boolean"
+          },
+          "viewer_can_update": {
+            "type": "boolean"
+          },
+          "viewer_did_author": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PrReviewThread": {
+        "type": "object",
+        "required": [
+          "id",
+          "path"
+        ],
+        "properties": {
+          "comments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrComment"
+            }
+          },
+          "diff_side": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_outdated": {
+            "type": "boolean"
+          },
+          "is_resolved": {
+            "type": "boolean"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "start_line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "viewer_can_reply": {
+            "type": "boolean"
+          },
+          "viewer_can_resolve": {
+            "type": "boolean"
+          },
+          "viewer_can_unresolve": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PrStack": {
+        "type": "object",
+        "description": "GitHub's native pull-request stack, when the host supports the current\nGraphQL stack fields and this PR belongs to one.",
+        "required": [
+          "id",
+          "number",
+          "size",
+          "base"
+        ],
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrStackEntry"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PrStackEntry": {
+        "type": "object",
+        "required": [
+          "position",
+          "number",
+          "title",
+          "url",
+          "state",
+          "base",
+          "head"
+        ],
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": "string"
+          },
+          "merge_state_status": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "review_decision": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
           }
         }
       },
@@ -9205,6 +11110,77 @@
           }
         }
       },
+      "SessionDiffFileSummary": {
+        "type": "object",
+        "description": "Bounded metadata for one path changed against a session's base ref.",
+        "required": [
+          "path",
+          "additions",
+          "deletions",
+          "binary"
+        ],
+        "properties": {
+          "additions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "binary": {
+            "type": "boolean"
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionDiffSummary": {
+        "type": "object",
+        "description": "Lightweight changed-file manifest for a session. File patch content is\nintentionally excluded and loaded only after the user selects a path.",
+        "required": [
+          "files",
+          "additions",
+          "deletions"
+        ],
+        "properties": {
+          "additions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionDiffFileSummary"
+            }
+          }
+        }
+      },
+      "SessionFileDiff": {
+        "type": "object",
+        "description": "A bounded unified patch for exactly one selected session-relative path.",
+        "required": [
+          "path",
+          "diff"
+        ],
+        "properties": {
+          "diff": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
       "SessionNotificationKind": {
         "type": "string",
         "description": "A fresh session-level notification edge derived from a durable thread\nevent. Clients apply their own notification preferences and foreground\nsuppression; this type only preserves the native event category without\nrequiring one background SSE follower per thread.",
@@ -9420,6 +11396,43 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          }
+        }
+      },
+      "SteerAccepted": {
+        "type": "object",
+        "description": "A steering message accepted by the active vendor turn. Durable display\nstate follows as `turn.steered` on the thread event stream.",
+        "required": [
+          "thread_id",
+          "turn"
+        ],
+        "properties": {
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "turn": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "SteerTurnRequest": {
+        "type": "object",
+        "description": "Add user guidance to the turn currently running on a thread. The backend\nmust advertise steering support for that exact turn.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            },
+            "description": "Steering accepts the same attachment inputs as an ordinary prompt."
+          },
+          "content": {
+            "type": "string"
           }
         }
       },
@@ -9769,6 +11782,37 @@
             "required": [
               "turn",
               "content",
+              "attachments",
+              "kind"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                }
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "steered"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
               "complete",
               "kind"
             ],
@@ -10084,6 +12128,18 @@
             "additionalProperties": {
               "type": "string",
               "format": "date-time"
+            },
+            "propertyNames": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "turn_steerable": {
+            "type": "object",
+            "description": "Per-turn native steering capability. False/absent is authoritative;\nclients must not infer capability from provider or model names.",
+            "additionalProperties": {
+              "type": "boolean"
             },
             "propertyNames": {
               "type": "integer",

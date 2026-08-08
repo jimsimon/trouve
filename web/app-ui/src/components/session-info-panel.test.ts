@@ -2,21 +2,11 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  sessionMcpAvailability,
-  summarizeSessionDiff,
-} from "./session-info-panel.js";
+import { sessionMcpAvailability } from "./session-info-panel.js";
 
 const source = readFileSync(new URL("./session-info-panel.ts", import.meta.url), "utf8");
 
 describe("session information overview", () => {
-  it("summarizes additions and deletions across changed files", () => {
-    expect(summarizeSessionDiff([
-      { additions: 3, deletions: 1 },
-      { additions: 4, deletions: 2 },
-    ])).toEqual({ additions: 7, deletions: 3, files: 2 });
-  });
-
   it("does not describe repository-controlled MCP definitions as active", () => {
     expect(sessionMcpAvailability({ health: "unknown", scope: "app-wide" }))
       .toMatchObject({ label: "Active", active: true });
@@ -28,10 +18,13 @@ describe("session information overview", () => {
 
   it("shares the authoritative pull-request projection and existing session endpoints", () => {
     expect(source).toContain("store?.sessionPullRequests(sessionId)");
-    expect(source).toContain("services.protocol.sessionDiff(sessionId)");
+    expect(source).toContain("services.protocol.sessionDiffSummary(sessionId)");
+    expect(source).not.toContain("services.protocol.sessionDiff(sessionId)");
     expect(source).toContain("services.protocol.sessionMcpServers(sessionId)");
-    expect(source).toContain("services.protocol.sessionPrs(sessionId)");
-    expect(source).toContain("replaceSessionPullRequests(sessionId, prResult.value)");
+    expect(source).not.toContain("services.protocol.sessionPrs(sessionId)");
+    expect(source).toContain("services.protocol.refreshGithubPrs(true)");
+    expect(source).toContain("services.protocol.serverProjectionSnapshot()");
+    expect(source).toContain("replaceServerProjection(projection.cursor, projection.value)");
   });
 
   it("keeps navigation to the detailed diff and pull-request surfaces", () => {

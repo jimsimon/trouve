@@ -54,8 +54,10 @@ export default defineConfig(({ mode }) => {
   const pwaCacheName = `trouve-static-${packageJson.version}-${sourceRevision}`;
   const input: Record<string, string> = {
     app: fileURLToPath(new URL("./index.html", import.meta.url)),
-    gallery: fileURLToPath(new URL("./gallery.html", import.meta.url)),
   };
+  // The parity gallery is a development/test fixture served directly by
+  // Vite. It is not a product route and does not belong in shipping desktop
+  // or PWA asset manifests.
   if (mode === "pwa") {
     input["service-worker"] = fileURLToPath(
       new URL("./src/pwa/service-worker.ts", import.meta.url),

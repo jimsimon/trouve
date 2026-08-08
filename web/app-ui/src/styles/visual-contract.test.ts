@@ -413,7 +413,10 @@ describe("Trouve visual contract", () => {
       /\.tool-card pre \{[^}]*min-width:\s*0[^}]*max-width:\s*100%[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap/s,
     );
     expect(app).toMatch(
-      /\.composer-entry \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 76px/s,
+      /\.composer-entry \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/s,
+    );
+    expect(app).toMatch(
+      /\.composer-entry-actions \{[^}]*display:\s*flex[^}]*align-items:\s*end[^}]*gap:\s*6px/s,
     );
     expect(app).toMatch(
       /\.composer textarea \{[^}]*min-height:\s*34px[^}]*max-height:\s*162px/s,
@@ -535,10 +538,10 @@ describe("Trouve visual contract", () => {
     );
     expect(app).not.toContain(".turn-timeline > .turn-rail-node:last-child::after");
     expect(app).toMatch(
-      /\.conversation-turn > \.turn-timeline\.has-transient-activity \{[^}]*padding-block-end:\s*7px[^}]*border-radius:\s*0/s,
+      /\.turn-rail-marker\.transient \{[^}]*color:\s*var\(--trouve-accent\)/s,
     );
     expect(app).toMatch(
-      /\.turn-activity-footer \{[^}]*padding:\s*0 14px 12px 36px/s,
+      /\.turn-transient-activity \.turn-node-header strong \{[^}]*color:\s*var\(--trouve-text-dim\)[^}]*font-size:\s*11px/s,
     );
     expect(app).toMatch(
       /\.turn-header-metadata-slot \{[^}]*width:\s*34ch[^}]*min-width:\s*34ch[^}]*justify-content:\s*flex-end/s,
@@ -562,7 +565,9 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain('class="composer-option model-option"');
     expect(thread).toContain('class="composer-option permission-option"');
     expect(thread).toContain("message-body turn-body-stream agent-body-stream turn-timeline");
-    expect(thread).toContain('html`<footer class="turn-activity-footer">');
+    expect(thread).not.toContain("turn-activity-footer");
+    expect(thread).toContain('class="turn-rail-node turn-transient-activity"');
+    expect(thread).toContain('className: "turn-transient-spinner"');
     expect(thread).toContain('this.#renderContextUsage(turnContextUsage, "turn-context-usage")');
     expect(thread).toContain('class="turn-node-body user-body-stream"');
     expect(thread).not.toContain("Collapse your message");

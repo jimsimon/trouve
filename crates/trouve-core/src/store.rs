@@ -6896,6 +6896,7 @@ mod tests {
                 mode: "code".into(),
                 model: "test/model".into(),
                 thinking_level: None,
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,
@@ -7374,6 +7375,7 @@ mod tests {
                     mode: "code".into(),
                     model: "p/m".into(),
                     thinking_level: None,
+                    supports_steering: false,
                 },
             )
             .unwrap();

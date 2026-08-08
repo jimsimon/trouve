@@ -32,7 +32,7 @@ use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
+    BackendStatus, BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -146,6 +146,22 @@ impl AgentBackend for CodexBackend {
                 note: format!("could not read usage from the Codex app-server: {e}"),
             },
         })
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        let server = self.server().await?;
+        let mut input = Vec::with_capacity(1 + steer.attachments.len());
+        if !steer.prompt.is_empty() {
+            input.push(json!({ "type": "text", "text": steer.prompt }));
+        }
+        for attachment in steer.attachments {
+            input.push(json!({ "type": "localImage", "path": attachment.path }));
+        }
+        server.steer_turn(&steer.session, input).await
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
@@ -2410,6 +2426,40 @@ impl AppServer {
         }
     }
 
+    /// Append input to the exact turn currently active on a Codex thread.
+    /// `expectedTurnId` makes a completion/replacement race fail closed
+    /// instead of steering whichever turn happens to run next.
+    async fn steer_turn(&self, thread_id: &str, input: Vec<Value>) -> Result<(), BackendError> {
+        let expected_turn_id = self
+            .active_turns
+            .lock()
+            .await
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "turn/steer: no active turn on Codex thread {thread_id}"
+                ))
+            })?;
+        let response = self
+            .request(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "input": input,
+                    "expectedTurnId": expected_turn_id,
+                }),
+            )
+            .await?;
+        let returned_turn_id = turn_id_of(&response)?;
+        if returned_turn_id != expected_turn_id {
+            return Err(BackendError::Protocol(format!(
+                "turn/steer returned turn {returned_turn_id}, expected {expected_turn_id}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn notify(&self, method: &str, params: Value) {
         let _ = self
             .write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
@@ -3672,6 +3722,63 @@ mod tests {
             agent_message_delta(&legacy, &commentary),
             Some(BackendEvent::TextDelta(text)) if text == "Legacy response."
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steer_turn_targets_the_exact_active_codex_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-steer");
+        let request_marker = std::path::PathBuf::from(format!("{}.request", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r request
+printf '%s\n' "$request" > "$0.request"
+echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-1"}}}'
+cat > /dev/null
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        assert!(matches!(
+            server
+                .steer_turn("thread-1", vec![json!({ "type": "text", "text": "early" })])
+                .await,
+            Err(BackendError::Protocol(message)) if message.contains("no active turn")
+        ));
+        server
+            .active_turns
+            .lock()
+            .await
+            .insert("thread-1".into(), "turn-1".into());
+        server
+            .steer_turn(
+                "thread-1",
+                vec![
+                    json!({ "type": "text", "text": "Focus on the regression." }),
+                    json!({ "type": "localImage", "path": "/tmp/screenshot.png" }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(request_marker).unwrap()).unwrap();
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(request["params"]["threadId"], "thread-1");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-1");
+        assert_eq!(
+            request["params"]["input"],
+            json!([
+                { "type": "text", "text": "Focus on the regression." },
+                { "type": "localImage", "path": "/tmp/screenshot.png" },
+            ])
+        );
     }
 
     #[tokio::test]

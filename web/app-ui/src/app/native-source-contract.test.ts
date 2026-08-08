@@ -78,6 +78,7 @@ const rustEventToWire = {
   TurnCompleted: "turn.completed",
   TurnFailed: "turn.failed",
   TurnStarted: "turn.started",
+  TurnSteered: "turn.steered",
   TurnUsageUpdated: "turn.usage_updated",
   UserMessage: "user.message",
 } as const;

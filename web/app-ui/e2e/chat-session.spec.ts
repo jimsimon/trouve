@@ -1,6 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
+import { parseUnifiedDiff } from "../src/components/diff-parser.js";
+
 interface FixtureEvent extends Record<string, unknown> {
   readonly cursor: number;
 }
@@ -192,6 +194,7 @@ const installEventStream = async (page: Page): Promise<void> => {
 
 interface ProtocolFixtureOptions {
   readonly sentMessages?: Array<Record<string, unknown>>;
+  readonly steeredMessages?: Array<Record<string, unknown>>;
   readonly dispatchedQueuePromptIds?: string[];
   readonly messageDelayMs?: number;
   readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
@@ -204,6 +207,7 @@ interface ProtocolFixtureOptions {
   readonly codeReviewDashboard?: Record<string, unknown>;
   readonly codeReviewSettings?: Record<string, unknown>;
   readonly sessionDiff?: string;
+  readonly sessionDiffRequests?: string[];
   readonly sessionPullRequests?: readonly Record<string, unknown>[];
   readonly sessionMcpServers?: readonly Record<string, unknown>[];
 }
@@ -212,6 +216,7 @@ const installProtocolFixtures = async (
   page: Page,
   {
     sentMessages = [],
+    steeredMessages = [],
     dispatchedQueuePromptIds = [],
     messageDelayMs = 0,
     beforeMessageResponse,
@@ -224,16 +229,42 @@ const installProtocolFixtures = async (
     codeReviewDashboard,
     codeReviewSettings,
     sessionDiff = "",
+    sessionDiffRequests = [],
     sessionPullRequests = [],
     sessionMcpServers = [],
   }: ProtocolFixtureOptions = {},
 ): Promise<void> => {
   let messageCount = 0;
   let editedQueue: readonly Record<string, unknown>[] = [];
+  const sessionDiffFiles = parseUnifiedDiff(sessionDiff);
+  const sessionDiffSummary = {
+    files: sessionDiffFiles.map((file) => ({
+      path: file.path,
+      additions: file.additions,
+      deletions: file.deletions,
+      binary: file.binary,
+    })),
+    additions: sessionDiffFiles.reduce((total, file) => total + file.additions, 0),
+    deletions: sessionDiffFiles.reduce((total, file) => total + file.deletions, 0),
+  };
   await page.route("**/v1/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const key = `${request.method()} ${url.pathname}`;
+    if (url.pathname.includes("/diff")) {
+      sessionDiffRequests.push(`${request.method()} ${url.pathname}${url.search}`);
+    }
+    if (key === "GET /v1/sessions/se_1/diff/file") {
+      const path = url.searchParams.get("path");
+      const file = sessionDiffFiles.find((candidate) => candidate.path === path);
+      await route.fulfill({
+        status: file === undefined ? 404 : 200,
+        json: file === undefined
+          ? { code: "not_found", message: "diff path not found" }
+          : { path: file.path, diff: file.raw },
+      });
+      return;
+    }
     if (key === "POST /v1/threads/th_fixture/messages") {
       sentMessages.push(request.postDataJSON() as Record<string, unknown>);
       messageCount += 1;
@@ -245,6 +276,14 @@ const installProtocolFixtures = async (
         json: messageCount === 1
           ? { thread_id: "th_fixture", turn: 8 }
           : { thread_id: "th_fixture", turn: 0, queued: true },
+      });
+      return;
+    }
+    if (key === "POST /v1/threads/th_fixture/steer") {
+      steeredMessages.push(request.postDataJSON() as Record<string, unknown>);
+      await route.fulfill({
+        status: 202,
+        json: { thread_id: "th_fixture", turn: 8 },
       });
       return;
     }
@@ -459,7 +498,7 @@ const installProtocolFixtures = async (
         turns: 1,
       },
       "GET /v1/sessions/se_1/paths": [],
-      "GET /v1/sessions/se_1/diff": { diff: sessionDiff },
+      "GET /v1/sessions/se_1/diff/summary": sessionDiffSummary,
       "GET /v1/sessions/se_1/prs": sessionPullRequests,
       "GET /v1/sessions/se_1/mcp-servers": sessionMcpServers,
       "GET /v1/sessions/se_2/usage": {
@@ -470,7 +509,11 @@ const installProtocolFixtures = async (
         turns: 0,
       },
       "GET /v1/sessions/se_2/paths": [],
-      "GET /v1/sessions/se_2/diff": { diff: "" },
+      "GET /v1/sessions/se_2/diff/summary": {
+        files: [],
+        additions: 0,
+        deletions: 0,
+      },
       "GET /v1/sessions/se_2/prs": [],
       "GET /v1/sessions/se_2/mcp-servers": [],
       ...(codeReviewDashboard === undefined
@@ -661,6 +704,7 @@ test("the TODO pane follows the thread's durable todo snapshot", async ({
 test("Diff shows one changed file at a time from a diff-only file tree", async ({
   page,
 }, testInfo) => {
+  const sessionDiffRequests: string[] = [];
   const sessionDiff = [
     "diff --git a/src/app.ts b/src/app.ts",
     "index 1111111..2222222 100644",
@@ -679,7 +723,7 @@ test("Diff shows one changed file at a time from a diff-only file tree", async (
     "+Updated guide",
     "",
   ].join("\n");
-  await installProtocolFixtures(page, { sessionDiff });
+  await installProtocolFixtures(page, { sessionDiff, sessionDiffRequests });
   await page.goto("/workspaces/ws_1/sessions/se_1/threads/th_fixture/inspect/diff");
   await replayHistory(page);
   if (testInfo.project.name === "mobile-chromium") {
@@ -699,6 +743,11 @@ test("Diff shows one changed file at a time from a diff-only file tree", async (
 
   const viewers = workspace.locator("trouve-diff-view");
   await expect(viewers).toHaveCount(1);
+  await expect(viewers).toHaveAttribute("label", "src/app.ts");
+  expect(sessionDiffRequests).not.toContain("GET /v1/sessions/se_1/diff");
+  expect(sessionDiffRequests.some((request) =>
+    request.includes("/diff/file?path=docs%2Fguide.md")
+  )).toBe(false);
   const appFile = tree.getByRole("treeitem", { name: /app\.ts/ });
   const guideFile = tree.getByRole("treeitem", { name: /guide\.md/ });
   await expect(appFile).toHaveAttribute("aria-selected", "true");
@@ -719,6 +768,9 @@ test("Diff shows one changed file at a time from a diff-only file tree", async (
   await tree.getByRole("treeitem", { name: /guide\.md/ }).click();
   await expect(viewers).toHaveCount(1);
   await expect(viewers).toHaveAttribute("label", "docs/guide.md");
+  expect(sessionDiffRequests.some((request) =>
+    request.includes("/diff/file?path=docs%2Fguide.md")
+  )).toBe(true);
   if (testInfo.project.name === "mobile-chromium") {
     await expect(tree).toBeHidden();
     await expect(viewers).toBeVisible();
@@ -2285,6 +2337,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       centerDrift: Math.abs(
         symbolBounds.left + symbolBounds.width / 2 - outerRail.center,
       ),
+      paddingInlineStart: getComputedStyle(marker).paddingInlineStart,
       outerRailDisplay: outerRail.display,
       beforeRailDisplay: beforeRail.display,
       afterRailDisplay: afterRail.display,
@@ -2304,6 +2357,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
     };
   });
   expect(connection.centerDrift).toBeLessThanOrEqual(0.25);
+  expect(connection.paddingInlineStart).toBe("4px");
   expect(connection.outerRailDisplay).not.toBe("none");
   expect(connection.beforeRailDisplay).toBe("none");
   expect(connection.afterRailDisplay).toBe("none");
@@ -2318,7 +2372,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
   expect(connection.afterBranchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
 });
 
-test("running activity groups retain explicit disclosure state as tools arrive", async ({
+test("active tools stay on the rail and join stable groups only after completion", async ({
   page,
 }) => {
   await installProtocolFixtures(page);
@@ -2363,13 +2417,17 @@ test("running activity groups retain explicit disclosure state as tools arrive",
     threadEvent(22, { type: "tool.started", call_id: "call_group_2" }),
   ]);
 
-  const group = page.locator(".activity-group").last();
-  await expect(group).toBeVisible();
-  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
-  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  const timeline = page.locator(".agent-turn-card").last().locator(
+    ":scope > .turn-timeline > .agent-activity-timeline",
+  );
+  await expect(timeline.locator(":scope > .activity-group")).toHaveCount(0);
+  await expect(timeline.locator(
+    ':scope > .tool-card.tool-running[data-call-id="call_group_2"]',
+  )).toBeVisible();
+  await expect(page.locator(".agent-turn-card").last().locator(
+    ".turn-transient-activity",
+  )).toHaveCount(0);
 
-  await group.locator(":scope > summary").click();
-  await expect(group.locator(".tool-card")).toHaveCount(2);
   await emitBatch(page, [
     threadEvent(23, {
       type: "tool.completed",
@@ -2387,11 +2445,16 @@ test("running activity groups retain explicit disclosure state as tools arrive",
     }),
     threadEvent(25, { type: "tool.started", call_id: "call_group_3" }),
   ]);
-  await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
-  await expect(group.locator(".tool-card")).toHaveCount(3);
+  const group = page.locator(".activity-group").last();
+  await expect(group).toBeVisible();
+  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(timeline.locator(
+    ':scope > .tool-card.tool-running[data-call-id="call_group_3"]',
+  )).toBeVisible();
 
   await group.locator(":scope > summary").click();
-  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(group.locator(".tool-card")).toHaveCount(2);
   await emitBatch(page, [
     threadEvent(26, {
       type: "tool.completed",
@@ -2409,8 +2472,23 @@ test("running activity groups retain explicit disclosure state as tools arrive",
     }),
     threadEvent(28, { type: "tool.started", call_id: "call_group_4" }),
   ]);
+  await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".tool-card")).toHaveCount(3);
+  await expect(timeline.locator(
+    ':scope > .tool-card.tool-running[data-call-id="call_group_4"]',
+  )).toBeVisible();
+
+  await group.locator(":scope > summary").click();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await emit(page, threadEvent(29, {
+    type: "tool.completed",
+    call_id: "call_group_4",
+    status: "ok",
+    result: { exit_code: 0 },
+  }));
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
 });
 
 test("context compaction is an animated durable boundary between tool groups", async ({
@@ -2441,6 +2519,12 @@ test("context compaction is an animated durable boundary between tool groups", a
       requires_approval: false,
     }),
     threadEvent(33, {
+      type: "tool.completed",
+      call_id: "before_compaction_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(34, {
       type: "tool.requested",
       turn: 10,
       call_id: "before_compaction_2",
@@ -2448,7 +2532,13 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "second" },
       requires_approval: false,
     }),
-    threadEvent(34, { type: "thread.compaction_started", turn: 10 }),
+    threadEvent(35, {
+      type: "tool.completed",
+      call_id: "before_compaction_2",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(36, { type: "thread.compaction_started", turn: 10 }),
   ]);
 
   const agent = page.locator(".agent-turn-card").last();
@@ -2476,12 +2566,12 @@ test("context compaction is an animated durable boundary between tool groups", a
     .toHaveAttribute("aria-disabled", "true");
 
   await emitBatch(page, [
-    threadEvent(35, {
+    threadEvent(37, {
       type: "thread.compaction_completed",
       turn: 10,
       messages_compacted: 24,
     }),
-    threadEvent(36, {
+    threadEvent(38, {
       type: "turn.usage_updated",
       turn: 10,
       usage: {
@@ -2492,7 +2582,7 @@ test("context compaction is an animated durable boundary between tool groups", a
         context_window: 128_000,
       },
     }),
-    threadEvent(37, {
+    threadEvent(39, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_1",
@@ -2500,13 +2590,25 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "third" },
       requires_approval: false,
     }),
-    threadEvent(38, {
+    threadEvent(40, {
+      type: "tool.completed",
+      call_id: "after_compaction_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(41, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_2",
       tool: "Bash",
       args: { command: "fourth" },
       requires_approval: false,
+    }),
+    threadEvent(42, {
+      type: "tool.completed",
+      call_id: "after_compaction_2",
+      status: "ok",
+      result: { exit_code: 0 },
     }),
   ]);
 
@@ -2822,14 +2924,18 @@ test("thought completion clears stale activity while standalone and grouped tool
   ]);
 
   const agent = page.locator(".agent-turn-card").last();
-  const transientActivity = agent.locator(":scope > .turn-activity-footer > .agent-activity");
-  await expect(transientActivity).toContainText("Thinking…");
-  await expect(agent.locator(":scope > .turn-timeline > .agent-activity")).toHaveCount(0);
+  const transientActivity = agent.locator(
+    ":scope > .turn-timeline > .turn-transient-activity",
+  );
+  await expect(agent.locator(".thinking-output.running")).toBeVisible();
+  await expect(transientActivity).toHaveCount(0);
   await emit(page, threadEvent(73, {
     type: "assistant.thinking_completed",
     turn: 14,
   }));
   await expect(transientActivity).toContainText("Processing…");
+  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
+    .toBeVisible();
 
   await emitBatch(page, [
     threadEvent(74, {
@@ -2878,6 +2984,20 @@ test("thought completion clears stale activity while standalone and grouped tool
       args: { command: "sleep 1" },
       requires_approval: false,
     }),
+    threadEvent(82, {
+      type: "tool.completed",
+      call_id: "group_two",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
+    threadEvent(83, {
+      type: "tool.requested",
+      turn: 14,
+      call_id: "group_three",
+      tool: "commandExecution",
+      args: { command: "sleep 2" },
+      requires_approval: false,
+    }),
   ]);
 
   const timeline = agent.locator(":scope > .message-body > .agent-activity-timeline");
@@ -2886,7 +3006,10 @@ test("thought completion clears stale activity while standalone and grouped tool
     ':scope > .tool-card[data-call-id="before_group"]',
   )).toBeVisible();
   await expect(timeline.locator(":scope > .activity-group")).toContainText("2 commands");
-  await expect(agent.locator(".agent-activity")).toContainText("Running commands…");
+  await expect(timeline.locator(
+    ':scope > .tool-card.tool-running[data-call-id="group_three"]',
+  )).toBeVisible();
+  await expect(transientActivity).toHaveCount(0);
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
@@ -3334,6 +3457,11 @@ test("chat surfaces contain pathological content from narrow to wide layouts", a
     return attachments === undefined ? Number.NaN : attachments.left - contentLeft;
   });
   expect(Math.abs(attachmentInset)).toBeLessThanOrEqual(1);
+  const completedToolGroup = page.locator(".activity-group").last();
+  await expect(completedToolGroup).toBeVisible();
+  if (!(await completedToolGroup.evaluate((element) => (element as HTMLDetailsElement).open))) {
+    await completedToolGroup.locator(":scope > summary").click();
+  }
   for (const callId of [
     "call_layout_command",
     "call_layout_todos",
@@ -4082,6 +4210,10 @@ test("queued prompts drag by the full row and adjacent drops always move", async
     },
   ];
   const submittedOrders: string[][] = [];
+  let releaseReorder!: () => void;
+  const reorderGate = new Promise<void>((resolve) => {
+    releaseReorder = resolve;
+  });
   await installProtocolFixtures(page);
   await page.route("**/v1/threads/th_fixture/queue", async (route) => {
     if (route.request().method() !== "PUT") {
@@ -4090,6 +4222,7 @@ test("queued prompts drag by the full row and adjacent drops always move", async
     }
     const { ids } = route.request().postDataJSON() as { readonly ids: string[] };
     submittedOrders.push(ids);
+    await reorderGate;
     await route.fulfill({
       json: ids.map((id, position) => ({
         ...prompts.find((prompt) => prompt.id === id)!,
@@ -4101,10 +4234,16 @@ test("queued prompts drag by the full row and adjacent drops always move", async
   await replayHistory(page);
   await emit(page, threadEvent(16, {
     type: "thread.queue_updated",
-    prompts,
+    prompts: prompts.slice(0, 1),
   }));
 
   const rows = page.locator(".queue-panel li[data-queue-id]");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toHaveAttribute("draggable", "false");
+  await emit(page, threadEvent(17, {
+    type: "thread.queue_updated",
+    prompts,
+  }));
   await expect(rows).toHaveCount(2);
   await expect(rows.first()).toHaveAttribute("draggable", "true");
   await expect(page.locator(".queue-grip")).toHaveCount(0);
@@ -4167,8 +4306,11 @@ test("queued prompts drag by the full row and adjacent drops always move", async
   });
 
   await expect.poll(() => submittedOrders).toEqual([["qp_second", "qp_first"]]);
+  await expect(page.locator(".queue-panel")).toHaveAttribute("aria-busy", "true");
   await expect(rows.nth(0)).toContainText("Second queued prompt");
   await expect(rows.nth(1)).toContainText("First queued prompt");
+  releaseReorder();
+  await expect(page.locator(".queue-panel")).toHaveAttribute("aria-busy", "false");
 });
 
 test("queued prompts reorder from the keyboard without visible move arrows", async ({ page }) => {
@@ -4246,6 +4388,50 @@ test("queued prompts reorder from the keyboard without visible move arrows", asy
   await expect(status).toContainText("Queued prompt dropped at position 2 of 2.");
 });
 
+test("a steerable running turn accepts guidance and renders it on the turn rail", async ({
+  page,
+}) => {
+  const steeredMessages: Array<Record<string, unknown>> = [];
+  await installProtocolFixtures(page, { steeredMessages });
+  await page.goto("/");
+  await replayHistory(page);
+  await emit(page, threadEvent(16, {
+    type: "turn.started",
+    turn: 8,
+    mode: "code",
+    model: "test/model",
+    thinking_level: "max",
+    supports_steering: true,
+  }));
+  await emit(page, threadEvent(17, {
+    type: "user.message",
+    turn: 8,
+    content: "Start the new turn",
+    attachments: [],
+  }));
+
+  const composer = page.getByRole("textbox", { name: "Message", exact: true });
+  const steer = page.getByRole("button", { name: "Steer active turn" });
+  await composer.fill("Prioritize the narrow layout");
+  await expect(steer).toBeVisible();
+  await steer.click();
+  await expect.poll(() => steeredMessages).toEqual([{
+    content: "Prioritize the narrow layout",
+  }]);
+  await expect(composer).toHaveValue("");
+
+  await emit(page, threadEvent(18, {
+    type: "turn.steered",
+    turn: 8,
+    content: "Prioritize the narrow layout",
+    attachments: [],
+  }));
+  const node = page.locator(".conversation-turn .turn-steered-node");
+  await expect(node.getByText("Steered", { exact: true })).toBeVisible();
+  await expect(node).toContainText("Prioritize the narrow layout");
+  await expect(node.locator('[data-font-awesome-icon="route"]')).toBeVisible();
+});
+
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {
   const sentMessages: Array<Record<string, unknown>> = [];
   const messageReleases: Array<() => void> = [];
@@ -4291,9 +4477,9 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
-    type: "assistant.delta",
+    type: "assistant.message",
     turn: 8,
-    text: "Working",
+    content: "Working",
   }));
   await emit(page, threadEvent(19, {
     type: "thread.queue_updated",
@@ -4359,14 +4545,17 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await composer.fill("");
   await expect(submit).toHaveText("Cancel");
   const activeAgent = page.locator(".agent-turn-card").last();
-  await expect(activeAgent.locator(".agent-activity")).toContainText("Processing…");
+  await expect(activeAgent.locator(".turn-transient-activity"))
+    .toContainText("Processing…");
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
   expect(await page.locator("trouve-thread-screen.thread-panel").evaluate((panel) => {
     const chat = panel.querySelector<HTMLElement>(".chat-stream")?.getBoundingClientRect();
     const queue = panel.querySelector<HTMLElement>(".queue-panel")?.getBoundingClientRect();
-    const activity = panel.querySelector<HTMLElement>(".agent-activity")?.getBoundingClientRect();
+    const activity = panel.querySelector<HTMLElement>(
+      ".turn-transient-activity",
+    )?.getBoundingClientRect();
     if (chat === undefined || queue === undefined || activity === undefined) {
       return ["missing chat, queue, or activity"];
     }
@@ -4378,8 +4567,8 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await page.locator("trouve-app").evaluate((element) => {
     element.setAttribute("data-reduce-motion", "");
   });
-  await expect.poll(() => activeAgent.locator("trouve-markdown-view[streaming]").evaluate(
-    (element) => getComputedStyle(element, "::after").animationName,
+  await expect.poll(() => activeAgent.locator(".turn-transient-spinner").evaluate(
+    (element) => getComputedStyle(element).animationName,
   )).toBe("none");
   await expect(page.locator('[data-virtual-id="ephemeral:activity"]')).toHaveCount(0);
   await expect(submit).toHaveText("Cancel");

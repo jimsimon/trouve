@@ -43,6 +43,7 @@ impl ThreadProjection {
                 turn,
                 model,
                 thinking_level,
+                supports_steering,
                 ..
             } => {
                 self.snapshot.turn_running = true;
@@ -52,6 +53,9 @@ impl ThreadProjection {
                         .turn_thinking_levels
                         .insert(*turn, thinking_level.clone());
                 }
+                self.snapshot
+                    .turn_steerable
+                    .insert(*turn, *supports_steering);
                 self.snapshot.turn_started_at.insert(*turn, envelope.ts);
                 let idx = self.push(ThreadViewItem::TurnStatus {
                     turn: *turn,
@@ -101,6 +105,18 @@ impl ThreadProjection {
                 attachments,
             } => {
                 self.push(ThreadViewItem::User {
+                    turn: *turn,
+                    content: content.clone(),
+                    attachments: attachments.clone(),
+                });
+            }
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            } => {
+                self.finish_thinking();
+                self.push(ThreadViewItem::Steered {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
@@ -427,6 +443,7 @@ impl ThreadProjection {
                     self.indexes.questions.insert(request_id.clone(), idx);
                 }
                 ThreadViewItem::User { .. }
+                | ThreadViewItem::Steered { .. }
                 | ThreadViewItem::Assistant { .. }
                 | ThreadViewItem::Compaction { .. } => {}
             }
@@ -617,6 +634,7 @@ mod tests {
                 mode: "code".into(),
                 model: "codex/gpt-5.6-sol".into(),
                 thinking_level: Some("max".into()),
+                supports_steering: false,
             },
         ));
         let usage = trouve_protocol::Usage {
@@ -656,6 +674,67 @@ mod tests {
     }
 
     #[test]
+    fn steering_is_a_durable_top_level_boundary_inside_the_running_turn() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::TurnStarted {
+                turn: 7,
+                mode: "code".into(),
+                model: "codex/gpt-5.6-sol".into(),
+                thinking_level: Some("max".into()),
+                supports_steering: true,
+            },
+            Event::UserMessage {
+                turn: 7,
+                content: "Start here.".into(),
+                attachments: Vec::new(),
+            },
+            Event::AssistantThinking {
+                turn: 7,
+                text: "Before steering.".into(),
+            },
+            Event::TurnSteered {
+                turn: 7,
+                content: "Prioritize the regression.".into(),
+                attachments: Vec::new(),
+            },
+            Event::AssistantThinking {
+                turn: 7,
+                text: "After steering.".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        assert_eq!(projection.snapshot.turn_steerable.get(&7), Some(&true));
+        assert!(projection.snapshot.turn_running);
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::TurnStatus { .. },
+                ThreadViewItem::User { content: prompt, .. },
+                ThreadViewItem::Thinking {
+                    content: before,
+                    complete: true,
+                    ..
+                },
+                ThreadViewItem::Steered { content: steering, .. },
+                ThreadViewItem::Thinking {
+                    content: after,
+                    complete: false,
+                    ..
+                },
+            ] if prompt == "Start here."
+                && before == "Before steering."
+                && steering == "Prioritize the regression."
+                && after == "After steering."
+        ));
+    }
+
+    #[test]
     fn completed_turn_retains_its_checkpoint_id() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
@@ -666,6 +745,7 @@ mod tests {
                 mode: "code".into(),
                 model: "test/model".into(),
                 thinking_level: None,
+                supports_steering: false,
             },
         ));
         projection.apply(&envelope(

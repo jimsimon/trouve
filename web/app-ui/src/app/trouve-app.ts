@@ -707,7 +707,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
     const results = await Promise.allSettled([
       this.#protocolIngress.refreshProjection(),
-      this.#protocolClient.refreshGithubPrs(),
+      this.#protocolClient.refreshGithubPrs(true),
     ]);
     this.#pullRefreshPending = false;
     if (!this.isConnected) return;

@@ -203,6 +203,10 @@ pub enum Event {
         /// turn after inherited defaults and model schema normalization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking_level: Option<String>,
+        /// Whether the backend running this exact turn accepts additional
+        /// user input without cancelling or starting another turn.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_steering: bool,
     },
     /// Live usage from the most recently completed model request in a running
     /// turn. This replaces the thread's context-usage snapshot without
@@ -229,6 +233,16 @@ pub enum Event {
         content: String,
         /// Files the user attached to the prompt (bytes at
         /// `GET /v1/attachments/{id}`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
+    },
+    /// Additional user input accepted by the backend while `turn` was still
+    /// running. This belongs on the active turn's timeline and does not start
+    /// or queue another turn.
+    #[serde(rename = "turn.steered")]
+    TurnSteered {
+        turn: u64,
+        content: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
     },
@@ -693,6 +707,7 @@ mod tests {
                 mode: "code".into(),
                 model: "gpt-x".into(),
                 thinking_level: Some("high".into()),
+                supports_steering: true,
             },
         };
         let json = serde_json::to_string(&env).unwrap();
@@ -703,13 +718,14 @@ mod tests {
             back.event,
             Event::TurnStarted {
                 thinking_level: Some(level),
+                supports_steering: true,
                 ..
             } if level == "high"
         ));
     }
 
     #[test]
-    fn historical_turn_started_defaults_thinking_level() {
+    fn historical_turn_started_defaults_additive_turn_capabilities() {
         let event: Event = serde_json::from_value(serde_json::json!({
             "type": "turn.started",
             "turn": 1,
@@ -721,8 +737,29 @@ mod tests {
             event,
             Event::TurnStarted {
                 thinking_level: None,
+                supports_steering: false,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn steered_event_omits_empty_attachments_and_roundtrips() {
+        let event = Event::TurnSteered {
+            turn: 9,
+            content: "Focus on the failing test.".into(),
+            attachments: Vec::new(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "turn.steered");
+        assert!(value.get("attachments").is_none());
+        assert!(matches!(
+            serde_json::from_value::<Event>(value).unwrap(),
+            Event::TurnSteered {
+                turn: 9,
+                content,
+                attachments,
+            } if content == "Focus on the failing test." && attachments.is_empty()
         ));
     }
 }

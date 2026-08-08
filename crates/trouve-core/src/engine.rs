@@ -11,12 +11,12 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
-use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
+use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendSteer, BackendTurn};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
-    Thread, ToolStatus, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertProviderRequest, Usage, Workspace,
+    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -41,6 +41,10 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Let every visible client retain its 30-second background cadence while
+/// collapsing slightly staggered requests into one upstream refresh. The
+/// five-second margin avoids stretching a single client's normal cadence.
+const GITHUB_DASHBOARD_REFRESH_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(25);
 // The title model independently bounds a cold sidecar start and decoding.
 // Leave a little handoff margin beyond those combined budgets so this outer
 // timeout does not silently replace a valid model request with heuristics.
@@ -428,6 +432,190 @@ fn resolved_thinking_level(
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
 
+const GITHUB_PR_DETAIL_CACHE_CAPACITY: usize = 48;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GithubPrDetailKey {
+    host: String,
+    repository: String,
+    number: u64,
+    head_sha: String,
+}
+
+impl GithubPrDetailKey {
+    fn from_info(info: &trouve_protocol::PrInfo) -> Self {
+        Self {
+            host: info.host.to_ascii_lowercase(),
+            repository: info.repository.to_ascii_lowercase(),
+            number: info.number,
+            head_sha: info
+                .head_sha
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedGithubPrDetail {
+    detail: trouve_protocol::PrDetail,
+    sections: HashSet<trouve_protocol::PrDetailSection>,
+    last_access: u64,
+}
+
+#[derive(Default)]
+struct GithubPrDetailCache {
+    entries: HashMap<GithubPrDetailKey, CachedGithubPrDetail>,
+    access_counter: u64,
+}
+
+impl GithubPrDetailCache {
+    fn invalidate_pr(&mut self, info: &trouve_protocol::PrInfo) {
+        let host = info.host.to_ascii_lowercase();
+        let repository = info.repository.to_ascii_lowercase();
+        self.entries.retain(|key, _| {
+            key.host != host || key.repository != repository || key.number != info.number
+        });
+    }
+
+    fn get(
+        &mut self,
+        key: &GithubPrDetailKey,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) -> Option<trouve_protocol::PrDetail> {
+        let entry = self.entries.get_mut(key)?;
+        if !sections.is_subset(&entry.sections) {
+            return None;
+        }
+        self.access_counter = self.access_counter.wrapping_add(1);
+        entry.last_access = self.access_counter;
+        Some(entry.detail.clone())
+    }
+
+    fn loaded_sections(
+        &self,
+        key: &GithubPrDetailKey,
+    ) -> HashSet<trouve_protocol::PrDetailSection> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.sections.clone())
+            .unwrap_or_default()
+    }
+
+    fn detail(&self, key: &GithubPrDetailKey) -> Option<trouve_protocol::PrDetail> {
+        self.entries.get(key).map(|entry| entry.detail.clone())
+    }
+
+    fn mark_stale(
+        &mut self,
+        key: &GithubPrDetailKey,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.sections.retain(|section| !sections.contains(section));
+        }
+    }
+
+    fn merge(
+        &mut self,
+        requested_key: &GithubPrDetailKey,
+        mut detail: trouve_protocol::PrDetail,
+        mut sections: HashSet<trouve_protocol::PrDetailSection>,
+    ) -> trouve_protocol::PrDetail {
+        let overview_fetched = sections.contains(&trouve_protocol::PrDetailSection::Overview);
+        sections.insert(trouve_protocol::PrDetailSection::Overview);
+        let actual_key = GithubPrDetailKey::from_info(&detail.info);
+        let same_head = actual_key == *requested_key;
+        if same_head && let Some(previous) = self.entries.remove(requested_key) {
+            if !sections.contains(&trouve_protocol::PrDetailSection::Conversation) {
+                detail.comments = previous.detail.comments;
+                detail.review_threads = previous.detail.review_threads;
+                detail.reviews = previous.detail.reviews;
+            }
+            if !sections.contains(&trouve_protocol::PrDetailSection::Commits) {
+                detail.commits = previous.detail.commits;
+                detail.commit_count = previous.detail.commit_count;
+            }
+            if !sections.contains(&trouve_protocol::PrDetailSection::Files) {
+                detail.files = previous.detail.files;
+            }
+            if !overview_fetched {
+                detail.stack = previous.detail.stack;
+            }
+            sections.extend(previous.sections);
+        } else {
+            self.entries.remove(requested_key);
+        }
+        self.access_counter = self.access_counter.wrapping_add(1);
+        self.entries.insert(
+            actual_key,
+            CachedGithubPrDetail {
+                detail: detail.clone(),
+                sections,
+                last_access: self.access_counter,
+            },
+        );
+        while self.entries.len() > GITHUB_PR_DETAIL_CACHE_CAPACITY {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        detail
+    }
+}
+
+struct SteerTurnCommand {
+    content: String,
+    attachments: Vec<trouve_protocol::Attachment>,
+    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurnSteerer {
+    turn: u64,
+    sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+}
+
+/// Remove only the registration installed by this backend turn. A cancelled
+/// dispatcher can overlap the next turn's startup while its future unwinds.
+struct ActiveTurnSteererGuard<'a> {
+    registry: &'a Mutex<HashMap<String, ActiveTurnSteerer>>,
+    thread_id: String,
+    turn: u64,
+}
+
+async fn receive_steer_command(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    backend_session_ready: bool,
+) -> Option<SteerTurnCommand> {
+    if !backend_session_ready {
+        return std::future::pending().await;
+    }
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Drop for ActiveTurnSteererGuard<'_> {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap();
+        if registry
+            .get(&self.thread_id)
+            .is_some_and(|active| active.turn == self.turn)
+        {
+            registry.remove(&self.thread_id);
+        }
+    }
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -471,6 +659,10 @@ pub struct Engine {
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Capability-aware channels into backend loops that can accept
+    /// additional user input during an active turn. The turn number protects
+    /// cleanup from removing a newer registration for the same thread.
+    turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -479,6 +671,10 @@ pub struct Engine {
     /// management and identity validation; each host has its own async lock so
     /// network refreshes do not block host removal or unrelated hosts.
     github_dashboard_caches: Mutex<HashMap<String, GithubDashboardCacheHandle>>,
+    /// Selected-PR page state, bounded and keyed by immutable head SHA. Tabs
+    /// add sections to an entry on demand instead of repeating GitHub's rich
+    /// nested detail query on every render or pane switch.
+    github_pr_detail_cache: Mutex<GithubPrDetailCache>,
     /// Orders authenticated-host capture, cache registration, and snapshot
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
@@ -837,8 +1033,10 @@ impl Engine {
             session_activity_publication: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
+            turn_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
+            github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
@@ -3215,6 +3413,287 @@ impl Engine {
         Ok(prs)
     }
 
+    /// Session-to-PR authorization from the newest persisted account
+    /// snapshots. Unlike discovery (`session_prs`), this never contacts
+    /// GitHub; the shell's 30-second account refresh keeps the projection
+    /// current in the background.
+    fn projected_session_prs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
+        let session = self.get_session(session_id)?;
+        let linked_urls = self.recorded_session_pr_urls(session_id)?;
+        let mut seen = HashSet::new();
+        let mut prs = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
+                continue;
+            };
+            prs.extend(snapshot.prs.into_iter().filter(|pr| {
+                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
+                    && seen.insert((
+                        pr.host.to_ascii_lowercase(),
+                        pr.repository.to_ascii_lowercase(),
+                        pr.number,
+                    ))
+            }));
+        }
+        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        Ok(prs)
+    }
+
+    fn projected_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+    ) -> Result<(Session, trouve_protocol::PrInfo), EngineError> {
+        let session = self.get_session(session_id)?;
+        let pr = self
+            .projected_session_prs(session_id)?
+            .into_iter()
+            .find(|pr| pr.number == number)
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "pull request #{number} is not associated with session {session_id}"
+                ))
+            })?;
+        Ok((session, pr))
+    }
+
+    async fn cached_session_pr_detail(
+        &self,
+        session: &Session,
+        pr: &trouve_protocol::PrInfo,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        let key = GithubPrDetailKey::from_info(pr);
+        if let Some(detail) = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .get(&key, sections)
+        {
+            return Ok(detail);
+        }
+        let loaded = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .loaded_sections(&key);
+        let existing = self.github_pr_detail_cache.lock().unwrap().detail(&key);
+        let mut missing = sections
+            .difference(&loaded)
+            .copied()
+            .collect::<HashSet<_>>();
+        if loaded.is_empty() {
+            missing.insert(trouve_protocol::PrDetailSection::Overview);
+        }
+        let mut detail = self
+            .github_for_session(session)?
+            .pr_detail(pr.number, &missing, existing)
+            .await
+            .map_err(EngineError::Internal)?;
+        detail.info.workspace_id = pr.workspace_id.clone();
+        detail.info.trouve_review = pr.trouve_review.clone();
+        Ok(self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .merge(&key, detail, missing))
+    }
+
+    /// Full GitHub collaboration state for one pull request already
+    /// associated with this session. The association check prevents a
+    /// session-scoped route from becoming a repository-wide PR browser.
+    pub async fn session_pr_detail(
+        &self,
+        session_id: &str,
+        number: u64,
+        section: Option<trouve_protocol::PrDetailSection>,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let sections = section.map_or_else(
+            || {
+                HashSet::from([
+                    trouve_protocol::PrDetailSection::Overview,
+                    trouve_protocol::PrDetailSection::Conversation,
+                    trouve_protocol::PrDetailSection::Commits,
+                    trouve_protocol::PrDetailSection::Files,
+                ])
+            },
+            |section| HashSet::from([trouve_protocol::PrDetailSection::Overview, section]),
+        );
+        self.cached_session_pr_detail(&session, &pr, &sections)
+            .await
+    }
+
+    /// Bounded before/after content for one changed file in an associated
+    /// session PR. The GitHub layer independently verifies that `path` belongs
+    /// to the selected pull request before resolving either immutable blob.
+    pub async fn session_pr_file_diff(
+        &self,
+        session_id: &str,
+        number: u64,
+        path: &str,
+    ) -> Result<trouve_protocol::PrFileDiff, EngineError> {
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let detail = self
+            .cached_session_pr_detail(
+                &session,
+                &pr,
+                &HashSet::from([
+                    trouve_protocol::PrDetailSection::Overview,
+                    trouve_protocol::PrDetailSection::Files,
+                ]),
+            )
+            .await?;
+        let file = detail
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "{path} is not a changed file in pull request #{number}"
+                ))
+            })?;
+        let github = self.github_for_session(&session)?;
+        match (detail.base_sha.as_deref(), detail.info.head_sha.as_deref()) {
+            (Some(base), Some(head)) if !base.is_empty() && !head.is_empty() => github
+                .pr_file_diff_known(file, base, head)
+                .await
+                .map_err(EngineError::Internal),
+            _ => github
+                .pr_file_diff(number, path)
+                .await
+                .map_err(EngineError::Internal),
+        }
+    }
+
+    /// Apply a typed action to one associated pull request, then refresh the
+    /// durable account projection used by the dashboard, session badges, and
+    /// every open PR pane. A successful GitHub mutation is not reported as a
+    /// failure merely because another configured host failed its refresh.
+    pub async fn act_on_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+        action: &trouve_protocol::PrActionRequest,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
+
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let key = GithubPrDetailKey::from_info(&pr);
+        let required = match action {
+            Action::UpdateReview { .. }
+            | Action::DeleteReview { .. }
+            | Action::DismissReview { .. }
+            | Action::AddComment { .. }
+            | Action::UpdateComment { .. }
+            | Action::DeleteComment { .. }
+            | Action::ReplyReviewThread { .. }
+            | Action::ResolveReviewThread { .. }
+            | Action::AddReaction { .. }
+            | Action::RemoveReaction { .. } => {
+                HashSet::from([Section::Overview, Section::Conversation])
+            }
+            Action::AddReviewThread { .. } | Action::SetFileViewed { .. } => {
+                HashSet::from([Section::Overview, Section::Files])
+            }
+            _ => HashSet::from([Section::Overview]),
+        };
+        let detail = self
+            .cached_session_pr_detail(&session, &pr, &required)
+            .await?;
+        self.github_for_session(&session)?
+            .act_on_pr(&detail, action)
+            .await
+            .map_err(EngineError::Internal)?;
+
+        let mut stale = HashSet::from([Section::Overview]);
+        match action {
+            Action::SubmitReview { .. }
+            | Action::UpdateReview { .. }
+            | Action::DeleteReview { .. }
+            | Action::DismissReview { .. }
+            | Action::AddComment { .. }
+            | Action::UpdateComment { .. }
+            | Action::DeleteComment { .. }
+            | Action::ReplyReviewThread { .. }
+            | Action::ResolveReviewThread { .. }
+            | Action::AddReaction { .. }
+            | Action::RemoveReaction { .. } => {
+                stale.insert(Section::Conversation);
+            }
+            Action::AddReviewThread { .. } => {
+                stale.insert(Section::Conversation);
+                stale.insert(Section::Files);
+            }
+            Action::SetFileViewed { .. } => {
+                stale.insert(Section::Files);
+            }
+            Action::UpdateBranch { .. } => {
+                stale.insert(Section::Commits);
+                stale.insert(Section::Files);
+            }
+            _ => {}
+        }
+        let mut refresh_sections = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .loaded_sections(&key);
+        if matches!(action, Action::UpdateBranch { .. }) {
+            // A new head invalidates every cached connection, not only files
+            // and commits. Re-fetch only the tabs this client population had
+            // actually loaded, but never carry old-head data into the new key.
+            stale.extend(refresh_sections.iter().copied());
+        }
+        refresh_sections.extend(stale.iter().copied());
+        self.github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .mark_stale(&key, &stale);
+        let refreshed = self
+            .cached_session_pr_detail(&session, &pr, &refresh_sections)
+            .await?;
+        self.publish_github_pr_summary(&refreshed.info)?;
+        Ok(refreshed)
+    }
+
+    /// Publish a mutation's already-returned summary into the durable account
+    /// projection. This updates all open clients immediately without another
+    /// GitHub discovery pass; the regular background refresh remains the
+    /// authority for subsequent external changes.
+    fn publish_github_pr_summary(&self, info: &trouve_protocol::PrInfo) -> Result<(), EngineError> {
+        let _publication = self.github_dashboard_publication.lock().unwrap();
+        let mut snapshot = self.store.latest_github_pr_snapshot(&info.host)?.unwrap_or(
+            trouve_protocol::GithubPrList {
+                viewer: String::new(),
+                host: info.host.clone(),
+                prs: Vec::new(),
+            },
+        );
+        if let Some(existing) = snapshot.prs.iter_mut().find(|candidate| {
+            candidate.number == info.number
+                && candidate.repository.eq_ignore_ascii_case(&info.repository)
+        }) {
+            *existing = info.clone();
+        } else {
+            snapshot.prs.push(info.clone());
+            snapshot
+                .prs
+                .sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        }
+        self.store.append_event(
+            Scope::Server,
+            Event::GithubPullRequestsUpdated {
+                pull_requests: snapshot,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Current durable server-owned UI projections paired with a server
     /// cursor. This is intentionally local-only: account PR state comes from
     /// the newest persisted replacement event and session associations come
@@ -3691,10 +4170,11 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(anyhow!(e)))?
         .map_err(EngineError::Internal)?;
-        let pr = github
+        let mut pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
             .map_err(EngineError::Internal)?;
+        pr.workspace_id = session.workspace_id.clone();
         self.store.append_event(
             Scope::Session(session.id.clone()),
             Event::SessionPrOpened {
@@ -3702,6 +4182,7 @@ impl Engine {
                 url: pr.url.clone(),
             },
         )?;
+        self.publish_github_pr_summary(&pr)?;
         Ok(pr)
     }
 
@@ -3733,6 +4214,99 @@ impl Engine {
             .map_err(|e| EngineError::Internal(anyhow!(e)))?;
         match result {
             Ok(diff) => Ok(diff),
+            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
+                Err(EngineError::SessionDiffTooLarge(error.to_string()))
+            }
+            Err(error) => Err(EngineError::Internal(error)),
+        }
+    }
+
+    /// Return only bounded changed-path metadata. Patch text is loaded through
+    /// `session_file_diff` after the client selects a file.
+    pub async fn session_diff_summary(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionDiffSummary, EngineError> {
+        let session = self.get_session(session_id)?;
+        let worktree = PathBuf::from(&session.worktree_path);
+        let base = session.base_ref.clone();
+        let result =
+            tokio::task::spawn_blocking(move || git::session_diff_summary(&worktree, &base))
+                .await
+                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
+                return Err(EngineError::SessionDiffTooLarge(error.to_string()));
+            }
+            Err(error) => return Err(EngineError::Internal(error)),
+        };
+        let additions = stats.iter().map(|file| file.additions).sum();
+        let deletions = stats.iter().map(|file| file.deletions).sum();
+        Ok(SessionDiffSummary {
+            additions,
+            deletions,
+            files: stats
+                .into_iter()
+                .map(|file| SessionDiffFileSummary {
+                    path: file.path,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    binary: file.binary,
+                })
+                .collect(),
+        })
+    }
+
+    /// Return a bounded unified patch for one worktree-relative changed path.
+    pub async fn session_file_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<SessionFileDiff, EngineError> {
+        let relative = Path::new(path);
+        if path.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(EngineError::BadRequest(
+                "diff path must be worktree-relative".into(),
+            ));
+        }
+        if !self
+            .session_diff_summary(session_id)
+            .await?
+            .files
+            .iter()
+            .any(|file| file.path == path)
+        {
+            return Err(EngineError::NotFound(format!(
+                "path is not changed in this session: {path}"
+            )));
+        }
+        let session = self.get_session(session_id)?;
+        let worktree = PathBuf::from(&session.worktree_path);
+        let base = session.base_ref.clone();
+        let selected_path = path.to_string();
+        let request_path = selected_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            git::session_diff_path(&worktree, &base, &request_path)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        match result {
+            Ok(diff) => Ok(SessionFileDiff {
+                path: selected_path,
+                diff,
+            }),
             Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
                 Err(EngineError::SessionDiffTooLarge(error.to_string()))
             }
@@ -4057,7 +4631,8 @@ impl Engine {
     }
 
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
-    pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
+    pub async fn refresh_github_prs(&self, force: bool) -> Result<(), EngineError> {
+        let request_started = Instant::now();
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
         let workspace_repositories = tokio::task::spawn_blocking(move || {
@@ -4075,10 +4650,24 @@ impl Engine {
         let mut failures = Vec::new();
         let refreshes = self.prepare_github_dashboard_refreshes();
         for (host, token, cache_handle) in refreshes {
-            let Ok(mut cache) = cache_handle.try_lock() else {
-                tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
-                continue;
+            let mut cache = if force {
+                cache_handle.lock().await
+            } else {
+                let Ok(cache) = cache_handle.try_lock() else {
+                    tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
+                    continue;
+                };
+                cache
             };
+            if !cache.should_refresh(
+                force,
+                request_started,
+                Instant::now(),
+                GITHUB_DASHBOARD_REFRESH_FRESHNESS,
+            ) {
+                tracing::debug!(host, force, "reusing fresh GitHub dashboard snapshot");
+                continue;
+            }
             let account =
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
             let refresh = tokio::time::timeout(
@@ -4117,16 +4706,31 @@ impl Engine {
                 )?;
             }
             let pull_requests = trouve_protocol::GithubPrList { viewer, host, prs };
-            if !cache.has_published_snapshot()
-                && let Some(persisted) =
-                    self.store.latest_github_pr_snapshot(&pull_requests.host)?
-            {
-                cache.seed_published_snapshot(&persisted)?;
+            let persisted = self.store.latest_github_pr_snapshot(&pull_requests.host)?;
+            if let Some(previous) = persisted.as_ref() {
+                let mut detail_cache = self.github_pr_detail_cache.lock().unwrap();
+                for pr in &pull_requests.prs {
+                    let changed = previous
+                        .prs
+                        .iter()
+                        .find(|candidate| {
+                            candidate.number == pr.number
+                                && candidate.repository.eq_ignore_ascii_case(&pr.repository)
+                        })
+                        .is_none_or(|candidate| {
+                            serde_json::to_value(candidate).ok() != serde_json::to_value(pr).ok()
+                        });
+                    if changed {
+                        detail_cache.invalidate_pr(pr);
+                    }
+                }
             }
-            let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
-                continue;
-            };
+            if !cache.has_published_snapshot()
+                && let Some(persisted) = persisted.as_ref()
             {
+                cache.seed_published_snapshot(persisted)?;
+            }
+            if let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? {
                 let _publication = self.github_dashboard_publication.lock().unwrap();
                 let cache_is_current = {
                     let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
@@ -4145,6 +4749,7 @@ impl Engine {
                 )?;
                 cache.mark_snapshot_published(snapshot);
             }
+            cache.mark_refresh_completed();
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));
@@ -4901,6 +5506,65 @@ impl Engine {
         content: String,
     ) -> Result<TurnAccepted, EngineError> {
         self.send_message_with_tools(thread_id, content, Vec::new(), false)
+    }
+
+    /// Append user guidance to the exact backend turn currently running on a
+    /// thread. The backend loop owns acceptance and durable ordering so a
+    /// steer cannot jump ahead of output already received from the vendor.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<trouve_protocol::SteerAccepted, EngineError> {
+        self.get_thread(thread_id)?;
+        if content.trim().is_empty() && uploads.is_empty() {
+            return Err(EngineError::BadRequest(
+                "a steering message needs text or an attachment".into(),
+            ));
+        }
+        // The registration belongs to the exact running turn and is the
+        // capability authority. Do not re-read the thread's selected model:
+        // an API client can change that selection while the previous model's
+        // turn is still unwinding, but steering must still target that turn.
+        let active = self
+            .turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
+            })?;
+        let attachments = self.save_attachments(thread_id, uploads)?;
+        let (response, accepted) = tokio::sync::oneshot::channel();
+        active
+            .sender
+            .send(SteerTurnCommand {
+                content,
+                attachments,
+                response,
+            })
+            .await
+            .map_err(|_| {
+                EngineError::Conflict(format!(
+                    "turn {} finished before it could be steered",
+                    active.turn
+                ))
+            })?;
+        accepted
+            .await
+            .map_err(|_| {
+                EngineError::Conflict(format!(
+                    "turn {} finished before steering was acknowledged",
+                    active.turn
+                ))
+            })?
+            .map_err(EngineError::Conflict)?;
+        Ok(trouve_protocol::SteerAccepted {
+            thread_id: thread_id.to_string(),
+            turn: active.turn,
+        })
     }
 
     fn send_message_with_tools(
@@ -5667,6 +6331,7 @@ impl Engine {
                 mode: mode.id.clone(),
                 model: thread.model.clone(),
                 thinking_level,
+                supports_steering: false,
             },
         )?;
         // Show the prompt in the UI before any slow pre-turn work:
@@ -6495,6 +7160,7 @@ impl Engine {
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let thinking_level = resolved_thinking_level(&model_options, selected_model);
+        let supports_steering = tools_enabled && backend.supports_steering();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -6504,7 +7170,7 @@ impl Engine {
         // A vendor session retains the tools it was created with. Tool-free
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
-        let (resume, handoff, seen_after) = if tools_enabled {
+        let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
             let payloads = self.store.messages(&thread.id)?;
             let unseen = match &resume {
@@ -6518,14 +7184,12 @@ impl Engine {
                 .filter_map(|p| serde_json::from_value(p.clone()).ok())
                 .collect();
             let handoff = render_history_digest(&messages, resume.is_some());
-            // After this turn the vendor has seen everything up to and
-            // including its own reply (appended below on completion).
-            let seen_after = payloads.len() as u64 + 2;
-            (resume, handoff, seen_after)
+            (resume, handoff)
         } else {
-            (None, None, 0)
+            (None, None)
         };
         let vendor_session = resume.map(|(id, _)| id);
+        let mut active_vendor_session = vendor_session.clone();
         self.store.append_event(
             scope.clone(),
             Event::TurnStarted {
@@ -6533,6 +7197,7 @@ impl Engine {
                 mode: mode.id.clone(),
                 model: thread.model.clone(),
                 thinking_level,
+                supports_steering,
             },
         )?;
         self.store.append_event(
@@ -6620,6 +7285,23 @@ impl Engine {
             .await
             .map_err(|e| anyhow!("backend error: {e}"))?;
 
+        let mut steer_rx = None;
+        let _steerer_guard = if supports_steering {
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            self.turn_steerers
+                .lock()
+                .unwrap()
+                .insert(thread.id.clone(), ActiveTurnSteerer { turn, sender });
+            steer_rx = Some(receiver);
+            Some(ActiveTurnSteererGuard {
+                registry: &self.turn_steerers,
+                thread_id: thread.id.clone(),
+                turn,
+            })
+        } else {
+            None
+        };
+
         // `text` records the whole turn for the transcript; `segment` is the
         // current streamed block, flushed (finalized) at each tool boundary
         // so tool cards interleave with the text in the order they happened
@@ -6661,6 +7343,69 @@ impl Engine {
                     persist_deadline = None;
                     continue;
                 }
+                steer = receive_steer_command(
+                    &mut steer_rx,
+                    active_vendor_session.is_some(),
+                ) => {
+                    let Some(command) = steer else {
+                        steer_rx = None;
+                        continue;
+                    };
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    persist_deadline = None;
+                    let resolved = self.resolve_attachments(&command.attachments);
+                    let (images, files): (Vec<_>, Vec<_>) = resolved
+                        .into_iter()
+                        .partition(|(attachment, _)| attachment.mime.starts_with("image/"));
+                    let backend_prompt = annotate_attachments(command.content.clone(), &files);
+                    let backend_attachments = images
+                        .into_iter()
+                        .map(|(attachment, path)| trouve_agents::TurnAttachment {
+                            name: attachment.name,
+                            mime: attachment.mime,
+                            path,
+                        })
+                        .collect();
+                    let backend_result = backend
+                        .steer_turn(BackendSteer {
+                            session: active_vendor_session
+                                .clone()
+                                .expect("steering branch requires a backend session"),
+                            prompt: backend_prompt.clone(),
+                            attachments: backend_attachments,
+                        })
+                        .await;
+                    if let Err(error) = backend_result {
+                        let _ = command.response.send(Err(error.to_string()));
+                        continue;
+                    }
+                    let persistence_result = (|| -> Result<()> {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::TurnSteered {
+                                turn,
+                                content: command.content,
+                                attachments: command.attachments,
+                            },
+                        )?;
+                        self.store.append_message(
+                            &thread.id,
+                            &serde_json::to_value(Message::User(backend_prompt))?,
+                        )?;
+                        Ok(())
+                    })();
+                    match persistence_result {
+                        Ok(()) => {
+                            let _ = command.response.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let _ = command.response.send(Err(message));
+                            return Err(error);
+                        }
+                    }
+                    continue;
+                }
                 ev = stream.next() => match ev {
                     Some(ev) => ev,
                     None => break,
@@ -6675,6 +7420,7 @@ impl Engine {
             };
             match event {
                 BackendEvent::SessionStarted { session_id } => {
+                    active_vendor_session = Some(session_id.clone());
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
@@ -6940,6 +7686,7 @@ impl Engine {
             })?,
         )?;
         if tools_enabled {
+            let seen_after = self.store.messages(&thread.id)?.len() as u64;
             self.store
                 .mark_backend_seen(&thread.id, backend_id, seen_after)?;
         }
@@ -9155,6 +9902,71 @@ mod tests {
         }
     }
 
+    fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
+        serde_json::from_value(serde_json::json!({
+            "info": info,
+            "base_sha": "base-sha",
+            "id": "PR_node",
+            "viewer": "octocat",
+            "created_at": "2026-08-08T00:00:00Z",
+            "updated_at": "2026-08-08T00:00:00Z",
+            "additions": 1,
+            "deletions": 1,
+            "changed_files": 1,
+            "commit_count": 1,
+            "capabilities": {},
+            "merge_queue": { "enabled": false }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pr_detail_cache_merges_lazy_sections_and_invalidates_independently() {
+        use trouve_protocol::PrDetailSection as Section;
+
+        let mut info = projection_pr(42, "ws", "trouve/cache");
+        info.head_sha = Some("head-one".into());
+        let key = GithubPrDetailKey::from_info(&info);
+        let mut cache = GithubPrDetailCache::default();
+        cache.merge(
+            &key,
+            projection_detail(info.clone()),
+            HashSet::from([Section::Overview]),
+        );
+
+        let mut files = projection_detail(info.clone());
+        files.files.push(trouve_protocol::PrFile {
+            path: "src/lib.rs".into(),
+            additions: 1,
+            deletions: 1,
+            change_type: "modified".into(),
+            viewer_viewed_state: "unviewed".into(),
+        });
+        cache.merge(&key, files, HashSet::from([Section::Files]));
+        let cached = cache
+            .get(&key, &HashSet::from([Section::Overview, Section::Files]))
+            .unwrap();
+        assert_eq!(cached.files.len(), 1);
+
+        cache.mark_stale(&key, &HashSet::from([Section::Files]));
+        assert!(cache.get(&key, &HashSet::from([Section::Files])).is_none());
+        assert!(
+            cache
+                .get(&key, &HashSet::from([Section::Overview]))
+                .is_some()
+        );
+
+        let mut next = info;
+        next.head_sha = Some("head-two".into());
+        let next_detail = cache.merge(
+            &key,
+            projection_detail(next),
+            HashSet::from([Section::Overview]),
+        );
+        assert!(next_detail.files.is_empty());
+        assert!(!cache.entries.contains_key(&key));
+    }
+
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
@@ -9296,6 +10108,12 @@ mod tests {
             )
             .unwrap();
         let engine = Engine::new(store, data.path().into(), &Config::default());
+
+        let local = engine.projected_session_prs(&session.id).unwrap();
+        assert_eq!(
+            local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![11, 10]
+        );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
 

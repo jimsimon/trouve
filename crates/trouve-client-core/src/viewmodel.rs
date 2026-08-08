@@ -71,6 +71,12 @@ pub enum ChatItem {
         /// at `GET /v1/attachments/{id}`).
         attachments: Vec<trouve_protocol::Attachment>,
     },
+    /// Additional user guidance appended to an already-running turn.
+    Steered {
+        turn: u64,
+        content: String,
+        attachments: Vec<trouve_protocol::Attachment>,
+    },
     /// Streaming or final assistant text (grows in place from deltas).
     Assistant {
         turn: u64,
@@ -175,6 +181,8 @@ pub struct ThreadViewModel {
     /// The effective provider-native thinking selection for each turn, from
     /// turn.started — shown alongside the model in the agent card header.
     pub turn_thinking_levels: HashMap<u64, String>,
+    /// Whether each turn's backend accepted native in-flight steering.
+    pub turn_steerable: HashMap<u64, bool>,
     /// When each turn started (the turn.started envelope timestamp);
     /// paired with the completion envelope to compute wall-clock duration.
     pub turn_started_at: HashMap<u64, chrono::DateTime<chrono::Utc>>,
@@ -205,6 +213,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             thinking: snapshot.thinking,
             turn_models: snapshot.turn_models.into_iter().collect(),
             turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
+            turn_steerable: snapshot.turn_steerable.into_iter().collect(),
             turn_started_at: snapshot.turn_started_at.into_iter().collect(),
             turn_duration_ms: snapshot.turn_duration_ms.into_iter().collect(),
             commands: snapshot.commands,
@@ -222,6 +231,15 @@ impl From<ThreadViewItem> for ChatItem {
                 content,
                 attachments,
             } => Self::User {
+                turn,
+                content,
+                attachments,
+            },
+            ThreadViewItem::Steered {
+                turn,
+                content,
+                attachments,
+            } => Self::Steered {
                 turn,
                 content,
                 attachments,
@@ -373,6 +391,7 @@ impl ThreadViewModel {
                 turn,
                 model,
                 thinking_level,
+                supports_steering,
                 ..
             } => {
                 self.turn_running = true;
@@ -381,6 +400,7 @@ impl ThreadViewModel {
                     self.turn_thinking_levels
                         .insert(*turn, thinking_level.clone());
                 }
+                self.turn_steerable.insert(*turn, *supports_steering);
                 self.turn_started_at.insert(*turn, envelope.ts);
                 self.items.push(ChatItem::TurnStatus {
                     turn: *turn,
@@ -458,6 +478,19 @@ impl ThreadViewModel {
                 attachments,
             } => {
                 self.items.push(ChatItem::User {
+                    turn: *turn,
+                    content: content.clone(),
+                    attachments: attachments.clone(),
+                });
+                Some(self.items.len() - 1)
+            }
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            } => {
+                self.finish_thinking();
+                self.items.push(ChatItem::Steered {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
@@ -799,6 +832,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 ChatItem::User { .. } => "user",
+                ChatItem::Steered { .. } => "steered",
                 ChatItem::Assistant { .. } => "assistant",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",
@@ -925,6 +959,7 @@ mod tests {
             mode: "code".into(),
             model: "m".into(),
             thinking_level: None,
+            supports_steering: false,
         });
         started.ts = start;
         vm.apply(&started);
@@ -982,6 +1017,7 @@ mod tests {
                 mode: "code".into(),
                 model: "m".into(),
                 thinking_level: None,
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,
@@ -1081,6 +1117,7 @@ mod tests {
             mode: "code".into(),
             model: "m".into(),
             thinking_level: None,
+            supports_steering: false,
         }));
         assert!(vm.turn_running);
         assert!(!vm.compacting);
@@ -1285,6 +1322,7 @@ mod tests {
             mode: "code".into(),
             model: "m".into(),
             thinking_level: None,
+            supports_steering: false,
         }));
         assert!(vm.turn_running);
         vm.apply(&env(Event::TurnCancelled { turn: 1 }));
@@ -1353,6 +1391,7 @@ mod tests {
             mode: "code".into(),
             model: "m".into(),
             thinking_level: None,
+            supports_steering: false,
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
@@ -1390,6 +1429,38 @@ mod tests {
             .filter(|i| matches!(i, ChatItem::Thinking { .. }))
             .count();
         assert_eq!(thinking_blocks, 2);
+    }
+
+    #[test]
+    fn steering_closes_thinking_and_preserves_capability_and_content() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 4,
+            mode: "code".into(),
+            model: "codex/gpt-5.6-sol".into(),
+            thinking_level: Some("max".into()),
+            supports_steering: true,
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: "Original direction.".into(),
+        }));
+        vm.apply(&env(Event::TurnSteered {
+            turn: 4,
+            content: "Check the smaller-screen layout too.".into(),
+            attachments: Vec::new(),
+        }));
+
+        assert_eq!(vm.turn_steerable.get(&4), Some(&true));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::TurnStatus { .. },
+                ChatItem::Thinking { complete: true, .. },
+                ChatItem::Steered { turn: 4, content, attachments },
+            ] if content == "Check the smaller-screen layout too." && attachments.is_empty()
+        ));
     }
 
     #[test]
@@ -1485,6 +1556,7 @@ mod tests {
                 mode: "code".into(),
                 model: "m".into(),
                 thinking_level: None,
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,
@@ -1524,6 +1596,7 @@ mod tests {
                 mode: "code".into(),
                 model: "test/model".into(),
                 thinking_level: Some("max".into()),
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,

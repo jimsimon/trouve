@@ -16,11 +16,20 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
 const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
-// The desktop diff view eagerly parses and materializes every returned row.
-// Bound all three independent growth dimensions before crossing the protocol.
+// The legacy aggregate endpoint still needs a strict whole-session budget.
+// New clients load a bounded metadata manifest and one bounded patch at a time.
 const MAX_SESSION_DIFF_FILES: usize = 250;
 const MAX_SESSION_DIFF_CHANGED_LINES: u64 = 20_000;
 const MAX_SESSION_DIFF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SESSION_FILE_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDiffStat {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
+}
 
 #[derive(Debug)]
 pub struct SessionDiffTooLarge(String);
@@ -191,6 +200,37 @@ fn bounded_session_diff(dir: &Path, base_ref: &str) -> Result<String> {
         let _ = stderr_reader.join();
         return Err(session_diff_too_large(format!(
             "session diff is too large to render (more than {MAX_SESSION_DIFF_BYTES} bytes)"
+        )));
+    }
+    finish_streamed_git(dir, &args, child, stderr_reader)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+fn bounded_session_diff_path(dir: &Path, base_ref: &str, path: &str) -> Result<String> {
+    let args = [
+        "diff",
+        "--no-renames",
+        "--end-of-options",
+        base_ref,
+        "--",
+        path,
+    ];
+    let mut child = spawn_git_with_piped_output(dir, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut bytes = Vec::with_capacity(MAX_SESSION_FILE_DIFF_BYTES.min(64 * 1024));
+    stdout
+        .take(MAX_SESSION_FILE_DIFF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("reading bounded selected-file diff")?;
+    if bytes.len() > MAX_SESSION_FILE_DIFF_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(session_diff_too_large(format!(
+            "selected file diff is too large to render (more than \
+             {MAX_SESSION_FILE_DIFF_BYTES} bytes)"
         )));
     }
     finish_streamed_git(dir, &args, child, stderr_reader)?;
@@ -529,6 +569,73 @@ pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
     bounded_session_diff(worktree, base_ref)
 }
 
+/// Lightweight metadata for every changed path. Disabling rename detection
+/// keeps the NUL-delimited numstat representation unambiguous and matches the
+/// path-scoped patch endpoint: a rename is represented as one deletion and one
+/// addition rather than requiring the client to understand Git's paired-path
+/// encoding.
+pub fn session_diff_summary(worktree: &Path, base_ref: &str) -> Result<Vec<SessionDiffStat>> {
+    ensure_safe_ref(base_ref)?;
+    let args = [
+        "diff",
+        "--numstat",
+        "--no-renames",
+        "-z",
+        "--end-of-options",
+        base_ref,
+    ];
+    let mut child = spawn_git_with_piped_output(worktree, &args)?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let mut bytes = Vec::with_capacity(MAX_SESSION_DIFF_BYTES.min(64 * 1024));
+    stdout
+        .take(MAX_SESSION_DIFF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("reading bounded session diff metadata")?;
+    if bytes.len() > MAX_SESSION_DIFF_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(session_diff_too_large(format!(
+            "session diff metadata is too large to render (more than \
+             {MAX_SESSION_DIFF_BYTES} bytes)"
+        )));
+    }
+    finish_streamed_git(worktree, &args, child, stderr_reader)?;
+
+    let mut files = Vec::new();
+    for entry in bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let text = String::from_utf8_lossy(entry);
+        let mut fields = text.splitn(3, '\t');
+        let additions = fields.next().unwrap_or_default();
+        let deletions = fields.next().unwrap_or_default();
+        let Some(path) = fields.next() else {
+            bail!("invalid git diff --numstat record");
+        };
+        let binary = additions == "-" || deletions == "-";
+        let parse_count = |value: &str| -> Result<u64> {
+            if value == "-" {
+                Ok(0)
+            } else {
+                value
+                    .parse()
+                    .with_context(|| format!("invalid git diff --numstat count: {value:?}"))
+            }
+        };
+        files.push(SessionDiffStat {
+            path: path.to_string(),
+            additions: parse_count(additions)?,
+            deletions: parse_count(deletions)?,
+            binary,
+        });
+    }
+    Ok(files)
+}
+
 /// Every changed path in git's deterministic diff order. NUL framing keeps
 /// whitespace and newlines in filenames unambiguous.
 pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>> {
@@ -555,10 +662,7 @@ pub fn session_diff_path(worktree: &Path, base_ref: &str, path: &str) -> Result<
     {
         bail!("invalid repository-relative diff path: {path:?}");
     }
-    git(
-        worktree,
-        &["diff", "--end-of-options", base_ref, "--", path],
-    )
+    bounded_session_diff_path(worktree, base_ref, path)
 }
 
 /// URL of the named remote (usually "origin"), if configured.
@@ -744,6 +848,24 @@ mod tests {
         assert!(full.contains("+added"));
         let files = session_diff_files(tmp.path(), &base).unwrap();
         assert_eq!(files, ["a.txt", "space name.txt"]);
+        let summary = session_diff_summary(tmp.path(), &base).unwrap();
+        assert_eq!(
+            summary,
+            [
+                SessionDiffStat {
+                    path: "a.txt".into(),
+                    additions: 1,
+                    deletions: 0,
+                    binary: false,
+                },
+                SessionDiffStat {
+                    path: "space name.txt".into(),
+                    additions: 1,
+                    deletions: 0,
+                    binary: false,
+                },
+            ]
+        );
         let first = session_diff_path(tmp.path(), &base, &files[0]).unwrap();
         let second = session_diff_path(tmp.path(), &base, &files[1]).unwrap();
         assert!(first.contains("+two"));
@@ -762,6 +884,9 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let summary = session_diff_summary(tmp.path(), &base).unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].additions, MAX_SESSION_DIFF_CHANGED_LINES + 1);
     }
 
     #[test]
@@ -781,6 +906,8 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let summary = session_diff_summary(tmp.path(), &base).unwrap();
+        assert_eq!(summary.len(), MAX_SESSION_DIFF_FILES + 1);
     }
 
     #[test]
@@ -794,6 +921,19 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+    }
+
+    #[test]
+    fn selected_file_diff_has_an_independent_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let content = format!("{}\n", "x".repeat(MAX_SESSION_FILE_DIFF_BYTES + 1));
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+
+        let error = session_diff_path(tmp.path(), &base, "a.txt").unwrap_err();
+        assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert!(error.to_string().contains("selected file diff"));
     }
 
     #[test]

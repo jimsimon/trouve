@@ -1075,6 +1075,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/diff/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["session_file_diff"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/diff/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["session_diff_summary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/file": {
         parameters: {
             query?: never;
@@ -1179,6 +1211,54 @@ export interface paths {
             cookie?: never;
         };
         get: operations["list_session_prs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/prs/{number}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_session_pr_detail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/prs/{number}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["act_on_session_pr"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/prs/{number}/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_session_pr_file_diff"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1454,6 +1534,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/threads/{id}/steer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["steer_turn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/threads/{id}/usage": {
         parameters: {
             query?: never;
@@ -1690,9 +1786,15 @@ export interface components {
             head: string;
         };
         CheckRun: {
+            /** Format: date-time */
+            completed_at?: string | null;
             /** @description success / failure / … (None while running) */
             conclusion?: string | null;
+            /** @description GitHub page for the check run, when the provider exposes one. */
+            details_url?: string | null;
             name: string;
+            /** Format: date-time */
+            started_at?: string | null;
             /** @description queued / in_progress / completed */
             status: string;
         };
@@ -2354,6 +2456,11 @@ export interface components {
             mode: string;
             model: string;
             /**
+             * @description Whether the backend running this exact turn accepts additional
+             *     user input without cancelling or starting another turn.
+             */
+            supports_steering?: boolean;
+            /**
              * @description Effective provider-native thinking/reasoning selection for this
              *     turn after inherited defaults and model schema normalization.
              */
@@ -2397,6 +2504,13 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "user.message";
+        } | {
+            attachments?: components["schemas"]["Attachment"][];
+            content: string;
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.steered";
         } | {
             text: string;
             /** Format: int64 */
@@ -3065,6 +3179,314 @@ export interface components {
          * @enum {string}
          */
         PermissionMode: "ask" | "allow_list" | "yolo";
+        /**
+         * @description Typed PR-page actions. The server resolves every opaque target against the
+         *     selected session PR before contacting GitHub; OAuth tokens and arbitrary
+         *     GitHub API access never cross into the frontend.
+         */
+        PrActionRequest: {
+            /** @enum {string} */
+            action: "update";
+            base?: string | null;
+            body?: string | null;
+            maintainer_can_modify?: boolean | null;
+            title?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "set_state";
+            /** @description draft / ready / close / reopen */
+            state: string;
+        } | {
+            /** @enum {string} */
+            action: "request_reviewers";
+            bots?: string[];
+            /** @description Replace the current request set instead of adding to it. */
+            replace?: boolean;
+            teams?: string[];
+            users?: string[];
+        } | {
+            /** @enum {string} */
+            action: "submit_review";
+            body?: string;
+            /** @description approve / request_changes / comment */
+            event: string;
+        } | {
+            /** @enum {string} */
+            action: "update_review";
+            body: string;
+            id: string;
+        } | {
+            /** @enum {string} */
+            action: "delete_review";
+            id: string;
+        } | {
+            /** @enum {string} */
+            action: "dismiss_review";
+            id: string;
+            message: string;
+        } | {
+            /** @enum {string} */
+            action: "add_comment";
+            body: string;
+        } | {
+            /** @enum {string} */
+            action: "update_comment";
+            body: string;
+            id: string;
+            kind: components["schemas"]["PrCommentKind"];
+        } | {
+            /** @enum {string} */
+            action: "delete_comment";
+            id: string;
+            kind: components["schemas"]["PrCommentKind"];
+        } | {
+            /** @enum {string} */
+            action: "reply_review_thread";
+            body: string;
+            thread_id: string;
+        } | {
+            /** @enum {string} */
+            action: "resolve_review_thread";
+            resolved: boolean;
+            thread_id: string;
+        } | {
+            /** @enum {string} */
+            action: "add_review_thread";
+            body: string;
+            /** Format: int64 */
+            line: number;
+            path: string;
+            /** @description left / right */
+            side: string;
+            /** Format: int64 */
+            start_line?: number | null;
+            start_side?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "set_file_viewed";
+            path: string;
+            viewed: boolean;
+        } | {
+            /** @enum {string} */
+            action: "update_branch";
+            expected_head_sha?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "merge";
+            commit_message?: string;
+            commit_title?: string;
+            expected_head_sha?: string | null;
+            /** @description merge / squash / rebase */
+            method: string;
+        } | {
+            /** @enum {string} */
+            action: "set_auto_merge";
+            commit_message?: string;
+            commit_title?: string;
+            enabled: boolean;
+            method?: string;
+        } | {
+            /** @enum {string} */
+            action: "set_merge_queue";
+            enabled: boolean;
+            expected_head_sha?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "set_labels";
+            label_ids?: string[];
+        } | {
+            /** @enum {string} */
+            action: "set_assignees";
+            assignee_ids?: string[];
+        } | {
+            /** @enum {string} */
+            action: "set_milestone";
+            milestone_id?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "set_lock";
+            locked: boolean;
+            reason?: string | null;
+        } | {
+            /** @enum {string} */
+            action: "set_subscription";
+            /** @description subscribed / unsubscribed / ignored */
+            state: string;
+        } | {
+            /** @enum {string} */
+            action: "add_reaction";
+            content: string;
+            subject_id: string;
+        } | {
+            /** @enum {string} */
+            action: "remove_reaction";
+            content: string;
+            subject_id: string;
+        };
+        /** @description A GitHub account, bot, or team shown in pull-request collaboration UI. */
+        PrActor: {
+            avatar_url?: string;
+            /**
+             * @description GraphQL node id. It is opaque to clients and only sent back in typed
+             *     pull-request actions.
+             */
+            id: string;
+            /** @description user / bot / team / mannequin / unknown */
+            kind: string;
+            /** @description User/bot login or team slug. */
+            login: string;
+            /** @description Human-readable name when GitHub exposes one. */
+            name?: string;
+            url?: string;
+        };
+        PrAutoMerge: {
+            commit_message?: string;
+            commit_title?: string;
+            /** Format: date-time */
+            enabled_at: string;
+            enabled_by?: null | components["schemas"]["PrActor"];
+            method: string;
+        };
+        PrCapabilities: {
+            can_assign?: boolean;
+            can_close?: boolean;
+            can_disable_auto_merge?: boolean;
+            can_enable_auto_merge?: boolean;
+            can_label?: boolean;
+            can_merge_as_admin?: boolean;
+            can_reopen?: boolean;
+            can_update?: boolean;
+            can_update_branch?: boolean;
+            did_author?: boolean;
+        };
+        /** @description A top-level PR conversation comment or one comment in a review thread. */
+        PrComment: {
+            author?: null | components["schemas"]["PrActor"];
+            body: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            database_id?: number | null;
+            diff_hunk?: string;
+            id: string;
+            /** Format: date-time */
+            last_edited_at?: string | null;
+            /** Format: int64 */
+            line?: number | null;
+            /** @description Review-comment-only context. */
+            path?: string;
+            reactions?: components["schemas"]["PrReactionSummary"][];
+            /** Format: date-time */
+            updated_at: string;
+            url: string;
+            viewer_can_delete?: boolean;
+            viewer_can_update?: boolean;
+            viewer_did_author?: boolean;
+        };
+        /** @enum {string} */
+        PrCommentKind: "issue" | "review";
+        PrCommit: {
+            abbreviated_oid: string;
+            author?: null | components["schemas"]["PrActor"];
+            /** Format: date-time */
+            committed_at: string;
+            message_body?: string;
+            message_headline: string;
+            oid: string;
+            url: string;
+        };
+        PrDetail: {
+            active_lock_reason?: string;
+            /** Format: int64 */
+            additions: number;
+            assignable_users?: components["schemas"]["PrActor"][];
+            assignees?: components["schemas"]["PrActor"][];
+            auto_merge?: null | components["schemas"]["PrAutoMerge"];
+            auto_merge_allowed?: boolean;
+            available_labels?: components["schemas"]["PrLabel"][];
+            available_milestones?: components["schemas"]["PrMilestone"][];
+            /**
+             * @description Immutable base commit used with `info.head_sha` to load known files
+             *     without re-listing the pull request's changed-file connection.
+             */
+            base_sha?: string | null;
+            body?: string;
+            capabilities: components["schemas"]["PrCapabilities"];
+            /** Format: int64 */
+            changed_files: number;
+            comments?: components["schemas"]["PrComment"][];
+            /** Format: int64 */
+            commit_count: number;
+            commits?: components["schemas"]["PrCommit"][];
+            /** Format: date-time */
+            created_at: string;
+            default_merge_method?: string;
+            /** Format: int64 */
+            deletions: number;
+            files?: components["schemas"]["PrFile"][];
+            /** @description Pull-request GraphQL node id used by typed server-side mutations. */
+            id: string;
+            info: components["schemas"]["PrInfo"];
+            labels?: components["schemas"]["PrLabel"][];
+            locked?: boolean;
+            maintainer_can_modify?: boolean;
+            /**
+             * @description Merge methods enabled by repository settings (`merge`, `squash`,
+             *     `rebase`).
+             */
+            merge_methods?: string[];
+            merge_queue: components["schemas"]["PrMergeQueueStatus"];
+            milestone?: null | components["schemas"]["PrMilestone"];
+            reactions?: components["schemas"]["PrReactionSummary"][];
+            review_decision?: string;
+            review_requests?: components["schemas"]["PrActor"][];
+            review_threads?: components["schemas"]["PrReviewThread"][];
+            reviews?: components["schemas"]["PrReviewDetail"][];
+            stack?: null | components["schemas"]["PrStack"];
+            /**
+             * @description True only when a safety cap prevented an unbounded GitHub connection
+             *     from being returned in full.
+             */
+            truncated?: boolean;
+            /** Format: date-time */
+            updated_at: string;
+            viewer: string;
+            /** @description subscribed / unsubscribed / ignored */
+            viewer_subscription?: string;
+        };
+        /**
+         * @description Full collaboration state for one selected PR. Account/session summary
+         *     projections remain compact; this is fetched lazily by the PR pane.
+         * @enum {string}
+         */
+        PrDetailSection: "overview" | "conversation" | "commits" | "files";
+        PrFile: {
+            /** Format: int64 */
+            additions: number;
+            change_type: string;
+            /** Format: int64 */
+            deletions: number;
+            path: string;
+            viewer_viewed_state?: string;
+        };
+        /**
+         * @description Lazily fetched before/after content for one file in a selected pull
+         *     request. Large and binary blobs retain their metadata without crossing the
+         *     protocol as unbounded text.
+         */
+        PrFileDiff: {
+            binary?: boolean;
+            change_type: string;
+            modified?: string | null;
+            /** Format: int64 */
+            modified_bytes?: number | null;
+            notice?: string;
+            original?: string | null;
+            /** Format: int64 */
+            original_bytes?: number | null;
+            path: string;
+            truncated?: boolean;
+        };
         PrInfo: {
             /** @description PR author's login. */
             author?: string;
@@ -3114,10 +3536,101 @@ export interface components {
             /** @description Matching local workspace, when one is registered. */
             workspace_id?: string;
         };
+        PrLabel: {
+            /** @description Six-digit GitHub label color without a leading `#`. */
+            color?: string;
+            description?: string;
+            id: string;
+            name: string;
+        };
+        PrMergeQueueEntry: {
+            /** Format: date-time */
+            enqueued_at: string;
+            /** Format: int64 */
+            estimated_time_to_merge?: number | null;
+            id: string;
+            /** Format: int64 */
+            position: number;
+            state: string;
+        };
+        PrMergeQueueStatus: {
+            enabled?: boolean;
+            entry?: null | components["schemas"]["PrMergeQueueEntry"];
+        };
+        PrMilestone: {
+            id: string;
+            /** Format: int64 */
+            number: number;
+            state?: string;
+            title: string;
+            url?: string;
+        };
+        PrReactionSummary: {
+            /** @description GitHub reaction content (`THUMBS_UP`, `HEART`, ...). */
+            content: string;
+            /** Format: int64 */
+            count: number;
+            viewer_has_reacted?: boolean;
+        };
         PrReview: {
             reviewer: string;
             /** @description approved / changes_requested / commented / … */
             state: string;
+        };
+        PrReviewDetail: {
+            author?: null | components["schemas"]["PrActor"];
+            body?: string;
+            commit_oid?: string;
+            id: string;
+            state: string;
+            /** Format: date-time */
+            submitted_at?: string | null;
+            url: string;
+            viewer_can_delete?: boolean;
+            viewer_can_update?: boolean;
+            viewer_did_author?: boolean;
+        };
+        PrReviewThread: {
+            comments?: components["schemas"]["PrComment"][];
+            diff_side?: string;
+            id: string;
+            is_outdated?: boolean;
+            is_resolved?: boolean;
+            /** Format: int64 */
+            line?: number | null;
+            path: string;
+            /** Format: int64 */
+            start_line?: number | null;
+            viewer_can_reply?: boolean;
+            viewer_can_resolve?: boolean;
+            viewer_can_unresolve?: boolean;
+        };
+        /**
+         * @description GitHub's native pull-request stack, when the host supports the current
+         *     GraphQL stack fields and this PR belongs to one.
+         */
+        PrStack: {
+            base: string;
+            entries?: components["schemas"]["PrStackEntry"][];
+            id: string;
+            /** Format: int64 */
+            number: number;
+            /** Format: int64 */
+            size: number;
+        };
+        PrStackEntry: {
+            base: string;
+            draft?: boolean;
+            head: string;
+            merge_state_status?: string;
+            /** Format: int64 */
+            number: number;
+            /** Format: int64 */
+            position: number;
+            review_decision?: string;
+            state: string;
+            title: string;
+            url: string;
         };
         /** @description One configuration field advertised by a well-known provider preset. */
         ProviderConfigField: {
@@ -3368,6 +3881,31 @@ export interface components {
         SessionDiff: {
             diff: string;
         };
+        /** @description Bounded metadata for one path changed against a session's base ref. */
+        SessionDiffFileSummary: {
+            /** Format: int64 */
+            additions: number;
+            binary: boolean;
+            /** Format: int64 */
+            deletions: number;
+            path: string;
+        };
+        /**
+         * @description Lightweight changed-file manifest for a session. File patch content is
+         *     intentionally excluded and loaded only after the user selects a path.
+         */
+        SessionDiffSummary: {
+            /** Format: int64 */
+            additions: number;
+            /** Format: int64 */
+            deletions: number;
+            files: components["schemas"]["SessionDiffFileSummary"][];
+        };
+        /** @description A bounded unified patch for exactly one selected session-relative path. */
+        SessionFileDiff: {
+            diff: string;
+            path: string;
+        };
         /**
          * @description A fresh session-level notification edge derived from a durable thread
          *     event. Clients apply their own notification preferences and foreground
@@ -3478,6 +4016,24 @@ export interface components {
          */
         SetLocalEnabledRequest: {
             enabled: boolean;
+        };
+        /**
+         * @description A steering message accepted by the active vendor turn. Durable display
+         *     state follows as `turn.steered` on the thread event stream.
+         */
+        SteerAccepted: {
+            thread_id: components["schemas"]["String"];
+            /** Format: int64 */
+            turn: number;
+        };
+        /**
+         * @description Add user guidance to the turn currently running on a thread. The backend
+         *     must advertise steering support for that exact turn.
+         */
+        SteerTurnRequest: {
+            /** @description Steering accepts the same attachment inputs as an ordinary prompt. */
+            attachments?: components["schemas"]["AttachmentUpload"][];
+            content: string;
         };
         String: string;
         /** @description Subscription usage for one configured provider. */
@@ -3593,6 +4149,13 @@ export interface components {
             /** Format: int64 */
             turn: number;
         } | {
+            attachments: components["schemas"]["Attachment"][];
+            content: string;
+            /** @enum {string} */
+            kind: "steered";
+            /** Format: int64 */
+            turn: number;
+        } | {
             complete: boolean;
             content: string;
             /** @enum {string} */
@@ -3695,6 +4258,13 @@ export interface components {
             turn_running?: boolean;
             turn_started_at?: {
                 [key: string]: string;
+            };
+            /**
+             * @description Per-turn native steering capability. False/absent is authoritative;
+             *     clients must not infer capability from provider or model names.
+             */
+            turn_steerable?: {
+                [key: string]: boolean;
             };
             turn_thinking_levels?: {
                 [key: string]: string;
@@ -5118,7 +5688,10 @@ export interface operations {
     };
     refresh_github_prs: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Bypass the automatic-refresh freshness window for an explicit user refresh */
+                force?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6308,6 +6881,91 @@ export interface operations {
             };
         };
     };
+    session_file_diff: {
+        parameters: {
+            query: {
+                /** @description Changed worktree-relative path */
+                path: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionFileDiff"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    session_diff_summary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionDiffSummary"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     session_file: {
         parameters: {
             query: {
@@ -6543,6 +7201,130 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session_pr_detail: {
+        parameters: {
+            query?: {
+                /** @description Optional lazy PR-page section; omitted loads every section for older clients */
+                section?: components["schemas"]["PrDetailSection"];
+            };
+            header?: never;
+            path: {
+                id: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrDetail"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    act_on_session_pr: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrActionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrDetail"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session_pr_file_diff: {
+        parameters: {
+            query: {
+                /** @description Exact changed-file path returned by PrDetail */
+                path: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrFileDiff"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7141,6 +7923,55 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    steer_turn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SteerTurnRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SteerAccepted"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

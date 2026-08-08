@@ -113,17 +113,17 @@ describe("tool presentation", () => {
     expect(toolExecutionMetadata(null)).toBe("");
   });
 
-  it("describes only current running activity", () => {
+  it("uses a transient label only when no durable activity node is active", () => {
     expect(runningActivityLabel([], true)).toBe("Thinking…");
     expect(runningActivityLabel([
       { kind: "tool", tool: "WebSearch", args: {}, status: "running" },
       { kind: "turn-status", state: { kind: "running" } },
       { kind: "tool", tool: "read_file", args: { path: "README.md" }, status: "running" },
-    ], false)).toBe("Reading files…");
+    ], false)).toBeUndefined();
     expect(runningActivityLabel([
       { kind: "turn-status", state: { kind: "running" } },
       { kind: "tool", tool: "mcp__github__create_issue", args: {}, status: "running" },
-    ], false)).toBe("Using github…");
+    ], false)).toBeUndefined();
     expect(runningActivityLabel([
       { kind: "turn-status", state: { kind: "running" } },
       {
@@ -132,9 +132,20 @@ describe("tool presentation", () => {
         args: { serverName: "github", toolName: "create_issue" },
         status: "running",
       },
-    ], false)).toBe("Using github…");
+    ], false)).toBeUndefined();
+    expect(runningActivityLabel([
+      { kind: "turn-status", state: { kind: "running" } },
+      { kind: "thinking", complete: false },
+    ], true)).toBeUndefined();
+    expect(runningActivityLabel([
+      { kind: "turn-status", state: { kind: "running" } },
+      { kind: "compaction", state: { kind: "running" } },
+    ], false)).toBeUndefined();
     expect(runningActivityLabel([
       { kind: "tool", tool: "Bash", args: {}, status: "running" },
+      { kind: "turn-status", state: { kind: "running" } },
+    ], false)).toBe("Processing…");
+    expect(runningActivityLabel([
       { kind: "turn-status", state: { kind: "running" } },
     ], false)).toBe("Processing…");
   });

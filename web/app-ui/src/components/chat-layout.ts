@@ -2,7 +2,7 @@ import type { ThreadChatItem } from "../state/thread-view-model.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "thinking" | "compaction" | "tool" | "questions" }
+  { readonly kind: "assistant" | "steered" | "thinking" | "compaction" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -38,6 +38,7 @@ export interface ChatLayout {
 
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
+  || item.kind === "steered"
   || item.kind === "thinking"
   || item.kind === "compaction"
   || item.kind === "tool"
@@ -108,6 +109,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     if (isAgentItem(item)) {
       const explicitTurn =
         item.kind === "assistant"
+        || item.kind === "steered"
         || item.kind === "thinking"
         || item.kind === "compaction"
           ? item.turn

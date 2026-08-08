@@ -155,8 +155,13 @@ impl ProtocolClient {
 
     /// Refresh account-relevant PR snapshots for every configured GitHub
     /// host. Results arrive on the persisted server event stream.
-    pub async fn refresh_github_prs(&self) -> Result<()> {
-        self.post_empty("/github/prs/refresh").await
+    pub async fn refresh_github_prs(&self, force: bool) -> Result<()> {
+        let path = if force {
+            "/github/prs/refresh?force=true"
+        } else {
+            "/github/prs/refresh"
+        };
+        self.post_empty(path).await
     }
 
     /// Fetch durable server-owned UI state without replaying retained server
@@ -271,6 +276,23 @@ impl ProtocolClient {
         self.post_json(
             &format!("/threads/{thread_id}/messages"),
             &SendMessageRequest {
+                content: content.into(),
+                attachments,
+            },
+        )
+        .await
+    }
+
+    /// Append guidance to the backend turn currently running on a thread.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        content: &str,
+        attachments: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<SteerAccepted> {
+        self.post_json(
+            &format!("/threads/{thread_id}/steer"),
+            &SteerTurnRequest {
                 content: content.into(),
                 attachments,
             },
@@ -688,6 +710,19 @@ impl ProtocolClient {
         self.get_json(&format!("/sessions/{session_id}/diff")).await
     }
 
+    pub async fn session_diff_summary(&self, session_id: &str) -> Result<SessionDiffSummary> {
+        self.get_json(&format!("/sessions/{session_id}/diff/summary"))
+            .await
+    }
+
+    pub async fn session_file_diff(&self, session_id: &str, path: &str) -> Result<SessionFileDiff> {
+        self.get_json(&format!(
+            "/sessions/{session_id}/diff/file?path={}",
+            urlencode(path)
+        ))
+        .await
+    }
+
     pub async fn session_files(&self, session_id: &str, path: &str) -> Result<Vec<DirEntry>> {
         self.get_json(&format!(
             "/sessions/{session_id}/files?path={}",
@@ -961,6 +996,42 @@ impl ProtocolClient {
             bail!("merge failed: {}", resp.status());
         }
         Ok(())
+    }
+
+    pub async fn session_pr_detail(&self, session_id: &str, number: u64) -> Result<PrDetail> {
+        self.get_json(&format!("/sessions/{session_id}/prs/{number}"))
+            .await
+    }
+
+    pub async fn session_pr_file_diff(
+        &self,
+        session_id: &str,
+        number: u64,
+        path: &str,
+    ) -> Result<PrFileDiff> {
+        let endpoint = format!("/sessions/{session_id}/prs/{number}/file");
+        let mut url = reqwest::Url::parse(&format!("{}{endpoint}", self.base))?;
+        url.query_pairs_mut().append_pair("path", path);
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {endpoint}"))?;
+        decode(response, &endpoint).await
+    }
+
+    pub async fn act_on_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+        action: &PrActionRequest,
+    ) -> Result<PrDetail> {
+        self.post_json(
+            &format!("/sessions/{session_id}/prs/{number}/actions"),
+            action,
+        )
+        .await
     }
 
     // --- automated code reviews ---------------------------------------------

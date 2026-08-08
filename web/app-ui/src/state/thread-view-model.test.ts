@@ -78,6 +78,42 @@ describe("ThreadViewModel", () => {
     }).toEqual(fixture.expected);
   });
 
+  it("keeps steering as a top-level boundary and closes preceding thought output", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+      thinking_level: "max",
+      supports_steering: true,
+    }));
+    vm.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 3,
+      text: "Following the original direction.",
+    }));
+    vm.apply(envelope(3, {
+      type: "turn.steered",
+      turn: 3,
+      content: "Prioritize the narrow layout.",
+      attachments: [],
+    }));
+
+    expect(vm.turnSteerable.get(3)).toBe(true);
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "turn-status", turn: 3 },
+      { kind: "thinking", turn: 3, complete: true },
+      {
+        kind: "steered",
+        turn: 3,
+        content: "Prioritize the narrow layout.",
+        attachments: [],
+      },
+    ]);
+  });
+
   it("installs a folded snapshot without replaying its historical deltas", () => {
     const snapshot: ProtocolThreadViewSnapshot = {
       item_offset: 40,

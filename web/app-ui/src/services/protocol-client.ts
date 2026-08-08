@@ -35,10 +35,14 @@ export type ProtocolBranchList = ProtocolComponents["schemas"]["BranchList"];
 export type ProtocolGithubPrList =
   ProtocolComponents["schemas"]["GithubPrList"];
 export type ProtocolPrInfo = ProtocolComponents["schemas"]["PrInfo"];
+export type ProtocolPrDetail = ProtocolComponents["schemas"]["PrDetail"];
+export type ProtocolPrDetailSection =
+  ProtocolComponents["schemas"]["PrDetailSection"];
+export type ProtocolPrFileDiff = ProtocolComponents["schemas"]["PrFileDiff"];
+export type ProtocolPrActionRequest =
+  ProtocolComponents["schemas"]["PrActionRequest"];
 export type ProtocolCreatePrRequest =
   ProtocolComponents["schemas"]["CreatePrRequest"];
-export type ProtocolMergePrRequest =
-  ProtocolComponents["schemas"]["MergePrRequest"];
 export type ProtocolAgentMode = ProtocolComponents["schemas"]["AgentMode"];
 export type ProtocolModeInfo = ProtocolComponents["schemas"]["ModeInfo"];
 export type ProtocolUpsertModeRequest =
@@ -64,13 +68,20 @@ export type ProtocolUpdateQueuedPromptRequest =
   ProtocolComponents["schemas"]["UpdateQueuedPromptRequest"];
 export type ProtocolSendMessageRequest =
   ProtocolComponents["schemas"]["SendMessageRequest"];
+export type ProtocolSteerTurnRequest =
+  ProtocolComponents["schemas"]["SteerTurnRequest"];
 export type ProtocolTurnAccepted = ProtocolComponents["schemas"]["TurnAccepted"];
 export type ProtocolUsageSummary = ProtocolComponents["schemas"]["UsageSummary"];
 export type ProtocolResolveApprovalRequest =
   ProtocolComponents["schemas"]["ResolveApprovalRequest"];
 export type ProtocolResolveQuestionRequest =
   ProtocolComponents["schemas"]["ResolveQuestionRequest"];
-export type ProtocolSessionDiff = ProtocolComponents["schemas"]["SessionDiff"];
+export type ProtocolSessionDiffFileSummary =
+  ProtocolComponents["schemas"]["SessionDiffFileSummary"];
+export type ProtocolSessionDiffSummary =
+  ProtocolComponents["schemas"]["SessionDiffSummary"];
+export type ProtocolSessionFileDiff =
+  ProtocolComponents["schemas"]["SessionFileDiff"];
 export type ProtocolRestoreDirection =
   ProtocolComponents["schemas"]["RestoreDirection"];
 export type ProtocolRelativeRestoreDirection = Exclude<
@@ -177,7 +188,6 @@ interface ProtocolValidators {
   readonly workspaces: ValidateFunction;
   readonly branchList: ValidateFunction;
   readonly prInfo: ValidateFunction;
-  readonly prInfos: ValidateFunction;
   readonly modes: ValidateFunction;
   readonly modeInfos: ValidateFunction;
   readonly models: ValidateFunction;
@@ -186,7 +196,6 @@ interface ProtocolValidators {
   readonly queuedPrompts: ValidateFunction;
   readonly turnAccepted: ValidateFunction;
   readonly usageSummary: ValidateFunction;
-  readonly sessionDiff: ValidateFunction;
   readonly dirEntries: ValidateFunction;
   readonly paths: ValidateFunction;
   readonly fileContent: ValidateFunction;
@@ -227,6 +236,38 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+const isNonnegativeInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+const isSessionDiffSummary = (
+  value: unknown,
+): value is ProtocolSessionDiffSummary => {
+  const record = asRecord(value);
+  if (
+    record === undefined ||
+    !isNonnegativeInteger(record["additions"]) ||
+    !isNonnegativeInteger(record["deletions"]) ||
+    !Array.isArray(record["files"])
+  ) return false;
+  return record["files"].every((candidate) => {
+    const file = asRecord(candidate);
+    return file !== undefined &&
+      typeof file["path"] === "string" &&
+      file["path"] !== "" &&
+      isNonnegativeInteger(file["additions"]) &&
+      isNonnegativeInteger(file["deletions"]) &&
+      typeof file["binary"] === "boolean";
+  });
+};
+
+const isSessionFileDiff = (value: unknown): value is ProtocolSessionFileDiff => {
+  const record = asRecord(value);
+  return record !== undefined &&
+    typeof record["path"] === "string" &&
+    record["path"] !== "" &&
+    typeof record["diff"] === "string";
+};
+
 let loadedValidators: Promise<ProtocolValidators> | undefined;
 
 /** Runtime schemas are sizeable generated code. Load them on the first
@@ -239,6 +280,20 @@ const validators = (): Promise<ProtocolValidators> => {
     }),
   );
   return loadedValidators;
+};
+
+let loadedPrDetailValidator: Promise<(value: unknown) => boolean> | undefined;
+const prDetailValidator = (): Promise<(value: unknown) => boolean> => {
+  loadedPrDetailValidator ??= import("./pr-detail-validator.js")
+    .then(({ validatePrDetail }) => validatePrDetail);
+  return loadedPrDetailValidator;
+};
+
+let loadedPrFileDiffValidator: Promise<(value: unknown) => boolean> | undefined;
+const prFileDiffValidator = (): Promise<(value: unknown) => boolean> => {
+  loadedPrFileDiffValidator ??= import("./pr-detail-validator.js")
+    .then(({ validatePrFileDiff }) => validatePrFileDiff);
+  return loadedPrFileDiffValidator;
 };
 
 const validateResponse = async <T>(
@@ -262,7 +317,6 @@ const validateResponse = async <T>(
     | "QueuedPrompt[]"
     | "TurnAccepted"
     | "UsageSummary"
-    | "SessionDiff"
     | "DirEntry[]"
     | "Path[]"
     | "FileContent"
@@ -461,6 +515,32 @@ export class ProtocolClient {
       cursor,
       value: await validateResponse<T>(schemaName, raw, validate),
     });
+  }
+
+  async #parsePrDetail(response: Response): Promise<ProtocolPrDetail> {
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      throw new ProtocolClientError("invalid-response", "server returned invalid PrDetail");
+    }
+    if (!(await prDetailValidator())(value)) {
+      throw new ProtocolClientError("invalid-response", "server returned invalid PrDetail");
+    }
+    return value as ProtocolPrDetail;
+  }
+
+  async #parsePrFileDiff(response: Response): Promise<ProtocolPrFileDiff> {
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      throw new ProtocolClientError("invalid-response", "server returned invalid PrFileDiff");
+    }
+    if (!(await prFileDiffValidator())(value)) {
+      throw new ProtocolClientError("invalid-response", "server returned invalid PrFileDiff");
+    }
+    return value as ProtocolPrFileDiff;
   }
 
   async #mutation(
@@ -738,17 +818,9 @@ export class ProtocolClient {
     );
   }
 
-  async refreshGithubPrs(): Promise<void> {
-    await this.#mutation("/v1/github/prs/refresh", "refresh pull requests", "POST");
-  }
-
-  async sessionPrs(sessionId: string): Promise<readonly ProtocolPrInfo[]> {
-    return this.#validatedJson(
-      `/v1/sessions/${encodeURIComponent(sessionId)}/prs`,
-      "session pull requests",
-      "PrInfo[]",
-      (loaded) => loaded.prInfos,
-    );
+  async refreshGithubPrs(force = false): Promise<void> {
+    const query = force ? "?force=true" : "";
+    await this.#mutation(`/v1/github/prs/refresh${query}`, "refresh pull requests", "POST");
   }
 
   async createSessionPr(
@@ -765,16 +837,70 @@ export class ProtocolClient {
     );
   }
 
-  async mergeSessionPr(
+  async sessionPrDetail(
     sessionId: string,
-    method?: ProtocolMergePrRequest["method"],
-  ): Promise<void> {
-    await this.#mutation(
-      `/v1/sessions/${encodeURIComponent(sessionId)}/pr/merge`,
-      "merge pull request",
-      "POST",
-      method == null ? {} : { method },
+    number: number,
+    section?: ProtocolPrDetailSection,
+  ): Promise<ProtocolPrDetail> {
+    let response: Response;
+    try {
+      const url = new URL(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/prs/${number}`,
+        this.#baseUrl,
+      );
+      if (section !== undefined) url.searchParams.set("section", section);
+      response = await this.#fetch(url);
+    } catch {
+      throw new ProtocolClientError("request-failed", "pull request detail request failed");
+    }
+    if (!response.ok) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "pull request detail request failed",
+        response.status,
+      );
+    }
+    return this.#parsePrDetail(response);
+  }
+
+  async sessionPrFileDiff(
+    sessionId: string,
+    number: number,
+    path: string,
+  ): Promise<ProtocolPrFileDiff> {
+    const url = new URL(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/prs/${number}/file`,
+      this.#baseUrl,
     );
+    url.searchParams.set("path", path);
+    let response: Response;
+    try {
+      response = await this.#fetch(url);
+    } catch {
+      throw new ProtocolClientError("request-failed", "pull request file request failed");
+    }
+    if (!response.ok) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "pull request file request failed",
+        response.status,
+      );
+    }
+    return this.#parsePrFileDiff(response);
+  }
+
+  async actOnSessionPr(
+    sessionId: string,
+    number: number,
+    action: ProtocolPrActionRequest,
+  ): Promise<ProtocolPrDetail> {
+    const response = await this.#mutation(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/prs/${number}/actions`,
+      "update pull request",
+      "POST",
+      action,
+    );
+    return this.#parsePrDetail(response);
   }
 
   async modes(workspaceId?: string): Promise<readonly ProtocolAgentMode[]> {
@@ -1594,6 +1720,25 @@ export class ProtocolClient {
     );
   }
 
+  async steerTurn(
+    threadId: string,
+    request: ProtocolSteerTurnRequest,
+  ): Promise<void> {
+    let result;
+    try {
+      result = await this.#client.POST("/v1/threads/{id}/steer", {
+        params: { path: { id: threadId } },
+        headers: this.#mutationHeaders(),
+        body: request,
+      });
+    } catch {
+      throw new ProtocolClientError("request-failed", "steer request failed");
+    }
+    if (!result.response.ok) {
+      throw new ProtocolClientError("request-failed", "steer request failed");
+    }
+  }
+
   async cancelTurn(threadId: string): Promise<void> {
     let result;
     try {
@@ -1639,23 +1784,66 @@ export class ProtocolClient {
     }
   }
 
-  async sessionDiff(sessionId: string): Promise<ProtocolSessionDiff> {
+  async sessionDiffSummary(sessionId: string): Promise<ProtocolSessionDiffSummary> {
     let result;
     try {
-      result = await this.#client.GET("/v1/sessions/{id}/diff", {
+      result = await this.#client.GET("/v1/sessions/{id}/diff/summary", {
         params: { path: { id: sessionId } },
       });
     } catch {
-      throw new ProtocolClientError("request-failed", "session diff request failed");
+      throw new ProtocolClientError(
+        "request-failed",
+        "session diff summary request failed",
+      );
     }
     if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "session diff request failed");
+      throw new ProtocolClientError(
+        "request-failed",
+        "session diff summary request failed",
+        result.response.status,
+      );
     }
-    return validateResponse<ProtocolSessionDiff>(
-      "SessionDiff",
-      result.data,
-      (loaded) => loaded.sessionDiff,
-    );
+    if (!isSessionDiffSummary(result.data)) {
+      throw new ProtocolClientError(
+        "invalid-response",
+        "server returned invalid SessionDiffSummary",
+      );
+    }
+    return result.data;
+  }
+
+  async sessionFileDiff(
+    sessionId: string,
+    path: string,
+  ): Promise<ProtocolSessionFileDiff> {
+    let result;
+    try {
+      result = await this.#client.GET("/v1/sessions/{id}/diff/file", {
+        params: { path: { id: sessionId }, query: { path } },
+      });
+    } catch {
+      throw new ProtocolClientError(
+        "request-failed",
+        "session file diff request failed",
+      );
+    }
+    if (!result.response.ok || result.data === undefined) {
+      const tooLarge = result.response.status === 413;
+      throw new ProtocolClientError(
+        "request-failed",
+        tooLarge
+          ? "This file's diff is too large to preview."
+          : "session file diff request failed",
+        result.response.status,
+      );
+    }
+    if (!isSessionFileDiff(result.data)) {
+      throw new ProtocolClientError(
+        "invalid-response",
+        "server returned invalid SessionFileDiff",
+      );
+    }
+    return result.data;
   }
 
   async sessionUsage(sessionId: string): Promise<ProtocolUsageSummary> {

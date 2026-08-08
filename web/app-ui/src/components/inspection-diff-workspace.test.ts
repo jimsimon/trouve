@@ -15,11 +15,23 @@ describe("inspection diff workspace contract", () => {
     expect(source).toContain("fileTreeDirectoriesForPaths(");
     expect(source).toContain("#navigateDiffFileTree");
     expect(source).toContain("#activateDiffFileTreeRow");
-    expect(source).toContain("Copy raw diff for ${selectedFile.path}");
+    expect(source).toContain("Copy raw diff for ${selectedPatch.path}");
     expect(source).toContain("<trouve-diff-view");
-    expect(source).toContain(".original=${file.original}");
-    expect(source).toContain(".modified=${file.modified}");
+    expect(source).toContain(".original=${patch.original}");
+    expect(source).toContain(".modified=${patch.modified}");
     expect(source).not.toContain('class="unified-diff-list"');
+  });
+
+  it("loads a lightweight manifest and only the selected file patch", () => {
+    const source = readFileSync(
+      new URL("./inspection-workspace.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(source).toContain("services.protocol.sessionDiffSummary(sessionId)");
+    expect(source).toContain("services.protocol.sessionFileDiff(sessionId, path)");
+    expect(source).not.toContain("services.protocol.sessionDiff(sessionId)");
+    expect(source).not.toContain("Copy complete diff");
   });
 
   it("does not present generic restore failures as authoritative boundaries", () => {

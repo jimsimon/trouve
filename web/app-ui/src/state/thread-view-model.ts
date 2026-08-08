@@ -55,6 +55,13 @@ export type ThreadChatItem =
     }
   | {
       readonly id: string;
+      readonly kind: "steered";
+      readonly turn: number;
+      readonly content: string;
+      readonly attachments: readonly Attachment[];
+    }
+  | {
+      readonly id: string;
       readonly kind: "assistant";
       readonly turn: number;
       content: string;
@@ -127,6 +134,7 @@ export class ThreadViewModel {
   readonly pendingQuestions: string[] = [];
   readonly turnModels = new Map<number, string>();
   readonly turnThinkingLevels = new Map<number, string>();
+  readonly turnSteerable = new Map<number, boolean>();
   readonly turnStartedAt = new Map<number, string>();
   readonly turnDurationMs = new Map<number, number>();
 
@@ -176,6 +184,7 @@ export class ThreadViewModel {
     );
     replaceNumericMap(this.turnModels, snapshot.turn_models);
     replaceNumericMap(this.turnThinkingLevels, snapshot.turn_thinking_levels);
+    replaceNumericMap(this.turnSteerable, snapshot.turn_steerable);
     replaceNumericMap(this.turnStartedAt, snapshot.turn_started_at);
     replaceNumericMap(this.turnDurationMs, snapshot.turn_duration_ms);
     this.cursor = cursor;
@@ -240,6 +249,14 @@ export class ThreadViewModel {
         return {
           id,
           kind: "user",
+          turn: item.turn,
+          content: item.content,
+          attachments: item.attachments,
+        };
+      case "steered":
+        return {
+          id,
+          kind: "steered",
           turn: item.turn,
           content: item.content,
           attachments: item.attachments,
@@ -344,6 +361,7 @@ export class ThreadViewModel {
         } else {
           this.turnThinkingLevels.set(envelope.turn, envelope.thinking_level);
         }
+        this.turnSteerable.set(envelope.turn, envelope.supports_steering ?? false);
         this.turnStartedAt.set(envelope.turn, envelope.ts);
         this.appendItem({
           id: `turn:${envelope.turn}`,
@@ -412,6 +430,16 @@ export class ThreadViewModel {
         this.appendItem({
           id: `user:${envelope.turn}`,
           kind: "user",
+          turn: envelope.turn,
+          content: envelope.content,
+          attachments: envelope.attachments ?? [],
+        });
+        return true;
+      case "turn.steered":
+        this.finishThinking();
+        this.appendItem({
+          id: `steered:${envelope.turn}:${envelope.cursor}`,
+          kind: "steered",
           turn: envelope.turn,
           content: envelope.content,
           attachments: envelope.attachments ?? [],

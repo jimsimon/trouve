@@ -578,7 +578,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                             class="control manual-refresh"
                             type="button"
                             ?disabled=${this.#refreshing || this.#integrationLoading || offline}
-                            @click=${() => void this.#refresh()}
+                            @click=${() => void this.#refresh(true)}
                           >${this.#refreshing ? "Refreshing…" : "Refresh"}</button>
                           <span class="refresh-status" role="status">${refreshStatus}</span>
                         </div>
@@ -762,7 +762,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     if (integrationConfigured(this.#integration)) await this.#refresh();
   }
 
-  async #refresh(): Promise<void> {
+  async #refresh(force = false): Promise<void> {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || this.#refreshing) return;
     this.#refreshing = true;
@@ -770,7 +770,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     this.#nextRefreshAt = Date.now() + REFRESH_INTERVAL_MS;
     this.requestUpdate();
     try {
-      await protocol.refreshGithubPrs();
+      await protocol.refreshGithubPrs(force);
       this.#lastRefreshAt = Date.now();
     } catch (cause) {
       this.#error = errorMessage(cause, "Pull requests could not be refreshed.");

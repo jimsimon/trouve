@@ -108,11 +108,120 @@ describe("ProtocolClient", () => {
       ),
     );
     const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
-    const error = await client.sessionPrs("se_1").catch((reason: unknown) => reason);
+    const error = await client.createSessionPr("se_1", {
+      title: "Test",
+      body: "",
+      draft: true,
+    }).catch((reason: unknown) => reason);
 
     expect(error).toBeInstanceOf(ProtocolClientError);
     expect((error as ProtocolClientError).status).toBe(400);
     expect(String(error)).not.toContain("workspace secret");
+  });
+
+  it("loads lightweight diff metadata separately from one encoded file patch", async () => {
+    const requests: Request[] = [];
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      return new URL(request.url).pathname.endsWith("/summary")
+        ? Response.json({
+            files: [{
+              path: "docs/setup guide.md",
+              additions: 2,
+              deletions: 1,
+              binary: false,
+            }],
+            additions: 2,
+            deletions: 1,
+          })
+        : Response.json({
+            path: "docs/setup guide.md",
+            diff: "diff --git a/docs/setup guide.md b/docs/setup guide.md\n",
+          });
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+
+    await expect(client.sessionDiffSummary("se_1")).resolves.toMatchObject({
+      additions: 2,
+      deletions: 1,
+    });
+    await expect(
+      client.sessionFileDiff("se_1", "docs/setup guide.md"),
+    ).resolves.toMatchObject({ path: "docs/setup guide.md" });
+
+    expect(new URL(requests[0]!.url).pathname).toBe(
+      "/v1/sessions/se_1/diff/summary",
+    );
+    const fileUrl = new URL(requests[1]!.url);
+    expect(fileUrl.pathname).toBe("/v1/sessions/se_1/diff/file");
+    expect(fileUrl.searchParams.get("path")).toBe("docs/setup guide.md");
+  });
+
+  it("reports an oversized selected-file diff without exposing its response", async () => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () => Response.json(
+        { code: "payload_too_large", message: "secret path is too large" },
+        { status: 413 },
+      )),
+    });
+    const error = await client.sessionFileDiff("se_1", "secret.txt").catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).status).toBe(413);
+    expect(String(error)).toContain("too large to preview");
+    expect(String(error)).not.toContain("secret path");
+  });
+
+  it("rejects malformed diff metadata without exposing its payload", async () => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () => Response.json({
+        files: [{ path: "repository secret", additions: "many" }],
+        additions: 1,
+        deletions: 0,
+      })),
+    });
+    const error = await client.sessionDiffSummary("se_1").catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).kind).toBe("invalid-response");
+    expect(String(error)).not.toContain("repository secret");
+  });
+
+  it("rejects malformed lazy pull-request detail without exposing its payload", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
+      id: "PR_secret",
+      body: "repository secret",
+      merge_queue: { enabled: "yes" },
+    }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.sessionPrDetail("se_1", 42).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).kind).toBe("invalid-response");
+    expect(String(error)).not.toContain("repository secret");
+  });
+
+  it("rejects malformed lazy pull-request file content without exposing it", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
+      path: "secret.txt",
+      change_type: "modified",
+      original: { secret: "do not echo" },
+    }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.sessionPrFileDiff("se_1", 42, "secret.txt").catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).kind).toBe("invalid-response");
+    expect(String(error)).not.toContain("do not echo");
   });
 
   it("loads generated workspace/thread models and validates both collections", async () => {
@@ -262,6 +371,30 @@ describe("ProtocolClient", () => {
     ).resolves.toMatchObject({ turn: 2 });
     expect(requests[0]?.url).toContain("/v1/threads/th%2Fslash/messages");
     expect(requests[0]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+  });
+
+  it("steers the exact encoded thread with text and attachments", async () => {
+    const requests: Request[] = [];
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json({ thread_id: "th/slash", turn: 4 }, { status: 202 });
+      }),
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await expect(client.steerTurn("th/slash", {
+      content: "Focus on the regression.",
+      attachments: [{ name: "view.png", mime: "image/png", data: "AA==" }],
+    })).resolves.toBeUndefined();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe("POST");
+    expect(requests[0]?.url).toContain("/v1/threads/th%2Fslash/steer");
+    expect(requests[0]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    await expect(requests[0]?.clone().json()).resolves.toEqual({
+      content: "Focus on the regression.",
+      attachments: [{ name: "view.png", mime: "image/png", data: "AA==" }],
+    });
   });
 
   it("validates session/thread management responses and protects every mutation", async () => {
@@ -611,11 +744,42 @@ describe("ProtocolClient", () => {
       checks: [],
       reviews: [],
     };
+    const prDetail = {
+      info: pr,
+      id: "PR_kwDO_selected",
+      viewer: "octocat",
+      created_at: "2026-08-01T12:00:00Z",
+      updated_at: "2026-08-01T12:01:00Z",
+      additions: 12,
+      deletions: 3,
+      changed_files: 2,
+      commit_count: 1,
+      capabilities: { can_update: true },
+      merge_queue: { enabled: true },
+    };
+    const prFileDiff = {
+      path: "src/a file.ts",
+      change_type: "modified",
+      original: "const value = 1;\n",
+      modified: "const value = 2;\n",
+      original_bytes: 17,
+      modified_bytes: 17,
+      binary: false,
+      truncated: false,
+      notice: "",
+    };
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(request);
       if (request.url.endsWith("/branches")) {
         return Response.json({ branches: ["main", "release"], head: "main" });
+      }
+      if (new URL(request.url).pathname.endsWith("/prs/42/file")) {
+        return Response.json(prFileDiff);
+      }
+      if (request.url.endsWith("/prs/42/actions")) return Response.json(prDetail);
+      if (new URL(request.url).pathname.endsWith("/prs/42")) {
+        return Response.json(prDetail);
       }
       if (request.url.endsWith("/prs")) return Response.json([pr]);
       if (request.url.endsWith("/pr") && request.method === "POST") {
@@ -638,7 +802,6 @@ describe("ProtocolClient", () => {
       branches: ["main", "release"],
       head: "main",
     });
-    await expect(client.sessionPrs("session / one")).resolves.toEqual([pr]);
     await expect(
       client.createSessionPr("session / one", {
         title: pr.title,
@@ -646,20 +809,41 @@ describe("ProtocolClient", () => {
         draft: false,
       }),
     ).resolves.toEqual(pr);
-    await expect(client.mergeSessionPr("session / one", "squash")).resolves.toBeUndefined();
+    await expect(
+      client.sessionPrDetail("session / one", 42, "conversation"),
+    ).resolves.toEqual(prDetail);
+    await expect(
+      client.sessionPrFileDiff("session / one", 42, "src/a file.ts"),
+    ).resolves.toEqual(prFileDiff);
+    await expect(
+      client.actOnSessionPr("session / one", 42, {
+        action: "request_reviewers",
+        users: ["octocat"],
+        teams: [],
+        replace: false,
+      }),
+    ).resolves.toEqual(prDetail);
     await expect(client.closeWorkspace("workspace / one")).resolves.toBeUndefined();
 
     expect(requests[1]?.url).toContain("/workspaces/workspace%20%2F%20one/branches");
-    expect(requests[2]?.url).toContain("/sessions/session%20%2F%20one/prs");
-    expect(requests[3]?.url).toContain("/sessions/session%20%2F%20one/pr");
-    expect(requests[4]?.url).toContain("/sessions/session%20%2F%20one/pr/merge");
-    expect(requests[5]?.url).toContain("/workspaces/workspace%20%2F%20one");
+    expect(requests[2]?.url).toContain("/sessions/session%20%2F%20one/pr");
+    expect(requests[3]?.url).toContain("/sessions/session%20%2F%20one/prs/42");
+    expect(new URL(requests[3]!.url).searchParams.get("section")).toBe("conversation");
+    expect(requests[4]?.url).toContain("/sessions/session%20%2F%20one/prs/42/file");
+    expect(new URL(requests[4]!.url).searchParams.get("path")).toBe("src/a file.ts");
+    expect(requests[5]?.url).toContain("/sessions/session%20%2F%20one/prs/42/actions");
+    expect(requests[6]?.url).toContain("/workspaces/workspace%20%2F%20one");
     expect(
-      [requests[0], requests[3], requests[4], requests[5]].every(
+      [requests[0], requests[2], requests[5], requests[6]].every(
         (request) => request?.headers.get("x-trouve-host-csrf") === "ephemeral-token",
       ),
     ).toBe(true);
-    await expect(requests[4]?.json()).resolves.toEqual({ method: "squash" });
+    await expect(requests[5]?.json()).resolves.toEqual({
+      action: "request_reviewers",
+      users: ["octocat"],
+      teams: [],
+      replace: false,
+    });
   });
 
   it("manages encoded vendor CLI installs without exposing server payloads", async () => {

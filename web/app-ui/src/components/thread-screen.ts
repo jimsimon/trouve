@@ -303,6 +303,12 @@ const toolStatusIcon = (
     aborted: "xmark",
   } as const)[status];
 
+const activeToolCall = (
+  item: AgentActivityItem,
+): boolean =>
+  item.kind === "tool"
+  && (item.status === "running" || item.status === "awaiting-approval");
+
 type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "mixed" | "error";
 
 const activityGroupStatusLabel = (status: ActivityGroupStatus): string =>
@@ -871,6 +877,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const selectedModel = thread === undefined
       ? undefined
       : this.#models.find((model) => model.id === thread.model);
+    const runningTurn = this.#latestRunningTurn(view?.items ?? []);
+    const activeTurnSteerable = runningTurn !== undefined
+      && view?.turnSteerable.get(runningTurn) === true;
+    const steerPending = this.#requestPending && this.#messageRequest === undefined;
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(this.#models, this.#subscriptionHealth);
     const selectedModelHealth = modelHealth[
@@ -1091,6 +1101,25 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             @compositionend=${this.#composerCompositionEnded}
             @paste=${this.#composerPaste}
           ></textarea>
+          <div class="composer-entry-actions">
+          ${!queueEditing
+            && activeTurnSteerable
+            && view?.turnRunning === true
+            && this.#cancelRequestedTurn === undefined
+            ? html`<wa-button
+                class="composer-steer"
+                type="button"
+                title="Steer active turn"
+                aria-label="Steer active turn"
+                ?disabled=${this.#requestPending
+                  || this.#attachmentPending
+                  || !hasComposerContent
+                  || connectivityBlocked}
+                @click=${this.#steerTurn}
+              >${fontAwesomeIcon(steerPending ? "spinner" : "route", {
+                spin: steerPending,
+              })}</wa-button>`
+            : nothing}
           ${queueEditing
             ? html`<wa-button
                 class="composer-submit"
@@ -1121,6 +1150,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   title=${turnControls.accessibleLabel}
                   ?disabled=${turnControls.disabled}
                 >${turnControls.label}</wa-button>`}
+          </div>
         </div>
         <div class="composer-controls" aria-label="Composer options">
           ${thread === undefined
@@ -1910,43 +1940,41 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         </header>
         ${open
           ? html`<div
-              class=${`message-body turn-body-stream agent-body-stream turn-timeline ${
-                activityLabel === undefined ? "" : "has-transient-activity"
-              }`}
+              class="message-body turn-body-stream agent-body-stream turn-timeline"
             >
-              ${unit.prompt === undefined ? nothing : this.#renderPromptNode(unit.prompt)}
+              ${unit.prompt === undefined ? nothing : this.#renderUserNode(unit.prompt)}
               ${this.#renderAgentBody(
                 unit,
                 presentation,
               )}
+              ${activityLabel === undefined
+                ? nothing
+                : this.#renderTransientActivityNode(activityLabel)}
               ${unit.status === undefined
                 ? nothing
                 : this.#renderTerminalTurnState(unit.status)}
-            </div>
-            ${activityLabel === undefined
-              ? nothing
-              : html`<footer class="turn-activity-footer">
-                  ${this.#renderActivityRow(activityLabel)}
-                </footer>`}`
+            </div>`
           : nothing}
       </article>
     `;
   }
 
-  #renderPromptNode(
-    item: Extract<ThreadChatItem, { readonly kind: "user" }>,
+  #renderUserNode(
+    item: Extract<ThreadChatItem, { readonly kind: "user" | "steered" }>,
   ) {
     this.#ensureMarkdown();
+    const steered = item.kind === "steered";
+    const label = steered ? "Steered" : "Prompt";
     return html`
       <section
-        class="turn-rail-node turn-prompt-node user-message"
+        class=${`turn-rail-node turn-${steered ? "steered" : "prompt"}-node user-message`}
         data-chat-anchor-id=${`item:${item.id}`}
-        aria-label="Prompt"
+        aria-label=${label}
       >
-        <span class="turn-rail-marker prompt" aria-hidden="true">
-          ${fontAwesomeIcon("user")}
+        <span class=${`turn-rail-marker ${steered ? "steered" : "prompt"}`} aria-hidden="true">
+          ${fontAwesomeIcon(steered ? "route" : "user")}
         </span>
-        <header class="turn-node-header"><strong>Prompt</strong></header>
+        <header class="turn-node-header"><strong>${label}</strong></header>
         <div class="turn-node-body user-body-stream">
           ${item.content === ""
             ? nothing
@@ -2045,6 +2073,25 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       <span class="activity-dots" aria-hidden="true"><i></i><i></i><i></i></span>
       <span>${label}</span>
     </p>`;
+  }
+
+  #renderTransientActivityNode(label: string) {
+    return html`
+      <section
+        class="turn-rail-node turn-transient-activity"
+        role="status"
+        aria-live="polite"
+        aria-label=${label}
+      >
+        <span class="turn-rail-marker transient" aria-hidden="true">
+          ${fontAwesomeIcon("spinner", {
+            className: "turn-transient-spinner",
+            spin: true,
+          })}
+        </span>
+        <header class="turn-node-header"><strong>${label}</strong></header>
+      </section>
+    `;
   }
 
   #renderCompactionMarker(
@@ -2149,6 +2196,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     while (index < unit.items.length) {
       const item = unit.items[index];
       if (item === undefined) break;
+      if (item.kind === "steered") {
+        flushActivityRows();
+        rows.push(this.#renderUserNode(item));
+        index += 1;
+        continue;
+      }
       if (item.kind === "assistant") {
         flushActivityRows();
         const stretch: Extract<AgentChatItem, { readonly kind: "assistant" }>[] = [];
@@ -2247,6 +2300,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index += 1;
         continue;
       }
+      // A live tool is the current activity, not history. Keep it as a direct
+      // rail node until its terminal event arrives; the next render can then
+      // fold it into the stable completed run without changing the group key.
+      if (activeToolCall(item)) {
+        activityRows.push({
+          content: this.#renderItem(item, presentation),
+          expandedGroup: false,
+          endsWithExpandedToolGroup: false,
+        });
+        index += 1;
+        continue;
+      }
       if (item.kind === "tool" && !collapseSequentialToolCalls) {
         activityRows.push({
           content: this.#renderItem(item, presentation),
@@ -2263,12 +2328,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         if (
           candidate === undefined
           || candidate.kind === "assistant"
+          || candidate.kind === "steered"
           || candidate.kind === "questions"
           || (!collapseCompactionWithTools && candidate.kind === "compaction")
           || (!collapseCompactionWithTools
             && candidate.kind === "tool"
             && isContextCompactionTool(candidate))
           || (!collapseThinkingWithTools && candidate.kind === "thinking")
+          || (candidate.kind === "tool" && activeToolCall(candidate))
         ) break;
         if (
           hasNativeCompaction
@@ -4480,7 +4547,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const bounds = preview.getBoundingClientRect();
     this.#queueDragImage = preview;
     try {
-      transfer.setDragImage(preview, 16, bounds.height + 8);
+      transfer.setDragImage(
+        preview,
+        Math.min(16, Math.max(0, bounds.width - 1)),
+        Math.max(0, bounds.height - 1),
+      );
     } catch {
       // Keep reordering functional in engines that expose but do not yet
       // implement custom drag images.
@@ -4522,8 +4593,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const preferred: QueueDropPlacement = event.clientY >= row.top + row.height / 2
       ? "after"
       : "before";
+    const currentQueue = this.#currentQueueForDrag(queue, this.#queueDragId, targetId);
     const placement = effectiveQueueDropPlacement(
-      queue,
+      currentQueue,
       this.#queueDragId,
       targetId,
       preferred,
@@ -4533,6 +4605,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#queueDropId = targetId;
     this.#queueDropPlacement = placement;
     this.requestUpdate();
+  }
+
+  #currentQueueForDrag(
+    fallback: readonly QueuedPrompt[],
+    sourceId: string,
+    targetId: string,
+  ): readonly QueuedPrompt[] {
+    if (sourceId === "" || targetId === "" || this.threadId === "") return fallback;
+    const current = this.#store.value?.threadView(this.threadId).queue;
+    return current !== undefined
+      && current.some(({ id }) => id === sourceId)
+      && current.some(({ id }) => id === targetId)
+      ? current
+      : fallback;
   }
 
   readonly #keepQueueDropActive = (event: DragEvent): void => {
@@ -4547,11 +4633,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     targetId: string,
   ): Promise<void> {
     event.preventDefault();
-    const promptId = this.#queueDragId;
-    const ids = droppedQueueIds(queue, promptId, targetId, this.#queueDropPlacement);
-    this.#endQueueDrag();
     const services = this.#services.value;
     const store = this.#store.value;
+    const promptId = this.#queueDragId
+      || event.dataTransfer?.getData("text/plain")
+      || "";
+    const currentQueue = this.#currentQueueForDrag(queue, promptId, targetId);
+    const ids = droppedQueueIds(
+      currentQueue,
+      promptId,
+      targetId,
+      this.#queueDropPlacement,
+    );
+    this.#endQueueDrag();
     if (
       services === undefined
       || store === undefined
@@ -4562,8 +4656,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) return;
     const threadId = this.threadId;
     const generation = this.#threadInteractionGeneration;
+    const byId = new Map(currentQueue.map((prompt) => [prompt.id, prompt]));
+    const optimistic = ids.map((id, position) => {
+      const prompt = byId.get(id);
+      return prompt === undefined ? undefined : { ...prompt, position };
+    });
+    if (optimistic.some((prompt) => prompt === undefined)) return;
+    const optimisticQueue = optimistic as QueuedPrompt[];
+    const previousQueue = [...currentQueue];
     this.#queueBusy = promptId;
     this.#queueError = "";
+    store.replaceThreadQueue(threadId, optimisticQueue);
     this.requestUpdate();
     try {
       const reordered = await services.protocol.reorderQueue(threadId, ids);
@@ -4572,8 +4675,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         threadId,
         reordered,
       );
+      const position = reordered.findIndex((prompt) => prompt.id === promptId);
+      this.#queueStatus = position < 0
+        ? "Queue order updated."
+        : `Queued prompt dropped at position ${position + 1} of ${reordered.length}.`;
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
+        try {
+          store.replaceThreadQueue(threadId, await services.protocol.listQueue(threadId));
+        } catch {
+          const currentIds = store.threadView(threadId).queue.map(({ id }) => id);
+          if (
+            currentIds.length === ids.length
+            && currentIds.every((id, index) => id === ids[index])
+          ) {
+            store.replaceThreadQueue(threadId, previousQueue);
+          }
+        }
         this.#queueError = "Queue order could not be changed.";
       }
     } finally {
@@ -4844,6 +4962,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     return undefined;
   }
 
+  readonly #steerTurn = async (event: Event): Promise<void> => {
+    event.preventDefault();
+    const form = (event.currentTarget as HTMLElement).closest<HTMLFormElement>("form");
+    if (form !== null) await this.#submitComposer(form, true);
+  };
+
   readonly #sendMessage = async (event: SubmitEvent): Promise<void> => {
     event.preventDefault();
     const services = this.#services.value;
@@ -4852,6 +4976,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       await this.#saveQueued(form);
       return;
     }
+    await this.#submitComposer(form, false);
+  };
+
+  async #submitComposer(form: HTMLFormElement, steering: boolean): Promise<void> {
+    const services = this.#services.value;
     const textarea = form.elements.namedItem("message") as HTMLTextAreaElement | null;
     const content = textarea?.value.trim() ?? "";
     if (
@@ -4863,28 +4992,37 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threadId = this.threadId;
     const requestGeneration = ++this.#turnRequestGeneration;
     this.#requestPending = true;
-    const view = this.#store.value?.threadView(this.threadId);
-    this.#messageRequest = view?.turnRunning === true
-      || this.#pendingStartTurn !== undefined
-      || this.#cancelRequestedTurn !== undefined
-      ? "queue"
-      : "start";
+    if (!steering) {
+      const view = this.#store.value?.threadView(this.threadId);
+      this.#messageRequest = view?.turnRunning === true
+        || this.#pendingStartTurn !== undefined
+        || this.#cancelRequestedTurn !== undefined
+        ? "queue"
+        : "start";
+    }
     this.#requestError = "";
     this.requestUpdate();
     try {
-      const accepted = await services.protocol.sendMessage(threadId, {
+      const request = {
         content,
         ...(this.#pendingAttachments.length === 0
           ? {}
           : { attachments: this.#pendingAttachments.map(({ upload }) => upload) }),
-      });
+      };
+      let acceptedTurn: number | undefined;
+      if (steering) {
+        await services.protocol.steerTurn(threadId, request);
+      } else {
+        const accepted = await services.protocol.sendMessage(threadId, request);
+        if (accepted.queued !== true && accepted.turn > 0) {
+          acceptedTurn = accepted.turn;
+        }
+      }
       if (
         requestGeneration !== this.#turnRequestGeneration
         || threadId !== this.threadId
       ) return;
-      if (accepted.queued !== true && accepted.turn > 0) {
-        this.#pendingStartTurn = accepted.turn;
-      }
+      if (acceptedTurn !== undefined) this.#pendingStartTurn = acceptedTurn;
       if (textarea !== null) {
         textarea.value = "";
         this.#resizeComposer(textarea);
@@ -4902,7 +5040,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         requestGeneration === this.#turnRequestGeneration
         && threadId === this.threadId
       ) {
-        this.#requestError = "Message could not be sent.";
+        this.#requestError = steering
+          ? "The active turn could not be steered."
+          : "Message could not be sent.";
       }
     } finally {
       if (
@@ -4916,7 +5056,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.#focusComposerNow();
       }
     }
-  };
+  }
 
   readonly #filesSelected = (event: Event): void => {
     const input = event.currentTarget as HTMLInputElement;

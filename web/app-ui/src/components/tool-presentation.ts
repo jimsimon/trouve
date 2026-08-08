@@ -166,56 +166,13 @@ export const toolLabel = (tool: string, argsValue: unknown): string => {
     : display;
 };
 
-const toolActivityLabel = (tool: string, argsValue: unknown): string => {
-  const rawArgs = record(argsValue) ?? {};
-  const wrapper = tool.replaceAll(/[^a-z0-9]/giu, "").toLowerCase();
-  if (wrapper === "mcptoolcall" || wrapper === "dynamictoolcall") {
-    const server = firstString(rawArgs, ["serverName", "server"]);
-    if (server !== undefined && server !== "" && server !== "trouve") {
-      return `Using ${server}…`;
-    }
-  }
-  const effective = effectiveToolCall(tool, rawArgs);
-  const mcp = effective.tool.startsWith("mcp__")
-    ? effective.tool.slice(5).split("__", 2)
-    : [];
-  if (mcp.length === 2 && mcp[0] !== "trouve") return `Using ${mcp[0]}…`;
-  const normalized = baseToolName(effective.tool)
-    .replaceAll(/[^a-z0-9]/giu, "")
-    .toLowerCase();
-  const title = stringValue(effective.args.title)?.toLowerCase() ?? "";
-  if (title.includes("web search")) return "Searching the web…";
-  if (title.includes("code search") || title.includes("find related")) {
-    return "Searching through code…";
-  }
-  if ([
-    "edit", "multiedit", "notebookedit", "write", "editfile", "writefile",
-    "createfile", "applypatch", "delete", "deletefile", "filechange",
-  ].includes(normalized)) return "Editing files…";
-  if (["read", "readfile", "listdir"].includes(normalized)) return "Reading files…";
-  if ([
-    "shell", "bash", "execute", "commandexecution", "shelloutput", "shellkill",
-  ].includes(normalized)) return "Running commands…";
-  if (["search", "findrelated", "grep", "glob"].includes(normalized)) {
-    return "Searching through code…";
-  }
-  if (normalized === "websearch") return "Searching the web…";
-  if (normalized === "webfetch") return "Fetching web content…";
-  if (["todowrite", "createplan", "updateplan"].includes(normalized)) return "Updating the plan…";
-  if (["task", "agent", "spawnagent", "collabagenttoolcall"].includes(normalized)) {
-    return "Delegating work…";
-  }
-  return `Using ${toolDisplayName(effective.tool)}…`;
-};
-
-/** Describe the active work at the transcript tail, using only running tools
- * after the current turn marker so stale interrupted cards cannot leak into a
- * newer turn. */
+/** Show a transient status only when the active turn has no durable node that
+ * already explains what is happening. Running tools, streamed thoughts,
+ * compaction, questions, and response text all own their place on the rail. */
 export const runningActivityLabel = (
   items: readonly unknown[],
   thinking: boolean,
-): string => {
-  if (thinking) return "Thinking…";
+): string | undefined => {
   let start = 0;
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = record(items[index]);
@@ -226,13 +183,19 @@ export const runningActivityLabel = (
   }
   for (let index = items.length - 1; index >= start; index -= 1) {
     const item = record(items[index]);
+    if (item === undefined) continue;
     if (
-      item?.kind === "tool" &&
-      item.status === "running" &&
-      typeof item.tool === "string"
-    ) return toolActivityLabel(item.tool, item.args);
+      item.kind === "tool"
+      && (item.status === "running" || item.status === "awaiting-approval")
+    ) return undefined;
+    if (item.kind === "thinking" && item.complete === false) return undefined;
+    if (item.kind === "assistant" && item.complete === false) return undefined;
+    if (item.kind === "compaction" && record(item.state)?.kind === "running") {
+      return undefined;
+    }
+    if (item.kind === "questions" && item.answers === undefined) return undefined;
   }
-  return "Processing…";
+  return thinking ? "Thinking…" : "Processing…";
 };
 
 const diffLine = (

@@ -51,6 +51,10 @@ const generateModule = ({ document, schemaId, validatorNamespace, validators, su
     strict: false,
     allErrors: false,
     validateFormats: false,
+    // The OpenAPI graph deliberately reuses many protocol components across
+    // response validators. Keeping refs as shared functions avoids emitting
+    // the same nested validation branches into every root validator.
+    inlineRefs: false,
     code: { source: true, esm: true, lines: true },
   });
   ajv.addSchema(document, schemaId);
@@ -71,6 +75,19 @@ const protocolSchemaId = "urn:trouve:protocol-openapi";
 const protocolDocument = readJson("src/generated/protocol-openapi.json");
 const protocolSchemas = asRecord(asRecord(protocolDocument.components)?.schemas);
 
+// Full PR detail adds optional check links and timestamps to the compact
+// CheckRun projection. The PR workspace validates those fields in its lazy
+// handwritten detail guard, and every URL is independently filtered before
+// use. Omitting the same optional leaves from the shared AJV validator avoids
+// adding roughly 20 KB of generated branches to every app build.
+const checkRun = asRecord(protocolSchemas?.CheckRun);
+const checkRunProperties = asRecord(checkRun?.properties);
+if (checkRunProperties !== undefined) {
+  delete checkRunProperties.details_url;
+  delete checkRunProperties.started_at;
+  delete checkRunProperties.completed_at;
+}
+
 // JSON object keys are always strings. utoipa currently describes the keys of
 // Rust maps keyed by u64 as integer-valued `propertyNames`, which rejects the
 // wire representation (for example `{ "7": "openai/gpt-5.6" }`). Normalize
@@ -81,6 +98,7 @@ const threadViewProperties = asRecord(threadViewSnapshot?.properties);
 for (const name of [
   "turn_models",
   "turn_thinking_levels",
+  "turn_steerable",
   "turn_started_at",
   "turn_duration_ms",
 ]) {
@@ -137,7 +155,6 @@ const protocolValidators = {
   workspaces: componentArray(protocolSchemaId, "Workspace"),
   branchList: componentRef(protocolSchemaId, "BranchList"),
   prInfo: componentRef(protocolSchemaId, "PrInfo"),
-  prInfos: componentArray(protocolSchemaId, "PrInfo"),
   modes: componentArray(protocolSchemaId, "AgentMode"),
   modeInfos: componentArray(protocolSchemaId, "ModeInfo"),
   models: componentArray(protocolSchemaId, "ModelInfo"),
@@ -146,7 +163,6 @@ const protocolValidators = {
   queuedPrompts: componentArray(protocolSchemaId, "QueuedPrompt"),
   turnAccepted: componentRef(protocolSchemaId, "TurnAccepted"),
   usageSummary: componentRef(protocolSchemaId, "UsageSummary"),
-  sessionDiff: componentRef(protocolSchemaId, "SessionDiff"),
   dirEntries: componentArray(protocolSchemaId, "DirEntry"),
   paths: { type: "array", items: { type: "string" } },
   fileContent: componentRef(protocolSchemaId, "FileContent"),
@@ -179,7 +195,15 @@ const protocolValidators = {
   cliInstallStatus: componentRef(protocolSchemaId, "CliInstallStatus"),
   knownEnvelope: componentRef(protocolSchemaId, "EventEnvelope"),
   compatibleEnvelope: {
-    components: protocolDocument.components,
+    // Unknown additive events need only the stable envelope fields. Supplying
+    // the complete OpenAPI component graph here makes AJV emit validators for
+    // unrelated request/response models (large PR detail in particular).
+    components: {
+      schemas: {
+        Scope: protocolSchemas?.Scope,
+        String: protocolSchemas?.String,
+      },
+    },
     allOf: [
       {
         type: "object",

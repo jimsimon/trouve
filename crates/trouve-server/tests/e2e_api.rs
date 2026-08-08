@@ -89,6 +89,103 @@ fn init_repo(dir: &Path) {
     run(&["commit", "-m", "init"]);
 }
 
+#[tokio::test]
+async fn session_diff_manifest_and_selected_file_patch_are_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::create_dir(repo.join("docs")).unwrap();
+    std::fs::write(repo.join("docs/setup guide.md"), "old guide\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "docs/setup guide.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "add guide"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = session["id"].as_str().unwrap();
+    let worktree = Path::new(session["worktree_path"].as_str().unwrap());
+    std::fs::write(
+        worktree.join("docs/setup guide.md"),
+        "new guide\nextra line\n",
+    )
+    .unwrap();
+
+    let summary: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/summary"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary["files"][0]["path"], "docs/setup guide.md");
+    assert_eq!(summary["additions"], 2);
+    assert_eq!(summary["deletions"], 1);
+
+    let selected: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "docs/setup guide.md")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(selected["path"], "docs/setup guide.md");
+    assert!(selected["diff"].as_str().unwrap().contains("+extra line"));
+
+    let invalid = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "../README.md")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
 async fn wait_for_event(
     client: &reqwest::Client,
     url: &str,
@@ -1704,6 +1801,243 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
         );
         assert!(prompt.ends_with("fourth message"));
     }
+}
+
+/// Holds a vendor turn open until its native steering method is called, then
+/// completes. This exercises the real HTTP endpoint, engine turn registry,
+/// backend capability, durable event ordering, and folded thread view.
+struct SteerableBackend {
+    steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl SteerableBackend {
+    fn new() -> Self {
+        Self {
+            steers: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for SteerableBackend {
+    fn id(&self) -> &str {
+        "steerable-agent"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "steerable-agent/model".into(),
+            display_name: "Steerable Agent".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(
+        &self,
+        steer: trouve_agents::BackendSteer,
+    ) -> Result<(), trouve_agents::BackendError> {
+        self.steers.lock().unwrap().push((
+            steer.session,
+            steer.prompt,
+            steer
+                .attachments
+                .into_iter()
+                .map(|attachment| attachment.path.display().to_string())
+                .collect(),
+        ));
+        let release =
+            self.release.lock().await.take().ok_or_else(|| {
+                trouve_agents::BackendError::Protocol("no active fake turn".into())
+            })?;
+        let _ = release.send(());
+        Ok(())
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        _turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.release.lock().await = Some(release_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            use trouve_agents::BackendEvent as E;
+            let _ = tx
+                .send(Ok(E::SessionStarted {
+                    session_id: "steerable-vendor-session".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(E::ThinkingDelta("Initial direction.".into())))
+                .await;
+            if release_rx.await.is_err() {
+                return;
+            }
+            let _ = tx.send(Ok(E::ThinkingCompleted)).await;
+            let _ = tx.send(Ok(E::TextDelta("Steering applied.".into()))).await;
+            let _ = tx
+                .send(Ok(E::Completed {
+                    usage: Usage::default(),
+                }))
+                .await;
+        });
+        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+            rx.poll_recv(cx)
+        })))
+    }
+}
+
+#[tokio::test]
+async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(SteerableBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("steerable-agent", backend.clone())
+            .with_default_model("steerable-agent/model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin the implementation."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking"
+    })
+    .await;
+    assert!(
+        before
+            .iter()
+            .any(|event| { event["type"] == "turn.started" && event["supports_steering"] == true })
+    );
+
+    let steered = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({
+            "content": "Prioritize the layout regression.",
+            "attachments": [{
+                "name": "reference.png",
+                "mime": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    let thinking_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.thinking")
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let response_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.delta")
+        .unwrap();
+    assert!(thinking_index < steering_index && steering_index < response_index);
+    let steering = &events[steering_index];
+    assert_eq!(steering["content"], "Prioritize the layout regression.");
+    assert_eq!(steering["attachments"][0]["name"], "reference.png");
+
+    let view: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["turn_steerable"]["1"], true);
+    assert!(view["items"].as_array().unwrap().iter().any(|item| {
+        item["kind"] == "steered" && item["content"] == "Prioritize the layout regression."
+    }));
+
+    let received = backend.steers.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0, "steerable-vendor-session");
+    assert_eq!(received[0].1, "Prioritize the layout regression.");
+    assert_eq!(received[0].2.len(), 1);
+    assert!(Path::new(&received[0].2[0]).exists());
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
