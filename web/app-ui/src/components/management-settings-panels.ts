@@ -393,6 +393,10 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
       if (cancel) await protocol.cancelTitleModelInstall();
       else await protocol.installTitleModel();
       await this.#load();
+      this.#message = cancel
+        ? "Title model install cancelled."
+        : "Title model install started.";
+      this.requestUpdate();
     } catch {
       this.#message = genericFailure(cancel ? "Cancelling install" : "Starting install");
       this.#error = true;
@@ -552,8 +556,9 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       form.reset();
       this.#formOpen = false;
       this.#editingServer = undefined;
-      this.#message = `Saved ${name}.`;
       await this.#load();
+      this.#message = `Saved ${name}.`;
+      this.requestUpdate();
     } catch {
       this.#message = genericFailure("Saving MCP server");
       this.#error = true;
@@ -570,8 +575,9 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       await protocol.deleteMcpServer(server.name, server.scope, server.workspace_id || undefined);
-      this.#message = `Removed ${server.name}.`;
       await this.#load();
+      this.#message = `Removed ${server.name}.`;
+      this.requestUpdate();
     } catch {
       this.#message = genericFailure("Removing MCP server");
       this.#error = true;
@@ -638,7 +644,10 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
         ${this.#formOpen ? html`<form class="card mcp-form" @submit=${(event: SubmitEvent) => void this.#save(event)}>
           <h3>${this.#editingServer === undefined ? "New" : "Edit"} ${this.#formScope === "user" ? "app-wide server (~/.config/trouve/mcp.json — every workspace)" : "workspace server (.agents/.mcp.json)"}</h3>
           <input name="scope" type="hidden" .value=${this.#formScope} />
-          ${this.#formScope === "workspace" ? html`<label><span>Workspace</span><select name="workspace_id" .value=${this.#editingServer?.workspace_id ?? workspaces[0]?.id ?? ""} ?disabled=${this.#editingServer !== undefined}><option value="">Choose workspace</option>${workspaces.map((workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`)}</select>${this.#editingServer?.workspace_id ? html`<input name="workspace_id" type="hidden" .value=${this.#editingServer.workspace_id} />` : nothing}</label>` : html`<input name="workspace_id" type="hidden" value="" />`}
+          ${this.#formScope === "workspace" ? (() => {
+            const selectedWorkspaceId = this.#editingServer?.workspace_id ?? workspaces[0]?.id ?? "";
+            return html`<label><span>Workspace</span><select name="workspace_id" ?disabled=${this.#editingServer !== undefined}><option value="" ?selected=${selectedWorkspaceId === ""}>Choose workspace</option>${workspaces.map((workspace) => html`<option value=${workspace.id} ?selected=${workspace.id === selectedWorkspaceId}>${workspace.name}</option>`)}</select>${this.#editingServer?.workspace_id ? html`<input name="workspace_id" type="hidden" .value=${this.#editingServer.workspace_id} />` : nothing}</label>`;
+          })() : html`<input name="workspace_id" type="hidden" value="" />`}
           <div class="grid mcp-command-grid"><label><span class="visually-hidden">Name</span><input required name="name" autocomplete="off" placeholder="name (e.g. jira)" .value=${this.#editingServer?.name ?? ""} ?readonly=${this.#editingServer !== undefined} /></label><label><span class="visually-hidden">Command and arguments</span><input required name="command_line" autocomplete="off" spellcheck="false" placeholder="command and args (e.g. npx -y jira-mcp --stdio)" .value=${this.#editingServer === undefined ? "" : sessionMcpCommandLine(this.#editingServer)} /></label></div>
           <label><span class="visually-hidden">Environment</span><textarea name="env" autocomplete="off" spellcheck="false" placeholder="environment, one KEY=VALUE per line; ${"${VAR}"} expands at launch" .value=${this.#editingServer === undefined ? "" : sessionMcpEnvironmentLines(this.#editingServer).join("\n")}></textarea></label>
           <div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${this.#editingServer === undefined ? "Add server" : "Save changes"}</button><button type="button" @click=${() => { this.#formOpen = false; this.#editingServer = undefined; this.requestUpdate(); }}>Cancel</button></div>

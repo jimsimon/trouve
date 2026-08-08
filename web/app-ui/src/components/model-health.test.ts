@@ -6,6 +6,7 @@ import {
   modelHealthPresentation,
   subscriptionUsageTone,
 } from "./model-health.js";
+import type { ProtocolModelInfo } from "../services/protocol-client.js";
 
 describe("model health presentation", () => {
   it("matches the highest-window summary and warning tones", () => {
@@ -55,11 +56,18 @@ describe("model health presentation", () => {
   });
 
   it("ranks prefix, contained, and subsequence model matches with a DOM bound", () => {
-    const models = [
-      { id: "openai/gpt-5", display_name: "GPT-5" },
-      { id: "anthropic/claude-sonnet", display_name: "Claude Sonnet" },
-      { id: "local/granite", display_name: "Granite" },
-    ] as never;
+    const model = (id: string, displayName: string): ProtocolModelInfo => ({
+      id,
+      display_name: displayName,
+      context_window: 128_000,
+      options_schema: {},
+      supports_tools: true,
+    });
+    const models: readonly ProtocolModelInfo[] = [
+      model("openai/gpt-5", "GPT-5"),
+      model("anthropic/claude-sonnet", "Claude Sonnet"),
+      model("local/granite", "Granite"),
+    ];
     expect(filteredModelIndices(models, "cla", 2)).toEqual([1, 2]);
     expect(filteredModelIndices(models, "g5", 2)).toEqual([0]);
     expect(filteredModelIndices(models, "", 2)).toEqual([0, 1]);

@@ -25,10 +25,17 @@ const subsequenceScore = (needle: string, haystack: string): number | undefined 
   return first + gaps;
 };
 
-const tokenScore = (token: string, item: FuzzyTextItem): number | undefined => {
-  const label = normalized(item.label);
-  const detail = normalized(item.detail);
-  const keywords = normalized(item.keywords);
+interface NormalizedFuzzyTextItem {
+  readonly label: string;
+  readonly detail: string;
+  readonly keywords: string;
+}
+
+const tokenScore = (
+  token: string,
+  item: NormalizedFuzzyTextItem,
+): number | undefined => {
+  const { label, detail, keywords } = item;
   if (label === token) return 0;
   if (label.startsWith(token)) return 5 + label.length - token.length;
   const labelWord = label.split(/\s+/u).findIndex((word) => word.startsWith(token));
@@ -54,9 +61,14 @@ export const filterFuzzyTextItems = <T extends FuzzyTextItem>(
   if (tokens.length === 0) return items;
   return items
     .map((item, index) => {
+      const normalizedItem = {
+        label: normalized(item.label),
+        detail: normalized(item.detail),
+        keywords: normalized(item.keywords),
+      };
       let score = 0;
       for (const token of tokens) {
-        const next = tokenScore(token, item);
+        const next = tokenScore(token, normalizedItem);
         if (next === undefined) return undefined;
         score += next;
       }

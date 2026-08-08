@@ -118,6 +118,64 @@ describe("CursorEventStream", () => {
     expect(readSignal(stream.state)).toBe("closed");
   });
 
+  it("grows and clamps reconnect delays until a connection remains stable", () => {
+    interface Scheduled {
+      readonly delay: number;
+      readonly callback: () => void;
+      cleared: boolean;
+    }
+    const scheduled: Scheduled[] = [];
+    const scheduler: TimerScheduler = {
+      set: (delay, callback) => {
+        const handle = { delay, callback, cleared: false };
+        scheduled.push(handle);
+        return handle;
+      },
+      clear: (handle) => {
+        (handle as Scheduled).cleared = true;
+      },
+    };
+    const run = (delay: number): void => {
+      const handle = scheduled.find((entry) => !entry.cleared && entry.delay === delay);
+      expect(handle).toBeDefined();
+      handle!.cleared = true;
+      handle!.callback();
+    };
+    const sources: FakeEventSource[] = [];
+    const stream = new CursorEventStream({
+      path: "/v1/events",
+      origin: "https://trouve.example",
+      after: 0,
+      parse,
+      onEvent: () => undefined,
+      scheduler,
+      baseDelayMs: 100,
+      maxDelayMs: 250,
+      stableConnectionMs: 50,
+      eventSourceFactory: () => {
+        const source = new FakeEventSource();
+        sources.push(source);
+        return source;
+      },
+    });
+
+    stream.start();
+    sources[0]!.failClosed();
+    run(100);
+    sources[1]!.open();
+    sources[1]!.failClosed();
+    run(200);
+    sources[2]!.failClosed();
+    run(250);
+    sources[3]!.open();
+    run(50);
+    sources[3]!.failClosed();
+
+    expect(scheduled.filter(({ delay }) => delay !== 50).map(({ delay }) => delay))
+      .toEqual([100, 200, 250, 100]);
+    stream.close();
+  });
+
   it("drops malformed data without putting payload content in diagnostics", () => {
     const source = new FakeEventSource();
     const diagnostics = vi.fn();

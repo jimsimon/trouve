@@ -97,8 +97,9 @@ describe("session list component contract", () => {
     expect(component).toContain('>Rename session</h2>');
     expect(component).toContain('>Delete session “${this.#modalTitle}”?</h2>');
     expect(component).toContain("This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.");
-    expect(styles).toContain('.session-actions { position: absolute;');
-    expect(styles).toContain('width: 150px;');
+    expect(styles).toMatch(
+      /\.session-actions \{[^}]*position: absolute;[^}]*width: 150px;/u,
+    );
     expect(styles).toContain('.session-modal { width: min(380px, calc(100vw - 32px));');
   });
 });

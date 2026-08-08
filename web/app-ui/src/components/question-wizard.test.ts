@@ -74,6 +74,13 @@ describe("question wizard", () => {
     expect(state.selections[1]).toEqual([OTHER_OPTION_ID]);
   });
 
+  it("rejects option ids that the current question does not declare", () => {
+    const state = createQuestionWizard(questions.length);
+    expect(toggleQuestionOption(state, questions, "pear")).toEqual(state);
+    expect(toggleQuestionOption(state, questions, "unknown")).toEqual(state);
+    expect(state.selections[0]).toEqual([]);
+  });
+
   it("builds the established review and submission representation", () => {
     let state = createQuestionWizard(questions.length);
     state = toggleQuestionOption(state, questions, "blue");

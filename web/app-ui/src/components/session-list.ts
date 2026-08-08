@@ -34,7 +34,10 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   #busySessionId = "";
   #requestError = "";
   readonly #expandedArchivedWorkspaceIds = new Set<string>();
-  readonly #archivedListId = `archived-sessions-${++nextArchivedListId}`;
+  readonly #instanceId = ++nextArchivedListId;
+  readonly #archivedListId = `archived-sessions-${this.#instanceId}`;
+  readonly #modalTitleId = `session-modal-title-${this.#instanceId}`;
+  readonly #modalDescriptionId = `session-modal-description-${this.#instanceId}`;
 
   readonly #store = new ContextConsumer(this, {
     context: appStoreContext,
@@ -142,14 +145,14 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
         : html`<p class="session-action-error" role="alert">${this.#requestError}</p>`}
       <dialog
         class="session-modal"
-        aria-labelledby="session-modal-title"
-        aria-describedby=${this.#deleteSessionId === "" ? nothing : "session-modal-description"}
+        aria-labelledby=${this.#modalTitleId}
+        aria-describedby=${this.#deleteSessionId === "" ? nothing : this.#modalDescriptionId}
         @cancel=${(event: Event) => { event.preventDefault(); this.#closeActions(); }}
       >
         ${this.#editingSessionId !== ""
           ? html`
               <form class="session-modal-layout" @submit=${(event: SubmitEvent) => this.#rename(event, this.#editingSessionId)}>
-                <h2 id="session-modal-title">Rename session</h2>
+                <h2 id=${this.#modalTitleId}>Rename session</h2>
                 <label class="visually-hidden" for=${`rename-${this.#editingSessionId}`}>Session title</label>
                 <input id=${`rename-${this.#editingSessionId}`} name="title" .value=${this.#modalTitle} maxlength="200" placeholder="Session title" required />
                 ${this.#requestError === "" ? nothing : html`<p class="dialog-error" role="alert">${this.#requestError}</p>`}
@@ -162,8 +165,8 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
           : this.#deleteSessionId !== ""
             ? html`
                 <div class="session-modal-layout">
-                  <h2 id="session-modal-title">Delete session “${this.#modalTitle}”?</h2>
-                  <p id="session-modal-description">This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.</p>
+                  <h2 id=${this.#modalTitleId}>Delete session “${this.#modalTitle}”?</h2>
+                  <p id=${this.#modalDescriptionId}>This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.</p>
                   ${this.#requestError === "" ? nothing : html`<p class="dialog-error" role="alert">${this.#requestError}</p>`}
                   <footer>
                     <button data-session-modal-action="cancel" type="button" @click=${this.#closeActions}>Cancel</button>

@@ -134,7 +134,7 @@ export const createBrowserSessionNotificationDelivery = (
     if (notifications.permission() !== "granted") return;
     notifications.show(request.title, {
       body: request.body,
-      tag: `trouve:${request.sessionId}:${request.kind}`,
+      tag: `trouve:${request.sessionId}${request.threadId === undefined ? "" : `:${request.threadId}`}:${request.kind}`,
       silent: !request.sound,
       data: {
         sessionId: request.sessionId,

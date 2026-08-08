@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -9,7 +9,7 @@ const read = (relativePath: string): string =>
 
 describe("CSP-safe runtime validation", () => {
   it("keeps generated validators synchronized with the OpenAPI snapshots", () => {
-    execFileSync(
+    const result = spawnSync(
       process.execPath,
       [
         fileURLToPath(
@@ -17,8 +17,12 @@ describe("CSP-safe runtime validation", () => {
         ),
         "--check",
       ],
-      { stdio: "pipe" },
+      { encoding: "utf8" },
     );
+    expect(
+      result.status,
+      [result.stdout, result.stderr].filter(Boolean).join("\n"),
+    ).toBe(0);
   });
 
   it("does not compile schemas or evaluate source in runtime clients", () => {

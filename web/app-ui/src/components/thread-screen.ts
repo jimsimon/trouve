@@ -357,6 +357,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #scrollCorrectionResumeAt = 0;
   #followTailControlHeight = 0;
   #chatScrollIntent = false;
+  #chatScrollIntentSequence = 0;
+  #historyPrefetchIntentSequence = 0;
   #chatScrollIntentTimer: ReturnType<typeof setTimeout> | undefined;
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
@@ -535,6 +537,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#followTailControlHeight = 0;
       this.#scrollCorrectionResumeAt = 0;
       this.#clearChatScrollIntent();
+      this.#chatScrollIntentSequence = 0;
+      this.#historyPrefetchIntentSequence = 0;
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#threadProvider.setValue({ threadId: this.threadId });
@@ -2727,7 +2731,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     // while the reader remains inside the threshold. Only an actual input
     // gesture may advance another page; otherwise one wheel tick can walk the
     // complete transcript after each prepend settles.
-    if (userInitiated && viewport.scrollTop <= historyPrefetchThreshold) {
+    if (
+      userInitiated
+      && viewport.scrollTop <= historyPrefetchThreshold
+      && this.#chatScrollIntentSequence > this.#historyPrefetchIntentSequence
+    ) {
+      this.#historyPrefetchIntentSequence = this.#chatScrollIntentSequence;
       if (this.#historyLoading) {
         // Preserve one explicit reader gesture that arrives while the prior
         // page is still settling. This remains bounded: programmatic prepend
@@ -2773,6 +2782,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && target.closest("button, a, input, textarea, select, summary") !== null
       ) return;
     }
+    this.#chatScrollIntentSequence += 1;
     this.#retainChatScrollIntent();
   };
 
@@ -4047,6 +4057,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (createdThreadId === undefined) {
         this.#newThreadError = "Thread could not be created. Review the setup and try again.";
       } else {
+        const content = event.detail.initialMessage?.content ?? "";
+        if (content !== "" && this.#composerDraft === "") {
+          this.#composerDraft = content;
+          this.#composerCursor = this.#composerDraft.length;
+          this.#scheduleComposerDraftPersistence();
+        }
         this.#requestError =
           "Thread was created, but its first message could not be sent. The message was not queued.";
       }

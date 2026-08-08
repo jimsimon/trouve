@@ -80,5 +80,18 @@ describe("workspace registration form model", () => {
       ),
     ).rejects.toThrow("invalid path");
     expect(registrations).toBe(0);
+
+    await expect(
+      pickAndRegisterWorkspace(
+        { pickDirectory: async () => "/srv/repos/secret\0path" },
+        { registerWorkspace: async () => { throw new Error("must not register"); } },
+      ),
+    ).rejects.toThrow("invalid path");
+    await expect(
+      pickAndRegisterWorkspace(
+        { pickDirectory: async () => "" },
+        { registerWorkspace: async () => { throw new Error("must not register"); } },
+      ),
+    ).rejects.toThrow("invalid path");
   });
 });

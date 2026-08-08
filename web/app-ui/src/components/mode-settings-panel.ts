@@ -156,8 +156,9 @@ export class TrouveModeSettings extends LitElement {
         }),
         protocol.setDefaultPermissionMode({ permission_mode: permission }),
       ]);
-      this.#message = "Defaults saved for new threads.";
       await this.#load();
+      this.#message = "Defaults saved for new threads.";
+      this.requestUpdate();
     } catch {
       this.#message = "Defaults could not be saved.";
       this.#error = true;
@@ -201,8 +202,9 @@ export class TrouveModeSettings extends LitElement {
       this.#editingModeId = "";
       this.#modeFormModelId = "";
       this.#modeFormThinkingDraft = undefined;
-      this.#message = `Saved mode ${id}.`;
       await this.#load();
+      this.#message = `Saved mode ${id}.`;
+      this.requestUpdate();
     } catch {
       this.#message = `Mode ${id} could not be saved.`;
       this.#error = true;
@@ -220,10 +222,12 @@ export class TrouveModeSettings extends LitElement {
     this.requestUpdate();
     try {
       await protocol.deleteMode(info.mode.id);
-      this.#message = info.origin === "custom"
+      const success = info.origin === "custom"
         ? `Deleted mode ${info.mode.id}.`
         : `Reset mode ${info.mode.id} to its built-in definition.`;
       await this.#load();
+      this.#message = success;
+      this.requestUpdate();
     } catch {
       this.#message = `Mode ${info.mode.id} could not be ${info.origin === "custom" ? "deleted" : "reset"}.`;
       this.#error = true;
@@ -293,8 +297,9 @@ export class TrouveModeSettings extends LitElement {
           ? mode.default_thinking_level ?? null
           : update.thinking,
       });
-      this.#message = `Saved mode ${mode.id}.`;
       await this.#load();
+      this.#message = `Saved mode ${mode.id}.`;
+      this.requestUpdate();
     } catch {
       this.#message = `Mode ${mode.id} could not be saved.`;
       this.#error = true;

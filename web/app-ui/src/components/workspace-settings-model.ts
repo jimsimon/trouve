@@ -27,10 +27,18 @@ export const emptyWorkspaceRegistrationDraft = (): WorkspaceRegistrationDraft =>
   name: "",
 });
 
+const invalidWorkspacePath = (value: string): boolean => {
+  const path = value.trim();
+  const absolute = path.startsWith("/")
+    || /^[A-Za-z]:[\\/]/u.test(path)
+    || path.startsWith("\\\\");
+  return path === "" || !absolute || /[\u0000-\u001f\u007f]/u.test(path);
+};
+
 export const validateWorkspaceRegistration = (
   draft: WorkspaceRegistrationDraft,
 ): WorkspaceRegistrationErrors =>
-  draft.path.trim() === ""
+  invalidWorkspacePath(draft.path)
     ? { path: "Enter an absolute repository path on the server host." }
     : {};
 
@@ -54,7 +62,7 @@ export const pickAndRegisterWorkspace = async (
 ): Promise<ProtocolWorkspace | undefined> => {
   const path = await picker.pickDirectory();
   if (path === undefined) return undefined;
-  if (path === "" || /[\u0000-\u001f\u007f]/u.test(path)) {
+  if (invalidWorkspacePath(path)) {
     throw new TypeError("desktop directory picker returned an invalid path");
   }
   return protocol.registerWorkspace({ path });

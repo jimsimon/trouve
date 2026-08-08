@@ -1,12 +1,14 @@
 const MAX_TERMINAL_TITLE_BYTES = 512;
 const TERMINAL_CONTROL_CHARACTER = /\p{Cc}/u;
+const terminalTitleEncoder = new TextEncoder();
+const terminalTitleDecoder = new TextDecoder();
 
 /** Match the native VT callback boundary: take at most 512 UTF-8 bytes,
  * decode lossily, and remove control characters before exposing a title. */
 export const normalizeTerminalTitle = (title: string): string => {
-  const bytes = new TextEncoder().encode(title);
+  const bytes = terminalTitleEncoder.encode(title);
   const bounded = bytes.subarray(0, MAX_TERMINAL_TITLE_BYTES);
-  return [...new TextDecoder().decode(bounded)]
+  return [...terminalTitleDecoder.decode(bounded)]
     .filter((character) => !TERMINAL_CONTROL_CHARACTER.test(character))
     .join("");
 };

@@ -16,6 +16,7 @@ import {
   withHostWorkspaceOrder,
   workspaceOrderFromHost,
 } from "./host-client.js";
+import type { HostPreferences } from "./host-client.js";
 
 const validCapabilities = {
   bridge_version: 8,
@@ -116,12 +117,13 @@ describe("HostClient", () => {
     expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("b".repeat(64));
   });
 
-  it("serializes preference writes in user-action order", async () => {
+  it("serializes active preference writes and coalesces queued values", async () => {
     let releaseFirst!: () => void;
     const firstBlocked = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
     let writes = 0;
+    const writtenPreferences: HostPreferences[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       if (request.url.endsWith("/capabilities")) {
@@ -129,7 +131,9 @@ describe("HostClient", () => {
       }
       writes += 1;
       if (writes === 1) await firstBlocked;
-      return Response.json(preferences);
+      const value = await request.clone().json() as HostPreferences;
+      writtenPreferences.push(value);
+      return Response.json(value);
     });
     const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
     await client.bootstrap();
@@ -139,11 +143,24 @@ describe("HostClient", () => {
       ...preferences,
       navigation_width: 310,
     });
+    const thirdValue = {
+      ...preferences,
+      navigation_width: 320,
+    };
+    const third = client.putPreferences(thirdValue);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(writes).toBe(1);
     releaseFirst();
-    await Promise.all([first, second]);
+    await expect(Promise.all([first, second, third])).resolves.toEqual([
+      preferences,
+      thirdValue,
+      thirdValue,
+    ]);
     expect(writes).toBe(2);
+    expect(writtenPreferences.map(({ navigation_width }) => navigation_width)).toEqual([
+      preferences.navigation_width,
+      320,
+    ]);
   });
 
   it("opens only validated HTTPS URLs through the CSRF-protected host action", async () => {

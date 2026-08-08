@@ -27,7 +27,7 @@ export const normalizeSystemFontFamilies = (
   const unique: string[] = [];
   const seen = new Set<string>();
   for (const name of names) {
-    const key = name.toLocaleLowerCase();
+    const key = name.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(name);

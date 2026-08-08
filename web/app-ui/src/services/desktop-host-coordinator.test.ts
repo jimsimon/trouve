@@ -110,6 +110,102 @@ describe("DesktopHostCoordinator", () => {
     expect(resolveClose).toHaveBeenCalledWith(31, "quit_now");
   });
 
+  it("cancels a close and announces each request only once", async () => {
+    let receive!: (value: HostLifecycleBatch) => void;
+    let actions: DesktopCloseActions | undefined;
+    const onCloseRequested = vi.fn((_request, nextActions: DesktopCloseActions) => {
+      actions = nextActions;
+    });
+    const resolveClose = vi.fn(async () => undefined);
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { onCloseRequested },
+    );
+    coordinator.start();
+    receive(batch(1, { requestId: 8, waitingForIdle: false }));
+    receive(batch(2, { requestId: 8, waitingForIdle: false }));
+    expect(onCloseRequested).toHaveBeenCalledOnce();
+    await actions!.cancel();
+    expect(resolveClose).toHaveBeenCalledWith(8, "cancel");
+  });
+
+  it("allows a repeated close announcement when the UI callback throws", () => {
+    let receive!: (value: HostLifecycleBatch) => void;
+    const onCloseRequested = vi.fn(() => {
+      throw new Error("dialog failed");
+    });
+    const onDiagnostic = vi.fn();
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose: async () => undefined,
+        setSleepInhibition: async () => undefined,
+      },
+      { onCloseRequested, onDiagnostic },
+    );
+    coordinator.start();
+    receive(batch(1, { requestId: 9, waitingForIdle: false }));
+    receive(batch(2, { requestId: 9, waitingForIdle: false }));
+    expect(onCloseRequested).toHaveBeenCalledTimes(2);
+    expect(onDiagnostic).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not spin on a failing automatic quit-now request", async () => {
+    let receive!: (value: HostLifecycleBatch) => void;
+    const resolveClose = vi.fn(async () => {
+      throw new Error("host unavailable");
+    });
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { onCloseRequested: vi.fn() },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    receive(batch(1, { requestId: 10, waitingForIdle: true }));
+    await settle();
+    coordinator.updateActivity({
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    await settle();
+    expect(resolveClose).toHaveBeenCalledTimes(1);
+
+    coordinator.updateActivity({
+      idle: false,
+      workRunning: true,
+      preventSleepWhileRunning: true,
+    });
+    coordinator.updateActivity({
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    await settle();
+    expect(resolveClose).toHaveBeenCalledTimes(2);
+  });
+
   it("does not inhibit sleep when the general preference is disabled", async () => {
     const setSleepInhibition = vi.fn(async (_active: boolean) => undefined);
     const coordinator = new DesktopHostCoordinator(

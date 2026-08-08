@@ -1,4 +1,5 @@
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
+import type { TimerScheduler } from "./cursor-event-stream.js";
 
 export type TerminalOutputState =
   | "idle"
@@ -20,9 +21,14 @@ export interface TerminalEventSourceLike {
 export type TerminalEventSourceFactory = (url: string) => TerminalEventSourceLike;
 
 export interface TerminalOutputDiagnostic {
-  readonly kind: "invalid-offset" | "invalid-base64";
+  readonly kind: "invalid-offset" | "invalid-base64" | "non-contiguous-offset";
   readonly offset: number;
 }
+
+const terminalScheduler: TimerScheduler = {
+  set: (delayMs, callback) => globalThis.setTimeout(callback, delayMs),
+  clear: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 const decodeBase64 = (value: string): Uint8Array => {
   const binary = globalThis.atob(value);
@@ -40,13 +46,19 @@ export class TerminalOutputStream {
   readonly #state = createSignal<TerminalOutputState>("idle");
   readonly #offset = createSignal(0);
   readonly #decoder = new TextDecoder();
+  readonly #scheduler: TimerScheduler;
+  readonly #baseDelayMs: number;
+  readonly #maxDelayMs: number;
+  readonly #stableConnectionMs: number;
 
   readonly state: ReadonlySignal<TerminalOutputState> = this.#state;
   readonly offset: ReadonlySignal<number> = this.#offset;
 
   #source: TerminalEventSourceLike | undefined;
   #running = false;
-  #retry: ReturnType<typeof setTimeout> | undefined;
+  #retry: unknown;
+  #stableRetry: unknown;
+  #attempt = 0;
 
   constructor(options: {
     readonly path: string;
@@ -55,6 +67,10 @@ export class TerminalOutputStream {
     readonly onExit?: () => void;
     readonly onDiagnostic?: (diagnostic: TerminalOutputDiagnostic) => void;
     readonly eventSourceFactory?: TerminalEventSourceFactory;
+    readonly scheduler?: TimerScheduler;
+    readonly baseDelayMs?: number;
+    readonly maxDelayMs?: number;
+    readonly stableConnectionMs?: number;
   }) {
     const after = options.after ?? 0;
     if (!Number.isSafeInteger(after) || after < 0) {
@@ -67,6 +83,10 @@ export class TerminalOutputStream {
     this.#onDiagnostic = options.onDiagnostic ?? (() => undefined);
     this.#factory =
       options.eventSourceFactory ?? ((url) => new EventSource(url) as TerminalEventSourceLike);
+    this.#scheduler = options.scheduler ?? terminalScheduler;
+    this.#baseDelayMs = options.baseDelayMs ?? 500;
+    this.#maxDelayMs = options.maxDelayMs ?? 10_000;
+    this.#stableConnectionMs = options.stableConnectionMs ?? 1_000;
   }
 
   start(): void {
@@ -77,8 +97,9 @@ export class TerminalOutputStream {
 
   close(): void {
     this.#running = false;
-    if (this.#retry !== undefined) clearTimeout(this.#retry);
+    if (this.#retry !== undefined) this.#scheduler.clear(this.#retry);
     this.#retry = undefined;
+    this.#clearStableRetry();
     this.#source?.close();
     this.#source = undefined;
     const tail = this.#decoder.decode();
@@ -94,7 +115,14 @@ export class TerminalOutputStream {
     const source = this.#factory(url.href);
     this.#source = source;
     source.onopen = () => {
-      if (source === this.#source && this.#running) this.#state.set("open");
+      if (source === this.#source && this.#running) {
+        this.#state.set("open");
+        this.#clearStableRetry();
+        this.#stableRetry = this.#scheduler.set(this.#stableConnectionMs, () => {
+          this.#stableRetry = undefined;
+          if (source === this.#source && this.#running) this.#attempt = 0;
+        });
+      }
     };
     source.onmessage = (message) => {
       if (source !== this.#source || !this.#running) return;
@@ -105,6 +133,9 @@ export class TerminalOutputStream {
       const tail = this.#decoder.decode();
       if (tail !== "") this.#onData(tail);
       this.#running = false;
+      if (this.#retry !== undefined) this.#scheduler.clear(this.#retry);
+      this.#retry = undefined;
+      this.#clearStableRetry();
       source.close();
       this.#state.set("exited");
       this.#onExit();
@@ -112,13 +143,7 @@ export class TerminalOutputStream {
     source.onerror = () => {
       if (source !== this.#source || !this.#running) return;
       this.#state.set("reconnecting");
-      if (source.readyState !== 2 || this.#retry !== undefined) return;
-      source.close();
-      this.#retry = setTimeout(() => {
-        this.#retry = undefined;
-        if (source === this.#source) this.#source = undefined;
-        this.#open("reconnecting");
-      }, 500);
+      if (source.readyState === 2) this.#scheduleReconnect(source);
     };
   }
 
@@ -140,6 +165,22 @@ export class TerminalOutputStream {
       this.#onDiagnostic({ kind: "invalid-base64", offset: previousOffset });
       return;
     }
+    if (
+      message.lastEventId !== "" &&
+      offset !== previousOffset + bytes.byteLength
+    ) {
+      // Flush and discard any partial scalar before resuming from the new
+      // frame. Keep the last accepted offset so the replacement stream can
+      // replay every missing byte instead of silently skipping the gap.
+      void this.#decoder.decode();
+      this.#onDiagnostic({ kind: "non-contiguous-offset", offset: previousOffset });
+      const source = this.#source;
+      if (source !== undefined) {
+        this.#state.set("reconnecting");
+        this.#scheduleReconnect(source);
+      }
+      return;
+    }
     // Some embedded engines deliver the SSE data but leave lastEventId empty.
     // Terminal events are contiguous byte chunks, so their decoded length is
     // a safe forward offset when the engine omits the server-provided id.
@@ -147,5 +188,27 @@ export class TerminalOutputStream {
     this.#offset.set(offset);
     const text = this.#decoder.decode(bytes, { stream: true });
     if (text !== "") this.#onData(text);
+  }
+
+  #scheduleReconnect(source: TerminalEventSourceLike): void {
+    if (this.#retry !== undefined) return;
+    this.#clearStableRetry();
+    source.close();
+    const delay = Math.min(
+      this.#baseDelayMs * 2 ** this.#attempt,
+      this.#maxDelayMs,
+    );
+    this.#attempt += 1;
+    this.#retry = this.#scheduler.set(delay, () => {
+      this.#retry = undefined;
+      if (source === this.#source) this.#source = undefined;
+      this.#open("reconnecting");
+    });
+  }
+
+  #clearStableRetry(): void {
+    if (this.#stableRetry === undefined) return;
+    this.#scheduler.clear(this.#stableRetry);
+    this.#stableRetry = undefined;
   }
 }

@@ -49,7 +49,11 @@ export const compareInboxSessions = (
     const outcomeDifference = outcomePriority(left) - outcomePriority(right);
     if (outcomeDifference !== 0) return outcomeDifference;
   }
-  const recencyDifference = compareText(right.updatedAt, left.updatedAt);
+  const leftEpoch = Date.parse(left.updatedAt);
+  const rightEpoch = Date.parse(right.updatedAt);
+  const recencyDifference = Number.isFinite(leftEpoch) && Number.isFinite(rightEpoch)
+    ? rightEpoch - leftEpoch
+    : compareText(right.updatedAt, left.updatedAt);
   return recencyDifference || compareText(left.id, right.id);
 };
 
@@ -65,6 +69,7 @@ export const inboxRecoverySession = <T extends InboxSessionOrderFields>(
 export const groupWorkspaceSessions = <T extends InboxSessionOrderFields>(
   sessions: readonly T[],
   options: {
+    /** Empty selects sessions from every workspace. */
     readonly workspaceId: string;
     readonly selectedSessionId: string | undefined;
     readonly archivedExpanded: boolean;

@@ -140,7 +140,6 @@ export class ThreadIngress {
 
   #stream: ThreadStream | undefined;
   #replayBatcher: ThreadReplayBatcher | undefined;
-  #activeThreadId: string | undefined;
   #generation = 0;
   #listenersAttached = false;
 
@@ -247,7 +246,6 @@ export class ThreadIngress {
     }
     this.#stream = stream;
     this.#replayBatcher = replayBatcher;
-    this.#activeThreadId = threadId;
     this.#attachListeners();
     stream.start();
   }
@@ -258,7 +256,6 @@ export class ThreadIngress {
     this.#replayBatcher = undefined;
     this.#stream?.close();
     this.#stream = undefined;
-    this.#activeThreadId = undefined;
   }
 
   #attachListeners(): void {

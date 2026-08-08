@@ -63,6 +63,7 @@ export class Virtualizer<T extends VirtualItem> {
   #mode: VirtualizationMode;
   #followingTail = true;
   #anchor: Anchor | undefined;
+  #window: VirtualWindow<T> | undefined;
 
   constructor(options: {
     readonly estimatedHeight: number;
@@ -80,7 +81,9 @@ export class Virtualizer<T extends VirtualItem> {
   }
 
   setMode(mode: VirtualizationMode): void {
+    if (this.#mode === mode) return;
     this.#mode = mode;
+    this.#window = undefined;
   }
 
   setItems(items: readonly T[]): ScrollCorrection {
@@ -116,6 +119,7 @@ export class Virtualizer<T extends VirtualItem> {
       this.#scrollTop = this.#clampScroll(this.#scrollTop);
       this.#anchor = this.#captureAnchor();
     }
+    this.#window = undefined;
     return correction(previousScrollTop, this.#scrollTop);
   }
 
@@ -148,6 +152,7 @@ export class Virtualizer<T extends VirtualItem> {
       this.#followingTail = false;
     }
     this.#anchor = this.#captureAnchor();
+    this.#window = undefined;
   }
 
   /** Update only the viewport size. A live-tail resize must remain anchored
@@ -162,6 +167,7 @@ export class Virtualizer<T extends VirtualItem> {
       ? this.#tailScrollTop()
       : this.#clampScroll(this.#scrollTop);
     this.#anchor = this.#captureAnchor();
+    this.#window = undefined;
     return correction(previousScrollTop, this.#scrollTop);
   }
 
@@ -170,6 +176,7 @@ export class Virtualizer<T extends VirtualItem> {
     this.#followingTail = true;
     this.#scrollTop = this.#tailScrollTop();
     this.#anchor = this.#captureAnchor();
+    this.#window = undefined;
     return correction(previousScrollTop, this.#scrollTop);
   }
 
@@ -200,6 +207,7 @@ export class Virtualizer<T extends VirtualItem> {
     } else {
       this.#scrollTop = this.#clampScroll(this.#scrollTop);
     }
+    this.#window = undefined;
     return correction(previousScrollTop, this.#scrollTop);
   }
 
@@ -210,6 +218,7 @@ export class Virtualizer<T extends VirtualItem> {
     const previousHeight = this.#heightAt(index);
     const previousScrollTop = this.#scrollTop;
     this.#measurements.set(id, height);
+    this.#window = undefined;
     const delta = height - previousHeight;
     if (delta === 0) return correction(previousScrollTop, this.#scrollTop);
 
@@ -231,9 +240,10 @@ export class Virtualizer<T extends VirtualItem> {
   }
 
   window(): VirtualWindow<T> {
+    if (this.#window !== undefined) return this.#window;
     const totalHeight = this.#totalHeight();
     if (this.#mode === "accessible") {
-      return {
+      this.#window = {
         items: this.#positionedRange(0, this.#items.length),
         paddingBefore: 0,
         paddingAfter: 0,
@@ -241,6 +251,7 @@ export class Virtualizer<T extends VirtualItem> {
         scrollTop: this.#scrollTop,
         followingTail: this.#followingTail,
       };
+      return this.#window;
     }
 
     const from = Math.max(0, this.#scrollTop - this.#overscanPx);
@@ -263,7 +274,7 @@ export class Virtualizer<T extends VirtualItem> {
       end += this.#heightAt(endIndex);
       endIndex += 1;
     }
-    return {
+    this.#window = {
       items: this.#positionedRange(startIndex, endIndex),
       paddingBefore: start,
       paddingAfter: Math.max(0, totalHeight - end),
@@ -271,6 +282,7 @@ export class Virtualizer<T extends VirtualItem> {
       scrollTop: this.#scrollTop,
       followingTail: this.#followingTail,
     };
+    return this.#window;
   }
 
   isMounted(id: string): boolean {

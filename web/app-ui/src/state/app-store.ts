@@ -115,29 +115,27 @@ const toListItem = (
   summary: ProtocolSessionSummary,
   metadata: ProtocolSession | undefined,
   seenCursor: number,
-): SessionListItem => ({
-  id: summary.session_id,
-  workspaceId: summary.workspace_id,
-  title: metadata?.title ?? "Untitled session",
-  branch: metadata?.branch ?? summary.session_id,
-  archived: summary.archived,
-  active: summary.active,
-  attention: summary.attention,
-  outcome: summary.outcome,
-  ...(summary.latest_thread_id == null
-    ? { latestThreadId: undefined }
-    : { latestThreadId: summary.latest_thread_id }),
-  updatedAt: summary.updated_at,
-  state: visualState(
-    summary,
-    !summary.active
-      && (summary.outcome === "succeeded" || summary.outcome === "failed")
-      && summary.latest_cursor > seenCursor,
-  ),
-  unread: !summary.active
+): SessionListItem => {
+  const unread = !summary.active
     && (summary.outcome === "succeeded" || summary.outcome === "failed")
-    && summary.latest_cursor > seenCursor,
-});
+    && summary.latest_cursor > seenCursor;
+  return {
+    id: summary.session_id,
+    workspaceId: summary.workspace_id,
+    title: metadata?.title ?? "Untitled session",
+    branch: metadata?.branch ?? summary.session_id,
+    archived: summary.archived,
+    active: summary.active,
+    attention: summary.attention,
+    outcome: summary.outcome,
+    ...(summary.latest_thread_id == null
+      ? { latestThreadId: undefined }
+      : { latestThreadId: summary.latest_thread_id }),
+    updatedAt: summary.updated_at,
+    state: visualState(summary, unread),
+    unread,
+  };
+};
 
 const samePullRequest = (
   left: ProtocolPrInfo,

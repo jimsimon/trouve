@@ -68,12 +68,13 @@ describe("PWA cache policy", () => {
   });
 
   it("uses a static shell only for safe same-origin document navigation", () => {
+    const navigation = new Request(
+      "https://trouve.example/workspaces/ws/sessions/se",
+      { headers: { accept: "text/html,application/xhtml+xml" } },
+    );
+    Object.defineProperty(navigation, "destination", { value: "document" });
     expect(
-      cachePolicyFor(
-        new Request("https://trouve.example/workspaces/ws/sessions/se", {
-          headers: { accept: "text/html,application/xhtml+xml" },
-        }),
-      ),
+      cachePolicyFor(navigation),
     ).toBe("app-shell-navigation");
     expect(
       cachePolicyFor(

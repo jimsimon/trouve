@@ -53,6 +53,7 @@ export class DesktopHostCoordinator {
   #announcedCloseRequest: number | undefined;
   #waitingForIdle: number | undefined;
   #idleQuitQueued = false;
+  #failedIdleQuitRequest: number | undefined;
   #closeTail: Promise<void> = Promise.resolve();
   #desiredSleepInhibition = false;
   #appliedSleepInhibition = false;
@@ -96,6 +97,7 @@ export class DesktopHostCoordinator {
   /** Call whenever protocol-backed running/idle state or the general
    * preference changes. This is the only source of quit-idle and sleep policy. */
   updateActivity(activity: DesktopAppActivity): void {
+    if (this.#idle !== activity.idle) this.#failedIdleQuitRequest = undefined;
     this.#idle = activity.idle;
     this.#setDesiredSleepInhibition(
       activity.workRunning && activity.preventSleepWhileRunning,
@@ -110,15 +112,20 @@ export class DesktopHostCoordinator {
     if (pending === undefined) {
       this.#announcedCloseRequest = undefined;
       this.#waitingForIdle = undefined;
+      this.#failedIdleQuitRequest = undefined;
       return;
     }
     if (pending.waitingForIdle) {
+      if (this.#waitingForIdle !== pending.requestId) {
+        this.#failedIdleQuitRequest = undefined;
+      }
       this.#announcedCloseRequest = pending.requestId;
       this.#waitingForIdle = pending.requestId;
       this.#quitWhenIdleIfReady();
       return;
     }
     this.#waitingForIdle = undefined;
+    this.#failedIdleQuitRequest = undefined;
     if (this.#announcedCloseRequest === pending.requestId) return;
     this.#announcedCloseRequest = pending.requestId;
     try {
@@ -132,6 +139,7 @@ export class DesktopHostCoordinator {
         }),
       );
     } catch (error) {
+      this.#announcedCloseRequest = undefined;
       this.#diagnostic(error);
     }
   }
@@ -147,10 +155,12 @@ export class DesktopHostCoordinator {
         if (this.#idle) {
           await this.#host.resolveClose(requestId, "quit_now");
           this.#waitingForIdle = undefined;
+          this.#failedIdleQuitRequest = undefined;
         }
       } else {
         this.#waitingForIdle = undefined;
         this.#announcedCloseRequest = undefined;
+        this.#failedIdleQuitRequest = undefined;
       }
     });
     this.#closeTail = operation.catch((error: unknown) => {
@@ -161,17 +171,26 @@ export class DesktopHostCoordinator {
 
   #quitWhenIdleIfReady(): void {
     const requestId = this.#waitingForIdle;
-    if (!this.#idle || requestId === undefined || this.#idleQuitQueued) return;
+    if (
+      !this.#idle ||
+      requestId === undefined ||
+      this.#idleQuitQueued ||
+      this.#failedIdleQuitRequest === requestId
+    ) return;
     this.#idleQuitQueued = true;
     const operation = this.#closeTail.then(async () => {
       if (this.#idle && this.#waitingForIdle === requestId) {
         await this.#host.resolveClose(requestId, "quit_now");
         this.#waitingForIdle = undefined;
         this.#announcedCloseRequest = undefined;
+        this.#failedIdleQuitRequest = undefined;
       }
     });
     this.#closeTail = operation
-      .catch((error: unknown) => this.#diagnostic(error))
+      .catch((error: unknown) => {
+        this.#failedIdleQuitRequest = requestId;
+        this.#diagnostic(error);
+      })
       .finally(() => {
         this.#idleQuitQueued = false;
         this.#quitWhenIdleIfReady();

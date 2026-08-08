@@ -115,7 +115,7 @@ describe("new thread setup model", () => {
     expect(effectiveNewThreadModel(inherited, catalog)?.id).toBe("provider/review");
 
     const plan = selectNewThreadMode(inherited, "plan", catalog);
-    expect(plan).toMatchObject({ modeId: "plan", modelId: "", thinking: "high" });
+    expect(plan).toMatchObject({ modeId: "plan", modelId: "", thinking: "medium" });
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
   });
 

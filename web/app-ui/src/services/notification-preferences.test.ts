@@ -60,6 +60,8 @@ describe("notification preferences", () => {
     const controller = new NotificationPreferencesController(storage);
     const next = controller.update({ enabled: false, sound: true });
     expect(Object.isFrozen(next)).toBe(true);
+    expect(next.enabled).toBe(false);
+    expect(next.sound).toBe(true);
     expect(controller.current.get()).toBe(next);
     expect(storage.save).toHaveBeenCalledWith(next);
   });

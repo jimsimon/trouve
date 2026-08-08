@@ -160,8 +160,14 @@ export const mergeabilitySummary = (pr: ProtocolPrInfo): PrSummary => {
   }
 };
 
-export const canMergePr = (pr: ProtocolPrInfo): boolean =>
-  pr.state === "open" && !pr.draft && pr.mergeable !== false;
+export const canMergePr = (pr: ProtocolPrInfo): boolean => {
+  const mergeState = pr.merge_state_status?.toLowerCase();
+  return pr.state === "open"
+    && !pr.draft
+    && pr.mergeable !== false
+    && mergeState !== "blocked"
+    && mergeState !== "dirty";
+};
 
 export const createPrRequest = (draft: CreatePrDraft): ProtocolCreatePrRequest => {
   const title = draft.title.trim();

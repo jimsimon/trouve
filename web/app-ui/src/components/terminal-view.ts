@@ -112,7 +112,8 @@ export class TrouveTerminalView extends LitElement {
       } else {
         this.#terminal?.blur();
       }
-    } else if (changed.has("label") && this.#terminal !== undefined) {
+    }
+    if (changed.has("label") && this.#terminal !== undefined) {
       this.#terminal.element?.setAttribute("aria-label", this.label);
     }
   }
@@ -222,8 +223,7 @@ export class TrouveTerminalView extends LitElement {
       allowProposedApi: true,
       cols: 100,
       convertEol: false,
-      cursorBlink:
-        !(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false),
+      cursorBlink: !this.#reduceMotion(),
       fontFamily: token("--trouve-font-mono", "monospace"),
       fontSize: Number.isFinite(requestedFontSize) ? requestedFontSize : 13,
       screenReaderMode: true,
@@ -405,6 +405,7 @@ export class TrouveTerminalView extends LitElement {
       style.getPropertyValue(name).trim() || fallback;
     const requestedFontSize = Number.parseFloat(token("--trouve-font-size", "13"));
     terminal.options = {
+      cursorBlink: !this.#reduceMotion(),
       fontFamily: token("--trouve-font-mono", "monospace"),
       fontSize: Number.isFinite(requestedFontSize) ? requestedFontSize : 13,
       theme: {
@@ -423,6 +424,11 @@ export class TrouveTerminalView extends LitElement {
       },
     };
     this.#fitAndNotify();
+  }
+
+  #reduceMotion(): boolean {
+    return this.closest("trouve-app")?.hasAttribute("data-reduce-motion") === true
+      || (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false);
   }
 
   #fitAndNotify(): void {

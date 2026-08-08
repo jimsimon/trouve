@@ -107,6 +107,7 @@ export class TrouveMarkdownView extends LitElement {
     if (anchor === undefined) return;
     const href = anchor.getAttribute("href");
     if (href === null || href === undefined) return;
+    if (href.startsWith("#")) return;
     const fileTarget = anchor.dataset.trouveFileTarget;
     if (fileTarget !== undefined) {
       const file = parseChatFileTarget(fileTarget);

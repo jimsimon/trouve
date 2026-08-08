@@ -103,7 +103,11 @@ export class BrowserWakeLockCoordinator {
     } finally {
       this.#requestPending = false;
     }
-    if (sentinel === undefined) return;
+    const requestBecameStale = generation !== this.#generation;
+    if (sentinel === undefined) {
+      if (requestBecameStale) void this.#reconcile();
+      return;
+    }
     if (
       generation !== this.#generation ||
       !this.#started ||
@@ -111,6 +115,7 @@ export class BrowserWakeLockCoordinator {
       this.#document.visibilityState !== "visible"
     ) {
       await sentinel.release().catch(() => undefined);
+      void this.#reconcile();
       return;
     }
     this.#sentinel = sentinel;

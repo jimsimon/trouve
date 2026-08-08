@@ -53,13 +53,14 @@ export class ThemeController {
   readonly #storage: ThemePreferenceStorage | undefined;
   readonly #darkQuery: MediaQueryLike;
   readonly #systemDark = createSignal(false);
+  readonly #preference = createSignal<ThemePreference>("system");
   readonly #onDarkChange = (event: { matches: boolean }) => {
     this.#systemDark.set(event.matches);
   };
 
-  readonly preference = createSignal<ThemePreference>("system");
+  readonly preference: ReadonlySignal<ThemePreference> = this.#preference;
   readonly theme: ReadonlySignal<ThemeName> = createComputed(() => {
-    const preference = this.preference.get();
+    const preference = this.#preference.get();
     if (preference !== "system") return preference;
     return this.#systemDark.get() ? "dark" : "light";
   });
@@ -71,12 +72,12 @@ export class ThemeController {
     this.#darkQuery = options.darkQuery;
     this.#storage = options.storage;
     this.#systemDark.set(options.darkQuery.matches);
-    this.preference.set(options.storage?.load() ?? "system");
+    this.#preference.set(options.storage?.load() ?? "system");
     options.darkQuery.addEventListener?.("change", this.#onDarkChange);
   }
 
   setPreference(preference: ThemePreference): void {
-    this.preference.set(preference);
+    this.#preference.set(preference);
     this.#storage?.save(preference);
   }
 

@@ -4,6 +4,7 @@ import {
   TerminalOutputStream,
   type TerminalEventSourceLike,
 } from "./terminal-output-stream.js";
+import type { TimerScheduler } from "./cursor-event-stream.js";
 
 class FakeSource implements TerminalEventSourceLike {
   readyState = 1;
@@ -89,5 +90,71 @@ describe("TerminalOutputStream", () => {
     expect(diagnostic).toHaveBeenCalledWith({ kind: "invalid-base64", offset: 2 });
     expect(exited).toHaveBeenCalledOnce();
     expect(source.close).toHaveBeenCalledOnce();
+  });
+
+  it("discards a partial scalar at a non-contiguous byte offset", () => {
+    const source = new FakeSource();
+    const output: string[] = [];
+    const diagnostic = vi.fn();
+    const delays: number[] = [];
+    const scheduler: TimerScheduler = {
+      set: (delay, callback) => {
+        delays.push(delay);
+        return callback;
+      },
+      clear: vi.fn(),
+    };
+    const stream = new TerminalOutputStream({
+      path: "http://127.0.0.1:43127/v1/terminals/term/output",
+      onData: (data) => output.push(data),
+      onDiagnostic: diagnostic,
+      scheduler,
+      eventSourceFactory: () => source,
+    });
+    stream.start();
+    source.onmessage?.(new MessageEvent("message", { data: "4oI=", lastEventId: "2" }));
+    source.onmessage?.(new MessageEvent("message", { data: "b2s=", lastEventId: "5" }));
+
+    expect(output).toEqual([]);
+    expect(stream.offset.get()).toBe(2);
+    expect(diagnostic).toHaveBeenCalledWith({
+      kind: "non-contiguous-offset",
+      offset: 2,
+    });
+    expect(delays).toEqual([500]);
+    stream.close();
+  });
+
+  it("uses injectable bounded exponential backoff for closed sources", () => {
+    const callbacks: Array<() => void> = [];
+    const delays: number[] = [];
+    const scheduler: TimerScheduler = {
+      set: (delay, callback) => {
+        delays.push(delay);
+        callbacks.push(callback);
+        return callback;
+      },
+      clear: vi.fn(),
+    };
+    const sources: FakeSource[] = [];
+    const stream = new TerminalOutputStream({
+      path: "http://127.0.0.1:43127/v1/terminals/term/output",
+      onData: () => undefined,
+      scheduler,
+      baseDelayMs: 100,
+      maxDelayMs: 150,
+      eventSourceFactory: () => {
+        const source = new FakeSource();
+        source.readyState = 2;
+        sources.push(source);
+        return source;
+      },
+    });
+    stream.start();
+    sources[0]!.onerror?.(new Event("error"));
+    callbacks[0]!();
+    sources[1]!.onerror?.(new Event("error"));
+    expect(delays).toEqual([100, 150]);
+    stream.close();
   });
 });

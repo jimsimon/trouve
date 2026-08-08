@@ -55,22 +55,25 @@ export const browserGeneralPreferenceStorage = (
 
 export class GeneralPreferencesController {
   readonly #storage: GeneralPreferenceStorage | undefined;
-  readonly current = createSignal<GeneralPreferences>(DEFAULT_GENERAL_PREFERENCES);
+  readonly #current = createSignal<GeneralPreferences>(DEFAULT_GENERAL_PREFERENCES);
+  readonly current: ReadonlySignal<GeneralPreferences> = this.#current;
 
   constructor(storage?: GeneralPreferenceStorage) {
     this.#storage = storage;
-    this.current.set(storage?.load() ?? DEFAULT_GENERAL_PREFERENCES);
+    this.#current.set(normalizeGeneralPreferences(
+      storage?.load() ?? DEFAULT_GENERAL_PREFERENCES,
+    ));
   }
 
   replace(value: Partial<GeneralPreferences>, persist = true): GeneralPreferences {
-    const next = normalizeGeneralPreferences(value, this.current.get());
-    this.current.set(next);
+    const next = normalizeGeneralPreferences(value, this.#current.get());
+    this.#current.set(next);
     if (persist) this.#storage?.save(next);
     return next;
   }
 
   update(patch: Partial<GeneralPreferences>): GeneralPreferences {
-    return this.replace({ ...this.current.get(), ...patch });
+    return this.replace({ ...this.#current.get(), ...patch });
   }
 }
 

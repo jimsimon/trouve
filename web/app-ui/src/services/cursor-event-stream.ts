@@ -55,6 +55,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
   readonly #scheduler: TimerScheduler;
   readonly #baseDelayMs: number;
   readonly #maxDelayMs: number;
+  readonly #stableConnectionMs: number;
   readonly #state = createSignal<StreamState>("idle");
   readonly #cursor = createSignal(0);
 
@@ -63,6 +64,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
 
   #source: EventSourceLike | undefined;
   #timer: unknown;
+  #stableTimer: unknown;
   #attempt = 0;
   #running = false;
 
@@ -78,6 +80,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
     readonly scheduler?: TimerScheduler;
     readonly baseDelayMs?: number;
     readonly maxDelayMs?: number;
+    readonly stableConnectionMs?: number;
   }) {
     if (!Number.isSafeInteger(options.after) || options.after < 0) {
       throw new RangeError("event cursor must be a non-negative safe integer");
@@ -93,6 +96,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
     this.#scheduler = options.scheduler ?? defaultScheduler;
     this.#baseDelayMs = options.baseDelayMs ?? 250;
     this.#maxDelayMs = options.maxDelayMs ?? 10_000;
+    this.#stableConnectionMs = options.stableConnectionMs ?? 1_000;
     this.#cursor.set(options.after);
   }
 
@@ -105,6 +109,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
   reconnectNow(): void {
     if (!this.#running) return;
     this.#clearTimer();
+    this.#clearStableTimer();
     this.#source?.close();
     this.#source = undefined;
     this.#open("reconnecting");
@@ -113,6 +118,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
   close(): void {
     this.#running = false;
     this.#clearTimer();
+    this.#clearStableTimer();
     this.#source?.close();
     this.#source = undefined;
     this.#state.set("closed");
@@ -127,9 +133,13 @@ export class CursorEventStream<T extends CursorEnvelope> {
     this.#source = source;
     source.onopen = () => {
       if (source !== this.#source || !this.#running) return;
-      this.#attempt = 0;
       this.#state.set("open");
       this.#onOpen();
+      this.#clearStableTimer();
+      this.#stableTimer = this.#scheduler.set(this.#stableConnectionMs, () => {
+        this.#stableTimer = undefined;
+        if (source === this.#source && this.#running) this.#attempt = 0;
+      });
     };
     source.onmessage = (message) => {
       if (source !== this.#source || !this.#running) return;
@@ -173,6 +183,7 @@ export class CursorEventStream<T extends CursorEnvelope> {
 
   #scheduleRecreate(source: EventSourceLike): void {
     if (this.#timer !== undefined) return;
+    this.#clearStableTimer();
     source.close();
     const delay = Math.min(this.#baseDelayMs * 2 ** this.#attempt, this.#maxDelayMs);
     this.#attempt += 1;
@@ -187,5 +198,11 @@ export class CursorEventStream<T extends CursorEnvelope> {
     if (this.#timer === undefined) return;
     this.#scheduler.clear(this.#timer);
     this.#timer = undefined;
+  }
+
+  #clearStableTimer(): void {
+    if (this.#stableTimer === undefined) return;
+    this.#scheduler.clear(this.#stableTimer);
+    this.#stableTimer = undefined;
   }
 }

@@ -6,6 +6,7 @@ import {
   disposeContentWorker,
   filterCommandPaletteItemsOffThread,
   prepareUnifiedDiffOffThread,
+  rankComposerCompletionsOffThread,
   renderMarkdownOffThread,
   setContentWorkerIdleTimeoutForTests,
 } from "./content-worker-client.js";
@@ -41,6 +42,15 @@ describe("lazy content worker", () => {
         },
       },
     ], "pref")).resolves.toHaveLength(1);
+    await expect(rankComposerCompletionsOffThread([
+      { value: "bounded.ts", detail: `${" detail ".repeat(10_000)}tail` },
+    ], "", 8)).resolves.toMatchObject([
+      { value: "bounded.ts", detail: expect.any(String) },
+    ]);
+    const [completion] = await rankComposerCompletionsOffThread([
+      { value: "bounded.ts", detail: `${" detail ".repeat(10_000)}tail` },
+    ], "", 8);
+    expect(completion?.detail.length).toBeLessThanOrEqual(512);
     expect(activeContentWorkerCount()).toBe(0);
   });
 

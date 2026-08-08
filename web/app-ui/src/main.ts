@@ -41,6 +41,10 @@ if (pwaTarget && "serviceWorker" in navigator) {
           reloading = true;
           globalThis.location.reload();
         });
+      })
+      .catch(() => {
+        // Offline, policy, and restricted-context failures leave the PWA
+        // usable for this visit without producing an unhandled rejection.
       });
   });
 }

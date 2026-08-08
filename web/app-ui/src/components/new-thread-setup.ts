@@ -250,6 +250,7 @@ export class TrouveNewThreadSetup extends LitElement {
   #loadedWorkspaceId = "";
   #observedSessionId = "";
   #loadGeneration = 0;
+  #attachmentGeneration = 0;
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
 
   readonly #services = new ContextConsumer(this, {
@@ -279,6 +280,7 @@ export class TrouveNewThreadSetup extends LitElement {
 
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
+    this.#attachmentGeneration += 1;
     this.#loadedWorkspaceId = "";
     this.#optionsLoading = false;
     super.disconnectedCallback();
@@ -287,8 +289,10 @@ export class TrouveNewThreadSetup extends LitElement {
   protected override willUpdate(changed: PropertyValues<this>): void {
     const sessionId = this.#effectiveSessionId;
     if (changed.has("sessionId") || sessionId !== this.#observedSessionId) {
+      this.#attachmentGeneration += 1;
       this.#observedSessionId = sessionId;
       this.#draft = createInitialNewThreadDraft(this.#catalog);
+      this.#attachmentLoading = false;
       this.#attachmentError = "";
       this.#internalError = "";
     }
@@ -605,6 +609,7 @@ export class TrouveNewThreadSetup extends LitElement {
       ...this.#draft,
       thinking: (event.currentTarget as HTMLSelectElement).value,
     };
+    this.requestUpdate();
   };
 
   readonly #permissionChanged = (event: Event): void => {
@@ -620,6 +625,7 @@ export class TrouveNewThreadSetup extends LitElement {
       ...this.#draft,
       prompt: (event.currentTarget as HTMLTextAreaElement).value,
     };
+    this.requestUpdate();
   };
 
   readonly #filesSelected = (event: Event): void => {
@@ -667,35 +673,62 @@ export class TrouveNewThreadSetup extends LitElement {
   async #pickNativeAttachments(): Promise<void> {
     const nativeHost = this.#services.value?.nativeHost;
     if (nativeHost === undefined || this.#attachmentLoading) return;
+    const generation = ++this.#attachmentGeneration;
+    const sessionId = this.#effectiveSessionId;
     this.#attachmentLoading = true;
     this.#attachmentError = "";
     this.requestUpdate();
     try {
-      for (const attachment of await nativeHost.pickFiles()) {
+      const attachments = await nativeHost.pickFiles();
+      if (
+        generation !== this.#attachmentGeneration ||
+        sessionId !== this.#effectiveSessionId
+      ) return;
+      for (const attachment of attachments) {
         if (!this.#stageNativeAttachment(attachment)) break;
       }
     } catch {
-      this.#attachmentError = "Files could not be read from the desktop picker.";
+      if (
+        generation === this.#attachmentGeneration &&
+        sessionId === this.#effectiveSessionId
+      ) {
+        this.#attachmentError = "Files could not be read from the desktop picker.";
+      }
     } finally {
-      this.#attachmentLoading = false;
-      this.requestUpdate();
+      if (generation === this.#attachmentGeneration) {
+        this.#attachmentLoading = false;
+        this.requestUpdate();
+      }
     }
   }
 
   async #readNativeClipboardImage(): Promise<void> {
     const nativeHost = this.#services.value?.nativeHost;
     if (nativeHost === undefined || this.#attachmentLoading) return;
+    const generation = ++this.#attachmentGeneration;
+    const sessionId = this.#effectiveSessionId;
     this.#attachmentLoading = true;
     this.#attachmentError = "";
     this.requestUpdate();
     try {
       const attachment = await nativeHost.readClipboardImage();
+      if (
+        generation !== this.#attachmentGeneration ||
+        sessionId !== this.#effectiveSessionId
+      ) return;
       if (attachment !== undefined) this.#stageNativeAttachment(attachment);
     } catch {
-      this.#attachmentError = "The desktop clipboard image could not be read.";
+      if (
+        generation === this.#attachmentGeneration &&
+        sessionId === this.#effectiveSessionId
+      ) {
+        this.#attachmentError = "The desktop clipboard image could not be read.";
+      }
     } finally {
-      this.#attachmentLoading = false;
-      this.requestUpdate();
+      if (generation === this.#attachmentGeneration) {
+        this.#attachmentLoading = false;
+        this.requestUpdate();
+      }
     }
   }
 
@@ -714,6 +747,8 @@ export class TrouveNewThreadSetup extends LitElement {
 
   async #addAttachments(files: readonly File[]): Promise<void> {
     if (files.length === 0 || this.#attachmentLoading) return;
+    const generation = ++this.#attachmentGeneration;
+    const sessionId = this.#effectiveSessionId;
     this.#attachmentLoading = true;
     this.#attachmentError = "";
     this.requestUpdate();
@@ -725,7 +760,15 @@ export class TrouveNewThreadSetup extends LitElement {
             file,
             `new-thread-${Date.now()}-${index + 1}.bin`,
           );
+          if (
+            generation !== this.#attachmentGeneration ||
+            sessionId !== this.#effectiveSessionId
+          ) return;
         } catch (error) {
+          if (
+            generation !== this.#attachmentGeneration ||
+            sessionId !== this.#effectiveSessionId
+          ) return;
           const kind = error instanceof AttachmentEncodingError
             ? error.kind
             : "read-failed";
@@ -748,8 +791,10 @@ export class TrouveNewThreadSetup extends LitElement {
         this.#draft = { ...this.#draft, attachments: appended.attachments };
       }
     } finally {
-      this.#attachmentLoading = false;
-      this.requestUpdate();
+      if (generation === this.#attachmentGeneration) {
+        this.#attachmentLoading = false;
+        this.requestUpdate();
+      }
     }
   }
 

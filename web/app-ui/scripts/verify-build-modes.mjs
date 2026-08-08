@@ -22,6 +22,7 @@ const serviceWorkerPath = resolve(pwaRoot, "service-worker.js");
 const metadataPath = resolve(pwaRoot, "pwa-meta.json");
 const manifestPath = resolve(pwaRoot, "manifest.webmanifest");
 const productIconPath = resolve(pwaRoot, "icons", "trouve-512.png");
+const vectorIconPath = resolve(pwaRoot, "icons", "trouve.svg");
 
 for (const root of [desktopRoot, pwaRoot]) {
   const sourceMaps = artifactFiles(root).filter((path) => path.endsWith(".map"));
@@ -49,6 +50,9 @@ if (!existsSync(serviceWorkerPath)) {
 }
 if (!existsSync(metadataPath)) {
   throw new Error("PWA artifact is missing pwa-meta.json");
+}
+if (!existsSync(vectorIconPath)) {
+  throw new Error("PWA artifact is missing icons/trouve.svg");
 }
 
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));

@@ -128,6 +128,8 @@ describe("session pull-request panel model", () => {
       tone: "failed",
     });
     expect(canMergePr(pullRequest({ mergeable: false }))).toBe(false);
+    expect(canMergePr(pullRequest({ mergeable: true, merge_state_status: "blocked" }))).toBe(false);
+    expect(canMergePr(pullRequest({ mergeable: null, merge_state_status: "dirty" }))).toBe(false);
     expect(canMergePr(pullRequest({ draft: true }))).toBe(false);
     expect(canMergePr(pullRequest({ state: "closed" }))).toBe(false);
   });

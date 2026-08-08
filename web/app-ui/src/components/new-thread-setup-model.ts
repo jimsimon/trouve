@@ -126,17 +126,22 @@ export const selectNewThreadMode = (
   modeId: string,
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
+  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
   const mode = knownMode(catalog.modes, modeId);
   const nextModeId = mode?.id ?? "";
   const advertisedDefault = nonEmpty(mode?.default_model ?? "");
   const nextModelId = knownModel(catalog.models, advertisedDefault)?.id ?? draft.modelId;
+  const nextEffectiveModel = effectiveNewThreadModel(
+    { modeId: nextModeId, modelId: nextModelId },
+    catalog,
+  );
   return {
     ...draft,
     modeId: nextModeId,
     modelId: nextModelId,
-    ...(nextModelId === draft.modelId
+    ...(nextEffectiveModel?.id === previousEffectiveModelId
       ? {}
-      : { thinking: defaultThinking(knownModel(catalog.models, nextModelId)) }),
+      : { thinking: defaultThinking(nextEffectiveModel) }),
   };
 };
 
@@ -178,9 +183,13 @@ export const newThreadAttachmentLimitMessage = (
   limit: NewThreadAttachmentLimit,
   name = "Attachment",
 ): string => {
-  if (limit === "item-too-large") return `${name} is larger than the 10 MB limit.`;
+  const megabytes = (bytes: number): string =>
+    String(bytes / (1024 * 1024));
+  if (limit === "item-too-large") {
+    return `${name} is larger than the ${megabytes(MAX_ATTACHMENT_BYTES)} MB limit.`;
+  }
   if (limit === "too-many") return `Attach at most ${MAX_PENDING_ATTACHMENTS} files at once.`;
-  return "Pending attachments exceed the 20 MB mobile memory budget.";
+  return `Pending attachments exceed the ${megabytes(MAX_PENDING_ATTACHMENT_BYTES)} MB mobile memory budget.`;
 };
 
 export const formatNewThreadAttachmentBytes = (bytes: number): string => {

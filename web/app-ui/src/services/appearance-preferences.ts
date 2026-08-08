@@ -82,22 +82,25 @@ export const browserAppearancePreferenceStorage = (
 
 export class AppearancePreferencesController {
   readonly #storage: AppearancePreferenceStorage | undefined;
-  readonly current = createSignal<AppearancePreferences>(DEFAULT_APPEARANCE_PREFERENCES);
+  readonly #current = createSignal<AppearancePreferences>(DEFAULT_APPEARANCE_PREFERENCES);
+  readonly current: ReadonlySignal<AppearancePreferences> = this.#current;
 
   constructor(storage?: AppearancePreferenceStorage) {
     this.#storage = storage;
-    this.current.set(storage?.load() ?? DEFAULT_APPEARANCE_PREFERENCES);
+    this.#current.set(normalizeAppearancePreferences(
+      storage?.load() ?? DEFAULT_APPEARANCE_PREFERENCES,
+    ));
   }
 
   replace(value: Partial<AppearancePreferences>, persist = true): AppearancePreferences {
-    const next = normalizeAppearancePreferences(value, this.current.get());
-    this.current.set(next);
+    const next = normalizeAppearancePreferences(value, this.#current.get());
+    this.#current.set(next);
     if (persist) this.#storage?.save(next);
     return next;
   }
 
   update(patch: Partial<AppearancePreferences>): AppearancePreferences {
-    return this.replace({ ...this.current.get(), ...patch });
+    return this.replace({ ...this.#current.get(), ...patch });
   }
 }
 

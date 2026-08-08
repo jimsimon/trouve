@@ -146,12 +146,8 @@ const schemaValidators = new Map<HostSchemaName, ValidateFunction>([
   ["ReadClipboardImageResponse", readClipboardImageResponse],
 ]);
 
-const validators = async (): Promise<ReadonlyMap<HostSchemaName, ValidateFunction>> => {
-  return schemaValidators;
-};
-
-const validate = async <T>(name: HostSchemaName, value: unknown): Promise<T> => {
-  const validator = (await validators()).get(name);
+const validate = <T>(name: HostSchemaName, value: unknown): T => {
+  const validator = schemaValidators.get(name);
   if (validator === undefined || !validator(value)) {
     throw new HostClientError("invalid-response", `desktop host returned invalid ${name}`);
   }
@@ -229,7 +225,16 @@ export class HostClient {
   #fontFamilies: readonly string[] = Object.freeze([]);
   #notificationSequence = 0;
   readonly #notificationActivations = new Map<string, () => void>();
-  #preferenceWriteTail: Promise<void> = Promise.resolve();
+  #preferenceWriteRunning = false;
+  #pendingPreferenceWrite:
+    | {
+        preferences: HostPreferences;
+        waiters: Array<{
+          resolve: (preferences: HostPreferences) => void;
+          reject: (reason: unknown) => void;
+        }>;
+      }
+    | undefined;
 
   constructor(baseUrl: string, fetchImplementation: typeof fetch = globalThis.fetch) {
     this.#client = createClient<HostPaths>({ baseUrl, fetch: fetchImplementation });
@@ -245,14 +250,14 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop host bootstrap request failed");
     }
-    const bootstrap = await validate<HostBootstrapWire>("HostBootstrap", result.data);
+    const bootstrap = validate<HostBootstrapWire>("HostBootstrap", result.data);
     const capabilities = mapHostCapabilities(bootstrap.capabilities);
     this.#fontFamilies = normalizeSystemFontFamilies(bootstrap.font_families ?? []);
     this.#csrfToken = bootstrap.csrf_token;
     this.#directoryPickerAvailable = capabilities.directoryPicker;
     this.#filePickerAvailable = capabilities.filePicker;
     this.#clipboardImageAvailable = capabilities.clipboardImage;
-    this.#openHttpsUrlAvailable = bootstrap.capabilities.open_https_url;
+    this.#openHttpsUrlAvailable = capabilities.openHttpsUrl;
     this.#lifecycleAvailable = capabilities.lifecycleEvents;
     this.#closeConfirmationAvailable = capabilities.closeConfirmation;
     this.#sleepInhibitionAvailable = capabilities.sleepInhibition;
@@ -269,19 +274,10 @@ export class HostClient {
   }
 
   async pickDirectory(): Promise<string | undefined> {
-    const csrfToken = this.#csrfToken;
-    if (csrfToken === undefined) {
-      throw new HostClientError(
-        "not-bootstrapped",
-        "desktop host must bootstrap before native actions",
-      );
-    }
-    if (!this.#directoryPickerAvailable) {
-      throw new HostClientError(
-        "capability-unavailable",
-        "desktop directory picker is unavailable",
-      );
-    }
+    const csrfToken = this.#nativeActionToken(
+      this.#directoryPickerAvailable,
+      "desktop directory picker is unavailable",
+    );
     let result;
     try {
       result = await this.#client.POST(HOST_PICK_DIRECTORY_PATH, {
@@ -296,7 +292,7 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop directory picker failed");
     }
-    const response = await validate<PickDirectoryResponseWire>(
+    const response = validate<PickDirectoryResponseWire>(
       "PickDirectoryResponse",
       result.data,
     );
@@ -334,7 +330,7 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop file picker failed");
     }
-    const response = await validate<PickFilesResponseWire>(
+    const response = validate<PickFilesResponseWire>(
       "PickFilesResponse",
       result.data,
     );
@@ -379,7 +375,7 @@ export class HostClient {
         "desktop clipboard image read failed",
       );
     }
-    const response = await validate<ReadClipboardImageResponseWire>(
+    const response = validate<ReadClipboardImageResponseWire>(
       "ReadClipboardImageResponse",
       result.data,
     );
@@ -389,19 +385,10 @@ export class HostClient {
   }
 
   async openHttpsUrl(value: string): Promise<void> {
-    const csrfToken = this.#csrfToken;
-    if (csrfToken === undefined) {
-      throw new HostClientError(
-        "not-bootstrapped",
-        "desktop host must bootstrap before native actions",
-      );
-    }
-    if (!this.#openHttpsUrlAvailable) {
-      throw new HostClientError(
-        "capability-unavailable",
-        "desktop external URL opening is unavailable",
-      );
-    }
+    const csrfToken = this.#nativeActionToken(
+      this.#openHttpsUrlAvailable,
+      "desktop external URL opening is unavailable",
+    );
     let url: URL;
     try {
       url = new URL(value);
@@ -465,7 +452,7 @@ export class HostClient {
     if (result.data === undefined || !result.response.ok) {
       throw new HostClientError("request-failed", "desktop lifecycle request failed");
     }
-    const wire = await validate<HostLifecycleBatchWire>(
+    const wire = validate<HostLifecycleBatchWire>(
       "HostLifecycleBatch",
       result.data,
     );
@@ -640,14 +627,35 @@ export class HostClient {
   }
 
   putPreferences(preferences: HostPreferences): Promise<HostPreferences> {
-    const write = this.#preferenceWriteTail.then(() =>
-      this.#putPreferencesNow(preferences),
-    );
-    this.#preferenceWriteTail = write.then(
-      () => undefined,
-      () => undefined,
-    );
-    return write;
+    const result = new Promise<HostPreferences>((resolve, reject) => {
+      if (this.#pendingPreferenceWrite === undefined) {
+        this.#pendingPreferenceWrite = {
+          preferences,
+          waiters: [{ resolve, reject }],
+        };
+      } else {
+        this.#pendingPreferenceWrite.preferences = preferences;
+        this.#pendingPreferenceWrite.waiters.push({ resolve, reject });
+      }
+    });
+    void this.#drainPreferenceWrites();
+    return result;
+  }
+
+  async #drainPreferenceWrites(): Promise<void> {
+    if (this.#preferenceWriteRunning) return;
+    this.#preferenceWriteRunning = true;
+    while (this.#pendingPreferenceWrite !== undefined) {
+      const pending = this.#pendingPreferenceWrite;
+      this.#pendingPreferenceWrite = undefined;
+      try {
+        const saved = await this.#putPreferencesNow(pending.preferences);
+        for (const waiter of pending.waiters) waiter.resolve(saved);
+      } catch (error) {
+        for (const waiter of pending.waiters) waiter.reject(error);
+      }
+    }
+    this.#preferenceWriteRunning = false;
   }
 
   async #putPreferencesNow(preferences: HostPreferences): Promise<HostPreferences> {

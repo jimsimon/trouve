@@ -139,5 +139,20 @@ describe("session inbox model", () => {
     expect(sessionStatusText(session("failed", { outcome: "failed" }))).toBe("Failed");
     expect(sessionStatusText(session("done", { outcome: "succeeded" }))).toBe("Completed");
     expect(sessionStatusText(session("idle"))).toBe("Idle");
+    expect(sessionStatusText(session("read-failure", {
+      outcome: "failed",
+      unread: false,
+    }))).toBe("Idle");
+    expect(sessionStatusText(session("read-success", {
+      outcome: "succeeded",
+      unread: false,
+    }))).toBe("Idle");
+  });
+
+  it("does not prioritize read terminal outcomes above active idle work", () => {
+    expect(sortInboxSessions([
+      session("read-failure", { outcome: "failed", unread: false }),
+      session("active-idle", { active: true, updatedAt: "2026-08-01T11:00:00Z" }),
+    ]).map(({ id }) => id)).toEqual(["active-idle", "read-failure"]);
   });
 });

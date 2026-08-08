@@ -4,7 +4,10 @@ import {
   createBrowserNotificationAdapter,
   type BrowserNotificationAdapter,
 } from "./browser-notifications.js";
-import { browserWakeLockCapability } from "./browser-wake-lock.js";
+import {
+  browserWakeLockCapability,
+  type WakeLockNavigatorLike,
+} from "./browser-wake-lock.js";
 
 export type HostKind = "desktop" | "pwa" | "browser";
 
@@ -33,6 +36,7 @@ export interface HostCapabilities {
 export const browserCapabilities = (
   kind: HostKind,
   notifications: BrowserNotificationAdapter = createBrowserNotificationAdapter(),
+  navigatorLike: WakeLockNavigatorLike | undefined = globalThis.navigator,
 ): HostCapabilities =>
   Object.freeze({
     kind,
@@ -50,7 +54,7 @@ export const browserCapabilities = (
     webNotifications:
       kind !== "desktop" && browserNotificationCapability(notifications),
     userAttention: false,
-    sleepInhibition: kind === "pwa" && browserWakeLockCapability(),
+    sleepInhibition: kind === "pwa" && browserWakeLockCapability(navigatorLike),
     windowGeometry: false,
     visibility: kind !== "desktop",
     occlusion: false,

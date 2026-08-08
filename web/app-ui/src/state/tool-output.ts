@@ -16,12 +16,20 @@ export interface ToolOutputBuffer {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const encodedBuffers = new WeakMap<ToolOutputBuffer, Uint8Array>();
 
-export const emptyToolOutput = (): ToolOutputBuffer => ({
-  text: "",
-  bytes: 0,
-  omitted: false,
-});
+const outputBuffer = (
+  text: string,
+  encoded: Uint8Array,
+  omitted: boolean,
+): ToolOutputBuffer => {
+  const buffer = Object.freeze({ text, bytes: encoded.byteLength, omitted });
+  encodedBuffers.set(buffer, encoded);
+  return buffer;
+};
+
+export const emptyToolOutput = (): ToolOutputBuffer =>
+  outputBuffer("", new Uint8Array(), false);
 
 /** Return the longest valid-Unicode suffix whose UTF-8 encoding fits. */
 const utf8Tail = (
@@ -66,29 +74,32 @@ export const appendBoundedToolOutput = (
 
   if (encodedChunk.byteLength >= limit) {
     const tail = utf8Tail(chunk, encodedChunk, limit);
-    return {
-      ...tail,
-      omitted:
-        current.omitted ||
+    const tailBytes = encodedChunk.subarray(encodedChunk.byteLength - tail.bytes);
+    return outputBuffer(
+      tail.text,
+      tailBytes,
+      current.omitted ||
         current.bytes > 0 ||
         tail.bytes < encodedChunk.byteLength,
-    };
+    );
   }
 
   const retainedBudget = limit - encodedChunk.byteLength;
   let retained = { text: current.text, bytes: current.bytes };
+  const currentEncoded = encodedBuffers.get(current) ?? encoder.encode(current.text);
+  let retainedEncoded = currentEncoded;
   let omitted = current.omitted;
   if (current.bytes > retainedBudget) {
     retained = utf8Tail(
       current.text,
-      encoder.encode(current.text),
+      currentEncoded,
       retainedBudget,
     );
+    retainedEncoded = currentEncoded.subarray(currentEncoded.byteLength - retained.bytes);
     omitted = true;
   }
-  return {
-    text: `${retained.text}${chunk}`,
-    bytes: retained.bytes + encodedChunk.byteLength,
-    omitted,
-  };
+  const combined = new Uint8Array(retainedEncoded.byteLength + encodedChunk.byteLength);
+  combined.set(retainedEncoded);
+  combined.set(encodedChunk, retainedEncoded.byteLength);
+  return outputBuffer(`${retained.text}${chunk}`, combined, omitted);
 };

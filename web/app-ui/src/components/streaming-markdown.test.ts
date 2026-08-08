@@ -25,4 +25,15 @@ describe("streaming Markdown stable prefix", () => {
       "intro\n\n~~~text\ninside\n\n~~~\n\n",
     );
   });
+
+  it("keeps mismatched markers open and accepts longer matching closers", () => {
+    const mismatched = "intro\n\n````text\ninside\n\n~~~~\n\nstill code";
+    expect(mismatched.slice(0, stableMarkdownPrefixLength(mismatched))).toBe(
+      "intro\n\n",
+    );
+    const closed = "intro\n\n~~~text\ninside\n~~~~~\n\ntail";
+    expect(closed.slice(0, stableMarkdownPrefixLength(closed))).toBe(
+      "intro\n\n~~~text\ninside\n~~~~~\n\n",
+    );
+  });
 });

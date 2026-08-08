@@ -21,6 +21,14 @@ describe("bounded tool output", () => {
     expect(second).toEqual({ text: "456789ab", bytes: 8, omitted: true });
   });
 
+  it("retains exact-limit output without marking earlier bytes omitted", () => {
+    expect(appendBoundedToolOutput(emptyToolOutput(), "12345678", 8)).toEqual({
+      text: "12345678",
+      bytes: 8,
+      omitted: false,
+    });
+  });
+
   it("bounds UTF-8 bytes without retaining a partial scalar value", () => {
     const output = appendBoundedToolOutput(emptyToolOutput(), "a🙂b🙂c", 7);
 

@@ -70,27 +70,30 @@ export const browserNotificationPreferenceStorage = (
 
 export class NotificationPreferencesController {
   readonly #storage: NotificationPreferenceStorage | undefined;
-  readonly current = createSignal<NotificationPreferences>(
+  readonly #current = createSignal<NotificationPreferences>(
     DEFAULT_NOTIFICATION_PREFERENCES,
   );
+  readonly current: ReadonlySignal<NotificationPreferences> = this.#current;
 
   constructor(storage?: NotificationPreferenceStorage) {
     this.#storage = storage;
-    this.current.set(storage?.load() ?? DEFAULT_NOTIFICATION_PREFERENCES);
+    this.#current.set(normalizeNotificationPreferences(
+      storage?.load() ?? DEFAULT_NOTIFICATION_PREFERENCES,
+    ));
   }
 
   replace(
     value: Partial<NotificationPreferences>,
     persist = true,
   ): NotificationPreferences {
-    const next = normalizeNotificationPreferences(value, this.current.get());
-    this.current.set(next);
+    const next = normalizeNotificationPreferences(value, this.#current.get());
+    this.#current.set(next);
     if (persist) this.#storage?.save(next);
     return next;
   }
 
   update(patch: Partial<NotificationPreferences>): NotificationPreferences {
-    return this.replace({ ...this.current.get(), ...patch });
+    return this.replace({ ...this.#current.get(), ...patch });
   }
 }
 

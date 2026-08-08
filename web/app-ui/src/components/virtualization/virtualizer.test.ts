@@ -162,6 +162,7 @@ describe("Virtualizer", () => {
 
   it("rejects duplicate stable ids and invalid measurements", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20 });
+    expect(() => virtualizer.setItems([{ id: "" }])).toThrow(/must not be empty/);
     expect(() => virtualizer.setItems([{ id: "same" }, { id: "same" }])).toThrow(
       /duplicate/,
     );

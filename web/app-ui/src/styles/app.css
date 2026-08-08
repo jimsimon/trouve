@@ -445,7 +445,7 @@ trouve-session-list { display: block; }
 .activity-row { min-width: 0; max-width: none; margin: 0 0 14px; overflow-wrap: anywhere; }
 .agent-activity { min-width: 0; min-height: 28px; display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
 .activity-dots { width: 22px; display: inline-flex; align-items: center; justify-content: space-between; }
-.activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: trouve-activity-dot 1.2s ease-in-out infinite; }
+.activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentcolor; animation: trouve-activity-dot 1.2s ease-in-out infinite; }
 .activity-dots i:nth-child(2) { animation-delay: 120ms; }
 .activity-dots i:nth-child(3) { animation-delay: 240ms; }
 @keyframes trouve-activity-dot {

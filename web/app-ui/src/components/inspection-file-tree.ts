@@ -60,12 +60,14 @@ export class InspectionFileTreeModel {
   readonly #directories = new Map<string, FileTreeDirectorySnapshot>();
   readonly #expanded = new Set<string>();
   #activePath: string | undefined;
+  #rows: readonly FileTreeRow[] | undefined;
 
   get activePath(): string | undefined {
     return this.#activePath;
   }
 
   get rows(): readonly FileTreeRow[] {
+    if (this.#rows !== undefined) return this.#rows;
     const rows: FileTreeRow[] = [];
     const walk = (directory: string, depth: number): void => {
       const state = this.directory(directory);
@@ -92,7 +94,8 @@ export class InspectionFileTreeModel {
       });
     };
     walk(".", 0);
-    return rows;
+    this.#rows = Object.freeze(rows);
+    return this.#rows;
   }
 
   get loading(): boolean {
@@ -117,6 +120,7 @@ export class InspectionFileTreeModel {
     this.#directories.clear();
     this.#expanded.clear();
     this.#activePath = preferredPath;
+    this.#rows = undefined;
   }
 
   /** Reset all state when the owning session changes. */
@@ -124,6 +128,7 @@ export class InspectionFileTreeModel {
     this.#directories.clear();
     this.#expanded.clear();
     this.#activePath = undefined;
+    this.#rows = undefined;
   }
 
   beginLoading(path: string): void {
@@ -131,6 +136,7 @@ export class InspectionFileTreeModel {
       status: "loading",
       entries: EMPTY_ENTRIES,
     });
+    this.#rows = undefined;
     this.#recoverActivePath();
   }
 
@@ -139,6 +145,7 @@ export class InspectionFileTreeModel {
       status: "loaded",
       entries: [...entries].sort(compareEntries),
     });
+    this.#rows = undefined;
     this.#recoverActivePath();
   }
 
@@ -147,6 +154,7 @@ export class InspectionFileTreeModel {
       status: "error",
       entries: EMPTY_ENTRIES,
     });
+    this.#rows = undefined;
     this.#recoverActivePath();
   }
 
@@ -165,6 +173,7 @@ export class InspectionFileTreeModel {
     const row = this.row(path);
     if (row === undefined || !row.isDirectory) return false;
     this.#expanded.add(path);
+    this.#rows = undefined;
     this.#activePath = path;
     return true;
   }
@@ -173,6 +182,7 @@ export class InspectionFileTreeModel {
     const row = this.row(path);
     if (row === undefined || !row.isDirectory || !row.expanded) return false;
     this.#expanded.delete(path);
+    this.#rows = undefined;
     if (
       this.#activePath !== undefined &&
       this.#activePath.startsWith(`${path}/`)

@@ -13,6 +13,14 @@ describe("OSC 52 clipboard requests", () => {
       kind: "copy",
       text: "hello 🌍",
     });
+    expect(parseOsc52ClipboardRequest(`p;${payload}`)).toEqual({
+      kind: "copy",
+      text: "hello 🌍",
+    });
+    expect(parseOsc52ClipboardRequest(`;${payload}`)).toEqual({
+      kind: "copy",
+      text: "hello 🌍",
+    });
   });
 
   it("rejects clipboard queries, malformed targets, base64, and UTF-8", () => {

@@ -381,12 +381,14 @@ const editPresentation = (tool: string, args: JsonRecord): EditPresentation | un
   const edits = Array.isArray(args.edits)
     ? args.edits.map(pair).filter((value): value is readonly [string, string, number] => value !== undefined)
     : [];
+  const directPair = pair(args);
+  const content = firstString(args, ["content", "contents", "file_text", "fileText"]);
   const pairs = edits.length > 0
     ? edits
-    : pair(args) !== undefined
-      ? [pair(args)!]
-      : firstString(args, ["content", "contents", "file_text", "fileText"]) !== undefined
-        ? [["", firstString(args, ["content", "contents", "file_text", "fileText"])!, 1] as const]
+    : directPair !== undefined
+      ? [directPair]
+      : content !== undefined
+        ? [["", content, 1] as const]
         : [];
   if (pairs.length === 0) return undefined;
   const lines: ToolDiffLine[] = [];

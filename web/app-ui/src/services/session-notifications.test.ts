@@ -95,6 +95,11 @@ describe("session notification coordinator", () => {
   });
 
   it("honors master/event preferences and focused-visible suppression", () => {
+    const masterDisabled = setup();
+    masterDisabled.preferences.update({ enabled: false });
+    masterDisabled.coordinator.receive(notificationEvent(3, "turn_failed"));
+    expect(masterDisabled.requests).toEqual([]);
+
     const disabled = setup();
     disabled.preferences.update({ onFinish: false });
     disabled.coordinator.receive(notificationEvent(3, "turn_completed"));
@@ -156,7 +161,7 @@ describe("browser notification delivery", () => {
     }, activate);
     expect(show).toHaveBeenCalledWith(
       "Approval needed",
-      expect.objectContaining({ silent: true, tag: "trouve:se-1:attention" }),
+      expect.objectContaining({ silent: true, tag: "trouve:se-1:th-1:attention" }),
       expect.any(Function),
     );
     click?.();

@@ -70,6 +70,7 @@ export class TrouveDiffView extends LitElement {
   #narrow = false;
   #viewportQuery: MediaQueryList | undefined;
   #viewportListening = false;
+  #correctedMode: DiffMode | undefined;
 
   readonly #viewportChanged = (event: MediaQueryListEvent): void => {
     this.#applyViewport(event.matches, true);
@@ -94,13 +95,16 @@ export class TrouveDiffView extends LitElement {
     void this.#mount();
   }
 
-  protected override updated(changed: PropertyValues<this>): void {
+  protected override willUpdate(): void {
     const effectiveMode = constrainDiffMode(this.mode, this.#narrow);
-    if (effectiveMode !== this.mode) {
-      this.mode = effectiveMode;
-      this.#dispatchModeChange(effectiveMode);
-      return;
-    }
+    this.#correctedMode = effectiveMode === this.mode ? undefined : effectiveMode;
+    if (this.#correctedMode !== undefined) this.mode = this.#correctedMode;
+  }
+
+  protected override updated(changed: PropertyValues<this>): void {
+    const correctedMode = this.#correctedMode;
+    this.#correctedMode = undefined;
+    if (correctedMode !== undefined) this.#dispatchModeChange(correctedMode);
     if (
       changed.has("original") ||
       changed.has("modified") ||
@@ -108,7 +112,8 @@ export class TrouveDiffView extends LitElement {
       changed.has("label") ||
       changed.has("mode") ||
       changed.has("originalLineNumbers") ||
-      changed.has("modifiedLineNumbers")
+      changed.has("modifiedLineNumbers") ||
+      correctedMode !== undefined
     ) {
       void this.#mount();
     }

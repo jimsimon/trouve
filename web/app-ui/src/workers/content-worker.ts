@@ -40,6 +40,14 @@ const processRequest = async (
   }
 };
 
+const failureMessage = (reason: unknown): string => {
+  if (reason instanceof Error) {
+    if (reason.message === "content exceeds worker bounds") return "content-too-large";
+    if (reason.message === "too many fuzzy candidates") return "too-many-candidates";
+  }
+  return "content processing failed";
+};
+
 self.addEventListener("message", (event: MessageEvent<ContentWorkerRequest>) => {
   const request = event.data;
   void processRequest(request).then(
@@ -47,11 +55,11 @@ self.addEventListener("message", (event: MessageEvent<ContentWorkerRequest>) => 
       const response: ContentWorkerResponse = { id: request.id, ok: true, value };
       self.postMessage(response);
     },
-    () => {
+    (reason: unknown) => {
       const response: ContentWorkerResponse = {
         id: request.id,
         ok: false,
-        error: "content processing failed",
+        error: failureMessage(reason),
       };
       self.postMessage(response);
     },

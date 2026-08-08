@@ -143,6 +143,7 @@ export class TrouveModelPicker extends LitElement {
                         aria-selected=${modelId === this.value ? "true" : "false"}
                         class=${matchIndex === this.#activeMatch ? "active" : ""}
                         title=${health?.detail ?? modelId}
+                        @mousedown=${(event: MouseEvent) => event.preventDefault()}
                         @pointerenter=${() => {
                           this.#activeMatch = matchIndex;
                           this.requestUpdate();

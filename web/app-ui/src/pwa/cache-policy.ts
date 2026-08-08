@@ -25,7 +25,7 @@ export const cachePolicyFor = (request: Request): CachePolicy => {
   if (request.headers.get("accept")?.includes("text/event-stream")) {
     return "network-only";
   }
-  if (request.headers.get("accept")?.includes("text/html")) {
+  if (request.mode === "navigate" || request.destination === "document") {
     return "app-shell-navigation";
   }
   return HASHED_ASSET.test(url.pathname) ? "static-asset" : "network-only";

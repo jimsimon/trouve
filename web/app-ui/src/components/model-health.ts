@@ -14,6 +14,9 @@ export interface ModelHealthPresentation {
 export const boundedSubscriptionUsage = (usedPercent: number): number =>
   Math.max(0, Math.min(100, usedPercent));
 
+const displayedSubscriptionUsage = (usedPercent: number): number =>
+  Math.round(boundedSubscriptionUsage(usedPercent));
+
 export const subscriptionUsageTone = (usedPercent: number): Exclude<
   ModelHealthTone,
   "neutral"
@@ -41,7 +44,7 @@ export const modelHealthPresentation = (
 
   if (health.status === "ok") {
     if (constrained !== undefined) {
-      const percent = boundedSubscriptionUsage(constrained.used_percent);
+      const percent = displayedSubscriptionUsage(constrained.used_percent);
       summary = `${plan === "" ? "" : `${plan} · `}${percent}% used`;
       tone = subscriptionUsageTone(percent);
     } else if (plan !== "") {
@@ -72,7 +75,7 @@ export const modelHealthPresentation = (
       : [
           "",
           ...health.windows.map((window) => {
-            const percent = boundedSubscriptionUsage(window.used_percent);
+            const percent = displayedSubscriptionUsage(window.used_percent);
             return `${window.label}: ${percent}% used${window.resets === "" ? "" : ` · ${window.resets}`}`;
           }),
         ]),

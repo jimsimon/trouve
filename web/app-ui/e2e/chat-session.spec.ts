@@ -200,6 +200,8 @@ interface ProtocolFixtureOptions {
   readonly additionalSessions?: readonly Record<string, unknown>[];
   readonly additionalSessionSummaries?: readonly Record<string, unknown>[];
   readonly restoredCheckpointIds?: string[];
+  readonly codeReviewDashboard?: Record<string, unknown>;
+  readonly codeReviewSettings?: Record<string, unknown>;
 }
 
 const installProtocolFixtures = async (
@@ -215,6 +217,8 @@ const installProtocolFixtures = async (
     additionalSessions = [],
     additionalSessionSummaries = [],
     restoredCheckpointIds = [],
+    codeReviewDashboard,
+    codeReviewSettings,
   }: ProtocolFixtureOptions = {},
 ): Promise<void> => {
   let messageCount = 0;
@@ -458,6 +462,12 @@ const installProtocolFixtures = async (
       "GET /v1/sessions/se_2/paths": [],
       "GET /v1/sessions/se_2/diff": { diff: "" },
       "GET /v1/sessions/se_2/prs": [],
+      ...(codeReviewDashboard === undefined
+        ? {}
+        : { "GET /v1/code-review": codeReviewDashboard }),
+      ...(codeReviewSettings === undefined
+        ? {}
+        : { "GET /v1/config/code-review": codeReviewSettings }),
     };
     const response = responses[key];
     if (response === undefined) {
@@ -717,6 +727,64 @@ test("turn separators expose exact restore and session-fork actions", async ({ p
   await expect(enabledRestore).toBeEnabled();
   await enabledRestore.click();
   await expect.poll(() => restoredCheckpointIds).toEqual(["cp_turn_7"]);
+});
+
+test("code review repository groups reorder through rendered keyboard controls", async ({ page }) => {
+  const job = (id: string, repository: string, pullNumber: number) => ({
+    id,
+    installation_id: 1,
+    repository,
+    pull_number: pullNumber,
+    pull_title: `Review ${repository}`,
+    pull_url: `https://github.com/${repository}/pull/${pullNumber}`,
+    head_sha: "a".repeat(40),
+    base_ref: "main",
+    head_ref: `feature/${pullNumber}`,
+    trigger: "automatic",
+    status: "succeeded",
+    created_at: "2026-08-04T08:00:00Z",
+  });
+  await installProtocolFixtures(page, {
+    codeReviewDashboard: {
+      app: { configured: true },
+      reviewers: [],
+      repositories: [
+        { installation_id: 1, repository: "trouve/alpha", mode: "automatic" },
+        { installation_id: 1, repository: "trouve/beta", mode: "automatic" },
+      ],
+      jobs: [
+        job("review-alpha", "trouve/alpha", 1),
+        job("review-beta", "trouve/beta", 2),
+      ],
+    },
+    codeReviewSettings: {
+      max_parallel_reviews: 2,
+      total_timeout_seconds: 1_200,
+      reviewer_timeout_seconds: 720,
+      coordinator_timeout_seconds: 360,
+    },
+  });
+  await page.goto("/reviews");
+  await page.getByRole("button", { name: "Review operations" }).click();
+
+  const groups = page.locator("[data-review-group]");
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0)).toHaveAttribute("data-review-group", "trouve/alpha");
+  await expect(page.getByRole("button", { name: "Move trouve/alpha up" }))
+    .toBeDisabled();
+  await expect(page.getByRole("button", { name: "Move trouve/beta down" }))
+    .toBeDisabled();
+
+  const betaGrip = page.locator('[data-review-group="trouve/beta"]')
+    .locator('[data-group-order-control="grip"]');
+  await betaGrip.press("ArrowUp");
+  await expect(groups.nth(0)).toHaveAttribute("data-review-group", "trouve/beta");
+  await expect(page.locator("trouve-code-review-dashboard [role=status]").first()).toContainText(
+    "trouve/beta moved to position 1 of 2",
+  );
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.localStorage.getItem("trouve.code-review-group-order.v1")
+  )).toBe('["trouve/beta","trouve/alpha"]');
 });
 
 test("the Agent header shows live token usage and elapsed time", async ({ page }) => {
@@ -1097,7 +1165,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
     await session.click();
   };
   await page.goto("/");
-  await openSession(/Chat rendering feature\/chat/u);
+  await openSession(/^Chat rendering/u);
   await page.getByRole("tab", { name: "Code · model", exact: true }).click();
 
   const textarea = page.locator('textarea[name="message"]');
@@ -1114,10 +1182,10 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(page.locator(".pending-attachments")).toHaveCount(0);
   await textarea.fill("Draft for the second thread");
 
-  await openSession(/Second session feature\/second/u);
+  await openSession(/^Second session/u);
   await expect(textarea).toHaveValue("");
   await textarea.fill("Draft in a different session");
-  await openSession(/Chat rendering feature\/chat/u);
+  await openSession(/^Chat rendering/u);
   await expect(textarea).toHaveValue("Draft for the second thread");
 
   await page.getByRole("tab", { name: "Code · model", exact: true }).click();
@@ -1158,10 +1226,10 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
   await page.getByRole("tab", { name: "Code · second", exact: true }).click();
   await expect(textarea).toHaveValue("Draft for the second thread");
-  await openSession(/Second session feature\/second/u);
+  await openSession(/^Second session/u);
   await expect(textarea).toHaveValue("Draft in a different session");
 
-  await openSession(/Chat rendering feature\/chat/u);
+  await openSession(/^Chat rendering/u);
   await page.getByRole("tab", { name: "Code · model", exact: true }).click();
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(textarea).toHaveValue("");
@@ -1172,7 +1240,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(page.locator(".pending-attachments")).toHaveCount(0);
   await page.getByRole("tab", { name: "Code · second", exact: true }).click();
   await expect(textarea).toHaveValue("Draft for the second thread");
-  await openSession(/Second session feature\/second/u);
+  await openSession(/^Second session/u);
   await expect(textarea).toHaveValue("Draft in a different session");
 });
 
@@ -3818,7 +3886,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     }],
   }));
 
-  await expect(page.locator(".queue-panel [role=status]")).toHaveText("1 queued prompt");
+  await expect(page.locator(".queue-panel [role=status]").first()).toHaveText("1 queued prompt");
   const queuedAttachment = page.locator(".queue-attachment-badge");
   await expect(queuedAttachment).toContainText("1");
   await expect(queuedAttachment.locator('[data-font-awesome-icon="paperclip"]')).toBeVisible();

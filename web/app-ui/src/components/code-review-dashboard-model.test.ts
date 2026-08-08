@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  codeReviewSettingsDraft,
   codeReviewSettingsRequest,
   codeReviewStatusClass,
   groupCodeReviewJobs,
@@ -164,6 +165,19 @@ describe("code-review dashboard model", () => {
       reviewer_timeout_seconds: 720,
       coordinator_timeout_seconds: 360,
     });
+    const wholeSeconds = {
+      max_parallel_reviews: 2,
+      total_timeout_seconds: 100,
+      reviewer_timeout_seconds: 100,
+      coordinator_timeout_seconds: 100,
+    };
+    const roundTripDraft = codeReviewSettingsDraft(wholeSeconds);
+    expect(roundTripDraft).toMatchObject({
+      totalMinutes: String(100 / 60),
+      reviewerMinutes: String(100 / 60),
+      coordinatorMinutes: String(100 / 60),
+    });
+    expect(codeReviewSettingsRequest(roundTripDraft)).toMatchObject(wholeSeconds);
   });
 
   it("rejects invalid concurrency and deadlines", () => {

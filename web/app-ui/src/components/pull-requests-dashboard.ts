@@ -399,29 +399,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
       white-space: nowrap !important;
     }
 
-    .operations-button, .manual-refresh {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      min-height: 0 !important;
-      overflow: hidden;
-      padding: 0 !important;
-      clip: rect(0 0 0 0);
-      clip-path: inset(50%);
-      white-space: nowrap;
-    }
-    .operations-button:focus-visible, .manual-refresh:focus-visible {
-      position: static;
-      width: auto;
-      height: auto;
-      min-height: 30px !important;
-      overflow: visible;
-      padding: 4px 10px !important;
-      clip: auto;
-      clip-path: none;
-      white-space: normal;
-    }
-
     @media (max-width: 1031px) {
       .groups-grid { grid-template-columns: minmax(0, 1fr); }
     }
@@ -482,6 +459,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
   #copiedRow = "";
   #copyTimer: ReturnType<typeof setTimeout> | undefined;
   #clock = Date.now();
+  #clockBucket = Math.floor(this.#clock / 5_000);
   #lastRefreshAt: number | undefined;
   #nextRefreshAt = 0;
   #tickTimer: ReturnType<typeof setInterval> | undefined;
@@ -804,6 +782,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
 
   #tick(): void {
     this.#clock = Date.now();
+    const clockBucket = Math.floor(this.#clock / 5_000);
     const store = this.#store.value;
     const online = store === undefined || readSignal(store.serverInfo)?.online !== false;
     if (
@@ -815,7 +794,10 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     ) {
       void this.#refresh();
     }
-    this.requestUpdate();
+    if (clockBucket !== this.#clockBucket) {
+      this.#clockBucket = clockBucket;
+      this.requestUpdate();
+    }
   }
 
   #refreshStatus(snapshotTimes: readonly string[]): string {
@@ -918,7 +900,9 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     const after = this.#dropAfter;
     this.#finishDrag();
     if (raw === undefined || !isGroupKey(raw) || raw === target) return;
-    const saved = readSignal(this.#services.value!.pullRequestGroupOrder);
+    const services = this.#services.value;
+    if (services === undefined) return;
+    const saved = readSignal(services.pullRequestGroupOrder);
     this.#saveOrder(reorderPullRequestGroup(saved, raw, target, after), raw);
   }
 

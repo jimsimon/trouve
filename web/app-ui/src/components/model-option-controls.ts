@@ -108,7 +108,7 @@ export const modelOptionControls = (
             ),
           },
         }),
-    ...(fastProperty === undefined
+    ...(fastProperty === undefined || fastProperty["type"] !== "boolean"
       ? {}
       : {
           fast: {

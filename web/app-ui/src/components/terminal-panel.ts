@@ -126,6 +126,7 @@ export class TrouveTerminalPanel extends LitElement {
                 this.#view(this.#activeId)?.clearSearch();
                 this.#controlStatus = "";
               }
+              this.requestUpdate();
             }}
             @keydown=${(event: KeyboardEvent) => {
               if (event.key !== "Enter") return;
@@ -476,10 +477,9 @@ export class TrouveTerminalPanel extends LitElement {
   readonly #terminalClipboardRequested = (
     event: CustomEvent<TerminalClipboardRequestDetail>,
   ): void => {
+    if (event.detail.terminalId !== this.#activeId) return;
     this.#clipboardRequests.set(event.detail.terminalId, event.detail.text);
-    if (event.detail.terminalId === this.#activeId) {
-      this.#controlStatus = "Terminal clipboard request awaiting confirmation.";
-    }
+    this.#controlStatus = "Terminal clipboard request awaiting confirmation.";
     this.requestUpdate();
   };
 
