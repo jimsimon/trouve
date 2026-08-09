@@ -219,4 +219,16 @@ describe("activityGroupSummary", () => {
       },
     ])).toBe("Updated 1 todo");
   });
+
+  it("describes repeated same-state todo updates with their lifecycle action", () => {
+    const completed = Array.from({ length: 5 }, (_, index): AgentActivityItem => ({
+      id: `todo${index}`,
+      kind: "todo",
+      turn: 1,
+      todoId: `todo-${index}`,
+      content: `Task ${index + 1}`,
+      state: "completed",
+    }));
+    expect(activityGroupSummary(completed)).toBe("Completed 5 TODOs");
+  });
 });

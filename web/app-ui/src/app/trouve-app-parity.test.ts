@@ -6,7 +6,7 @@ const source = readFileSync(new URL("./trouve-app.ts", import.meta.url), "utf8")
 
 describe("root shell parity wiring", () => {
   it("uses the dedicated todo projection in the inspection shell", () => {
-    expect(source).toContain('import "../components/todo-plan-panel.js"');
+    expect(source).toContain('void import("../components/todo-plan-panel.js")');
     expect(source).toContain("<trouve-todo-plan-panel");
     expect(source).not.toContain(".todos=${activeView.todos}");
   });

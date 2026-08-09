@@ -149,6 +149,23 @@ const plural = (count: number, one: string, many: string): string =>
 
 /** Build the activity-group sentence used for consecutive work items. */
 export const activityGroupSummary = (items: readonly AgentActivityItem[]): string => {
+  const todoItems = items.filter((item) => item.kind === "todo");
+  const repeatedTodoState = todoItems.length > 1
+    && todoItems.length === items.length
+    && todoItems.every((item) => item.state === todoItems[0]?.state)
+      ? todoItems[0]?.state
+      : undefined;
+  if (repeatedTodoState !== undefined) {
+    const action = {
+      started: "Started",
+      completed: "Completed",
+      cancelled: "Cancelled",
+      skipped: "Skipped",
+    }[repeatedTodoState];
+    const count = new Set(todoItems.map((item) => item.todoId)).size;
+    return `${action} ${plural(count, "TODO", "TODOs")}`;
+  }
+
   const edited = new Set<string>();
   const read = new Set<string>();
   let editsWithoutPath = 0;

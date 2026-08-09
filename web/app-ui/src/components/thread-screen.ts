@@ -2359,12 +2359,28 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         continue;
       }
       if (item.kind === "todo" && !collapseTodoUpdatesWithTools) {
-        activityRows.push({
-          content: this.#renderTodoUpdate(item),
-          expandedGroup: false,
-          endsWithExpandedToolGroup: false,
-        });
-        index += 1;
+        const repeatedTodos: Extract<AgentActivityItem, { readonly kind: "todo" }>[] = [item];
+        let nextIndex = index + 1;
+        while (nextIndex < unit.items.length) {
+          const candidate = unit.items[nextIndex];
+          if (candidate?.kind !== "todo" || candidate.state !== item.state) break;
+          repeatedTodos.push(candidate);
+          nextIndex += 1;
+        }
+        if (repeatedTodos.length === 1) {
+          activityRows.push({
+            content: this.#renderTodoUpdate(item),
+            expandedGroup: false,
+            endsWithExpandedToolGroup: false,
+          });
+        } else {
+          activityRows.push({
+            content: this.#renderActivityGroup(unit, repeatedTodos, presentation),
+            expandedGroup: this.#activityGroupOpen(unit, repeatedTodos),
+            endsWithExpandedToolGroup: false,
+          });
+        }
+        index = nextIndex;
         continue;
       }
       // A live tool is the current activity, not history. Keep it as a direct

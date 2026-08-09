@@ -774,6 +774,39 @@ test("TODO lifecycle updates can collapse with sequential tool activity", async 
   await expect(group.locator(".todo-rail-item.started")).toContainText("Build the pane");
 });
 
+test("repeated TODO lifecycle updates collapse into an expandable state summary", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  await emit(page, threadEvent(16, {
+    type: "turn.started",
+    turn: 2,
+    mode: "code",
+    model: "test/model",
+  }));
+  await emit(page, threadEvent(17, {
+    type: "thread.todos_updated",
+    todos: Array.from({ length: 5 }, (_, index) => ({
+      id: `completed-${index}`,
+      content: `Completed task ${index + 1}`,
+      status: "completed" as const,
+    })),
+  }));
+
+  const group = page.locator(".activity-group").filter({
+    has: page.locator(":scope > summary", { hasText: "Completed 5 TODOs" }),
+  });
+  await expect(group).toHaveCount(1);
+  await expect(group.locator(".todo-rail-item.completed")).toBeHidden();
+  await group.locator(":scope > summary").click();
+  await expect(group.locator(".todo-rail-item.completed")).toHaveCount(5);
+  await expect(group.locator(".todo-rail-item.completed").first()).toContainText(
+    "Completed task 1",
+  );
+});
+
 test("Diff shows one changed file at a time from a diff-only file tree", async ({
   page,
 }, testInfo) => {
