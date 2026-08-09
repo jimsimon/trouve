@@ -5,7 +5,6 @@ import type {
 import { formatDownloadRate } from "../services/download-rate.js";
 
 export const CLI_POLL_INTERVAL_MS = 1_000;
-export const MAX_CLI_POLL_ATTEMPTS = 600;
 
 export const idleCliInstallStatus = (): ProtocolCliInstallStatus => ({
   status: "none",
@@ -99,6 +98,4 @@ export const pendingCliIds = (
 
 export const shouldPollCliInstalls = (
   statuses: ReadonlyMap<string, ProtocolCliInstallStatus>,
-  completedAttempts: number,
-  maxAttempts = MAX_CLI_POLL_ATTEMPTS,
-): boolean => completedAttempts < maxAttempts && pendingCliIds(statuses).length > 0;
+): boolean => pendingCliIds(statuses).length > 0;

@@ -200,13 +200,6 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
     }
   }
 
-  #refreshActiveProviderPanel(): void {
-    const panel = this.querySelector<HTMLElement & { refresh: () => Promise<void> }>(
-      "trouve-provider-settings, trouve-local-model-settings",
-    );
-    if (panel !== null) void panel.refresh();
-  }
-
   override render() {
     const services = this.#services.value;
     const store = this.#store.value;
@@ -274,7 +267,6 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                       <div class="settings-provider-shell">
                         <header class="settings-provider-header">
                           <h1 id="settings-title">Providers</h1>
-                          <button type="button" @click=${this.#refreshActiveProviderPanel}>Refresh</button>
                         </header>
                         <nav class="settings-subnav" aria-label="Provider settings">
                           ${([

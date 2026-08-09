@@ -163,8 +163,6 @@ export const configureApp = (body: {
   webhook_secret: string;
 }): Promise<Dashboard["app"]> =>
   api("/code-review/github-app", { method: "PUT", body: JSON.stringify(body) });
-export const refreshReviews = (): Promise<void> =>
-  api("/code-review/refresh", { method: "POST", body: "{}" });
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
 export const getModels = (): Promise<Model[]> => api("/models");
 export const getModeInfos = (): Promise<ModeInfo[]> => api("/mode-infos");

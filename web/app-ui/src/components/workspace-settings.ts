@@ -18,6 +18,8 @@ import {
 } from "./workspace-settings-model.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
+const AUTOMATIC_RETRY_MS = 5_000;
+
 export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
   static override styles = css`
     :host {
@@ -230,18 +232,27 @@ export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
   #refreshing = false;
   #error = "";
   #notice = "";
+  #refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   protected override firstUpdated(): void {
     void this.refresh();
   }
 
+  override disconnectedCallback(): void {
+    this.#clearRefreshTimer();
+    super.disconnectedCallback();
+  }
+
   /** Replaces the shared workspace projection with a fresh protocol snapshot. */
   async refresh(): Promise<void> {
+    if (this.#refreshing) return;
+    this.#clearRefreshTimer();
     const services = this.#services.value;
     const store = this.#store.value;
     if (services === undefined || store === undefined) {
       this.#loading = false;
       this.#error = "Workspace services are unavailable.";
+      this.#scheduleRefresh();
       this.requestUpdate();
       return;
     }
@@ -251,7 +262,8 @@ export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
     try {
       await this.#refreshStore();
     } catch {
-      this.#error = "Workspaces could not be refreshed. Check the connection and retry.";
+      this.#error = "Workspaces could not be refreshed. Retrying automatically.";
+      this.#scheduleRefresh();
     } finally {
       this.#loading = false;
       this.#refreshing = false;
@@ -279,9 +291,6 @@ export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
             <h2 id="workspace-settings-title">Workspaces</h2>
             <p>Repositories available for sessions, worktrees, modes, and automations.</p>
           </div>
-          <button type="button" aria-label="Refresh workspaces" ?disabled=${this.#refreshing || mutationBusy} @click=${() => void this.refresh()}>
-            ${this.#refreshing ? "Refreshing…" : "Refresh"}
-          </button>
         </header>
         ${services.deployment === "pwa"
           ? html`
@@ -564,6 +573,24 @@ export class TrouveWorkspaceSettings extends withSignalTracking(LitElement) {
     if (!workspaces.some((workspace) => workspace.id === this.#confirmCloseId)) {
       this.#confirmCloseId = "";
     }
+  }
+
+  #scheduleRefresh(): void {
+    if (!this.isConnected || this.#refreshTimer !== undefined) return;
+    this.#refreshTimer = globalThis.setTimeout(() => {
+      this.#refreshTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleRefresh();
+        return;
+      }
+      void this.refresh();
+    }, AUTOMATIC_RETRY_MS);
+  }
+
+  #clearRefreshTimer(): void {
+    if (this.#refreshTimer === undefined) return;
+    globalThis.clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
   }
 }
 

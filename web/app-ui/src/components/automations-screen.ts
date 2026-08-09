@@ -12,6 +12,8 @@ import type {
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { modelOptionLabel } from "./model-option-controls.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+
+const AUTOMATION_RETRY_MS = 5_000;
 import {
   AUTOMATION_DAY_NAMES,
   automationDraftFrom,
@@ -360,6 +362,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #refreshedAutomationRevision = 0;
   #pollTimer: ReturnType<typeof setInterval> | undefined;
   #deferredRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  #loadRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -393,17 +396,21 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     if (this.#deferredRefreshTimer !== undefined) {
       globalThis.clearTimeout(this.#deferredRefreshTimer);
     }
+    if (this.#loadRetryTimer !== undefined) globalThis.clearTimeout(this.#loadRetryTimer);
     this.#pollTimer = undefined;
     this.#deferredRefreshTimer = undefined;
+    this.#loadRetryTimer = undefined;
     super.disconnectedCallback();
   }
 
   /** Refreshes the automation snapshot and the templates used by this screen. */
   async refresh(): Promise<void> {
+    this.#clearLoadRetry();
     const services = this.#services.value;
     if (services === undefined) {
       this.#loading = false;
       this.#actionError = "Automation services are unavailable.";
+      this.#scheduleLoadRetry();
       this.requestUpdate();
       return;
     }
@@ -422,6 +429,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       () => {
         if (generation !== this.#loadGeneration || !this.isConnected) return;
         this.#modelsError = "Model choices could not be loaded. Existing defaults are preserved.";
+        this.#scheduleLoadRetry();
       },
     ).finally(() => {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
@@ -453,8 +461,9 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       this.#liveError = "";
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
-      this.#actionError = "Automations could not be loaded. Check the connection and retry.";
+      this.#actionError = "Automations could not be loaded. Retrying automatically.";
       this.#liveError = "Reconnect needed";
+      this.#scheduleLoadRetry();
     } finally {
       if (generation === this.#loadGeneration) {
         this.#loading = false;
@@ -483,14 +492,6 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
             <div class="automation-heading">
               <h2>Scheduled prompts</h2>
               <div class="heading-actions">
-                <button
-                  type="button"
-                  aria-label="Refresh automations"
-                  ?disabled=${this.#refreshing || this.#loading}
-                  @click=${() => void this.refresh()}
-                >${this.#refreshing
-                  ? "Refreshing…"
-                  : html`${fontAwesomeIcon("arrows-rotate")} Refresh`}</button>
                 <button
                   class="primary"
                   type="button"
@@ -924,6 +925,24 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       : this.#automations.map((candidate, candidateIndex) =>
           candidateIndex === index ? automation : candidate,
         );
+  }
+
+  #scheduleLoadRetry(): void {
+    if (!this.isConnected || this.#loadRetryTimer !== undefined) return;
+    this.#loadRetryTimer = globalThis.setTimeout(() => {
+      this.#loadRetryTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleLoadRetry();
+        return;
+      }
+      void this.refresh();
+    }, AUTOMATION_RETRY_MS);
+  }
+
+  #clearLoadRetry(): void {
+    if (this.#loadRetryTimer === undefined) return;
+    globalThis.clearTimeout(this.#loadRetryTimer);
+    this.#loadRetryTimer = undefined;
   }
 }
 

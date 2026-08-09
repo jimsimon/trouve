@@ -43,7 +43,6 @@ import {
 import { createBrowserComposerDraftController } from "../services/composer-drafts.js";
 import { createBrowserWorkspaceOrderController } from "../services/workspace-order.js";
 import { createBrowserPullRequestGroupOrderController } from "../services/pull-request-group-order.js";
-import { PullToRefreshGesture } from "../services/pull-to-refresh.js";
 import {
   appearanceFontFamilyCssValue,
   createBrowserAppearancePreferencesController,
@@ -166,6 +165,7 @@ const INSPECTION_PANELS = [
 ] as const satisfies readonly InspectionPanel[];
 
 const GITHUB_REFRESH_INTERVAL_MS = 30_000;
+const AUTOMATIC_RETRY_MS = 5_000;
 
 const INSPECTION_PANEL_LABELS: Readonly<Record<
   InspectionPanel,
@@ -380,13 +380,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionAttachments: PendingAttachment[] = [];
   #newSessionAttachmentPending = false;
   #pullRequestActionPending = false;
-  readonly #pullRefreshGesture = new PullToRefreshGesture();
-  #pullRefreshDistance = 0;
-  #pullRefreshArmed = false;
-  #pullRefreshPointerId: number | undefined;
-  #pullRefreshPending = false;
-  #pullRefreshStatus = "";
-  #pullRefreshStatusTimer: ReturnType<typeof setTimeout> | undefined;
   #collapsedWorkspaceIds = new Set<string>();
   #showArchivedWorkspaceIds = new Set<string>();
   #workspaceActionMenuId = "";
@@ -410,6 +403,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #resumePersistTimer: ReturnType<typeof setTimeout> | undefined;
   #githubRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #githubRefreshPending = false;
+  #protocolRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #hostRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #routeRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #navigationWidth = 260;
   #inspectionWidth = 460;
   #activeResize:
@@ -500,16 +496,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#flushResumePreferences();
     this.#desktopCoordinator?.stop();
     this.#browserWakeLock?.stop();
-    if (this.#pullRefreshStatusTimer !== undefined) {
-      clearTimeout(this.#pullRefreshStatusTimer);
-      this.#pullRefreshStatusTimer = undefined;
-    }
+    this.#clearAutomaticRetryTimers();
     if (this.#connectivityNoticeTimer !== undefined) {
       clearTimeout(this.#connectivityNoticeTimer);
       this.#connectivityNoticeTimer = undefined;
     }
-    this.#pullRefreshGesture.cancel();
-    this.#pullRefreshPointerId = undefined;
     this.#routeGeneration += 1;
     this.#loadedRouteKey = "";
     this.#protocolLoadStarted = false;
@@ -519,6 +510,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   async #startDesktopHost(): Promise<void> {
     if (this.#hostLoadStarted) return;
+    if (this.#hostRetryTimer !== undefined) {
+      clearTimeout(this.#hostRetryTimer);
+      this.#hostRetryTimer = undefined;
+    }
     this.#hostLoadStarted = true;
     this.#hostError = false;
     this.requestUpdate();
@@ -531,13 +526,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } catch {
       this.#hostLoadStarted = false;
       this.#hostError = true;
-      this.#shellNotice = "Desktop host unavailable; protocol actions are disabled.";
+      this.#shellNotice = "Desktop host unavailable; retrying automatically.";
+      this.#scheduleHostRetry();
       this.requestUpdate();
     }
   }
 
   #startProtocolIngress(): void {
     if (this.#protocolLoadStarted || !this.isConnected) return;
+    if (this.#protocolRetryTimer !== undefined) {
+      clearTimeout(this.#protocolRetryTimer);
+      this.#protocolRetryTimer = undefined;
+    }
     this.#protocolLoadStarted = true;
     this.#protocolReady = false;
     void this.#protocolIngress
@@ -552,8 +552,36 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.#protocolLoadStarted = false;
         this.#protocolReady = false;
         this.#protocolError = true;
+        this.#scheduleProtocolRetry();
         this.requestUpdate();
       });
+  }
+
+  #scheduleHostRetry(): void {
+    if (!this.isConnected || this.#hostRetryTimer !== undefined) return;
+    this.#hostRetryTimer = setTimeout(() => {
+      this.#hostRetryTimer = undefined;
+      if (globalThis.document?.visibilityState === "hidden") {
+        this.#scheduleHostRetry();
+        return;
+      }
+      void this.#startDesktopHost();
+    }, AUTOMATIC_RETRY_MS);
+  }
+
+  #scheduleProtocolRetry(): void {
+    if (!this.isConnected || this.#protocolRetryTimer !== undefined) return;
+    this.#protocolRetryTimer = setTimeout(() => {
+      this.#protocolRetryTimer = undefined;
+      if (
+        globalThis.document?.visibilityState === "hidden"
+        || globalThis.navigator?.onLine === false
+      ) {
+        this.#scheduleProtocolRetry();
+        return;
+      }
+      this.#startProtocolIngress();
+    }, AUTOMATIC_RETRY_MS);
   }
 
   readonly #retryProtocolAfterConnectivity = (): void => {
@@ -613,9 +641,19 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   readonly #retryProtocolAfterVisibility = (): void => {
     if (globalThis.document?.visibilityState !== "visible") return;
+    if (this.#hostError) void this.#startDesktopHost();
     this.#retryProtocolAfterConnectivity();
     if (this.#protocolReady) this.#scheduleGithubRefresh(0);
   };
+
+  #clearAutomaticRetryTimers(): void {
+    if (this.#protocolRetryTimer !== undefined) clearTimeout(this.#protocolRetryTimer);
+    if (this.#hostRetryTimer !== undefined) clearTimeout(this.#hostRetryTimer);
+    if (this.#routeRetryTimer !== undefined) clearTimeout(this.#routeRetryTimer);
+    this.#protocolRetryTimer = undefined;
+    this.#hostRetryTimer = undefined;
+    this.#routeRetryTimer = undefined;
+  }
 
   #scheduleGithubRefresh(delayMs = GITHUB_REFRESH_INTERVAL_MS): void {
     if (!this.isConnected || !this.#protocolReady) return;
@@ -642,91 +680,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       // when the full Pull Requests route has never been opened.
       await this.#protocolClient.refreshGithubPrs();
     } catch {
-      // This background refresh is intentionally quiet. The dashboard's
-      // user-initiated refresh owns actionable GitHub diagnostics.
+      // This background refresh is intentionally quiet. Projection consumers
+      // retain their last durable snapshot while the next scheduled pass
+      // retries after connectivity returns.
     } finally {
       this.#githubRefreshPending = false;
       this.#scheduleGithubRefresh();
     }
-  }
-
-  readonly #pullRefreshStarted = (event: PointerEvent): void => {
-    if (
-      deployment !== "pwa" ||
-      event.pointerType !== "touch" ||
-      event.button !== 0 ||
-      this.#pullRefreshPending
-    ) return;
-    const navigation = event.currentTarget as HTMLElement;
-    if (!this.#pullRefreshGesture.begin(event.clientX, event.clientY, navigation.scrollTop <= 0)) {
-      return;
-    }
-    this.#pullRefreshPointerId = event.pointerId;
-    try {
-      navigation.setPointerCapture(event.pointerId);
-    } catch {
-      this.#pullRefreshCancelled(event);
-    }
-  };
-
-  readonly #pullRefreshMoved = (event: PointerEvent): void => {
-    if (event.pointerId !== this.#pullRefreshPointerId) return;
-    const state = this.#pullRefreshGesture.move(event.clientX, event.clientY);
-    this.#pullRefreshDistance = state.distance;
-    this.#pullRefreshArmed = state.armed;
-    if (state.distance > 6 && event.cancelable) event.preventDefault();
-    this.requestUpdate();
-  };
-
-  readonly #pullRefreshFinished = (event: PointerEvent): void => {
-    if (event.pointerId !== this.#pullRefreshPointerId) return;
-    const refresh = this.#pullRefreshGesture.finish();
-    this.#pullRefreshPointerId = undefined;
-    this.#pullRefreshDistance = 0;
-    this.#pullRefreshArmed = false;
-    this.requestUpdate();
-    if (refresh) void this.#refreshMobileInbox();
-  };
-
-  readonly #pullRefreshCancelled = (event: PointerEvent): void => {
-    if (event.pointerId !== this.#pullRefreshPointerId) return;
-    this.#pullRefreshGesture.cancel();
-    this.#pullRefreshPointerId = undefined;
-    this.#pullRefreshDistance = 0;
-    this.#pullRefreshArmed = false;
-    this.requestUpdate();
-  };
-
-  async #refreshMobileInbox(): Promise<void> {
-    if (this.#pullRefreshPending || !this.#protocolReady) {
-      this.#setPullRefreshStatus("Refresh is unavailable while disconnected.");
-      return;
-    }
-    this.#pullRefreshPending = true;
-    this.#pullRefreshStatus = "Refreshing sessions…";
-    this.requestUpdate();
-    const results = await Promise.allSettled([
-      this.#protocolIngress.refreshProjection(),
-      this.#protocolClient.refreshGithubPrs(true),
-    ]);
-    this.#pullRefreshPending = false;
-    if (!this.isConnected) return;
-    this.#setPullRefreshStatus(
-      results.every(({ status }) => status === "fulfilled")
-        ? "Sessions refreshed."
-        : "Some session data could not be refreshed.",
-    );
-  }
-
-  #setPullRefreshStatus(status: string): void {
-    this.#pullRefreshStatus = status;
-    if (this.#pullRefreshStatusTimer !== undefined) clearTimeout(this.#pullRefreshStatusTimer);
-    this.#pullRefreshStatusTimer = setTimeout(() => {
-      this.#pullRefreshStatusTimer = undefined;
-      this.#pullRefreshStatus = "";
-      this.requestUpdate();
-    }, 2_500);
-    this.requestUpdate();
   }
 
   async #loadDesktopHost(): Promise<void> {
@@ -1152,6 +1112,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       return;
     }
     if (route.kind !== "session") {
+      if (this.#routeRetryTimer !== undefined) {
+        clearTimeout(this.#routeRetryTimer);
+        this.#routeRetryTimer = undefined;
+      }
       if (this.#loadedRouteKey !== "") {
         this.#loadedRouteKey = "";
         this.#threadIngress.close();
@@ -1175,6 +1139,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   async #loadRoute(route: Extract<AppRoute, { kind: "session" }>): Promise<void> {
+    if (this.#routeRetryTimer !== undefined) {
+      clearTimeout(this.#routeRetryTimer);
+      this.#routeRetryTimer = undefined;
+    }
     const generation = ++this.#routeGeneration;
     this.#routeLoading = true;
     this.#routeError = "";
@@ -1191,6 +1159,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } catch {
       if (generation === this.#routeGeneration) {
         this.#routeError = "This session could not be loaded.";
+        this.#scheduleRouteRetry(route);
       }
     } finally {
       if (generation === this.#routeGeneration) {
@@ -1198,6 +1167,28 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.requestUpdate();
       }
     }
+  }
+
+  #scheduleRouteRetry(route: Extract<AppRoute, { kind: "session" }>): void {
+    if (!this.isConnected || this.#routeRetryTimer !== undefined) return;
+    this.#routeRetryTimer = setTimeout(() => {
+      this.#routeRetryTimer = undefined;
+      const current = readSignal(this.#router.route);
+      if (
+        current.kind !== "session"
+        || current.sessionId !== route.sessionId
+        || current.threadId !== route.threadId
+      ) return;
+      if (
+        globalThis.document?.visibilityState === "hidden"
+        || globalThis.navigator?.onLine === false
+      ) {
+        this.#scheduleRouteRetry(route);
+        return;
+      }
+      this.#loadedRouteKey = "";
+      this.requestUpdate();
+    }, AUTOMATIC_RETRY_MS);
   }
 
   #selectInspection(panel: InspectionPanel): void {
@@ -2246,23 +2237,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         <nav
           class="navigation-panel"
           aria-label="Workspaces and sessions"
-          style=${deployment === "pwa"
-            ? `--trouve-pull-refresh-distance:${this.#pullRefreshDistance}px`
-            : nothing}
-          @pointerdown=${this.#pullRefreshStarted}
-          @pointermove=${this.#pullRefreshMoved}
-          @pointerup=${this.#pullRefreshFinished}
-          @pointercancel=${this.#pullRefreshCancelled}
         >
-          ${deployment !== "pwa"
-            ? nothing
-            : html`<div
-                class="pwa-pull-refresh ${this.#pullRefreshPending ? "pending" : this.#pullRefreshArmed ? "armed" : ""}"
-                aria-hidden="true"
-              >${this.#pullRefreshPending
-                ? "Refreshing…"
-                : this.#pullRefreshArmed ? "Release to refresh" : "Pull to refresh"}</div>
-              <p class="visually-hidden" role="status" aria-live="polite">${this.#pullRefreshStatus}</p>`}
           <div class="primary-links" aria-label="Application sections">
             <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}<strong>Pull Requests</strong></button>
             <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}<strong>Automations</strong></button>
@@ -2270,14 +2245,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           </div>
           <div class="workspace-list-heading">
             <strong>Workspaces</strong>
-            ${deployment === "pwa"
-              ? html`<button
-                  class="pwa-refresh-button"
-                  type="button"
-                  ?disabled=${this.#pullRefreshPending || !this.#protocolReady}
-                  @click=${() => void this.#refreshMobileInbox()}
-                >${this.#pullRefreshPending ? "Refreshing…" : "Refresh"}</button>`
-              : nothing}
             <button
               class="command-palette-compact"
               type="button"
@@ -2475,7 +2442,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       )}
                 ></trouve-thread-screen>
               `
-            : html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Unable to load session</strong><span>${this.#routeError}</span><button type="button" @click=${() => { this.#loadedRouteKey = ""; this.requestUpdate(); }}>Retry</button></div></section>`
+            : html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Unable to load session</strong><span>${this.#routeError}</span><span>Retrying automatically.</span></div></section>`
           : route.kind === "settings"
             ? html`<trouve-settings-screen
                 class="thread-panel"
@@ -2489,7 +2456,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             : route.kind === "not-found"
               ? html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Page not found</strong><button type="button" @click=${() => this.#router.navigate({ kind: "inbox" }, true)}>Return to sessions</button></div></section>`
               : this.#protocolError
-                ? html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Could not connect</strong><span>The frontend will reconnect when the server is available.</span><button type="button" @click=${() => this.#startProtocolIngress()}>Retry connection</button></div></section>`
+                ? html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Could not connect</strong><span>The frontend will reconnect automatically when the server is available.</span></div></section>`
                 : html`<trouve-thread-screen
                     class="thread-panel"
                     aria-label="No active session"
@@ -2854,13 +2821,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           <span class="online-dot ${this.#protocolError || this.#hostError || serverOffline ? "offline" : ""}"></span><span class="status-copy">${connectionLabel}</span><span class="status-spacer"></span>
           ${this.#connectivityNotice === "" ? nothing : html`<span class="status-copy" role="status" aria-live="polite">${this.#connectivityNotice}</span>`}
           ${this.#shellNotice === "" ? nothing : html`<span class="status-copy" role="status">${this.#shellNotice}</span>`}
-          ${this.#hostError
-            ? html`<button
-                class="update-action"
-                type="button"
-                @click=${() => void this.#startDesktopHost()}
-              >Retry desktop host</button>`
-            : nothing}
           ${this.#pwaActivate === undefined
             ? nothing
             : html`<button

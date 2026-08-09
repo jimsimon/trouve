@@ -26,6 +26,8 @@ import {
   type ReviewerPromptMode,
 } from "./code-review-configuration-model.js";
 
+const CONFIGURATION_RETRY_MS = 5_000;
+
 export interface CodeReviewConfigurationChangeDetail {
   readonly kind: "github-app" | "repository" | "reviewer" | "reviewer-delete";
   readonly id?: string;
@@ -255,10 +257,12 @@ export class TrouveCodeReviewConfiguration extends LitElement {
   #noticeIsError = false;
   #confirmDeleteReviewer = "";
   #loadGeneration = 0;
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
 
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
     this.#loadedServices = undefined;
+    this.#clearRetry();
     super.disconnectedCallback();
   }
 
@@ -278,8 +282,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     if (this.#app === undefined) {
       return html`
         <div class="settings-card" role="alert">
-          Code-review configuration could not be loaded.
-          <button type="button" @click=${() => void this.#load()}>Retry</button>
+          Code-review configuration could not be loaded. Retrying automatically.
         </div>
       `;
     }
@@ -294,15 +297,12 @@ export class TrouveCodeReviewConfiguration extends LitElement {
             <h2 id="code-review-configuration-title">Code review</h2>
             <p>Configure the GitHub App, repository policies, and focused reviewer personas.</p>
           </div>
-          <button type="button" ?disabled=${this.#loading || this.#busy !== ""} @click=${() => void this.#load()}>
-            ${this.#loading ? "Refreshing…" : "Refresh"}
-          </button>
         </header>
         <p class=${`notice${this.#noticeIsError ? " error" : ""}`} role=${this.#noticeIsError ? "alert" : "status"} aria-live="polite">
           ${this.#notice}
         </p>
         ${this.#modelsUnavailable
-          ? html`<p class="model-warning" role="note">Model choices could not be loaded. Existing model ids remain editable; use Refresh to try again.</p>`
+          ? html`<p class="model-warning" role="note">Model choices could not be loaded. Existing model ids remain editable while trouve retries automatically.</p>`
           : nothing}
         ${this.#renderGithubApp(this.#app)}
         ${this.#renderRepositories()}
@@ -339,7 +339,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
           <div><dt>Rate limit reset</dt><dd>${formatTimestamp(app.rate_limit_reset_at)}</dd></div>
         </dl>
         ${this.#appNeedsAttention
-          ? html`<p class="model-warning" role="alert">The GitHub App reported a problem. Recheck its permissions and credentials, then save or refresh.</p>`
+          ? html`<p class="model-warning" role="alert">The GitHub App reported a problem. Recheck its permissions and credentials; status updates automatically.</p>`
           : nothing}
         <form @submit=${(event: SubmitEvent) => void this.#configureGithubApp(event)}>
           <div class="form-grid">
@@ -645,6 +645,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
   async #load(): Promise<void> {
     const services = this.#services.value;
     if (services === undefined) return;
+    this.#clearRetry();
     const generation = ++this.#loadGeneration;
     this.#loading = true;
     this.requestUpdate();
@@ -665,6 +666,10 @@ export class TrouveCodeReviewConfiguration extends LitElement {
       this.#reviewers = dashboard.reviewers;
       this.#models = modelResult.models;
       this.#modelsUnavailable = modelResult.unavailable;
+      if (modelResult.unavailable) this.#scheduleRetry();
+      if (this.#notice === "Code-review configuration could not be loaded. Retrying automatically.") {
+        this.#setNotice("", false);
+      }
       this.#repositoryDrafts = new Map(dashboard.repositories.map((repository) => [
         repositoryKey(repository),
         repositoryDraft(repository),
@@ -678,9 +683,31 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
       this.#loading = false;
-      this.#setNotice("Code-review configuration could not be loaded. Try again.", true);
+      this.#setNotice("Code-review configuration could not be loaded. Retrying automatically.", true);
+      this.#scheduleRetry();
     }
     this.requestUpdate();
+  }
+
+  #scheduleRetry(): void {
+    if (!this.isConnected || this.#retryTimer !== undefined) return;
+    this.#retryTimer = globalThis.setTimeout(() => {
+      this.#retryTimer = undefined;
+      if (
+        this.#busy !== ""
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) {
+        this.#scheduleRetry();
+        return;
+      }
+      void this.#load();
+    }, CONFIGURATION_RETRY_MS);
+  }
+
+  #clearRetry(): void {
+    if (this.#retryTimer === undefined) return;
+    globalThis.clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
   }
 
   async #configureGithubApp(event: SubmitEvent): Promise<void> {

@@ -5,12 +5,13 @@ import { describe, expect, it } from "vitest";
 describe("thread composer and queue integration", () => {
   const screen = readFileSync(new URL("./thread-screen.ts", import.meta.url), "utf8");
 
-  it("shows explicit completion loading, empty, unavailable, and retry states", () => {
+  it("shows explicit completion loading, empty, unavailable, and automatic retry states", () => {
     expect(screen).toContain("Loading workspace files…");
     expect(screen).toContain("Slash commands are unavailable for this thread.");
     expect(screen).toContain("No matching workspace files.");
     expect(screen).toContain("File suggestions are unavailable.");
-    expect(screen).toContain("#retryMentionPaths");
+    expect(screen).toContain("#scheduleMentionPathsRetry(sessionId)");
+    expect(screen).toContain("trouve will retry automatically");
     expect(screen).toContain("generation !== this.#pathsGeneration");
     expect(screen).toContain("isComposerCompletionTokenCurrent");
     expect(screen).toContain("sourceStillContainsValue");

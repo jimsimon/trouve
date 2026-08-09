@@ -39,6 +39,8 @@ type PrReaction = NonNullable<PrComment["reactions"]>[number];
 type PrActor = NonNullable<ProtocolPrDetail["assignees"]>[number];
 type PrReview = NonNullable<ProtocolPrDetail["reviews"]>[number];
 
+const AUTOMATIC_RETRY_MS = 5_000;
+
 const detailSectionForTab = (tab: PrTab): ProtocolPrDetailSection =>
   tab === "checks" ? "overview" : tab;
 
@@ -382,11 +384,15 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
   #fileDiffLoading = false;
   #fileDiffError = "";
   #diffMode: DiffMode = "unified";
+  #loadRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #detailRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #fileDiffRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
     this.#detailGeneration += 1;
     this.#fileDiffGeneration += 1;
+    this.#clearRetryTimers();
     this.#loadedServices = undefined;
     this.#loadedSessionId = "";
     super.disconnectedCallback();
@@ -448,7 +454,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
                 ${this.#loading && prs.length === 0
                   ? html`<div class="empty pr-empty" role="status">Looking for pull requests…</div>`
                   : this.#loadError && prs.length === 0
-                    ? html`<div class="empty pr-empty"><strong>Pull requests unavailable</strong><span>Retry when the server connection or GitHub configuration is ready.</span></div>`
+                    ? html`<div class="empty pr-empty"><strong>Pull requests unavailable</strong><span>trouve will retry automatically when the server connection and GitHub configuration are ready.</span></div>`
                     : prs.length === 0
                       ? html`<div class="empty pr-empty"><span>No pull requests are associated with this session yet.</span></div>`
                       : selectedPr === undefined
@@ -517,14 +523,6 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
                 if (pullRequestsHref !== undefined) this.#openExternal(pullRequestsHref);
               }}
             >${fontAwesomeIcon("arrow-up-right-from-square")}</button>
-            <button
-              class="icon-button"
-              type="button"
-              title="Refresh pull requests"
-              aria-label="Refresh pull requests"
-              ?disabled=${this.#loading || this.#busy !== ""}
-              @click=${() => void this.#load(true)}
-            >${fontAwesomeIcon("arrows-rotate")}</button>
           </div>
         </div>
         ${prs.length > 1
@@ -555,9 +553,6 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
         aria-live="polite"
       >
         <span>${this.#notice}</span>
-        ${this.#loadError
-          ? html`<button type="button" ?disabled=${this.#loading} @click=${() => void this.#load(true)}>Retry</button>`
-          : nothing}
       </div>
     `;
   }
@@ -684,6 +679,10 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     const number = this.#selectedPrNumber;
     if (services === undefined || sessionId === "" || number === undefined || path === "") return;
     const generation = ++this.#fileDiffGeneration;
+    if (this.#fileDiffRetryTimer !== undefined) {
+      globalThis.clearTimeout(this.#fileDiffRetryTimer);
+      this.#fileDiffRetryTimer = undefined;
+    }
     this.#fileDiffLoading = true;
     this.#fileDiffError = "";
     this.requestUpdate();
@@ -702,6 +701,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
       this.#fileDiffError = cause instanceof Error
         ? cause.message
         : "The selected file could not be loaded.";
+      this.#scheduleFileDiffRetry(path);
     } finally {
       if (generation === this.#fileDiffGeneration) {
         this.#fileDiffLoading = false;
@@ -1070,7 +1070,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
                             <strong>File diff unavailable</strong>
                             <p>${this.#fileDiffError}</p>
                             <div class="actions">
-                              <button type="button" @click=${() => void this.#loadFileDiff(selected.path)}>Retry</button>
+                              <span>Retrying automatically.</span>
                               ${filesHref === undefined ? nothing : html`<button class="icon-button" type="button" title="Open files on GitHub" aria-label="Open files on GitHub" @click=${() => this.#openExternal(filesHref)}>${fontAwesomeIcon("arrow-up-right-from-square")}</button>`}
                             </div>
                           </div>`
@@ -1334,11 +1334,15 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     return projected.length > 0 || this.#prs.length === 0 ? projected : this.#prs;
   }
 
-  async #load(refresh = false): Promise<void> {
+  async #load(): Promise<void> {
     const services = this.#services.value;
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "") return;
     const generation = ++this.#loadGeneration;
+    if (this.#loadRetryTimer !== undefined) {
+      globalThis.clearTimeout(this.#loadRetryTimer);
+      this.#loadRetryTimer = undefined;
+    }
     this.#loading = true;
     this.requestUpdate();
     try {
@@ -1350,11 +1354,6 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
         return;
       }
       this.#repositorySetupRequired = false;
-      if (refresh) {
-        await services.protocol.refreshGithubPrs(true);
-        const projection = await services.protocol.serverProjectionSnapshot();
-        this.#store.value?.replaceServerProjection(projection.cursor, projection.value);
-      }
       if (!this.#loadIsCurrent(generation, sessionId)) return;
       this.#loadError = false;
       if (this.#noticeIsError) this.#setNotice("", false);
@@ -1366,7 +1365,8 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
         this.#clearPrStateForSetup();
       } else {
         this.#loadError = true;
-        this.#setNotice("Pull requests could not be loaded. Check the server connection and retry.", true);
+        this.#setNotice("Pull requests could not be loaded. trouve will retry automatically.", true);
+        this.#scheduleLoadRetry();
       }
     } finally {
       if (this.#loadIsCurrent(generation, sessionId)) {
@@ -1403,6 +1403,10 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "") return;
     const generation = ++this.#detailGeneration;
+    if (this.#detailRetryTimer !== undefined) {
+      globalThis.clearTimeout(this.#detailRetryTimer);
+      this.#detailRetryTimer = undefined;
+    }
     this.#detailLoading = true;
     this.requestUpdate();
     try {
@@ -1425,6 +1429,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
       if (generation !== this.#detailGeneration || sessionId !== this.#effectiveSessionId) return;
       this.#detail = undefined;
       this.#setNotice(cause instanceof Error ? cause.message : "Pull request detail could not be loaded.", true);
+      this.#scheduleDetailRetry(number, section);
     } finally {
       if (generation === this.#detailGeneration && sessionId === this.#effectiveSessionId) {
         this.#detailLoading = false;
@@ -1710,6 +1715,58 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     services.router.navigate({ ...route, inspection: "terminal" });
   };
 
+  #scheduleLoadRetry(): void {
+    if (this.#loadRetryTimer !== undefined) return;
+    this.#loadRetryTimer = globalThis.setTimeout(() => {
+      this.#loadRetryTimer = undefined;
+      if (!this.isConnected) return;
+      if (globalThis.document?.visibilityState === "hidden") {
+        this.#scheduleLoadRetry();
+        return;
+      }
+      void this.#load();
+    }, AUTOMATIC_RETRY_MS);
+  }
+
+  #scheduleDetailRetry(number: number, section: ProtocolPrDetailSection): void {
+    if (this.#detailRetryTimer !== undefined) return;
+    this.#detailRetryTimer = globalThis.setTimeout(() => {
+      this.#detailRetryTimer = undefined;
+      if (!this.isConnected || number !== this.#selectedPrNumber) return;
+      if (globalThis.document?.visibilityState === "hidden") {
+        this.#scheduleDetailRetry(number, section);
+        return;
+      }
+      void this.#loadDetail(number, section);
+    }, AUTOMATIC_RETRY_MS);
+  }
+
+  #scheduleFileDiffRetry(path: string): void {
+    if (this.#fileDiffRetryTimer !== undefined) return;
+    this.#fileDiffRetryTimer = globalThis.setTimeout(() => {
+      this.#fileDiffRetryTimer = undefined;
+      if (!this.isConnected || path !== this.#selectedFilePath) return;
+      if (globalThis.document?.visibilityState === "hidden") {
+        this.#scheduleFileDiffRetry(path);
+        return;
+      }
+      void this.#loadFileDiff(path);
+    }, AUTOMATIC_RETRY_MS);
+  }
+
+  #clearRetryTimers(): void {
+    for (const timer of [
+      this.#loadRetryTimer,
+      this.#detailRetryTimer,
+      this.#fileDiffRetryTimer,
+    ]) {
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+    }
+    this.#loadRetryTimer = undefined;
+    this.#detailRetryTimer = undefined;
+    this.#fileDiffRetryTimer = undefined;
+  }
+
   #loadIsCurrent(generation: number, sessionId: string): boolean {
     return generation === this.#loadGeneration
       && this.isConnected
@@ -1717,6 +1774,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
   }
 
   #resetSessionState(): void {
+    this.#clearRetryTimers();
     this.#fileDiffGeneration += 1;
     this.#prs = [];
     this.#detail = undefined;

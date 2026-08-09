@@ -23,6 +23,7 @@ import "./terminal-view.js";
 
 const INITIAL_COLS = 100;
 const INITIAL_ROWS = 28;
+const TERMINAL_RETRY_MS = 5_000;
 
 export class TrouveTerminalPanel extends LitElement {
   static override properties = {
@@ -51,6 +52,7 @@ export class TrouveTerminalPanel extends LitElement {
   readonly #streams = new Map<string, TerminalOutputStream>();
   readonly #pendingOutput = new Map<string, string>();
   readonly #resizeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -89,6 +91,7 @@ export class TrouveTerminalPanel extends LitElement {
     this.#disposeStreams();
     for (const timer of this.#resizeTimers.values()) clearTimeout(timer);
     this.#resizeTimers.clear();
+    this.#clearRetry();
     super.disconnectedCallback();
   }
 
@@ -97,7 +100,7 @@ export class TrouveTerminalPanel extends LitElement {
       return html`<div class="screen-empty" role="status"><span>Loading terminals…</span></div>`;
     }
     if (this.#error !== "" && this.#terminals.length === 0) {
-      return html`<div class="screen-empty" role="alert"><strong>Unable to load terminals</strong><span>${this.#error}</span><button type="button" @click=${() => this.#load()}>Retry</button></div>`;
+      return html`<div class="screen-empty" role="alert"><strong>Unable to load terminals</strong><span>${this.#error}</span><span>Retrying automatically.</span></div>`;
     }
     const clipboardRequest = this.#clipboardRequests.get(this.#activeId);
     const activeNotice = this.#notices.get(this.#activeId) ?? "";
@@ -210,6 +213,7 @@ export class TrouveTerminalPanel extends LitElement {
     const generation = ++this.#generation;
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "") return;
+    this.#clearRetry();
     this.#disposeStreams();
     this.#loading = true;
     this.#error = "";
@@ -244,7 +248,10 @@ export class TrouveTerminalPanel extends LitElement {
       this.#terminalProvider.setValue({ terminalId: this.#activeId });
       for (const terminal of terminals) this.#follow(terminal);
     } catch {
-      if (generation === this.#generation) this.#error = "The terminal request failed.";
+      if (generation === this.#generation) {
+        this.#error = "The terminal request failed.";
+        this.#scheduleRetry();
+      }
     } finally {
       if (generation === this.#generation) {
         this.#loading = false;
@@ -254,6 +261,24 @@ export class TrouveTerminalPanel extends LitElement {
         }
       }
     }
+  }
+
+  #scheduleRetry(): void {
+    if (!this.isConnected || this.#retryTimer !== undefined) return;
+    this.#retryTimer = globalThis.setTimeout(() => {
+      this.#retryTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleRetry();
+        return;
+      }
+      void this.#load();
+    }, TERMINAL_RETRY_MS);
+  }
+
+  #clearRetry(): void {
+    if (this.#retryTimer === undefined) return;
+    globalThis.clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
   }
 
   async #open(createNew: boolean): Promise<void> {

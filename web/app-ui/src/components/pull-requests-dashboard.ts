@@ -34,7 +34,7 @@ export interface PullRequestFixDetail extends PullRequestChatDetail {
 
 type ReviewsView = "pull-requests" | "operations";
 const GROUP_DRAG_TYPE = "application/x-trouve-pull-request-group";
-const REFRESH_INTERVAL_MS = 30_000;
+const INTEGRATION_RETRY_MS = 5_000;
 
 const errorMessage = (cause: unknown, fallback: string): string =>
   cause instanceof Error && cause.message.trim() !== "" ? cause.message : fallback;
@@ -448,7 +448,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
   #view: ReviewsView = "pull-requests";
   #integration: ProtocolGithubIntegration | undefined;
   #integrationLoading = true;
-  #refreshing = false;
   #error = "";
   #repository = "";
   #collapsed = new Set<PullRequestGroupKey>();
@@ -460,8 +459,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
   #copyTimer: ReturnType<typeof setTimeout> | undefined;
   #clock = Date.now();
   #clockBucket = Math.floor(this.#clock / 5_000);
-  #lastRefreshAt: number | undefined;
-  #nextRefreshAt = 0;
+  #integrationRetryAt = 0;
   #tickTimer: ReturnType<typeof setInterval> | undefined;
 
   protected override firstUpdated(): void {
@@ -536,7 +534,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
           : html`<div
               id="pull-request-inbox-panel"
               class="account-scroll"
-              aria-busy=${this.#refreshing || this.#integrationLoading}
+              aria-busy=${this.#integrationLoading}
             >
               <div class="account-body">
                 <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
@@ -548,7 +546,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                     ? html`<div class="setup" role="alert">
                         <strong>GitHub integration status is unavailable</strong>
                         <p>${this.#error}</p>
-                        <button class="control" type="button" @click=${() => void this.#initialize()}>Retry</button>
+                        <p>trouve will retry automatically when the server is available.</p>
                       </div>`
                     : !configured
                     ? html`<div class="setup">
@@ -574,12 +572,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                               ${repositoryOptions.map((key) => html`<option value=${key}>${key}</option>`)}
                             </select>
                           </label>
-                          <button
-                            class="control manual-refresh"
-                            type="button"
-                            ?disabled=${this.#refreshing || this.#integrationLoading || offline}
-                            @click=${() => void this.#refresh(true)}
-                          >${this.#refreshing ? "Refreshing…" : "Refresh"}</button>
                           <span class="refresh-status" role="status">${refreshStatus}</span>
                         </div>
                         <div class="groups-grid">
@@ -753,29 +745,12 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     try {
       this.#integration = await protocol.githubIntegration();
       this.#error = "";
+      this.#integrationRetryAt = 0;
     } catch (cause) {
       this.#error = errorMessage(cause, "GitHub integration status could not be loaded.");
+      this.#integrationRetryAt = Date.now() + INTEGRATION_RETRY_MS;
     } finally {
       this.#integrationLoading = false;
-      this.requestUpdate();
-    }
-    if (integrationConfigured(this.#integration)) await this.#refresh();
-  }
-
-  async #refresh(force = false): Promise<void> {
-    const protocol = this.#services.value?.protocol;
-    if (protocol === undefined || this.#refreshing) return;
-    this.#refreshing = true;
-    this.#error = "";
-    this.#nextRefreshAt = Date.now() + REFRESH_INTERVAL_MS;
-    this.requestUpdate();
-    try {
-      await protocol.refreshGithubPrs(force);
-      this.#lastRefreshAt = Date.now();
-    } catch (cause) {
-      this.#error = errorMessage(cause, "Pull requests could not be refreshed.");
-    } finally {
-      this.#refreshing = false;
       this.requestUpdate();
     }
   }
@@ -786,13 +761,13 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     const store = this.#store.value;
     const online = store === undefined || readSignal(store.serverInfo)?.online !== false;
     if (
-      this.#nextRefreshAt !== 0 &&
-      this.#clock >= this.#nextRefreshAt &&
-      integrationConfigured(this.#integration) &&
+      this.#integration === undefined &&
+      this.#integrationRetryAt !== 0 &&
+      this.#clock >= this.#integrationRetryAt &&
       online &&
-      !this.#refreshing
+      !this.#integrationLoading
     ) {
-      void this.#refresh();
+      void this.#initialize();
     }
     if (clockBucket !== this.#clockBucket) {
       this.#clockBucket = clockBucket;
@@ -804,23 +779,13 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     const snapshotMilliseconds = snapshotTimes
       .map((value) => Date.parse(value))
       .filter(Number.isFinite);
-    const last = Math.max(this.#lastRefreshAt ?? Number.NEGATIVE_INFINITY, ...snapshotMilliseconds);
-    const nextSeconds = this.#nextRefreshAt === 0
-      ? undefined
-      : Math.max(0, Math.round((this.#nextRefreshAt - this.#clock) / 1_000));
+    const last = Math.max(Number.NEGATIVE_INFINITY, ...snapshotMilliseconds);
     if (!Number.isFinite(last)) {
-      if (this.#refreshing) {
-        return nextSeconds === undefined
-          ? "Refreshing for the first time"
-          : `Refreshing for the first time, next refresh in ${nextSeconds} seconds`;
-      }
-      return "Not refreshed yet";
+      return "Waiting for the first automatic refresh";
     }
     const age = Math.max(0, Math.floor((this.#clock - last) / 1_000));
     const ageLabel = age === 1 ? "1 second ago" : `${age} seconds ago`;
-    return nextSeconds === undefined
-      ? `Last refreshed ${ageLabel}`
-      : `Last refreshed ${ageLabel}, next refresh in ${nextSeconds} seconds`;
+    return `Last refreshed ${ageLabel}`;
   }
 
   #selectView(view: ReviewsView): void {

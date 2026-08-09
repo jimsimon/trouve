@@ -423,6 +423,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #pathsLoadedAt = 0;
   #pathsRetryAfter = 0;
   #pathsGeneration = 0;
+  #pathsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #sessionUsage: ProtocolUsageSummary | undefined;
   #usageRequestKey = "";
   #usageResolvedKey = "";
@@ -489,6 +490,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pathsUnavailableSessionId = "";
       this.#pathsLoadedAt = 0;
       this.#pathsRetryAfter = 0;
+      this.#clearMentionPathsRetry();
       this.#completionSelected = 0;
       this.#completionDismissed = false;
       this.#queueEditId = "";
@@ -798,6 +800,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
+    this.#clearMentionPathsRetry();
     this.#clearChatScrollIntent();
     this.#clearQueueDragImage();
     this.#markdownContextMenu = undefined;
@@ -1502,12 +1505,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : completion.searching
             ? html`<p class="composer-completion-status" role="status">Searching suggestions…</p>`
           : completion.unavailable && completion.matches.length === 0
-            ? html`
-                <div class="composer-completion-status completion-error" role="status">
-                  <span>File suggestions are unavailable.</span>
-                  <button type="button" @click=${this.#retryMentionPaths}>Retry</button>
-                </div>
-              `
+            ? html`<p class="composer-completion-status completion-error" role="status">File suggestions are unavailable. trouve will retry automatically.</p>`
             : completion.matches.length === 0
               ? html`<p class="composer-completion-status" role="status">${completion.emptyMessage}</p>`
               : nothing}
@@ -5310,14 +5308,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) void this.#ensureSessionPaths();
   }
 
-  readonly #retryMentionPaths = (): void => {
-    if (this.sessionId === "" || this.#pathsLoadingSessionId === this.sessionId) return;
-    this.#pathsUnavailableSessionId = "";
-    this.#pathsRetryAfter = 0;
-    this.#pathsLoadedAt = 0;
-    void this.#ensureSessionPaths();
-  };
-
   async #ensureSessionPaths(): Promise<void> {
     const protocol = this.#services.value?.protocol;
     const sessionId = this.sessionId;
@@ -5342,16 +5332,35 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pathsSessionId = sessionId;
       this.#pathsLoadedAt = Date.now();
       this.#pathsRetryAfter = 0;
+      this.#clearMentionPathsRetry();
     } catch {
       if (generation !== this.#pathsGeneration || this.sessionId !== sessionId) return;
       this.#pathsUnavailableSessionId = sessionId;
       this.#pathsRetryAfter = Date.now() + PATH_REFRESH_INTERVAL_MS;
+      this.#scheduleMentionPathsRetry(sessionId);
     } finally {
       if (generation === this.#pathsGeneration) {
         this.#pathsLoadingSessionId = "";
         this.requestUpdate();
       }
     }
+  }
+
+  #scheduleMentionPathsRetry(sessionId: string): void {
+    this.#clearMentionPathsRetry();
+    this.#pathsRetryTimer = globalThis.setTimeout(() => {
+      this.#pathsRetryTimer = undefined;
+      const token = composerCompletionToken(this.#composerDraft, this.#composerCursor);
+      if (!this.isConnected || this.sessionId !== sessionId || token?.kind !== "file") return;
+      this.#pathsRetryAfter = 0;
+      void this.#ensureSessionPaths();
+    }, PATH_REFRESH_INTERVAL_MS);
+  }
+
+  #clearMentionPathsRetry(): void {
+    if (this.#pathsRetryTimer === undefined) return;
+    globalThis.clearTimeout(this.#pathsRetryTimer);
+    this.#pathsRetryTimer = undefined;
   }
 
   #applyComposerCompletion(token: ComposerCompletionToken, value: string): void {

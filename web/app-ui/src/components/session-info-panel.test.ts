@@ -22,9 +22,9 @@ describe("session information overview", () => {
     expect(source).not.toContain("services.protocol.sessionDiff(sessionId)");
     expect(source).toContain("services.protocol.sessionMcpServers(sessionId)");
     expect(source).not.toContain("services.protocol.sessionPrs(sessionId)");
-    expect(source).toContain("services.protocol.refreshGithubPrs(true)");
-    expect(source).toContain("services.protocol.serverProjectionSnapshot()");
-    expect(source).toContain("replaceServerProjection(projection.cursor, projection.value)");
+    expect(source).not.toContain("services.protocol.refreshGithubPrs(true)");
+    expect(source).toContain("RESOURCE_REFRESH_MS");
+    expect(source).toContain("void this.#refreshResources()");
   });
 
   it("keeps navigation to the detailed diff and pull-request surfaces", () => {

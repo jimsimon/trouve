@@ -35,6 +35,8 @@ import {
   type NewThreadSetupSubmitDetail,
 } from "./new-thread-setup-model.js";
 import "./image-preview.js";
+
+const OPTIONS_RETRY_MS = 5_000;
 import "./model-picker.js";
 
 export const NEW_THREAD_SETUP_SUBMIT_EVENT = "trouve-new-thread-submit" as const;
@@ -252,6 +254,7 @@ export class TrouveNewThreadSetup extends LitElement {
   #loadGeneration = 0;
   #attachmentGeneration = 0;
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
+  #optionsRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -283,6 +286,10 @@ export class TrouveNewThreadSetup extends LitElement {
     this.#attachmentGeneration += 1;
     this.#loadedWorkspaceId = "";
     this.#optionsLoading = false;
+    if (this.#optionsRetryTimer !== undefined) {
+      globalThis.clearTimeout(this.#optionsRetryTimer);
+      this.#optionsRetryTimer = undefined;
+    }
     super.disconnectedCallback();
   }
 
@@ -484,12 +491,7 @@ export class TrouveNewThreadSetup extends LitElement {
           : nothing}
         ${this.#optionsError === ""
           ? nothing
-          : html`
-              <div class="notice-row">
-                <p id="new-thread-options-error" class="notice warning" role="status">${this.#optionsError}</p>
-                <button type="button" ?disabled=${this.busy} @click=${this.#retryOptions}>Retry</button>
-              </div>
-            `}
+          : html`<p id="new-thread-options-error" class="notice warning" role="status">${this.#optionsError}</p>`}
         ${this.#attachmentError === "" && this.#internalError === "" && this.errorMessage === ""
           ? nothing
           : html`<p id="new-thread-error" class="notice error" role="alert">${this.errorMessage || this.#internalError || this.#attachmentError}</p>`}
@@ -521,6 +523,10 @@ export class TrouveNewThreadSetup extends LitElement {
     const services = this.#services.value;
     const workspaceId = this.#effectiveWorkspaceId;
     if (services === undefined || workspaceId === "") return;
+    if (this.#optionsRetryTimer !== undefined) {
+      globalThis.clearTimeout(this.#optionsRetryTimer);
+      this.#optionsRetryTimer = undefined;
+    }
     const generation = ++this.#loadGeneration;
     this.#loadedWorkspaceId = workspaceId;
     this.#optionsLoading = true;
@@ -570,7 +576,8 @@ export class TrouveNewThreadSetup extends LitElement {
         attachments: this.#draft.attachments,
       };
       this.#optionsError =
-        "Mode and model choices could not be loaded. Server defaults remain available.";
+        "Mode and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
+      this.#scheduleOptionsRetry();
     } finally {
       if (generation === this.#loadGeneration && workspaceId === this.#effectiveWorkspaceId) {
         this.#optionsLoading = false;
@@ -579,10 +586,18 @@ export class TrouveNewThreadSetup extends LitElement {
     }
   }
 
-  readonly #retryOptions = (): void => {
-    this.#loadedWorkspaceId = "";
-    void this.#loadOptions();
-  };
+  #scheduleOptionsRetry(): void {
+    if (!this.isConnected || this.#optionsRetryTimer !== undefined) return;
+    this.#optionsRetryTimer = globalThis.setTimeout(() => {
+      this.#optionsRetryTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleOptionsRetry();
+        return;
+      }
+      this.#loadedWorkspaceId = "";
+      void this.#loadOptions();
+    }, OPTIONS_RETRY_MS);
+  }
 
   readonly #modeChanged = (event: Event): void => {
     this.#draft = selectNewThreadMode(

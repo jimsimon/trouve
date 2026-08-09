@@ -36,6 +36,9 @@ import {
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./code-review-configuration.js";
 
+const CODE_REVIEW_REFRESH_MS = 30_000;
+const CODE_REVIEW_RETRY_MS = 5_000;
+
 interface PendingJobAction {
   readonly action: CodeReviewJobAction;
   readonly jobId: string;
@@ -383,6 +386,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
   #dropTarget = "";
   #dropAfter = false;
   #loadedServices: object | undefined;
+  #autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor() {
     super();
@@ -405,6 +409,11 @@ export class TrouveCodeReviewDashboard extends LitElement {
 
   protected override updated(): void {
     this.#loadForCurrentServices();
+  }
+
+  override disconnectedCallback(): void {
+    this.#clearAutoRefresh();
+    super.disconnectedCallback();
   }
 
   #loadForCurrentServices(): void {
@@ -432,14 +441,6 @@ export class TrouveCodeReviewDashboard extends LitElement {
             <h1 id="code-review-title">Code reviews</h1>
             <p>Monitor automated reviews without leaving the main trouve workspace.</p>
           </div>
-          <div class="actions">
-            <button
-              type="button"
-              ?disabled=${this.#loading || this.#refreshing || this.#busyJobId !== ""}
-              aria-label="Refresh code reviews from GitHub"
-              @click=${this.#refresh}
-            >${this.#refreshing ? "Refreshing…" : "Refresh"}</button>
-          </div>
         </header>
 
         <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
@@ -447,7 +448,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         </p>
 
         ${this.#error !== "" && dashboard !== undefined
-          ? html`<div class="banner" role="alert"><span>${this.#error}</span><button class="compact" type="button" @click=${this.#loadInitial}>Retry</button></div>`
+          ? html`<div class="banner" role="alert"><span>${this.#error}</span><span>Retrying automatically.</span></div>`
           : nothing}
 
         ${dashboard === undefined
@@ -472,7 +473,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
       <div class="empty-state" role="alert">
         <strong>Unable to load code reviews</strong>
         <p>${this.#error || "The review dashboard request failed."}</p>
-        <button type="button" @click=${this.#loadInitial}>Retry</button>
+        <p>Retrying automatically.</p>
       </div>
     `;
   }
@@ -870,7 +871,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         ${settings === undefined
           ? html`<div class="empty-state" role=${this.#settingsError ? "alert" : "status"}>
               <strong>${this.#settingsError ? "Unable to load review settings" : "Loading review settings…"}</strong>
-              ${this.#settingsError ? html`<p>${this.#settingsError}</p><button type="button" @click=${this.#loadSettings}>Retry settings</button>` : nothing}
+              ${this.#settingsError ? html`<p>${this.#settingsError} Retrying automatically.</p>` : nothing}
             </div>`
           : html`
               <form class="settings-body" @submit=${this.#saveSettings}>
@@ -1017,6 +1018,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
   readonly #refresh = async (): Promise<void> => {
     const services = this.#services.value;
     if (services === undefined || this.#refreshing) return;
+    this.#clearAutoRefresh();
     this.#refreshing = true;
     this.#error = "";
     this.#liveStatus = "Refreshing code reviews from GitHub…";
@@ -1035,15 +1037,18 @@ export class TrouveCodeReviewDashboard extends LitElement {
       if (this.isConnected) {
         this.#refreshing = false;
         this.requestUpdate();
+        this.#scheduleAutoRefresh(this.#error === "" ? CODE_REVIEW_REFRESH_MS : CODE_REVIEW_RETRY_MS);
       }
     }
   };
 
   readonly #loadInitial = async (): Promise<void> => {
+    this.#clearAutoRefresh();
     const services = this.#services.value;
     if (services === undefined) {
       this.#loading = false;
       this.#error = "Application services are unavailable.";
+      this.#scheduleAutoRefresh(CODE_REVIEW_RETRY_MS);
       this.requestUpdate();
       return;
     }
@@ -1071,31 +1076,44 @@ export class TrouveCodeReviewDashboard extends LitElement {
     this.#loading = false;
     this.#liveStatus = this.#error || "Code reviews loaded.";
     this.requestUpdate();
-  };
-
-  readonly #loadSettings = async (): Promise<void> => {
-    const services = this.#services.value;
-    if (services === undefined) return;
-    this.#settingsError = "";
-    this.#liveStatus = "Loading review settings…";
-    this.requestUpdate();
-    try {
-      const settings = await services.protocol.codeReviewSettings();
-      if (!this.isConnected) return;
-      this.#applySettings(settings);
-      this.#liveStatus = "Review settings loaded.";
-    } catch (cause) {
-      if (!this.isConnected) return;
-      this.#settingsError = errorMessage(cause, "The review settings request failed.");
-      this.#liveStatus = this.#settingsError;
-    }
-    this.requestUpdate();
+    this.#scheduleAutoRefresh(
+      this.#error === "" && this.#settingsError === ""
+        ? CODE_REVIEW_REFRESH_MS
+        : CODE_REVIEW_RETRY_MS,
+    );
   };
 
   #applySettings(settings: ProtocolCodeReviewSettings): void {
     this.#settings = settings;
     this.#settingsDraft = codeReviewSettingsDraft(settings);
     this.#settingsError = "";
+  }
+
+  #scheduleAutoRefresh(delayMs: number): void {
+    this.#clearAutoRefresh();
+    if (!this.isConnected) return;
+    this.#autoRefreshTimer = globalThis.setTimeout(() => {
+      this.#autoRefreshTimer = undefined;
+      if (
+        this.#busyJobId !== ""
+        || this.#savingSettings
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) {
+        this.#scheduleAutoRefresh(CODE_REVIEW_RETRY_MS);
+        return;
+      }
+      if (this.#dashboard === undefined || this.#settings === undefined) {
+        void this.#loadInitial();
+      } else {
+        void this.#refresh();
+      }
+    }, delayMs);
+  }
+
+  #clearAutoRefresh(): void {
+    if (this.#autoRefreshTimer === undefined) return;
+    globalThis.clearTimeout(this.#autoRefreshTimer);
+    this.#autoRefreshTimer = undefined;
   }
 
   #updateSettingsDraft(field: keyof CodeReviewSettingsDraft, event: Event): void {

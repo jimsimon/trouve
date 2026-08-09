@@ -22,6 +22,7 @@ import {
 } from "./session-pr-panel-model.js";
 
 const DIFF_REFRESH_MS = 2_000;
+const RESOURCE_REFRESH_MS = 30_000;
 
 export interface SessionDiffOverview {
   readonly additions: number;
@@ -76,13 +77,11 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     .session-info-header h2 { font-size: 15px; }
     .session-info-card h3 { font-size: 13px; }
     .session-info-header p, .session-info-section-header p { margin-top: 3px; color: var(--trouve-text-dim); font-size: 11px; line-height: 1.35; }
-    .session-info-refresh, .session-info-section-header button, .session-info-icon-button { min-height: 28px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); }
-    .session-info-refresh { width: 28px; flex: none; padding: 0; }
+    .session-info-section-header button, .session-info-icon-button { min-height: 28px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); }
     .session-info-section-header button { flex: none; padding: 3px 7px; }
     .session-info-icon-button { width: 28px; flex: none; padding: 0; }
-    .session-info-refresh:hover:not(:disabled), .session-info-section-header button:hover:not(:disabled), .session-info-icon-button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-    .session-info-refresh:focus-visible, .session-info-section-header button:focus-visible, .session-info-icon-button:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
-    .session-info-refresh:disabled { opacity: .56; }
+    .session-info-section-header button:hover:not(:disabled), .session-info-icon-button:hover:not(:disabled) { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+    .session-info-section-header button:focus-visible, .session-info-icon-button:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
     .session-info-card { display: grid; gap: 9px; padding: 11px; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
     .session-info-identity dl { display: grid; gap: 1px; margin: 0; background: var(--trouve-rule); }
     .session-info-identity dl > div { min-width: 0; display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; gap: 10px; padding: 7px 8px; background: var(--trouve-inset-bg); }
@@ -126,8 +125,8 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     @media (max-width: 760px) {
       .session-info-surface { padding: 8px; }
       .session-info-card { padding: 10px; }
-      .session-info-refresh, .session-info-section-header button, .session-info-icon-button { min-height: 44px; }
-      .session-info-refresh, .session-info-icon-button { width: 44px; }
+      .session-info-section-header button, .session-info-icon-button { min-height: 44px; }
+      .session-info-icon-button { width: 44px; }
       .session-info-mcp-row { grid-template-columns: 18px minmax(0, 1fr) auto; }
       .session-info-mcp-row .session-info-scope { grid-column: 2; }
     }
@@ -158,9 +157,9 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
   #mcpServers: readonly ProtocolMcpServerInfo[] = [];
   #diffError = "";
   #mcpError = "";
-  #prError = "";
   #loadScheduled = false;
   #diffRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  #resourceRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -169,8 +168,13 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       this.#checkpointRestored,
     );
     this.#diffRefreshTimer ??= globalThis.setInterval(() => {
+      if (globalThis.document?.visibilityState === "hidden") return;
       void this.#refreshDiff(true);
     }, DIFF_REFRESH_MS);
+    this.#resourceRefreshTimer ??= globalThis.setInterval(() => {
+      if (globalThis.document?.visibilityState === "hidden") return;
+      void this.#refreshResources();
+    }, RESOURCE_REFRESH_MS);
   }
 
   override disconnectedCallback(): void {
@@ -184,6 +188,10 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     if (this.#diffRefreshTimer !== undefined) {
       globalThis.clearInterval(this.#diffRefreshTimer);
       this.#diffRefreshTimer = undefined;
+    }
+    if (this.#resourceRefreshTimer !== undefined) {
+      globalThis.clearInterval(this.#resourceRefreshTimer);
+      this.#resourceRefreshTimer = undefined;
     }
     super.disconnectedCallback();
   }
@@ -209,7 +217,6 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       this.#mcpServers = [];
       this.#diffError = "";
       this.#mcpError = "";
-      this.#prError = "";
     }
     if (services !== undefined && sessionId !== "" && !this.#loadScheduled) {
       this.#loadScheduled = true;
@@ -251,14 +258,6 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
             <h2 id="session-info-title">Session overview</h2>
             <p>Branch activity, pull requests, and tools available to this session.</p>
           </div>
-          <button
-            class="session-info-refresh"
-            type="button"
-            title="Refresh session overview"
-            aria-label="Refresh session overview"
-            ?disabled=${refreshing}
-            @click=${() => void this.#refreshAll(true)}
-          >${fontAwesomeIcon("arrows-rotate", { spin: refreshing })}</button>
         </header>
 
         <section class="session-info-card session-info-identity" aria-labelledby="session-info-identity-title">
@@ -330,9 +329,6 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
             Manage ${fontAwesomeIcon("arrow-right")}
           </button>
         </header>
-        ${this.#prError === ""
-          ? nothing
-          : html`<p class="session-info-notice error" role="status">${this.#prError}</p>`}
         ${pullRequests.length === 0
           ? html`<p class="session-info-empty">No pull requests are associated with this branch.</p>`
           : html`<ul class="session-info-pr-list">
@@ -423,10 +419,10 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     `;
   }
 
-  async #refreshAll(refreshGithub = false): Promise<void> {
+  async #refreshAll(): Promise<void> {
     await Promise.all([
       this.#refreshDiff(false),
-      this.#refreshResources(refreshGithub),
+      this.#refreshResources(),
     ]);
   }
 
@@ -466,14 +462,13 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     }
   }
 
-  async #refreshResources(refreshGithub: boolean): Promise<void> {
+  async #refreshResources(): Promise<void> {
     const services = this.#services.value;
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "" || this.#resourcesRequestActive) return;
     const generation = this.#generation;
     this.#resourcesRequestActive = true;
     this.#mcpError = "";
-    this.#prError = "";
     this.requestUpdate();
     const mcpResult = await Promise.resolve(
       services.protocol.sessionMcpServers(sessionId),
@@ -486,17 +481,6 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       this.#mcpServers = mcpResult.value;
     } else {
       this.#mcpError = "The effective MCP configuration could not be loaded.";
-    }
-    if (refreshGithub) {
-      try {
-        await services.protocol.refreshGithubPrs(true);
-        const projection = await services.protocol.serverProjectionSnapshot();
-        if (generation === this.#generation && sessionId === this.#effectiveSessionId) {
-          this.#store.value?.replaceServerProjection(projection.cursor, projection.value);
-        }
-      } catch {
-        this.#prError = "Pull requests could not be refreshed; showing the latest shared state.";
-      }
     }
     this.#resourcesRequestActive = false;
     this.requestUpdate();

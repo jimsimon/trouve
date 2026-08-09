@@ -21,6 +21,9 @@ import {
 } from "./session-mcp-model.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
+const MCP_REFRESH_MS = 30_000;
+const MCP_LOG_REFRESH_MS = 2_000;
+
 const panelStyles = css`
   :host {
     display: block;
@@ -483,27 +486,55 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
   #importJson = "";
   #formScope: "user" | "workspace" = "user";
   #editingServer: ProtocolMcpServerInfo | undefined;
+  #refreshTimer: ReturnType<typeof setInterval> | undefined;
+  #logsRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  #logsLoading = false;
 
   override connectedCallback(): void {
     super.connectedCallback();
     queueMicrotask(() => void this.#load());
+    this.#refreshTimer ??= globalThis.setInterval(() => {
+      if (
+        this.#busy
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) return;
+      void this.#load(true);
+    }, MCP_REFRESH_MS);
+    this.#logsRefreshTimer ??= globalThis.setInterval(() => {
+      if (
+        this.#logsName === ""
+        || this.#logsLoading
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) return;
+      void this.#showLogs(this.#logsName, true);
+    }, MCP_LOG_REFRESH_MS);
   }
 
-  async #load(): Promise<void> {
+  override disconnectedCallback(): void {
+    if (this.#refreshTimer !== undefined) globalThis.clearInterval(this.#refreshTimer);
+    if (this.#logsRefreshTimer !== undefined) globalThis.clearInterval(this.#logsRefreshTimer);
+    this.#refreshTimer = undefined;
+    this.#logsRefreshTimer = undefined;
+    super.disconnectedCallback();
+  }
+
+  async #load(silent = false): Promise<void> {
     const protocol = this.#services.value?.protocol;
-    if (protocol === undefined) return;
-    this.#busy = true;
-    this.#message = "Checking MCP servers…";
-    this.#error = false;
-    this.requestUpdate();
+    if (protocol === undefined || (silent && this.#busy)) return;
+    if (!silent) this.#busy = true;
+    if (!silent) {
+      this.#message = "Checking MCP servers…";
+      this.#error = false;
+      this.requestUpdate();
+    }
     try {
       this.#servers = await protocol.mcpServers(this.#workspaceId || undefined, true);
       this.#message = "";
     } catch {
-      this.#message = genericFailure("Loading MCP servers");
+      this.#message = "MCP servers could not be loaded. Retrying automatically.";
       this.#error = true;
     } finally {
-      this.#busy = false;
+      if (!silent) this.#busy = false;
       this.requestUpdate();
     }
   }
@@ -646,17 +677,22 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     this.requestUpdate();
   }
 
-  async #showLogs(name: string): Promise<void> {
+  async #showLogs(name: string, silent = false): Promise<void> {
     const protocol = this.#services.value?.protocol;
-    if (protocol === undefined) return;
+    if (protocol === undefined || this.#logsLoading) return;
     this.#logsName = name;
-    this.#logs = undefined;
-    this.requestUpdate();
+    this.#logsLoading = true;
+    if (!silent) {
+      this.#logs = undefined;
+      this.requestUpdate();
+    }
     try {
       this.#logs = await protocol.mcpServerLogs(name);
     } catch {
-      this.#message = genericFailure("Loading MCP logs");
+      this.#message = "MCP logs are temporarily unavailable. Retrying automatically.";
       this.#error = true;
+    } finally {
+      this.#logsLoading = false;
     }
     this.requestUpdate();
   }
@@ -675,7 +711,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       : readSignal(this.#store.value.workspaces);
     return html`
       <div class="stack">
-        <div class="row"><h2 class="grow">MCP Servers</h2><button type="button" @click=${() => void this.#load()} ?disabled=${this.#busy}>${fontAwesomeIcon("arrows-rotate")} Refresh</button></div>
+        <div class="row"><h2 class="grow">MCP Servers</h2></div>
         <p class="meta">External tool servers offered to the agent as mcp__&lt;server&gt;__&lt;tool&gt;. In ask and allow-list modes each one needs first-use approval per session; read-only modes block MCP tools entirely; yolo skips prompts. trouve's own built-in servers are not listed.</p>
         <p class="meta">Sessions merge these by name: the app-wide list (applies to every workspace), then the session workspace's list. A session branch can override or disable entries via its own committed .agents/.mcp.json — those per-branch files are managed in git, not here.</p>
         ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
@@ -723,7 +759,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
           <label><span class="visually-hidden">Environment</span><textarea name="env" autocomplete="off" spellcheck="false" placeholder="environment, one KEY=VALUE per line; ${"${VAR}"} expands at launch" .value=${this.#editingServer === undefined ? "" : sessionMcpEnvironmentLines(this.#editingServer).join("\n")}></textarea></label>
           <div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${this.#editingServer === undefined ? "Add server" : "Save changes"}</button><button type="button" @click=${() => { this.#formOpen = false; this.#editingServer = undefined; this.requestUpdate(); }}>Cancel</button></div>
         </form>` : nothing}
-        ${this.#logsName === "" ? nothing : html`<section class="card" aria-label=${`Logs for ${this.#logsName}`}><div class="row"><h3 class="grow">Logs — ${this.#logsName}</h3><button type="button" aria-label="Refresh logs" title="Refresh logs" @click=${() => void this.#showLogs(this.#logsName)}>${fontAwesomeIcon("arrows-rotate")}</button><button type="button" aria-label="Close logs" title="Close logs" @click=${() => { this.#logsName = ""; this.#logs = undefined; this.requestUpdate(); }}>${fontAwesomeIcon("xmark")}</button></div><pre>${this.#logs === undefined ? "Loading…" : this.#logs.lines.length === 0 ? "No log lines yet — logs appear after a health check or the first tool call." : this.#logs.lines.join("\n")}</pre></section>`}
+        ${this.#logsName === "" ? nothing : html`<section class="card" aria-label=${`Logs for ${this.#logsName}`}><div class="row"><h3 class="grow">Logs — ${this.#logsName}</h3><button type="button" aria-label="Close logs" title="Close logs" @click=${() => { this.#logsName = ""; this.#logs = undefined; this.requestUpdate(); }}>${fontAwesomeIcon("xmark")}</button></div><pre>${this.#logs === undefined ? "Loading…" : this.#logs.lines.length === 0 ? "No log lines yet — logs appear after a health check or the first tool call." : this.#logs.lines.join("\n")}</pre></section>`}
       </div>
     `;
   }

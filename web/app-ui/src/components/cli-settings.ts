@@ -16,10 +16,12 @@ import {
   cliSourceLabel,
   cliVersionLabel,
   idleCliInstallStatus,
-  MAX_CLI_POLL_ATTEMPTS,
   pendingCliIds,
   shouldPollCliInstalls,
 } from "./cli-settings-model.js";
+
+const CLI_STATUS_REFRESH_MS = 5 * 60_000;
+const CLI_STATUS_RETRY_MS = 5_000;
 
 const genericFailure = (action: string): string =>
   `${action} failed. Check the server connection, then retry.`;
@@ -69,8 +71,6 @@ export class TrouveCliSettings extends LitElement {
     .section-heading { align-items: flex-start; gap: 12px; }
     .section-heading > div, .cli-heading > div { min-width: 0; flex: 1; }
     .section-heading p { margin-top: 4px; }
-    .cli-refresh-action { position: absolute; width: 1px; height: 1px; min-height: 0; overflow: hidden; padding: 0; clip: rect(0, 0, 0, 0); }
-    .cli-refresh-action:focus-visible { position: static; width: auto; height: 30px; min-height: 30px; overflow: visible; padding: 4px 8px; clip: auto; }
     .settings-card {
       height: 130px;
       overflow: auto;
@@ -217,9 +217,9 @@ export class TrouveCliSettings extends LitElement {
   #lifecycleGeneration = 0;
   #loadRequest = 0;
   #pollGeneration = 0;
-  #pollAttempts = 0;
   #pollFailures = 0;
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
+  #statusRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   readonly #rateTracker = new DownloadRateTracker();
   readonly #downloadRates = new Map<string, number>();
 
@@ -235,6 +235,7 @@ export class TrouveCliSettings extends LitElement {
     this.#lifecycleGeneration += 1;
     this.#loadRequest += 1;
     this.#stopPolling();
+    this.#clearStatusRefresh();
     this.#rateTracker.clear();
     this.#downloadRates.clear();
     this.#busyId = "";
@@ -251,13 +252,6 @@ export class TrouveCliSettings extends LitElement {
             <h2 id="cli-settings-heading">Vendor CLIs</h2>
             <p>Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.</p>
           </div>
-          <button
-            class="cli-refresh-action"
-            type="button"
-            ?disabled=${this.#loading || this.#busyId !== ""}
-            aria-label="Refresh vendor CLI status"
-            @click=${() => void this.#load()}
-          >${this.#loading ? "Refreshing…" : "Refresh"}</button>
         </header>
 
         ${this.#message === ""
@@ -268,7 +262,7 @@ export class TrouveCliSettings extends LitElement {
           ${clis === undefined
             ? this.#loading
               ? html`<div class="empty" role="status"><strong>Loading vendor CLIs…</strong><span>Checking installed sources and available versions.</span></div>`
-              : html`<div class="empty" role="alert"><strong>Vendor CLIs could not be loaded.</strong><span>Check the server connection and try again.</span><button type="button" @click=${() => void this.#load()}>Retry</button></div>`
+              : html`<div class="empty" role="alert"><strong>Vendor CLIs could not be loaded.</strong><span>Retrying automatically when the server is available.</span></div>`
             : clis.length === 0
               ? html`<div class="empty"><strong>No vendor CLIs reported.</strong><span>This server did not return any supported vendor binaries.</span></div>`
               : html`<div class="cli-list">${clis.map((cli, index) => this.#renderCli(cli, index))}</div>`}
@@ -357,8 +351,9 @@ export class TrouveCliSettings extends LitElement {
     if (protocol === undefined) {
       this.#clis = undefined;
       this.#loading = false;
-      this.#message = genericFailure("Loading vendor CLIs");
+      this.#message = "Vendor CLI status is unavailable. Retrying automatically.";
       this.#error = true;
+      this.#scheduleStatusRefresh(CLI_STATUS_RETRY_MS);
       this.requestUpdate();
       return;
     }
@@ -390,18 +385,19 @@ export class TrouveCliSettings extends LitElement {
       this.#replaceStatuses(statuses);
       this.#confirmUninstallId = "";
       this.#message = partialFailure
-        ? "Some install progress could not be loaded. Refresh to retry."
+        ? "Some install progress could not be loaded. Retrying automatically."
         : "";
       this.#error = partialFailure;
     } catch {
       if (!this.#loadIsCurrent(lifecycle, request)) return;
-      this.#message = genericFailure("Loading vendor CLIs");
+      this.#message = "Vendor CLI status could not be loaded. Retrying automatically.";
       this.#error = true;
     } finally {
       if (this.#loadIsCurrent(lifecycle, request)) {
         this.#loading = false;
         this.requestUpdate();
         if (pendingCliIds(this.#statuses).length > 0) this.#startPolling();
+        this.#scheduleStatusRefresh(this.#error ? CLI_STATUS_RETRY_MS : CLI_STATUS_REFRESH_MS);
       }
     }
   }
@@ -554,7 +550,6 @@ export class TrouveCliSettings extends LitElement {
 
   #startPolling(): void {
     this.#stopPolling();
-    this.#pollAttempts = 0;
     this.#pollFailures = 0;
     this.#schedulePoll(this.#pollGeneration);
   }
@@ -563,7 +558,7 @@ export class TrouveCliSettings extends LitElement {
     if (
       generation !== this.#pollGeneration ||
       !this.isConnected ||
-      !shouldPollCliInstalls(this.#statuses, this.#pollAttempts)
+      !shouldPollCliInstalls(this.#statuses)
     ) return;
     this.#pollTimer = setTimeout(
       () => void this.#poll(generation),
@@ -574,18 +569,10 @@ export class TrouveCliSettings extends LitElement {
   async #poll(generation: number): Promise<void> {
     this.#pollTimer = undefined;
     if (generation !== this.#pollGeneration || !this.isConnected) return;
-    if (!shouldPollCliInstalls(this.#statuses, this.#pollAttempts)) {
-      if (pendingCliIds(this.#statuses).length > 0) {
-        this.#message = "Install progress polling reached its safety limit. Refresh to continue checking progress.";
-        this.#error = true;
-        this.requestUpdate();
-      }
-      return;
-    }
+    if (!shouldPollCliInstalls(this.#statuses)) return;
 
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined) return;
-    this.#pollAttempts += 1;
     const pendingIds = pendingCliIds(this.#statuses);
     const statuses = new Map(this.#statuses);
     let terminalStatusObserved = false;
@@ -626,6 +613,7 @@ export class TrouveCliSettings extends LitElement {
         ? "A CLI installation failed. Retry the install or check the server logs."
         : "CLI install activity finished.";
       this.#error = anyFailed;
+      this.#scheduleStatusRefresh(CLI_STATUS_REFRESH_MS);
     } else if (this.#pollFailures >= 3) {
       this.#message = "Install progress is temporarily unavailable. Polling will keep retrying.";
       this.#error = true;
@@ -638,15 +626,6 @@ export class TrouveCliSettings extends LitElement {
     }
     this.requestUpdate();
 
-    if (
-      this.#pollAttempts >= MAX_CLI_POLL_ATTEMPTS &&
-      pendingCliIds(this.#statuses).length > 0
-    ) {
-      this.#message = "Install progress polling reached its safety limit. Refresh to continue checking progress.";
-      this.#error = true;
-      this.requestUpdate();
-      return;
-    }
     this.#schedulePoll(generation);
   }
 
@@ -654,6 +633,28 @@ export class TrouveCliSettings extends LitElement {
     this.#pollGeneration += 1;
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
     this.#pollTimer = undefined;
+  }
+
+  #scheduleStatusRefresh(delayMs: number): void {
+    this.#clearStatusRefresh();
+    if (!this.isConnected || pendingCliIds(this.#statuses).length > 0) return;
+    this.#statusRefreshTimer = globalThis.setTimeout(() => {
+      this.#statusRefreshTimer = undefined;
+      if (
+        this.#busyId !== ""
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) {
+        this.#scheduleStatusRefresh(CLI_STATUS_RETRY_MS);
+        return;
+      }
+      void this.#load();
+    }, delayMs);
+  }
+
+  #clearStatusRefresh(): void {
+    if (this.#statusRefreshTimer === undefined) return;
+    globalThis.clearTimeout(this.#statusRefreshTimer);
+    this.#statusRefreshTimer = undefined;
   }
 }
 

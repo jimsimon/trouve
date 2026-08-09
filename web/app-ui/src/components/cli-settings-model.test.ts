@@ -12,7 +12,6 @@ import {
   cliSourceLabel,
   cliVersionLabel,
   formatCliBytes,
-  MAX_CLI_POLL_ATTEMPTS,
   pendingCliIds,
   shouldPollCliInstalls,
 } from "./cli-settings-model.js";
@@ -80,13 +79,12 @@ describe("CLI settings model", () => {
       ["cursor-agent", status("failed")],
     ]);
     expect(pendingCliIds(statuses)).toEqual(["codex"]);
-    expect(shouldPollCliInstalls(statuses, 0)).toBe(true);
+    expect(shouldPollCliInstalls(statuses)).toBe(true);
   });
 
-  it("stops polling at the explicit attempt bound", () => {
+  it("keeps polling until every install reaches a terminal state", () => {
     const statuses = new Map([["codex", status("pending")]]);
-    expect(shouldPollCliInstalls(statuses, MAX_CLI_POLL_ATTEMPTS - 1)).toBe(true);
-    expect(shouldPollCliInstalls(statuses, MAX_CLI_POLL_ATTEMPTS)).toBe(false);
-    expect(shouldPollCliInstalls(new Map(), 0)).toBe(false);
+    expect(shouldPollCliInstalls(statuses)).toBe(true);
+    expect(shouldPollCliInstalls(new Map())).toBe(false);
   });
 });

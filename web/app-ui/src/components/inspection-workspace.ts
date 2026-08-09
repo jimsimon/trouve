@@ -41,6 +41,7 @@ import "./markdown-view.js";
 
 type WorkspaceInspection = "diff" | "files";
 const DIFF_REFRESH_MS = 2_000;
+const FILES_REFRESH_MS = 10_000;
 const MOBILE_FILES_QUERY = "(max-width: 760px)";
 
 export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
@@ -70,6 +71,8 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #copyFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
   #checkpointHints = initialCheckpointHints();
   #diffRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  #filesRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  #filesRefreshActive = false;
   #error = "";
   #diffManifest = "";
   #diffFiles: readonly ProtocolSessionDiffFileSummary[] = [];
@@ -144,6 +147,13 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       ) return;
       void this.#refreshDiff({ silent: true });
     }, DIFF_REFRESH_MS);
+    this.#filesRefreshTimer ??= globalThis.setInterval(() => {
+      if (
+        this.panel !== "files"
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) return;
+      void this.#refreshVisibleFiles();
+    }, FILES_REFRESH_MS);
   }
 
   protected override willUpdate(changed: PropertyValues<this>): void {
@@ -227,6 +237,10 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       globalThis.clearInterval(this.#diffRefreshTimer);
       this.#diffRefreshTimer = undefined;
     }
+    if (this.#filesRefreshTimer !== undefined) {
+      globalThis.clearInterval(this.#filesRefreshTimer);
+      this.#filesRefreshTimer = undefined;
+    }
     super.disconnectedCallback();
   }
 
@@ -235,7 +249,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       return html`<div class="screen-empty" role="status"><span>Loading ${this.panel}…</span></div>`;
     }
     if (this.panel === "diff" && this.#error !== "") {
-      return html`<div class="screen-empty" role="alert"><strong>Unable to load ${this.panel}</strong><span>${this.#error}</span><button type="button" @click=${() => this.#load()}>Retry</button></div>`;
+      return html`<div class="screen-empty" role="alert"><strong>Unable to load ${this.panel}</strong><span>${this.#error}</span><span>Retrying automatically.</span></div>`;
     }
     return this.panel === "diff" ? this.#renderDiff() : this.#renderFiles();
   }
@@ -320,16 +334,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                     ? "check"
                     : "copy",
                 )}</button>`}
-            <button
-              class="diff-refresh-action"
-              type="button"
-              aria-label="Refresh diff"
-              title="Refresh diff"
-              ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
-              @click=${() => void this.#refreshDiff({ silent: false })}
-            >${fontAwesomeIcon(this.#refreshing ? "spinner" : "arrows-rotate", {
-              spin: this.#refreshing,
-            })}</button>
           </span>
           ${this.#notice === ""
             ? nothing
@@ -418,10 +422,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       return html`<div class="screen-empty diff-view-state" role="alert">
         <strong>Unable to load ${file.path}</strong>
         <span>${this.#diffFileError}</span>
-        <button type="button" @click=${() => void this.#loadDiffFile(file.path, {
-          force: true,
-          silent: false,
-        })}>Retry</button>
+        <span>Retrying automatically.</span>
       </div>`;
     }
     if (patch === undefined) {
@@ -653,13 +654,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
             }}
           >${fontAwesomeIcon("folder-tree")}</button>
           <strong title=${file?.path ?? "Session worktree"}>${file?.path ?? ""}</strong>
-          <button
-            class="files-refresh-action"
-            type="button"
-            aria-label="Refresh files"
-            ?disabled=${root.status === "loading"}
-            @click=${() => void this.#loadRootDirectory(true)}
-          >${fontAwesomeIcon("arrows-rotate")}</button>
           ${file === undefined
             ? nothing
             : html`
@@ -758,16 +752,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
             : root.status === "loading"
               ? html`<p class="file-tree-state root" role="status">Loading files…</p>`
               : root.status === "error"
-                ? html`
-                    <div class="file-tree-state root error" role="alert">
-                      <span>The file tree could not be loaded.</span>
-                      <button
-                        type="button"
-                        data-file-tree-retry="."
-                        @click=${() => void this.#loadRootDirectory(false, true)}
-                      >Retry</button>
-                    </div>
-                  `
+                ? html`<p class="file-tree-state root error" role="alert">The file tree could not be loaded. Retrying automatically.</p>`
                 : root.entries.length === 0
                   ? html`<p class="file-tree-state root">This session worktree is empty.</p>`
                   : nothing}
@@ -779,11 +764,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                 <div class="screen-empty file-view-state" role="alert">
                   <strong>Unable to open file</strong>
                   <span>${this.#fileError}</span>
-                  <button
-                    type="button"
-                    ?disabled=${this.#fileTargetPath === ""}
-                    @click=${() => void this.#loadFile(this.#fileTargetPath)}
-                  >Retry</button>
+                  <span>Retrying automatically.</span>
                 </div>
               `
             : this.#file === undefined
@@ -890,16 +871,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       return html`<p class="file-tree-state" style=${style} role="status">Loading ${row.name}…</p>`;
     }
     if (directory.status === "error") {
-      return html`
-        <div class="file-tree-state error" style=${style} role="alert">
-          <span>${row.name} could not be loaded.</span>
-          <button
-            type="button"
-            data-file-tree-retry=${row.path}
-            @click=${() => void this.#ensureDirectory(row.path, true)}
-          >Retry</button>
-        </div>
-      `;
+      return html`<p class="file-tree-state error" style=${style} role="alert">${row.name} could not be loaded. Retrying automatically.</p>`;
     }
     if (directory.status === "loaded" && directory.entries.length === 0) {
       return html`<p class="file-tree-state" style=${style}>Empty directory</p>`;
@@ -967,25 +939,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     });
   }
 
-  #recoverFileTreeFocus(retryPath: string): void {
-    this.requestUpdate();
-    void this.updateComplete.then(() => {
-      if (!this.isConnected || this.panel !== "files") return;
-      const active = this.#fileTree.activePath;
-      const rows = [...this.querySelectorAll<HTMLButtonElement>(".file-tree-item")];
-      const activeRow = active === undefined
-        ? undefined
-        : rows.find((candidate) => candidate.dataset["filePath"] === active);
-      if (activeRow !== undefined) {
-        activeRow.focus();
-        return;
-      }
-      [...this.querySelectorAll<HTMLButtonElement>("[data-file-tree-retry]")]
-        .find((candidate) => candidate.dataset["fileTreeRetry"] === retryPath)
-        ?.focus();
-    });
-  }
-
   async #load(): Promise<void> {
     const services = this.#services.value;
     if (services === undefined || this.#effectiveSessionId === "") return;
@@ -1015,6 +968,10 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     try {
       const response = await services.protocol.sessionDiffSummary(sessionId);
       if (generation !== this.#generation || sessionId !== this.#effectiveSessionId) return false;
+      if (this.#error !== "") {
+        this.#error = "";
+        shouldRender = true;
+      }
       const nextManifest = JSON.stringify(response.files);
       if (!this.#diffLoaded || nextManifest !== this.#diffManifest) {
         this.#selectedDiff = selectedDiffIndexAfterRefresh(
@@ -1180,7 +1137,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
 
   async #loadRootDirectory(
     refresh: boolean,
-    recoverFocus = false,
   ): Promise<void> {
     const services = this.#services.value;
     if (services === undefined || this.#effectiveSessionId === "") return;
@@ -1213,12 +1169,81 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
         sessionId === this.#effectiveSessionId
       ) {
         this.requestUpdate();
-        if (recoverFocus) this.#recoverFileTreeFocus(".");
       }
     }
   }
 
-  async #ensureDirectory(path: string, recoverFocus = false): Promise<void> {
+  /** Refresh the visible Files projection without replacing loaded rows with
+   * loading placeholders. Expanded directories are the only nested listings
+   * the user can currently observe, so refreshing those keeps network work
+   * bounded while still recovering failed listings automatically. */
+  async #refreshVisibleFiles(): Promise<void> {
+    const services = this.#services.value;
+    const sessionId = this.#effectiveSessionId;
+    if (
+      services === undefined
+      || sessionId === ""
+      || this.#filesRefreshActive
+      || this.panel !== "files"
+    ) return;
+
+    const rootStatus = this.#fileTree.directory(".").status;
+    if (rootStatus === "unloaded" || rootStatus === "error") {
+      await this.#loadRootDirectory(false);
+      return;
+    }
+    if (rootStatus === "loading") return;
+
+    const generation = this.#fileTreeGeneration;
+    const directories = [
+      ".",
+      ...this.#fileTree.rows
+        .filter((row) => row.isDirectory && row.expanded)
+        .map((row) => row.path),
+    ].filter((path) => this.#fileTree.directory(path).status !== "loading");
+    this.#filesRefreshActive = true;
+    try {
+      const results = await Promise.allSettled(
+        directories.map(async (path) => ({
+          path,
+          entries: await services.protocol.sessionFiles(sessionId, path),
+        })),
+      );
+      if (
+        generation !== this.#fileTreeGeneration
+        || sessionId !== this.#effectiveSessionId
+        || this.panel !== "files"
+      ) return;
+
+      let changed = false;
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        const previous = this.#fileTree.directory(result.value.path);
+        const next = [...result.value.entries].sort((left, right) => {
+          if (left.is_dir !== right.is_dir) return left.is_dir ? -1 : 1;
+          return left.name.localeCompare(right.name);
+        });
+        const same = previous.status === "loaded"
+          && previous.entries.length === next.length
+          && previous.entries.every((entry, index) => {
+            const candidate = next[index];
+            return candidate?.name === entry.name && candidate.is_dir === entry.is_dir;
+          });
+        if (same) continue;
+        this.#fileTree.resolveDirectory(result.value.path, result.value.entries);
+        changed = true;
+      }
+      if (changed) this.requestUpdate();
+
+      if (this.#fileError !== "" && this.#fileTargetPath !== "") {
+        await this.#loadFile(this.#fileTargetPath);
+      }
+    } finally {
+      this.#filesRefreshActive = false;
+    }
+  }
+
+  async #ensureDirectory(path: string): Promise<void> {
     const services = this.#services.value;
     if (
       services === undefined ||
@@ -1247,7 +1272,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
         sessionId === this.#effectiveSessionId
       ) {
         this.requestUpdate();
-        if (recoverFocus) this.#recoverFileTreeFocus(path);
       }
     }
   }

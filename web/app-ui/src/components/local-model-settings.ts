@@ -19,7 +19,8 @@ import {
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const LOCAL_REFRESH_MS = 1_000;
-const MAX_LOCAL_REFRESH_ATTEMPTS = 600;
+const LOCAL_RETRY_MS = 5_000;
+const LOCAL_IDLE_REFRESH_MS = 5 * 60_000;
 
 export const formatBytes = (bytes: number): string => {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -260,7 +261,6 @@ export class TrouveLocalModelSettings extends LitElement {
   #confirmDelete = "";
   #loadGeneration = 0;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  #refreshAttempts = 0;
   readonly #rateTracker = new DownloadRateTracker();
   readonly #downloadRates = new Map<string, number>();
 
@@ -281,10 +281,6 @@ export class TrouveLocalModelSettings extends LitElement {
     }
   }
 
-  async refresh(): Promise<void> {
-    await this.#load();
-  }
-
   override render() {
     const services = this.#services.value;
     const status = this.#status;
@@ -294,8 +290,7 @@ export class TrouveLocalModelSettings extends LitElement {
     if (status === undefined) {
       return html`
         <div class="settings-card" role="alert">
-          Local-model status could not be loaded.
-          <button type="button" @click=${() => void this.#load()}>Retry</button>
+          Local-model status could not be loaded. Retrying automatically.
         </div>
       `;
     }
@@ -333,9 +328,6 @@ export class TrouveLocalModelSettings extends LitElement {
             />
             <span>${status.enabled ? "Enabled" : "Disabled"}</span>
           </label>
-          ${status.enabled
-            ? html`<button type="button" ?disabled=${this.#loading} @click=${() => void this.#load()}>${this.#loading ? "Refreshing…" : html`${fontAwesomeIcon("arrows-rotate")} Refresh`}</button>`
-            : nothing}
         </header>
 
         <p>Run models fully offline. trouve manages the llama.cpp runtime and downloads models from HuggingFace; downloaded models appear in the model picker as local/&lt;model&gt;. Expect far less capability than the cloud providers — this is an offline fallback tier, not a peer.</p>
@@ -565,34 +557,34 @@ export class TrouveLocalModelSettings extends LitElement {
       this.#status = status;
       this.#runtimeInstallStatus = runtimeInstallStatus;
       this.#loading = false;
+      if (this.#notice === "Local-model status could not be loaded. Retrying automatically.") {
+        this.#setNotice("", false);
+      }
       if (shouldRefreshLocalStatus(status, runtimeInstallStatus)) {
         this.#scheduleRefresh();
       } else {
         this.#clearRefreshTimer();
-        this.#refreshAttempts = 0;
+        this.#scheduleRefresh(true, LOCAL_IDLE_REFRESH_MS);
       }
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
       this.#loading = false;
-      this.#setNotice("Local-model status could not be loaded. Try again.", true);
-      if (this.#status !== undefined && shouldRefreshLocalStatus(this.#status, this.#runtimeInstallStatus)) {
-        this.#scheduleRefresh();
-      }
+      this.#setNotice("Local-model status could not be loaded. Retrying automatically.", true);
+      this.#scheduleRefresh(true, LOCAL_RETRY_MS);
     }
     this.requestUpdate();
   }
 
-  #scheduleRefresh(force = false): void {
+  #scheduleRefresh(force = false, delayMs = LOCAL_REFRESH_MS): void {
     if (this.#refreshTimer !== undefined || (!force && this.#status !== undefined && !shouldRefreshLocalStatus(this.#status, this.#runtimeInstallStatus))) return;
-    if (this.#refreshAttempts >= MAX_LOCAL_REFRESH_ATTEMPTS) {
-      this.#setNotice("Automatic local-model refresh stopped. Use Refresh to check again.", true);
-      return;
-    }
-    this.#refreshAttempts += 1;
     this.#refreshTimer = globalThis.setTimeout(() => {
       this.#refreshTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleRefresh(true, LOCAL_RETRY_MS);
+        return;
+      }
       void this.#load();
-    }, LOCAL_REFRESH_MS);
+    }, delayMs);
   }
 
   #updateDownloadRates(
@@ -630,7 +622,6 @@ export class TrouveLocalModelSettings extends LitElement {
 
   #restartRefreshLoop(): void {
     this.#clearRefreshTimer();
-    this.#refreshAttempts = 0;
   }
 
   async #setEnabled(enabled: boolean): Promise<void> {

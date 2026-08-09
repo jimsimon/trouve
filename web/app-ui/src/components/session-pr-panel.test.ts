@@ -79,7 +79,7 @@ describe("session pull-request workspace", () => {
     expect(source).toContain("Stack · ${stack.size}");
   });
 
-  it("uses the durable session projection and reserves GitHub refresh for explicit refreshes", () => {
+  it("uses the durable session projection without a panel-owned manual refresh", () => {
     const integration = source.indexOf(
       "const integration = await services.protocol.githubIntegration()",
     );
@@ -88,9 +88,9 @@ describe("session pull-request workspace", () => {
     expect(integration).toBeGreaterThan(-1);
     expect(unconfigured).toBeGreaterThan(integration);
     expect(source).not.toContain("services.protocol.sessionPrs(sessionId)");
-    expect(source).toContain("if (refresh)");
-    expect(source).toContain("await services.protocol.refreshGithubPrs(true)");
-    expect(source).toContain("services.protocol.serverProjectionSnapshot()");
+    expect(source).not.toContain("await services.protocol.refreshGithubPrs(true)");
+    expect(source).toContain("this.#syncProjectedSelection()");
+    expect(source).toContain("this.#scheduleLoadRetry()");
     expect(source).toContain("Connect GitHub to manage this session's pull requests");
     expect(source).toContain("Set up GitHub integration");
     expect(source).toContain('navigate({ kind: "settings", section: "integrations" })');

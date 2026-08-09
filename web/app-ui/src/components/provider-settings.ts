@@ -20,6 +20,9 @@ import {
 } from "./model-health.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
+const PROVIDER_REFRESH_MS = 30_000;
+const PROVIDER_RETRY_MS = 5_000;
+
 const CUSTOM_PROVIDER = "__custom__";
 const DEFAULT_LOGIN_POLL_MS = 1_000;
 const DEFAULT_LOGIN_POLL_ATTEMPTS = 180;
@@ -387,12 +390,30 @@ export class TrouveProviderSettings extends LitElement {
   #loadGeneration = 0;
   #login: ActiveLogin | undefined;
   #loginPoller: ProviderLoginPoller | undefined;
+  #refreshTimer: ReturnType<typeof setInterval> | undefined;
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.#refreshTimer ??= globalThis.setInterval(() => {
+      if (
+        this.#loading
+        || (typeof document !== "undefined" && document.visibilityState === "hidden")
+      ) return;
+      void this.#load(false);
+    }, PROVIDER_REFRESH_MS);
+  }
 
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
     this.#loadedServices = undefined;
     this.#loginPoller?.stop();
     this.#loginPoller = undefined;
+    if (this.#refreshTimer !== undefined) {
+      globalThis.clearInterval(this.#refreshTimer);
+      this.#refreshTimer = undefined;
+    }
+    this.#clearRetry();
     super.disconnectedCallback();
   }
 
@@ -400,7 +421,7 @@ export class TrouveProviderSettings extends LitElement {
     const services = this.#services.value;
     if (services !== undefined && services !== this.#loadedServices) {
       this.#loadedServices = services;
-      void this.#load();
+      void this.#load(true);
     }
   }
 
@@ -441,9 +462,6 @@ export class TrouveProviderSettings extends LitElement {
             <div>
               <h2 id="provider-settings-title">Providers</h2>
             </div>
-            <button type="button" ?disabled=${this.#loading} @click=${() => void this.#load()}>
-              ${this.#loading ? "Refreshing…" : "Refresh"}
-            </button>
           </header>
         ` : nothing}
 
@@ -542,10 +560,6 @@ export class TrouveProviderSettings extends LitElement {
         </section>`}
       </section>
     `;
-  }
-
-  async refresh(): Promise<void> {
-    await this.#load();
   }
 
   #renderProvider(provider: ProtocolProviderInfo) {
@@ -757,16 +771,17 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
-  async #load(): Promise<void> {
+  async #load(forceHealth = true): Promise<void> {
     const services = this.#services.value;
     if (services === undefined) return;
+    this.#clearRetry();
     const generation = ++this.#loadGeneration;
     this.#loading = true;
     this.requestUpdate();
     const [providers, knownProviders, health] = await Promise.allSettled([
       services.protocol.providers(),
       services.protocol.knownProviders(),
-      services.subscriptionHealth.refresh("force"),
+      services.subscriptionHealth.refresh(forceHealth ? "force" : "if-stale"),
     ]);
     if (generation !== this.#loadGeneration || !this.isConnected) return;
     this.#loading = false;
@@ -774,9 +789,16 @@ export class TrouveProviderSettings extends LitElement {
     if (knownProviders.status === "fulfilled") this.#knownProviders = knownProviders.value;
     if (health.status === "fulfilled") this.#health = health.value;
     if (providers.status === "rejected" || knownProviders.status === "rejected") {
-      this.#setNotice("Provider settings could not be loaded. Try again.", true);
+      this.#setNotice("Provider settings could not be loaded. Retrying automatically.", true);
+      this.#scheduleRetry();
     } else if (health.status === "rejected") {
       this.#setNotice("Providers loaded, but subscription usage is unavailable.", false);
+      this.#scheduleRetry();
+    } else if (
+      this.#notice === "Provider settings could not be loaded. Retrying automatically."
+      || this.#notice === "Providers loaded, but subscription usage is unavailable."
+    ) {
+      this.#setNotice("", false);
     }
     const subscriptions = this.#knownProviders.filter(
       (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
@@ -792,6 +814,24 @@ export class TrouveProviderSettings extends LitElement {
       this.#apiPresetId = api[0]?.id ?? CUSTOM_PROVIDER;
     }
     this.requestUpdate();
+  }
+
+  #scheduleRetry(): void {
+    if (!this.isConnected || this.#retryTimer !== undefined) return;
+    this.#retryTimer = globalThis.setTimeout(() => {
+      this.#retryTimer = undefined;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this.#scheduleRetry();
+        return;
+      }
+      void this.#load(false);
+    }, PROVIDER_RETRY_MS);
+  }
+
+  #clearRetry(): void {
+    if (this.#retryTimer === undefined) return;
+    globalThis.clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
   }
 
   async #saveSubscription(

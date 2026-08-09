@@ -105,7 +105,6 @@ const SURFACES: readonly CallbackSurface[] = [
     callbacks: [
       "open-automations",
       "close-automations",
-      "automations-refresh",
       "automation-saved",
       "automation-toggled",
       "automation-run",
@@ -151,8 +150,6 @@ const SURFACES: readonly CallbackSurface[] = [
   {
     description: "MCP settings and the effective session overview",
     callbacks: [
-      "refresh-session-info",
-      "mcp-refresh",
       "mcp-saved",
       "mcp-deleted",
       "mcp-logs-requested",
@@ -208,7 +205,6 @@ const SURFACES: readonly CallbackSurface[] = [
       "mode-deleted",
       "mode-model-picked",
       "mode-thinking-picked",
-      "refresh-settings",
       "close-settings",
     ],
     evidence: [
@@ -284,7 +280,6 @@ const SURFACES: readonly CallbackSurface[] = [
     callbacks: [
       "local-search",
       "local-search-filters-changed",
-      "local-refresh",
       "local-enabled-toggled",
       "local-runtime-install",
       "local-runtime-cancel",
@@ -592,7 +587,7 @@ describe("Lit application action contract", () => {
   it("keeps every established action mapped exactly once", () => {
     const callbacks = SURFACES.flatMap((surface) => surface.callbacks);
     expect(new Set(callbacks).size).toBe(callbacks.length);
-    expect(callbacks).toHaveLength(150);
+    expect(callbacks).toHaveLength(145);
   });
 
   for (const surface of SURFACES) {

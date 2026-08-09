@@ -1106,13 +1106,87 @@ cat > /dev/null
         thread_start["params"]["config"]["show_raw_agent_reasoning"],
         true
     );
+    assert_eq!(
+        thread_start["params"]["developerInstructions"],
+        "mode prompt"
+    );
     let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
     let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
     assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
     assert_eq!(turn_start["params"]["summary"], "none");
     assert_eq!(
+        turn_start["params"]["input"][0]["text"], "do the thing",
+        "mode instructions belong in developerInstructions, not user input"
+    );
+    assert_eq!(
         turn_start["params"]["sandboxPolicy"],
         serde_json::json!({ "type": "dangerFullAccess" })
+    );
+}
+
+#[tokio::test]
+async fn codex_adapter_reasserts_instructions_once_after_cold_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-cold-resume-instructions",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # first thread/resume
+printf '%s\n' "$line" > "$0.thread-resume-1"
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # first turn/start
+printf '%s\n' "$line" > "$0.turn-start-1"
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+IFS= read -r line # second thread/resume
+printf '%s\n' "$line" > "$0.thread-resume-2"
+echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # second turn/start
+printf '%s\n' "$line" > "$0.turn-start-2"
+echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    for _ in 0..2 {
+        let mut stream = start_turn(&backend, || {
+            turn(
+                tmp.path().to_path_buf(),
+                Some("thr-1"),
+                BackendPermission::Ask,
+            )
+        })
+        .await;
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+
+    let first_resume: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.thread-resume-1")).unwrap())
+            .unwrap();
+    assert_eq!(
+        first_resume["params"]["developerInstructions"],
+        "mode prompt"
+    );
+    let first_turn: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.turn-start-1")).unwrap())
+            .unwrap();
+    assert_eq!(
+        first_turn["params"]["input"][0]["text"],
+        "<mode-instructions>\nmode prompt\n</mode-instructions>\n\ndo the thing",
+        "the first cold-resumed request needs a prompt fallback for Codex versions that delay developer-instruction overrides"
+    );
+    let second_turn: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.turn-start-2")).unwrap())
+            .unwrap();
+    assert_eq!(
+        second_turn["params"]["input"][0]["text"], "do the thing",
+        "once this app-server process has applied the instructions, later user prompts stay clean"
     );
 }
 
@@ -1461,6 +1535,7 @@ printf '%s\n' "$line" > "$0.interrupt.tmp"
 mv "$0.interrupt.tmp" "$0.interrupt"
 echo '{"jsonrpc":"2.0","id":4,"result":{}}'
 IFS= read -r line # thread/resume
+printf '%s\n' "$line" > "$0.thread-resume"
 echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # replacement turn/start
 echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
@@ -1507,6 +1582,15 @@ cat > /dev/null
 
     assert_eq!(text, "replacement");
     assert_eq!(completed, 1);
+    let resumed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.thread-resume")).unwrap())
+            .unwrap();
+    assert_eq!(resumed["method"], "thread/resume");
+    assert_eq!(resumed["params"]["threadId"], "thr-1");
+    assert_eq!(
+        resumed["params"]["developerInstructions"], "mode prompt",
+        "resumed Codex threads must recover current mode and bridge guidance"
+    );
 }
 
 #[tokio::test]

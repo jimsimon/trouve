@@ -234,15 +234,21 @@ impl AgentBackend for CodexBackend {
         // Per-thread config overrides: request raw reasoning from models that
         // expose it and mount trouve/user MCP servers. Both thread/start and
         // thread/resume accept `config`, and resumed threads re-spawn their
-        // MCP servers from it.
+        // MCP servers from it. Developer instructions also travel on both
+        // requests so a resumed thread retains its current mode and, most
+        // importantly, the ToolExecutor bridge guidance after an app restart
+        // or vendor-side compaction.
         let config_override = codex_config_override(&turn);
-        let with_config = |mut params: Value| {
+        let with_thread_settings = |mut params: Value| {
             params["config"] = config_override.clone();
+            if let Some(instructions) = &turn.instructions {
+                params["developerInstructions"] = json!(instructions);
+            }
             params
         };
 
         // Start or resume the vendor-side thread.
-        let mut start_params = with_config(json!({
+        let mut start_params = with_thread_settings(json!({
             "cwd": turn.worktree,
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
@@ -257,7 +263,7 @@ impl AgentBackend for CodexBackend {
                 let resumed = server
                     .request_cancellable(
                         "thread/resume",
-                        with_config(json!({ "threadId": sid })),
+                        with_thread_settings(json!({ "threadId": sid })),
                         &cancel,
                     )
                     .await;
@@ -303,12 +309,20 @@ impl AgentBackend for CodexBackend {
             route = server.subscribe(&codex_thread_id) => route?,
         };
 
-        // Mode instructions (which include the search-tool guidance when
-        // the bridge is mounted) ride along in the first user message of a
-        // fresh vendor session (app-server owns the system prompt).
-        let text = match (&turn.instructions, fresh_session) {
-            (Some(instr), true) => format!(
-                "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
+        // A cold `thread/resume` accepts developerInstructions but some Codex
+        // versions do not expose a changed value to the first resumed model
+        // request. Preserve the clean developer-instruction path normally,
+        // while carrying one user-input fallback after each app-server
+        // restart (or instruction change). Once the server has successfully
+        // started a turn with this instruction set, subsequent prompts stay
+        // untouched.
+        let instructions_need_fallback = !fresh_session
+            && turn.instructions.as_ref().is_some_and(|instructions| {
+                server.instructions_need_prompt_fallback(&codex_thread_id, instructions)
+            });
+        let text = match (&turn.instructions, instructions_need_fallback) {
+            (Some(instructions), true) => format!(
+                "<mode-instructions>\n{instructions}\n</mode-instructions>\n\n{}",
                 turn.prompt
             ),
             _ => turn.prompt.clone(),
@@ -340,6 +354,9 @@ impl AgentBackend for CodexBackend {
                 return Err(error);
             }
         };
+        if let Some(instructions) = &turn.instructions {
+            server.remember_thread_instructions(&codex_thread_id, instructions);
+        }
 
         let stream = turn_stream(
             server.clone(),
@@ -2609,6 +2626,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     }
 }
 
+const THREAD_INSTRUCTION_CACHE_CAP: usize = 256;
+
 struct AppServer {
     stdin: SharedStdin,
     next_id: AtomicI64,
@@ -2624,6 +2643,10 @@ struct AppServer {
     /// Per-thread guards serializing interruption through replacement
     /// registration.
     turn_lifecycles: TurnLifecycles,
+    /// Instruction set known to have reached at least one turn in this
+    /// app-server process. This is intentionally process-local: an empty map
+    /// after restart is what activates the cold-resume prompt fallback.
+    thread_instructions: std::sync::Mutex<HashMap<String, String>>,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     child: Arc<std::sync::Mutex<Child>>,
     retired_response_tx: mpsc::Sender<Value>,
@@ -2672,6 +2695,7 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             completed_turns: Arc::new(Mutex::new(CompletedTurnState::default())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            thread_instructions: std::sync::Mutex::new(HashMap::new()),
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2684,6 +2708,25 @@ impl AppServer {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
+        self.thread_instructions
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_none_or(|known| known != instructions)
+    }
+
+    fn remember_thread_instructions(&self, thread_id: &str, instructions: &str) {
+        let mut known = self.thread_instructions.lock().unwrap();
+        if known.len() >= THREAD_INSTRUCTION_CACHE_CAP
+            && !known.contains_key(thread_id)
+            && let Some(evicted) = known.keys().next().cloned()
+        {
+            known.remove(&evicted);
+        }
+        known.insert(thread_id.to_string(), instructions.to_string());
     }
 
     fn invalidate_transport_now(&self) {

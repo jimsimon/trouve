@@ -104,8 +104,12 @@ pub const VENDOR_TOOL_BRIDGE_GUIDANCE: &str = "\
 
 Use tools from the `trouve` MCP server for every file edit, shell command, \
 git operation, or other side effect. Vendor-native mutation tools are not \
-available in this turn. Independent read-only tool calls may run in parallel; \
-trouve serializes mutation-capable calls within the session worktree.";
+available in this turn. In particular, do not use Codex's built-in \
+`apply_patch` or `exec_command` for mutations; use the corresponding `trouve` \
+MCP tools. A read-only error from a vendor-native tool does not mean the \
+trouve thread or Code mode is read-only. Independent read-only tool calls may \
+run in parallel; trouve serializes mutation-capable calls within the session \
+worktree.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks
