@@ -480,6 +480,10 @@
           "collapse_thinking_with_tools": {
             "type": "boolean",
             "description": "Include thinking output in collapsible tool-activity groups."
+          },
+          "collapse_todo_updates_with_tools": {
+            "type": "boolean",
+            "description": "Include todo lifecycle updates in collapsible tool-activity groups."
           }
         }
       },

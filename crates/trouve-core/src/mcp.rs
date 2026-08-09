@@ -30,9 +30,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +51,9 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Health probes are deliberately shorter than turn-time lazy connection
 /// setup so a broken settings entry gets prompt feedback.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_PARALLEL_MCP_CONNECTIONS: usize = 4;
+const MAX_MCP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MCP_LOG_LINE_BYTES: usize = 16 * 1024;
 
 /// One entry under `mcpServers` in `.mcp.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,7 +286,62 @@ pub fn split_tool_name(name: &str) -> Option<(&str, &str)> {
 
 struct Pipes {
     stdin: ChildStdin,
-    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if oversized {
+                bail!("MCP message exceeds the {max_bytes}-byte limit");
+            }
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        let content_len = newline.unwrap_or(buffer.len());
+        if !oversized {
+            if bytes.len().saturating_add(content_len) > max_bytes {
+                oversized = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&buffer[..content_len]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            if oversized {
+                bail!("MCP message exceeds the {max_bytes}-byte limit");
+            }
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .context("MCP server emitted non-UTF-8 JSON")
+}
+
+async fn write_json_line(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
+    let encoded = serde_json::to_vec(message)?;
+    if encoded.len() > MAX_MCP_MESSAGE_BYTES {
+        bail!("MCP request exceeds the {MAX_MCP_MESSAGE_BYTES}-byte limit");
+    }
+    stdin.write_all(&encoded).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
 }
 
 /// A live connection to one MCP server process.
@@ -344,13 +403,15 @@ impl McpConnection {
             .spawn()
             .with_context(|| format!("spawning MCP server '{server}' ({})", config.command))?;
         let stdin = child.stdin.take().context("mcp stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("mcp stdout")?).lines();
+        let stdout = BufReader::new(child.stdout.take().context("mcp stdout")?);
         if let (Some(logs), Some(stderr)) = (logs, child.stderr.take()) {
             let logs = logs.clone();
             let server = server.to_string();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut stderr = BufReader::new(stderr);
+                while let Ok(Some(line)) =
+                    read_bounded_line(&mut stderr, MAX_MCP_LOG_LINE_BYTES).await
+                {
                     logs.push(&server, line);
                 }
             });
@@ -451,9 +512,7 @@ impl McpConnection {
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         let mut pipes = self.pipes.lock().await;
-        pipes.stdin.write_all(format!("{msg}\n").as_bytes()).await?;
-        pipes.stdin.flush().await?;
-        Ok(())
+        write_json_line(&mut pipes.stdin, &msg).await
     }
 
     /// Send a request and wait for its response, skipping any interleaved
@@ -465,11 +524,12 @@ impl McpConnection {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut pipes = self.pipes.lock().await;
-        pipes.stdin.write_all(format!("{msg}\n").as_bytes()).await?;
-        pipes.stdin.flush().await?;
+        write_json_line(&mut pipes.stdin, &msg).await?;
         let read = async {
             loop {
-                let Some(line) = pipes.stdout.next_line().await? else {
+                let Some(line) =
+                    read_bounded_line(&mut pipes.stdout, MAX_MCP_MESSAGE_BYTES).await?
+                else {
                     bail!("MCP server closed the stream during '{method}'");
                 };
                 let Ok(reply) = serde_json::from_str::<Value>(&line) else {
@@ -553,9 +613,14 @@ pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -
 }
 
 /// Lazily-connected MCP servers, keyed by (worktree, server name).
+struct CachedConnection {
+    config: McpServerConfig,
+    connection: std::sync::Arc<McpConnection>,
+}
+
 #[derive(Default)]
 pub struct McpManager {
-    connections: Mutex<HashMap<(String, String), std::sync::Arc<McpConnection>>>,
+    connections: Mutex<HashMap<(String, String), CachedConnection>>,
     logs: McpLogStore,
 }
 
@@ -582,7 +647,6 @@ impl McpManager {
         server: &str,
         cancel: &CancellationToken,
     ) -> Result<std::sync::Arc<McpConnection>> {
-        let key = (worktree.to_string_lossy().to_string(), server.to_string());
         // Look up the config outside the connections lock so a slow spawn or
         // handshake can't wedge every other MCP call process-wide.
         let configs = trusted_configs(config_dir, workspace_root, worktree);
@@ -594,16 +658,36 @@ impl McpManager {
                 user_config_path(config_dir.unwrap_or(Path::new("<config dir>"))).display()
             )
         })?;
-        {
-            let connections = self.connections.lock().await;
-            if let Some(existing) = connections.get(&key) {
-                return Ok(existing.clone());
+        self.connection_with_config(worktree, server, &config, cancel)
+            .await
+    }
+
+    async fn connection_with_config(
+        &self,
+        worktree: &Path,
+        server: &str,
+        config: &McpServerConfig,
+        cancel: &CancellationToken,
+    ) -> Result<std::sync::Arc<McpConnection>> {
+        let key = (worktree.to_string_lossy().to_string(), server.to_string());
+        let stale = {
+            let mut connections = self.connections.lock().await;
+            if let Some(existing) = connections.get(&key)
+                && existing.config == *config
+            {
+                return Ok(existing.connection.clone());
             }
+            connections.remove(&key).map(|entry| entry.connection)
+        };
+        if let Some(stale) = stale {
+            self.logs
+                .push(server, "configuration changed; reconnecting");
+            stale.terminate().await;
         }
         let connection = std::sync::Arc::new(
             McpConnection::connect_controlled(
                 server,
-                &config,
+                config,
                 Some(&self.logs),
                 cancel,
                 CONNECT_TIMEOUT,
@@ -614,19 +698,29 @@ impl McpManager {
             server,
             format!("connected ({} tools)", connection.tools().len()),
         );
-        let (selected, duplicate) = {
+        let (selected, removed) = {
             let mut connections = self.connections.lock().await;
             // Another caller may have connected while we spawned; keep
             // theirs, but explicitly reap our redundant child.
-            if let Some(existing) = connections.get(&key) {
-                (existing.clone(), Some(connection))
+            if let Some(existing) = connections.get(&key)
+                && existing.config == *config
+            {
+                (existing.connection.clone(), Some(connection))
             } else {
-                connections.insert(key, connection.clone());
-                (connection, None)
+                let replaced = connections
+                    .insert(
+                        key,
+                        CachedConnection {
+                            config: config.clone(),
+                            connection: connection.clone(),
+                        },
+                    )
+                    .map(|entry| entry.connection);
+                (connection, replaced)
             }
         };
-        if let Some(duplicate) = duplicate {
-            duplicate.terminate().await;
+        if let Some(removed) = removed {
+            removed.terminate().await;
         }
         Ok(selected)
     }
@@ -636,7 +730,12 @@ impl McpManager {
     /// server doesn't stay permanently broken in the cache.
     async fn evict(&self, worktree: &Path, server: &str) {
         let key = (worktree.to_string_lossy().to_string(), server.to_string());
-        let connection = self.connections.lock().await.remove(&key);
+        let connection = self
+            .connections
+            .lock()
+            .await
+            .remove(&key)
+            .map(|entry| entry.connection);
         if let Some(connection) = connection {
             connection.terminate().await;
         }
@@ -656,6 +755,7 @@ impl McpManager {
                 .collect::<Vec<_>>();
             keys.into_iter()
                 .filter_map(|key| connections.remove(&key))
+                .map(|entry| entry.connection)
                 .collect::<Vec<_>>()
         };
         for connection in removed {
@@ -672,31 +772,51 @@ impl McpManager {
         worktree: &Path,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<ToolSpec> {
-        let mut specs = Vec::new();
-        // Only trusted (user-config) servers are spawned; repo-scoped ones
-        // are noted so the user understands why their tools aren't offered.
-        let trusted = trusted_configs(config_dir, workspace_root, worktree);
-        for name in discover_configs(config_dir, workspace_root, worktree).keys() {
+        // Read each config layer once. The old path rediscovered all layers
+        // for the visible set, again for the trusted set, and once more per
+        // server connection (O(server count) file parsing per turn).
+        let discovered = discover_with_provenance(config_dir, workspace_root, worktree);
+        let mut trusted = Vec::new();
+        for (name, config, source) in discovered {
             if cancel.is_cancelled() {
                 break;
             }
-            if !trusted.contains_key(name) {
+            if config.disabled {
+                continue;
+            }
+            if source != "app-wide" {
                 self.logs.push(
-                    name,
+                    &name,
                     "skipped: defined in a repo's .agents/.mcp.json; not auto-run \
                      (copy it into your own config to trust it)",
                 );
                 continue;
             }
-            // `connection` owns cancellation cleanup once it has spawned a
-            // child. Do not race and drop that future from the outside.
-            let connection = self
-                .connection(config_dir, workspace_root, worktree, name, cancel)
-                .await;
+            trusted.push((name, config));
+        }
+
+        // Independent MCP servers have independent subprocesses. Handshake
+        // them concurrently (within a small cap) while preserving stable
+        // config order in the returned tool list.
+        let connections =
+            futures::stream::iter(trusted.into_iter().map(|(name, config)| async move {
+                // `connection` owns cancellation cleanup once it has spawned a
+                // child. Do not race and drop that future from the outside.
+                let connection = self
+                    .connection_with_config(worktree, &name, &config, cancel)
+                    .await;
+                (name, connection)
+            }))
+            .buffered(MAX_PARALLEL_MCP_CONNECTIONS)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut specs = Vec::new();
+        for (name, connection) in connections {
             match connection {
                 Ok(connection) => specs.extend(connection.tools().iter().cloned()),
                 Err(e) => {
-                    self.logs.push(name, format!("unavailable: {e:#}"));
+                    self.logs.push(&name, format!("unavailable: {e:#}"));
                     tracing::warn!("MCP server '{name}' unavailable: {e:#}");
                 }
             }
@@ -748,6 +868,18 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_and_drains_oversized_messages() {
+        let input = b"12345\nok\n";
+        let mut reader = BufReader::new(&input[..]);
+        assert!(read_bounded_line(&mut reader, 4).await.is_err());
+        assert_eq!(
+            read_bounded_line(&mut reader, 4).await.unwrap(),
+            Some("ok".into())
+        );
+        assert_eq!(read_bounded_line(&mut reader, 4).await.unwrap(), None);
+    }
 
     #[test]
     fn parses_config_with_env_refs() {

@@ -261,6 +261,18 @@ impl ProtocolClient {
         decode_cursor_response(response, &path).await
     }
 
+    /// Load the full argument/result payload for one completed historical
+    /// tool call. Folded history pages intentionally contain only compact
+    /// presentation metadata until the call is expanded.
+    pub async fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<ThreadToolDetails> {
+        self.get_json(&format!("/threads/{thread_id}/tools/{call_id}"))
+            .await
+    }
+
     pub async fn send_message(&self, thread_id: &str, content: &str) -> Result<TurnAccepted> {
         self.send_message_with(thread_id, content, Vec::new()).await
     }

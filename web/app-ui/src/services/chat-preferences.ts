@@ -10,12 +10,15 @@ export interface ChatPreferences {
   readonly collapseThinkingWithTools: boolean;
   /** Include context-compaction boundaries in collapsible tool-activity runs. */
   readonly collapseCompactionWithTools: boolean;
+  /** Include todo lifecycle updates in collapsible tool-activity runs. */
+  readonly collapseTodoUpdatesWithTools: boolean;
 }
 
 export const DEFAULT_CHAT_PREFERENCES: ChatPreferences = Object.freeze({
   collapseSequentialToolCalls: true,
   collapseThinkingWithTools: false,
   collapseCompactionWithTools: false,
+  collapseTodoUpdatesWithTools: false,
 });
 
 /** Collapse preferences as applied by the transcript renderer. Subordinate
@@ -31,6 +34,9 @@ export const effectiveChatCollapsePreferences = (
   collapseCompactionWithTools:
     preferences.collapseSequentialToolCalls
     && preferences.collapseCompactionWithTools,
+  collapseTodoUpdatesWithTools:
+    preferences.collapseSequentialToolCalls
+    && preferences.collapseTodoUpdatesWithTools,
 });
 
 const STORAGE_KEY = "trouve.chat.v1";
@@ -56,6 +62,10 @@ export const normalizeChatPreferences = (
     typeof value.collapseCompactionWithTools === "boolean"
       ? value.collapseCompactionWithTools
       : fallback.collapseCompactionWithTools,
+  collapseTodoUpdatesWithTools:
+    typeof value.collapseTodoUpdatesWithTools === "boolean"
+      ? value.collapseTodoUpdatesWithTools
+      : fallback.collapseTodoUpdatesWithTools,
 });
 
 export const browserChatPreferenceStorage = (

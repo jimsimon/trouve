@@ -32,4 +32,10 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#scheduleGithubRefresh()");
     expect(source).toContain('globalThis.document?.visibilityState === "hidden"');
   });
+
+  it("reconciles activity while desktop sleep is inhibited", () => {
+    expect(source).toContain("const SLEEP_ACTIVITY_RECONCILE_INTERVAL_MS = 15_000");
+    expect(source).toContain("this.#protocolIngress.reconcileSessionActivity()");
+    expect(source).toContain("this.#scheduleSleepActivityReconciliation(shouldPreventSleep)");
+  });
 });

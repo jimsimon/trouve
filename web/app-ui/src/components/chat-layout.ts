@@ -2,12 +2,12 @@ import type { ThreadChatItem } from "../state/thread-view-model.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "thinking" | "compaction" | "tool" | "questions" }
+  { readonly kind: "assistant" | "steered" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
   AgentChatItem,
-  { readonly kind: "thinking" | "compaction" | "tool" }
+  { readonly kind: "thinking" | "compaction" | "todo" | "tool" }
 >;
 
 /** Older Codex transcripts represented native context compaction as a tool
@@ -41,6 +41,7 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   || item.kind === "steered"
   || item.kind === "thinking"
   || item.kind === "compaction"
+  || item.kind === "todo"
   || item.kind === "tool"
   || item.kind === "questions";
 
@@ -112,6 +113,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
         || item.kind === "steered"
         || item.kind === "thinking"
         || item.kind === "compaction"
+        || item.kind === "todo"
           ? item.turn
           : undefined;
       claim(explicitTurn, item.id).items.push(item);
@@ -155,10 +157,15 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   let tools = 0;
   let thoughts = 0;
   let compactions = 0;
+  const todos = new Set<string>();
 
   for (const item of items) {
     if (item.kind === "thinking") {
       thoughts += 1;
+      continue;
+    }
+    if (item.kind === "todo") {
+      todos.add(item.todoId);
       continue;
     }
     if (item.kind === "compaction" || isContextCompactionTool(item)) {
@@ -212,6 +219,7 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   if (compactions > 0) {
     parts.push(compactions === 1 ? "compacted context" : `compacted context ${compactions} times`);
   }
+  if (todos.size > 0) parts.push(`updated ${plural(todos.size, "todo", "todos")}`);
   const summary = parts.join(", ");
   return summary === "" ? "Worked" : `${summary[0]?.toUpperCase() ?? ""}${summary.slice(1)}`;
 };

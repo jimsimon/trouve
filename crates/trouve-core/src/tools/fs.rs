@@ -1,6 +1,7 @@
 //! File tools: read, write, list.
 
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -8,10 +9,13 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 /// Images larger than this are rejected rather than truncated (a partial
 /// image is useless as vision input).
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-/// Text files larger than this are refused up front: `read_to_string`
-/// buffers the whole file regardless of offset/limit, so an adversarial
-/// multi-GB file would otherwise exhaust memory before the line paging runs.
+/// Text files larger than this are refused up front. Ranged reads are
+/// streamed and stop at the requested page, but retaining this scan bound
+/// also protects against pathological single-line files and enormous offsets.
 const MAX_TEXT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_WRITE_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LIST_ENTRIES: usize = 1_000;
 
 /// MIME type for paths `read_file` should return as vision content.
 fn image_mime(path: &str) -> Option<&'static str> {
@@ -98,8 +102,8 @@ impl Tool for ReadFile {
                 meta.len()
             ));
         }
-        let text = match tokio::fs::read_to_string(&full).await {
-            Ok(t) => t,
+        let file = match tokio::fs::File::open(&full).await {
+            Ok(file) => file,
             Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
         };
         let offset = args
@@ -112,24 +116,63 @@ impl Tool for ReadFile {
             .and_then(Value::as_u64)
             .map(|l| l as usize);
 
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut line_number = 0usize;
+        let mut lines_read = 0usize;
         let mut out = String::new();
         let mut truncated = false;
-        let mut remaining = limit;
-        for line in text.lines().skip(offset - 1) {
-            if remaining == Some(0) || out.len() + line.len() + 1 > MAX_READ_BYTES {
+        let mut total_lines = None;
+        loop {
+            line.clear();
+            let read = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("file read cancelled");
+                }
+                read = reader.read_line(&mut line) => read,
+            };
+            let bytes = match read {
+                Ok(bytes) => bytes,
+                Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+            };
+            if bytes == 0 {
+                total_lines = Some(line_number);
+                break;
+            }
+            line_number += 1;
+            if line_number < offset {
+                continue;
+            }
+
+            let content = line.strip_suffix('\n').unwrap_or(&line);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            if out.len() + content.len() + 1 > MAX_READ_BYTES {
                 truncated = true;
                 break;
             }
-            out.push_str(line);
+            out.push_str(content);
             out.push('\n');
-            if let Some(r) = remaining.as_mut() {
-                *r -= 1;
+            lines_read += 1;
+
+            if limit.is_some_and(|limit| lines_read >= limit) {
+                let has_more = match reader.fill_buf().await {
+                    Ok(buffer) => !buffer.is_empty(),
+                    Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+                };
+                truncated = has_more;
+                if !has_more {
+                    total_lines = Some(line_number);
+                }
+                break;
             }
         }
         ToolResult::ok(json!({
             "content": out,
             "truncated": truncated,
-            "total_lines": text.lines().count(),
+            "lines_read": lines_read,
+            "next_offset": truncated.then_some(offset + lines_read),
+            "total_lines": total_lines,
         }))
     }
 }
@@ -165,6 +208,15 @@ impl Tool for WriteFile {
         ) else {
             return ToolResult::error("missing required arguments: path, content");
         };
+        if content.len() > MAX_WRITE_FILE_BYTES {
+            return ToolResult::error(format!(
+                "content is {} bytes; write_file's limit is {MAX_WRITE_FILE_BYTES}",
+                content.len()
+            ));
+        }
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("write cancelled");
+        }
         let full = match ctx.resolve(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
@@ -233,27 +285,55 @@ impl Tool for EditFile {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
+        if let Ok(metadata) = tokio::fs::metadata(&full).await
+            && metadata.len() > MAX_EDIT_FILE_BYTES
+        {
+            return ToolResult::error(format!(
+                "{path} is {} bytes; edit_file's limit is {MAX_EDIT_FILE_BYTES}. Use apply_patch or a targeted shell transformation.",
+                metadata.len()
+            ));
+        }
         let content = match tokio::fs::read_to_string(&full).await {
             Ok(t) => t,
             Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
         };
-        let count = content.matches(old).count();
-        if count == 0 {
-            return ToolResult::error(format!(
-                "old_string not found in {path}; re-read the file and match its content exactly"
-            ));
-        }
-        if count > 1 && !replace_all {
-            return ToolResult::error(format!(
-                "old_string matches {count} places in {path}; add surrounding context to make \
-                 it unique, or set replace_all"
-            ));
-        }
-        let updated = if replace_all {
-            content.replace(old, new)
-        } else {
-            content.replacen(old, new, 1)
+        let old = old.to_owned();
+        let new = new.to_owned();
+        let replaced = tokio::task::spawn_blocking(move || {
+            let count = content.matches(&old).count();
+            if count == 0 {
+                return Err("old_string not found".to_owned());
+            }
+            if count > 1 && !replace_all {
+                return Err(format!("old_string matches {count} places"));
+            }
+            let updated = if replace_all {
+                content.replace(&old, &new)
+            } else {
+                content.replacen(&old, &new, 1)
+            };
+            Ok((updated, count))
+        })
+        .await;
+        let (updated, count) = match replaced {
+            Ok(Ok(replaced)) => replaced,
+            Ok(Err(error)) if error == "old_string not found" => {
+                return ToolResult::error(format!(
+                    "old_string not found in {path}; re-read the file and match its content exactly"
+                ));
+            }
+            Ok(Err(error)) => {
+                return ToolResult::error(format!(
+                    "{error} in {path}; add surrounding context to make it unique, or set replace_all"
+                ));
+            }
+            Err(error) => {
+                return ToolResult::error(format!("edit worker failed: {error}"));
+            }
         };
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("edit cancelled");
+        }
         match tokio::fs::write(&full, &updated).await {
             Ok(()) => ToolResult::ok(json!({
                 "replacements": if replace_all { count } else { 1 },
@@ -296,7 +376,26 @@ impl Tool for ListDir {
             Err(e) => return ToolResult::error(format!("cannot list {rel}: {e}")),
         };
         let mut entries = Vec::new();
-        while let Ok(Some(entry)) = rd.next_entry().await {
+        let mut truncated = false;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("directory listing cancelled");
+                }
+                next = rd.next_entry() => next,
+            };
+            let entry = match next {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    return ToolResult::error(format!("cannot list {rel}: {error}"));
+                }
+            };
+            if entries.len() >= MAX_LIST_ENTRIES {
+                truncated = true;
+                break;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             let kind = match entry.file_type().await {
                 Ok(ft) if ft.is_dir() => "dir",
@@ -306,7 +405,7 @@ impl Tool for ListDir {
             entries.push(json!({"name": name, "kind": kind}));
         }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        ToolResult::ok(json!({"entries": entries}))
+        ToolResult::ok(json!({"entries": entries, "truncated": truncated}))
     }
 }
 
@@ -334,10 +433,29 @@ mod tests {
             .run(&ctx, &json!({"path": "a/b.txt", "offset": 2, "limit": 1}))
             .await;
         assert_eq!(res.result["content"], "line2\n");
-        assert_eq!(res.result["total_lines"], 3);
+        assert_eq!(res.result["total_lines"], Value::Null);
+        assert_eq!(res.result["next_offset"], 3);
 
         let res = ListDir.run(&ctx, &json!({"path": "a"})).await;
         assert_eq!(res.result["entries"][0]["name"], "b.txt");
+    }
+
+    #[tokio::test]
+    async fn ranged_read_does_not_consume_an_invalid_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("mixed.txt"), b"first\n\xff\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let res = ReadFile
+            .run(&ctx, &json!({"path": "mixed.txt", "offset": 1, "limit": 1}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(res.result["content"], "first\n");
+        assert_eq!(res.result["truncated"], true);
+        assert_eq!(res.result["next_offset"], 2);
     }
 
     #[tokio::test]

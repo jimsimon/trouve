@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.21"
+    "version": "3.24"
   },
   "paths": {
     "/v1/approvals": {
@@ -4423,6 +4423,52 @@
         }
       }
     },
+    "/v1/threads/{id}/tools/{call_id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_thread_tool_details",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "call_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadToolDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/usage": {
       "get": {
         "tags": [],
@@ -7190,6 +7236,15 @@
             "properties": {
               "call_id": {
                 "$ref": "#/components/schemas/String"
+              },
+              "execution_duration_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Time spent inside `ToolExecutor::execute`, measured with a\nmonotonic clock. Absent for older servers, denied calls, and\nprovider-owned tool calls that do not expose an execution span.",
+                "minimum": 0
               },
               "result": {},
               "status": {
@@ -11668,6 +11723,31 @@
           }
         ]
       },
+      "ThreadTodoState": {
+        "type": "string",
+        "description": "One user-visible transition in a todo's lifecycle. `Skipped` is derived\nwhen an unfinished todo disappears from a replacement snapshot; it is not\na current-list status because skipped items are no longer in that list.",
+        "enum": [
+          "started",
+          "completed",
+          "cancelled",
+          "skipped"
+        ]
+      },
+      "ThreadToolDetails": {
+        "type": "object",
+        "description": "Full arguments and terminal result for one materialized historical tool\ncall. Live-tail tool calls continue to carry these fields inline.",
+        "required": [
+          "call_id",
+          "args"
+        ],
+        "properties": {
+          "args": {},
+          "call_id": {
+            "type": "string"
+          },
+          "result": {}
+        }
+      },
       "ThreadToolStatus": {
         "type": "string",
         "enum": [
@@ -11891,6 +11971,39 @@
           },
           {
             "type": "object",
+            "description": "A durable todo lifecycle boundary derived from successive\n`thread.todos_updated` snapshots while a turn is running.",
+            "required": [
+              "turn",
+              "todo_id",
+              "content",
+              "state",
+              "kind"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "todo_update"
+                ]
+              },
+              "state": {
+                "$ref": "#/components/schemas/ThreadTodoState"
+              },
+              "todo_id": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "call_id",
               "tool",
@@ -11903,13 +12016,17 @@
               "call_id": {
                 "type": "string"
               },
+              "details_deferred": {
+                "type": "boolean",
+                "description": "Completed historical rows may contain only bounded presentation\narguments. Fetch `/v1/threads/{thread}/tools/{call_id}` before\nrendering expanded/raw detail when this flag is true."
+              },
               "duration_ms": {
                 "type": [
                   "integer",
                   "null"
                 ],
                 "format": "int64",
-                "description": "Wall-clock execution time derived from the durable tool event\ntimestamps. This remains available when a provider omits timing\nmetadata or reports a zero-valued placeholder in its result.",
+                "description": "Executor-only duration when the completion event carries a\nmonotonic measurement; otherwise the compatible fallback derived\nfrom durable tool event timestamps.",
                 "minimum": 0
               },
               "kind": {

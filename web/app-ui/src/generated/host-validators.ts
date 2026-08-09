@@ -522,7 +522,7 @@ return errors === 0;
 }
 validate62.evaluated = {"props":{"font_family":true,"font_size":true,"reduce_motion":true,"theme":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema27 = {"type":"object","description":"Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.","properties":{"collapse_compaction_with_tools":{"type":"boolean","description":"Include context-compaction boundaries in collapsible tool-activity groups."},"collapse_sequential_tool_calls":{"type":"boolean","description":"Summarize consecutive tool calls inside collapsible activity groups."},"collapse_thinking_with_tools":{"type":"boolean","description":"Include thinking output in collapsible tool-activity groups."}}};
+const schema27 = {"type":"object","description":"Chat transcript presentation remains client-owned and does not affect the\ndurable thread view shared through the harness protocol.","properties":{"collapse_compaction_with_tools":{"type":"boolean","description":"Include context-compaction boundaries in collapsible tool-activity groups."},"collapse_sequential_tool_calls":{"type":"boolean","description":"Summarize consecutive tool calls inside collapsible activity groups."},"collapse_thinking_with_tools":{"type":"boolean","description":"Include thinking output in collapsible tool-activity groups."},"collapse_todo_updates_with_tools":{"type":"boolean","description":"Include todo lifecycle updates in collapsible tool-activity groups."}}};
 
 function validate64(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -571,6 +571,19 @@ var valid0 = _errs5 === errors;
 else {
 var valid0 = true;
 }
+if(valid0){
+if(data.collapse_todo_updates_with_tools !== undefined){
+const _errs7 = errors;
+if(typeof data.collapse_todo_updates_with_tools !== "boolean"){
+validate64.errors = [{instancePath:instancePath+"/collapse_todo_updates_with_tools",schemaPath:"#/properties/collapse_todo_updates_with_tools/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs7 === errors;
+}
+else {
+var valid0 = true;
+}
+}
 }
 }
 }
@@ -582,7 +595,7 @@ return false;
 validate64.errors = vErrors;
 return errors === 0;
 }
-validate64.evaluated = {"props":{"collapse_compaction_with_tools":true,"collapse_sequential_tool_calls":true,"collapse_thinking_with_tools":true},"dynamicProps":false,"dynamicItems":false};
+validate64.evaluated = {"props":{"collapse_compaction_with_tools":true,"collapse_sequential_tool_calls":true,"collapse_thinking_with_tools":true,"collapse_todo_updates_with_tools":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema28 = {"type":"object","description":"General desktop-only behavior persisted by the stable native host rather\nthan by an ephemeral loopback browser origin.","properties":{"prevent_sleep_while_running":{"type":"boolean"}}};
 

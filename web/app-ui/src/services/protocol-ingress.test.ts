@@ -547,6 +547,51 @@ describe("ProtocolIngress", () => {
     ingress.stop();
   });
 
+  it("reconciles missed idle activity without a full projection refresh", async () => {
+    const store = new AppStore();
+    const activeSummary = { ...summary, active: true, outcome: "running" as const };
+    const idleSummary = { ...summary, active: false, outcome: "idle" as const };
+    let summaryRequest = 0;
+    const sessionSummaries = vi.fn(async () => {
+      summaryRequest += 1;
+      return summaryRequest === 1
+        ? { summaries: [activeSummary], cursor: 10 }
+        : { summaries: [idleSummary], cursor: 11 };
+    });
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions: vi.fn(async () => [session("Current")]),
+      sessionSummaries,
+      workspaces: vi.fn(async () => [workspace]),
+      serverEvents: vi.fn(async () => stream()),
+    };
+    const onSessionSummaries = vi.fn();
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+      { onSessionSummaries },
+    );
+
+    await ingress.start();
+    expect(readSignal(store.sessions)[0]?.active).toBe(true);
+
+    const first = ingress.reconcileSessionActivity();
+    const coalesced = ingress.reconcileSessionActivity();
+    expect(coalesced).toBe(first);
+    await first;
+
+    expect(readSignal(store.sessions)[0]).toMatchObject({
+      active: false,
+      state: "idle",
+    });
+    expect(protocol.serverInfo).toHaveBeenCalledOnce();
+    expect(protocol.sessions).toHaveBeenCalledOnce();
+    expect(protocol.workspaces).toHaveBeenCalledOnce();
+    expect(sessionSummaries).toHaveBeenCalledTimes(2);
+    expect(onSessionSummaries).toHaveBeenLastCalledWith([idleSummary], 11);
+    ingress.stop();
+  });
+
   it("refreshes durable child threads and discards an in-flight stale list", async () => {
     const store = new AppStore();
     const staleThreads = deferred<Threads>();

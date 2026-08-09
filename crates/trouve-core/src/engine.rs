@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
@@ -45,10 +46,40 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
+struct PreparedAttachmentCleanup {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl PreparedAttachmentCleanup {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for PreparedAttachmentCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Keep backend persistence efficient without making live SSE output feel
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
-const BACKEND_EVENT_BATCH_MAX: usize = 64;
-const BACKEND_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+const STREAM_EVENT_BATCH_MAX: usize = 64;
+const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
@@ -121,6 +152,7 @@ struct BackendCollaboratorProjection {
     segment: String,
     usage: Usage,
     tool_calls: HashMap<String, (String, serde_json::Value)>,
+    tool_started_at: HashMap<String, Instant>,
     persisted: Vec<Event>,
     terminal: bool,
 }
@@ -766,6 +798,10 @@ pub struct Engine {
     /// Orders active-thread transitions with their persisted session activity
     /// events without holding `active_threads` across durable event appends.
     session_activity_publication: Mutex<()>,
+    /// Serializes relational prompt-queue mutations with the full queue
+    /// snapshots published on the durable thread stream. Lock ordering is
+    /// activity publication -> prompt_queue_mutations -> active_threads.
+    prompt_queue_mutations: Mutex<()>,
     /// Sessions currently being deleted. Dispatch checks this while holding
     /// `active_threads`, making "no active turns" and "no new turns" one
     /// atomic state transition before destructive cleanup begins.
@@ -1147,6 +1183,7 @@ impl Engine {
             tool_execution_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
+            prompt_queue_mutations: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
@@ -5266,6 +5303,19 @@ impl Engine {
         Ok(self.store.thread_view_snapshot(id, before, limit)?)
     }
 
+    pub fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<trouve_protocol::ThreadToolDetails, EngineError> {
+        self.get_thread(thread_id)?;
+        self.store
+            .thread_tool_details(thread_id, call_id)?
+            .ok_or_else(|| {
+                EngineError::NotFound(format!("tool call {call_id} in thread {thread_id}"))
+            })
+    }
+
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>, EngineError> {
         Ok(self.store.list_threads(session_id)?)
     }
@@ -5645,6 +5695,56 @@ impl Engine {
         self.send_message_with_tools(thread_id, content, Vec::new(), false)
     }
 
+    fn turn_shell_events(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        prompt: &trouve_protocol::QueuedPrompt,
+        tools_enabled: bool,
+    ) -> Result<Vec<Event>, EngineError> {
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let (selected_model, supports_steering) =
+            if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
+                (
+                    backend
+                        .models()
+                        .into_iter()
+                        .find(|model| model.id == thread.model),
+                    tools_enabled && backend.supports_steering(),
+                )
+            } else {
+                (
+                    self.resolve_provider(&thread.model)
+                        .ok()
+                        .and_then(|(provider, _)| {
+                            provider
+                                .models()
+                                .into_iter()
+                                .find(|model| model.id == thread.model)
+                        }),
+                    false,
+                )
+            };
+        if selected_model.is_some() {
+            normalize_thinking_option(&mut model_options, selected_model.as_ref());
+        }
+        let thinking_level = resolved_thinking_level(&model_options, selected_model.as_ref());
+        Ok(vec![
+            Event::TurnStarted {
+                turn,
+                mode: thread.mode.clone(),
+                model: thread.model.clone(),
+                thinking_level,
+                supports_steering,
+            },
+            Event::UserMessage {
+                turn,
+                content: prompt.content.clone(),
+                attachments: prompt.attachments.clone(),
+            },
+        ])
+    }
+
     /// Append user guidance to the exact backend turn currently running on a
     /// thread. The backend loop owns acceptance and durable ordering so a
     /// steer cannot jump ahead of output already received from the vendor.
@@ -5711,16 +5811,150 @@ impl Engine {
         uploads: Vec<trouve_protocol::AttachmentUpload>,
         tools_enabled: bool,
     ) -> Result<TurnAccepted, EngineError> {
-        self.get_thread(thread_id)?; // 404 for unknown threads
-        let attachments = self.save_attachments(thread_id, uploads)?;
-        self.store
-            .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
-        self.emit_queue(thread_id)?;
-        let turn = self.dispatch_queue(thread_id)?;
+        let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        let prepared = self.prepare_attachments(uploads)?;
+        let attachments = prepared
+            .iter()
+            .map(|(attachment, _)| attachment.clone())
+            .collect::<Vec<_>>();
+        let attachment_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        let mut attachment_cleanup =
+            PreparedAttachmentCleanup::new(prepared.iter().map(|(_, path)| path.clone()).collect());
+
+        let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+        let mut active = self.active_threads.lock().unwrap();
+        if self
+            .deleting_sessions
+            .lock()
+            .unwrap()
+            .contains(&thread.session_id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
+
+        let position = self.store.next_queued_prompt_position(thread_id)?;
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: format!("qp_{}", uuid::Uuid::new_v4().simple()),
+            thread_id: thread_id.to_string(),
+            position,
+            content,
+            attachments,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let mut visible_queue = self.store.queued_prompts(thread_id)?;
+        visible_queue.push(prompt.clone());
+        visible_queue.sort_by_key(|candidate| candidate.position);
+
+        if active.contains_key(thread_id) {
+            let cancelling = self
+                .turn_cancels
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+            if cancelling {
+                self.resume_after_cancel
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.to_string());
+            }
+            let result = self.store.accept_prompt_with_events(
+                prompt,
+                tools_enabled,
+                attachment_rows,
+                None,
+                None,
+                vec![(
+                    Scope::Thread(thread_id.to_string()),
+                    Event::QueueUpdated {
+                        prompts: visible_queue,
+                    },
+                )],
+            );
+            drop(active);
+            drop(activity_publication);
+            if let Err(error) = result {
+                return Err(error.into());
+            }
+            attachment_cleanup.disarm();
+            return Ok(TurnAccepted {
+                thread_id: thread_id.to_string(),
+                turn: 0,
+                queued: true,
+            });
+        }
+
+        let started_prompt = visible_queue.remove(0);
+        let started_tools_enabled = if started_prompt.id == prompt.id {
+            tools_enabled
+        } else {
+            self.store.queued_prompt_tools_enabled(&started_prompt.id)?
+        };
+        let previous_turn = self.store.last_turn(thread_id)?;
+        let turn = previous_turn + 1;
+        let session_woke = !active
+            .values()
+            .any(|session_id| session_id == &thread.session_id);
+        let mut events = Vec::with_capacity(if session_woke { 4 } else { 3 });
+        if session_woke {
+            let workspace_id = self
+                .store
+                .session(&thread.session_id)?
+                .map(|session| session.workspace_id)
+                .unwrap_or_default();
+            events.push((
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: thread.session_id.clone(),
+                    workspace_id,
+                    active: true,
+                },
+            ));
+        }
+        events.push((
+            Scope::Thread(thread_id.to_string()),
+            Event::QueueUpdated {
+                prompts: visible_queue,
+            },
+        ));
+        events.extend(
+            self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled)?
+                .into_iter()
+                .map(|event| (Scope::Thread(thread_id.to_string()), event)),
+        );
+
+        active.insert(thread_id.to_string(), thread.session_id.clone());
+        let cancel = self.register_cancel(thread_id);
+        let accepted = self.store.accept_prompt_with_events(
+            prompt,
+            tools_enabled,
+            attachment_rows,
+            Some(started_prompt.id.clone()),
+            Some(previous_turn),
+            events,
+        );
+        if let Err(error) = accepted {
+            active.remove(thread_id);
+            self.clear_cancel(thread_id);
+            drop(active);
+            drop(activity_publication);
+            return Err(error.into());
+        }
+        drop(active);
+        drop(activity_publication);
+        attachment_cleanup.disarm();
+        self.spawn_claimed_prompt(thread, turn, started_prompt, cancel, true);
         Ok(TurnAccepted {
             thread_id: thread_id.to_string(),
-            turn: turn.unwrap_or(0),
-            queued: turn.is_none(),
+            turn,
+            queued: false,
         })
     }
 
@@ -5733,9 +5967,32 @@ impl Engine {
         thread_id: &str,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<Vec<trouve_protocol::Attachment>, EngineError> {
+        let prepared = self.prepare_attachments(uploads)?;
+        let mut out = Vec::with_capacity(prepared.len());
+        for (attachment, path) in prepared {
+            if let Err(error) =
+                self.store
+                    .add_attachment(thread_id, &attachment, &path.to_string_lossy())
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(error.into());
+            }
+            out.push(attachment);
+        }
+        Ok(out)
+    }
+
+    /// Decode uploads and write their opaque files without touching SQLite.
+    /// Ordinary sends pass these records to the event writer so attachment
+    /// indexing and prompt acceptance share one durable transaction.
+    fn prepare_attachments(
+        &self,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<Vec<(trouve_protocol::Attachment, PathBuf)>, EngineError> {
         use base64::Engine as _;
         const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
         let mut out = Vec::new();
+        let mut cleanup = PreparedAttachmentCleanup::new(Vec::new());
         let dir = self.data_dir.join("attachments");
         for up in uploads {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -5768,16 +6025,16 @@ impl Engine {
                 .unwrap_or_default();
             let path = dir.join(format!("{id}{ext}"));
             std::fs::write(&path, &bytes).map_err(anyhow::Error::from)?;
+            cleanup.track(path.clone());
             let attachment = trouve_protocol::Attachment {
                 id,
                 name: up.name,
                 mime: up.mime,
                 size_bytes: bytes.len() as u64,
             };
-            self.store
-                .add_attachment(thread_id, &attachment, &path.to_string_lossy())?;
-            out.push(attachment);
+            out.push((attachment, path));
         }
+        cleanup.disarm();
         Ok(out)
     }
 
@@ -5840,6 +6097,7 @@ impl Engine {
         prompt_id: &str,
         request: trouve_protocol::UpdateQueuedPromptRequest,
     ) -> Result<(), EngineError> {
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
@@ -5886,6 +6144,7 @@ impl Engine {
     }
 
     pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
@@ -5899,6 +6158,7 @@ impl Engine {
     /// Apply a full new order for the thread's queue. `ids` must name every
     /// currently queued prompt exactly once.
     pub fn reorder_queue(&self, thread_id: &str, ids: &[String]) -> Result<(), EngineError> {
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         self.get_thread(thread_id)?;
         if !self.store.reorder_queued_prompts(thread_id, ids)? {
             return Err(EngineError::Conflict(
@@ -5921,6 +6181,7 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
         let thread = self.get_thread(&thread_id)?;
         let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let mut active = self.active_threads.lock().unwrap();
         if self
             .deleting_sessions
@@ -6002,6 +6263,7 @@ impl Engine {
     pub fn dispatch_queue(self: &Arc<Self>, thread_id: &str) -> Result<Option<u64>, EngineError> {
         let thread = self.get_thread(thread_id)?;
         let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         // Claim the thread and take the queue front atomically so two
         // concurrent sends can't both start a dispatcher.
         let (prompt, session_woke, cancel) = {
@@ -6086,17 +6348,31 @@ impl Engine {
                 return Err(e.into());
             }
         };
+        self.spawn_claimed_prompt(thread, turn, prompt, cancel, false);
+        Ok(turn)
+    }
+
+    fn spawn_claimed_prompt(
+        self: &Arc<Self>,
+        thread: Thread,
+        turn: u64,
+        prompt: trouve_protocol::QueuedPrompt,
+        cancel: tokio_util::sync::CancellationToken,
+        prompt_persisted: bool,
+    ) {
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
-            if let Err(error) = engine.drain_queue(thread, turn, prompt, cancel).await {
+            if let Err(error) = engine
+                .drain_queue(thread, turn, prompt, cancel, prompt_persisted)
+                .await
+            {
                 // A terminal or activity event failed to persist. The
                 // transition keeps or restores the active claim so no later
                 // turn can overtake the unrecorded state.
                 tracing::error!("turn dispatcher for {thread_id} retained its claim: {error:#}");
             }
         });
-        Ok(turn)
     }
 
     /// Run `content` as `turn`, then keep pulling queued prompts until the
@@ -6108,19 +6384,27 @@ impl Engine {
         turn: u64,
         prompt: trouve_protocol::QueuedPrompt,
         first_cancel: tokio_util::sync::CancellationToken,
+        first_prompt_persisted: bool,
     ) -> Result<()> {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
         let mut turn_cancel = Some(first_cancel);
+        let mut shell_persisted = first_prompt_persisted;
         loop {
             let cancel = turn_cancel
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
-            let result =
-                std::panic::AssertUnwindSafe(self.run_turn(&thread, turn, &prompt, cancel.clone()))
-                    .catch_unwind()
-                    .await;
+            let prompt_persisted = AtomicBool::new(shell_persisted);
+            let result = std::panic::AssertUnwindSafe(self.run_turn(
+                &thread,
+                turn,
+                &prompt,
+                cancel.clone(),
+                &prompt_persisted,
+            ))
+            .catch_unwind()
+            .await;
             let result = match result {
                 Ok(result) => result,
                 Err(_) => {
@@ -6166,12 +6450,31 @@ impl Engine {
                 // A cancellation can arrive before run_turn consumes the
                 // claimed queue row. Remove it here as an idempotent fallback.
                 let _ = self.store.finish_queued_prompt(&prompt.id);
-                let _ = self.emit_queue(&thread.id);
+                let mut terminal_events = Vec::with_capacity(3);
+                if !prompt_persisted.load(Ordering::Acquire) {
+                    // Cancellation becomes available as soon as dispatch is
+                    // claimed, before provider discovery or scheduler waits
+                    // can publish the display events. Preserve the claimed
+                    // prompt even when cancellation wins that startup race.
+                    terminal_events.extend([
+                        Event::TurnStarted {
+                            turn,
+                            mode: thread.mode.clone(),
+                            model: thread.model.clone(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                        Event::UserMessage {
+                            turn,
+                            content: prompt.content.clone(),
+                            attachments: prompt.attachments.clone(),
+                        },
+                    ]);
+                }
+                terminal_events.push(Event::TurnCancelled { turn });
                 self.store
-                    .append_event(
-                        Scope::Thread(thread.id.clone()),
-                        Event::TurnCancelled { turn },
-                    )
+                    .append_events_async(Scope::Thread(thread.id.clone()), terminal_events)
+                    .await
                     .with_context(|| {
                         format!("persisting cancellation for turn {turn} of {}", thread.id)
                     })?;
@@ -6207,6 +6510,7 @@ impl Engine {
             // queue must be atomic against concurrent send_message calls.
             let (next, next_cancel) = {
                 let _activity_publication = self.session_activity_publication.lock().unwrap();
+                let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
                 let (next, next_cancel, idle_session) = {
                     let mut active = self.active_threads.lock().unwrap();
                     if !resume_after_failure && !cancelled {
@@ -6245,6 +6549,7 @@ impl Engine {
                 }
             };
             prompt = next;
+            shell_persisted = false;
         }
     }
 
@@ -6370,10 +6675,20 @@ impl Engine {
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
+        prompt_persisted: &AtomicBool,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
+        if !prompt_persisted.load(Ordering::Acquire) {
+            self.store
+                .append_events_async(
+                    Scope::Thread(thread.id.clone()),
+                    self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
+                )
+                .await?;
+            prompt_persisted.store(true, Ordering::Release);
+        }
         let session = self
             .store
             .session(&thread.session_id)?
@@ -6384,9 +6699,11 @@ impl Engine {
             .context("workspace vanished")?;
         let scope = Scope::Thread(thread.id.clone());
         let worktree = PathBuf::from(&session.worktree_path);
+        let canonical_worktree = worktree.canonicalize()?;
         let ctx = ToolCtx {
             cancel: cancel.clone(),
             worktree: worktree.clone(),
+            canonical_worktree: Some(canonical_worktree),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
@@ -6409,14 +6726,16 @@ impl Engine {
         {
             self.emit_code_review_task_progress(progress).await?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnCapacityAcquired {
-                turn,
-                wait_ms: turn_capacity.wait_ms,
-                background,
-            },
-        )?;
+        self.store
+            .append_event_async(
+                scope.clone(),
+                Event::TurnCapacityAcquired {
+                    turn,
+                    wait_ms: turn_capacity.wait_ms,
+                    background,
+                },
+            )
+            .await?;
 
         // Serialize worktree mutations across the session's threads while
         // allowing ordinary read-only siblings (review, plan, question) to
@@ -6481,29 +6800,6 @@ impl Engine {
         };
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
-        let thinking_level = resolved_thinking_level(&model_options, selected_model);
-
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-                thinking_level,
-                supports_steering: false,
-            },
-        )?;
-        // Show the prompt in the UI before any slow pre-turn work:
-        // compaction below can block for a while (its model probe may even
-        // spawn the local llama-server and load a model).
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
 
         // Compact the transcript when it nears the model's context window,
         // before this turn's user message joins it (the stored transcript —
@@ -6528,7 +6824,6 @@ impl Engine {
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
-        self.emit_queue(&thread.id)?;
 
         // Tool policy: empty allowed_tools = all registered tools. Engine-
         // served tools are added only when tools_enabled is true; tool-free
@@ -6646,29 +6941,36 @@ impl Engine {
             // persist and replay verbatim — Anthropic rejects a follow-up
             // tool-use turn whose thinking blocks aren't preserved.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
+            let mut pending_events = Vec::new();
+            let mut persist_deadline = None;
             loop {
+                let flush_at = persist_deadline.unwrap_or_else(Instant::now);
                 let ev = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
-                    ev = stream.next() => match ev {
-                        Some(ev) => ev,
-                        None => break,
-                    },
+                    _ = cancel.cancelled() => None,
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
+                    ev = stream.next() => ev,
                 };
-                match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
+                let Some(ev) = ev else { break };
+                let event = match ev {
+                    Ok(event) => event,
+                    Err(error) => {
+                        flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                        return Err(anyhow!("provider stream error: {error}"));
+                    }
+                };
+                match event {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantDelta { turn, text: delta },
-                        )?;
+                        pending_events.push(Event::AssistantDelta { turn, text: delta });
                     }
                     // Display-only; never joins the provider transcript.
                     ProviderEvent::ThinkingDelta(delta) => {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantThinking { turn, text: delta },
-                        )?;
+                        pending_events.push(Event::AssistantThinking { turn, text: delta });
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
                     // carried in the transcript for replay only.
@@ -6680,24 +6982,32 @@ impl Engine {
                         });
                         usage.context_input_tokens = Some(context_input_tokens);
                         accumulate_usage(&usage);
-                        self.store
-                            .append_event(scope.clone(), Event::TurnUsageUpdated { turn, usage })?;
+                        pending_events.push(Event::TurnUsageUpdated { turn, usage });
                     }
                 }
+                if pending_events.len() >= STREAM_EVENT_BATCH_MAX {
+                    flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                    persist_deadline = None;
+                } else if !pending_events.is_empty() && persist_deadline.is_none() {
+                    persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
+                }
             }
+            flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
             // Interrupted mid-stream: keep any streamed text for display, but
             // drop the (unexecuted) tool calls so we don't strand tool_use
             // without results, and stop the turn.
             if cancel.is_cancelled() {
                 if !text.is_empty() {
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::AssistantMessage {
-                            turn,
-                            content: text.clone(),
-                        },
-                    )?;
+                    self.store
+                        .append_event_async(
+                            scope.clone(),
+                            Event::AssistantMessage {
+                                turn,
+                                content: text.clone(),
+                            },
+                        )
+                        .await?;
                     self.store.append_message(
                         &thread.id,
                         &serde_json::to_value(Message::Assistant {
@@ -6712,13 +7022,15 @@ impl Engine {
             }
 
             if !text.is_empty() {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::AssistantMessage {
-                        turn,
-                        content: text.clone(),
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::AssistantMessage {
+                            turn,
+                            content: text.clone(),
+                        },
+                    )
+                    .await?;
             }
             // Skip a fully-empty assistant message (no text, no tool calls —
             // e.g. a thinking-only or empty provider response): it serializes
@@ -6798,10 +7110,18 @@ impl Engine {
                 None => {}
                 Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
+                    let mut pending_events = Vec::new();
+                    let mut persist_deadline = None;
                     loop {
+                        let flush_at = persist_deadline.unwrap_or_else(Instant::now);
                         let event = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                                flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                                persist_deadline = None;
+                                continue;
+                            }
                             event = stream.next() => match event {
                                 Some(event) => event,
                                 None => break,
@@ -6810,16 +7130,10 @@ impl Engine {
                         match event {
                             Ok(ProviderEvent::TextDelta(delta)) => {
                                 final_text.push_str(&delta);
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantDelta { turn, text: delta },
-                                )?;
+                                pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
                             Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantThinking { turn, text: delta },
-                                )?;
+                                pending_events.push(Event::AssistantThinking { turn, text: delta });
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { mut usage }) => {
@@ -6829,10 +7143,7 @@ impl Engine {
                                     });
                                 usage.context_input_tokens = Some(context_input_tokens);
                                 accumulate_usage(&usage);
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::TurnUsageUpdated { turn, usage },
-                                )?;
+                                pending_events.push(Event::TurnUsageUpdated { turn, usage });
                             }
                             // Tools are deliberately unavailable on this
                             // final pass. Ignore a non-conforming provider's
@@ -6843,7 +7154,15 @@ impl Engine {
                                 break;
                             }
                         }
+                        if pending_events.len() >= STREAM_EVENT_BATCH_MAX {
+                            flush_backend_event_batch(&self.store, &scope, &mut pending_events)
+                                .await?;
+                            persist_deadline = None;
+                        } else if !pending_events.is_empty() && persist_deadline.is_none() {
+                            persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
+                        }
                     }
+                    flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
                 Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
             }
@@ -6856,13 +7175,15 @@ impl Engine {
                      Send another message to continue."
                 );
             }
-            self.store.append_event(
-                scope.clone(),
-                Event::AssistantMessage {
-                    turn,
-                    content: final_text.clone(),
-                },
-            )?;
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::AssistantMessage {
+                        turn,
+                        content: final_text.clone(),
+                    },
+                )
+                .await?;
             self.store.append_message(
                 &thread.id,
                 &serde_json::to_value(Message::Assistant {
@@ -6896,14 +7217,16 @@ impl Engine {
         if cancel.is_cancelled() {
             return Ok(());
         }
-        self.store.append_event(
-            scope,
-            Event::TurnCompleted {
-                turn,
-                usage: usage_total,
-                checkpoint_id,
-            },
-        )?;
+        self.store
+            .append_event_async(
+                scope,
+                Event::TurnCompleted {
+                    turn,
+                    usage: usage_total,
+                    checkpoint_id,
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -7062,20 +7385,10 @@ impl Engine {
         let matched = self.open_vendor_call(&thread.id, turn, tool, args);
         let synthetic = matched.is_none();
         let call_id = matched.unwrap_or_else(|| new_id("appr"));
-        if synthetic {
-            self.store
-                .append_event(
-                    scope.clone(),
-                    Event::ToolRequested {
-                        turn,
-                        call_id: call_id.clone(),
-                        tool: tool.to_string(),
-                        args: args.clone(),
-                        requires_approval: true,
-                    },
-                )
-                .map_err(EngineError::Internal)?;
-        }
+        // `gate_backend_approval` creates a missing tool card and batches it
+        // with approval.requested. Do not pre-write a synthetic card here:
+        // that used to force an extra SQLite transaction for every bridged
+        // approval.
         let approved = self
             .gate_backend_approval(&session, &thread, turn, &mode, &call_id, tool, args)
             .await
@@ -7084,7 +7397,7 @@ impl Engine {
         // tool_result; only the synthetic card needs closing here.
         if synthetic {
             self.store
-                .append_event(
+                .append_event_async(
                     scope,
                     Event::ToolCompleted {
                         call_id,
@@ -7094,8 +7407,10 @@ impl Engine {
                             ToolStatus::Denied
                         },
                         result: serde_json::json!(if approved { "approved" } else { "denied" }),
+                        execution_duration_ms: None,
                     },
                 )
+                .await
                 .map_err(EngineError::Internal)?;
         }
         Ok(approved)
@@ -7289,9 +7604,14 @@ impl Engine {
             .get(thread_id)
             .cloned()
             .unwrap_or_default();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let canonical_worktree = worktree
+            .canonicalize()
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let ctx = ToolCtx {
             cancel,
-            worktree: PathBuf::from(&session.worktree_path),
+            worktree,
+            canonical_worktree: Some(canonical_worktree),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
@@ -7387,6 +7707,7 @@ impl Engine {
         collaborator.segment.clear();
         collaborator.usage = Usage::default();
         collaborator.tool_calls.clear();
+        collaborator.tool_started_at.clear();
         collaborator.terminal = false;
         self.store.append_event(
             Scope::Thread(collaborator.thread.id.clone()),
@@ -7500,6 +7821,7 @@ impl Engine {
             segment: String::new(),
             usage: Usage::default(),
             tool_calls: HashMap::new(),
+            tool_started_at: HashMap::new(),
             persisted: Vec::new(),
             terminal: true,
         };
@@ -7661,6 +7983,9 @@ impl Engine {
                 mut args,
             } => {
                 collaborator
+                    .tool_started_at
+                    .insert(call_id.clone(), Instant::now());
+                collaborator
                     .tool_calls
                     .insert(call_id.clone(), (tool.clone(), args.clone()));
                 if !collaborator.segment.is_empty() {
@@ -7700,6 +8025,10 @@ impl Engine {
                 } else {
                     ToolStatus::Error
                 };
+                let execution_duration_ms = collaborator
+                    .tool_started_at
+                    .remove(&call_id)
+                    .map(monotonic_elapsed_ms);
                 let todos = match collaborator.tool_calls.get(&call_id) {
                     Some((tool, args)) => self.persist_todos_from_result(
                         &collaborator.thread.id,
@@ -7714,6 +8043,7 @@ impl Engine {
                     call_id,
                     status,
                     result,
+                    execution_duration_ms,
                 });
                 if let Some(todos) = todos {
                     collaborator.persisted.push(Event::TodosUpdated { todos });
@@ -7833,7 +8163,6 @@ impl Engine {
         };
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
-        let thinking_level = resolved_thinking_level(&model_options, selected_model);
         let supports_steering = tools_enabled && backend.supports_steering();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
@@ -7864,24 +8193,6 @@ impl Engine {
         };
         let vendor_session = resume.map(|(id, _)| id);
         let mut active_vendor_session = vendor_session.clone();
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-                thinking_level,
-                supports_steering,
-            },
-        )?;
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
@@ -7905,7 +8216,6 @@ impl Engine {
         if !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
-        self.emit_queue(&thread.id)?;
 
         let permission = if mode.read_only {
             BackendPermission::ReadOnly
@@ -8002,6 +8312,7 @@ impl Engine {
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
+        let mut tool_started_at = HashMap::<String, Instant>::new();
         // Creation tools sometimes stream their final PR URL before the
         // completion payload. Buffer output only for calls whose request is
         // demonstrably creating a PR; list/view output must never associate
@@ -8010,12 +8321,11 @@ impl Engine {
         // A vendor may use any GitHub client instead of trouve's create-PR
         // endpoint. Turn repository-specific PR references in its output into
         // the same durable session event, independent of the tool name.
-        let github_repository = self.github_repository_for_session(session).ok();
-        let mut recorded_prs = if github_repository.is_some() {
-            self.recorded_session_pr_numbers(&session.id)?
-        } else {
-            HashSet::new()
-        };
+        // Repository discovery shells out to Git. Defer it until a tool call
+        // can plausibly create a pull request so ordinary turns do not pay
+        // that process-startup cost.
+        let mut github_repository = None;
+        let mut recorded_prs = HashSet::new();
         let mut vendor_threads = HashMap::<String, String>::new();
         if let Some(vendor_session_id) = active_vendor_session.as_ref() {
             vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
@@ -8198,6 +8508,14 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
+                    tool_started_at.insert(call_id.clone(), Instant::now());
+                    if github_repository.is_none()
+                        && might_request_pull_request_creation(&tool, &args)
+                        && let Ok(repository) = self.github_repository_for_session(session)
+                    {
+                        recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
+                        github_repository = Some(repository);
+                    }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
@@ -8372,6 +8690,8 @@ impl Engine {
                     } else {
                         ToolStatus::Error
                     };
+                    let execution_duration_ms =
+                        tool_started_at.remove(&call_id).map(monotonic_elapsed_ms);
                     let todos = match tool_calls.get(&call_id) {
                         Some((tool, args)) => self.persist_todos_from_result(
                             &thread.id,
@@ -8407,6 +8727,7 @@ impl Engine {
                         call_id,
                         status,
                         result,
+                        execution_duration_ms,
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
@@ -8497,13 +8818,13 @@ impl Engine {
                     .values()
                     .map(|collaborator| collaborator.persisted.len())
                     .sum::<usize>()
-                >= BACKEND_EVENT_BATCH_MAX
+                >= STREAM_EVENT_BATCH_MAX
             {
                 flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                 flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                 persist_deadline = None;
             } else if persist_deadline.is_none() {
-                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
+                persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
             }
         }
         // Adapters close only after cancellation cleanup has completed. The
@@ -8711,19 +9032,17 @@ impl Engine {
                 // before the tool_call announcement that normally creates the
                 // card. Without a synthetic card the Approve/Deny UI has
                 // nowhere to attach and the turn hangs forever.
+                let mut approval_events = Vec::with_capacity(2);
                 if !self.tool_card_exists(&thread.id, turn, call_id) {
                     let mut display_args = args.clone();
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolRequested {
-                            turn,
-                            call_id: call_id.to_string(),
-                            tool: tool.to_string(),
-                            args: display_args,
-                            requires_approval: true,
-                        },
-                    )?;
+                    approval_events.push(Event::ToolRequested {
+                        turn,
+                        call_id: call_id.to_string(),
+                        tool: tool.to_string(),
+                        args: display_args,
+                        requires_approval: true,
+                    });
                 }
                 let cancel = self
                     .turn_cancels
@@ -8733,13 +9052,13 @@ impl Engine {
                     .cloned()
                     .unwrap_or_default();
                 let rx = self.approvals.request(call_id);
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ApprovalRequested {
-                        turn,
-                        call_id: call_id.to_string(),
-                    },
-                )?;
+                approval_events.push(Event::ApprovalRequested {
+                    turn,
+                    call_id: call_id.to_string(),
+                });
+                self.store
+                    .append_events_async(scope.clone(), approval_events)
+                    .await?;
                 // A cancelled turn must not hang on an unanswered approval.
                 let decision = tokio::select! {
                     biased;
@@ -8751,13 +9070,15 @@ impl Engine {
                     },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
-                self.store.append_event(
-                    scope,
-                    Event::ApprovalResolved {
-                        call_id: call_id.to_string(),
-                        decision,
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope,
+                        Event::ApprovalResolved {
+                            call_id: call_id.to_string(),
+                            decision,
+                        },
+                    )
+                    .await?;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
                 if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
@@ -8990,22 +9311,31 @@ impl Engine {
             call.name.as_str(),
             "spawn_thread" | "spawn_session" | "spawn_output" | "search_transcript"
         ) {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: call.name.clone(),
-                    args: call.arguments.clone(),
-                    requires_approval: false,
-                },
-            )?;
+            self.store
+                .append_events_async(
+                    scope.clone(),
+                    vec![
+                        Event::ToolRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                            tool: call.name.clone(),
+                            args: call.arguments.clone(),
+                            requires_approval: false,
+                        },
+                        Event::ToolStarted {
+                            call_id: call_id.clone(),
+                        },
+                    ],
+                )
+                .await?;
+            let execution_started = std::time::Instant::now();
             let outcome = if call.name == "search_transcript" {
                 self.handle_search_transcript(session, thread, &call.arguments)
             } else {
                 self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
                     .await
             };
+            let execution_duration_ms = monotonic_elapsed_ms(execution_started);
             let result = match outcome {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "error": e.to_string() }),
@@ -9015,15 +9345,19 @@ impl Engine {
             } else {
                 ToolStatus::Ok
             };
-            self.store.append_event(
-                scope,
-                Event::ToolCompleted {
-                    call_id,
-                    status,
-                    result: result.clone(),
-                },
-            )?;
-            return Ok((result.to_string(), Vec::new()));
+            let model_result = result.to_string();
+            self.store
+                .append_event_async(
+                    scope,
+                    Event::ToolCompleted {
+                        call_id,
+                        status,
+                        result,
+                        execution_duration_ms: Some(execution_duration_ms),
+                    },
+                )
+                .await?;
+            return Ok((model_result, Vec::new()));
         }
 
         let known = self.executor.tool_mutates(&call.name);
@@ -9048,29 +9382,34 @@ impl Engine {
         // UI diff can number its gutter. Stored/executed args stay pristine.
         let mut display_args = call.arguments.clone();
         annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolRequested {
-                turn,
-                call_id: call_id.clone(),
-                tool: call.name.clone(),
-                args: display_args,
-                requires_approval: decision == Gate::NeedsApproval,
-            },
-        )?;
+        self.store
+            .append_event_async(
+                scope.clone(),
+                Event::ToolRequested {
+                    turn,
+                    call_id: call_id.clone(),
+                    tool: call.name.clone(),
+                    args: display_args,
+                    requires_approval: decision == Gate::NeedsApproval,
+                },
+            )
+            .await?;
 
         let decision = match decision {
             Gate::Deny => {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ToolCompleted {
-                        call_id: call_id.clone(),
-                        status: ToolStatus::Denied,
-                        result: serde_json::json!({
-                            "error": "tool not permitted in this mode"
-                        }),
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::ToolCompleted {
+                            call_id: call_id.clone(),
+                            status: ToolStatus::Denied,
+                            result: serde_json::json!({
+                                "error": "tool not permitted in this mode"
+                            }),
+                            execution_duration_ms: None,
+                        },
+                    )
+                    .await?;
                 return Ok((
                     "Tool call denied: not permitted in this mode.".into(),
                     Vec::new(),
@@ -9078,13 +9417,15 @@ impl Engine {
             }
             Gate::NeedsApproval => {
                 let rx = self.approvals.request(&call_id);
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ApprovalRequested {
-                        turn,
-                        call_id: call_id.clone(),
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::ApprovalRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                        },
+                    )
+                    .await?;
                 // A cancelled turn must not hang on an unanswered approval:
                 // treat cancellation as a denial so the wait unblocks.
                 let decision = tokio::select! {
@@ -9099,13 +9440,15 @@ impl Engine {
                     },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ApprovalResolved {
-                        call_id: call_id.clone(),
-                        decision,
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::ApprovalResolved {
+                            call_id: call_id.clone(),
+                            decision,
+                        },
+                    )
+                    .await?;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
                 if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
@@ -9118,14 +9461,17 @@ impl Engine {
         };
 
         if decision == ApprovalDecision::Deny {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolCompleted {
-                    call_id: call_id.clone(),
-                    status: ToolStatus::Denied,
-                    result: serde_json::json!({"error": "denied by user"}),
-                },
-            )?;
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::ToolCompleted {
+                        call_id: call_id.clone(),
+                        status: ToolStatus::Denied,
+                        result: serde_json::json!({"error": "denied by user"}),
+                        execution_duration_ms: None,
+                    },
+                )
+                .await?;
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
@@ -9151,20 +9497,23 @@ impl Engine {
                 permit = execution_lock.clone().read_owned() => Some(ExecutionPermit::Read { _guard: permit }),
             }
         };
-        let mut outcome = if let Some(permit) = permit {
+        let (mut outcome, execution_duration_ms) = if let Some(permit) = permit {
             // Retain the lane until the executor has acknowledged cancellation
             // and cleaned up its process/protocol resources.
             let mut permit = Some(permit);
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolStarted {
-                    call_id: call_id.clone(),
-                },
-            )?;
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::ToolStarted {
+                        call_id: call_id.clone(),
+                    },
+                )
+                .await?;
             let executor = self.executor.clone();
             let tool_ctx = ctx.clone();
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
+            let execution_started = std::time::Instant::now();
             let mut execute = Box::pin(async move {
                 executor
                     .execute(&tool_ctx, &tool_name, &tool_arguments)
@@ -9208,9 +9557,9 @@ impl Engine {
                 }
             };
             drop(permit);
-            outcome
+            (outcome, Some(monotonic_elapsed_ms(execution_started)))
         } else {
-            ToolResult::error("tool call cancelled")
+            (ToolResult::error("tool call cancelled"), None)
         };
         // Peel vision content ("_images") out of the result: megabytes of
         // base64 must not land in the event log or the text transcript —
@@ -9224,6 +9573,7 @@ impl Engine {
             Some(&call.arguments),
         )?;
         if matches!(outcome.status, ToolStatus::Ok)
+            && might_request_pull_request_creation(&call.name, &call.arguments)
             && let Ok(repository) = self.github_repository_for_session(session)
             && requests_pull_request_creation(
                 &call.name,
@@ -9238,19 +9588,20 @@ impl Engine {
             numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
             self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolCompleted {
-                call_id,
-                status: outcome.status,
-                result: outcome.result.clone(),
-            },
-        )?;
+        let model_result = outcome.result.to_string();
+        let mut completion_events = vec![Event::ToolCompleted {
+            call_id,
+            status: outcome.status,
+            result: outcome.result,
+            execution_duration_ms,
+        }];
         if let Some(todos) = todos {
-            self.store
-                .append_event(scope, Event::TodosUpdated { todos })?;
+            completion_events.push(Event::TodosUpdated { todos });
         }
-        Ok((outcome.result.to_string(), images))
+        self.store
+            .append_events_async(scope, completion_events)
+            .await?;
+        Ok((model_result, images))
     }
 
     /// The spawn tool family: `spawn_thread` starts a child agent on a new
@@ -10053,6 +10404,52 @@ fn contains_rest_mutation(
 
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
+fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
+    let tool_compact = compact_activity(tool);
+    if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
+        return true;
+    }
+
+    // Restrict argument inspection to execution/integration tools. File and
+    // search arguments often contain phrases such as "pull request" but can
+    // never create one; treating those as candidates caused a git subprocess
+    // after nearly every successful read/search call.
+    let execution_like = [
+        "shell",
+        "bash",
+        "command",
+        "terminal",
+        "exec",
+        "gh",
+        "github",
+        "browser",
+        "web",
+        "playwright",
+        "mcp",
+        "dynamictoolcall",
+    ]
+    .iter()
+    .any(|marker| tool_compact.contains(marker));
+    if !execution_like {
+        return false;
+    }
+
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let args_compact = compact_activity(&args_text);
+    args_words.contains("gh pr create")
+        || args_words.contains("create pull request")
+        || args_compact.contains("createpullrequest")
+        || (args_words.split_whitespace().any(|word| word == "post")
+            && args_text.to_ascii_lowercase().contains("/pulls"))
+}
+
+fn monotonic_elapsed_ms(started: std::time::Instant) -> u64 {
+    // UI durations are integral milliseconds. Round a real sub-millisecond
+    // execution up instead of presenting the misleading "0ms" placeholder.
+    u64::try_from(started.elapsed().as_millis().max(1)).unwrap_or(u64::MAX)
+}
+
 fn requests_pull_request_creation(
     tool: &str,
     args: &serde_json::Value,
@@ -10177,6 +10574,7 @@ fn pr_evidence_from_events(
                 call_id,
                 status,
                 result,
+                ..
             } => {
                 let request = requested.remove(&call_id);
                 let output = output.remove(&call_id).unwrap_or_default();
@@ -11042,6 +11440,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_message_acceptance_persists_the_turn_shell_before_startup() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_fast_accept".into(),
+            name: "fast accept".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_fast_accept".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Fast acceptance".into(),
+            branch: "trouve/fast-accept".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_fast_accept".into(),
+            session_id: session.id,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        ));
+
+        let accepted = engine
+            .send_message(&thread.id, "Visible immediately".into(), Vec::new())
+            .unwrap();
+
+        assert_eq!(accepted.turn, 1);
+        assert!(!accepted.queued);
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(matches!(
+            events.first().map(|event| &event.event),
+            Some(Event::QueueUpdated { prompts }) if prompts.is_empty()
+        ));
+        assert!(matches!(
+            events.get(1).map(|event| &event.event),
+            Some(Event::TurnStarted { turn: 1, .. })
+        ));
+        assert!(matches!(
+            events.get(2).map(|event| &event.event),
+            Some(Event::UserMessage {
+                turn: 1,
+                content,
+                ..
+            }) if content == "Visible immediately"
+        ));
+    }
+
+    #[test]
+    fn active_message_acceptance_publishes_one_visible_queue_state() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_fast_queue".into(),
+            name: "fast queue".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_fast_queue".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Fast queue".into(),
+            branch: "trouve/fast-queue".into(),
+            worktree_path: workspace.path,
+            base_ref: "main".into(),
+            archived: false,
+            active: true,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_fast_queue".into(),
+            session_id: session.id.clone(),
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        ));
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(thread.id.clone(), session.id);
+
+        let accepted = engine
+            .send_message(&thread.id, "Queue immediately".into(), Vec::new())
+            .unwrap();
+
+        assert_eq!(accepted.turn, 0);
+        assert!(accepted.queued);
+        let queue = store.queued_prompts(&thread.id).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].content, "Queue immediately");
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::QueueUpdated { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, Event::TurnStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_resolves_and_removes_pending_user_questions() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -11871,6 +12413,7 @@ mod tests {
                     "ref": "refs/heads/fix/manual-pr",
                     "object": {"sha": remote_commit}
                 }),
+                execution_duration_ms: None,
             },
             Event::ToolRequested {
                 turn: 1,
@@ -11887,6 +12430,7 @@ mod tests {
                 call_id: "failed".into(),
                 status: ToolStatus::Error,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             Event::ToolRequested {
                 turn: 1,
@@ -11905,6 +12449,7 @@ mod tests {
                 call_id: "graphql".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             // Successful list/view output may mention many PRs, but none of
             // them were created by this session.
@@ -11923,6 +12468,7 @@ mod tests {
                 call_id: "list".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             Event::UserMessage {
                 turn: 2,

@@ -1,6 +1,7 @@
 import type { components as ProtocolComponents } from "../generated/protocol.js";
 import type {
   ProtocolEventEnvelope,
+  ProtocolThreadToolDetails,
   ProtocolThreadViewSnapshot,
 } from "../services/protocol-client.js";
 import {
@@ -45,6 +46,8 @@ export type CompactionState =
   | { readonly kind: "completed"; readonly messagesCompacted: number }
   | { readonly kind: "failed" };
 
+export type TodoLifecycleState = "started" | "completed" | "cancelled" | "skipped";
+
 export type ThreadChatItem =
   | {
       readonly id: string;
@@ -82,10 +85,19 @@ export type ThreadChatItem =
     }
   | {
       readonly id: string;
+      readonly kind: "todo";
+      readonly turn: number;
+      readonly todoId: string;
+      readonly content: string;
+      readonly state: TodoLifecycleState;
+    }
+  | {
+      readonly id: string;
       readonly kind: "tool";
       readonly callId: string;
       readonly tool: string;
-      readonly args: unknown;
+      args: unknown;
+      detailsDeferred?: boolean;
       status: ToolCallStatus;
       result: unknown | undefined;
       output: ToolOutputBuffer;
@@ -113,6 +125,40 @@ const terminalToolStatus = (status: ToolCallStatus): boolean =>
   status === "error" ||
   status === "denied" ||
   status === "aborted";
+
+interface TodoTransition {
+  readonly todo: TodoItem;
+  readonly state: TodoLifecycleState;
+}
+
+const todoTransitions = (
+  previous: readonly TodoItem[],
+  current: readonly TodoItem[],
+): readonly TodoTransition[] => {
+  const previousById = new Map(previous.map((todo) => [todo.id, todo]));
+  const currentIds = new Set(current.map((todo) => todo.id));
+  const transitions: TodoTransition[] = [];
+  for (const todo of current) {
+    const previousStatus = previousById.get(todo.id)?.status;
+    if (todo.status === "in_progress" && previousStatus !== "in_progress") {
+      transitions.push({ todo, state: "started" });
+    } else if (todo.status === "completed" && previousStatus !== "completed") {
+      transitions.push({ todo, state: "completed" });
+    } else if (todo.status === "cancelled" && previousStatus !== "cancelled") {
+      transitions.push({ todo, state: "cancelled" });
+    }
+  }
+  for (const todo of previous) {
+    if (
+      !currentIds.has(todo.id)
+      && todo.status !== "completed"
+      && todo.status !== "cancelled"
+    ) {
+      transitions.push({ todo, state: "skipped" });
+    }
+  }
+  return transitions;
+};
 
 const replaceNumericMap = <T>(
   target: Map<number, T>,
@@ -220,6 +266,29 @@ export class ThreadViewModel {
     if (snapshot.todos !== undefined) this.replaceTodos(snapshot.todos);
   }
 
+  /** Merge a fresh folded tail into an already-prefetched history window.
+   * Absolute snapshot ids make the retained prefix stable across reconnects. */
+  mergeTailSnapshot(cursor: number, snapshot: ProtocolThreadViewSnapshot): void {
+    if (!this.snapshotLoaded) {
+      this.replaceSnapshot(cursor, snapshot);
+      return;
+    }
+    const previousOffset = this.itemOffset;
+    const previousEnd = previousOffset + this.items.length;
+    const nextOffset = snapshot.item_offset ?? 0;
+    const retained = nextOffset >= previousOffset && nextOffset <= previousEnd
+      ? this.items.slice(0, nextOffset - previousOffset)
+      : [];
+    const previousTotal = this.totalItems;
+    this.replaceSnapshot(cursor, snapshot);
+    if (retained.length > 0) {
+      this.items.splice(0, 0, ...retained);
+      this.itemOffset = previousOffset;
+      this.hasOlder = previousOffset > 0;
+    }
+    this.totalItems = Math.max(previousTotal, this.totalItems);
+  }
+
   /** Prepend one contiguous folded history page without replacing live state. */
   prependSnapshot(snapshot: ProtocolThreadViewSnapshot): boolean {
     const itemOffset = snapshot.item_offset ?? 0;
@@ -295,6 +364,15 @@ export class ThreadViewModel {
         }
         return { id, kind: "compaction", turn: item.turn, state };
       }
+      case "todo_update":
+        return {
+          id,
+          kind: "todo",
+          turn: item.turn,
+          todoId: item.todo_id,
+          content: item.content,
+          state: item.state,
+        };
       case "tool_call":
         return {
           id,
@@ -302,6 +380,7 @@ export class ThreadViewModel {
           callId: item.call_id,
           tool: item.tool,
           args: item.args,
+          detailsDeferred: item.details_deferred ?? false,
           status: item.status === "awaiting_approval"
             ? "awaiting-approval"
             : item.status,
@@ -385,9 +464,24 @@ export class ThreadViewModel {
       case "thread.queue_updated":
         this.queue = envelope.prompts;
         return true;
-      case "thread.todos_updated":
+      case "thread.todos_updated": {
+        const turn = this.activeTurn();
+        const transitions = todoTransitions(this.todos, envelope.todos);
         this.replaceTodos(envelope.todos);
+        if (turn !== undefined) {
+          for (const [index, transition] of transitions.entries()) {
+            this.appendItem({
+              id: `todo:${turn}:${transition.todo.id}:${transition.state}:${envelope.cursor}:${index}`,
+              kind: "todo",
+              turn,
+              todoId: transition.todo.id,
+              content: transition.todo.content,
+              state: transition.state,
+            });
+          }
+        }
         return true;
+      }
       case "thread.compaction_completed": {
         this.compacting = false;
         const compaction = this.findRunningCompaction(envelope.turn);
@@ -506,6 +600,7 @@ export class ThreadViewModel {
           callId: envelope.call_id,
           tool: envelope.tool,
           args: envelope.args,
+          detailsDeferred: false,
           status: envelope.requires_approval ? "awaiting-approval" : "running",
           result: undefined,
           output: emptyToolOutput(),
@@ -555,12 +650,16 @@ export class ThreadViewModel {
         if (tool !== undefined) {
           if (tool.status !== "denied") tool.status = envelope.status;
           tool.result = envelope.result;
-          const startedAt = tool.startedAt === undefined
-            ? Number.NaN
-            : Date.parse(tool.startedAt);
-          const completedAt = Date.parse(envelope.ts);
-          if (Number.isFinite(startedAt) && Number.isFinite(completedAt)) {
-            tool.durationMs = Math.max(0, completedAt - startedAt);
+          if (envelope.execution_duration_ms != null) {
+            tool.durationMs = envelope.execution_duration_ms;
+          } else {
+            const startedAt = tool.startedAt === undefined
+              ? Number.NaN
+              : Date.parse(tool.startedAt);
+            const completedAt = Date.parse(envelope.ts);
+            if (Number.isFinite(startedAt) && Number.isFinite(completedAt)) {
+              tool.durationMs = Math.max(0, completedAt - startedAt);
+            }
           }
         }
         this.removePending(this.pendingApprovals, envelope.call_id);
@@ -644,6 +743,13 @@ export class ThreadViewModel {
     this.totalItems += 1;
   }
 
+  private activeTurn(): number | undefined {
+    const running = this.#findLast(
+      (item) => item.kind === "turn-status" && item.state.kind === "running",
+    );
+    return running?.kind === "turn-status" ? running.turn : undefined;
+  }
+
   #findLast(predicate: (item: ThreadChatItem) => boolean): ThreadChatItem | undefined {
     for (let index = this.items.length - 1; index >= 0; index -= 1) {
       const item = this.items[index];
@@ -657,6 +763,25 @@ export class ThreadViewModel {
       (candidate) => candidate.kind === "tool" && candidate.callId === callId,
     );
     return item?.kind === "tool" ? item : undefined;
+  }
+
+  replaceToolDetails(details: ProtocolThreadToolDetails): boolean {
+    const tool = this.findTool(details.call_id);
+    if (tool === undefined) return false;
+    tool.args = details.args;
+    tool.result = details.result;
+    tool.detailsDeferred = false;
+    return true;
+  }
+
+  /** Bound inactive transcript caches without changing absolute item ids. */
+  trimHistory(maxItems: number): void {
+    const retained = Math.max(1, Math.floor(maxItems));
+    if (this.items.length <= retained) return;
+    const removed = this.items.length - retained;
+    this.items.splice(0, removed);
+    this.itemOffset += removed;
+    this.hasOlder = this.itemOffset > 0;
   }
 
   findQuestions(

@@ -167,7 +167,7 @@
     "thinking": false,
     "pending_approvals": [],
     "pending_questions": [],
-    "item_kinds": ["turn-status", "user", "thinking", "assistant", "tool", "questions"],
+    "item_kinds": ["turn-status", "user", "thinking", "assistant", "tool", "questions", "todo"],
     "turn_state": "completed",
     "assistant_text": "Working now.",
     "thinking_text": "first thought",

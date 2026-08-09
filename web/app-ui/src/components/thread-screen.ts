@@ -150,23 +150,32 @@ import "./new-thread-setup.js";
 
 type VirtualChatItem = VirtualItem & (
   | { readonly kind: "unit"; readonly unitIndex: number }
+  | { readonly kind: "optimistic-prompt" }
   | { readonly kind: "compacting" }
   | { readonly kind: "activity"; readonly label: string }
-  | { readonly kind: "history" }
   | { readonly kind: "edge-spacer"; readonly edge: "start" }
 );
 
+interface OptimisticPromptSubmission {
+  readonly id: string;
+  readonly threadId: string;
+  readonly content: string;
+  readonly attachments: readonly PendingAttachment[];
+  readonly minimumTurn: number;
+  disposition: "turn" | "queue";
+  turn?: number;
+}
+
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
-const CHAT_HISTORY_LOADER_ID = "ephemeral:chat-history-loader";
 const CHAT_TAIL_EPSILON_PX = 2;
 const CHAT_POSITION_SETTLE_MS = 140;
-const CHAT_SCROLL_CORRECTION_SETTLE_MS = 240;
-const CHAT_SCROLL_INTENT_SETTLE_MS = 240;
+const CHAT_NATIVE_SCROLL_CORRECTION_GUARD_MS = 240;
 const CHAT_TAIL_CONVERGENCE_FRAMES = 3;
 const CHAT_SCROLL_INDICATOR_INSET_PX = 3;
 const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
-const CHAT_HISTORY_PREFETCH_VIEWPORTS = 5;
-const CHAT_HISTORY_PREFETCH_MIN_PX = 2_400;
+const CHAT_HISTORY_PREFETCH_ROOT_MARGIN = "500% 0px 0px 0px";
+const CHAT_HISTORY_STATUS_DELAY_MS = 180;
+const CHAT_HISTORY_RETRY_DELAY_MS = 1_500;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -335,18 +344,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #pendingStartTurn: number | undefined;
   #cancelRequestedTurn: number | undefined;
   #messageRequest: "start" | "queue" | undefined;
+  #optimisticPrompt: OptimisticPromptSubmission | undefined;
   #newThreadSetupOpen = false;
   #newThreadBusy = false;
   #newThreadError = "";
   #accessibleHistory = false;
   #historyLoading = false;
-  #historyLoadRequested = false;
   #historyError = "";
+  #historyStatusVisible = false;
   #historyGeneration = 0;
-  readonly #historyWarmThreads = new Set<string>();
+  #historyObserver: IntersectionObserver | undefined;
+  #observedHistorySentinel: Element | undefined;
+  #historyStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  #historyRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #pendingHistoryPrepend: PendingHistoryPrepend | undefined;
   #historyAnchorToRestore: ChatDomAnchor | undefined;
-  #historyAnchorStabilizer: ChatDomAnchor | undefined;
+  #historyAnchorGeneration = 0;
+  #parkedLayoutAnchor: ChatDomAnchor | undefined;
   #virtualizer = new Virtualizer<VirtualChatItem>({
     estimatedHeight: 120,
     overscanPx: 1_200,
@@ -356,6 +370,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   readonly #observedVirtualRows = new Set<HTMLElement>();
   #viewportHeight = 0;
   #programmaticScrollFrame: number | undefined;
+  #programmaticScrollTarget: number | undefined;
   #tailConvergenceFrame: number | undefined;
   #scrollRenderFrame: number | undefined;
   #scrollIndicatorFrame: number | undefined;
@@ -363,12 +378,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     | { readonly maxScrollTop: number; readonly thumbTravel: number }
     | undefined;
   #chatPositionTimer: ReturnType<typeof setTimeout> | undefined;
-  #scrollCorrectionResumeAt = 0;
+  #nativeScrollCorrectionBlockedUntil = 0;
   #followTailControlHeight = 0;
-  #chatScrollIntent = false;
-  #chatScrollIntentSequence = 0;
-  #historyPrefetchIntentSequence = 0;
-  #chatScrollIntentTimer: ReturnType<typeof setTimeout> | undefined;
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
@@ -438,6 +449,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   readonly #messageDisclosure = new Map<string, boolean>();
   readonly #rawToolCalls = new Set<string>();
   readonly #toolDisclosure = new Map<string, boolean>();
+  readonly #toolDetailLoading = new Set<string>();
+  readonly #toolDetailErrors = new Map<string, string>();
   readonly #questionWizards = new Map<string, QuestionWizardState>();
   readonly #questionSubmissions = new Set<string>();
 
@@ -520,11 +533,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#threadInteractionGeneration += 1;
       this.#historyGeneration += 1;
       this.#historyLoading = false;
-      this.#historyLoadRequested = false;
       this.#historyError = "";
+      this.#historyStatusVisible = false;
+      this.#disconnectHistoryObserver();
+      this.#clearHistoryStatusTimer();
+      this.#clearHistoryRetryTimer();
       this.#pendingHistoryPrepend = undefined;
       this.#historyAnchorToRestore = undefined;
-      this.#clearHistoryAnchorStabilizer();
+      this.#cancelHistoryAnchorCorrection();
+      this.#parkedLayoutAnchor = undefined;
       this.#requestPending = false;
       this.#requestError = "";
       this.#threadSettingsPending = false;
@@ -538,6 +555,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#cancelScheduledScrollRender();
       this.#cancelScheduledScrollIndicator();
       this.#cancelScheduledChatPosition();
+      this.#nativeScrollCorrectionBlockedUntil = 0;
       this.#scrollIndicatorMetrics = undefined;
       this.#virtualizer = new Virtualizer<VirtualChatItem>({
         estimatedHeight: 120,
@@ -547,10 +565,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
       this.#viewportHeight = 0;
       this.#followTailControlHeight = 0;
-      this.#scrollCorrectionResumeAt = 0;
-      this.#clearChatScrollIntent();
-      this.#chatScrollIntentSequence = 0;
-      this.#historyPrefetchIntentSequence = 0;
       this.#restoredScrollThreadId = undefined;
       this.#invalidScrollBookmarkThreadId = undefined;
       this.#threadProvider.setValue({ threadId: this.threadId });
@@ -563,6 +577,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#messageDisclosure.clear();
       this.#rawToolCalls.clear();
       this.#toolDisclosure.clear();
+      this.#toolDetailLoading.clear();
+      this.#toolDetailErrors.clear();
       this.#questionWizards.clear();
       this.#questionSubmissions.clear();
       this.#completionSelected = 0;
@@ -582,6 +598,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pendingStartTurn = undefined;
       this.#cancelRequestedTurn = undefined;
       this.#messageRequest = undefined;
+      this.#optimisticPrompt = undefined;
     }
     if (composerScopeChanged) {
       this.#restoreComposerDraft(this.#draftThreadIdForCurrentScope());
@@ -596,28 +613,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       // tail as well as clearing the persisted preference in the shell.
       this.#virtualizer.enableFollowTail();
       this.#restoredScrollThreadId = this.threadId;
-    }
-    if (!changed.has("threadId") && this.#pendingHistoryPrepend !== undefined) {
-      const viewport = this.querySelector<HTMLElement>(".chat-stream");
-      if (viewport !== null) {
-        const followingTail = this.#virtualizer.window().followingTail;
-        if (!followingTail) {
-          // Render can run after another native wheel frame. Synchronize the
-          // virtual anchor to the live viewport immediately before replacing
-          // the item list; setItems can then preserve the actual visible item
-          // instead of relying on a transcript-wide height delta.
-          this.#virtualizer.setViewport(
-            viewport.scrollTop,
-            viewport.clientHeight,
-            { userInitiated: true, atTail: false },
-          );
-        }
-        this.#pendingHistoryPrepend = {
-          anchor: followingTail
-            ? undefined
-            : this.#captureChatDomAnchor(viewport),
-        };
-      }
     }
   }
 
@@ -647,6 +642,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (viewport === null) {
       this.#resizeObserver?.disconnect();
       this.#observedVirtualRows.clear();
+      this.#disconnectHistoryObserver();
       this.#followTailControlHeight = 0;
       this.#cancelScheduledScrollIndicator();
       this.#scrollIndicatorMetrics = undefined;
@@ -656,33 +652,49 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       .querySelector<HTMLElement>(".follow-tail")
       ?.offsetHeight ?? 0;
     this.#restoreHistoryPrependAnchor(viewport);
+    this.#syncHistoryObserver(viewport);
     if (viewport.clientHeight !== this.#viewportHeight) {
+      const before = this.#virtualizer.window();
       this.#viewportHeight = viewport.clientHeight;
-      const correction = this.#virtualizer.resizeViewport(viewport.clientHeight);
-      const expected = this.#virtualizer.window().followingTail
-        ? this.#transcriptTailScrollTop(viewport)
-        : correction.scrollTop;
-      this.#setChatScrollTop(viewport, expected);
+      if (before.followingTail) {
+        this.#virtualizer.resizeViewport(viewport.clientHeight);
+        this.#setChatScrollTop(viewport, this.#transcriptTailScrollTop(viewport));
+      } else {
+        this.#virtualizer.setViewport(
+          viewport.scrollTop,
+          viewport.clientHeight,
+          { userInitiated: true, atTail: false },
+        );
+      }
       this.#refreshChatScrollIndicator(viewport);
-      this.requestUpdate();
-      return;
+      if (!sameVirtualRenderWindow(before, this.#virtualizer.window())) {
+        this.#scheduleScrollRender();
+      }
     }
     const virtualWindow = this.#virtualizer.window();
-    const expected = virtualWindow.followingTail
-      ? this.#transcriptTailScrollTop(viewport)
-      : virtualWindow.scrollTop;
-    this.#setChatScrollTop(viewport, expected);
+    if (virtualWindow.followingTail) {
+      this.#setChatScrollTop(viewport, this.#transcriptTailScrollTop(viewport));
+    } else {
+      // While reading history, the browser's native scrolling is the source
+      // of truth. Synchronize the model without writing scrollTop back.
+      this.#virtualizer.setViewport(
+        viewport.scrollTop,
+        viewport.clientHeight,
+        { userInitiated: true, atTail: false },
+      );
+    }
     this.#refreshChatScrollIndicator(viewport);
-    this.#warmOlderHistory();
     if (typeof ResizeObserver === "undefined") return;
     this.#resizeObserver ??= new ResizeObserver((entries) => {
       const activeViewport = this.querySelector<HTMLElement>(".chat-stream");
       if (activeViewport === null) return;
       const before = this.#virtualizer.window();
       const followingTail = before.followingTail;
+      const layoutAnchor = followingTail ? undefined : this.#parkedLayoutAnchor;
+      const nativeScrollActive = !followingTail
+        && globalThis.performance.now() < this.#nativeScrollCorrectionBlockedUntil;
       let measured = false;
       let scrollCorrected = false;
-      let scrollTop = activeViewport.scrollTop;
       for (const entry of entries) {
         const element = entry.target as HTMLElement;
         const id = element.dataset["virtualId"];
@@ -692,33 +704,28 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           const correction = this.#virtualizer.measure(id, entry.contentRect.height);
           if (correction.delta !== 0) {
             scrollCorrected = true;
-            // A ResizeObserver delivery can lag behind another native scroll
-            // frame. Apply parked-history corrections relative to the live DOM
-            // position instead of writing the virtualizer's now-stale absolute
-            // position back over the user's momentum.
-            scrollTop = followingTail
-              ? correction.scrollTop
-              : scrollTop + correction.delta;
           }
         } catch {
           // A row may have unmounted between delivery and measurement.
         }
       }
       let expectedScrollTop: number | undefined;
-      if (!followingTail && scrollCorrected) {
-        if (Date.now() < this.#scrollCorrectionResumeAt) {
-          // Keep the native viewport authoritative while wheel/touch momentum
-          // is active. Measurements still improve future windows, but must
-          // never push against the direction of the user's current gesture.
-          this.#virtualizer.setViewport(
-            activeViewport.scrollTop,
-            activeViewport.clientHeight,
-            { userInitiated: true, atTail: false },
-          );
-        } else {
-          this.#virtualizer.setViewport(scrollTop, activeViewport.clientHeight);
-          expectedScrollTop = this.#virtualizer.window().scrollTop;
-        }
+      if (!followingTail && layoutAnchor === undefined && measured && nativeScrollActive) {
+        // A native scroll clears the settled DOM anchor. During wheel, touch,
+        // keyboard, or scrollbar momentum, measurements may update geometry
+        // but must never write a compensating scroll position. Re-anchor the
+        // model to the browser's live position and wait until scrolling has
+        // settled before permitting layout correction again.
+        this.#virtualizer.setViewport(activeViewport.scrollTop, activeViewport.clientHeight, {
+          userInitiated: true,
+          atTail: false,
+        });
+      } else if (!followingTail && layoutAnchor === undefined && scrollCorrected) {
+        // If a nested DOM anchor is temporarily unavailable after scrolling
+        // has settled, the virtualizer's stable row anchor is the fallback.
+        // This preserves late Markdown and attachment layout without writing
+        // against active native momentum.
+        expectedScrollTop = this.#virtualizer.window().scrollTop;
       }
       const after = this.#virtualizer.window();
       if (!sameVirtualRenderWindow(before, after)) {
@@ -738,17 +745,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           activeViewport,
           this.#transcriptTailScrollTop(activeViewport),
         );
+      } else if (
+        !nativeScrollActive
+        &&
+        layoutAnchor !== undefined
+        && this.#applyChatDomAnchor(activeViewport, layoutAnchor, false)
+      ) {
+        // The nested DOM anchor is more precise than a virtual-row anchor
+        // when Markdown or attachments above it finish layout asynchronously.
       } else if (expectedScrollTop !== undefined) {
         this.#setChatScrollTop(activeViewport, expectedScrollTop);
-      }
-      if (!followingTail && this.#historyAnchorStabilizer !== undefined) {
-        // A single paged Agent turn can re-render many nested markdown blocks
-        // after the parent update. Keep the exact visible thought/tool fixed
-        // through every delayed ResizeObserver delivery. The anchor follows
-        // explicit reader scrolling and is cleared at the tail or on a thread
-        // change, so worker-backed Markdown cannot outlive a fixed timer and
-        // shift the parked viewport later.
-        this.#correctHistoryAnchor(activeViewport);
       }
       this.#refreshChatScrollIndicator(activeViewport);
     });
@@ -789,9 +795,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#cancelScheduledScrollRender();
     this.#cancelScheduledScrollIndicator();
     this.#cancelScheduledChatPosition();
-    this.#clearHistoryAnchorStabilizer();
+    this.#disconnectHistoryObserver();
+    this.#clearHistoryStatusTimer();
+    this.#clearHistoryRetryTimer();
+    this.#cancelHistoryAnchorCorrection();
+    this.#parkedLayoutAnchor = undefined;
     this.#scrollIndicatorMetrics = undefined;
-    this.#scrollCorrectionResumeAt = 0;
     this.#copyFeedbackGeneration += 1;
     this.#usageGeneration += 1;
     this.#turnRequestGeneration += 1;
@@ -800,8 +809,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
+    this.#optimisticPrompt = undefined;
     this.#clearMentionPathsRetry();
-    this.#clearChatScrollIntent();
     this.#clearQueueDragImage();
     this.#markdownContextMenu = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
@@ -838,6 +847,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threads = store.threadsForSession(this.sessionId);
     const thread = this.threadId === "" ? undefined : store.thread(this.threadId);
     const view = this.threadId === "" ? undefined : store.threadView(this.threadId);
+    this.#reconcileOptimisticPrompt(view?.items ?? [], view?.queue ?? []);
+    const displayedQueue = this.#queueWithOptimisticPrompt(view?.queue ?? []);
     const turnLabels = agentTurnLabels(
       view?.turnModels,
       view?.turnThinkingLevels,
@@ -975,7 +986,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       )}
 
       ${this.#renderQueue(
-        view?.queue ?? [],
+        displayedQueue,
         turnControls.effectiveTurnRunning,
         connectivityBlocked,
       )}
@@ -1513,6 +1524,62 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  #renderOptimisticPrompt(optimistic: OptimisticPromptSubmission) {
+    this.#ensureMarkdown();
+    return html`
+      <article
+        class="message turn-card assistant-message agent-turn-card conversation-turn turn-running optimistic-turn"
+        aria-label="Pending turn"
+        aria-busy="true"
+      >
+        <header class="message-header agent-header turn-header">
+          <div class="message-disclosure optimistic-turn-header">
+            <strong>Pending turn</strong>
+            <small class="agent-model-label">Awaiting durable acceptance</small>
+            <span class="agent-header-spacer"></span>
+            <small class="turn-metadata">Sending…</small>
+          </div>
+        </header>
+        <div class="message-body turn-body-stream agent-body-stream turn-timeline">
+          <section class="turn-rail-node turn-prompt-node user-message">
+            <span class="turn-rail-marker prompt" aria-hidden="true">
+              ${fontAwesomeIcon("user")}
+            </span>
+            <header class="turn-node-header"><strong>Prompt</strong></header>
+            <div class="turn-node-body user-body-stream">
+              ${optimistic.content === ""
+                ? nothing
+                : html`<trouve-markdown-view
+                    .content=${optimistic.content}
+                  ></trouve-markdown-view>`}
+              ${optimistic.attachments.length === 0
+                ? nothing
+                : html`<ul class="attachment-list" aria-label="Pending message attachments">
+                    ${optimistic.attachments.map((attachment) => {
+                      const preview = pendingAttachmentPreviewUrl(attachment);
+                      return html`<li class=${preview === undefined
+                        ? "file-attachment"
+                        : "image-attachment"}>
+                        ${preview === undefined
+                          ? html`<span class="attachment-icon">${fontAwesomeIcon("file")}</span>`
+                          : html`<trouve-image-preview
+                              .source=${preview}
+                              .name=${attachment.upload.name}
+                            ></trouve-image-preview>`}
+                        <div class="attachment-details">
+                          <strong title=${attachment.upload.name}>${attachment.upload.name}</strong>
+                          <small>${attachment.upload.mime} · ${formatAttachmentBytes(attachment.size)}</small>
+                        </div>
+                      </li>`;
+                    })}
+                  </ul>`}
+            </div>
+          </section>
+        </div>
+      </article>
+    `;
+  }
+
   #renderChat(
     items: readonly ThreadChatItem[],
     turnRunning: boolean,
@@ -1565,6 +1632,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         (item) => item.kind === "tool" || item.kind === "questions",
       ),
     }));
+    const optimistic = this.#optimisticPrompt;
+    if (
+      optimistic !== undefined
+      && optimistic.threadId === this.threadId
+      && optimistic.disposition === "turn"
+    ) {
+      virtualItems.push({
+        id: optimistic.id,
+        kind: "optimistic-prompt",
+        estimatedHeight: Math.max(170, 120 + optimistic.attachments.length * 52),
+      });
+    }
     const hasRunningCompaction = items.some(
       (item) => item.kind === "compaction" && item.state.kind === "running",
     );
@@ -1581,13 +1660,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         kind: "activity",
         label: activityLabel,
         estimatedHeight: 32,
-      });
-    }
-    if (hasOlder || this.#historyLoading || this.#historyError !== "") {
-      virtualItems.unshift({
-        id: CHAT_HISTORY_LOADER_ID,
-        kind: "history",
-        estimatedHeight: this.#historyError === "" ? 38 : 58,
       });
     }
     if (virtualItems.length > 0) {
@@ -1636,9 +1708,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           aria-live=${window.followingTail ? "polite" : "off"}
           aria-relevant="additions text"
           aria-busy=${effectiveTurnRunning || compacting}
-          @wheel=${this.#chatScrollIntended}
-          @pointerdown=${this.#chatScrollIntended}
-          @touchstart=${this.#chatScrollIntended}
           @scroll=${this.#chatScrolled}
           @scrollend=${this.#chatScrollEnded}
         >
@@ -1647,7 +1716,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             : html`<div
                 class="chat-virtual-canvas"
                 style=${`height:${window.totalHeight}px`}
-              >${repeat(window.items, ({ item }) => item.id, ({ item, start }) => {
+              >${hasOlder
+                ? html`<span class="chat-history-sentinel" aria-hidden="true"></span>`
+                : nothing}${repeat(window.items, ({ item }) => item.id, ({ item, start }) => {
               const style = `inset-block-start:${start}px`;
               if (item.kind === "edge-spacer") {
                 return html`<div
@@ -1662,28 +1733,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   ${this.#renderCompactionMarker({ kind: "running" })}
                 </div>`;
               }
+              if (item.kind === "optimistic-prompt") {
+                const pending = this.#optimisticPrompt;
+                return pending === undefined
+                  ? nothing
+                  : html`<div data-virtual-id=${item.id} style=${style}>
+                      ${this.#renderOptimisticPrompt(pending)}
+                    </div>`;
+              }
               if (item.kind === "activity") {
                 return html`<div data-virtual-id=${item.id} style=${style}>
                   ${this.#renderActivityRow(item.label)}
-                </div>`;
-              }
-              if (item.kind === "history") {
-                return html`<div
-                  class="chat-history-loader"
-                  data-virtual-id=${item.id}
-                  style=${style}
-                  role="status"
-                >
-                  ${this.#historyLoading
-                    ? html`<span>Loading earlier messages…</span>`
-                    : html`
-                        <button type="button" @click=${() => this.#loadOlderHistory(false)}>
-                          Load earlier messages
-                        </button>
-                        ${this.#historyError === ""
-                          ? nothing
-                          : html`<span class="error-text">${this.#historyError}</span>`}
-                      `}
                 </div>`;
               }
               const unit = layout.units[item.unitIndex];
@@ -1703,6 +1763,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             ? html`<button class="follow-tail" type="button" @click=${this.#followTail}>Jump to latest</button>`
             : nothing}
         </div>
+        ${this.#historyStatusVisible || this.#historyError !== ""
+          ? html`<div class="chat-history-status" role="status">
+              ${this.#historyError === ""
+                ? "Loading earlier messages…"
+                : this.#historyError}
+            </div>`
+          : nothing}
         <span class="chat-scroll-indicator" aria-hidden="true"></span>
       </div>
     `;
@@ -2145,6 +2212,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const collapseSequentialToolCalls = effectiveCollapse.collapseSequentialToolCalls;
     const collapseThinkingWithTools = effectiveCollapse.collapseThinkingWithTools;
     const collapseCompactionWithTools = effectiveCollapse.collapseCompactionWithTools;
+    const collapseTodoUpdatesWithTools = effectiveCollapse.collapseTodoUpdatesWithTools;
     const rows: unknown[] = [];
     let activityConnectedFromCompaction = false;
     let activityRows: Array<{
@@ -2175,7 +2243,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const candidate = unit.items[cursor];
         if (candidate === undefined) return false;
         if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
-        return candidate.kind === "thinking" || candidate.kind === "tool";
+        return candidate.kind === "thinking"
+          || candidate.kind === "todo"
+          || candidate.kind === "tool";
       }
       return false;
     };
@@ -2288,6 +2358,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index += 1;
         continue;
       }
+      if (item.kind === "todo" && !collapseTodoUpdatesWithTools) {
+        activityRows.push({
+          content: this.#renderTodoUpdate(item),
+          expandedGroup: false,
+          endsWithExpandedToolGroup: false,
+        });
+        index += 1;
+        continue;
+      }
       // A live tool is the current activity, not history. Keep it as a direct
       // rail node until its terminal event arrives; the next render can then
       // fold it into the stable completed run without changing the group key.
@@ -2323,6 +2402,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             && candidate.kind === "tool"
             && isContextCompactionTool(candidate))
           || (!collapseThinkingWithTools && candidate.kind === "thinking")
+          || (!collapseTodoUpdatesWithTools && candidate.kind === "todo")
           || (candidate.kind === "tool" && activeToolCall(candidate))
         ) break;
         if (
@@ -2339,6 +2419,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const only = run[0];
       const groupSinglePreferenceBoundary = run.length === 1 && (
         (collapseThinkingWithTools && only?.kind === "thinking")
+        || (collapseTodoUpdatesWithTools && only?.kind === "todo")
         || (collapseCompactionWithTools && (
           only?.kind === "compaction"
           || (only?.kind === "tool" && isContextCompactionTool(only))
@@ -2405,6 +2486,43 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  #renderTodoUpdate(
+    item: Extract<ThreadChatItem, { readonly kind: "todo" }>,
+  ) {
+    const presentation = {
+      started: { icon: "play", label: "Started TODO" },
+      completed: { icon: "check", label: "Completed TODO" },
+      cancelled: { icon: "xmark", label: "Cancelled TODO" },
+      skipped: { icon: "arrow-right", label: "Skipped TODO" },
+    } as const;
+    const { icon, label } = presentation[item.state];
+    return html`
+      <button
+        class=${`message todo-rail-item ${item.state}`}
+        type="button"
+        data-chat-anchor-id=${`item:${item.id}`}
+        aria-label=${`${label}: ${item.content}. Open Todos pane.`}
+        title="Open Todos"
+        @click=${() => this.dispatchEvent(new CustomEvent(
+          "trouve-open-inspection",
+          {
+            detail: { panel: "plan" },
+            bubbles: true,
+            composed: true,
+          },
+        ))}
+      >
+        <span class="todo-rail-icon" aria-hidden="true">
+          ${fontAwesomeIcon(icon)}
+        </span>
+        <span class="todo-rail-copy">
+          <strong>${label}</strong>
+          <span>${item.content}</span>
+        </span>
+      </button>
+    `;
+  }
+
   #renderActivityGroup(
     unit: ChatRenderUnit,
     items: readonly AgentActivityItem[],
@@ -2416,29 +2534,47 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const needsApproval = items.some(
       (item) => item.kind === "tool" && item.status === "awaiting-approval",
     );
+    const latestTodoStates = new Map<
+      string,
+      Extract<AgentActivityItem, { readonly kind: "todo" }>["state"]
+    >();
+    for (const item of items) {
+      if (item.kind === "todo") latestTodoStates.set(item.todoId, item.state);
+    }
     const active = items.some((item) =>
       item.kind === "thinking"
         ? !item.complete
         : item.kind === "compaction"
           ? item.state.kind === "running"
-          : item.status === "running" || item.status === "awaiting-approval"
+          : item.kind === "todo"
+            ? latestTodoStates.get(item.todoId) === "started"
+            : item.status === "running" || item.status === "awaiting-approval"
     );
     const failed = items.some((item) =>
       item.kind === "compaction"
         ? item.state.kind === "failed"
-        : item.kind === "tool"
-          && (item.status === "error" || item.status === "denied" || item.status === "aborted")
+        : item.kind === "todo"
+          ? latestTodoStates.get(item.todoId) === "cancelled"
+          : item.kind === "tool"
+            && (item.status === "error" || item.status === "denied" || item.status === "aborted")
     );
     const succeeded = items.some((item) =>
       item.kind === "compaction"
         ? item.state.kind === "completed"
-        : item.kind === "tool" && item.status === "ok"
+        : item.kind === "todo"
+          ? latestTodoStates.get(item.todoId) === "completed"
+          : item.kind === "tool" && item.status === "ok"
+    );
+    const skipped = items.some(
+      (item) => item.kind === "todo" && latestTodoStates.get(item.todoId) === "skipped",
     );
     const mixed = failed && succeeded;
     const tone = mixed
       ? "warning"
       : failed
       ? "error"
+      : skipped
+        ? "warning"
       : needsApproval
         ? "warning"
         : active
@@ -2448,6 +2584,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? "mixed"
       : failed
       ? "error"
+      : skipped
+        ? "mixed"
       : needsApproval
         ? "awaiting-approval"
         : active
@@ -2503,6 +2641,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     presentation: ChatPresentationIndex,
   ) {
     if (item.kind === "thinking") return this.#renderVisibleThinking(item);
+    if (item.kind === "todo") return this.#renderTodoUpdate(item);
     if (item.kind === "compaction") {
       return this.#renderCompactionMarker(item.state, item.id, {
         before: false,
@@ -2545,13 +2684,85 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestDisclosureUpdate();
   }
 
+  #matchesOptimisticPrompt(
+    content: string,
+    attachments: readonly ProtocolAttachment[] | undefined,
+    optimistic: OptimisticPromptSubmission,
+  ): boolean {
+    if (content !== optimistic.content) return false;
+    const durable = attachments ?? [];
+    return durable.length === optimistic.attachments.length
+      && durable.every((attachment, index) => {
+        const pending = optimistic.attachments[index];
+        return pending !== undefined
+          && attachment.name === pending.upload.name
+          && attachment.mime === pending.upload.mime
+          && attachment.size_bytes === pending.size;
+      });
+  }
+
+  #reconcileOptimisticPrompt(
+    items: readonly ThreadChatItem[],
+    queue: readonly QueuedPrompt[],
+  ): void {
+    const optimistic = this.#optimisticPrompt;
+    if (optimistic === undefined || optimistic.threadId !== this.threadId) return;
+    if (queue.some((prompt) => this.#matchesOptimisticPrompt(
+      prompt.content,
+      prompt.attachments,
+      optimistic,
+    ))) {
+      this.#optimisticPrompt = undefined;
+      return;
+    }
+    if (items.some((item) =>
+      item.kind === "user"
+      && item.turn >= optimistic.minimumTurn
+      && (optimistic.turn === undefined || item.turn === optimistic.turn)
+      && this.#matchesOptimisticPrompt(item.content, item.attachments, optimistic)
+    )) {
+      this.#optimisticPrompt = undefined;
+    }
+  }
+
+  #queueWithOptimisticPrompt(queue: readonly QueuedPrompt[]): readonly QueuedPrompt[] {
+    const optimistic = this.#optimisticPrompt;
+    if (
+      optimistic === undefined
+      || optimistic.threadId !== this.threadId
+      || optimistic.disposition !== "queue"
+    ) return queue;
+    const position = queue.reduce(
+      (maximum, prompt) => Math.max(maximum, prompt.position),
+      0,
+    ) + 1;
+    return [
+      ...queue,
+      {
+        id: optimistic.id,
+        thread_id: optimistic.threadId,
+        position,
+        content: optimistic.content,
+        created_at: new Date().toISOString(),
+        attachments: optimistic.attachments.map((attachment, index) => ({
+          id: `${optimistic.id}:attachment:${index}`,
+          name: attachment.upload.name,
+          mime: attachment.upload.mime,
+          size_bytes: attachment.size,
+        })),
+      },
+    ];
+  }
+
   #renderQueue(
     queue: readonly QueuedPrompt[],
     turnRunning: boolean,
     connectivityBlocked: boolean,
   ) {
     if (queue.length === 0) return nothing;
-    const queueMutationBusy = this.#queueBusy !== ""
+    const optimisticQueuePending = queue.some((prompt) => prompt.id.startsWith("optimistic:"));
+    const queueMutationBusy = optimisticQueuePending
+      || this.#queueBusy !== ""
       || (this.#queueEditId !== "" && this.#attachmentPending);
     const keyboardReordering = this.#queueKeyboardStateValid(queue);
     const orderedQueue = this.#keyboardOrderedQueue(queue);
@@ -2743,61 +2954,77 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const anchor = this.#historyAnchorToRestore;
     this.#historyAnchorToRestore = undefined;
     if (anchor === undefined) return;
-    this.#historyAnchorStabilizer = anchor;
-
-    const beforeMeasure = this.#virtualizer.window();
-    for (const row of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
-      const id = row.dataset["virtualId"];
-      const height = row.getBoundingClientRect().height;
-      if (id === undefined || height <= 0) continue;
-      try {
-        this.#virtualizer.measure(id, height);
-      } catch {
-        // A row can leave the window while this one-time history correction runs.
-      }
-    }
-    const afterMeasure = this.#virtualizer.window();
-    if (!sameVirtualRenderWindow(beforeMeasure, afterMeasure)) {
-      this.#syncMountedVirtualGeometry(viewport, afterMeasure);
-    }
-
-    this.#correctHistoryAnchor(viewport);
+    const generation = ++this.#historyAnchorGeneration;
+    // The anchor was captured after the page response, so it supersedes the
+    // guard left by the scroll that triggered prefetch. Any subsequent native
+    // scroll invalidates this generation before the correction can run.
+    this.#nativeScrollCorrectionBlockedUntil = 0;
+    globalThis.queueMicrotask(() => {
+      if (
+        generation !== this.#historyAnchorGeneration
+        || !this.isConnected
+        || !viewport.isConnected
+        || viewport.dataset["threadId"] !== this.threadId
+      ) return;
+      this.#applyChatDomAnchor(viewport, anchor, true);
+    });
   }
 
-  #correctHistoryAnchor(viewport: HTMLElement): void {
-    const anchor = this.#historyAnchorStabilizer;
-    if (anchor === undefined) return;
-    const virtualId = anchor.id.startsWith("virtual:")
-      ? anchor.id.slice("virtual:".length)
-      : undefined;
-    const candidates = virtualId === undefined
-      ? [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
-        .filter((element) => element.dataset["chatAnchorId"] === anchor.id)
-      : [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
-        .filter((element) => element.dataset["virtualId"] === virtualId);
-    const element = candidates[0];
-    if (element === undefined) {
-      // Fast scrolling can unmount the prior anchor before its scroll event is
-      // observed. Adopt the currently visible row so subsequent async layout
-      // still has an exact reference point.
-      this.#historyAnchorStabilizer = this.#captureChatDomAnchor(viewport);
-      return;
+  #applyChatDomAnchor(
+    viewport: HTMLElement,
+    anchor: ChatDomAnchor,
+    refreshMeasurements: boolean,
+  ): boolean {
+    if (refreshMeasurements) {
+      const beforeMeasure = this.#virtualizer.window();
+      for (const row of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
+        const id = row.dataset["virtualId"];
+        const height = row.getBoundingClientRect().height;
+        if (id === undefined || height <= 0) continue;
+        try {
+          this.#virtualizer.measure(id, height);
+        } catch {
+          // A row can leave the window while this one-time correction runs.
+        }
+      }
+      const afterMeasure = this.#virtualizer.window();
+      if (!sameVirtualRenderWindow(beforeMeasure, afterMeasure)) {
+        this.#syncMountedVirtualGeometry(viewport, afterMeasure);
+      }
     }
-
+    const element = this.#chatDomAnchorElement(viewport, anchor);
+    if (element === undefined) return false;
     const delta = element.getBoundingClientRect().top
       - viewport.getBoundingClientRect().top
       - anchor.offset;
-    const target = Math.max(0, viewport.scrollTop + delta);
-    this.#virtualizer.setViewport(target, viewport.clientHeight, {
-      userInitiated: true,
-      atTail: false,
-    });
-    const correctedScrollTop = this.#virtualizer.window().scrollTop;
-    this.#setChatScrollTop(viewport, correctedScrollTop);
+    if (Math.abs(delta) > 0.5) {
+      const target = Math.max(0, viewport.scrollTop + delta);
+      this.#virtualizer.setViewport(target, viewport.clientHeight, {
+        userInitiated: true,
+        atTail: false,
+      });
+      this.#setChatScrollTop(viewport, this.#virtualizer.window().scrollTop);
+    }
+    this.#parkedLayoutAnchor = anchor;
+    return true;
   }
 
-  #clearHistoryAnchorStabilizer(): void {
-    this.#historyAnchorStabilizer = undefined;
+  #chatDomAnchorElement(
+    viewport: HTMLElement,
+    anchor: ChatDomAnchor,
+  ): HTMLElement | undefined {
+    const virtualId = anchor.id.startsWith("virtual:")
+      ? anchor.id.slice("virtual:".length)
+      : undefined;
+    return virtualId === undefined
+      ? [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
+        .find((element) => element.dataset["chatAnchorId"] === anchor.id)
+      : [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
+        .find((element) => element.dataset["virtualId"] === virtualId);
+  }
+
+  #cancelHistoryAnchorCorrection(): void {
+    this.#historyAnchorGeneration += 1;
   }
 
   // WebKitGTK retains native scrollbar hit-testing while intermittently
@@ -2871,6 +3098,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#restoredScrollThreadId !== this.threadId
     ) return;
     this.#scheduleChatScrollIndicator(viewport);
+    if (this.#historyLoading && viewport.scrollTop <= CHAT_TAIL_EPSILON_PX) {
+      this.#historyStatusVisible = true;
+      this.requestUpdate();
+    }
+    if (
+      typeof IntersectionObserver === "undefined"
+      && !this.#historyLoading
+      && this.#historyError === ""
+      && viewport.scrollTop <= viewport.clientHeight * 5
+    ) {
+      void this.#loadOlderHistory(false);
+    }
     const before = this.#virtualizer.window();
     // The sticky jump control is an overlay visually, but WebKit retains its
     // border-box in normal flow and includes it in scrollHeight. Its height is
@@ -2878,71 +3117,38 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const tailGap = this.#chatTailGap(viewport);
     const atTail = tailGap <= CHAT_TAIL_EPSILON_PX;
     const programmaticScroll = this.#programmaticScrollFrame !== undefined
-      || this.#tailConvergenceFrame !== undefined;
-    // Native scrollbar interaction is not required to dispatch pointer events
-    // into the page. A scroll that reaches the real transcript tail while no
-    // app-owned correction is active is therefore user intent as well.
-    const userInitiated = this.#chatScrollIntent || (atTail && !programmaticScroll);
-    if (userInitiated) this.#retainChatScrollIntent();
-    if (programmaticScroll && !userInitiated) {
+      || this.#tailConvergenceFrame !== undefined
+      || (
+        this.#programmaticScrollTarget !== undefined
+        && Math.abs(viewport.scrollTop - this.#programmaticScrollTarget) <= 0.5
+      );
+    if (programmaticScroll) {
       // Row measurement and tail corrections already updated the virtualizer.
       // Ignore their resulting DOM events instead of treating them as another
       // user scroll and starting a render/persistence loop.
+      this.#programmaticScrollTarget = undefined;
       return;
     }
-    if (atTail) {
-      this.#clearHistoryAnchorStabilizer();
-    } else if (
-      this.#historyAnchorStabilizer !== undefined
-      && (userInitiated || !programmaticScroll)
-    ) {
-      // Follow the reader rather than retaining the item that was visible
-      // when the page request completed. Fast wheel/touch scrolling can move
-      // that item out of the virtual window before delayed Markdown and row
-      // measurements arrive.
-      this.#historyAnchorStabilizer = this.#captureChatDomAnchor(viewport)
-        ?? this.#historyAnchorStabilizer;
-    }
+    this.#programmaticScrollTarget = undefined;
+    this.#nativeScrollCorrectionBlockedUntil = globalThis.performance.now()
+      + CHAT_NATIVE_SCROLL_CORRECTION_GUARD_MS;
+    this.#cancelHistoryAnchorCorrection();
+    // A native user scroll invalidates the prior nested layout anchor. A new
+    // one is captured only after scrolling settles, keeping layout reads out
+    // of the hot path and preventing corrections from fighting momentum.
+    this.#parkedLayoutAnchor = undefined;
     if (before.followingTail && atTail) return;
-    this.#scrollCorrectionResumeAt = Date.now() + CHAT_SCROLL_CORRECTION_SETTLE_MS;
-    if (userInitiated) {
-      this.#cancelProgrammaticScrollWindow();
-      this.#cancelTailConvergence();
-    }
+    // Every native scroll not initiated by this controller is authoritative.
+    // This covers wheel, touch, keyboard, and native scrollbar dragging.
+    this.#cancelProgrammaticScrollWindow();
+    this.#cancelTailConvergence();
     this.#virtualizer.setViewport(
       viewport.scrollTop,
       viewport.clientHeight,
-      { userInitiated, atTail },
+      { userInitiated: true, atTail },
     );
     const after = this.#virtualizer.window();
-    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-    const historyPrefetchThreshold = Math.min(
-      maxScrollTop / 2,
-      Math.max(
-        CHAT_HISTORY_PREFETCH_MIN_PX,
-        viewport.clientHeight * CHAT_HISTORY_PREFETCH_VIEWPORTS,
-      ),
-    );
-    // Prepend corrections and virtual-row measurement can emit scroll events
-    // while the reader remains inside the threshold. Only an actual input
-    // gesture may advance another page; otherwise one wheel tick can walk the
-    // complete transcript after each prepend settles.
-    if (
-      userInitiated
-      && viewport.scrollTop <= historyPrefetchThreshold
-      && this.#chatScrollIntentSequence > this.#historyPrefetchIntentSequence
-    ) {
-      this.#historyPrefetchIntentSequence = this.#chatScrollIntentSequence;
-      if (this.#historyLoading) {
-        // Preserve one explicit reader gesture that arrives while the prior
-        // page is still settling. This remains bounded: programmatic prepend
-        // events cannot set the flag, and multiple gestures coalesce into one
-        // additional page instead of replaying the full transcript.
-        this.#historyLoadRequested = true;
-      } else {
-        void this.#loadOlderHistory(false);
-      }
-    }
+    this.#parkedLayoutAnchor = undefined;
     if (!before.followingTail && after.followingTail) {
       this.#cancelScheduledChatPosition();
       this.#scheduleTailConvergence();
@@ -2961,47 +3167,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ) {
       this.#resumeFollowTailAtDomEnd(viewport);
     }
+    this.#captureParkedLayoutAnchor();
     this.#syncChatScrollIndicatorPosition(viewport);
     this.#flushScheduledChatPosition();
-    this.#clearChatScrollIntent();
   };
-
-  readonly #chatScrollIntended = (event: Event): void => {
-    if (event.type === "wheel") {
-      const wheel = event as WheelEvent;
-      if (wheel.deltaX === 0 && wheel.deltaY === 0) return;
-    }
-    if (event.type === "pointerdown") {
-      const target = event.target;
-      if (
-        target instanceof Element
-        && target.closest("button, a, input, textarea, select, summary") !== null
-      ) return;
-    }
-    this.#chatScrollIntentSequence += 1;
-    this.#retainChatScrollIntent();
-  };
-
-  #retainChatScrollIntent(): void {
-    this.#chatScrollIntent = true;
-    if (this.#chatScrollIntentTimer !== undefined) {
-      clearTimeout(this.#chatScrollIntentTimer);
-    }
-    // `scrollend` closes the gesture in supporting engines. The timer keeps
-    // pointer clicks without a scroll from misclassifying a later layout
-    // correction and covers engines that do not dispatch `scrollend`.
-    this.#chatScrollIntentTimer = setTimeout(() => {
-      this.#chatScrollIntentTimer = undefined;
-      this.#chatScrollIntent = false;
-    }, CHAT_SCROLL_INTENT_SETTLE_MS);
-  }
-
-  #clearChatScrollIntent(): void {
-    this.#chatScrollIntent = false;
-    if (this.#chatScrollIntentTimer === undefined) return;
-    clearTimeout(this.#chatScrollIntentTimer);
-    this.#chatScrollIntentTimer = undefined;
-  }
 
   #chatTailGap(viewport: HTMLElement): number {
     return Math.max(
@@ -3027,6 +3196,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       { userInitiated: true, atTail: true },
     );
     const after = this.#virtualizer.window();
+    this.#parkedLayoutAnchor = undefined;
     this.#cancelScheduledChatPosition();
     this.#scheduleTailConvergence();
     this.#emitChatPosition();
@@ -3044,6 +3214,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
     });
     viewport.scrollTop = scrollTop;
+    this.#programmaticScrollTarget = viewport.scrollTop;
     this.#scheduleChatScrollIndicator(viewport);
   }
 
@@ -3073,6 +3244,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #cancelProgrammaticScrollWindow(): void {
+    this.#programmaticScrollTarget = undefined;
     if (this.#programmaticScrollFrame !== undefined) {
       globalThis.cancelAnimationFrame(this.#programmaticScrollFrame);
       this.#programmaticScrollFrame = undefined;
@@ -3121,7 +3293,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
     this.#chatPositionTimer = setTimeout(() => {
       this.#chatPositionTimer = undefined;
-      if (this.isConnected) this.#emitChatPosition();
+      if (this.isConnected) {
+        this.#captureParkedLayoutAnchor();
+        this.#emitChatPosition();
+      }
     }, CHAT_POSITION_SETTLE_MS);
   }
 
@@ -3129,6 +3304,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.#chatPositionTimer === undefined) return;
     clearTimeout(this.#chatPositionTimer);
     this.#chatPositionTimer = undefined;
+    this.#captureParkedLayoutAnchor();
     this.#emitChatPosition();
   }
 
@@ -3140,9 +3316,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #followTail = (): void => {
     this.#cancelScheduledChatPosition();
-    this.#clearChatScrollIntent();
-    this.#clearHistoryAnchorStabilizer();
-    this.#scrollCorrectionResumeAt = 0;
+    this.#parkedLayoutAnchor = undefined;
     this.#virtualizer.enableFollowTail();
     const viewport = this.querySelector<HTMLElement>(".chat-stream");
     if (viewport !== null) {
@@ -3153,18 +3327,99 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
   };
 
-  #warmOlderHistory(): void {
-    if (this.threadId === "" || this.#historyWarmThreads.has(this.threadId)) return;
-    const store = this.#store.value;
-    const services = this.#services.value;
-    if (store === undefined || services === undefined) return;
-    const view = store.threadView(this.threadId);
-    if (!view.hasOlder || view.itemOffset === 0) return;
-    // Warm exactly one bounded page per thread. Further pages are loaded by
-    // the rolling scroll threshold, avoiding both a visible boundary pause
-    // and the old full-session replay behavior.
-    this.#historyWarmThreads.add(this.threadId);
-    if (!this.#historyLoading) void this.#loadOlderHistory(false);
+  #captureParkedLayoutAnchor(): void {
+    const viewport = this.querySelector<HTMLElement>(".chat-stream");
+    if (
+      viewport === null
+      || viewport.dataset["threadId"] !== this.threadId
+      || this.#virtualizer.window().followingTail
+    ) {
+      this.#parkedLayoutAnchor = undefined;
+      return;
+    }
+    this.#parkedLayoutAnchor = this.#captureChatDomAnchor(viewport);
+  }
+
+  #syncHistoryObserver(viewport: HTMLElement): void {
+    const view = this.threadId === ""
+      ? undefined
+      : this.#store.value?.threadView(this.threadId);
+    const sentinel = view?.hasOlder === true && this.#historyError === ""
+      ? viewport.querySelector(".chat-history-sentinel")
+      : null;
+    if (sentinel === this.#observedHistorySentinel) return;
+    this.#disconnectHistoryObserver();
+    if (
+      sentinel === null
+      || sentinel === undefined
+      || typeof IntersectionObserver === "undefined"
+    ) return;
+    this.#historyObserver = new IntersectionObserver((entries) => {
+      if (
+        entries.some((entry) => entry.isIntersecting)
+        && !this.#historyLoading
+        && this.#historyError === ""
+      ) {
+        void this.#loadOlderHistory(false);
+      }
+    }, {
+      root: viewport,
+      rootMargin: CHAT_HISTORY_PREFETCH_ROOT_MARGIN,
+      threshold: 0,
+    });
+    this.#observedHistorySentinel = sentinel;
+    this.#historyObserver.observe(sentinel);
+  }
+
+  #disconnectHistoryObserver(): void {
+    this.#historyObserver?.disconnect();
+    this.#historyObserver = undefined;
+    this.#observedHistorySentinel = undefined;
+  }
+
+  #scheduleHistoryStatus(): void {
+    this.#clearHistoryStatusTimer();
+    this.#historyStatusTimer = setTimeout(() => {
+      this.#historyStatusTimer = undefined;
+      if (!this.#historyLoading || !this.isConnected) return;
+      const viewport = this.querySelector<HTMLElement>(".chat-stream");
+      const sentinel = viewport?.querySelector<HTMLElement>(".chat-history-sentinel");
+      if (
+        viewport === null
+        || viewport === undefined
+        || sentinel === null
+        || sentinel === undefined
+      ) return;
+      const viewportRect = viewport.getBoundingClientRect();
+      const sentinelRect = sentinel.getBoundingClientRect();
+      if (sentinelRect.bottom >= viewportRect.top && sentinelRect.top <= viewportRect.bottom) {
+        this.#historyStatusVisible = true;
+        this.requestUpdate();
+      }
+    }, CHAT_HISTORY_STATUS_DELAY_MS);
+  }
+
+  #clearHistoryStatusTimer(): void {
+    if (this.#historyStatusTimer === undefined) return;
+    clearTimeout(this.#historyStatusTimer);
+    this.#historyStatusTimer = undefined;
+  }
+
+  #scheduleHistoryRetry(): void {
+    this.#clearHistoryRetryTimer();
+    const generation = this.#historyGeneration;
+    this.#historyRetryTimer = setTimeout(() => {
+      this.#historyRetryTimer = undefined;
+      if (generation !== this.#historyGeneration || !this.isConnected) return;
+      this.#historyError = "";
+      this.requestUpdate();
+    }, CHAT_HISTORY_RETRY_DELAY_MS);
+  }
+
+  #clearHistoryRetryTimer(): void {
+    if (this.#historyRetryTimer === undefined) return;
+    clearTimeout(this.#historyRetryTimer);
+    this.#historyRetryTimer = undefined;
   }
 
   #emitChatPosition(): void {
@@ -3192,6 +3447,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
     this.#historyLoading = true;
     this.#historyError = "";
+    this.#historyStatusVisible = false;
+    this.#disconnectHistoryObserver();
+    this.#scheduleHistoryStatus();
     this.requestUpdate();
     try {
       do {
@@ -3214,14 +3472,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     } catch {
       if (generation === this.#historyGeneration && threadId === this.threadId) {
         this.#historyError = "Earlier messages could not be loaded.";
+        this.#scheduleHistoryRetry();
       }
     } finally {
       if (generation === this.#historyGeneration && threadId === this.threadId) {
-        const loadRequested = this.#historyLoadRequested;
-        this.#historyLoadRequested = false;
+        this.#clearHistoryStatusTimer();
+        this.#historyStatusVisible = false;
         this.#historyLoading = false;
+        this.#disconnectHistoryObserver();
         this.requestUpdate();
-        if (loadRequested) void this.#loadOlderHistory(false);
       }
     }
   }
@@ -3285,19 +3544,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       }
       case "compaction":
         return this.#renderCompactionMarker(item.state, item.id);
+      case "todo":
+        return this.#renderTodoUpdate(item);
       case "tool": {
         const approvalPending = this.#approvalSubmissions.has(item.callId);
         const approvalRequired = item.status === "awaiting-approval";
         const raw = this.#rawToolCalls.has(item.callId);
+        const detailLoading = this.#toolDetailLoading.has(item.callId);
+        const detailError = this.#toolDetailErrors.get(item.callId) ?? "";
         const toolPresentation = presentToolCall(item.tool, item.args, item.result);
         const toolOpen = approvalRequired
           || (this.#toolDisclosure.get(item.callId) ?? false);
-        const toolDetail = toolOpen && !raw
+        const toolDetail = toolOpen && !raw && !item.detailsDeferred
           ? toolDetailText(item.args, item.result)
           : "";
-        const toolMeta = [
+        const toolDuration = toolExecutionMetadata(item.result, item.durationMs);
+        const toolTargetMeta = [
           toolPresentation.meta,
-          toolExecutionMetadata(item.result, item.durationMs),
+          toolDuration,
         ].filter((part) => part !== "").join(" · ");
         return html`
           <details
@@ -3318,12 +3582,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 })}
               </span>
               <strong>${toolPresentation.title}</strong>
-              <span class="tool-inline-status ${item.status}" aria-hidden="true">
-                ${fontAwesomeIcon(toolStatusIcon(item.status), {
-                  className: "tool-status-icon",
-                  spin: item.status === "running",
-                })}
-              </span>
               ${toolPresentation.subject === ""
                 ? nothing
                 : toolPresentation.filePath === ""
@@ -3331,7 +3589,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   : html`<button
                       class="tool-file-target"
                       type="button"
-                      title=${`Open ${toolPresentation.filePath}${toolMeta === "" ? "" : ` ${toolMeta}`}`}
+                      title=${`Open ${toolPresentation.filePath}${toolTargetMeta === "" ? "" : ` ${toolTargetMeta}`}`}
                       @click=${(event: MouseEvent) => this.#openToolFile(event, toolPresentation)}
                     >${toolPresentation.subject}</button>`}
               ${toolPresentation.additions === 0
@@ -3340,10 +3598,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ${toolPresentation.deletions === 0
                 ? nothing
                 : html`<span class="tool-change-count delete">−${toolPresentation.deletions}</span>`}
-              ${toolMeta === ""
+              ${toolPresentation.meta === ""
                 ? nothing
-                : html`<small class="tool-meta">${toolMeta}</small>`}
+                : html`<small class="tool-meta tool-detail-meta">${toolPresentation.meta}</small>`}
+              <span class="tool-inline-status ${item.status}" aria-hidden="true">
+                ${fontAwesomeIcon(toolStatusIcon(item.status), {
+                  className: "tool-status-icon",
+                  spin: item.status === "running",
+                })}
+              </span>
               <small class="tool-state visually-hidden">${toolStatusLabel(item.status)}</small>
+              ${toolDuration === ""
+                ? nothing
+                : html`<small class="tool-meta tool-duration">· ${toolDuration}</small>`}
               <span class="tool-raw-action" @click=${(event: Event) => event.stopPropagation()}>
                 <button
                   type="button"
@@ -3354,11 +3621,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 >${fontAwesomeIcon(raw ? "code" : "list")}</button>
               </span>
               <span class="tool-copy-action" @click=${(event: Event) => event.stopPropagation()}>
-                ${this.#renderCopyButton(
-                  `tool:${item.callId}`,
-                  raw ? this.#rawToolText(item) : this.#toolCopyText(item),
-                  `Copy ${item.tool} details`,
-                )}
+                ${item.detailsDeferred
+                  ? nothing
+                  : this.#renderCopyButton(
+                      `tool:${item.callId}`,
+                      raw ? this.#rawToolText(item) : this.#toolCopyText(item),
+                      `Copy ${item.tool} details`,
+                    )}
               </span>
               ${approvalRequired
                 ? html`
@@ -3398,7 +3667,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             </summary>
             ${toolOpen
               ? html`
-                  ${raw
+                  ${item.detailsDeferred
+                    ? html`<div class="tool-detail-loading" role="status">
+                        ${detailLoading
+                          ? "Loading tool details…"
+                          : detailError === ""
+                            ? "Tool details are loading…"
+                            : detailError}
+                      </div>`
+                    : raw
                     ? html`<pre aria-label="Raw tool data">${this.#rawToolText(item)}</pre>`
                     : html`
                         ${toolPresentation.diff.length === 0
@@ -3811,7 +4088,42 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #toggleRawTool(callId: string): void {
     if (this.#rawToolCalls.has(callId)) this.#rawToolCalls.delete(callId);
     else this.#rawToolCalls.add(callId);
+    void this.#ensureToolDetails(callId);
     this.#requestDisclosureUpdate();
+  }
+
+  async #ensureToolDetails(callId: string): Promise<void> {
+    const services = this.#services.value;
+    const store = this.#store.value;
+    const threadId = this.threadId;
+    if (
+      services === undefined
+      || store === undefined
+      || threadId === ""
+      || this.#toolDetailLoading.has(callId)
+    ) return;
+    const tool = store.threadView(threadId).findTool(callId);
+    if (tool?.detailsDeferred !== true) return;
+    const generation = this.#threadInteractionGeneration;
+    this.#toolDetailLoading.add(callId);
+    this.#toolDetailErrors.delete(callId);
+    this.requestUpdate();
+    try {
+      const details = await services.protocol.threadToolDetails(threadId, callId);
+      if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
+      if (!store.replaceThreadToolDetails(threadId, details)) {
+        throw new Error("tool detail no longer belongs to this thread view");
+      }
+    } catch {
+      if (this.#isCurrentThreadInteraction(threadId, generation)) {
+        this.#toolDetailErrors.set(callId, "Tool details could not be loaded.");
+      }
+    } finally {
+      if (this.#isCurrentThreadInteraction(threadId, generation)) {
+        this.#toolDetailLoading.delete(callId);
+        this.requestUpdate();
+      }
+    }
   }
 
   #requestDisclosureUpdate(): void {
@@ -3819,9 +4131,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     if (!preserveTail) return;
     // A disclosure changes its box before ResizeObserver reports the new
-    // virtual-row height. Guard layout-generated scroll events and converge
-    // on the real tail while Lit and the virtual canvas apply the measurement.
-    this.#scrollCorrectionResumeAt = 0;
+    // virtual-row height. Converge on the real tail only when it is pinned.
     this.#scheduleTailConvergence();
   }
 
@@ -4959,47 +5269,40 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   async #submitComposer(form: HTMLFormElement, steering: boolean): Promise<void> {
     const services = this.#services.value;
     const textarea = form.elements.namedItem("message") as HTMLTextAreaElement | null;
-    const content = textarea?.value.trim() ?? "";
+    const draftContent = textarea?.value ?? "";
+    const content = draftContent.trim();
+    const attachments = [...this.#pendingAttachments];
     if (
       services === undefined ||
       this.threadId === "" ||
       this.#connectivityBlocked() ||
-      (content === "" && this.#pendingAttachments.length === 0)
+      (content === "" && attachments.length === 0)
     ) return;
     const threadId = this.threadId;
     const requestGeneration = ++this.#turnRequestGeneration;
+    const composerCursor = textarea?.selectionStart ?? this.#composerCursor;
+    const view = this.#store.value?.threadView(threadId);
+    const startingTurn = view?.turnRunning === true
+      || this.#pendingStartTurn !== undefined
+      || this.#cancelRequestedTurn !== undefined;
+    const minimumTurn = (view?.items ?? []).reduce(
+      (maximum, item) => "turn" in item ? Math.max(maximum, item.turn + 1) : maximum,
+      1,
+    );
+    const optimistic = steering
+      ? undefined
+      : {
+          id: `optimistic:${threadId}:${requestGeneration}`,
+          threadId,
+          content,
+          attachments,
+          minimumTurn,
+          disposition: startingTurn ? "queue" as const : "turn" as const,
+        } satisfies OptimisticPromptSubmission;
     this.#requestPending = true;
     if (!steering) {
-      const view = this.#store.value?.threadView(this.threadId);
-      this.#messageRequest = view?.turnRunning === true
-        || this.#pendingStartTurn !== undefined
-        || this.#cancelRequestedTurn !== undefined
-        ? "queue"
-        : "start";
-    }
-    this.#requestError = "";
-    this.requestUpdate();
-    try {
-      const request = {
-        content,
-        ...(this.#pendingAttachments.length === 0
-          ? {}
-          : { attachments: this.#pendingAttachments.map(({ upload }) => upload) }),
-      };
-      let acceptedTurn: number | undefined;
-      if (steering) {
-        await services.protocol.steerTurn(threadId, request);
-      } else {
-        const accepted = await services.protocol.sendMessage(threadId, request);
-        if (accepted.queued !== true && accepted.turn > 0) {
-          acceptedTurn = accepted.turn;
-        }
-      }
-      if (
-        requestGeneration !== this.#turnRequestGeneration
-        || threadId !== this.threadId
-      ) return;
-      if (acceptedTurn !== undefined) this.#pendingStartTurn = acceptedTurn;
+      this.#messageRequest = startingTurn ? "queue" : "start";
+      this.#optimisticPrompt = optimistic;
       if (textarea !== null) {
         textarea.value = "";
         this.#resizeComposer(textarea);
@@ -5011,12 +5314,81 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pendingAttachments = [];
       const input = form.querySelector<HTMLInputElement>('input[type="file"]');
       if (input !== null) input.value = "";
+      if (this.#composerDraftPersistTimer !== undefined) {
+        clearTimeout(this.#composerDraftPersistTimer);
+        this.#composerDraftPersistTimer = undefined;
+      }
       void services.composerDrafts.clear(threadId).catch(() => undefined);
+    }
+    this.#requestError = "";
+    this.requestUpdate();
+    try {
+      const request = {
+        content,
+        ...(attachments.length === 0
+          ? {}
+          : { attachments: attachments.map(({ upload }) => upload) }),
+      };
+      let acceptedTurn: number | undefined;
+      if (steering) {
+        await services.protocol.steerTurn(threadId, request);
+      } else {
+        const accepted = await services.protocol.sendMessage(threadId, request);
+        const pendingOptimistic = this.#optimisticPrompt;
+        if (optimistic !== undefined && pendingOptimistic?.id === optimistic.id) {
+          pendingOptimistic.disposition = accepted.queued ? "queue" : "turn";
+          if (!accepted.queued && accepted.turn > 0) {
+            pendingOptimistic.turn = accepted.turn;
+          }
+          this.#reconcileOptimisticPrompt(
+            this.#store.value?.threadView(threadId)?.items ?? [],
+            this.#store.value?.threadView(threadId)?.queue ?? [],
+          );
+        }
+        if (accepted.queued !== true && accepted.turn > 0) {
+          acceptedTurn = accepted.turn;
+        }
+      }
+      if (
+        requestGeneration !== this.#turnRequestGeneration
+        || threadId !== this.threadId
+      ) return;
+      if (acceptedTurn !== undefined) this.#pendingStartTurn = acceptedTurn;
+      if (steering) {
+        if (textarea !== null) {
+          textarea.value = "";
+          this.#resizeComposer(textarea);
+        }
+        this.#composerDraft = "";
+        this.#composerCursor = 0;
+        this.#completionSelected = 0;
+        this.#completionDismissed = false;
+        this.#pendingAttachments = [];
+        const input = form.querySelector<HTMLInputElement>('input[type="file"]');
+        if (input !== null) input.value = "";
+        void services.composerDrafts.clear(threadId).catch(() => undefined);
+      }
     } catch {
       if (
         requestGeneration === this.#turnRequestGeneration
         && threadId === this.threadId
       ) {
+        if (!steering && this.#optimisticPrompt?.id === optimistic?.id) {
+          this.#optimisticPrompt = undefined;
+          if (textarea !== null) {
+            textarea.value = draftContent;
+            textarea.setSelectionRange(composerCursor, composerCursor);
+            this.#resizeComposer(textarea);
+          }
+          this.#composerDraft = draftContent;
+          this.#composerCursor = composerCursor;
+          this.#pendingAttachments = attachments;
+          void services.composerDrafts.save(threadId, {
+            text: draftContent,
+            cursor: composerCursor,
+            attachments,
+          });
+        }
         this.#requestError = steering
           ? "The active turn could not be steered."
           : "Message could not be sent.";
@@ -5528,6 +5900,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (approvalRequired) return;
     const open = this.#toolDisclosure.get(callId) ?? false;
     this.#toolDisclosure.set(callId, !open);
+    if (!open) void this.#ensureToolDetails(callId);
     this.#requestDisclosureUpdate();
   }
 

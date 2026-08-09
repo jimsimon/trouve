@@ -55,6 +55,8 @@ export type ProtocolModelInfo = ProtocolComponents["schemas"]["ModelInfo"];
 export type ProtocolThread = ProtocolComponents["schemas"]["Thread"];
 export type ProtocolThreadViewSnapshot =
   ProtocolComponents["schemas"]["ThreadViewSnapshot"];
+export type ProtocolThreadToolDetails =
+  ProtocolComponents["schemas"]["ThreadToolDetails"];
 export type ProtocolTodoItem = ProtocolComponents["schemas"]["TodoItem"];
 export type ProtocolCreateThreadRequest =
   ProtocolComponents["schemas"]["CreateThreadRequest"];
@@ -266,6 +268,14 @@ const isSessionFileDiff = (value: unknown): value is ProtocolSessionFileDiff => 
     typeof record["path"] === "string" &&
     record["path"] !== "" &&
     typeof record["diff"] === "string";
+};
+
+const isThreadToolDetails = (value: unknown): value is ProtocolThreadToolDetails => {
+  const record = asRecord(value);
+  return record !== undefined
+    && typeof record["call_id"] === "string"
+    && record["call_id"] !== ""
+    && Object.hasOwn(record, "args");
 };
 
 let loadedValidators: Promise<ProtocolValidators> | undefined;
@@ -1527,6 +1537,46 @@ export class ProtocolClient {
       "ThreadViewSnapshot",
       () => threadView,
     );
+  }
+
+  /** Fetch heavyweight arguments/results only when historical tool detail is
+   * explicitly opened. Collapsed transcript pages intentionally omit them. */
+  async threadToolDetails(
+    threadId: string,
+    callId: string,
+  ): Promise<ProtocolThreadToolDetails> {
+    let response: Response;
+    try {
+      response = await this.#fetch(new URL(
+        `/v1/threads/${encodeURIComponent(threadId)}/tools/${encodeURIComponent(callId)}`,
+        this.#baseUrl,
+      ));
+    } catch {
+      throw new ProtocolClientError("request-failed", "tool detail request failed");
+    }
+    if (!response.ok) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "tool detail request failed",
+        response.status,
+      );
+    }
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      throw new ProtocolClientError(
+        "invalid-response",
+        "server returned invalid ThreadToolDetails",
+      );
+    }
+    if (!isThreadToolDetails(value) || value.call_id !== callId) {
+      throw new ProtocolClientError(
+        "invalid-response",
+        "server returned invalid ThreadToolDetails",
+      );
+    }
+    return value;
   }
 
   async createThread(request: ProtocolCreateThreadRequest): Promise<ProtocolThread> {

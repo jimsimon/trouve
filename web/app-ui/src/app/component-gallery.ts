@@ -70,10 +70,10 @@ export class TrouveComponentGallery extends LitElement {
                       })}
                     </span>
                     <strong>theme parity</strong>
+                    <small>5 palettes</small>
                     <span class="tool-inline-status ok" aria-hidden="true">
                       ${fontAwesomeIcon("check", { className: "tool-status-icon" })}
                     </span>
-                    <small>5 palettes</small>
                   </summary>
                   <pre>generated CSS matches theme.rs</pre>
                 </details>

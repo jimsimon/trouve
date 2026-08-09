@@ -144,7 +144,6 @@ import "../components/command-palette.js";
 import "../components/image-preview.js";
 import "../components/session-list.js";
 import "../components/thread-screen.js";
-import "../components/todo-plan-panel.js";
 import "../components/model-picker.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
@@ -161,10 +160,12 @@ const INSPECTION_PANELS = [
   "diff",
   "files",
   "pr",
+  "plan",
   "terminal",
 ] as const satisfies readonly InspectionPanel[];
 
 const GITHUB_REFRESH_INTERVAL_MS = 30_000;
+const SLEEP_ACTIVITY_RECONCILE_INTERVAL_MS = 15_000;
 const AUTOMATIC_RETRY_MS = 5_000;
 
 const INSPECTION_PANEL_LABELS: Readonly<Record<
@@ -403,6 +404,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #resumePersistTimer: ReturnType<typeof setTimeout> | undefined;
   #githubRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #githubRefreshPending = false;
+  #sleepActivityReconcileTimer: ReturnType<typeof setTimeout> | undefined;
+  #sleepActivityReconcilePending = false;
   #protocolRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #hostRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #routeRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -493,6 +496,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#githubRefreshTimer = undefined;
     }
     this.#githubRefreshPending = false;
+    if (this.#sleepActivityReconcileTimer !== undefined) {
+      clearTimeout(this.#sleepActivityReconcileTimer);
+      this.#sleepActivityReconcileTimer = undefined;
+    }
+    this.#sleepActivityReconcilePending = false;
     this.#flushResumePreferences();
     this.#desktopCoordinator?.stop();
     this.#browserWakeLock?.stop();
@@ -890,12 +898,40 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const workRunning = readSignal(this.#store.sessions).some((session) => session.active);
     const preventSleepWhileRunning =
       readSignal(this.#generalPreferences.current).preventSleepWhileRunning;
+    const shouldPreventSleep = workRunning && preventSleepWhileRunning;
     this.#desktopCoordinator?.updateActivity({
       idle: !workRunning,
       workRunning,
       preventSleepWhileRunning,
     });
-    this.#browserWakeLock?.setDesired(workRunning && preventSleepWhileRunning);
+    this.#browserWakeLock?.setDesired(shouldPreventSleep);
+    this.#scheduleSleepActivityReconciliation(shouldPreventSleep);
+  }
+
+  #scheduleSleepActivityReconciliation(shouldPreventSleep: boolean): void {
+    if (!shouldPreventSleep) {
+      if (this.#sleepActivityReconcileTimer !== undefined) {
+        clearTimeout(this.#sleepActivityReconcileTimer);
+        this.#sleepActivityReconcileTimer = undefined;
+      }
+      return;
+    }
+    if (
+      this.#sleepActivityReconcileTimer !== undefined
+      || this.#sleepActivityReconcilePending
+      || !this.isConnected
+    ) return;
+    this.#sleepActivityReconcileTimer = setTimeout(() => {
+      this.#sleepActivityReconcileTimer = undefined;
+      if (!this.isConnected) return;
+      this.#sleepActivityReconcilePending = true;
+      void this.#protocolIngress.reconcileSessionActivity()
+        .catch(() => undefined)
+        .finally(() => {
+          this.#sleepActivityReconcilePending = false;
+          if (this.isConnected) this.#syncDesktopActivity();
+        });
+    }, SLEEP_ACTIVITY_RECONCILE_INTERVAL_MS);
   }
 
   #desktopCloseRequested(
@@ -1069,17 +1105,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (route.kind === "settings") void import("../components/settings-screen.js");
     if (route.kind === "automations") void import("../components/automations-screen.js");
     if (route.kind === "reviews") void import("../components/pull-requests-dashboard.js");
-    if (
-      route.kind === "session" &&
-      route.inspection === "plan" &&
-      (
-        route.threadId === undefined ||
-        this.#store.threadView(route.threadId).todos.length === 0
-      )
-    ) {
-      this.#router.navigate({ ...route, inspection: "info" }, true);
-      return;
-    }
     const inspectionVisible =
       !globalThis.matchMedia("(max-width: 760px)").matches ||
       this.#mobilePane === "inspection";
@@ -1090,6 +1115,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       if (inspection === "diff" || inspection === "files") {
         void import("../components/inspection-workspace.js");
       }
+      if (inspection === "plan") void import("../components/todo-plan-panel.js");
       if (inspection === "pr") void import("../components/session-pr-panel.js");
     }
     const sessions = readSignal(this.#store.sessions);
@@ -1196,6 +1222,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (route.kind !== "session") return;
     this.#router.navigate({ ...route, inspection: panel });
   }
+
+  readonly #openInspection = (
+    event: CustomEvent<{ readonly panel: InspectionPanel }>,
+  ): void => {
+    if (!INSPECTION_PANELS.includes(event.detail.panel)) return;
+    this.#selectInspection(event.detail.panel);
+    this.#showMobilePane("inspection");
+  };
 
   #selectInspectionWithKeyboard(event: KeyboardEvent, currentIndex: number): void {
     if (event.altKey || event.ctrlKey || event.metaKey) return;
@@ -2160,14 +2194,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       route.kind === "session" && route.threadId !== undefined
         ? this.#store.threadView(route.threadId)
         : undefined;
-    const requestedInspection =
+    const selectedInspection =
       route.kind === "session" ? (route.inspection ?? "info") : "info";
-    // Never leave an empty TODO surface mounted while the route correction
-    // scheduled in updated() propagates through history/router signals.
-    const selectedInspection = requestedInspection === "plan" &&
-        (activeView === undefined || activeView.todos.length === 0)
-      ? "info"
-      : requestedInspection;
     const liveSessionIds = new Set(sessions.map((session) => session.id));
     for (const sessionId of this.#terminalSessionIds) {
       if (!liveSessionIds.has(sessionId)) this.#terminalSessionIds.delete(sessionId);
@@ -2175,9 +2203,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (route.kind === "session" && selectedInspection === "terminal") {
       this.#terminalSessionIds.add(route.sessionId);
     }
-    const selectedInspectionIndex = selectedInspection === "plan"
-      ? -1
-      : INSPECTION_PANELS.indexOf(selectedInspection);
+    const selectedInspectionIndex = INSPECTION_PANELS.indexOf(selectedInspection);
     const activeThread =
       route.kind === "session" && route.threadId !== undefined
         ? this.#store.thread(route.threadId)
@@ -2228,6 +2254,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         @trouve-open-internal=${this.#openInternal}
         @trouve-open-external=${this.#openExternal}
         @trouve-open-file=${this.#openFile}
+        @trouve-open-inspection=${this.#openInspection}
         @trouve-chat-position=${this.#chatPositionChanged}
         @trouve-command-palette-action=${this.#commandPaletteAction}
         @trouve-pull-request-chat=${this.#openPullRequestChat}
@@ -2482,21 +2509,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         ></div>
 
         <aside class="inspection-panel" aria-label="Inspection">
-          ${activeView !== undefined && activeView.todos.length > 0
-            ? html`<div class="inspection-todo-switch">
-                <button
-                  type="button"
-                  aria-pressed=${selectedInspection === "plan" ? "true" : "false"}
-                  @click=${() => this.#selectInspection(
-                    selectedInspection === "plan" ? "info" : "plan",
-                  )}
-                >${selectedInspection === "plan"
-                  ? html`${fontAwesomeIcon("arrow-left")} Info`
-                  : html`${fontAwesomeIcon("list-check")} Todos  ${
-                      activeView.todos.filter((todo) => todo.status === "completed").length
-                    }/${activeView.todos.length} complete`}</button>
-              </div>`
-            : nothing}
           <div class="inspection-tabs" role="tablist" aria-label="Inspection views">
             ${INSPECTION_PANELS.map(
               (panel, index) => html`
@@ -2545,7 +2557,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 class="inspection-content"
                 panel=${selectedInspection}
               ></trouve-inspection-workspace>`
-            : selectedInspection === "plan" && activeView !== undefined
+            : route.kind === "session" && selectedInspection === "plan"
             ? html`<trouve-todo-plan-panel
                 class="inspection-content"
               ></trouve-todo-plan-panel>`

@@ -32,9 +32,9 @@ export interface ToolPresentation {
 
 /** Compact execution duration shown beside the tool title. A positive
  * provider duration is authoritative; zero is commonly a provider
- * placeholder, so a server/event measurement supplies the fallback. The
- * status glyph communicates success or failure without repeating an exit
- * code in the collapsed row. */
+ * placeholder, so the server's executor-only measurement (or its compatible
+ * durable-timestamp fallback) supplies the value. The status glyph
+ * communicates success or failure without repeating an exit code. */
 export const toolExecutionMetadata = (
   resultValue: unknown,
   measuredDurationMs?: number,

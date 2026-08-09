@@ -1,6 +1,8 @@
 //! Recursive filename search by glob pattern, honouring .gitignore.
 
 use serde_json::{Value, json};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -81,7 +83,31 @@ fn search(
     matcher: &globset::GlobMatcher,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Vec<Value>, bool), String> {
-    let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
+    #[derive(Eq, PartialEq)]
+    struct Candidate {
+        modified: std::time::SystemTime,
+        path: String,
+    }
+
+    impl Ord for Candidate {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.modified
+                .cmp(&other.modified)
+                // Lexically smaller paths rank higher for deterministic ties.
+                .then_with(|| other.path.cmp(&self.path))
+        }
+    }
+
+    impl PartialOrd for Candidate {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    // Reverse makes this a min-heap: once full, its root is the least useful
+    // retained result. Memory stays O(MAX_RESULTS) even in giant repos.
+    let mut files = BinaryHeap::<Reverse<Candidate>>::with_capacity(MAX_RESULTS + 1);
+    let mut truncated = false;
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .require_git(false)
@@ -111,14 +137,35 @@ fn search(
             .unwrap_or(entry.path())
             .to_string_lossy()
             .to_string();
-        files.push((mtime, rel));
+        let candidate = Candidate {
+            modified: mtime,
+            path: rel,
+        };
+        if files.len() < MAX_RESULTS {
+            files.push(Reverse(candidate));
+        } else {
+            truncated = true;
+            if files.peek().is_some_and(|worst| candidate > worst.0) {
+                files.pop();
+                files.push(Reverse(candidate));
+            }
+        }
     }
     // Newest first: recently touched files are almost always the relevant
     // ones. Path as tiebreaker keeps the order deterministic.
-    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let truncated = files.len() > MAX_RESULTS;
-    files.truncate(MAX_RESULTS);
-    let files = files.into_iter().map(|(_, p)| json!(p)).collect();
+    let mut files = files
+        .into_iter()
+        .map(|Reverse(candidate)| candidate)
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let files = files
+        .into_iter()
+        .map(|candidate| json!(candidate.path))
+        .collect();
     Ok((files, truncated))
 }
 

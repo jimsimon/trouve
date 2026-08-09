@@ -215,7 +215,16 @@ pub use requests::*;
 // /v1/threads/{id}/steer adds input to an active vendor turn, and the durable
 // turn.steered event/folded item preserves that input in the turn rail
 // (additive).
-pub const PROTOCOL_VERSION: &str = "3.21";
+// 3.22: tool.completed optionally carries monotonic executor-only duration,
+// allowing clients to distinguish actual tool work from event-log queueing,
+// persistence, scheduling, and post-processing latency (additive).
+// 3.23: historical tool calls can defer their complete arguments/results to
+// a lazy detail endpoint while thread snapshots retain bounded presentation
+// data (additive).
+// 3.24: folded thread history includes durable TODO lifecycle entries so
+// clients can render started, completed, cancelled, and skipped TODO rail
+// nodes while retaining the latest TODO snapshot (additive).
+pub const PROTOCOL_VERSION: &str = "3.24";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

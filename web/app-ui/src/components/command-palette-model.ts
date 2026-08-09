@@ -83,8 +83,8 @@ const INSPECTION_VIEWS = [
   ["diff", "Diff", "code-compare", "changes patch review"],
   ["files", "Files", "file-lines", "source tree code"],
   ["pr", "Pull request", "code-pull-request", "branch review status"],
+  ["plan", "Todos", "list-check", "todos tasks plan checklist"],
   ["terminal", "Terminal", "terminal", "shell pty console"],
-  ["plan", "Plan", "list-check", "todos tasks"],
 ] as const satisfies readonly [
   InspectionPanel,
   string,

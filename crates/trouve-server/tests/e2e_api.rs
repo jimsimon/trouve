@@ -511,6 +511,20 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         folded_tool["duration_ms"].is_u64(),
         "folded tool calls retain server-measured execution time"
     );
+    assert_eq!(folded_tool["details_deferred"], true);
+    assert!(folded_tool.get("result").is_none() || folded_tool["result"].is_null());
+    let folded_call_id = folded_tool["call_id"].as_str().unwrap();
+    let tool_details: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/tools/{folded_call_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tool_details["call_id"], folded_call_id);
+    assert_eq!(tool_details["args"]["content"], "hi\n");
+    assert_eq!(tool_details["result"]["bytes_written"], 3);
     assert_eq!(view["turn_running"], false);
     assert_eq!(view["last_usage"]["context_input_tokens"], 20);
     let folded_turn = view["items"]

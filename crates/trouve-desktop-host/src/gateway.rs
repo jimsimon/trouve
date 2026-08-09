@@ -3182,6 +3182,7 @@ mod tests {
         assert!(loaded.chat.collapse_sequential_tool_calls);
         assert!(loaded.chat.collapse_thinking_with_tools);
         assert!(!loaded.chat.collapse_compaction_with_tools);
+        assert!(!loaded.chat.collapse_todo_updates_with_tools);
         assert!(!loaded.notifications.on_finish);
         assert!(loaded.notifications.sound);
         assert_eq!(loaded.workspace_order, ["ws-2", "ws-1"]);
@@ -3342,6 +3343,7 @@ mod tests {
         assert!(preferences.chat.collapse_sequential_tool_calls);
         assert!(preferences.chat.collapse_thinking_with_tools);
         assert!(preferences.chat.collapse_compaction_with_tools);
+        assert!(!preferences.chat.collapse_todo_updates_with_tools);
         assert_eq!(
             preferences.notifications,
             crate::NotificationPreferences::default()

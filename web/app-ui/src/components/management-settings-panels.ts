@@ -1003,7 +1003,7 @@ export class TrouveIntegrationsSettings extends LitElement {
     return html`
       <div class="stack">
         <h2>Integrations</h2>
-        <p class="meta">Powers the Pull Requests tab and PR creation. Sign in to each GitHub host separately with OAuth. GitHub Enterprise hosts require a device-flow-enabled OAuth app client ID.</p>
+        <p class="meta">Powers the Pull Requests tab and PR creation. Sign in to each GitHub host separately with OAuth. GitHub access requests repository and organization-read permissions so team reviewers can be displayed. Existing OAuth connections must be re-signed in once to grant the additional permission. GitHub Enterprise hosts require a device-flow-enabled OAuth app client ID.</p>
         ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
         ${hosts.length === 0 ? html`<p class="meta">No GitHub host information is available.</p>` : hosts.map((host) => html`
             <article class="card integration-host">

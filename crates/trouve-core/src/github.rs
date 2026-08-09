@@ -785,8 +785,10 @@ pub fn oauth_config(host: &str, client_id: &str) -> trouve_providers::auth::OAut
         device_authorization_url: Some(format!("https://{host}/login/device/code")),
         authorization_url: None,
         token_url: format!("https://{host}/login/oauth/access_token"),
-        // Classic OAuth-app scope covering PR read/write and checks.
-        scopes: vec!["repo".into()],
+        // `repo` covers pull-request mutations. Rich reviewer details also
+        // resolve requested teams, which GitHub gates behind `read:org` even
+        // when the repository itself is already visible to the token.
+        scopes: vec!["repo".into(), "read:org".into()],
         redirect_port: None,
         redirect_path: None,
     }
@@ -3931,6 +3933,12 @@ impl GitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_oauth_requests_repository_and_team_read_scopes() {
+        let config = oauth_config("github.com", "client-id");
+        assert_eq!(config.scopes, ["repo", "read:org"]);
+    }
 
     #[test]
     fn parses_remote_forms() {

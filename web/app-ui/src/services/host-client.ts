@@ -882,6 +882,9 @@ export const chatPreferencesFromHost = (
   collapseCompactionWithTools:
     preferences.chat?.collapse_compaction_with_tools ??
     fallback.collapseCompactionWithTools,
+  collapseTodoUpdatesWithTools:
+    preferences.chat?.collapse_todo_updates_with_tools ??
+    fallback.collapseTodoUpdatesWithTools,
 });
 
 export const notificationPreferencesFromHost = (
@@ -942,6 +945,7 @@ export const withHostChatPreferences = (
     collapse_sequential_tool_calls: chat.collapseSequentialToolCalls,
     collapse_thinking_with_tools: chat.collapseThinkingWithTools,
     collapse_compaction_with_tools: chat.collapseCompactionWithTools,
+    collapse_todo_updates_with_tools: chat.collapseTodoUpdatesWithTools,
   },
 });
 

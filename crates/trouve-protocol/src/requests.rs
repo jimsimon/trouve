@@ -293,6 +293,18 @@ pub enum TodoStatus {
     Cancelled,
 }
 
+/// One user-visible transition in a todo's lifecycle. `Skipped` is derived
+/// when an unfinished todo disappears from a replacement snapshot; it is not
+/// a current-list status because skipped items are no longer in that list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadTodoState {
+    Started,
+    Completed,
+    Cancelled,
+    Skipped,
+}
+
 /// One stable item in a thread's current todo list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TodoItem {
@@ -355,16 +367,29 @@ pub enum ThreadViewItem {
         turn: u64,
         state: ThreadCompactionState,
     },
+    /// A durable todo lifecycle boundary derived from successive
+    /// `thread.todos_updated` snapshots while a turn is running.
+    TodoUpdate {
+        turn: u64,
+        todo_id: String,
+        content: String,
+        state: ThreadTodoState,
+    },
     ToolCall {
         call_id: String,
         tool: String,
         args: serde_json::Value,
+        /// Completed historical rows may contain only bounded presentation
+        /// arguments. Fetch `/v1/threads/{thread}/tools/{call_id}` before
+        /// rendering expanded/raw detail when this flag is true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        details_deferred: bool,
         status: ThreadToolStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<serde_json::Value>,
-        /// Wall-clock execution time derived from the durable tool event
-        /// timestamps. This remains available when a provider omits timing
-        /// metadata or reports a zero-valued placeholder in its result.
+        /// Executor-only duration when the completion event carries a
+        /// monotonic measurement; otherwise the compatible fallback derived
+        /// from durable tool event timestamps.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
@@ -384,6 +409,16 @@ pub enum ThreadViewItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answers: Option<Vec<crate::QuestionAnswer>>,
     },
+}
+
+/// Full arguments and terminal result for one materialized historical tool
+/// call. Live-tail tool calls continue to carry these fields inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadToolDetails {
+    pub call_id: String,
+    pub args: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

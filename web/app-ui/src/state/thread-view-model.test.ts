@@ -201,6 +201,67 @@ describe("ThreadViewModel", () => {
     });
   });
 
+  it("hydrates deferred historical tool details without replacing the page", () => {
+    const view = ThreadViewModel.fromSnapshot(9, {
+      item_offset: 12,
+      total_items: 13,
+      has_older: true,
+      items: [{
+        kind: "tool_call",
+        call_id: "deferred",
+        tool: "read_file",
+        args: { path: "README.md" },
+        details_deferred: true,
+        status: "ok",
+      }],
+    });
+
+    expect(view.findTool("deferred")).toMatchObject({
+      detailsDeferred: true,
+      args: { path: "README.md" },
+      result: undefined,
+    });
+    expect(view.replaceToolDetails({
+      call_id: "deferred",
+      args: { path: "README.md", content: "full arguments" },
+      result: { content: "full result" },
+    })).toBe(true);
+    expect(view.findTool("deferred")).toMatchObject({
+      detailsDeferred: false,
+      args: { path: "README.md", content: "full arguments" },
+      result: { content: "full result" },
+    });
+    expect(view.itemOffset).toBe(12);
+  });
+
+  it("prefers executor timing over durable event latency", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "tool.requested",
+      turn: 1,
+      call_id: "measured",
+      tool: "read_file",
+      args: { path: "README.md" },
+      requires_approval: false,
+    }, "2026-08-01T12:00:00.000Z"));
+    view.apply(envelope(2, {
+      type: "tool.started",
+      call_id: "measured",
+    }, "2026-08-01T12:00:00.100Z"));
+    view.apply(envelope(3, {
+      type: "tool.completed",
+      call_id: "measured",
+      status: "ok",
+      result: {},
+      execution_duration_ms: 7,
+    }, "2026-08-01T12:00:00.845Z"));
+
+    expect(view.items[0]).toMatchObject({
+      kind: "tool",
+      durationMs: 7,
+    });
+  });
+
   it("restores a completed compaction boundary from a folded snapshot", () => {
     const view = ThreadViewModel.fromSnapshot(12, {
       item_offset: 8,
@@ -270,6 +331,80 @@ describe("ThreadViewModel", () => {
       item_offset: 8,
       items: [{ kind: "user", turn: 9, content: "gap", attachments: [] }],
     })).toBe(false);
+  });
+
+  it("merges a fresh tail without discarding prefetched history", () => {
+    const view = ThreadViewModel.fromSnapshot(20, {
+      item_offset: 4,
+      total_items: 6,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 3, content: "old tail", attachments: [] },
+        { kind: "assistant", turn: 3, content: "old answer", complete: true },
+      ],
+    });
+    expect(view.prependSnapshot({
+      item_offset: 2,
+      total_items: 6,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 2, content: "prefetched", attachments: [] },
+        { kind: "assistant", turn: 2, content: "history", complete: true },
+      ],
+    })).toBe(true);
+
+    view.mergeTailSnapshot(25, {
+      item_offset: 4,
+      total_items: 7,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 3, content: "fresh tail", attachments: [] },
+        { kind: "assistant", turn: 3, content: "fresh answer", complete: true },
+        { kind: "user", turn: 4, content: "new item", attachments: [] },
+      ],
+    });
+
+    expect(view.itemOffset).toBe(2);
+    expect(view.totalItems).toBe(7);
+    expect(view.items.map(({ id }) => id)).toEqual([
+      "snapshot:2",
+      "snapshot:3",
+      "snapshot:4",
+      "snapshot:5",
+      "snapshot:6",
+    ]);
+    expect(view.items.map((item) => "content" in item ? item.content : "")).toEqual([
+      "prefetched",
+      "history",
+      "fresh tail",
+      "fresh answer",
+      "new item",
+    ]);
+  });
+
+  it("bounds retained history while preserving absolute ids", () => {
+    const view = ThreadViewModel.fromSnapshot(20, {
+      item_offset: 10,
+      total_items: 15,
+      has_older: true,
+      items: Array.from({ length: 5 }, (_, index) => ({
+        kind: "user" as const,
+        turn: index,
+        content: `item ${index}`,
+        attachments: [],
+      })),
+    });
+
+    view.trimHistory(3);
+
+    expect(view.itemOffset).toBe(12);
+    expect(view.totalItems).toBe(15);
+    expect(view.hasOlder).toBe(true);
+    expect(view.items.map(({ id }) => id)).toEqual([
+      "snapshot:12",
+      "snapshot:13",
+      "snapshot:14",
+    ]);
   });
 
   it("folds a streamed turn into stable user, assistant, and terminal status items", () => {
@@ -635,6 +770,52 @@ describe("ThreadViewModel", () => {
       { id: "second", content: "Second", status: "completed" },
       { id: "third", content: "Third", status: "pending" },
     ]);
+  });
+
+  it("projects todo lifecycle updates into the active turn", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 9,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(2, {
+      type: "thread.todos_updated",
+      todos: [
+        { id: "one", content: "Implement", status: "in_progress" },
+        { id: "two", content: "Verify", status: "pending" },
+      ],
+    }));
+    vm.apply(envelope(3, {
+      type: "thread.todos_updated",
+      todos: [{ id: "one", content: "Implement", status: "completed" }],
+    }));
+
+    expect(vm.items.filter((item) => item.kind === "todo")).toMatchObject([
+      { kind: "todo", turn: 9, todoId: "one", state: "started" },
+      { kind: "todo", turn: 9, todoId: "one", state: "completed" },
+      { kind: "todo", turn: 9, todoId: "two", state: "skipped" },
+    ]);
+  });
+
+  it("hydrates materialized todo updates from a folded snapshot", () => {
+    const view = ThreadViewModel.fromSnapshot(12, {
+      items: [{
+        kind: "todo_update",
+        turn: 4,
+        todo_id: "verify",
+        content: "Run the checks",
+        state: "cancelled",
+      }],
+    });
+    expect(view.items).toMatchObject([{
+      kind: "todo",
+      turn: 4,
+      todoId: "verify",
+      content: "Run the checks",
+      state: "cancelled",
+    }]);
   });
 
   it("produces the same projection during replay and live delivery", () => {

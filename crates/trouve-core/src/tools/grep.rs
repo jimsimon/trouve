@@ -5,12 +5,14 @@
 
 use regex::Regex;
 use serde_json::{Value, json};
+use std::io::BufRead as _;
 
 use super::{Tool, ToolCtx, ToolResult};
 
 const MAX_RESULTS: usize = 200;
-/// Skip files larger than this: grep slurps each file into a String, so a
-/// single huge or newline-free file would spike memory and CPU.
+/// Skip files larger than this to bound worst-case scans of generated,
+/// minified, or newline-free content. Ordinary files are streamed line by
+/// line and stop as soon as the result budget is full.
 const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct Grep;
@@ -100,36 +102,49 @@ fn search(
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        // Skip files too large to slurp: one huge or newline-free file
-        // (minified/generated) would otherwise blow up memory and CPU.
+        // Bound pathological files; eligible files are still streamed rather
+        // than retained in full.
         if entry
             .metadata()
             .is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES)
         {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+        let Ok(file) = std::fs::File::open(entry.path()) else {
             continue; // binary or unreadable
         };
-        for (i, line) in text.lines().enumerate() {
+        let rel = entry
+            .path()
+            .strip_prefix(worktree)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .to_string();
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        let mut line_number = 0usize;
+        loop {
             if cancel.is_cancelled() {
                 return Err("search cancelled".into());
             }
-            if regex.is_match(line) {
+            line.clear();
+            let Ok(bytes) = reader.read_line(&mut line) else {
+                break; // binary/invalid UTF-8 or unreadable
+            };
+            if bytes == 0 {
+                break;
+            }
+            line_number += 1;
+            let text = line.strip_suffix('\n').unwrap_or(&line);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            if regex.is_match(text) {
                 if matches.len() >= MAX_RESULTS {
                     truncated = true;
                     break 'outer;
                 }
-                let rel = entry
-                    .path()
-                    .strip_prefix(worktree)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .to_string();
                 matches.push(json!({
-                    "path": rel,
-                    "line": i + 1,
-                    "text": line.chars().take(500).collect::<String>(),
+                    "path": &rel,
+                    "line": line_number,
+                    "text": text.chars().take(500).collect::<String>(),
                 }));
             }
         }

@@ -14,20 +14,24 @@ describe("chat preferences", () => {
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
     expect(normalizeChatPreferences({})).toEqual({
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
     expect(normalizeChatPreferences({
       collapseSequentialToolCalls: "yes" as unknown as boolean,
       collapseThinkingWithTools: "yes" as unknown as boolean,
       collapseCompactionWithTools: "yes" as unknown as boolean,
+      collapseTodoUpdatesWithTools: "yes" as unknown as boolean,
     })).toEqual({
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
   });
 
@@ -36,10 +40,12 @@ describe("chat preferences", () => {
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     })).toEqual({
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
   });
 
@@ -55,17 +61,20 @@ describe("chat preferences", () => {
     controller.update({
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
 
     expect(controller.current.get()).toEqual({
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
     expect(adapter.load()).toEqual({
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
     expect(storage.setItem).toHaveBeenCalledOnce();
   });
@@ -80,6 +89,7 @@ describe("chat preferences", () => {
     new ChatPreferencesController(browserChatPreferenceStorage(storage)).update({
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
     const reloaded = new ChatPreferencesController(
       browserChatPreferenceStorage(storage),
@@ -89,6 +99,7 @@ describe("chat preferences", () => {
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
   });
 

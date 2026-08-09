@@ -24,6 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt as _;
 use serde_json::Value;
 use trouve_protocol::ToolStatus;
 use trouve_providers::ToolSpec;
@@ -36,6 +37,9 @@ pub struct ToolCtx {
     /// must finish process/protocol cleanup before returning from it.
     pub cancel: tokio_util::sync::CancellationToken,
     pub worktree: PathBuf,
+    /// Canonicalized once when the engine builds the turn context. Isolated
+    /// tool tests may omit it and pay the one-off fallback canonicalization.
+    pub canonical_worktree: Option<PathBuf>,
     /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
     /// tool tests that do not exercise thread state.
     pub thread_id: String,
@@ -72,10 +76,13 @@ impl ToolCtx {
         // canonicalized worktree. The not-yet-created remainder is safe: it
         // contains only `Normal` components (checked above) and dangling
         // symlinks fail canonicalization rather than being written through.
-        let root = self
-            .worktree
-            .canonicalize()
-            .with_context(|| format!("worktree unavailable: {}", self.worktree.display()))?;
+        let root = match &self.canonical_worktree {
+            Some(root) => root.clone(),
+            None => self
+                .worktree
+                .canonicalize()
+                .with_context(|| format!("worktree unavailable: {}", self.worktree.display()))?,
+        };
         let mut existing = joined.clone();
         while existing.symlink_metadata().is_err() {
             if !existing.pop() {
@@ -180,11 +187,68 @@ pub struct ReviewRepositorySync {
     pub base_sha: String,
     pub head_sha: String,
     pub token: String,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 pub struct ReviewRepositoryDiff {
     pub worktree: PathBuf,
     pub base_sha: String,
+}
+
+const REVIEW_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_REVIEW_GIT_MESSAGE_BYTES: usize = 64 * 1024;
+
+fn bounded_review_git_message(bytes: &[u8]) -> String {
+    let end = bytes.len().min(MAX_REVIEW_GIT_MESSAGE_BYTES);
+    let mut message = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+    if end < bytes.len() {
+        message.push_str("\n… output truncated");
+    }
+    message
+}
+
+async fn run_review_git(
+    repository_path: &Path,
+    auth: &str,
+    args: Vec<String>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String, String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(&args)
+        .current_dir(repository_path)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("review repository sync cancelled".into()),
+        result = tokio::time::timeout(REVIEW_GIT_TIMEOUT, command.output()) => {
+            match result {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => return Err(format!("running git: {error}")),
+                Err(_) => return Err(format!(
+                    "git {} timed out after {}s",
+                    args.join(" "),
+                    REVIEW_GIT_TIMEOUT.as_secs(),
+                )),
+            }
+        }
+    };
+    if output.status.success() {
+        if output.stdout.len() > MAX_REVIEW_GIT_MESSAGE_BYTES {
+            return Err(format!(
+                "git {} returned more than {MAX_REVIEW_GIT_MESSAGE_BYTES} bytes",
+                args.join(" ")
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(bounded_review_git_message(&output.stderr))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +261,7 @@ pub struct ReviewDiffFile {
 /// servers configured for the workspace.
 pub struct LocalToolExecutor {
     tools: Vec<Arc<dyn Tool>>,
+    built_in_specs: Vec<ToolSpec>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
 }
@@ -216,28 +281,38 @@ impl LocalToolExecutor {
         let search_cache = search::shared_cache();
         // The three shell tools share one background-job registry.
         let jobs = Arc::new(shell::JobRegistry::default());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(fs::ReadFile),
+            Arc::new(fs::WriteFile),
+            Arc::new(fs::EditFile),
+            Arc::new(patch::ApplyPatch),
+            Arc::new(fs::ListDir),
+            Arc::new(diff::GitDiff),
+            Arc::new(glob::Glob),
+            Arc::new(shell::Shell { jobs: jobs.clone() }),
+            Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
+            Arc::new(shell::ShellKill { jobs: jobs.clone() }),
+            Arc::new(grep::Grep),
+            Arc::new(web::WebFetch::default()),
+            Arc::new(todo::TodoWrite),
+            Arc::new(search::Search {
+                cache: search_cache.clone(),
+            }),
+            Arc::new(search::FindRelated {
+                cache: search_cache,
+            }),
+        ];
+        let built_in_specs = tools
+            .iter()
+            .map(|tool| ToolSpec {
+                name: tool.name().to_owned(),
+                description: tool.description().to_owned(),
+                parameters: tool.parameters(),
+            })
+            .collect();
         Self {
-            tools: vec![
-                Arc::new(fs::ReadFile),
-                Arc::new(fs::WriteFile),
-                Arc::new(fs::EditFile),
-                Arc::new(patch::ApplyPatch),
-                Arc::new(fs::ListDir),
-                Arc::new(diff::GitDiff),
-                Arc::new(glob::Glob),
-                Arc::new(shell::Shell { jobs: jobs.clone() }),
-                Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
-                Arc::new(shell::ShellKill { jobs: jobs.clone() }),
-                Arc::new(grep::Grep),
-                Arc::new(web::WebFetch::default()),
-                Arc::new(todo::TodoWrite),
-                Arc::new(search::Search {
-                    cache: search_cache.clone(),
-                }),
-                Arc::new(search::FindRelated {
-                    cache: search_cache,
-                }),
-            ],
+            tools,
+            built_in_specs,
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
         }
@@ -251,15 +326,7 @@ impl LocalToolExecutor {
 #[async_trait::async_trait]
 impl ToolExecutor for LocalToolExecutor {
     async fn specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
-        let mut specs: Vec<ToolSpec> = self
-            .tools
-            .iter()
-            .map(|t| ToolSpec {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters(),
-            })
-            .collect();
+        let mut specs = self.built_in_specs.clone();
         specs.extend(
             self.mcp
                 .specs(
@@ -353,23 +420,8 @@ impl ToolExecutor for LocalToolExecutor {
         let run = |args: Vec<String>| {
             let repository_path = repository_path.clone();
             let auth = auth.clone();
-            async move {
-                let output = tokio::process::Command::new("git")
-                    .args(args)
-                    .current_dir(&repository_path)
-                    .env("GIT_CONFIG_COUNT", "1")
-                    .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-                    .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .output()
-                    .await
-                    .map_err(|error| format!("running git: {error}"))?;
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-                }
-            }
+            let cancel = request.cancel.clone();
+            async move { run_review_git(&repository_path, &auth, args, &cancel).await }
         };
 
         if !repository_path.exists() {
@@ -407,6 +459,7 @@ impl ToolExecutor for LocalToolExecutor {
         let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         run(vec![
             "fetch".into(),
+            "--quiet".into(),
             "--force".into(),
             "--no-tags".into(),
             "origin".into(),
@@ -430,20 +483,33 @@ impl ToolExecutor for LocalToolExecutor {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         let worktree = request.worktree.clone();
         let base_sha = request.base_sha.clone();
-        tokio::task::spawn_blocking(move || {
-            let paths = crate::git::session_diff_files(&worktree, &base_sha)
-                .map_err(|error| error.to_string())?;
-            paths
-                .into_iter()
-                .map(|path| {
+        let paths = tokio::task::spawn_blocking({
+            let worktree = worktree.clone();
+            let base_sha = base_sha.clone();
+            move || crate::git::session_diff_files(&worktree, &base_sha)
+        })
+        .await
+        .map_err(|error| format!("review diff manifest task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+        futures::stream::iter(paths.into_iter().map(|path| {
+            let worktree = worktree.clone();
+            let base_sha = base_sha.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
                     let diff = crate::git::session_diff_path(&worktree, &base_sha, &path)
                         .map_err(|error| error.to_string())?;
                     Ok(ReviewDiffFile { path, diff })
                 })
-                .collect()
-        })
+                .await
+                .map_err(|error| format!("review file diff task failed: {error}"))?
+            }
+        }))
+        .buffered(4)
+        .collect::<Vec<Result<ReviewDiffFile, String>>>()
         .await
-        .map_err(|error| format!("review diff task failed: {error}"))?
+        .into_iter()
+        .collect()
     }
 
     async fn evict_worktree(&self, worktree: &Path) {

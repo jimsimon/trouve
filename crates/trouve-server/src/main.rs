@@ -17,6 +17,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
 
     let security = trouve_server::ServerSecurity::resolve();
-    let (_, server) = trouve_server::bind_local(addr, security).await?;
+    let binding = trouve_server::bind_local(addr, security).await?;
+    let address = binding.address();
+    let Some(server) = binding.into_server() else {
+        tracing::info!(%address, "a local trouve server already owns this data directory");
+        return Ok(());
+    };
     server.await
 }

@@ -41,3 +41,5 @@ sequentially.
 | [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |
 | [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Accepted |
 | [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |
+| [0032](0032-single-local-server-owner.md) | Single local server owner per data directory | Accepted |
+| [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |

@@ -16,8 +16,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
-    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadViewSnapshot,
-    Workspace,
+    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadToolDetails,
+    ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
 use trouve_thread_view::ThreadProjection;
 
@@ -28,7 +28,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // folding their durable event history again, without a storage migration.
 // v3 retains the checkpoint id on completed folded turns so cached histories
 // expose exact restore/fork actions after an upgrade.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 3;
+// v4 stores completed folded rows independently and keeps only the live tail
+// in the serialized projection cache.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -128,6 +130,19 @@ CREATE TABLE IF NOT EXISTS thread_view_cache (
   cursor INTEGER NOT NULL,
   schema_version INTEGER NOT NULL,
   state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_view_items (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  item_index INTEGER NOT NULL,
+  item TEXT NOT NULL,
+  PRIMARY KEY (thread_id, item_index)
+);
+CREATE TABLE IF NOT EXISTS thread_tool_details (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  call_id TEXT NOT NULL,
+  args TEXT NOT NULL,
+  result TEXT,
+  PRIMARY KEY (thread_id, call_id)
 );
 CREATE TABLE IF NOT EXISTS session_summaries (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2009,12 +2024,29 @@ enum StoreMutation {
     Delete {
         id: String,
     },
+    AcceptPrompt {
+        prompt: Box<trouve_protocol::QueuedPrompt>,
+        tools_enabled: bool,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        claim_prompt_id: Option<String>,
+        expected_previous_turn: Option<u64>,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
 struct AppendRequest {
     events: Vec<PendingEvent>,
     reply: AppendReply,
+    queued_at: std::time::Instant,
+}
+
+/// The on-disk event writer owns a dedicated SQLite connection so read-side
+/// queries cannot hold it behind the store's process-local connection mutex.
+/// In-memory stores must share their sole connection because independent
+/// `:memory:` connections are independent databases.
+enum EventWriterConnection {
+    Dedicated(Connection),
+    Shared(Arc<Mutex<Connection>>),
 }
 
 enum AppendReply {
@@ -2082,7 +2114,7 @@ fn scope_from_cols(kind: &str, id: String) -> Scope {
 /// The thread exits when every `Store` clone (each holding a request sender)
 /// has been dropped.
 fn spawn_event_writer(
-    conn: Arc<Mutex<Connection>>,
+    conn: EventWriterConnection,
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
 ) -> std::sync::mpsc::Sender<AppendRequest> {
@@ -2100,6 +2132,7 @@ fn spawn_event_writer(
                     },
                 };
                 let mut event_count = first.events.len();
+                let queued_at = first.queued_at;
                 let mut requests = vec![first];
                 while event_count < APPEND_BATCH_MAX {
                     let Ok(request) = rx.try_recv() else {
@@ -2112,32 +2145,50 @@ fn spawn_event_writer(
                     event_count += request.events.len();
                     requests.push(request);
                 }
-                let wait_started = std::time::Instant::now();
-                let (inserted, wait, elapsed) = {
-                    let conn = conn.lock().unwrap();
-                    let wait = wait_started.elapsed();
-                    let started = std::time::Instant::now();
-                    let inserted = insert_event_batch(
-                        &conn,
-                        requests.iter().flat_map(|request| request.events.iter()),
-                        event_count,
-                    );
-                    (inserted, wait, started.elapsed())
+                let queue_wait = queued_at.elapsed();
+                let (inserted, connection_wait, commit_elapsed) = match &conn {
+                    EventWriterConnection::Dedicated(conn) => {
+                        let started = std::time::Instant::now();
+                        let inserted = insert_event_batch(
+                            conn,
+                            requests.iter().flat_map(|request| request.events.iter()),
+                            event_count,
+                        );
+                        (inserted, std::time::Duration::ZERO, started.elapsed())
+                    }
+                    EventWriterConnection::Shared(conn) => {
+                        let wait_started = std::time::Instant::now();
+                        let conn = conn.lock().unwrap();
+                        let connection_wait = wait_started.elapsed();
+                        let started = std::time::Instant::now();
+                        let inserted = insert_event_batch(
+                            &conn,
+                            requests.iter().flat_map(|request| request.events.iter()),
+                            event_count,
+                        );
+                        (inserted, connection_wait, started.elapsed())
+                    }
                 };
-                if elapsed >= std::time::Duration::from_millis(20) {
+                let total_elapsed = queue_wait
+                    .saturating_add(connection_wait)
+                    .saturating_add(commit_elapsed);
+                if total_elapsed >= std::time::Duration::from_millis(20) {
                     tracing::warn!(
                         event_count,
                         request_count = requests.len(),
-                        wait_ms = wait.as_millis(),
-                        elapsed_ms = elapsed.as_millis(),
+                        queue_wait_ms = queue_wait.as_millis(),
+                        connection_wait_ms = connection_wait.as_millis(),
+                        commit_ms = commit_elapsed.as_millis(),
+                        total_ms = total_elapsed.as_millis(),
                         "slow event-log batch commit"
                     );
                 } else {
                     tracing::trace!(
                         event_count,
                         request_count = requests.len(),
-                        wait_us = wait.as_micros(),
-                        elapsed_us = elapsed.as_micros(),
+                        queue_wait_us = queue_wait.as_micros(),
+                        connection_wait_us = connection_wait.as_micros(),
+                        commit_us = commit_elapsed.as_micros(),
                         "event-log batch committed"
                     );
                 }
@@ -2316,6 +2367,63 @@ fn apply_store_mutation(
             archived,
         } => update_session_row(conn, id, title.as_deref(), *archived)?,
         StoreMutation::Delete { id } => delete_session_rows(conn, id)?,
+        StoreMutation::AcceptPrompt {
+            prompt,
+            tools_enabled,
+            attachments,
+            claim_prompt_id,
+            expected_previous_turn,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        prompt.thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO queued_prompts
+                   (id, thread_id, position, content, attachments, tools_enabled, claimed, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![
+                    prompt.id,
+                    prompt.thread_id,
+                    prompt.position as i64,
+                    prompt.content,
+                    serde_json::to_string(&prompt.attachments)?,
+                    tools_enabled,
+                    prompt.created_at,
+                ],
+            )?;
+            if let Some(claim_prompt_id) = claim_prompt_id {
+                let claimed = conn.execute(
+                    "UPDATE queued_prompts SET claimed = 1
+                     WHERE id = ?1 AND thread_id = ?2 AND claimed = 0",
+                    params![claim_prompt_id, prompt.thread_id],
+                )?;
+                anyhow::ensure!(
+                    claimed == 1,
+                    "queued prompt changed while accepting message"
+                );
+            }
+            if let Some(expected_previous_turn) = expected_previous_turn {
+                let updated = conn.execute(
+                    "UPDATE threads SET last_turn = last_turn + 1
+                     WHERE id = ?1 AND last_turn = ?2",
+                    params![prompt.thread_id, *expected_previous_turn as i64],
+                )?;
+                anyhow::ensure!(updated == 1, "turn changed while accepting message");
+            }
+        }
     }
     Ok(())
 }
@@ -2394,6 +2502,139 @@ fn insert_event_batch<'a>(
     })
 }
 
+fn compact_tool_argument(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    const SUMMARY_KEYS: &[&str] = &[
+        "tool",
+        "toolName",
+        "name",
+        "arguments",
+        "command",
+        "cmd",
+        "cwd",
+        "query",
+        "pattern",
+        "url",
+        "path",
+        "file_path",
+        "title",
+        "repo",
+        "offset",
+        "limit",
+        "line",
+        "start_line",
+        "end_line",
+    ];
+    if depth > 3 {
+        return serde_json::Value::Null;
+    }
+    match value {
+        serde_json::Value::String(value) => {
+            let mut chars = value.chars();
+            let mut summary = chars.by_ref().take(320).collect::<String>();
+            if chars.next().is_some() {
+                summary.push('…');
+            }
+            serde_json::Value::String(summary)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .take(4)
+                .map(|value| compact_tool_argument(value, depth + 1))
+                .collect(),
+        ),
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| SUMMARY_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), compact_tool_argument(value, depth + 1)))
+                .collect(),
+        ),
+        value => value.clone(),
+    }
+}
+
+fn persist_materialized_thread_items(
+    conn: &Connection,
+    thread_id: &str,
+    start: u64,
+    items: Vec<ThreadViewItem>,
+) -> Result<()> {
+    for (offset, item) in items.into_iter().enumerate() {
+        let item_index = start
+            .checked_add(offset as u64)
+            .context("thread-view item index overflow")?;
+        let persisted = match item {
+            ThreadViewItem::ToolCall {
+                call_id,
+                tool,
+                args,
+                status,
+                result,
+                duration_ms,
+                ..
+            } => {
+                let encoded_args = serde_json::to_string(&args)?;
+                let encoded_result = result.as_ref().map(serde_json::to_string).transpose()?;
+                conn.execute(
+                    "INSERT INTO thread_tool_details (thread_id, call_id, args, result)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(thread_id, call_id) DO UPDATE SET
+                       args = excluded.args,
+                       result = excluded.result",
+                    params![thread_id, &call_id, encoded_args, encoded_result],
+                )?;
+                ThreadViewItem::ToolCall {
+                    call_id,
+                    tool,
+                    args: compact_tool_argument(&args, 0),
+                    details_deferred: true,
+                    status,
+                    result: None,
+                    duration_ms,
+                }
+            }
+            item => item,
+        };
+        conn.execute(
+            "INSERT INTO thread_view_items (thread_id, item_index, item)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_id, item_index) DO UPDATE SET item = excluded.item",
+            params![
+                thread_id,
+                i64::try_from(item_index).context("thread-view item index exceeds SQLite")?,
+                serde_json::to_string(&persisted)?
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_materialized_thread_items(
+    conn: &Connection,
+    thread_id: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<ThreadViewItem>> {
+    if start >= end {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT item FROM thread_view_items
+         WHERE thread_id = ?1 AND item_index >= ?2 AND item_index < ?3
+         ORDER BY item_index",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            thread_id,
+            i64::try_from(start).context("thread-view start exceeds SQLite")?,
+            i64::try_from(end).context("thread-view end exceeds SQLite")?
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 fn update_thread_view_caches(
     tx: &rusqlite::Transaction<'_>,
     events: &[(String, EventEnvelope)],
@@ -2465,6 +2706,8 @@ fn update_thread_view_caches(
                 event,
             });
         }
+        let (item_start, completed_items) = projection.take_materializable_prefix();
+        persist_materialized_thread_items(tx, &thread_id, item_start, completed_items)?;
         tx.execute(
             "UPDATE thread_view_cache
              SET cursor = ?2, schema_version = ?3, state = ?4
@@ -2539,7 +2782,11 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
-        Ok(Self::from_conn(conn))
+        let writer_conn = Connection::open(path)
+            .with_context(|| format!("opening event-writer database {}", path.display()))?;
+        writer_conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        writer_conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self::from_connections(conn, Some(writer_conn)))
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -2553,15 +2800,18 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
-        Ok(Self::from_conn(conn))
+        Ok(Self::from_connections(conn, None))
     }
 
-    fn from_conn(conn: Connection) -> Self {
+    fn from_connections(conn: Connection, writer_conn: Option<Connection>) -> Self {
         let conn = Arc::new(Mutex::new(conn));
         let (events_tx, _) = broadcast::channel(4096);
         let scoped_events = Arc::new(Mutex::new(HashMap::new()));
         let append_tx = spawn_event_writer(
-            Arc::clone(&conn),
+            writer_conn.map_or_else(
+                || EventWriterConnection::Shared(Arc::clone(&conn)),
+                EventWriterConnection::Dedicated,
+            ),
             events_tx.clone(),
             Arc::clone(&scoped_events),
         );
@@ -2594,6 +2844,7 @@ impl Store {
             .send(AppendRequest {
                 events,
                 reply: AppendReply::Sync(reply),
+                queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
         reply_rx
@@ -2618,11 +2869,19 @@ impl Store {
             .send(AppendRequest {
                 events: serialize_events(scope, events)?,
                 reply: AppendReply::Async(reply),
+                queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
+    /// Persist one event without blocking a Tokio worker thread, while
+    /// retaining the same commit-before-return guarantee as `append_event`.
+    pub async fn append_event_async(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
+        let mut envelopes = self.append_events_async(scope, vec![event]).await?;
+        Ok(envelopes.pop().expect("single append returns one event"))
     }
 
     /// Newest persisted cursor for `scope`, or zero when the scope is empty.
@@ -2648,18 +2907,28 @@ impl Store {
         before: Option<u64>,
         limit: usize,
     ) -> Result<(u64, ThreadViewSnapshot)> {
-        let (mut projection, cache_valid, rows) = {
+        let (mut projection, cache_valid, observed_cache, rows) = {
             let conn = self.conn.lock().unwrap();
             let cached = conn
                 .query_row(
-                    "SELECT schema_version, state FROM thread_view_cache WHERE thread_id = ?1",
+                    "SELECT cursor, schema_version, state FROM thread_view_cache
+                     WHERE thread_id = ?1",
                     params![thread_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .optional()?;
+            let observed_cache = cached
+                .as_ref()
+                .map(|(cursor, version, _)| (*cursor, *version));
             let mut cache_valid = false;
             let projection: ThreadProjection = cached
-                .and_then(|(version, state)| {
+                .and_then(|(_, version, state)| {
                     (version == THREAD_VIEW_SCHEMA_VERSION)
                         .then(|| serde_json::from_str(&state).ok())
                         .flatten()
@@ -2691,6 +2960,7 @@ impl Store {
             (
                 projection,
                 cache_valid,
+                observed_cache,
                 rows.collect::<rusqlite::Result<Vec<_>>>()?,
             )
         };
@@ -2717,40 +2987,115 @@ impl Store {
                 event,
             });
         }
+        let (item_start, completed_items) = projection.take_materializable_prefix();
         if needs_write {
             projection.snapshot.item_offset = 0;
             projection.snapshot.total_items = 0;
             projection.snapshot.has_older = false;
             let state = serde_json::to_string(&projection)?;
-            self.conn.lock().unwrap().execute(
-                "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(thread_id) DO UPDATE SET
-                   cursor = excluded.cursor,
-                   schema_version = excluded.schema_version,
-                   state = excluded.state
-                 WHERE thread_view_cache.cursor <= excluded.cursor",
-                params![
-                    thread_id,
-                    projection.cursor as i64,
-                    THREAD_VIEW_SCHEMA_VERSION,
-                    state
-                ],
-            )?;
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            let current_cache = tx
+                .query_row(
+                    "SELECT cursor, schema_version FROM thread_view_cache WHERE thread_id = ?1",
+                    params![thread_id],
+                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let cache_advanced = current_cache != observed_cache
+                && current_cache.is_some_and(|(cursor, version)| {
+                    cursor > projection.cursor
+                        || (cursor == projection.cursor && version == THREAD_VIEW_SCHEMA_VERSION)
+                });
+            if !cache_advanced {
+                if !cache_valid {
+                    tx.execute(
+                        "DELETE FROM thread_view_items WHERE thread_id = ?1",
+                        params![thread_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM thread_tool_details WHERE thread_id = ?1",
+                        params![thread_id],
+                    )?;
+                }
+                persist_materialized_thread_items(&tx, thread_id, item_start, completed_items)?;
+                tx.execute(
+                    "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(thread_id) DO UPDATE SET
+                       cursor = excluded.cursor,
+                       schema_version = excluded.schema_version,
+                       state = excluded.state
+                     WHERE thread_view_cache.cursor <= excluded.cursor",
+                    params![
+                        thread_id,
+                        projection.cursor as i64,
+                        THREAD_VIEW_SCHEMA_VERSION,
+                        state
+                    ],
+                )?;
+            }
+            tx.commit()?;
         }
+        let cursor = projection.cursor;
+        let materialized = projection.materialized_items();
+        let total = projection.total_items();
+        let end = before.unwrap_or(total).min(total);
+        let start = end.saturating_sub(u64::try_from(limit.max(1)).unwrap_or(u64::MAX));
+        let mut items = {
+            let conn = self.conn.lock().unwrap();
+            load_materialized_thread_items(
+                &conn,
+                thread_id,
+                start.min(materialized),
+                end.min(materialized),
+            )?
+        };
+        if end > materialized {
+            let tail_start = start.saturating_sub(materialized) as usize;
+            let tail_end = end.saturating_sub(materialized) as usize;
+            items.extend_from_slice(&projection.snapshot.items[tail_start..tail_end]);
+        }
+        anyhow::ensure!(
+            items.len() as u64 == end.saturating_sub(start),
+            "materialized thread-view page is not contiguous"
+        );
         let mut snapshot = projection.snapshot;
-        let total = snapshot.items.len();
-        let end = before
-            .and_then(|offset| usize::try_from(offset).ok())
-            .unwrap_or(total)
-            .min(total);
-        let start = end.saturating_sub(limit.max(1));
-        let items = snapshot.items.drain(start..end).collect();
         snapshot.items = items;
-        snapshot.item_offset = start as u64;
-        snapshot.total_items = total as u64;
+        snapshot.item_offset = start;
+        snapshot.total_items = total;
         snapshot.has_older = start > 0;
-        Ok((projection.cursor, snapshot))
+        Ok((cursor, snapshot))
+    }
+
+    /// Load the full payload for one completed historical tool call. The
+    /// thread event log remains authoritative; this row is a rebuildable
+    /// projection used only to avoid embedding large payloads in every page.
+    pub fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<Option<ThreadToolDetails>> {
+        let conn = self.conn.lock().unwrap();
+        let encoded = conn
+            .query_row(
+                "SELECT args, result FROM thread_tool_details
+                 WHERE thread_id = ?1 AND call_id = ?2",
+                params![thread_id, call_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        encoded
+            .map(|(args, result)| {
+                Ok(ThreadToolDetails {
+                    call_id: call_id.to_string(),
+                    args: serde_json::from_str(&args)?,
+                    result: result
+                        .map(|result| serde_json::from_str(&result))
+                        .transpose()?,
+                })
+            })
+            .transpose()
     }
 
     /// Atomic session-summary snapshot. The cursor and rows share one SQLite
@@ -3338,6 +3683,32 @@ impl Store {
         Ok(turn as u64)
     }
 
+    /// Persist prompt acceptance, its attachment index rows, the optional
+    /// dispatcher claim/turn allocation, and every resulting durable event in
+    /// the event writer's single transaction. Callers construct the visible
+    /// queue and turn shell while holding the engine's queue/activity locks.
+    pub(crate) fn accept_prompt_with_events(
+        &self,
+        prompt: trouve_protocol::QueuedPrompt,
+        tools_enabled: bool,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        claim_prompt_id: Option<String>,
+        expected_previous_turn: Option<u64>,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::AcceptPrompt {
+                prompt: Box::new(prompt),
+                tools_enabled,
+                attachments,
+                claim_prompt_id,
+                expected_previous_turn,
+            },
+        )?;
+        self.append_pending_events(pending)
+    }
+
     // --- queued prompts -------------------------------------------------------
     // Prompts submitted while a turn was running. Persisted so a restart or
     // crash doesn't lose them; drained in `position` order between turns.
@@ -3399,6 +3770,16 @@ impl Store {
             params![id],
             |row| row.get(0),
         )?)
+    }
+
+    pub(crate) fn next_queued_prompt_position(&self, thread_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let position: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        Ok(position as u64)
     }
 
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
@@ -6883,7 +7264,16 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trouve_protocol::Event;
+    use trouve_protocol::{Event, ToolStatus};
+
+    #[test]
+    fn compact_tool_argument_bounds_utf8_summary() {
+        let compact = compact_tool_argument(&serde_json::json!("🦀".repeat(400)), 0);
+        let text = compact.as_str().unwrap();
+        assert_eq!(text.chars().count(), 321);
+        assert!(text.ends_with('…'));
+        assert_eq!(text.trim_end_matches('…'), "🦀".repeat(320));
+    }
 
     #[test]
     fn thread_view_snapshot_rebuilds_and_advances_with_event_appends() {
@@ -6985,6 +7375,19 @@ mod tests {
         assert_eq!(rebuilt_cursor, second_cursor);
         assert_eq!(rebuilt.items, second.items);
 
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE thread_view_cache SET state = '{' WHERE thread_id = 'th_view'",
+                [],
+            )
+            .unwrap();
+        let (repaired_cursor, repaired) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        assert_eq!(repaired_cursor, second_cursor);
+        assert_eq!(repaired.items, second.items);
+
         for index in 0..300 {
             store
                 .append_event(
@@ -7002,6 +7405,97 @@ mod tests {
         assert_eq!(bounded.total_items, 303);
         assert_eq!(bounded.item_offset, 47);
         assert!(bounded.has_older);
+    }
+
+    #[test]
+    fn completed_tool_payloads_are_materialized_separately_from_history_pages() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_tool_details");
+        let scope = Scope::Thread("th_tool_details".into());
+        let large_argument = format!("argument-marker-{}", "a".repeat(32_768));
+        let large_result = format!("result-marker-{}", "r".repeat(32_768));
+        for event in [
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "inspect the repository".into(),
+                attachments: Vec::new(),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "large-read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "command": large_argument,
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "large-read".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({"content": large_result}),
+                execution_duration_ms: Some(12),
+            },
+            Event::AssistantMessage {
+                turn: 1,
+                content: "done".into(),
+            },
+            Event::TurnCompleted {
+                turn: 1,
+                usage: Default::default(),
+                checkpoint_id: None,
+            },
+        ] {
+            store.append_event(scope.clone(), event).unwrap();
+        }
+
+        let (_, snapshot) = store
+            .thread_view_snapshot("th_tool_details", None, 256)
+            .unwrap();
+        let compact_tool = snapshot
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ThreadViewItem::ToolCall {
+                    call_id,
+                    args,
+                    details_deferred,
+                    result,
+                    ..
+                } if call_id == "large-read" => Some((args, *details_deferred, result.as_ref())),
+                _ => None,
+            })
+            .expect("materialized tool call");
+        assert!(compact_tool.1);
+        assert!(compact_tool.2.is_none());
+        assert!(serde_json::to_string(compact_tool.0).unwrap().len() < 1_024);
+
+        let details = store
+            .thread_tool_details("th_tool_details", "large-read")
+            .unwrap()
+            .expect("lazy tool details");
+        assert_eq!(details.args["command"], large_argument);
+        assert_eq!(details.result.unwrap()["content"], large_result);
+
+        let cached_state = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM thread_view_cache WHERE thread_id = 'th_tool_details'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(!cached_state.contains("argument-marker"));
+        assert!(!cached_state.contains("result-marker"));
     }
 
     #[test]
@@ -8030,6 +8524,34 @@ mod tests {
     }
 
     #[test]
+    fn on_disk_event_writer_does_not_wait_for_read_connection_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("trouve.db")).unwrap();
+        let read_guard = store.conn.lock().unwrap();
+        let writer = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let append = std::thread::spawn(move || {
+            result_tx
+                .send(writer.append_event(
+                    Scope::Server,
+                    Event::AssistantDelta {
+                        turn: 1,
+                        text: "persisted independently".into(),
+                    },
+                ))
+                .unwrap();
+        });
+
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("event writer waited for the read-side connection mutex");
+        assert!(result.is_ok());
+        drop(read_guard);
+        append.join().unwrap();
+        assert_eq!(store.events_after(&Scope::Server, 0).unwrap().len(), 1);
+    }
+
+    #[test]
     fn live_subscription_receives_appends() {
         let store = Store::open_in_memory().unwrap();
         let mut rx = store.subscribe();
@@ -8370,6 +8892,135 @@ mod tests {
 
         // The other thread's queue is untouched.
         assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prompt_acceptance_commits_queue_turn_attachments_and_events_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_accept");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_accept".into(),
+            name: "layout.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4,
+        };
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_accept".into(),
+            thread_id: "th_accept".into(),
+            position: 1,
+            content: "Ship the prompt quickly".into(),
+            attachments: vec![attachment.clone()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let events = vec![
+            (
+                Scope::Thread("th_accept".into()),
+                Event::QueueUpdated {
+                    prompts: Vec::new(),
+                },
+            ),
+            (
+                Scope::Thread("th_accept".into()),
+                Event::TurnStarted {
+                    turn: 1,
+                    mode: "code".into(),
+                    model: "p/m".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+            ),
+            (
+                Scope::Thread("th_accept".into()),
+                Event::UserMessage {
+                    turn: 1,
+                    content: prompt.content.clone(),
+                    attachments: prompt.attachments.clone(),
+                },
+            ),
+        ];
+
+        store
+            .accept_prompt_with_events(
+                prompt.clone(),
+                false,
+                vec![(attachment.clone(), "/tmp/at_accept.png".into())],
+                Some(prompt.id.clone()),
+                Some(0),
+                events,
+            )
+            .unwrap();
+
+        assert_eq!(store.last_turn("th_accept").unwrap(), 1);
+        assert!(store.queued_prompts("th_accept").unwrap().is_empty());
+        assert!(!store.queued_prompt_tools_enabled(&prompt.id).unwrap());
+        assert_eq!(
+            store.attachment(&attachment.id).unwrap().unwrap().0,
+            attachment
+        );
+        let persisted = store
+            .events_after(&Scope::Thread("th_accept".into()), 0)
+            .unwrap();
+        assert_eq!(persisted.len(), 3);
+        assert!(matches!(persisted[0].event, Event::QueueUpdated { .. }));
+        assert!(matches!(
+            persisted[1].event,
+            Event::TurnStarted { turn: 1, .. }
+        ));
+        assert!(matches!(
+            persisted[2].event,
+            Event::UserMessage { turn: 1, .. }
+        ));
+        assert!(store.finish_queued_prompt(&prompt.id).unwrap());
+    }
+
+    #[test]
+    fn failed_prompt_acceptance_rolls_back_every_related_row_and_event() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_accept_rollback");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_accept_rollback".into(),
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 5,
+        };
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_accept_rollback".into(),
+            thread_id: "th_accept_rollback".into(),
+            position: 1,
+            content: "This transaction must roll back".into(),
+            attachments: vec![attachment.clone()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let result = store.accept_prompt_with_events(
+            prompt,
+            true,
+            vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
+            Some("qp_accept_rollback".into()),
+            Some(99),
+            vec![(
+                Scope::Thread("th_accept_rollback".into()),
+                Event::QueueUpdated {
+                    prompts: Vec::new(),
+                },
+            )],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(store.last_turn("th_accept_rollback").unwrap(), 0);
+        assert!(
+            store
+                .queued_prompt_thread("qp_accept_rollback")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.attachment(&attachment.id).unwrap().is_none());
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_accept_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

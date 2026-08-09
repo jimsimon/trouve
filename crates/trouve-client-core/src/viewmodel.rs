@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use trouve_protocol::{
     ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadCompactionState,
-    ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus, Usage,
+    ThreadTodoState, ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot,
+    TodoItem, TodoStatus, ToolStatus, Usage,
 };
 
 /// Per-tool retained output budget. The projection keeps the latest valid
@@ -62,6 +63,50 @@ fn utf8_tail(value: &str, max_bytes: usize) -> &str {
     &value[start..]
 }
 
+fn todo_transitions<'a>(
+    previous: &'a [TodoItem],
+    current: &'a [TodoItem],
+) -> Vec<(&'a TodoItem, ThreadTodoState)> {
+    let previous_by_id = previous
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect::<HashMap<_, _>>();
+    let current_by_id = current
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect::<HashMap<_, _>>();
+    let mut transitions = Vec::new();
+    for todo in current {
+        let previous_status = previous_by_id.get(todo.id.as_str()).map(|todo| todo.status);
+        let state = match todo.status {
+            TodoStatus::InProgress if previous_status != Some(TodoStatus::InProgress) => {
+                Some(ThreadTodoState::Started)
+            }
+            TodoStatus::Completed if previous_status != Some(TodoStatus::Completed) => {
+                Some(ThreadTodoState::Completed)
+            }
+            TodoStatus::Cancelled if previous_status != Some(TodoStatus::Cancelled) => {
+                Some(ThreadTodoState::Cancelled)
+            }
+            TodoStatus::Pending
+            | TodoStatus::InProgress
+            | TodoStatus::Completed
+            | TodoStatus::Cancelled => None,
+        };
+        if let Some(state) = state {
+            transitions.push((todo, state));
+        }
+    }
+    for todo in previous {
+        if !current_by_id.contains_key(todo.id.as_str())
+            && !matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled)
+        {
+            transitions.push((todo, ThreadTodoState::Skipped));
+        }
+    }
+    transitions
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatItem {
     User {
@@ -94,6 +139,13 @@ pub enum ChatItem {
     Compaction {
         turn: u64,
         state: CompactionState,
+    },
+    /// A durable todo lifecycle transition rendered on the turn rail.
+    TodoUpdate {
+        turn: u64,
+        todo_id: String,
+        content: String,
+        state: ThreadTodoState,
     },
     ToolCall {
         call_id: String,
@@ -272,10 +324,22 @@ impl From<ThreadViewItem> for ChatItem {
                     ThreadCompactionState::Failed => CompactionState::Failed,
                 },
             },
+            ThreadViewItem::TodoUpdate {
+                turn,
+                todo_id,
+                content,
+                state,
+            } => Self::TodoUpdate {
+                turn,
+                todo_id,
+                content,
+                state,
+            },
             ThreadViewItem::ToolCall {
                 call_id,
                 tool,
                 args,
+                details_deferred: _,
                 status,
                 result,
                 duration_ms,
@@ -382,6 +446,16 @@ impl ThreadViewModel {
         }
     }
 
+    fn active_turn(&self) -> Option<u64> {
+        self.items.iter().rev().find_map(|item| match item {
+            ChatItem::TurnStatus {
+                turn,
+                state: TurnState::Running,
+            } => Some(*turn),
+            _ => None,
+        })
+    }
+
     /// Apply one event. Returns the index of the item that changed (for
     /// minimal UI updates), or `None` when nothing visible changed.
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
@@ -425,8 +499,22 @@ impl ThreadViewModel {
                 None
             }
             Event::TodosUpdated { todos } => {
-                self.todos = todos.clone();
-                None
+                let turn = self.active_turn();
+                let previous = std::mem::replace(&mut self.todos, todos.clone());
+                let turn = turn?;
+                let transitions = todo_transitions(&previous, todos);
+                if transitions.is_empty() {
+                    return None;
+                }
+                for (todo, state) in transitions {
+                    self.items.push(ChatItem::TodoUpdate {
+                        turn,
+                        todo_id: todo.id.clone(),
+                        content: todo.content.clone(),
+                        state,
+                    });
+                }
+                Some(self.items.len() - 1)
             }
             Event::CompactionCompleted {
                 turn,
@@ -675,6 +763,7 @@ impl ThreadViewModel {
                 call_id,
                 status,
                 result,
+                execution_duration_ms,
             } => {
                 let measured_duration_ms = self
                     .tool_started_at
@@ -702,8 +791,8 @@ impl ThreadViewModel {
                         };
                     }
                     *r = Some(result.clone());
-                    if measured_duration_ms.is_some() {
-                        *duration_ms = measured_duration_ms;
+                    if execution_duration_ms.is_some() || measured_duration_ms.is_some() {
+                        *duration_ms = execution_duration_ms.or(measured_duration_ms);
                     }
                 }
                 self.pending_approvals.retain(|c| c != call_id);
@@ -836,6 +925,7 @@ mod tests {
                 ChatItem::Assistant { .. } => "assistant",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",
+                ChatItem::TodoUpdate { .. } => "todo",
                 ChatItem::ToolCall { .. } => "tool",
                 ChatItem::TurnStatus { .. } => "turn-status",
                 ChatItem::Questions { .. } => "questions",
@@ -984,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_snapshot_replaces_previous_state_without_adding_chat_rows() {
+    fn todo_snapshot_outside_a_turn_replaces_state_without_chat_rows() {
         let mut vm = ThreadViewModel::new();
         let first = trouve_protocol::TodoItem {
             id: "one".into(),
@@ -1006,6 +1096,54 @@ mod tests {
 
         assert_eq!(vm.todos, vec![completed]);
         assert!(vm.items.is_empty());
+    }
+
+    #[test]
+    fn todo_updates_add_lifecycle_rows_during_a_turn() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 7,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        let started = trouve_protocol::TodoItem {
+            id: "one".into(),
+            content: "First".into(),
+            status: trouve_protocol::TodoStatus::InProgress,
+        };
+        let pending = trouve_protocol::TodoItem {
+            id: "two".into(),
+            content: "Second".into(),
+            status: trouve_protocol::TodoStatus::Pending,
+        };
+        vm.apply(&env(Event::TodosUpdated {
+            todos: vec![started.clone(), pending],
+        }));
+        vm.apply(&env(Event::TodosUpdated {
+            todos: vec![trouve_protocol::TodoItem {
+                status: trouve_protocol::TodoStatus::Completed,
+                ..started
+            }],
+        }));
+
+        let updates = vm
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatItem::TodoUpdate { todo_id, state, .. } => Some((todo_id.as_str(), *state)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates,
+            vec![
+                ("one", ThreadTodoState::Started),
+                ("one", ThreadTodoState::Completed),
+                ("two", ThreadTodoState::Skipped),
+            ]
+        );
     }
 
     #[test]
@@ -1071,6 +1209,7 @@ mod tests {
                 call_id: "c1".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({"bytes_written": 3}),
+                execution_duration_ms: None,
             },
             Event::TurnCompleted {
                 turn: 1,
@@ -1303,6 +1442,7 @@ mod tests {
             call_id: "done".into(),
             status: ToolStatus::Ok,
             result: serde_json::Value::Null,
+            execution_duration_ms: None,
         }));
         assert_eq!(
             vm.apply(&env(Event::ToolOutput {
@@ -1372,6 +1512,7 @@ mod tests {
             call_id: "toolu_1".into(),
             status: ToolStatus::Error,
             result: serde_json::json!("user denied"),
+            execution_duration_ms: None,
         }));
         assert!(matches!(
             &vm.items[0],
@@ -1625,6 +1766,7 @@ mod tests {
                 call_id: "call_1".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({"content": "a"}),
+                execution_duration_ms: None,
             },
             Event::AssistantMessage {
                 turn: 1,

@@ -1550,6 +1550,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/threads/{id}/tools/{call_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_thread_tool_details"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/threads/{id}/usage": {
         parameters: {
             query?: never;
@@ -2565,6 +2581,13 @@ export interface components {
             type: "tool.output";
         } | {
             call_id: components["schemas"]["String"];
+            /**
+             * Format: int64
+             * @description Time spent inside `ToolExecutor::execute`, measured with a
+             *     monotonic clock. Absent for older servers, denied calls, and
+             *     provider-owned tool calls that do not expose an execution span.
+             */
+            execution_duration_ms?: number | null;
             result: unknown;
             status: components["schemas"]["ToolStatus"];
             /** @enum {string} */
@@ -4122,6 +4145,22 @@ export interface components {
             /** @enum {string} */
             state: "failed";
         };
+        /**
+         * @description One user-visible transition in a todo's lifecycle. `Skipped` is derived
+         *     when an unfinished todo disappears from a replacement snapshot; it is not
+         *     a current-list status because skipped items are no longer in that list.
+         * @enum {string}
+         */
+        ThreadTodoState: "started" | "completed" | "cancelled" | "skipped";
+        /**
+         * @description Full arguments and terminal result for one materialized historical tool
+         *     call. Live-tail tool calls continue to carry these fields inline.
+         */
+        ThreadToolDetails: {
+            args: unknown;
+            call_id: string;
+            result?: unknown;
+        };
         /** @enum {string} */
         ThreadToolStatus: "awaiting_approval" | "running" | "ok" | "error" | "denied" | "aborted";
         ThreadTurnState: {
@@ -4176,13 +4215,27 @@ export interface components {
             /** Format: int64 */
             turn: number;
         } | {
+            content: string;
+            /** @enum {string} */
+            kind: "todo_update";
+            state: components["schemas"]["ThreadTodoState"];
+            todo_id: string;
+            /** Format: int64 */
+            turn: number;
+        } | {
             args: unknown;
             call_id: string;
             /**
+             * @description Completed historical rows may contain only bounded presentation
+             *     arguments. Fetch `/v1/threads/{thread}/tools/{call_id}` before
+             *     rendering expanded/raw detail when this flag is true.
+             */
+            details_deferred?: boolean;
+            /**
              * Format: int64
-             * @description Wall-clock execution time derived from the durable tool event
-             *     timestamps. This remains available when a provider omits timing
-             *     metadata or reports a zero-valued placeholder in its result.
+             * @description Executor-only duration when the completion event carries a
+             *     monotonic measurement; otherwise the compatible fallback derived
+             *     from durable tool event timestamps.
              */
             duration_ms?: number | null;
             /** @enum {string} */
@@ -7972,6 +8025,36 @@ export interface operations {
                 };
             };
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_thread_tool_details: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                call_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadToolDetails"];
+                };
+            };
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

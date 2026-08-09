@@ -65,6 +65,24 @@ describe("buildChatLayout", () => {
     });
   });
 
+  it("keeps todo lifecycle rows in their explicit turn", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      {
+        id: "todo4",
+        kind: "todo",
+        turn: 4,
+        todoId: "verify",
+        content: "Run the checks",
+        state: "completed",
+      },
+    ];
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      turn: 4,
+      items: [{ id: "todo4", kind: "todo" }],
+    });
+  });
+
   it("keeps steering in its active turn between the output it redirects", () => {
     const items: ThreadChatItem[] = [
       { id: "u5", kind: "user", turn: 5, content: "Begin", attachments: [] },
@@ -179,5 +197,26 @@ describe("activityGroupSummary", () => {
       { id: "c1", kind: "compaction", turn: 1, state: { kind: "completed", messagesCompacted: 8 } },
     ])).toBe("Compacted context");
     expect(activityGroupSummary([legacy])).toBe("Compacted context");
+  });
+
+  it("includes collapsed todo updates in the activity summary", () => {
+    expect(activityGroupSummary([
+      {
+        id: "todo1",
+        kind: "todo",
+        turn: 1,
+        todoId: "verify",
+        content: "Run the checks",
+        state: "started",
+      },
+      {
+        id: "todo2",
+        kind: "todo",
+        turn: 1,
+        todoId: "verify",
+        content: "Run the checks",
+        state: "completed",
+      },
+    ])).toBe("Updated 1 todo");
   });
 });

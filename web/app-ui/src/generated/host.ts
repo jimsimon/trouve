@@ -232,6 +232,8 @@ export interface components {
             collapse_sequential_tool_calls?: boolean;
             /** @description Include thinking output in collapsible tool-activity groups. */
             collapse_thinking_with_tools?: boolean;
+            /** @description Include todo lifecycle updates in collapsible tool-activity groups. */
+            collapse_todo_updates_with_tools?: boolean;
         };
         /**
          * @description Stable first-visible chat item plus its non-negative offset into the item.

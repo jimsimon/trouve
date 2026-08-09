@@ -207,10 +207,6 @@ trouve-session-list { display: block; }
 .inspection-tabs button, .thread-options button { border: 0; padding: 8px 10px 7px; color: var(--trouve-text-dim); background: transparent; }
 .inspection-tabs button { display: inline-flex; align-items: center; gap: 5px; }
 .inspection-tabs [aria-selected="true"] { color: var(--trouve-text-hi); border-bottom: 2px solid var(--trouve-accent); }
-.inspection-todo-switch { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; padding: 4px 8px; border-bottom: 1px solid var(--trouve-rule); background: var(--trouve-raised-bg); }
-.inspection-todo-switch button { min-height: 26px; display: inline-flex; align-items: center; gap: 7px; border: 0; border-radius: var(--trouve-radius-sm); padding: 3px 8px; color: var(--trouve-text-mid); background: var(--trouve-control-bg); }
-.inspection-todo-switch button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.inspection-todo-switch small { border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); }
 .thread-options { display: flex; gap: 4px; padding: 6px 10px; border-top: 1px solid var(--trouve-rule); }
 .thread-options button { padding: 3px 8px; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
 .thread-options label { min-width: 0; }
@@ -255,6 +251,8 @@ trouve-session-list { display: block; }
 }
 .chat-scroll-indicator[data-scrollable] { opacity: 1; }
 .chat-virtual-canvas { position: relative; min-width: 0; }
+.chat-history-sentinel { position: absolute; inset-block-start: 0; inset-inline: 0; height: 1px; pointer-events: none; }
+.chat-history-status { position: absolute; z-index: 4; inset-block-start: 6px; inset-inline-start: 50%; translate: -50% 0; max-width: calc(100% - 32px); border: 1px solid var(--trouve-border); border-radius: 999px; padding: 4px 9px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); box-shadow: 0 2px 8px var(--trouve-scrim); font-size: 11px; pointer-events: none; }
 .chat-stream [data-virtual-id] {
   box-sizing: border-box;
   position: absolute;
@@ -264,8 +262,6 @@ trouve-session-list { display: block; }
   display: flow-root;
 }
 .chat-edge-spacer.start { height: 10px; }
-.chat-history-loader { min-height: 38px; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 4px 0 8px; color: var(--trouve-text-dim); font-size: 11px; }
-.chat-history-loader button { min-height: 28px; padding: 3px 9px; }
 /* The preceding card already contributes a 10px trailing margin. Add 4px
    above and 14px below so the 1px rule has a balanced, comfortable gap on
    both sides and its centered checkpoint actions do not crowd either turn. */
@@ -359,14 +355,27 @@ trouve-session-list { display: block; }
 .agent-activity-timeline.single-activity::before { inset-block: 6px; }
 .agent-activity-timeline.ends-with-expanded-tool-group::before { inset-block-end: 20.5px; }
 .agent-activity-timeline.compaction-connected-timeline::before { inset-block: 6px; display: block; }
-.agent-activity-timeline > .activity-group, .agent-activity-timeline > .tool-card, .agent-activity-timeline > .thinking-card, .agent-activity-timeline > .thinking-output { width: 100%; margin: 0; }
+.agent-activity-timeline > .activity-group, .agent-activity-timeline > .tool-card, .agent-activity-timeline > .thinking-card, .agent-activity-timeline > .thinking-output, .agent-activity-timeline > .todo-rail-item { width: 100%; margin: 0; }
 .agent-activity-timeline + .agent-text-block { margin-block-start: 6px; }
 .agent-text-block + .agent-activity-timeline { margin-block-start: 2px; }
-.activity-group, .tool-card, .thinking-card, .thinking-output { position: relative; isolation: isolate; }
+.activity-group, .tool-card, .thinking-card, .thinking-output, .todo-rail-item { position: relative; isolation: isolate; }
 .agent-activity-timeline > .activity-group::before, .agent-activity-timeline > .tool-card::before { display: none; content: ""; }
 .thinking-rail-icon { position: absolute; z-index: 2; inset-block-start: 8px; inset-inline-start: -20.5px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 12px; line-height: 1; pointer-events: none; transition: color 120ms ease, transform 120ms ease; }
 .thinking-rail-icon .trouve-icon { --trouve-icon-width: 14px; }
 .thinking-card.running > .thinking-rail-icon, .thinking-output.running > .thinking-rail-icon, .thinking-card:hover > .thinking-rail-icon, .thinking-card:focus-within > .thinking-rail-icon, .thinking-output:hover > .thinking-rail-icon, .thinking-output:focus-within > .thinking-rail-icon { color: var(--trouve-accent); transform: scale(1.08); }
+.todo-rail-item { min-width: 0; max-width: 100%; min-height: 27px; display: flex; align-items: center; gap: 7px; overflow: visible; padding: 2px 8px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-mid); background: transparent; font: inherit; text-align: start; cursor: pointer; }
+.todo-rail-item:hover { background: var(--trouve-hover-bg); }
+.todo-rail-item:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: -2px; background: var(--trouve-accent-bg); }
+.todo-rail-icon { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-start: -20.5px; width: 16px; height: 16px; display: grid; flex: none; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-win-bg); box-shadow: 0 0 0 3px var(--trouve-win-bg); font-size: 11px; line-height: 1; transform: translateY(-50%); transition: color 120ms ease, transform 120ms ease; }
+.todo-rail-icon .trouve-icon { --trouve-icon-width: 12px; }
+.todo-rail-item.started .todo-rail-icon { color: var(--trouve-accent); }
+.todo-rail-item.completed .todo-rail-icon { color: var(--trouve-ok); }
+.todo-rail-item.cancelled .todo-rail-icon { color: var(--trouve-err); }
+.todo-rail-item.skipped .todo-rail-icon { color: var(--trouve-warn); }
+.todo-rail-item:hover .todo-rail-icon, .todo-rail-item:focus-visible .todo-rail-icon { transform: translateY(-50%) scale(1.08); }
+.todo-rail-copy { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.todo-rail-copy strong { flex: none; color: var(--trouve-text-mid); font-size: 11px; font-weight: 600; }
+.todo-rail-copy > span { min-width: 0; overflow: hidden; color: var(--trouve-text-dim); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .activity-group { width: 100%; min-width: 0; max-width: 100%; margin: 0; overflow: visible; border: 0; border-radius: 0; background: transparent; }
 .activity-group > summary { position: relative; min-width: 0; min-height: 29px; display: flex; align-items: center; gap: 6px; overflow: visible; padding: 2px 8px; border: 0; border-radius: var(--trouve-radius-sm); color: var(--trouve-text-mid); background: transparent; cursor: pointer; list-style: none; }
 .activity-group > summary:hover { background: var(--trouve-hover-bg); }
@@ -382,9 +391,11 @@ trouve-session-list { display: block; }
 .activity-group-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); padding: 3px 0 6px; border: 0; background: transparent; }
 .activity-group-timeline { width: 100%; max-width: 100%; gap: 6px; margin-inline-start: 0; padding-inline-start: 0; }
 .activity-group-timeline::before { display: none; }
-.activity-group-timeline > .tool-card::before { position: absolute; z-index: 1; inset-block-start: 50%; inset-inline-start: -12.5px; width: 20.5px; height: var(--trouve-chat-timeline-rail-width); display: block; border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
+.activity-group-timeline > .tool-card::before, .activity-group-timeline > .todo-rail-item::before { position: absolute; z-index: 1; inset-block-start: 50%; inset-inline-start: -12.5px; width: 20.5px; height: var(--trouve-chat-timeline-rail-width); display: block; border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
 .activity-group-timeline > .tool-card > summary > .activity-rail-disclosure { position: static; inset: auto; transform: none; }
-.activity-group-body .tool-card, .activity-group-body .thinking-card { margin-top: 0; }
+.activity-group-timeline > .todo-rail-item > .todo-rail-icon { position: static; inset: auto; transform: none; }
+.activity-group-timeline > .todo-rail-item:hover > .todo-rail-icon, .activity-group-timeline > .todo-rail-item:focus-visible > .todo-rail-icon { transform: scale(1.08); }
+.activity-group-body .tool-card, .activity-group-body .thinking-card, .activity-group-body .todo-rail-item { margin-top: 0; }
 .context-compaction-marker { position: relative; width: 100%; min-width: 0; max-width: 100%; min-height: 27px; display: grid; grid-template-columns: 18px minmax(0, max-content) minmax(24px, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 2px 4px; border: 0; color: var(--trouve-text-mid); background: transparent; }
 .context-compaction-marker.timeline-connect-before, .context-compaction-marker.timeline-connect-after { grid-template-columns: minmax(0, max-content) minmax(24px, 1fr); overflow: visible; padding-inline: 28px 4px; }
 .context-compaction-marker.timeline-connect-before::before, .context-compaction-marker.timeline-connect-after::before { position: absolute; z-index: 0; inset-block: 50%; inset-inline-start: 7px; width: var(--trouve-chat-timeline-rail-width); border-radius: 999px; background: var(--trouve-border-strong); content: ""; opacity: .65; pointer-events: none; }
@@ -704,7 +715,7 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 trouve-todo-plan-panel { display: block; min-height: 0; }
 .todo-plan-surface { display: flex; min-height: 100%; flex-direction: column; gap: 8px; padding: 10px; }
 .todo-plan-header { display: flex; align-items: center; gap: 8px; }
-.todo-plan-header strong { flex: 1; color: var(--trouve-text-hi); font-size: 13px; }
+.todo-plan-header h2 { flex: 1; margin: 0; color: var(--trouve-text-hi); font-size: 14px; }
 .todo-plan-header small { color: var(--trouve-text-dim); }
 .todo-plan-list { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 0; border-radius: var(--trouve-radius); background: var(--trouve-surface); list-style: none; }
 .todo-plan-list li { display: grid; grid-template-columns: 16px minmax(0, 1fr); min-height: 34px; align-items: center; gap: 8px; padding: 7px 10px; }
@@ -714,7 +725,8 @@ trouve-todo-plan-panel { display: block; min-height: 0; }
 .todo-plan-list li.cancelled .todo-plan-icon { color: var(--trouve-text-disabled); }
 .todo-plan-content { min-width: 0; overflow-wrap: anywhere; }
 .todo-plan-list li.completed .todo-plan-content, .todo-plan-list li.cancelled .todo-plan-content { color: var(--trouve-text-disabled); }
-.todo-plan-empty { min-height: 10rem; }
+.todo-plan-empty { min-height: 14rem; }
+.todo-plan-empty-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-raised-bg); font-size: 18px; }
 .inspection-split { display: grid; grid-template-rows: auto minmax(70px, 28%) minmax(0, 1fr); height: 100%; min-height: 0; }
 .inspection-summary { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border-bottom: 1px solid var(--trouve-rule); }
 .inspection-summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

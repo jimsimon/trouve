@@ -35,15 +35,18 @@ export class TrouveTodoPlanPanel extends withSignalTracking(LitElement) {
       ?? (threadId === "" ? [] : this.#store.value?.threadView(threadId).todos ?? []);
     const plan = buildTodoPlanModel(todos);
     return html`
-      <section class="todo-plan-surface" aria-label="Thread todos">
+      <section class="todo-plan-surface" aria-labelledby="todo-plan-title">
         <header class="todo-plan-header">
-          <strong>Thread todos</strong>
-          <small>${plan.progressLabel}</small>
+          <h2 id="todo-plan-title">Todos</h2>
+          ${plan.total === 0 ? nothing : html`<small>${plan.progressLabel}</small>`}
         </header>
         ${plan.rows.length === 0
           ? html`<div class="screen-empty todo-plan-empty">
-              <strong>No plan items</strong>
-              <span>Todos will appear here when the thread publishes a plan.</span>
+              <span class="todo-plan-empty-icon" aria-hidden="true">
+                ${fontAwesomeIcon("list-check")}
+              </span>
+              <strong>No todos yet</strong>
+              <span>When the agent creates a plan, its tasks and progress will appear here.</span>
             </div>`
           : html`<ol class="todo-plan-list">
               ${plan.rows.map((todo) => html`

@@ -287,6 +287,11 @@ pub enum Event {
         call_id: CallId,
         status: ToolStatus,
         result: serde_json::Value,
+        /// Time spent inside `ToolExecutor::execute`, measured with a
+        /// monotonic clock. Absent for older servers, denied calls, and
+        /// provider-owned tool calls that do not expose an execution span.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_duration_ms: Option<u64>,
     },
 
     /// The agent asked the user one or more questions; the turn is blocked

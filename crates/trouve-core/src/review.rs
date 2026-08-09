@@ -3246,6 +3246,7 @@ impl Engine {
                 base_sha: job.review_base_sha.clone(),
                 head_sha: job.head_sha.clone(),
                 token,
+                cancel: superseded.clone(),
             })
             .await
             .map_err(|error| anyhow!(error))?;

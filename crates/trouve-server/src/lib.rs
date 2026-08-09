@@ -7,7 +7,14 @@
 mod mcp;
 
 use std::convert::Infallible;
+use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
+use std::path::Path as FsPath;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -38,10 +45,10 @@ use trouve_protocol::{
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
     SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SteerAccepted, SteerTurnRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -113,6 +120,7 @@ impl IntoResponse for ApiError {
         list_threads,
         get_thread,
         get_thread_view,
+        get_thread_tool_details,
         update_thread,
         send_message,
         steer_turn,
@@ -234,6 +242,7 @@ impl IntoResponse for ApiError {
         ThreadViewQuery,
         ThreadViewSnapshot,
         trouve_protocol::ThreadViewItem,
+        ThreadToolDetails,
         trouve_protocol::ThreadToolStatus,
         trouve_protocol::ThreadTurnState,
         UpdateThreadRequest,
@@ -699,6 +708,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/view", get(get_thread_view))
+        .route(
+            "/v1/threads/{id}/tools/{call_id}",
+            get(get_thread_tool_details),
+        )
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/threads/{id}/steer", post(steer_turn))
         .route("/v1/attachments/{id}", get(get_attachment))
@@ -736,24 +749,130 @@ pub async fn serve(
 
 /// Bootstrap the full local stack — store, real config file (provider
 /// changes write back), index hooks, system connectivity probe — and bind
-/// `addr` (port 0 for ephemeral). Returns the bound address and the serve
-/// future.
+/// `addr` (port 0 for ephemeral). The first process receives the bound address
+/// and serve future; later processes receive the elected owner's address and
+/// no future, so they attach without opening the database.
 ///
 /// This is the single entry point for embedders (the desktop app, ADR
 /// 0008) and the standalone binary alike: an embedder spawns the future
 /// and speaks HTTP + SSE to the returned address, keeping the protocol
 /// boundary intact without ever touching engine internals.
+pub type LocalServerFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>;
+
+/// Result of claiming the process-wide local data owner. A second product
+/// window receives the already-running address and must attach over HTTP/SSE;
+/// it never opens SQLite or constructs another Engine.
+pub struct LocalServerBinding {
+    address: SocketAddr,
+    server: Option<LocalServerFuture>,
+}
+
+impl LocalServerBinding {
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn into_server(self) -> Option<LocalServerFuture> {
+        self.server
+    }
+}
+
+enum LocalServerOwnership {
+    Owner(File),
+    Existing(SocketAddr),
+}
+
+const LOCAL_SERVER_OWNER_FILE: &str = "local-server.lock";
+const LOCAL_SERVER_OWNER_WAIT: Duration = Duration::from_secs(5);
+const LOCAL_SERVER_OWNER_RETRY: Duration = Duration::from_millis(50);
+
+fn write_local_server_address(file: &mut File, address: SocketAddr) -> anyhow::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{address}")?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn read_local_server_address(file: &mut File) -> anyhow::Result<Option<SocketAddr>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut registered = String::new();
+    file.read_to_string(&mut registered)?;
+    let registered = registered.trim();
+    if registered.is_empty() {
+        return Ok(None);
+    }
+    let address = registered
+        .parse::<SocketAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid local server owner address: {error}"))?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!("local server owner address is not loopback: {address}");
+    }
+    Ok(Some(address))
+}
+
+async fn claim_local_server(
+    data: &FsPath,
+    address: SocketAddr,
+) -> anyhow::Result<LocalServerOwnership> {
+    std::fs::create_dir_all(data)?;
+    let mut owner = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join(LOCAL_SERVER_OWNER_FILE))?;
+    match owner.try_lock() {
+        Ok(()) => {
+            write_local_server_address(&mut owner, address)?;
+            return Ok(LocalServerOwnership::Owner(owner));
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+
+    // Give a process that just acquired the lock time to replace a stale
+    // registration before reading it. If that process exits during startup,
+    // this claimant can take ownership instead of attaching to a dead port.
+    let deadline = Instant::now() + LOCAL_SERVER_OWNER_WAIT;
+    loop {
+        tokio::time::sleep(LOCAL_SERVER_OWNER_RETRY).await;
+        match owner.try_lock() {
+            Ok(()) => {
+                write_local_server_address(&mut owner, address)?;
+                return Ok(LocalServerOwnership::Owner(owner));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        if let Some(existing) = read_local_server_address(&mut owner)? {
+            return Ok(LocalServerOwnership::Existing(existing));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for the local server owner address");
+        }
+    }
+}
+
 pub async fn bind_local(
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     security: ServerSecurity,
-) -> anyhow::Result<(
-    std::net::SocketAddr,
-    impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
-)> {
+) -> anyhow::Result<LocalServerBinding> {
     install_crypto_provider();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let data = trouve_core::config::data_dir();
+    let owner = match claim_local_server(&data, local).await? {
+        LocalServerOwnership::Owner(owner) => owner,
+        LocalServerOwnership::Existing(address) => {
+            drop(listener);
+            tracing::info!(%address, "attaching to the existing local trouve server");
+            return Ok(LocalServerBinding {
+                address,
+                server: None,
+            });
+        }
+    };
     let store = trouve_core::store::Store::open(&data.join("trouve.db"))?;
     let config = trouve_core::config::Config::load();
     let engine = Arc::new(
@@ -762,7 +881,47 @@ pub async fn bind_local(
             .with_index_hooks()
             .with_connectivity_probe(trouve_core::connectivity::system_probe()),
     );
-    Ok((local, serve_listener(engine, listener, security)))
+    let server = Box::pin(async move {
+        // The registration lock must outlive Engine and the listener. Dropping
+        // this future releases ownership even when startup or serving fails.
+        let _owner = owner;
+        serve_listener(engine, listener, security).await
+    });
+    Ok(LocalServerBinding {
+        address: local,
+        server: Some(server),
+    })
+}
+
+#[cfg(test)]
+mod local_server_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_local_server_owns_a_data_directory_at_a_time() {
+        let data = tempfile::tempdir().unwrap();
+        let first_address: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let second_address: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let owner = match claim_local_server(data.path(), first_address)
+            .await
+            .unwrap()
+        {
+            LocalServerOwnership::Owner(owner) => owner,
+            LocalServerOwnership::Existing(_) => panic!("first claimant must own the server"),
+        };
+        assert!(matches!(
+            claim_local_server(data.path(), second_address).await.unwrap(),
+            LocalServerOwnership::Existing(address) if address == first_address
+        ));
+
+        drop(owner);
+        assert!(matches!(
+            claim_local_server(data.path(), second_address)
+                .await
+                .unwrap(),
+            LocalServerOwnership::Owner(_)
+        ));
+    }
 }
 
 /// Serve on an already-bound listener (embedded mode: bind port 0, read the
@@ -1270,6 +1429,22 @@ async fn get_thread_view(
                 )))
             })??;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
+}
+
+#[utoipa::path(get, path = "/v1/threads/{id}/tools/{call_id}",
+    params(
+        ("id" = String, Path,),
+        ("call_id" = String, Path,)
+    ),
+    responses(
+        (status = 200, body = ThreadToolDetails),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_thread_tool_details(
+    State(engine): State<Arc<Engine>>,
+    Path((id, call_id)): Path<(String, String)>,
+) -> Result<Json<ThreadToolDetails>, ApiError> {
+    Ok(Json(engine.thread_tool_details(&id, &call_id)?))
 }
 
 #[utoipa::path(patch, path = "/v1/threads/{id}", params(("id" = String, Path,)),

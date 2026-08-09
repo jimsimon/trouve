@@ -308,7 +308,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                             <span class="toggle-state">${chatPreferences.collapseSequentialToolCalls ? "On" : "Off"}</span>
                             <span>Collapse sequential tool calls.</span>
                           </label>
-                          <p class="settings-note">When off, every tool call is shown separately; thinking and context compaction remain visible at the top level.</p>
+                          <p class="settings-note">When off, every tool call is shown separately; thinking, context compaction, and TODO updates remain visible at the top level.</p>
                           <div class=${`nested-toggles ${chatPreferences.collapseSequentialToolCalls ? "" : "disabled"}`}>
                             <label class="settings-toggle-row" for="settings-collapse-thinking">
                               <input
@@ -340,6 +340,21 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                               <span>Collapse context compaction with tool calls.</span>
                             </label>
                             <p class="settings-note">When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.</p>
+                            <label class="settings-toggle-row" for="settings-collapse-todos">
+                              <input
+                                id="settings-collapse-todos"
+                                type="checkbox"
+                                .checked=${chatPreferences.collapseTodoUpdatesWithTools}
+                                ?disabled=${!chatPreferences.collapseSequentialToolCalls}
+                                @change=${(event: Event) => services.setChatPreferences({
+                                  collapseTodoUpdatesWithTools:
+                                    (event.currentTarget as HTMLInputElement).checked,
+                                })}
+                              />
+                              <span class="toggle-state">${chatPreferences.collapseTodoUpdatesWithTools ? "On" : "Off"}</span>
+                              <span>Collapse TODO updates with tool calls.</span>
+                            </label>
+                            <p class="settings-note">When off, started, completed, cancelled, and skipped TODO updates stay visible on the turn rail and separate collapsible tool-call groups.</p>
                           </div>
                         </div>
                         <trouve-git-worktree-settings></trouve-git-worktree-settings>

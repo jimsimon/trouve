@@ -285,6 +285,28 @@ describe("ProtocolClient", () => {
     expect(url.searchParams.get("before")).toBe("512");
   });
 
+  it("loads full details for one deferred historical tool call", async () => {
+    const requests: Request[] = [];
+    const details = {
+      call_id: "call / one",
+      args: { path: "README.md", content: "complete arguments" },
+      result: { content: "complete result" },
+    };
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(details);
+      }),
+    });
+
+    await expect(
+      client.threadToolDetails("th / one", "call / one"),
+    ).resolves.toEqual(details);
+    expect(new URL(requests[0]!.url).pathname).toBe(
+      "/v1/threads/th%20%2F%20one/tools/call%20%2F%20one",
+    );
+  });
+
   it("loads encoded session mention paths and rejects malformed path lists", async () => {
     const requests: Request[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {

@@ -84,10 +84,11 @@ These are load-bearing. Do not violate them without a new ADR.
    harness state and effects through `trouve-server` (ADR 0023). Runtime asset
    directories and Vite proxying are explicit development/qualification
    sources, remain loopback-only behind the same gateway origin, and are never
-   enabled by shipping product hosts (ADR 0026). The default Wry process owns
-   one embedded server through `trouve_server::bind_local`; comparison and
-   Servo qualification hosts require an explicit server URL and never open
-   the default database.
+   enabled by shipping product hosts (ADR 0026). The first default Wry process
+   owns one embedded server through `trouve_server::bind_local`; additional
+   default windows attach to that elected owner and never open a second Engine
+   or database connection (ADR 0032). Comparison and Servo qualification hosts
+   require an explicit server URL and never open the default database.
 
 ## Conventions
 

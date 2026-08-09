@@ -253,6 +253,7 @@ const SURFACES: readonly CallbackSurface[] = [
       "collapse-sequential-tool-calls-toggled",
       "collapse-thinking-with-tools-toggled",
       "collapse-compaction-with-tools-toggled",
+      "collapse-todo-updates-with-tools-toggled",
     ],
     evidence: [
       {
@@ -261,6 +262,7 @@ const SURFACES: readonly CallbackSurface[] = [
           "collapseSequentialToolCalls",
           "collapseThinkingWithTools",
           "collapseCompactionWithTools",
+          "collapseTodoUpdatesWithTools",
           "setChatPreferences",
         ],
       },
@@ -271,6 +273,7 @@ const SURFACES: readonly CallbackSurface[] = [
           "collapseSequentialToolCalls",
           "collapseThinkingWithTools",
           "collapseCompactionWithTools",
+          "collapseTodoUpdatesWithTools",
         ],
       },
     ],
@@ -587,7 +590,7 @@ describe("Lit application action contract", () => {
   it("keeps every established action mapped exactly once", () => {
     const callbacks = SURFACES.flatMap((surface) => surface.callbacks);
     expect(new Set(callbacks).size).toBe(callbacks.length);
-    expect(callbacks).toHaveLength(145);
+    expect(callbacks).toHaveLength(146);
   });
 
   for (const surface of SURFACES) {

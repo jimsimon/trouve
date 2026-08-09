@@ -462,20 +462,30 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     "When off, context compaction remains a visible top-level boundary and separates the collapsible tool-call groups on either side.",
     { exact: true },
   )).toBeVisible();
+  const todoToggle = page.getByLabel("Collapse TODO updates with tool calls.");
+  await expect(todoToggle).not.toBeChecked();
+  await expect(page.getByText(
+    "When off, started, completed, cancelled, and skipped TODO updates stay visible on the turn rail and separate collapsible tool-call groups.",
+    { exact: true },
+  )).toBeVisible();
 
   await page.locator('label[for="settings-collapse-sequential-tools"]').click();
   await expect(sequentialToggle).not.toBeChecked();
   await expect(toggle).toBeDisabled();
   await expect(compactionToggle).toBeDisabled();
+  await expect(todoToggle).toBeDisabled();
   await page.locator('label[for="settings-collapse-sequential-tools"]').click();
   await expect(sequentialToggle).toBeChecked();
   await expect(toggle).toBeEnabled();
   await expect(compactionToggle).toBeEnabled();
+  await expect(todoToggle).toBeEnabled();
 
   await page.getByText("Collapse thinking output with tool calls.", { exact: true }).click();
   await expect(toggle).toBeChecked();
   await page.getByText("Collapse context compaction with tool calls.", { exact: true }).click();
   await expect(compactionToggle).toBeChecked();
+  await page.getByText("Collapse TODO updates with tool calls.", { exact: true }).click();
+  await expect(todoToggle).toBeChecked();
   const branchUpdate = page.waitForRequest((request) =>
     request.method() === "PUT" &&
     new URL(request.url()).pathname === "/v1/config/git-worktrees"
@@ -491,11 +501,14 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     .toContain('"collapseThinkingWithTools":true');
   await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
     .toContain('"collapseCompactionWithTools":true');
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("trouve.chat.v1")))
+    .toContain('"collapseTodoUpdatesWithTools":true');
 
   await page.reload();
   await expect(page.getByLabel("Collapse sequential tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse thinking output with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
+  await expect(page.getByLabel("Collapse TODO updates with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Use session names in branch names")).toBeChecked();
 });
 

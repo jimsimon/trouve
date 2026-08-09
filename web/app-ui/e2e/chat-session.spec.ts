@@ -198,6 +198,7 @@ interface ProtocolFixtureOptions {
   readonly dispatchedQueuePromptIds?: string[];
   readonly messageDelayMs?: number;
   readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
+  readonly messageFailureAt?: number;
   readonly threadViewFixture?: ThreadViewFixtureLoader;
   readonly permissionMode?: "ask" | "allow_list" | "yolo";
   readonly additionalThreads?: readonly Record<string, unknown>[];
@@ -220,6 +221,7 @@ const installProtocolFixtures = async (
     dispatchedQueuePromptIds = [],
     messageDelayMs = 0,
     beforeMessageResponse,
+    messageFailureAt,
     threadViewFixture,
     permissionMode = "ask",
     additionalThreads = [],
@@ -271,6 +273,13 @@ const installProtocolFixtures = async (
       await beforeMessageResponse?.(messageCount);
       if (messageDelayMs > 0) {
         await new Promise((resolve) => globalThis.setTimeout(resolve, messageDelayMs));
+      }
+      if (messageFailureAt === messageCount) {
+        await route.fulfill({
+          status: 500,
+          json: { code: "acceptance_failed", message: "message acceptance failed" },
+        });
+        return;
       }
       await route.fulfill({
         json: messageCount === 1
@@ -666,7 +675,7 @@ test.beforeEach(async ({ page }, testInfo) => {
   await installEventStream(page);
 });
 
-test("the TODO pane follows the thread's durable todo snapshot", async ({
+test("the persistent TODO pane follows durable state and opens from rail updates", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-chromium", "Desktop owns the inspection layout");
@@ -674,31 +683,95 @@ test("the TODO pane follows the thread's durable todo snapshot", async ({
   await page.goto("/");
   await replayHistory(page);
 
-  const todoSwitch = page.locator(".inspection-todo-switch button");
-  await expect(todoSwitch).toHaveCount(0);
+  await expect(page.locator(".inspection-todo-switch")).toHaveCount(0);
+  const todoTab = page.getByRole("tab", { name: "Todos" });
+  await expect(todoTab).toBeVisible();
+  await todoTab.click();
+  const plan = page.locator("trouve-todo-plan-panel");
+  await expect(plan.getByText("No todos yet", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Info" }).click();
 
   await emit(page, threadEvent(16, {
+    type: "turn.started",
+    turn: 2,
+    mode: "code",
+    model: "test/model",
+  }));
+  await emit(page, threadEvent(17, {
     type: "thread.todos_updated",
     todos: [
       { id: "inspect", content: "Inspect the adapter", status: "completed" },
       { id: "publish", content: "Publish the todo snapshot", status: "in_progress" },
+      { id: "skip", content: "Skip the obsolete check", status: "pending" },
     ],
   }));
 
-  await expect(todoSwitch).toHaveText(/Todos\s+1\/2 complete/);
-  await todoSwitch.click();
-  const plan = page.locator("trouve-todo-plan-panel");
-  await expect(plan.getByText("Thread todos", { exact: true })).toBeVisible();
+  const startedUpdate = page.locator(".todo-rail-item.started");
+  await expect(startedUpdate).toContainText("Publish the todo snapshot");
+  await expect(page.locator(".todo-rail-item.completed")).toContainText(
+    "Inspect the adapter",
+  );
+  await startedUpdate.click();
+  await expect(todoTab).toHaveAttribute("aria-selected", "true");
+  await expect(plan.getByText("Todos", { exact: true })).toBeVisible();
   await expect(plan.locator("[data-todo-id=inspect]")).toContainText("Inspect the adapter");
   await expect(plan.locator("[data-todo-id=publish]")).toHaveAttribute(
     "aria-current",
     "step",
   );
 
-  await emit(page, threadEvent(17, { type: "thread.todos_updated", todos: [] }));
-  await expect(todoSwitch).toHaveCount(0);
-  await expect(plan).toHaveCount(0);
-  await expect(page.getByRole("tab", { name: "Info" })).toHaveAttribute("aria-selected", "true");
+  await emit(page, threadEvent(18, {
+    type: "thread.todos_updated",
+    todos: [
+      { id: "inspect", content: "Inspect the adapter", status: "completed" },
+      { id: "publish", content: "Publish the todo snapshot", status: "completed" },
+      { id: "cancel", content: "Cancel the redundant pass", status: "cancelled" },
+    ],
+  }));
+  await expect(page.locator(".todo-rail-item.completed").filter({
+    hasText: "Publish the todo snapshot",
+  })).toBeVisible();
+  await expect(page.locator(".todo-rail-item.cancelled")).toContainText(
+    "Cancel the redundant pass",
+  );
+  await expect(page.locator(".todo-rail-item.skipped")).toContainText(
+    "Skip the obsolete check",
+  );
+
+  await emit(page, threadEvent(19, { type: "thread.todos_updated", todos: [] }));
+  await expect(plan.getByText("No todos yet", { exact: true })).toBeVisible();
+  await expect(todoTab).toHaveAttribute("aria-selected", "true");
+});
+
+test("TODO lifecycle updates can collapse with sequential tool activity", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop owns the activity layout");
+  await installProtocolFixtures(page);
+  await page.addInitScript(() => {
+    localStorage.setItem("trouve.chat.v1", JSON.stringify({
+      collapseSequentialToolCalls: true,
+      collapseTodoUpdatesWithTools: true,
+    }));
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  await emit(page, threadEvent(16, {
+    type: "turn.started",
+    turn: 2,
+    mode: "code",
+    model: "test/model",
+  }));
+  await emit(page, threadEvent(17, {
+    type: "thread.todos_updated",
+    todos: [{ id: "build", content: "Build the pane", status: "in_progress" }],
+  }));
+
+  const group = page.locator(".activity-group").last();
+  await expect(group.locator(":scope > summary")).toContainText("Updated 1 todo");
+  await expect(group.locator(".todo-rail-item")).toBeHidden();
+  await group.locator(":scope > summary").click();
+  await expect(group.locator(".todo-rail-item.started")).toContainText("Build the pane");
 });
 
 test("Diff shows one changed file at a time from a diff-only file tree", async ({
@@ -1754,7 +1827,7 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
     .toBeGreaterThanOrEqual(focusedToolInteraction.disclosureRight - 2);
   await expect(editCard.getByLabel("Live tool output")).toContainText("updated src/app.ts");
   await expect(editCard.locator(".tool-inline-diff")).toBeVisible();
-  await expect(editCard.locator(".tool-meta")).toHaveText("2s");
+  await expect(editCard.locator(".tool-duration")).toHaveText("· 2s");
   await expect(editCard.locator(
     ':scope > summary .tool-inline-status [data-font-awesome-icon="check"]',
   )).toHaveCount(1);
@@ -2122,6 +2195,7 @@ test("disabling sequential tool grouping renders subordinate activity at the top
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     }));
   });
   await page.goto("/");
@@ -2153,12 +2227,19 @@ test("the Chat preference persists across a frontend reload", async ({ page }) =
   await expect(compactionPreference).not.toBeChecked();
   await page.locator('label[for="settings-collapse-compaction"]').click();
   await expect(compactionPreference).toBeChecked();
+  const todoPreference = page.getByRole("checkbox", {
+    name: "Collapse TODO updates with tool calls.",
+  });
+  await expect(todoPreference).not.toBeChecked();
+  await page.locator('label[for="settings-collapse-todos"]').click();
+  await expect(todoPreference).toBeChecked();
   await expect.poll(() => page.evaluate(() =>
     localStorage.getItem("trouve.chat.v1")
   )).toBe(JSON.stringify({
     collapseSequentialToolCalls: true,
     collapseThinkingWithTools: true,
     collapseCompactionWithTools: true,
+    collapseTodoUpdatesWithTools: true,
   }));
 
   await page.reload();
@@ -2170,6 +2251,9 @@ test("the Chat preference persists across a frontend reload", async ({ page }) =
   })).toBeChecked();
   await expect(page.getByRole("checkbox", {
     name: "Collapse context compaction with tool calls.",
+  })).toBeChecked();
+  await expect(page.getByRole("checkbox", {
+    name: "Collapse TODO updates with tool calls.",
   })).toBeChecked();
 });
 
@@ -3882,13 +3966,9 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   let olderResponses = 0;
   const olderBoundaries: number[] = [];
   const completedBoundaries: number[] = [];
-  let releaseWarmPage: (() => void) | undefined;
-  const warmPageReleased = new Promise<void>((resolve) => {
-    releaseWarmPage = resolve;
-  });
-  let releaseSecondPage: (() => void) | undefined;
-  const secondPageReleased = new Promise<void>((resolve) => {
-    releaseSecondPage = resolve;
+  let releaseFirstPage: (() => void) | undefined;
+  const firstPageReleased = new Promise<void>((resolve) => {
+    releaseFirstPage = resolve;
   });
   await installProtocolFixtures(page, { threadViewFixture: async (before) => {
     if (before === undefined) {
@@ -3897,9 +3977,7 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     olderRequests += 1;
     olderBoundaries.push(before);
     if (before === 150) {
-      await warmPageReleased;
-    } else if (before === 120) {
-      await secondPageReleased;
+      await firstPageReleased;
     }
     olderResponses += 1;
     completedBoundaries.push(before);
@@ -3915,17 +3993,14 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   await page.goto("/");
   await replayHistory(page);
 
-  await expect.poll(() => olderRequests).toBe(1);
-  const heightBeforeWarmPage = await page.locator(".chat-stream").evaluate(
+  // A full tail page already supplies more than the requested five-viewport
+  // buffer. Unlike the retired one-shot warmer, the sentinel should not make
+  // a request until the reader approaches that buffer boundary.
+  await page.waitForTimeout(250);
+  expect(olderRequests).toBe(0);
+  const heightBeforeFirstPage = await page.locator(".chat-stream").evaluate(
     (viewport) => viewport.scrollHeight,
   );
-  releaseWarmPage?.();
-  await expect.poll(() => olderResponses).toBe(1);
-  await expect.poll(() => page.locator(".chat-stream").evaluate(
-    (viewport) => viewport.scrollHeight,
-  )).toBeGreaterThan(heightBeforeWarmPage);
-  expect(olderRequests, "opening a thread should warm only one bounded page").toBe(1);
-  await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
 
   await page.locator(".chat-stream").evaluate((viewport) => {
     viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1_000 }));
@@ -3935,7 +4010,7 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     );
     viewport.dispatchEvent(new Event("scroll"));
   });
-  await expect.poll(() => olderRequests).toBe(2);
+  await expect.poll(() => olderRequests).toBe(1);
   await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
   const anchor = await page.locator(".chat-stream").evaluate(async (viewport) => {
     // Keep moving after the fetch starts. The response must preserve the
@@ -3986,14 +4061,11 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     };
     requestAnimationFrame(sample);
   }, anchor);
-  const heightBeforeSecondPage = await page.locator(".chat-stream").evaluate(
-    (viewport) => viewport.scrollHeight,
-  );
-  releaseSecondPage?.();
-  await expect.poll(() => olderResponses).toBe(2);
+  releaseFirstPage?.();
+  await expect.poll(() => olderResponses).toBe(1);
   await expect.poll(() => page.locator(".chat-stream").evaluate(
     (viewport) => viewport.scrollHeight,
-  )).toBeGreaterThan(heightBeforeSecondPage);
+  )).toBeGreaterThan(heightBeforeFirstPage);
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport, expected) => {
     const row = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
       .find((candidate) => candidate.dataset["virtualId"] === expected.id);
@@ -4021,7 +4093,7 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   expect(anchorProbe.missingFrames).toBe(0);
   expect(anchorProbe.maxDeviation).toBeLessThanOrEqual(2);
 
-  const heightBeforeThirdPage = await page.locator(".chat-stream").evaluate(
+  const heightBeforeSecondPage = await page.locator(".chat-stream").evaluate(
     (viewport) => viewport.scrollHeight,
   );
   await page.locator(".chat-stream").evaluate((viewport) => {
@@ -4029,14 +4101,14 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     viewport.scrollTop = 0;
     viewport.dispatchEvent(new Event("scroll"));
   });
-  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(3);
+  await expect.poll(() => olderResponses).toBeGreaterThanOrEqual(2);
   await expect(page.getByText("Loading earlier messages…", { exact: true })).toHaveCount(0);
   // The route fixture records its response before the browser has consumed
   // and rendered it. Wait for the newly prepended page itself instead of a
   // fixed number of animation frames, which can still race a loaded CI host.
   await expect.poll(() => page.locator(".chat-stream").evaluate(
     (viewport) => viewport.scrollHeight,
-  )).toBeGreaterThan(heightBeforeThirdPage);
+  )).toBeGreaterThan(heightBeforeSecondPage);
   // This is one deliberate reader gesture. A polling callback that emits a
   // wheel event can race a fast response and accidentally request every
   // remaining page, testing the poller rather than the prefetch boundary.
@@ -4047,16 +4119,16 @@ test("prefetches older history before the reader reaches the loaded boundary", a
     chatBounds.y + chatBounds.height / 2,
   );
   await page.mouse.wheel(0, -1_000);
-  await expect.poll(() => new Set(olderBoundaries).has(60)).toBe(true);
-  await expect.poll(() => completedBoundaries.includes(60)).toBe(true);
+  await expect.poll(() => new Set(olderBoundaries).has(90)).toBe(true);
+  await expect.poll(() => completedBoundaries.includes(90)).toBe(true);
   const requestedBoundaries = [...new Set(olderBoundaries)];
   expect(requestedBoundaries).toContain(120);
-  expect(olderBoundaries).toContain(60);
-  expect(olderBoundaries.filter((boundary) => boundary === 60)).toHaveLength(1);
-  // More older pages remain available than the reader requested. Re-fetching
-  // a boundary after a route refresh is harmless; automatically walking every
-  // distinct page from one scroll gesture is not.
-  expect(requestedBoundaries.length).toBeLessThan(olderPageBoundaries.length);
+  expect(olderBoundaries).toContain(90);
+  expect(olderBoundaries.filter((boundary) => boundary === 90)).toHaveLength(1);
+  // The observer may continue through several distinct pages when compact
+  // rows require that much data to fill the five-viewport buffer. It must
+  // never issue duplicate requests for a boundary while doing so.
+  expect(olderBoundaries).toHaveLength(requestedBoundaries.length);
 });
 
 test("keeps a nested thought anchored when history extends the same agent turn", async ({
@@ -4474,16 +4546,30 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Send");
   await submit.click();
   await expect(submit).toHaveText("Sending…");
+  await expect(composer).toHaveValue("");
+  const optimisticTurn = page.locator(".optimistic-turn");
+  await expect(optimisticTurn).toContainText("Start another turn");
+  await expect(optimisticTurn).toContainText("Awaiting durable acceptance");
   expect(messageReleases).toHaveLength(1);
   messageReleases.shift()?.();
   await expect(submit).toHaveText("Starting…");
   await expect(page.locator('[data-virtual-id="ephemeral:activity"] .agent-activity'))
     .toContainText("Starting turn…");
 
+  await page.locator("form.composer .attachment-button input").setInputFiles({
+    name: "layout.png",
+    mimeType: "image/png",
+    buffer: Buffer.alloc(1024),
+  });
+  await expect(page.locator(".pending-attachments")).toContainText("layout.png");
   await composer.fill("Queue this while startup is pending");
   await expect(submit).toHaveText("Queue");
   await submit.click();
   await expect(submit).toHaveText("Queueing…");
+  await expect(composer).toHaveValue("");
+  await expect(page.locator(".queue-panel [role=status]").first()).toHaveText("1 queued prompt");
+  await expect(page.locator(".queue-panel")).toContainText("Queue this while startup is pending");
+  await expect(page.locator(".queue-attachment-badge")).toContainText("1");
   expect(messageReleases).toHaveLength(1);
   messageReleases.shift()?.();
   await expect(submit).toHaveText("Starting…");
@@ -4628,4 +4714,37 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     "Queue this while startup is pending",
     "Continue after the cancellation",
   ]);
+});
+
+test("failed optimistic acceptance restores the exact composer draft and attachments", async ({
+  page,
+}) => {
+  const messageReleases: Array<() => void> = [];
+  await installProtocolFixtures(page, {
+    messageFailureAt: 1,
+    beforeMessageResponse: () => new Promise<void>((resolve) => {
+      messageReleases.push(resolve);
+    }),
+  });
+  await page.goto("/");
+  await replayHistory(page);
+  const composer = page.getByRole("textbox", { name: "Message", exact: true });
+  await page.locator("form.composer .attachment-button input").setInputFiles({
+    name: "rollback.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("restore me"),
+  });
+  await expect(page.locator(".pending-attachments")).toContainText("rollback.txt");
+  await composer.fill("  Preserve this draft  ");
+
+  await page.locator("wa-button.composer-submit").click();
+  await expect(composer).toHaveValue("");
+  await expect(page.locator(".optimistic-turn")).toContainText("Preserve this draft");
+  await expect(page.locator(".optimistic-turn")).toContainText("rollback.txt");
+  messageReleases.shift()?.();
+
+  await expect(page.getByRole("alert")).toHaveText("Message could not be sent.");
+  await expect(composer).toHaveValue("  Preserve this draft  ");
+  await expect(page.locator(".pending-attachments")).toContainText("rollback.txt");
+  await expect(page.locator(".optimistic-turn")).toHaveCount(0);
 });

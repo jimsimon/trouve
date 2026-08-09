@@ -163,6 +163,30 @@ describe("Trouve visual contract", () => {
     }
   });
 
+  it("keeps emphasized diff text readable in every product theme", () => {
+    const palettes = [...themes.matchAll(
+      /(?:^:root,\n)?\[data-theme="([^"]+)"\] \{\n([\s\S]*?)\n\}/gmu,
+    )].map((match) => ({
+      name: match[1]!,
+      roles: new Map(
+        [...match[2]!.matchAll(/(--trouve-[a-z0-9-]+):\s*(#[0-9a-f]{6});/gi)]
+          .map((role) => [role[1]!, role[2]!] as const),
+      ),
+    }));
+    for (const palette of palettes) {
+      const foreground = palette.roles.get("--trouve-code-fg");
+      expect(foreground, `${palette.name} code foreground`).toBeDefined();
+      for (const role of ["--trouve-diff-add-text-bg", "--trouve-diff-del-text-bg"]) {
+        const background = palette.roles.get(role);
+        expect(background, `${palette.name} ${role}`).toBeDefined();
+        expect(
+          contrastRatio(foreground!, background!),
+          `${palette.name} ${role} contrast`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
   it("keeps the established desktop navigation hierarchy and density", () => {
     expect(shell).not.toContain('class="brand-row"');
     expect(shell).not.toContain(">Inbox</button>");
@@ -302,7 +326,7 @@ describe("Trouve visual contract", () => {
 
   it("keeps the primary inspection order and desktop-height contract", () => {
     expect(shell).toMatch(
-      /const INSPECTION_PANELS = \[\s*"info",\s*"diff",\s*"files",\s*"pr",\s*"terminal",/,
+      /const INSPECTION_PANELS = \[\s*"info",\s*"diff",\s*"files",\s*"pr",\s*"plan",\s*"terminal",/,
     );
     for (const [panel, icon, label] of [
       ["info", "circle-info", "Info"],
@@ -382,7 +406,7 @@ describe("Trouve visual contract", () => {
     );
     expect(app).toContain(".user-message .message-header");
     expect(app).toContain(".assistant-message .message-header");
-    expect(app).toContain(".thread-todo-progress");
+    expect(app).toContain(".todo-rail-item");
     expect(app).toMatch(
       /\.turn-body-stream \{[^}]*min-width:\s*0[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s,
     );
@@ -475,7 +499,7 @@ describe("Trouve visual contract", () => {
       /\.activity-rail-disclosure-icon \{[^}]*--trouve-icon-width:\s*14px/s,
     );
     expect(app).toMatch(
-      /\.activity-group-timeline > \.tool-card::before \{[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-12\.5px[^}]*width:\s*20\.5px[^}]*background:\s*var\(--trouve-border-strong\)/s,
+      /\.activity-group-timeline > \.tool-card::before, \.activity-group-timeline > \.todo-rail-item::before \{[^}]*inset-block-start:\s*50%[^}]*inset-inline-start:\s*-12\.5px[^}]*width:\s*20\.5px[^}]*background:\s*var\(--trouve-border-strong\)/s,
     );
     expect(app).toMatch(
       /\.activity-group-timeline \{[^}]*padding-inline-start:\s*0/s,
@@ -580,6 +604,16 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain('class="activity-rail-disclosure"');
     expect(thread).toContain('className: "activity-rail-disclosure-icon"');
     expect(thread).toContain('class="tool-inline-status ${item.status}"');
+    const toolCase = thread.slice(
+      thread.indexOf('case "tool":'),
+      thread.indexOf('case "questions":'),
+    );
+    const detailPosition = toolCase.indexOf('class="tool-meta tool-detail-meta"');
+    const statusPosition = toolCase.indexOf('class="tool-inline-status ${item.status}"');
+    const durationPosition = toolCase.indexOf('class="tool-meta tool-duration"');
+    expect(detailPosition).toBeGreaterThan(-1);
+    expect(detailPosition).toBeLessThan(statusPosition);
+    expect(statusPosition).toBeLessThan(durationPosition);
     expect(thread).not.toContain('class="turn-markdown"');
     expect(thread).toContain('class="agent-copy-action"');
     expect(thread).toContain('response ? "Copy assistant response" : "Copy assistant update"');

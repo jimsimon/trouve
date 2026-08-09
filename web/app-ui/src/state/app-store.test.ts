@@ -493,6 +493,50 @@ describe("AppStore", () => {
     expect(store.threadView("th_1").cursor).toBe(50);
   });
 
+  it("retains prefetched history when a revisited thread receives a fresh tail", () => {
+    const store = new AppStore();
+    expect(store.replaceThreadViewSnapshot("th_1", 10, {
+      item_offset: 2,
+      total_items: 4,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 2, content: "tail", attachments: [] },
+        { kind: "assistant", turn: 2, content: "answer", complete: true },
+      ],
+    })).toBe(true);
+    expect(store.prependThreadViewSnapshot("th_1", {
+      item_offset: 0,
+      total_items: 4,
+      has_older: false,
+      items: [
+        { kind: "user", turn: 1, content: "cached", attachments: [] },
+        { kind: "assistant", turn: 1, content: "history", complete: true },
+      ],
+    })).toBe(true);
+
+    expect(store.replaceThreadViewSnapshot("th_1", 12, {
+      item_offset: 2,
+      total_items: 5,
+      has_older: true,
+      items: [
+        { kind: "user", turn: 2, content: "fresh tail", attachments: [] },
+        { kind: "assistant", turn: 2, content: "fresh answer", complete: true },
+        { kind: "user", turn: 3, content: "new", attachments: [] },
+      ],
+    })).toBe(true);
+
+    const view = store.threadView("th_1");
+    expect(view.itemOffset).toBe(0);
+    expect(view.totalItems).toBe(5);
+    expect(view.items.map((item) => "content" in item ? item.content : "")).toEqual([
+      "cached",
+      "history",
+      "fresh tail",
+      "fresh answer",
+      "new",
+    ]);
+  });
+
   it("seeds new thread projections from the initial todo snapshot", () => {
     const store = new AppStore();
     const todos = [

@@ -42,8 +42,19 @@ export class TrouveDiffView extends LitElement {
       .cm-scroller, .cm-mergeView { overflow: auto; }
       .cm-mergeView { height: 100%; }
       .cm-mergeViewEditors { height: 100%; }
-      .cm-changedLine { background: var(--trouve-diff-add-bg); }
-      .cm-deletedChunk { background: var(--trouve-diff-del-bg); }
+      .cm-merge-a .cm-changedLine,
+      .cm-deletedChunk,
+      .cm-deletedLine { background: var(--trouve-diff-del-bg) !important; }
+      .cm-merge-b .cm-changedLine,
+      .cm-inlineChangedLine { background: var(--trouve-diff-add-bg) !important; }
+      .cm-merge-a .cm-changedText,
+      .cm-deletedText { background: var(--trouve-diff-del-text-bg) !important; background-image: none !important; }
+      .cm-merge-b .cm-changedText,
+      .cm-inlineChangedLine .cm-changedText { background: var(--trouve-diff-add-text-bg) !important; background-image: none !important; }
+      .cm-changedText { background-image: none !important; text-decoration: none !important; }
+      .cm-deletedText,
+      .cm-deletedChunk del,
+      .cm-deletedLine del { text-decoration: none !important; }
       .fallback { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; overflow: hidden; }
       .fallback section { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden; }
       .fallback section + section { border-inline-start: 1px solid var(--trouve-rule); }
@@ -259,7 +270,7 @@ export class TrouveDiffView extends LitElement {
           merge.unifiedMergeView({
             original: this.original,
             mergeControls: false,
-            allowInlineDiffs: true,
+            allowInlineDiffs: false,
             collapseUnchanged: { margin: 3, minSize: 8 },
             diffConfig: { scanLimit: 5_000, timeout: 1_000 },
           }),

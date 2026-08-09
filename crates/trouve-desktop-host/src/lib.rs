@@ -263,6 +263,9 @@ pub struct ChatPreferences {
     /// Include context-compaction boundaries in collapsible tool-activity groups.
     #[serde(default)]
     pub collapse_compaction_with_tools: bool,
+    /// Include todo lifecycle updates in collapsible tool-activity groups.
+    #[serde(default)]
+    pub collapse_todo_updates_with_tools: bool,
 }
 
 impl Default for ChatPreferences {
@@ -271,6 +274,7 @@ impl Default for ChatPreferences {
             collapse_sequential_tool_calls: true,
             collapse_thinking_with_tools: false,
             collapse_compaction_with_tools: false,
+            collapse_todo_updates_with_tools: false,
         }
     }
 }

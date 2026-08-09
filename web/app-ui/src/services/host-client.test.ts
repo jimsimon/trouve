@@ -591,15 +591,18 @@ describe("HostClient", () => {
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
     expect(chatPreferencesFromHost(preferences, {
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     })).toEqual({
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
     expect(chatPreferencesFromHost({
       ...preferences,
@@ -607,15 +610,18 @@ describe("HostClient", () => {
         collapse_sequential_tool_calls: false,
         collapse_thinking_with_tools: false,
         collapse_compaction_with_tools: false,
+        collapse_todo_updates_with_tools: false,
       },
     }, {
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     })).toEqual({
       collapseSequentialToolCalls: false,
       collapseThinkingWithTools: false,
       collapseCompactionWithTools: false,
+      collapseTodoUpdatesWithTools: false,
     });
     expect(notificationPreferencesFromHost(preferences)).toEqual({
       enabled: true,
@@ -631,6 +637,7 @@ describe("HostClient", () => {
       collapseSequentialToolCalls: true,
       collapseThinkingWithTools: true,
       collapseCompactionWithTools: true,
+      collapseTodoUpdatesWithTools: true,
     });
     next = withHostNotificationPreferences(next, {
       enabled: true,
@@ -655,6 +662,7 @@ describe("HostClient", () => {
     expect(next.chat?.collapse_sequential_tool_calls).toBe(true);
     expect(next.chat?.collapse_thinking_with_tools).toBe(true);
     expect(next.chat?.collapse_compaction_with_tools).toBe(true);
+    expect(next.chat?.collapse_todo_updates_with_tools).toBe(true);
     expect(next.notifications).toMatchObject({
       on_finish: false,
       on_attention: false,

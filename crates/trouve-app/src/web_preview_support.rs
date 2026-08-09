@@ -1,9 +1,9 @@
 //! Shared bootstrap and lifecycle for desktop Wry and qualification hosts.
 //!
-//! The product host owns one embedded `trouve-server` unless an explicit
-//! `TROUVE_SERVER_URL` selects another process. Qualification hosts always
-//! require that explicit URL so they cannot silently become a second owner of
-//! the default database.
+//! The first product host owns one embedded `trouve-server`; later product
+//! windows attach to that elected owner unless `TROUVE_SERVER_URL` explicitly
+//! selects another process. Qualification hosts always require that explicit
+//! URL so they cannot silently become an owner of the default database.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -78,7 +78,7 @@ impl WebPreviewHost {
     }
 
     /// Start the shipping desktop host. With no configured upstream, this
-    /// process becomes the single owner of the local server and database.
+    /// process claims the local server/database or attaches to their owner.
     // The shared support module is also compiled into qualification binaries.
     #[allow(dead_code)]
     pub fn start_product_with_native_actions(
@@ -107,7 +107,7 @@ impl WebPreviewHost {
         let (upstream, embedded_server_task) = match configured_upstream {
             Some(upstream) => (upstream, None),
             None => {
-                let (address, server) = runtime
+                let binding = runtime
                     .block_on(trouve_server::bind_local(
                         "127.0.0.1:0"
                             .parse()
@@ -115,22 +115,21 @@ impl WebPreviewHost {
                         trouve_server::ServerSecurity::loopback(),
                     ))
                     .context("binding the embedded trouve server")?;
-                let server_task = runtime.spawn(async move {
-                    if let Err(error) = server.await {
-                        tracing::error!(%error, "embedded trouve server stopped");
-                    }
+                let address = binding.address();
+                let server_task = binding.into_server().map(|server| {
+                    runtime.spawn(async move {
+                        if let Err(error) = server.await {
+                            tracing::error!(%error, "embedded trouve server stopped");
+                        }
+                    })
                 });
-                (format!("http://{address}"), Some(server_task))
+                (format!("http://{address}"), server_task)
             }
         };
 
         let protocol = ProtocolClient::new(&upstream);
         let server_info = runtime
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), protocol.info())
-                    .await
-                    .context("timed out after 5 seconds")?
-            })
+            .block_on(wait_for_server_info(&protocol))
             .with_context(|| format!("connecting desktop host to {upstream}"))?;
         ensure_compatible_protocol(&server_info.protocol_version, PROTOCOL_VERSION)
             .with_context(|| format!("connecting desktop host to {upstream}"))?;
@@ -258,6 +257,19 @@ impl WebPreviewHost {
         }
         runtime.shutdown_timeout(Duration::from_secs(1));
     }
+}
+
+async fn wait_for_server_info(protocol: &ProtocolClient) -> Result<trouve_protocol::ServerInfo> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match protocol.info().await {
+                Ok(info) => return Ok(info),
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .context("timed out after 5 seconds")?
 }
 
 fn native_actions() -> HostNativeActions {

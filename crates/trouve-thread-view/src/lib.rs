@@ -5,14 +5,20 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use trouve_protocol::{
-    ApprovalDecision, Event, EventEnvelope, ThreadCompactionState, ThreadToolStatus,
-    ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, ToolStatus,
+    ApprovalDecision, Event, EventEnvelope, ThreadCompactionState, ThreadTodoState,
+    ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot, TodoItem, TodoStatus,
+    ToolStatus,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ThreadProjection {
     pub cursor: u64,
     pub snapshot: ThreadViewSnapshot,
+    /// Number of completed folded items already persisted as independently
+    /// pageable rows. `snapshot.items` contains only the live/unmaterialized
+    /// suffix after this absolute offset.
+    #[serde(default)]
+    materialized_items: u64,
     /// Execution anchors are projection state rather than protocol state.
     /// They are serialized with the cache so a command that spans a cache
     /// refresh still receives an accurate duration when it completes.
@@ -73,7 +79,20 @@ impl ThreadProjection {
             }
             Event::CommandsUpdated { commands } => self.snapshot.commands = commands.clone(),
             Event::QueueUpdated { prompts } => self.snapshot.queue = prompts.clone(),
-            Event::TodosUpdated { todos } => self.snapshot.todos = todos.clone(),
+            Event::TodosUpdated { todos } => {
+                let turn = self.active_turn();
+                let previous = std::mem::replace(&mut self.snapshot.todos, todos.clone());
+                if let Some(turn) = turn {
+                    for (todo, state) in todo_transitions(&previous, todos) {
+                        self.push(ThreadViewItem::TodoUpdate {
+                            turn,
+                            todo_id: todo.id.clone(),
+                            content: todo.content.clone(),
+                            state,
+                        });
+                    }
+                }
+            }
             Event::CompactionCompleted {
                 turn,
                 messages_compacted,
@@ -191,6 +210,7 @@ impl ThreadProjection {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
                     args: args.clone(),
+                    details_deferred: false,
                     status: if *requires_approval {
                         ThreadToolStatus::AwaitingApproval
                     } else {
@@ -256,6 +276,7 @@ impl ThreadProjection {
                 call_id,
                 status,
                 result,
+                execution_duration_ms,
             } => {
                 let measured_duration_ms = self
                     .tool_started_at
@@ -277,8 +298,8 @@ impl ThreadProjection {
                         };
                     }
                     *current_result = Some(result.clone());
-                    if measured_duration_ms.is_some() {
-                        *duration_ms = measured_duration_ms;
+                    if execution_duration_ms.is_some() || measured_duration_ms.is_some() {
+                        *duration_ms = execution_duration_ms.or(measured_duration_ms);
                     }
                 }
                 self.snapshot.pending_approvals.retain(|id| id != call_id);
@@ -370,6 +391,62 @@ impl ThreadProjection {
         idx
     }
 
+    fn active_turn(&self) -> Option<u64> {
+        self.snapshot
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ThreadViewItem::TurnStatus {
+                    turn,
+                    state: ThreadTurnState::Running,
+                } => Some(*turn),
+                _ => None,
+            })
+    }
+
+    /// Absolute folded-item offset of the current live suffix.
+    pub fn materialized_items(&self) -> u64 {
+        self.materialized_items
+    }
+
+    /// Complete folded item count without loading any materialized row.
+    pub fn total_items(&self) -> u64 {
+        self.materialized_items + self.snapshot.items.len() as u64
+    }
+
+    /// Remove the completed prefix that can be persisted independently. An
+    /// active turn remains in the live projection because subsequent stream
+    /// events can still mutate its thinking, assistant, approval, question,
+    /// and tool rows in place.
+    pub fn take_materializable_prefix(&mut self) -> (u64, Vec<ThreadViewItem>) {
+        let keep_from = if self.snapshot.turn_running {
+            self.snapshot
+                .items
+                .iter()
+                .rposition(|item| {
+                    matches!(
+                        item,
+                        ThreadViewItem::TurnStatus {
+                            state: ThreadTurnState::Running,
+                            ..
+                        }
+                    )
+                })
+                .unwrap_or(0)
+        } else {
+            self.snapshot.items.len()
+        };
+        if keep_from == 0 {
+            return (self.materialized_items, Vec::new());
+        }
+        let start = self.materialized_items;
+        let items = self.snapshot.items.drain(..keep_from).collect::<Vec<_>>();
+        self.materialized_items += items.len() as u64;
+        self.indexes = ProjectionIndexes::default();
+        (start, items)
+    }
+
     fn tool_mut(&mut self, call_id: &str) -> Option<&mut ThreadViewItem> {
         let idx = *self.indexes.tools.get(call_id)?;
         self.snapshot.items.get_mut(idx)
@@ -445,10 +522,55 @@ impl ThreadProjection {
                 ThreadViewItem::User { .. }
                 | ThreadViewItem::Steered { .. }
                 | ThreadViewItem::Assistant { .. }
+                | ThreadViewItem::TodoUpdate { .. }
                 | ThreadViewItem::Compaction { .. } => {}
             }
         }
     }
+}
+
+fn todo_transitions<'a>(
+    previous: &'a [TodoItem],
+    current: &'a [TodoItem],
+) -> Vec<(&'a TodoItem, ThreadTodoState)> {
+    let previous_by_id = previous
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect::<HashMap<_, _>>();
+    let current_by_id = current
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect::<HashMap<_, _>>();
+    let mut transitions = Vec::new();
+    for todo in current {
+        let previous_status = previous_by_id.get(todo.id.as_str()).map(|todo| todo.status);
+        let state = match todo.status {
+            TodoStatus::InProgress if previous_status != Some(TodoStatus::InProgress) => {
+                Some(ThreadTodoState::Started)
+            }
+            TodoStatus::Completed if previous_status != Some(TodoStatus::Completed) => {
+                Some(ThreadTodoState::Completed)
+            }
+            TodoStatus::Cancelled if previous_status != Some(TodoStatus::Cancelled) => {
+                Some(ThreadTodoState::Cancelled)
+            }
+            TodoStatus::Pending
+            | TodoStatus::InProgress
+            | TodoStatus::Completed
+            | TodoStatus::Cancelled => None,
+        };
+        if let Some(state) = state {
+            transitions.push((todo, state));
+        }
+    }
+    for todo in previous {
+        if !current_by_id.contains_key(todo.id.as_str())
+            && !matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled)
+        {
+            transitions.push((todo, ThreadTodoState::Skipped));
+        }
+    }
+    transitions
 }
 
 #[cfg(test)]
@@ -473,6 +595,89 @@ mod tests {
             ThreadViewItem::ToolCall { duration_ms, .. } => *duration_ms,
             item => panic!("expected tool call, got {item:?}"),
         }
+    }
+
+    #[test]
+    fn todo_updates_materialize_lifecycle_rows_during_a_turn() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 7,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TodosUpdated {
+                todos: vec![
+                    TodoItem {
+                        id: "one".into(),
+                        content: "First".into(),
+                        status: TodoStatus::InProgress,
+                    },
+                    TodoItem {
+                        id: "two".into(),
+                        content: "Second".into(),
+                        status: TodoStatus::Pending,
+                    },
+                ],
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            2,
+            Event::TodosUpdated {
+                todos: vec![TodoItem {
+                    id: "one".into(),
+                    content: "First".into(),
+                    status: TodoStatus::Completed,
+                }],
+            },
+        ));
+
+        let updates = projection
+            .snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ThreadViewItem::TodoUpdate { todo_id, state, .. } => {
+                    Some((todo_id.as_str(), *state))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates,
+            vec![
+                ("one", ThreadTodoState::Started),
+                ("one", ThreadTodoState::Completed),
+                ("two", ThreadTodoState::Skipped),
+            ]
+        );
+    }
+
+    #[test]
+    fn todo_snapshot_outside_a_turn_does_not_add_transcript_rows() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TodosUpdated {
+                todos: vec![TodoItem {
+                    id: "one".into(),
+                    content: "First".into(),
+                    status: TodoStatus::InProgress,
+                }],
+            },
+        ));
+        assert!(projection.snapshot.items.is_empty());
+        assert_eq!(projection.snapshot.todos.len(), 1);
     }
 
     #[test]
@@ -516,10 +721,11 @@ mod tests {
                 call_id: "command".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({ "exit_code": 0, "duration_ms": 0 }),
+                execution_duration_ms: Some(7),
             },
         ));
 
-        assert_eq!(measured_duration(&projection), Some(50));
+        assert_eq!(measured_duration(&projection), Some(7));
     }
 
     #[test]
@@ -543,6 +749,7 @@ mod tests {
                 call_id: "command".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({ "exit_code": 0 }),
+                execution_duration_ms: None,
             },
         ));
 
@@ -578,6 +785,7 @@ mod tests {
                 call_id: "command".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::json!({ "exit_code": 0 }),
+                execution_duration_ms: None,
             },
         ));
 
@@ -768,6 +976,87 @@ mod tests {
                 },
             }) if checkpoint_id == "cp_after_2"
         ));
+    }
+
+    #[test]
+    fn materialization_drains_completed_turns_but_keeps_the_live_turn_mutable() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "first".into(),
+                attachments: Vec::new(),
+            },
+            Event::TurnCompleted {
+                turn: 1,
+                usage: Default::default(),
+                checkpoint_id: None,
+            },
+            Event::TurnStarted {
+                turn: 2,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+            Event::AssistantThinking {
+                turn: 2,
+                text: "still ".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        let (start, completed) = projection.take_materializable_prefix();
+        assert_eq!(start, 0);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(projection.materialized_items(), 2);
+        assert_eq!(projection.snapshot.items.len(), 2);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 2,
+                state: ThreadTurnState::Running,
+            })
+        ));
+
+        projection.apply(&envelope(
+            6,
+            6,
+            Event::AssistantThinking {
+                turn: 2,
+                text: "running".into(),
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Thinking { content, .. }) if content == "still running"
+        ));
+
+        projection.apply(&envelope(
+            7,
+            7,
+            Event::TurnCompleted {
+                turn: 2,
+                usage: Default::default(),
+                checkpoint_id: None,
+            },
+        ));
+        let (next_start, second_turn) = projection.take_materializable_prefix();
+        assert_eq!(next_start, 2);
+        assert_eq!(second_turn.len(), 2);
+        assert!(projection.snapshot.items.is_empty());
+        assert_eq!(projection.total_items(), 4);
     }
 
     #[test]

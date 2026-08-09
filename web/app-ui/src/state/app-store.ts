@@ -9,6 +9,7 @@ import type {
   ProtocolSessionSummary,
   ProtocolThread,
   ProtocolThreadViewSnapshot,
+  ProtocolThreadToolDetails,
   ProtocolTodoItem,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
@@ -20,6 +21,8 @@ import {
 import { sortInboxSessions } from "./session-inbox-model.js";
 import { ThreadViewModel } from "./thread-view-model.js";
 import type { QueuedPrompt } from "./thread-view-model.js";
+
+const MAX_CACHED_THREAD_HISTORY_ITEMS = 2_048;
 
 export type SessionVisualState =
   | "running"
@@ -441,7 +444,7 @@ export class AppStore {
     return view;
   }
 
-  /** Atomically install the server-folded transcript tail at its SSE cursor. */
+  /** Merge the server-folded live tail into any retained prefetched history. */
   replaceThreadViewSnapshot(
     threadId: string,
     cursor: number,
@@ -449,13 +452,19 @@ export class AppStore {
   ): boolean {
     const current = this.#threadViews.get(threadId);
     if (current !== undefined && current.cursor > cursor) return false;
+    for (const [cachedThreadId, cachedView] of this.#threadViews) {
+      if (cachedThreadId !== threadId) {
+        cachedView.trimHistory(MAX_CACHED_THREAD_HISTORY_ITEMS);
+      }
+    }
     this.#threadViews.delete(threadId);
     while (this.#threadViews.size >= this.#maxThreadViews) {
       const oldest = this.#threadViews.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.#threadViews.delete(oldest);
     }
-    const view = ThreadViewModel.fromSnapshot(cursor, snapshot);
+    const view = current ?? new ThreadViewModel();
+    view.mergeTailSnapshot(cursor, snapshot);
     if (snapshot.todos === undefined) {
       const preserved = this.#threadTodoEvents.get(threadId)
         ?? this.#threads.get(threadId)?.todos;
@@ -469,6 +478,16 @@ export class AppStore {
       const thread = this.#threads.get(threadId);
       if (thread !== undefined) this.#threads.set(threadId, { ...thread, todos });
     }
+    this.#touch();
+    return true;
+  }
+
+  replaceThreadToolDetails(
+    threadId: string,
+    details: ProtocolThreadToolDetails,
+  ): boolean {
+    const view = this.#threadViews.get(threadId);
+    if (view === undefined || !view.replaceToolDetails(details)) return false;
     this.#touch();
     return true;
   }

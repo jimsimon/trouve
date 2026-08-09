@@ -185,8 +185,8 @@ impl Tool for Search {
             "properties": {
                 "query": {"type": "string", "description": "Natural language or code query."},
                 "repo": {"type": "string", "description": REPO_PARAM},
-                "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "default": 5},
-                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "default": 10}
+                "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "maximum": 100, "default": 5},
+                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10}
             },
             "required": ["query"]
         })
@@ -221,8 +221,8 @@ impl Tool for FindRelated {
                 "file_path": {"type": "string", "description": "Path as reported by a search result."},
                 "line": {"type": "integer", "description": "Line number (1-indexed)."},
                 "repo": {"type": "string", "description": REPO_PARAM},
-                "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "default": 5},
-                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "default": 10}
+                "top_k": {"type": "integer", "description": "Number of results.", "minimum": 1, "maximum": 100, "default": 5},
+                "max_snippet_lines": {"type": "integer", "description": SNIPPET_PARAM, "minimum": 0, "maximum": 1000, "default": 10}
             },
             "required": ["file_path", "line"]
         })

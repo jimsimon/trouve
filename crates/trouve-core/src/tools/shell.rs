@@ -21,12 +21,18 @@ const MAX_JOB_SECS: u64 = 3600;
 const MAX_JOBS: usize = 16;
 const CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn truncate_utf8(mut bytes: Vec<u8>) -> (String, bool) {
-    let truncated = bytes.len() > MAX_CAPTURE_BYTES;
-    if truncated {
-        bytes.truncate(MAX_CAPTURE_BYTES);
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl CapturedOutput {
+    fn into_string(self) -> (String, bool) {
+        (
+            String::from_utf8_lossy(&self.bytes).into_owned(),
+            self.truncated,
+        )
     }
-    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
 /// One background job: the child (for kill/wait), its captured output, and
@@ -168,15 +174,31 @@ fn pump(
     });
 }
 
-async fn read_all(stream: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+async fn read_capped(
+    stream: Option<impl tokio::io::AsyncRead + Unpin>,
+) -> std::io::Result<CapturedOutput> {
     use tokio::io::AsyncReadExt as _;
 
     let Some(mut stream) = stream else {
-        return Ok(Vec::new());
+        return Ok(CapturedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        });
     };
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+    let mut bytes = Vec::with_capacity(MAX_CAPTURE_BYTES);
+    let mut truncated = false;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let room = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+        let retained = read.min(room);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(CapturedOutput { bytes, truncated })
 }
 
 pub struct Shell {
@@ -248,8 +270,8 @@ impl Tool for Shell {
         let child = Arc::new(tokio::sync::Mutex::new(child));
         // Drain both pipes while the process runs; waiting first can
         // deadlock once a pipe fills its kernel buffer.
-        let stdout_task = tokio::spawn(read_all(stdout));
-        let stderr_task = tokio::spawn(read_all(stderr));
+        let stdout_task = tokio::spawn(read_capped(stdout));
+        let stderr_task = tokio::spawn(read_capped(stderr));
         let wait = {
             let child = child.clone();
             async move { child.lock().await.wait().await }
@@ -275,14 +297,20 @@ impl Tool for Shell {
                     .await
                     .ok()
                     .and_then(Result::ok)
-                    .unwrap_or_default();
+                    .unwrap_or(CapturedOutput {
+                        bytes: Vec::new(),
+                        truncated: false,
+                    });
                 let stderr = stderr_task
                     .await
                     .ok()
                     .and_then(Result::ok)
-                    .unwrap_or_default();
-                let (stdout, stdout_truncated) = truncate_utf8(stdout);
-                let (stderr, stderr_truncated) = truncate_utf8(stderr);
+                    .unwrap_or(CapturedOutput {
+                        bytes: Vec::new(),
+                        truncated: false,
+                    });
+                let (stdout, stdout_truncated) = stdout.into_string();
+                let (stderr, stderr_truncated) = stderr.into_string();
                 ToolResult::ok(json!({
                     "exit_code": status.code(),
                     "stdout": stdout,
@@ -434,28 +462,36 @@ impl Tool for ShellOutput {
                 let out = job.output.lock().unwrap();
                 if out.bytes.len() > job.cursor || out.exit_code.is_some() {
                     let slice = &out.bytes[job.cursor..];
+                    let capped_len = slice.len().min(MAX_CAPTURE_BYTES);
+                    let capped = &slice[..capped_len];
                     // Decode only up to the last complete UTF-8 character so
                     // a multi-byte char split across two reads isn't mangled
                     // into replacement chars at the seam; keep the trailing
                     // partial bytes for the next read. Once the process has
-                    // exited there is no more input, so flush the remainder.
-                    let take = if out.exit_code.is_some() {
-                        slice.len()
+                    // exited and this is the final page, flush the remainder.
+                    let take = if out.exit_code.is_some() && capped_len == slice.len() {
+                        capped.len()
                     } else {
-                        match std::str::from_utf8(slice) {
+                        match std::str::from_utf8(capped) {
                             Ok(s) => s.len(),
                             Err(e) => e.valid_up_to(),
                         }
                     };
-                    let new = String::from_utf8_lossy(&slice[..take]).into_owned();
+                    let new = String::from_utf8_lossy(&capped[..take]).into_owned();
                     job.cursor += take;
-                    Some((new, out.exit_code, out.truncated, out.killed))
+                    Some((
+                        new,
+                        out.exit_code,
+                        out.truncated,
+                        out.killed,
+                        job.cursor < out.bytes.len(),
+                    ))
                 } else {
                     None
                 }
             };
             match read {
-                Some((new_output, exit_code, truncated, killed)) => {
+                Some((new_output, exit_code, truncated, killed, more_available)) => {
                     return ToolResult::ok(json!({
                         "job_id": id,
                         "running": exit_code.is_none(),
@@ -463,6 +499,7 @@ impl Tool for ShellOutput {
                         "new_output": new_output,
                         "truncated": truncated,
                         "killed": killed,
+                        "more_available": more_available,
                     }));
                 }
                 None if tokio::time::Instant::now() >= deadline => {
@@ -583,6 +620,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreground_capture_drains_but_does_not_retain_unbounded_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+
+        let res = shell
+            .run(&ctx, &json!({"command": "yes x | head -c 131072"}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(
+            res.result["stdout"].as_str().unwrap().len(),
+            MAX_CAPTURE_BYTES
+        );
+        assert_eq!(res.result["truncated"], true);
+    }
+
+    #[tokio::test]
     async fn times_out() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ToolCtx {
@@ -689,6 +746,40 @@ mod tests {
         let res = output.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(res.result["running"], false);
         assert_eq!(res.result["new_output"], "");
+    }
+
+    #[tokio::test]
+    async fn background_output_is_paged_into_bounded_tool_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, output, _) = tools();
+        let res = shell
+            .run(
+                &ctx,
+                &json!({
+                    "command": "yes x | head -c 100000",
+                    "run_in_background": true
+                }),
+            )
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+
+        let mut received = 0usize;
+        for _ in 0..20 {
+            let page = output
+                .run(&ctx, &json!({"job_id": id, "wait_ms": 500}))
+                .await;
+            let content = page.result["new_output"].as_str().unwrap();
+            assert!(content.len() <= MAX_CAPTURE_BYTES);
+            received += content.len();
+            if page.result["running"] == false && page.result["more_available"] == false {
+                break;
+            }
+        }
+        assert_eq!(received, 100_000);
     }
 
     #[tokio::test]

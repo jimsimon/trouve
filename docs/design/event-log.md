@@ -55,6 +55,17 @@ session stream.
   rebuildable projections of this log; they do not replace it as the durable
   source of truth.
 
+Completed folded transcript rows are materialized in the indexed
+`thread_view_items` projection, while `thread_view_cache` retains only the
+currently mutable turn suffix and its fold indexes. A page request therefore
+deserializes at most the live suffix and the requested rows; it never loads a
+thread's complete folded history merely to slice one page. Completed tool rows
+carry bounded presentation arguments and a `details_deferred` marker. Their
+full arguments and terminal result live in the rebuildable
+`thread_tool_details` projection and are fetched only when the user expands
+that call. Both tables are disposable cache state: invalidating their schema
+version rebuilds them from the authoritative thread event stream.
+
 ### Session-list bootstrap and resume
 
 Clients must not retain every background thread merely to render the session
@@ -138,7 +149,10 @@ Thread scope:
 - `approval.requested` `{turn, call_id}` / `approval.resolved` `{call_id,
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
-  `tool.completed` `{call_id, status, result}`
+  `tool.completed` `{call_id, status, result, execution_duration_ms?}`. The
+  optional duration covers only `ToolExecutor::execute`, measured with a
+  monotonic clock; clients fall back to durable timestamps for older or
+  provider-owned calls.
   Multiple call ids may be live concurrently. Cursor order reflects actual
   request/start/output/completion timing and is not required to match the
   provider transcript's tool-call order; `call_id` is the correlation key.

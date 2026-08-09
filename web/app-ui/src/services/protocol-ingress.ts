@@ -140,6 +140,7 @@ export class ProtocolIngress {
   #listenersAttached = false;
   #bootstrap: Promise<void> | undefined;
   #projectionRefresh: Promise<void> | undefined;
+  #activityReconciliation: Promise<void> | undefined;
   #metadataRefresh: Promise<void> | undefined;
   #metadataRefreshPending = false;
   #metadataRevision = 0;
@@ -205,6 +206,7 @@ export class ProtocolIngress {
     this.#started = false;
     this.#bootstrap = undefined;
     this.#projectionRefresh = undefined;
+    this.#activityReconciliation = undefined;
     this.#metadataRefresh = undefined;
     this.#metadataRefreshPending = false;
     this.#threadRefreshes.clear();
@@ -228,6 +230,26 @@ export class ProtocolIngress {
     });
     this.#projectionRefresh = refresh;
     return refresh;
+  }
+
+  /** Reconcile only the durable session-activity projection. Desktop sleep
+   * inhibition uses this narrow read as a safety net for a missed live event;
+   * unlike a full foreground refresh it does not refetch workspace, metadata,
+   * or GitHub state. Concurrent timers share one request. */
+  reconcileSessionActivity(): Promise<void> {
+    if (!this.#started) return Promise.resolve();
+    if (this.#activityReconciliation !== undefined) {
+      return this.#activityReconciliation;
+    }
+    const generation = this.#generation;
+    let reconciliation!: Promise<void>;
+    reconciliation = this.#reconcileSessionActivityGeneration(generation).finally(() => {
+      if (this.#activityReconciliation === reconciliation) {
+        this.#activityReconciliation = undefined;
+      }
+    });
+    this.#activityReconciliation = reconciliation;
+    return reconciliation;
   }
 
   async #bootstrapGeneration(generation: number): Promise<void> {
@@ -384,6 +406,20 @@ export class ProtocolIngress {
         projection.snapshot.value,
       );
     }
+  }
+
+  async #reconcileSessionActivityGeneration(generation: number): Promise<void> {
+    const boundary = await this.#sessionSummaryBoundary();
+    if (!this.#isCurrentGeneration(generation)) return;
+    const snapshot = boundary.kind === "atomic"
+      ? boundary.snapshot
+      : materializeSessionSnapshot(boundary, await this.#client.sessions());
+    if (!this.#isCurrentGeneration(generation)) return;
+    const acceptedCursor =
+      this.#stream === undefined ? 0 : readSignal(this.#stream.cursor);
+    if (snapshot.cursor < acceptedCursor) return;
+    this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
+    this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
   }
 
   /** Early protocol 2.5 builds exposed session activity and cursor-bearing
