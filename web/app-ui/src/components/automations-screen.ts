@@ -364,6 +364,13 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #deferredRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #loadRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
+  #availableModels(): readonly ProtocolModelInfo[] {
+    const catalog = this.#services.value?.modelCatalog.current;
+    if (catalog === undefined) return this.#models;
+    const models = readSignal(catalog);
+    return models.length === 0 ? this.#models : models;
+  }
+
   override connectedCallback(): void {
     super.connectedCallback();
     if (this.#pollTimer === undefined) {
@@ -421,7 +428,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#modelsLoading = true;
     this.#modelsError = "";
     this.requestUpdate();
-    void services.protocol.models().then(
+    void services.modelCatalog.refresh("if-stale").then(
       (models) => {
         if (generation !== this.#loadGeneration || !this.isConnected) return;
         this.#models = models;
@@ -605,8 +612,9 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   }
 
   #renderEditor() {
+    const models = this.#availableModels();
     const editing = this.#editorMode === "edit";
-    const selectedModel = this.#models.find((model) => model.id === this.#draft.model);
+    const selectedModel = models.find((model) => model.id === this.#draft.model);
     const thinking = thinkingOption(selectedModel);
     const nameError = this.#draftErrors.name;
     const promptError = this.#draftErrors.prompt;
@@ -634,7 +642,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
             placeholder="Mode or server default"
             empty-label="Mode or server default"
             .value=${this.#draft.model}
-            .models=${this.#models}
+            .models=${models}
             .disabled=${busy || this.#modelsLoading}
             @trouve-model-picked=${this.#modelPicked}
           ></trouve-model-picker>
@@ -728,7 +736,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
-    const model = this.#models.find((candidate) => candidate.id === event.detail.modelId);
+    const model = this.#availableModels().find((candidate) => candidate.id === event.detail.modelId);
     const thinking = thinkingOption(model);
     const thinkingLevel = thinking?.values.includes(this.#draft.thinkingLevel)
       ? this.#draft.thinkingLevel
@@ -751,7 +759,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       return;
     }
     const thinking = thinkingOption(
-      this.#models.find((model) => model.id === this.#draft.model),
+      this.#availableModels().find((model) => model.id === this.#draft.model),
     );
     if (
       this.#draft.thinkingLevel !== ""

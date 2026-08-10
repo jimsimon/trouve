@@ -8,6 +8,7 @@ import {
   type SessionIndicatorPresentation,
 } from "../state/session-indicator-model.js";
 import type { FontAwesomeIconName } from "./font-awesome-icon.js";
+import { threadNavigationTitle } from "./thread-title.js";
 import {
   visibleSessionPullRequestBadge,
   type SessionPullRequestBadge,
@@ -25,6 +26,7 @@ export interface CommandPaletteSession extends SessionIndicatorFields {
   readonly branch: string;
   readonly archived: boolean;
   readonly latestThreadId: string | undefined;
+  readonly navigationThreadId?: string;
   readonly pullRequests: readonly ProtocolPrInfo[];
   readonly state: SessionVisualState;
 }
@@ -34,6 +36,7 @@ export interface CommandPaletteThread {
   readonly session_id: string;
   readonly mode: string;
   readonly model: string;
+  readonly title?: string | null;
   readonly spawned?: boolean;
 }
 
@@ -74,16 +77,15 @@ export interface CommandPaletteInput {
   readonly workspaces: readonly CommandPaletteWorkspace[];
   readonly sessions: readonly CommandPaletteSession[];
   /** Threads retained for the active session. Other sessions remain reachable
-   * through their session item and latest-thread route. */
+   * through their session item and persisted open-tab route. */
   readonly activeThreads: readonly CommandPaletteThread[];
 }
 
 const INSPECTION_VIEWS = [
-  ["info", "Info", "circle-info", "overview session branch changes pull requests mcp tools"],
+  ["info", "Details", "circle-info", "details overview session branch changes pull requests mcp tools"],
   ["diff", "Diff", "code-compare", "changes patch review"],
   ["files", "Files", "file-lines", "source tree code"],
   ["pr", "Pull request", "code-pull-request", "branch review status"],
-  ["plan", "Todos", "list-check", "todos tasks plan checklist"],
   ["terminal", "Terminal", "terminal", "shell pty console"],
 ] as const satisfies readonly [
   InspectionPanel,
@@ -91,11 +93,6 @@ const INSPECTION_VIEWS = [
   FontAwesomeIconName,
   string,
 ][];
-
-const shortModelName = (model: string): string => {
-  const segments = model.split("/").filter((segment) => segment !== "");
-  return segments.at(-1) ?? model;
-};
 
 const workspaceForRoute = (
   route: AppRoute,
@@ -160,15 +157,21 @@ export const buildCommandPaletteItems = (
   }
 
   if (route.kind === "session") {
+    const activeSession = sessions.find((session) => session.id === route.sessionId);
+    const initialThreadId = activeThreads[0]?.id;
     for (const [index, thread] of activeThreads.entries()) {
-      const label = `${thread.mode} · ${shortModelName(thread.model)}`;
+      const label = threadNavigationTitle({
+        thread,
+        sessionTitle: activeSession?.title ?? "",
+        initialThreadId,
+      });
       const current = thread.id === route.threadId;
       items.push({
         id: `thread:${thread.id}`,
         group: "Threads",
         label,
         detail: `Thread ${index + 1}`,
-        keywords: `${current ? "current " : ""}${thread.id} ${thread.mode} ${thread.model} conversation tab`,
+        keywords: `${current ? "current " : ""}${thread.id} ${label} ${thread.mode} ${thread.model} conversation tab`,
         icon: thread.spawned === true ? "code-branch" : "message",
         current,
         action: {
@@ -224,9 +227,9 @@ export const buildCommandPaletteItems = (
           kind: "session",
           workspaceId: session.workspaceId,
           sessionId: session.id,
-          ...(session.latestThreadId === undefined
+          ...(session.navigationThreadId === undefined
             ? {}
-            : { threadId: session.latestThreadId }),
+            : { threadId: session.navigationThreadId }),
         },
       },
     });

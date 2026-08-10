@@ -20,6 +20,11 @@ export class SubscriptionHealthController {
   );
   readonly current: ReadonlySignal<readonly ProtocolSubscriptionHealth[]> =
     this.#current;
+  readonly #loading = createSignal(false);
+  /** True only while the newest provider-usage probe is in flight. Catalog
+   * consumers use this to reserve the Subscription field without blocking
+   * any of the static composer controls. */
+  readonly loading: ReadonlySignal<boolean> = this.#loading;
 
   #lastStartedAt: number | undefined;
   #generation = 0;
@@ -51,6 +56,7 @@ export class SubscriptionHealthController {
 
     this.#lastStartedAt = now;
     const generation = ++this.#generation;
+    this.#loading.set(true);
     const promise = this.#protocol.subscriptionHealth().then(
       (health) => {
         if (generation === this.#generation) {
@@ -67,7 +73,10 @@ export class SubscriptionHealthController {
         throw error;
       },
     ).finally(() => {
-      if (this.#pending?.generation === generation) this.#pending = undefined;
+      if (this.#pending?.generation === generation) {
+        this.#pending = undefined;
+        this.#loading.set(false);
+      }
     });
     this.#pending = { generation, promise };
     return promise;

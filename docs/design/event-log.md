@@ -111,6 +111,18 @@ session. Recovery clears stale activity and approval/question attention and
 marks the interrupted outcome failed; snapshot and resumed-stream clients
 therefore converge on the same cursor-addressed transition.
 
+Conversation tab status uses the same projection pattern at thread scope.
+`GET /v1/thread-statuses?session_id=…` returns compact `ThreadStatus` rows for
+the selected session, and source turn/approval/question events transactionally
+append `thread.status_updated` replacements on the server stream. Clients can
+therefore keep open and closed thread tabs current without retaining each
+thread transcript or opening one SSE connection per tab. Each row's
+`latest_cursor` is the source-event cursor and also drives client-local
+seen/unseen terminal indicators. `started_at` records the current or most
+recent turn start, while `completed_at` records its terminal event; clients use
+that pair for live and completed child-agent elapsed time without replaying the
+thread.
+
 ## Event envelope
 
 ```json
@@ -140,6 +152,9 @@ Thread scope:
   `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
   `{turn, error}`
 - `user.message` `{turn, content}`
+- `subagent.spawned` `{turn, thread_id, session_id, prompt, model, call_id?}` —
+  a separately navigable child-agent transcript was attached to the parent
+  turn; the optional call id identifies a redundant trouve spawn tool row
 - `assistant.delta` `{turn, text}` — streamed model output
 - `assistant.thinking` `{turn, text}` — streamed display-only model reasoning /
   `assistant.thinking_completed` `{turn}` — the provider explicitly closed
@@ -174,6 +189,8 @@ Session scope:
 Server scope:
 
 - `workspace.registered` `{workspace_id, path}`
+- `thread.status_updated` `{status}` — compact replacement activity,
+  attention, outcome, and source cursor for one thread
 - `github.pull_requests_updated` `{pull_requests}` — full account-centric
   dashboard snapshot for one configured GitHub host
 - `session.created` / `session.deleted` `{session_id, workspace_id}`

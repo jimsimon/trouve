@@ -282,6 +282,7 @@ describe("ProtocolClient", () => {
     const url = new URL(requests[0]!.url);
     expect(url.pathname).toBe("/v1/threads/th%2Ffolded/view");
     expect(url.searchParams.get("limit")).toBe("256");
+    expect(url.searchParams.get("turn_aligned")).toBe("true");
     expect(url.searchParams.get("before")).toBe("512");
   });
 
@@ -355,6 +356,7 @@ describe("ProtocolClient", () => {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(request);
       if (request.url.includes("/v1/modes")) return Response.json([mode]);
+      if (request.url.endsWith("/v1/models/refresh")) return Response.json([model]);
       if (request.url.endsWith("/v1/models")) return Response.json([model]);
       return Response.json(thread);
     });
@@ -365,12 +367,13 @@ describe("ProtocolClient", () => {
 
     await expect(client.modes("ws_1")).resolves.toEqual([mode]);
     await expect(client.models()).resolves.toEqual([model]);
+    await expect(client.refreshModels()).resolves.toEqual([model]);
     await expect(
       client.updateThread("th_1", { permission_mode: "allow_list" }),
     ).resolves.toEqual(thread);
 
     expect(requests[0]?.url).toContain("workspace_id=ws_1");
-    expect(requests[2]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    expect(requests[3]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
   });
 
   it("attaches the ephemeral desktop CSRF header only through mutation calls", async () => {
@@ -684,6 +687,11 @@ describe("ProtocolClient", () => {
       }),
     ).resolves.toEqual(provider);
     await expect(client.mcpServers("workspace / one", false)).resolves.toEqual([]);
+    await expect(client.setMcpServerEnabled("docs/server", {
+      scope: "workspace",
+      workspace_id: "workspace / one",
+      enabled: false,
+    })).resolves.toBeUndefined();
     await expect(
       client.deleteMcpServer("docs/server", "workspace", "workspace / one"),
     ).resolves.toBeUndefined();
@@ -692,8 +700,11 @@ describe("ProtocolClient", () => {
     expect(requests[1]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
     expect(requests[2]?.url).toContain("workspace_id=workspace+%2F+one");
     expect(requests[2]?.url).toContain("probe=false");
-    expect(requests[3]?.url).toContain("/v1/mcp-servers/docs%2Fserver?");
+    expect(requests[3]?.url).toContain("/v1/mcp-servers/docs%2Fserver/enabled");
+    expect(requests[3]?.method).toBe("PUT");
     expect(requests[3]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    expect(requests[4]?.url).toContain("/v1/mcp-servers/docs%2Fserver?");
+    expect(requests[4]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
   });
 
   it("redacts malformed management payloads from diagnostics", async () => {

@@ -5,6 +5,7 @@ import {
   chatBookmarkForNavigation,
   DEFAULT_RESUME_PREFERENCES,
   normalizeResumePreferences,
+  preferredSessionThreadId,
   ResumePreferencesController,
 } from "./resume-preferences.js";
 
@@ -22,12 +23,14 @@ describe("resume preferences", () => {
         "th-2": { itemId: "bad\nitem", offset: 2 },
         "th-3": { itemId: "assistant:43", offset: Number.POSITIVE_INFINITY },
       },
+      closedThreadTabs: ["th-2", "bad/thread", "th-2", "th-3"],
     });
 
     expect(normalized).toEqual({
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
+      closedThreadTabs: ["th-2", "th-3"],
     });
     expect(Object.isFrozen(normalized)).toBe(true);
     expect(Object.isFrozen(normalized.threadScroll["th-1"])).toBe(true);
@@ -45,11 +48,13 @@ describe("resume preferences", () => {
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "user:1", offset: 4 } },
+      closedThreadTabs: ["th-2"],
     });
     expect(adapter.load()).toEqual({
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "user:1", offset: 4 } },
+      closedThreadTabs: ["th-2"],
     });
     values.set("trouve.resume.v1", "{");
     expect(adapter.load()).toBeUndefined();
@@ -68,6 +73,11 @@ describe("resume preferences", () => {
     controller.persist();
     expect(storage.save).toHaveBeenCalledTimes(2);
     expect(controller.setThreadScroll("th-1", undefined).threadScroll).toEqual({});
+
+    const closed = controller.setThreadTabClosed("th-2", true);
+    expect(closed.closedThreadTabs).toEqual(["th-2"]);
+    expect(controller.setThreadTabClosed("th-2", true)).toBe(closed);
+    expect(controller.setThreadTabClosed("th-2", false).closedThreadTabs).toEqual([]);
   });
 
   it("opens running and queued threads at the tail instead of parked history", () => {
@@ -75,6 +85,26 @@ describe("resume preferences", () => {
     expect(chatBookmarkForNavigation(bookmark, false, false)).toBe(bookmark);
     expect(chatBookmarkForNavigation(bookmark, true, false)).toBeUndefined();
     expect(chatBookmarkForNavigation(bookmark, false, true)).toBeUndefined();
+  });
+
+  it("keeps session-level navigation on an open thread tab", () => {
+    const preferences = normalizeResumePreferences({
+      selectedSessionId: "se-1",
+      sessionThreads: { "se-1": "th-closed" },
+      closedThreadTabs: ["th-closed", "th-latest"],
+    });
+    expect(preferredSessionThreadId(
+      preferences,
+      "se-1",
+      "th-latest",
+      ["th-open", "th-closed", "th-latest"],
+    )).toBe("th-open");
+    expect(preferredSessionThreadId(
+      preferences,
+      "se-1",
+      "th-latest",
+      ["th-closed", "th-latest"],
+    )).toBeUndefined();
   });
 
   it("keeps only the most recently touched thousand entries", () => {
@@ -86,5 +116,13 @@ describe("resume preferences", () => {
     expect(Object.keys(current.sessionThreads)).toHaveLength(1_000);
     expect(current.sessionThreads["se-0"]).toBeUndefined();
     expect(current.sessionThreads["se-1004"]).toBe("th-1004");
+
+    for (let index = 0; index < 1_005; index += 1) {
+      controller.setThreadTabClosed(`th-closed-${index}`, true, false);
+    }
+    const closed = controller.current.get().closedThreadTabs;
+    expect(closed).toHaveLength(1_000);
+    expect(closed[0]).toBe("th-closed-5");
+    expect(closed.at(-1)).toBe("th-closed-1004");
   });
 });

@@ -34,10 +34,12 @@ describe("SubscriptionHealthController", () => {
 
     const one = controller.refresh();
     const two = controller.refresh();
+    expect(controller.loading.get()).toBe(true);
     expect(subscriptionHealth).toHaveBeenCalledTimes(1);
     first.resolve([health("codex")]);
     await expect(one).resolves.toEqual([health("codex")]);
     await expect(two).resolves.toEqual([health("codex")]);
+    expect(controller.loading.get()).toBe(false);
 
     now += 29_999;
     await expect(controller.refresh()).resolves.toEqual([health("codex")]);
@@ -58,8 +60,10 @@ describe("SubscriptionHealthController", () => {
 
     const oldRequest = controller.refresh();
     const currentRequest = controller.refresh("force");
+    expect(controller.loading.get()).toBe(true);
     current.resolve([health("current")]);
     await expect(currentRequest).resolves.toEqual([health("current")]);
+    expect(controller.loading.get()).toBe(false);
     old.resolve([health("stale")]);
     await expect(oldRequest).resolves.toEqual([health("current")]);
     expect(controller.current.get()).toEqual([health("current")]);

@@ -13,8 +13,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
 use trouve_agents::{
-    AgentBackend, BackendCollaboratorEvent, BackendError, BackendEvent, BackendPermission,
-    BackendSteer, BackendTurn,
+    AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
+    BackendPermission, BackendSteer, BackendTurn,
 };
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
@@ -1130,6 +1130,10 @@ fn build_all_backends(
 
 impl Engine {
     pub fn new(store: Store, data_dir: PathBuf, config: &Config) -> Self {
+        // Desktop launchers commonly inherit a reduced PATH. Capture the
+        // user's login-shell PATH during server startup so the first provider
+        // or MCP launch never pays shell initialization latency.
+        let _ = trouve_agents::process_env::effective_path();
         let secrets: Arc<dyn trouve_providers::secrets::SecretStore> =
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
         let model_catalog =
@@ -1400,22 +1404,61 @@ impl Engine {
         ids
     }
 
-    /// All models available right now. Catalog-covered providers and backends
-    /// use live account-visible ids over canonical models.dev metadata;
-    /// uncatalogued custom, Cursor-only, and local models come from explicit
-    /// adapters. Backends without credentials are skipped entirely — their
-    /// models cannot run, so listing them only clutters the picker.
+    /// Instant model snapshot for first paint. Catalog-covered providers and
+    /// backends use their offline-safe static rosters, while explicit adapters
+    /// may expose a cached live result. Backends without credentials are
+    /// skipped entirely — their models cannot run, so listing them only
+    /// clutters the picker.
     ///
     /// While the server is offline, only models that can actually run are
     /// listed: the built-in local provider and loopback endpoints (Ollama
     /// etc.). Remote providers and vendor backends are dropped instead of
-    /// degrading to static/fallback catalogs of models every turn would
-    /// fail on; clients gate prompt entry on this list being non-empty.
+    /// degrading to static/fallback catalogs of models every turn would fail
+    /// on. Live account and vendor-CLI availability is resolved separately by
+    /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let online = self.is_online();
-        // A model-list request is an explicit synchronization point. Refresh
-        // here rather than mutating UI-visible metadata silently from the
-        // background connectivity poll.
+        let offline_capable = if online {
+            std::collections::HashSet::new()
+        } else {
+            self.offline_capable_provider_ids()
+        };
+        let providers: Vec<_> = self
+            .providers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
+            .map(|(_, p)| p.clone())
+            .collect();
+        let mut models: Vec<_> = providers
+            .iter()
+            .flat_map(|provider| provider.models())
+            .collect();
+        let ready: Vec<_> = if online {
+            self.backends
+                .read()
+                .unwrap()
+                .values()
+                .filter(|b| {
+                    let status = b.status();
+                    status.installed && status.has_credentials
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new() // vendor backends all need their cloud
+        };
+        models.extend(ready.iter().flat_map(|backend| backend.models()));
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
+
+    /// Resolve live account-visible and vendor-CLI model availability. Clients
+    /// call this after painting list_models, then replace the static snapshot
+    /// when this richer result arrives.
+    pub async fn refresh_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let online = self.is_online();
         if online
             && self.connectivity_probe.is_some()
             && let Err(error) = self.model_catalog.refresh_if_stale().await
@@ -1433,24 +1476,25 @@ impl Engine {
             .unwrap()
             .iter()
             .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(_, p)| p.clone())
+            .map(|(_, provider)| provider.clone())
             .collect();
         let provider_lists =
-            futures::future::join_all(providers.iter().map(|p| p.list_models())).await;
+            futures::future::join_all(providers.iter().map(|provider| provider.list_models()))
+                .await;
         let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
         let ready: Vec<_> = if online {
             self.backends
                 .read()
                 .unwrap()
                 .values()
-                .filter(|b| {
-                    let status = b.status();
+                .filter(|backend| {
+                    let status = backend.status();
                     status.installed && status.has_credentials
                 })
                 .cloned()
                 .collect()
         } else {
-            Vec::new() // vendor backends all need their cloud
+            Vec::new()
         };
         let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
         models.extend(listings.into_iter().flatten());
@@ -2433,6 +2477,7 @@ impl Engine {
         }
         let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
             session_id: session.id.clone(),
+            title: Some(automation.name.clone()),
             mode: automation.mode.clone(),
             model: automation.model.clone(),
             model_options,
@@ -3173,6 +3218,28 @@ impl Engine {
                     source: "heuristic".into(),
                 }
             }
+        }
+    }
+
+    async fn generate_subagent_title(
+        &self,
+        supplied_name: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Option<String> {
+        let name = match supplied_name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => name.to_string(),
+            None => {
+                let prompt = prompt.map(str::trim).filter(|prompt| !prompt.is_empty())?;
+                self.generate_session_title(prompt).await.title
+            }
+        };
+        let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else if normalized.starts_with("Subagent:") {
+            Some(normalized)
+        } else {
+            Some(format!("Subagent: {normalized}"))
         }
     }
 
@@ -4019,7 +4086,10 @@ impl Engine {
                         match probed {
                             Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
                             Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
-                            None => ("unknown".to_string(), String::new()),
+                            None => self
+                                .mcp_logs
+                                .health(&name, &config)
+                                .unwrap_or_else(|| ("unknown".to_string(), String::new())),
                         }
                     };
                     trouve_protocol::McpServerInfo {
@@ -4030,6 +4100,7 @@ impl Engine {
                         command: config.command,
                         args: config.args,
                         env: config.env,
+                        enabled: Some(!config.disabled),
                         health,
                         detail,
                     }
@@ -4057,24 +4128,35 @@ impl Engine {
             Path::new(&session.worktree_path),
         )
         .into_iter()
-        .map(|(name, config, source)| trouve_protocol::McpServerInfo {
-            name,
-            scope: source.clone(),
-            workspace_id: session.workspace_id.clone(),
-            workspace_name: String::new(),
-            command: config.command,
-            args: config.args,
-            env: config.env,
-            health: if config.disabled {
-                "disabled".into()
+        .map(|(name, config, source)| {
+            let (health, detail) = if config.disabled {
+                (
+                    "disabled".into(),
+                    format!("disabled by the {source} config"),
+                )
+            } else if source != "app-wide" {
+                (
+                    "untrusted".into(),
+                    "defined in this repository; copy it into the app-wide MCP settings to trust it"
+                        .into(),
+                )
             } else {
-                "unknown".into()
-            },
-            detail: if config.disabled {
-                format!("disabled by the {source} config")
-            } else {
-                String::new()
-            },
+                self.mcp_logs
+                    .health(&name, &config)
+                    .unwrap_or_else(|| ("unknown".into(), "Health not checked".into()))
+            };
+            trouve_protocol::McpServerInfo {
+                name,
+                scope: source,
+                workspace_id: session.workspace_id.clone(),
+                workspace_name: String::new(),
+                command: config.command,
+                args: config.args,
+                env: config.env,
+                enabled: Some(!config.disabled),
+                health,
+                detail,
+            }
         })
         .collect())
     }
@@ -4099,9 +4181,31 @@ impl Engine {
             command: req.command.trim().to_string(),
             args: req.args.clone(),
             env: req.env.clone(),
-            disabled: false,
+            disabled: !req.enabled.unwrap_or(true),
         };
         crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)
+    }
+
+    /// Persistently enable or disable an existing MCP server without
+    /// replacing the rest of its configuration.
+    pub fn set_mcp_server_enabled(
+        &self,
+        name: &str,
+        req: &trouve_protocol::SetMcpServerEnabledRequest,
+    ) -> Result<(), EngineError> {
+        let name = name.trim();
+        if name.is_empty() || name.contains("__") || name.contains('/') {
+            return Err(EngineError::BadRequest(
+                "server name must be non-empty and free of '__' and '/'".into(),
+            ));
+        }
+        let path = self.mcp_config_path(&req.scope, req.workspace_id.as_deref())?;
+        let found = crate::mcp::set_server_enabled(&path, name, req.enabled)
+            .map_err(EngineError::Internal)?;
+        if !found {
+            return Err(EngineError::NotFound(format!("MCP server {name}")));
+        }
+        Ok(())
     }
 
     /// Remove an MCP server from the scope's config file.
@@ -5261,6 +5365,11 @@ impl Engine {
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
+            title: req
+                .title
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .map(|title| title.chars().take(96).collect::<String>())
+                .filter(|title| !title.is_empty()),
             mode: mode.id.clone(),
             model,
             model_options: model_options.clone(),
@@ -5293,14 +5402,79 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("thread {id}")))
     }
 
+    /// Spawn parentage controls hierarchy, while the selected data-driven
+    /// mode controls whether a child is an audit transcript or an interactive
+    /// conversation. Unknown/missing modes fail closed.
+    fn subagent_is_read_only(&self, thread: &Thread) -> Result<bool, EngineError> {
+        if !thread.spawned {
+            return Ok(false);
+        }
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
+        let modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        Ok(modes::find_mode(&modes, &thread.mode)
+            .map(|mode| mode.read_only)
+            .unwrap_or(true))
+    }
+
+    fn backend_collaborator_mode(
+        &self,
+        session: &Session,
+        inherited_thread: &Thread,
+        access: BackendCollaboratorAccess,
+    ) -> Result<String, EngineError> {
+        if access == BackendCollaboratorAccess::Inherit {
+            return Ok(inherited_thread.mode.clone());
+        }
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
+        let modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let read_only = access == BackendCollaboratorAccess::ReadOnly;
+        let inherited = modes::find_mode(&modes, &inherited_thread.mode);
+        let inherited_matches = inherited.is_some_and(|mode| mode.read_only == read_only);
+        if inherited_matches {
+            return Ok(inherited_thread.mode.clone());
+        }
+        let preferred = match access {
+            BackendCollaboratorAccess::ReadOnly => ["plan", "review", "question"].as_slice(),
+            BackendCollaboratorAccess::Interactive => ["code", "architect"].as_slice(),
+            BackendCollaboratorAccess::Inherit => unreachable!(),
+        };
+        preferred
+            .iter()
+            .find_map(|id| modes::find_mode(&modes, id).filter(|mode| mode.read_only == read_only))
+            .or_else(|| modes.iter().find(|mode| mode.read_only == read_only))
+            .map(|mode| mode.id.clone())
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!(
+                    "no {} mode is configured for this subagent",
+                    if access == BackendCollaboratorAccess::ReadOnly {
+                        "read-only"
+                    } else {
+                        "interactive"
+                    }
+                ))
+            })
+    }
+
     pub fn thread_view_snapshot(
         &self,
         id: &str,
         before: Option<u64>,
         limit: usize,
+        turn_aligned: bool,
     ) -> Result<(u64, trouve_protocol::ThreadViewSnapshot), EngineError> {
         self.get_thread(id)?;
-        Ok(self.store.thread_view_snapshot(id, before, limit)?)
+        Ok(self
+            .store
+            .thread_view_snapshot(id, before, limit, turn_aligned)?)
     }
 
     pub fn thread_tool_details(
@@ -5320,6 +5494,32 @@ impl Engine {
         Ok(self.store.list_threads(session_id)?)
     }
 
+    pub fn list_thread_subagents(&self, thread_id: &str) -> Result<Vec<Thread>, EngineError> {
+        self.get_thread(thread_id)?;
+        let mut children = self
+            .store
+            .spawned_children(thread_id)?
+            .into_iter()
+            .map(|child_id| self.store.thread(&child_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        children.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(children)
+    }
+
+    pub fn list_thread_statuses(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::ThreadStatus>, EngineError> {
+        Ok(self.store.list_thread_statuses(session_id)?)
+    }
+
     /// Change thread settings (mode/model/options) between turns. Conflicts
     /// while a turn is running in the thread's session.
     pub fn update_thread(
@@ -5328,6 +5528,11 @@ impl Engine {
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
         let thread = self.get_thread(id)?;
+        if self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
         let session = self.get_session(&thread.session_id)?;
 
         // The session lock is held for the duration of a turn; a locked
@@ -5578,6 +5783,7 @@ impl Engine {
             .await?;
         let thread = match self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
+            title: Some(session.title.clone()),
             mode: Some(source_thread.mode),
             model: Some(source_thread.model),
             model_options: source_thread.model_options,
@@ -5684,7 +5890,7 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
-        self.send_message_with_tools(thread_id, content, uploads, true)
+        self.send_message_with_tools(thread_id, content, uploads, true, false)
     }
 
     pub(crate) fn send_message_without_tools(
@@ -5692,7 +5898,7 @@ impl Engine {
         thread_id: &str,
         content: String,
     ) -> Result<TurnAccepted, EngineError> {
-        self.send_message_with_tools(thread_id, content, Vec::new(), false)
+        self.send_message_with_tools(thread_id, content, Vec::new(), false, false)
     }
 
     fn turn_shell_events(
@@ -5754,7 +5960,12 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<trouve_protocol::SteerAccepted, EngineError> {
-        self.get_thread(thread_id)?;
+        let thread = self.get_thread(thread_id)?;
+        if self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
         if content.trim().is_empty() && uploads.is_empty() {
             return Err(EngineError::BadRequest(
                 "a steering message needs text or an attachment".into(),
@@ -5810,8 +6021,14 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
         tools_enabled: bool,
+        allow_spawned: bool,
     ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        if !allow_spawned && self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
         let prepared = self.prepare_attachments(uploads)?;
         let attachments = prepared
             .iter()
@@ -5865,6 +6082,7 @@ impl Engine {
                     .unwrap()
                     .insert(thread_id.to_string());
             }
+            let queued_prompt = prompt.clone();
             let result = self.store.accept_prompt_with_events(
                 prompt,
                 tools_enabled,
@@ -5888,6 +6106,7 @@ impl Engine {
                 thread_id: thread_id.to_string(),
                 turn: 0,
                 queued: true,
+                queued_prompt: Some(queued_prompt),
             });
         }
 
@@ -5955,6 +6174,7 @@ impl Engine {
             thread_id: thread_id.to_string(),
             turn,
             queued: false,
+            queued_prompt: None,
         })
     }
 
@@ -6237,6 +6457,7 @@ impl Engine {
                 thread_id,
                 turn: 0,
                 queued: true,
+                queued_prompt: Some(prompt),
             });
         }
 
@@ -6250,6 +6471,7 @@ impl Engine {
             thread_id,
             turn,
             queued: false,
+            queued_prompt: None,
         })
     }
 
@@ -6714,6 +6936,17 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        // A turn owns only a shared session lifecycle lease. Sibling turns in
+        // the same worktree may reason and invoke tools concurrently; the
+        // narrower tool-execution lane is the authority that serializes
+        // actual mutations. Exclusive lifecycle operations still wait for
+        // every active turn.
+        let session_lifecycle = self.session_lock(&session.id);
+        let _session_lifecycle_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = session_lifecycle.read() => guard,
+        };
         let background = self.store.is_code_review_thread(&thread.id)?;
         let turn_capacity = self
             .turn_scheduler
@@ -6737,38 +6970,11 @@ impl Engine {
             )
             .await?;
 
-        // Serialize worktree mutations across the session's threads while
-        // allowing ordinary read-only siblings (review, plan, question) to
-        // run together. Agent-spawned read-only children retain their
-        // lock-free exception so they can inspect while a writing parent
-        // holds the write guard; that pre-existing trade-off is what makes
-        // spawn_thread fan-out usable from code mode.
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
-        let lock = self.session_lock(&session.id);
-        let _read_guard;
-        let _write_guard;
-        if concurrent_child {
-            _read_guard = None;
-            _write_guard = None;
-        } else if mode.read_only {
-            _read_guard = Some(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                guard = lock.read() => guard,
-            });
-            _write_guard = None;
-        } else {
-            _read_guard = None;
-            _write_guard = Some(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                guard = lock.write() => guard,
-            });
-        }
         let _turn_capacity = turn_capacity;
 
         // External agent backend? The vendor harness owns the loop; we
-        // stream its events and bridge approvals. (Session lock stays held.)
+        // stream its events and bridge approvals. The shared lifecycle lease
+        // stays held; mutation tools take the exclusive execution lane.
         if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
@@ -6781,7 +6987,6 @@ impl Engine {
                     model_name,
                     content,
                     attachments,
-                    concurrent_child,
                     cancel,
                     &prompt.id,
                     tools_enabled,
@@ -7206,13 +7411,14 @@ impl Engine {
             context_input_tokens,
         )?;
 
-        // Snapshot the worktree when the turn changed it. Lock-free child
-        // turns never snapshot: they can't write, so any dirt is the
-        // parent's in-flight work — not theirs to checkpoint.
-        let checkpoint_id = if concurrent_child {
+        // Read-only turns never snapshot: any dirty worktree state belongs to
+        // a concurrent mutation-capable turn. Code turns checkpoint through
+        // the same exclusive mutation lane as edits and Git commands.
+        let checkpoint_id = if mode.read_only {
             None
         } else {
-            self.maybe_checkpoint(&session, thread, turn).await?
+            self.maybe_checkpoint(&session, thread, turn, &cancel)
+                .await?
         };
         if cancel.is_cancelled() {
             return Ok(());
@@ -7724,13 +7930,15 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_backend_collaborator(
+    async fn start_backend_collaborator(
         &self,
         session: &Session,
         parent_thread: &Thread,
         backend_id: &str,
         vendor_session_id: String,
         parent_vendor_session_id: &str,
+        name: Option<String>,
+        access: BackendCollaboratorAccess,
         prompt: Option<String>,
         model: Option<String>,
         thinking_level: Option<String>,
@@ -7786,10 +7994,15 @@ impl Engine {
                     .map(str::to_string)
             })
         });
+        let title = self
+            .generate_subagent_title(name.as_deref(), prompt.as_deref())
+            .await;
+        let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
         let child = self
             .create_thread(CreateThreadRequest {
                 session_id: session.id.clone(),
-                mode: Some(inherited_thread.mode.clone()),
+                title,
+                mode: Some(child_mode),
                 model: Some(model),
                 model_options,
                 permission_mode: Some(inherited_thread.permission_mode),
@@ -8149,7 +8362,6 @@ impl Engine {
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
-        concurrent_child: bool,
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
         tools_enabled: bool,
@@ -8588,24 +8800,80 @@ impl Engine {
                 BackendEvent::CollaboratorStarted {
                     session_id,
                     parent_session_id,
+                    name,
+                    access,
                     prompt,
                     model,
                     thinking_level,
                 } => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let vendor_session_id = session_id.clone();
+                    let newly_announced = !collaborators.contains_key(&vendor_session_id);
+                    let prompt_announced =
+                        prompt.as_deref().is_some_and(|prompt| !prompt.is_empty());
                     self.start_backend_collaborator(
                         session,
                         thread,
                         backend_id,
                         session_id,
                         &parent_session_id,
+                        name,
+                        access,
                         prompt,
                         model,
                         thinking_level,
                         &mut vendor_threads,
                         &mut collaborators,
-                    )?;
+                    )
+                    .await?;
+                    if newly_announced
+                        && let Some(collaborator) = collaborators.get(&vendor_session_id)
+                    {
+                        let child_thread_id = collaborator.thread.id.clone();
+                        let child_session_id = collaborator.thread.session_id.clone();
+                        let child_model = collaborator.thread.model.clone();
+                        let child_prompt =
+                            collaborator.last_user_message.clone().unwrap_or_default();
+                        let parent_thread_id = self
+                            .store
+                            .spawn_parent(&child_thread_id)?
+                            .unwrap_or_else(|| thread.id.clone());
+                        let parent_turn = if parent_thread_id == thread.id {
+                            turn
+                        } else {
+                            collaborators
+                                .values()
+                                .find(|candidate| candidate.thread.id == parent_thread_id)
+                                .map_or(turn, |candidate| candidate.turn)
+                        };
+                        self.store
+                            .append_event_async(
+                                Scope::Thread(parent_thread_id),
+                                Event::SubagentSpawned {
+                                    turn: parent_turn,
+                                    thread_id: child_thread_id,
+                                    session_id: child_session_id,
+                                    prompt: child_prompt,
+                                    model: child_model,
+                                    call_id: None,
+                                },
+                            )
+                            .await?;
+                    }
+                    // The child route does not replay its initial user item.
+                    // When the backend announcement supplies or recovers the
+                    // spawn prompt, publish it immediately instead of waiting
+                    // for the child's first tool completion or terminal event.
+                    if prompt_announced
+                        && let Some(collaborator) = collaborators.get_mut(&vendor_session_id)
+                    {
+                        flush_backend_event_batch(
+                            &self.store,
+                            &Scope::Thread(collaborator.thread.id.clone()),
+                            &mut collaborator.persisted,
+                        )
+                        .await?;
+                    }
                     if let Some(collaborator) =
                         collaborators
                             .get(&vendor_session_id)
@@ -8633,11 +8901,14 @@ impl Engine {
                             session_id.clone(),
                             &parent_session_id,
                             None,
+                            BackendCollaboratorAccess::Inherit,
+                            None,
                             None,
                             None,
                             &mut vendor_threads,
                             &mut collaborators,
-                        )?;
+                        )
+                        .await?;
                     }
                     if let Some(collaborator) = collaborators.get(&session_id) {
                         collaborator_claims.claim(&collaborator.thread.id, &session.id);
@@ -8908,14 +9179,13 @@ impl Engine {
             &usage_total,
             context_input_tokens,
         )?;
-        // Lock-free children (read-only spawned agents) never checkpoint:
-        // they hold no session lock, so `git add`/write-tree here would race
-        // the parent's concurrent turn and snapshot its half-finished work as
-        // the child's checkpoint. Matches the native path (invariant 4).
-        let checkpoint_id = if concurrent_child {
+        // Read-only turns never checkpoint shared dirt. Mutation-capable
+        // turns serialize the snapshot with every other worktree mutation.
+        let checkpoint_id = if mode.read_only {
             None
         } else {
-            self.maybe_checkpoint(session, thread, turn).await?
+            self.maybe_checkpoint(session, thread, turn, &cancel)
+                .await?
         };
         self.store.append_event(
             scope,
@@ -9346,17 +9616,43 @@ impl Engine {
                 ToolStatus::Ok
             };
             let model_result = result.to_string();
-            self.store
-                .append_event_async(
-                    scope,
-                    Event::ToolCompleted {
-                        call_id,
-                        status,
-                        result,
-                        execution_duration_ms: Some(execution_duration_ms),
-                    },
-                )
-                .await?;
+            let spawned = if status == ToolStatus::Ok
+                && matches!(call.name.as_str(), "spawn_thread" | "spawn_session")
+            {
+                match (
+                    result.get("thread_id").and_then(serde_json::Value::as_str),
+                    result.get("session_id").and_then(serde_json::Value::as_str),
+                    result.get("prompt").and_then(serde_json::Value::as_str),
+                    result.get("model").and_then(serde_json::Value::as_str),
+                ) {
+                    (Some(thread_id), Some(session_id), Some(prompt), Some(model)) => Some((
+                        thread_id.to_string(),
+                        session_id.to_string(),
+                        prompt.to_string(),
+                        model.to_string(),
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut completed = vec![Event::ToolCompleted {
+                call_id: call_id.clone(),
+                status,
+                result,
+                execution_duration_ms: Some(execution_duration_ms),
+            }];
+            if let Some((thread_id, session_id, prompt, model)) = spawned {
+                completed.push(Event::SubagentSpawned {
+                    turn,
+                    thread_id,
+                    session_id,
+                    prompt,
+                    model,
+                    call_id: Some(call_id),
+                });
+            }
+            self.store.append_events_async(scope, completed).await?;
             return Ok((model_result, Vec::new()));
         }
 
@@ -9702,24 +9998,40 @@ impl Engine {
         } else {
             serde_json::Map::new()
         };
-
-        let (child_session_id, extra) = if name == "spawn_session" {
-            let title = args
-                .get("title")
+        let explicit_session_title = args
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(String::from);
+        let supplied_child_name = ["name", "task_name", "title"].into_iter().find_map(|key| {
+            args.get(key)
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|t| !t.is_empty())
+                .filter(|name| !name.is_empty())
                 .map(String::from)
-                .unwrap_or_else(|| {
-                    let snippet: String = prompt
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(48)
-                        .collect();
-                    format!("Agent: {snippet}")
-                });
+        });
+        let generated_title = if supplied_child_name.is_none()
+            || (name == "spawn_session" && explicit_session_title.is_none())
+        {
+            Some(self.generate_session_title(prompt).await.title)
+        } else {
+            None
+        };
+        let child_title = self
+            .generate_subagent_title(
+                supplied_child_name
+                    .as_deref()
+                    .or(generated_title.as_deref()),
+                None,
+            )
+            .await;
+
+        let (child_session_id, extra) = if name == "spawn_session" {
+            let title = explicit_session_title
+                .clone()
+                .or_else(|| generated_title.clone())
+                .expect("a missing child-session title is generated");
             // Base the child on the parent's latest checkpoint commit, not
             // its branch: turn checkpoints are written to hidden refs and
             // never move the session branch, so basing on the branch would
@@ -9756,6 +10068,7 @@ impl Engine {
         let child = self
             .create_thread(CreateThreadRequest {
                 session_id: child_session_id.clone(),
+                title: child_title,
                 mode: Some(child_mode),
                 model: Some(child_model),
                 model_options,
@@ -9768,12 +10081,14 @@ impl Engine {
             "thread"
         };
         self.store.insert_spawned(&child.id, &thread.id, kind)?;
-        self.send_message(&child.id, prompt.to_string(), Vec::new())
+        self.send_message_with_tools(&child.id, prompt.to_string(), Vec::new(), true, true)
             .map_err(|e| anyhow!(e.to_string()))?;
 
         let mut result = serde_json::json!({
             "thread_id": child.id,
             "session_id": child_session_id,
+            "prompt": prompt,
+            "model": child.model,
             "note": "child agent started; check on it with spawn_output",
         });
         if let Some(extra) = extra {
@@ -10014,7 +10329,14 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<String>> {
+        let execution_lock = self.tool_execution_lock(&session.id);
+        let _mutation_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(None),
+            guard = execution_lock.write_owned() => guard,
+        };
         let worktree = PathBuf::from(&session.worktree_path);
         let dirty = {
             let wt = worktree.clone();
@@ -10804,12 +11126,10 @@ pub fn spawn_thread_spec() -> ToolSpec {
         description: "Start a child agent on a new thread in this session (same working \
                       tree). Returns the child's thread_id immediately; collect results \
                       with spawn_output. The child inherits your mode, model and \
-                      permission level unless overridden. Children in read-only modes \
-                      (e.g. plan) run concurrently with your turn — ideal for parallel \
-                      exploration and research. Children that can write must wait for \
-                      your current turn to finish before starting, so never block on \
-                      one with spawn_output's wait_ms; prefer spawn_session for \
-                      write-heavy delegation."
+                      permission level unless overridden. Children run concurrently with \
+                      your turn. Same-session mutations are serialized by trouve, but \
+                      agents share one worktree and can still make semantically conflicting \
+                      changes; use spawn_session when work needs full isolation."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -10817,6 +11137,10 @@ pub fn spawn_thread_spec() -> ToolSpec {
                 "prompt": {
                     "type": "string",
                     "description": "The task for the child agent. Self-contained: the child does not see your conversation."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional concise name for the child. When omitted, trouve applies the configured session/thread naming model to the prompt."
                 },
                 "mode": {
                     "type": "string",
@@ -10856,6 +11180,10 @@ pub fn spawn_session_spec() -> ToolSpec {
                     "type": "string",
                     "description": "Session title; derived from the prompt when omitted. It also contributes to the branch name when title-derived branch naming is enabled."
                 },
+                "name": {
+                    "type": "string",
+                    "description": "Optional concise name for the child thread. The session title is used when omitted; otherwise trouve applies the configured session/thread naming model to the prompt."
+                },
                 "mode": {
                     "type": "string",
                     "description": "Agent mode id for the child (default: your mode)."
@@ -10879,9 +11207,7 @@ pub fn spawn_output_spec() -> ToolSpec {
                       spawn_thread or spawn_session. Returns status (pending | running \
                       | completed | failed), the child's last assistant message, turns \
                       completed, and token usage. Set wait_ms to block until the child \
-                      finishes (or the timeout passes) — but only wait on children that \
-                      run concurrently (read-only same-session children, or any \
-                      spawn_session child)."
+                      finishes or the timeout passes."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -11365,6 +11691,55 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    struct CatalogTestProvider {
+        live_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
+        trouve_protocol::ModelInfo {
+            id: id.into(),
+            display_name: display_name.into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({}),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CatalogTestProvider {
+        fn id(&self) -> &str {
+            "catalog-test"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "catalog-test/static",
+                "Static catalog model",
+            )]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.live_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![catalog_test_model(
+                "catalog-test/live",
+                "Live discovered model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("model catalog tests never start a provider turn")
+        }
+    }
+
     struct BlockingToolExecutor {
         started: tokio::sync::mpsc::UnboundedSender<String>,
         releases: Arc<tokio::sync::Semaphore>,
@@ -11440,6 +11815,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_model_catalog_does_not_wait_for_live_discovery() {
+        let data = tempfile::tempdir().unwrap();
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "catalog-test",
+            Arc::new(CatalogTestProvider {
+                live_calls: live_calls.clone(),
+            }),
+        );
+
+        let static_models = engine.list_models().await;
+        assert!(
+            static_models
+                .iter()
+                .any(|model| model.id == "catalog-test/static")
+        );
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let live_models = engine.refresh_models().await;
+        assert!(
+            live_models
+                .iter()
+                .any(|model| model.id == "catalog-test/live")
+        );
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn idle_message_acceptance_persists_the_turn_shell_before_startup() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -11464,6 +11875,7 @@ mod tests {
         let thread = Thread {
             id: "th_fast_accept".into(),
             session_id: session.id,
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -11534,6 +11946,7 @@ mod tests {
         let thread = Thread {
             id: "th_fast_queue".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -11566,6 +11979,7 @@ mod tests {
         let queue = store.queued_prompts(&thread.id).unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].content, "Queue immediately");
+        assert_eq!(accepted.queued_prompt.as_ref(), queue.first());
         let events = store
             .events_after(&Scope::Thread(thread.id.clone()), 0)
             .unwrap();
@@ -11608,6 +12022,7 @@ mod tests {
         let thread = Thread {
             id: "th_cancel_question".into(),
             session_id: session.id,
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -11710,6 +12125,7 @@ mod tests {
         let parent = engine
             .create_thread(CreateThreadRequest {
                 session_id: session.id.clone(),
+                title: Some(session.title.clone()),
                 mode: Some("code".into()),
                 model: Some("codex/gpt-5.6-sol".into()),
                 model_options: serde_json::Map::new(),
@@ -11722,6 +12138,13 @@ mod tests {
 
         let mut vendor_threads = HashMap::from([("vendor-root".into(), parent.id.clone())]);
         let mut collaborators = HashMap::new();
+        assert_eq!(
+            engine
+                .generate_subagent_title(None, Some("Investigate the failing test"))
+                .await
+                .as_deref(),
+            Some("Subagent: Investigate failing test")
+        );
         engine
             .start_backend_collaborator(
                 &session,
@@ -11729,18 +12152,22 @@ mod tests {
                 "codex",
                 "vendor-child".into(),
                 "vendor-root",
+                Some("Native reviewer".into()),
+                BackendCollaboratorAccess::Interactive,
                 Some("Investigate the failing test".into()),
                 Some("gpt-5.6-terra".into()),
                 Some("high".into()),
                 &mut vendor_threads,
                 &mut collaborators,
             )
+            .await
             .unwrap();
 
         let child_id = vendor_threads["vendor-child"].clone();
         let child = engine.get_thread(&child_id).unwrap();
         assert!(child.spawned);
         assert_eq!(child.session_id, session.id);
+        assert_eq!(child.title.as_deref(), Some("Subagent: Native reviewer"));
         assert_eq!(child.model, "codex/gpt-5.6-terra");
         assert_eq!(child.permission_mode, trouve_protocol::PermissionMode::Yolo);
         assert_eq!(
@@ -11758,11 +12185,54 @@ mod tests {
 
         let mut claims = BackendCollaboratorClaims::new(&engine.active_threads);
         claims.claim(&child.id, &session.id);
+        assert!(!engine.subagent_is_read_only(&child).unwrap());
         let accepted = engine
             .send_message(&child.id, "Follow up when finished".into(), Vec::new())
             .unwrap();
         assert!(accepted.queued);
         assert_eq!(store.queued_prompts(&child.id).unwrap().len(), 1);
+
+        let workspace_modes = data.path().join(".agents/modes");
+        std::fs::create_dir_all(&workspace_modes).unwrap();
+        std::fs::write(
+            workspace_modes.join("plan.toml"),
+            r#"
+id = "plan"
+display_name = "Interactive Plan Override"
+system_prompt = "This workspace intentionally made plan interactive."
+allowed_tools = ["read_file"]
+read_only = false
+default_permission_mode = "ask"
+"#,
+        )
+        .unwrap();
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-audit".into(),
+                "vendor-root",
+                Some("Implementation auditor".into()),
+                BackendCollaboratorAccess::ReadOnly,
+                Some("Audit the implementation and report issues only".into()),
+                Some("gpt-5.6-terra".into()),
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let audit_child = engine.get_thread(&vendor_threads["vendor-audit"]).unwrap();
+        assert!(audit_child.spawned);
+        assert_eq!(audit_child.mode, "review");
+        assert!(engine.subagent_is_read_only(&audit_child).unwrap());
+        assert!(matches!(
+            engine.send_message(&audit_child.id, "Make a follow-up change".into(), Vec::new()),
+            Err(EngineError::Conflict(message))
+                if message.contains("read-only exploration, audit, or review mode")
+        ));
+        assert!(store.queued_prompts(&audit_child.id).unwrap().is_empty());
 
         let mode = modes::find_mode(&modes::builtin_modes(), "code")
             .unwrap()
@@ -11907,12 +12377,15 @@ mod tests {
                 "codex",
                 "vendor-child".into(),
                 "vendor-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
                 Some("Run a follow-up check".into()),
                 None,
                 None,
                 &mut vendor_threads,
                 &mut collaborators,
             )
+            .await
             .unwrap();
         let projection = collaborators.get_mut("vendor-child").unwrap();
         engine
@@ -11941,12 +12414,15 @@ mod tests {
                 "codex",
                 "vendor-child".into(),
                 "vendor-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
                 Some("Also inspect the current protocol".into()),
                 None,
                 None,
                 &mut vendor_threads,
                 &mut collaborators,
             )
+            .await
             .unwrap();
         let projection = collaborators.get_mut("vendor-child").unwrap();
         engine
@@ -12012,12 +12488,15 @@ mod tests {
                 "codex",
                 "vendor-grandchild".into(),
                 "vendor-child",
+                None,
+                BackendCollaboratorAccess::Inherit,
                 Some("Verify one more edge case".into()),
                 None,
                 None,
                 &mut vendor_threads,
                 &mut collaborators,
             )
+            .await
             .unwrap();
         let grandchild_id = vendor_threads["vendor-grandchild"].clone();
         assert_eq!(
@@ -12720,6 +13199,7 @@ mod tests {
         let thread = Thread {
             id: "th_todo".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -13172,7 +13652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_access_shares_readers_and_excludes_writers() {
+    async fn session_lifecycle_shares_turns_and_excludes_destructive_operations() {
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
             Store::open_in_memory().unwrap(),
@@ -13186,7 +13666,7 @@ mod tests {
             .expect("a second read-only turn should overlap");
         assert!(
             lock.try_write().is_err(),
-            "mutating work must wait for every read-only turn"
+            "destructive lifecycle work must wait for every active turn"
         );
         drop(second_reader);
         drop(first_reader);
@@ -13264,6 +13744,7 @@ mod tests {
         let thread = Thread {
             id: "th_vendor_lane".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "code".into(),
             model: "cursor/model".into(),
             model_options: Default::default(),
@@ -13329,6 +13810,7 @@ mod tests {
         let thread = Thread {
             id: "th_cancel_tool".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -13502,6 +13984,7 @@ mod tests {
         let thread = Thread {
             id: "th_parallel_tools".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),

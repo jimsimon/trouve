@@ -326,15 +326,14 @@ describe("Trouve visual contract", () => {
 
   it("keeps the primary inspection order and desktop-height contract", () => {
     expect(shell).toMatch(
-      /const INSPECTION_PANELS = \[\s*"info",\s*"diff",\s*"files",\s*"pr",\s*"plan",\s*"terminal",/,
+      /const INSPECTION_PANELS = \[\s*"info",\s*"diff",\s*"files",\s*"pr",\s*"terminal",/,
     );
     for (const [panel, icon, label] of [
-      ["info", "circle-info", "Info"],
+      ["info", "circle-info", "Details"],
       ["diff", "code-compare", "Diff"],
       ["files", "file-lines", "Files"],
       ["pr", "code-pull-request", "Pull Requests"],
       ["terminal", "terminal", "Terminal"],
-      ["plan", "list-check", "Todos"],
     ]) {
       expect(shell).toContain(`${panel}: { icon: "${icon}", label: "${label}" }`);
     }
@@ -383,6 +382,10 @@ describe("Trouve visual contract", () => {
   it("keeps the thread, turn-card, and composer geometry", () => {
     expect(app).toMatch(/\.thread-tabs button \{[^}]*width:\s*145px[^}]*height:\s*30px/s);
     expect(app).toMatch(/\.thread-header \{[^}]*padding:\s*10px[^}]*box-shadow:/s);
+    expect(app).toMatch(/\.thread-tab-header \{[^}]*z-index:\s*8/s);
+    expect(app).toMatch(
+      /\.thread-tab-title \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
+    );
     expect(app).toMatch(
       /\.thread-panel \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)[^}]*overflow:\s*hidden/s,
     );

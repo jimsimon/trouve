@@ -1,5 +1,7 @@
 import type { ProtocolMcpServerInfo } from "../services/protocol-client.js";
 
+export const MCP_CONFIG_CHANGED_EVENT = "trouve-mcp-config-changed";
+
 const shellWord = (value: string): string =>
   /^[A-Za-z0-9_./:@%+=,-]+$/u.test(value)
     ? value
@@ -18,6 +20,7 @@ export interface ImportedMcpServer {
   readonly command: string;
   readonly args: readonly string[];
   readonly env: Readonly<Record<string, string>>;
+  readonly enabled: boolean;
 }
 
 const jsonObject = (value: unknown): Record<string, unknown> | undefined =>
@@ -51,9 +54,6 @@ export const parseMcpConfigJson = (source: string): readonly ImportedMcpServer[]
     if (name === "") throw new Error("MCP server names cannot be empty.");
     const config = jsonObject(rawConfig);
     if (config === undefined) throw new Error(`MCP server “${name}” must be an object.`);
-    if (config.disabled === true) {
-      throw new Error(`MCP server “${name}” is disabled and cannot be imported into a managed scope.`);
-    }
     if (config.url !== undefined || config.type === "http" || config.type === "sse") {
       throw new Error(`MCP server “${name}” uses a remote transport; only stdio servers can be imported.`);
     }
@@ -74,6 +74,7 @@ export const parseMcpConfigJson = (source: string): readonly ImportedMcpServer[]
       command: config.command,
       args: [...args] as string[],
       env: Object.fromEntries(Object.entries(env) as [string, string][]),
+      enabled: config.disabled !== true,
     });
   }
   if (imported.length === 0) throw new Error("The MCP config does not contain any servers.");

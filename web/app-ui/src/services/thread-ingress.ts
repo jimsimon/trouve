@@ -6,6 +6,7 @@ import type {
   ProtocolEventEnvelope,
   ProtocolIngressEvent,
   ProtocolThread,
+  ProtocolThreadStatus,
   ProtocolThreadViewSnapshot,
 } from "./protocol-client.js";
 
@@ -13,6 +14,7 @@ type ThreadStream = CursorEventStream<ProtocolIngressEvent>;
 
 export interface ThreadProtocol {
   threads(sessionId: string): Promise<readonly ProtocolThread[]>;
+  threadStatuses?(sessionId: string): Promise<readonly ProtocolThreadStatus[]>;
   threadView(
     threadId: string,
     before?: number,
@@ -170,15 +172,32 @@ export class ThreadIngress {
   async openSession(
     sessionId: string,
     requestedThreadId?: string,
+    closedThreadIds: readonly string[] = [],
   ): Promise<string | undefined> {
     const generation = ++this.#generation;
     this.#state.set("loading");
     try {
-      const threads = await this.#client.threads(sessionId);
+      const [threads, statuses] = await Promise.all([
+        this.#client.threads(sessionId),
+        this.#client.threadStatuses?.(sessionId) ?? Promise.resolve([]),
+      ]);
       if (generation !== this.#generation) return undefined;
       this.#store.replaceThreadsForSession(sessionId, threads);
-      const selected =
-        threads.find((thread) => thread.id === requestedThreadId) ?? threads.at(-1);
+      if (this.#client.threadStatuses !== undefined) {
+        this.#store.replaceThreadStatusesForSession(sessionId, statuses);
+      }
+      const closed = new Set(closedThreadIds);
+      let latestOpen: typeof threads[number] | undefined;
+      for (let index = threads.length - 1; index >= 0; index -= 1) {
+        const candidate = threads[index];
+        if (candidate !== undefined && !closed.has(candidate.id)) {
+          latestOpen = candidate;
+          break;
+        }
+      }
+      const selected = requestedThreadId === undefined
+        ? latestOpen
+        : threads.find((thread) => thread.id === requestedThreadId) ?? latestOpen;
       if (selected === undefined) {
         this.#closeStream();
         this.#state.set("open");

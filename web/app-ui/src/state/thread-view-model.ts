@@ -29,6 +29,10 @@ export type ToolCallStatus =
 
 export type TurnState =
   | {
+      readonly kind: "waiting-for-capacity";
+      readonly startedAt?: string;
+    }
+  | {
       readonly kind: "running";
       readonly startedAt?: string;
       readonly usage?: Usage;
@@ -62,6 +66,16 @@ export type ThreadChatItem =
       readonly turn: number;
       readonly content: string;
       readonly attachments: readonly Attachment[];
+    }
+  | {
+      readonly id: string;
+      readonly kind: "subagent";
+      readonly turn: number;
+      readonly threadId: string;
+      readonly sessionId: string;
+      readonly prompt: string;
+      readonly model: string;
+      readonly callId?: string;
     }
   | {
       readonly id: string;
@@ -183,6 +197,7 @@ export class ThreadViewModel {
   readonly turnSteerable = new Map<number, boolean>();
   readonly turnStartedAt = new Map<number, string>();
   readonly turnDurationMs = new Map<number, number>();
+  readonly #capacityAcquiredBeforeStart = new Set<number>();
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -211,6 +226,7 @@ export class ThreadViewModel {
 
   /** Replace replay-built state with the server's current folded tail. */
   replaceSnapshot(cursor: number, snapshot: ProtocolThreadViewSnapshot): void {
+    this.#capacityAcquiredBeforeStart.clear();
     const itemOffset = snapshot.item_offset ?? 0;
     this.items.splice(
       0,
@@ -246,16 +262,26 @@ export class ThreadViewModel {
     this.compacting = snapshot.compacting ?? false;
     this.turnRunning = snapshot.turn_running ?? false;
     if (this.turnRunning) {
-      const runningTurn = this.#findLast(
-        (item) => item.kind === "turn-status" && item.state.kind === "running",
+      const activeTurn = this.#findLast(
+        (item) =>
+          item.kind === "turn-status"
+          && (
+            item.state.kind === "waiting-for-capacity"
+            || item.state.kind === "running"
+          ),
       );
-      if (runningTurn?.kind === "turn-status") {
-        const startedAt = this.turnStartedAt.get(runningTurn.turn);
-        runningTurn.state = {
-          kind: "running",
-          ...(startedAt === undefined ? {} : { startedAt }),
-          ...(this.lastUsage === undefined ? {} : { usage: this.lastUsage }),
-        };
+      if (activeTurn?.kind === "turn-status") {
+        const startedAt = this.turnStartedAt.get(activeTurn.turn);
+        activeTurn.state = activeTurn.state.kind === "running"
+          ? {
+              kind: "running",
+              ...(startedAt === undefined ? {} : { startedAt }),
+              ...(this.lastUsage === undefined ? {} : { usage: this.lastUsage }),
+            }
+          : {
+              kind: "waiting-for-capacity",
+              ...(startedAt === undefined ? {} : { startedAt }),
+            };
       }
     }
     this.thinking = snapshot.thinking ?? false;
@@ -330,6 +356,17 @@ export class ThreadViewModel {
           content: item.content,
           attachments: item.attachments,
         };
+      case "subagent":
+        return {
+          id,
+          kind: "subagent",
+          turn: item.turn,
+          threadId: item.thread_id,
+          sessionId: item.session_id,
+          prompt: item.prompt,
+          model: item.model,
+          ...(item.call_id == null ? {} : { callId: item.call_id }),
+        };
       case "assistant":
         return {
           id,
@@ -391,6 +428,9 @@ export class ThreadViewModel {
       case "turn_status": {
         let state: TurnState;
         switch (item.state.state) {
+          case "waiting_for_capacity":
+            state = { kind: "waiting-for-capacity" };
+            break;
           case "running":
             state = { kind: "running" };
             break;
@@ -432,6 +472,24 @@ export class ThreadViewModel {
   apply(envelope: ProtocolEventEnvelope): boolean {
     this.cursor = envelope.cursor;
     switch (envelope.type) {
+      case "turn.capacity_acquired": {
+        const waitingTurn = this.#findLast(
+          (item) =>
+            item.kind === "turn-status"
+            && item.turn === envelope.turn
+            && item.state.kind === "waiting-for-capacity",
+        );
+        if (waitingTurn?.kind === "turn-status") {
+          const startedAt = this.turnStartedAt.get(envelope.turn);
+          waitingTurn.state = {
+            kind: "running",
+            ...(startedAt === undefined ? {} : { startedAt }),
+          };
+          return true;
+        }
+        this.#capacityAcquiredBeforeStart.add(envelope.turn);
+        return false;
+      }
       case "turn.started":
         this.turnRunning = true;
         this.turnModels.set(envelope.turn, envelope.model);
@@ -442,11 +500,14 @@ export class ThreadViewModel {
         }
         this.turnSteerable.set(envelope.turn, envelope.supports_steering ?? false);
         this.turnStartedAt.set(envelope.turn, envelope.ts);
+        const capacityAcquired = this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.appendItem({
           id: `turn:${envelope.turn}`,
           kind: "turn-status",
           turn: envelope.turn,
-          state: { kind: "running", startedAt: envelope.ts },
+          state: capacityAcquired
+            ? { kind: "running", startedAt: envelope.ts }
+            : { kind: "waiting-for-capacity", startedAt: envelope.ts },
         });
         return true;
       case "thread.compaction_started":
@@ -537,6 +598,20 @@ export class ThreadViewModel {
           turn: envelope.turn,
           content: envelope.content,
           attachments: envelope.attachments ?? [],
+        });
+        return true;
+      case "subagent.spawned":
+        this.failOpenCompaction(envelope.turn);
+        this.finishThinking();
+        this.appendItem({
+          id: `subagent:${envelope.thread_id}:${envelope.cursor}`,
+          kind: "subagent",
+          turn: envelope.turn,
+          threadId: envelope.thread_id,
+          sessionId: envelope.session_id,
+          prompt: envelope.prompt,
+          model: envelope.model,
+          ...(envelope.call_id == null ? {} : { callId: envelope.call_id }),
         });
         return true;
       case "assistant.thinking": {
@@ -701,6 +776,7 @@ export class ThreadViewModel {
         return true;
       }
       case "turn.completed":
+        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
@@ -708,7 +784,7 @@ export class ThreadViewModel {
         this.lastUsage = envelope.usage;
         this.lastUsageCursor = envelope.cursor;
         this.recordTurnDuration(envelope.turn, envelope.ts);
-        return this.replaceRunningTurn(envelope.turn, {
+        return this.replaceActiveTurn(envelope.turn, {
           kind: "completed",
           usage: envelope.usage,
           ...(envelope.checkpoint_id == null
@@ -716,22 +792,24 @@ export class ThreadViewModel {
             : { checkpointId: envelope.checkpoint_id }),
         });
       case "turn.failed":
+        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
-        return this.replaceRunningTurn(envelope.turn, {
+        return this.replaceActiveTurn(envelope.turn, {
           kind: "failed",
           error: envelope.error,
         });
       case "turn.cancelled": {
+        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
-        return this.replaceRunningTurn(envelope.turn, { kind: "cancelled" });
+        return this.replaceActiveTurn(envelope.turn, { kind: "cancelled" });
       }
       default:
         return false;
@@ -744,10 +822,15 @@ export class ThreadViewModel {
   }
 
   private activeTurn(): number | undefined {
-    const running = this.#findLast(
-      (item) => item.kind === "turn-status" && item.state.kind === "running",
+    const active = this.#findLast(
+      (item) =>
+        item.kind === "turn-status"
+        && (
+          item.state.kind === "waiting-for-capacity"
+          || item.state.kind === "running"
+        ),
     );
-    return running?.kind === "turn-status" ? running.turn : undefined;
+    return active?.kind === "turn-status" ? active.turn : undefined;
   }
 
   #findLast(predicate: (item: ThreadChatItem) => boolean): ThreadChatItem | undefined {
@@ -841,12 +924,15 @@ export class ThreadViewModel {
     if (Number.isFinite(duration)) this.turnDurationMs.set(turn, Math.max(0, duration));
   }
 
-  private replaceRunningTurn(turn: number, state: TurnState): boolean {
+  private replaceActiveTurn(turn: number, state: TurnState): boolean {
     const item = this.#findLast(
       (candidate) =>
         candidate.kind === "turn-status" &&
         candidate.turn === turn &&
-        candidate.state.kind === "running",
+        (
+          candidate.state.kind === "waiting-for-capacity"
+          || candidate.state.kind === "running"
+        ),
     );
     if (item?.kind !== "turn-status") return false;
     item.state = state;

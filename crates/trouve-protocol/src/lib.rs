@@ -224,7 +224,30 @@ pub use requests::*;
 // 3.24: folded thread history includes durable TODO lifecycle entries so
 // clients can render started, completed, cancelled, and skipped TODO rail
 // nodes while retaining the latest TODO snapshot (additive).
-pub const PROTOCOL_VERSION: &str = "3.24";
+// 3.25: folded turn state distinguishes a started turn waiting for scheduler
+// capacity from one actively running its provider (additive).
+// 3.26: parent turns expose durable, linked subagent transcript nodes with an
+// optional originating tool-call id (additive).
+// 3.27: threads expose an optional durable navigation title and creation can
+// seed it without a follow-up mutation (additive).
+// 3.28: compact durable per-thread status snapshots and replacement events
+// keep every conversation tab's activity/attention outcome live (additive).
+// 3.29: GET /v1/threads/{id}/subagents exposes every durable child transcript
+// independently of paginated parent chat history (additive).
+// 3.30: ThreadStatus exposes optional latest-turn start/completion timestamps
+// so compact background-thread lists can show live and terminal durations.
+// 3.31: MCP server projections expose persistent enablement and a narrow
+// settings mutation can enable or disable an existing definition (additive).
+// 3.32: folded history pages can opt into expanding backward to a complete
+// turn boundary so prepending history never mutates the oldest already-rendered
+// turn (additive).
+// 3.33: queued turn acceptance can include the newly persisted prompt row so
+// clients can mutate its durable id without waiting for event-stream delivery
+// (additive).
+// 3.34: GET /v1/models/refresh resolves live account and vendor-CLI model
+// availability separately from the instant static GET /v1/models snapshot
+// (additive).
+pub const PROTOCOL_VERSION: &str = "3.34";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

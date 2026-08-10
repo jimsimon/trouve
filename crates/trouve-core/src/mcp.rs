@@ -86,9 +86,17 @@ const LOG_CAP: usize = 400;
 /// Rolling per-server log buffers (stderr lines + lifecycle events), shared
 /// between the runtime `McpManager` and settings health probes so the
 /// settings "View logs" button sees both.
+#[derive(Debug, Clone)]
+struct McpHealthRecord {
+    config: McpServerConfig,
+    health: String,
+    detail: String,
+}
+
 #[derive(Default, Clone)]
 pub struct McpLogStore {
     buffers: Arc<std::sync::Mutex<HashMap<String, VecDeque<String>>>>,
+    health: Arc<std::sync::Mutex<HashMap<String, McpHealthRecord>>>,
 }
 
 impl McpLogStore {
@@ -110,6 +118,45 @@ impl McpLogStore {
             .map(|b| b.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Record the latest structured health for exactly this configuration.
+    /// Config matching prevents a stale result from surviving an edit to the
+    /// server command, arguments, environment, or enabled state.
+    pub fn record_health(
+        &self,
+        server: &str,
+        config: &McpServerConfig,
+        health: &str,
+        detail: impl Into<String>,
+    ) {
+        self.health.lock().unwrap().insert(
+            server.to_string(),
+            McpHealthRecord {
+                config: config.clone(),
+                health: health.to_string(),
+                detail: detail.into(),
+            },
+        );
+    }
+
+    /// Return health only when it was observed for the current definition.
+    pub fn health(&self, server: &str, config: &McpServerConfig) -> Option<(String, String)> {
+        self.health
+            .lock()
+            .unwrap()
+            .get(server)
+            .filter(|record| record.config == *config)
+            .map(|record| (record.health.clone(), record.detail.clone()))
+    }
+
+    /// Update a live connection's existing record without losing the config
+    /// identity used to reject stale health after configuration changes.
+    fn update_health(&self, server: &str, health: &str, detail: impl Into<String>) {
+        if let Some(record) = self.health.lock().unwrap().get_mut(server) {
+            record.health = health.to_string();
+            record.detail = detail.into();
+        }
+    }
 }
 
 /// Expand `${VAR}` references from the process environment. Missing vars
@@ -122,7 +169,14 @@ pub fn expand_env(value: &str) -> String {
         match rest[start + 2..].find('}') {
             Some(end) => {
                 let var = &rest[start + 2..start + 2 + end];
-                out.push_str(&std::env::var(var).unwrap_or_default());
+                let expanded = if var == "PATH" {
+                    trouve_agents::process_env::effective_path()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    std::env::var(var).unwrap_or_default()
+                };
+                out.push_str(&expanded);
                 rest = &rest[start + 2 + end + 1..];
             }
             None => {
@@ -168,6 +222,28 @@ pub fn upsert_server(path: &Path, name: &str, config: &McpServerConfig) -> Resul
             serde_json::to_value(config).expect("mcp config serializes"),
         );
     })
+}
+
+/// Persistently enable or disable one existing server while preserving its
+/// command, environment, and any extension keys written by another client.
+/// Returns `false` when the config file or named server does not exist.
+pub fn set_server_enabled(path: &Path, name: &str, enabled: bool) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut found = false;
+    edit_file(path, |servers| {
+        let Some(config) = servers.get_mut(name).and_then(Value::as_object_mut) else {
+            return;
+        };
+        found = true;
+        if enabled {
+            config.remove("disabled");
+        } else {
+            config.insert("disabled".into(), Value::Bool(true));
+        }
+    })?;
+    Ok(found)
 }
 
 /// Remove one server from a config file. Missing file or name is a no-op.
@@ -385,7 +461,7 @@ impl McpConnection {
         if cancel.is_cancelled() {
             bail!("MCP server '{server}' connection cancelled");
         }
-        let mut command = tokio::process::Command::new(&config.command);
+        let mut command = trouve_agents::process_env::tokio_command(&config.command);
         command
             .args(&config.args)
             .stdin(Stdio::piped())
@@ -587,6 +663,7 @@ impl McpConnection {
 /// afterwards; stderr and lifecycle lines land in `logs`.
 pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -> Result<usize> {
     logs.push(server, format!("health check: spawning {}", config.command));
+    logs.record_health(server, config, "unknown", "Checking health");
     let connection = McpConnection::connect_controlled(
         server,
         config,
@@ -597,16 +674,15 @@ pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -
     .await;
     match connection {
         Ok(connection) => {
-            logs.push(
-                server,
-                format!("health check: ok ({} tools)", connection.tools().len()),
-            );
             let count = connection.tools().len();
+            logs.push(server, format!("health check: ok ({count} tools)"));
+            logs.record_health(server, config, "ok", format!("{count} tools"));
             connection.terminate().await;
             Ok(count)
         }
         Err(error) => {
             logs.push(server, format!("health check: failed: {error:#}"));
+            logs.record_health(server, config, "error", format!("{error:#}"));
             Err(error)
         }
     }
@@ -675,6 +751,12 @@ impl McpManager {
             if let Some(existing) = connections.get(&key)
                 && existing.config == *config
             {
+                self.logs.record_health(
+                    server,
+                    config,
+                    "ok",
+                    format!("{} tools", existing.connection.tools().len()),
+                );
                 return Ok(existing.connection.clone());
             }
             connections.remove(&key).map(|entry| entry.connection)
@@ -684,19 +766,33 @@ impl McpManager {
                 .push(server, "configuration changed; reconnecting");
             stale.terminate().await;
         }
-        let connection = std::sync::Arc::new(
-            McpConnection::connect_controlled(
-                server,
-                config,
-                Some(&self.logs),
-                cancel,
-                CONNECT_TIMEOUT,
-            )
-            .await?,
-        );
+        self.logs
+            .record_health(server, config, "unknown", "Connecting");
+        let connection = match McpConnection::connect_controlled(
+            server,
+            config,
+            Some(&self.logs),
+            cancel,
+            CONNECT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(connection) => std::sync::Arc::new(connection),
+            Err(error) => {
+                self.logs
+                    .record_health(server, config, "error", format!("{error:#}"));
+                return Err(error);
+            }
+        };
         self.logs.push(
             server,
             format!("connected ({} tools)", connection.tools().len()),
+        );
+        self.logs.record_health(
+            server,
+            config,
+            "ok",
+            format!("{} tools", connection.tools().len()),
         );
         let (selected, removed) = {
             let mut connections = self.connections.lock().await;
@@ -850,15 +946,22 @@ impl McpManager {
                 // A cancelled JSON-RPC request leaves the newline stream
                 // desynchronized. Evicting the cached connection kills the
                 // child and makes the next call handshake from a clean state.
+                self.logs.update_health(
+                    server,
+                    "unknown",
+                    "Connection stopped after cancellation",
+                );
                 self.evict(worktree, server).await;
                 bail!("MCP tool call cancelled")
             }
             result = connection.call_tool(tool, args) => result,
         };
-        if result.is_err() {
+        if let Err(error) = &result {
             // The connection may be dead or desynced (closed stream, timeout
             // mid-response); drop it so the next call reconnects instead of
             // failing forever against a cached-but-broken process.
+            self.logs
+                .update_health(server, "error", format!("{error:#}"));
             self.evict(worktree, server).await;
         }
         result
@@ -868,6 +971,15 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server_config(command: impl Into<String>) -> McpServerConfig {
+        McpServerConfig {
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            disabled: false,
+        }
+    }
 
     #[tokio::test]
     async fn bounded_line_reader_rejects_and_drains_oversized_messages() {
@@ -879,6 +991,55 @@ mod tests {
             Some("ok".into())
         );
         assert_eq!(read_bounded_line(&mut reader, 4).await.unwrap(), None);
+    }
+
+    #[test]
+    fn runtime_health_is_scoped_to_the_exact_server_config() {
+        let logs = McpLogStore::default();
+        let original = test_server_config("first-mcp");
+        let changed = test_server_config("replacement-mcp");
+        logs.record_health("docs", &original, "error", "failed to start");
+
+        assert_eq!(
+            logs.health("docs", &original),
+            Some(("error".into(), "failed to start".into()))
+        );
+        assert_eq!(logs.health("docs", &changed), None);
+    }
+
+    #[tokio::test]
+    async fn failed_probe_records_structured_runtime_health() {
+        let logs = McpLogStore::default();
+        let command = format!("trouve-missing-mcp-command-{}", std::process::id());
+        let config = test_server_config(&command);
+
+        assert!(probe("missing", &config, &logs).await.is_err());
+        let (health, detail) = logs.health("missing", &config).unwrap();
+        assert_eq!(health, "error");
+        assert!(!detail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_connection_records_structured_health() {
+        let manager = McpManager::default();
+        let worktree = tempfile::tempdir().unwrap();
+        let command = format!("trouve-missing-runtime-mcp-{}", std::process::id());
+        let config = test_server_config(&command);
+
+        assert!(
+            manager
+                .connection_with_config(
+                    worktree.path(),
+                    "missing-runtime",
+                    &config,
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        let (health, detail) = manager.logs.health("missing-runtime", &config).unwrap();
+        assert_eq!(health, "error");
+        assert!(!detail.is_empty());
     }
 
     #[test]
@@ -906,6 +1067,12 @@ mod tests {
             "Bearer sekrit!"
         );
         assert_eq!(expand_env("${MISSING_VAR_XYZ}"), "");
+        assert_eq!(
+            expand_env("${PATH}"),
+            trouve_agents::process_env::effective_path()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
     }
 
     #[test]
@@ -1066,6 +1233,35 @@ mod tests {
         assert_eq!(read_servers(&fresh).len(), 1);
         // Removing from a missing file is a no-op.
         remove_server(&tmp.path().join("missing.json"), "x").unwrap();
+    }
+
+    #[test]
+    fn enablement_edits_only_the_disabled_property_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"other":{"keep":true},"mcpServers":{"jira":{"command":"jira-mcp","args":["--stdio"],"extension":{"keep":true}}}}"#,
+        )
+        .unwrap();
+
+        assert!(set_server_enabled(&path, "jira", false).unwrap());
+        assert!(read_servers(&path)["jira"].disabled);
+        let disabled: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disabled["other"]["keep"], Value::Bool(true));
+        assert_eq!(
+            disabled["mcpServers"]["jira"]["extension"]["keep"],
+            Value::Bool(true)
+        );
+
+        assert!(set_server_enabled(&path, "jira", true).unwrap());
+        assert!(!read_servers(&path)["jira"].disabled);
+        let enabled: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(enabled["mcpServers"]["jira"].get("disabled").is_none());
+        assert!(!set_server_enabled(&path, "missing", false).unwrap());
+        assert!(!set_server_enabled(&tmp.path().join("missing.json"), "jira", false).unwrap());
     }
 
     #[test]

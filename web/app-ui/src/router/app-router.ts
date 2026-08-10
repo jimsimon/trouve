@@ -1,6 +1,6 @@
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 
-export type InspectionPanel = "info" | "terminal" | "diff" | "plan" | "files" | "pr";
+export type InspectionPanel = "info" | "terminal" | "diff" | "files" | "pr";
 
 export type AppRoute =
   | { readonly kind: "inbox" }
@@ -29,7 +29,6 @@ const isInspectionPanel = (value: string): value is InspectionPanel =>
   value === "info" ||
   value === "terminal" ||
   value === "diff" ||
-  value === "plan" ||
   value === "files" ||
   value === "pr";
 
@@ -71,9 +70,10 @@ export const parseRoute = (pathname: string): AppRoute => {
     }
     if (parts[index] === "inspect") {
       const panel = parts[index + 1];
-      if (panel === "mcp") {
-        // MCP details moved into the session overview. Keep old bookmarks and
-        // retained routes useful without preserving a second product pane.
+      if (panel === "mcp" || panel === "plan") {
+        // MCP and TODO details moved into the session overview. Keep old
+        // bookmarks and retained routes useful without preserving duplicate
+        // product panes.
         inspection = "info";
       } else if (panel === undefined || !isInspectionPanel(panel)) {
         return { kind: "not-found", pathname };

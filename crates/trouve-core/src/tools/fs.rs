@@ -38,7 +38,9 @@ impl Tool for ReadFile {
     }
     fn description(&self) -> &'static str {
         "Read a file from the workspace. Text returns at most 64KB (use offset to page through \
-         larger files); images (png/jpeg/gif/webp) are returned as vision content."
+         larger files); images (png/jpeg/gif/webp) are returned as vision content. Set \
+         format=\"hashline\" to receive a whole-file snapshot tag and numbered lines for \
+         compact hashline_edit calls."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -46,7 +48,13 @@ impl Tool for ReadFile {
             "properties": {
                 "path": {"type": "string", "description": "Workspace-relative file path"},
                 "offset": {"type": "integer", "description": "Line to start from (1-based)", "minimum": 1},
-                "limit": {"type": "integer", "description": "Maximum number of lines", "minimum": 1}
+                "limit": {"type": "integer", "description": "Maximum number of lines", "minimum": 1},
+                "format": {
+                    "type": "string",
+                    "enum": ["plain", "hashline"],
+                    "default": "plain",
+                    "description": "Use hashline to include a whole-file snapshot tag and numbered lines"
+                }
             },
             "required": ["path"]
         })
@@ -102,10 +110,6 @@ impl Tool for ReadFile {
                 meta.len()
             ));
         }
-        let file = match tokio::fs::File::open(&full).await {
-            Ok(file) => file,
-            Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
-        };
         let offset = args
             .get("offset")
             .and_then(Value::as_u64)
@@ -114,8 +118,40 @@ impl Tool for ReadFile {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
-            .map(|l| l as usize);
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX).max(1));
+        let format = args
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("plain");
+        if !matches!(format, "plain" | "hashline") {
+            return ToolResult::error("format must be plain or hashline");
+        }
+        if format == "hashline" {
+            let content = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("file read cancelled");
+                }
+                content = tokio::fs::read_to_string(&full) => {
+                    match content {
+                        Ok(content) => content,
+                        Err(error) => {
+                            return ToolResult::error(format!("cannot read {path}: {error}"));
+                        }
+                    }
+                }
+            };
+            return match super::hashline::render_read(path, &content, offset, limit, MAX_READ_BYTES)
+            {
+                Ok(result) => ToolResult::ok(result),
+                Err(error) => ToolResult::error(error),
+            };
+        }
 
+        let file = match tokio::fs::File::open(&full).await {
+            Ok(file) => file,
+            Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+        };
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         let mut line_number = 0usize;
@@ -456,6 +492,37 @@ mod tests {
         assert_eq!(res.result["content"], "first\n");
         assert_eq!(res.result["truncated"], true);
         assert_eq!(res.result["next_offset"], 2);
+    }
+
+    #[tokio::test]
+    async fn hashline_read_returns_snapshot_header_and_numbered_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let res = ReadFile
+            .run(
+                &ctx,
+                &json!({
+                    "path": "f.txt",
+                    "offset": 2,
+                    "limit": 1,
+                    "format": "hashline",
+                }),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        let snapshot = res.result["snapshot"].as_str().unwrap();
+        assert_eq!(snapshot.len(), 12);
+        assert_eq!(
+            res.result["content"],
+            format!("[f.txt#{snapshot}]\n2:two\n")
+        );
+        assert_eq!(res.result["next_offset"], 3);
+        assert_eq!(res.result["total_lines"], 3);
     }
 
     #[tokio::test]

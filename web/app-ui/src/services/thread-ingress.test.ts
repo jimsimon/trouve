@@ -115,6 +115,29 @@ describe("ThreadIngress", () => {
     expect(closes[1]).toHaveBeenCalledOnce();
   });
 
+  it("does not reopen closed tabs when a session has no explicit thread route", async () => {
+    const store = new AppStore();
+    const close = vi.fn();
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1"), thread("th_2")]),
+      threadView: vi.fn(async () => viewSnapshot()),
+      threadEvents: vi.fn(async () => ({
+        start: vi.fn(),
+        close,
+      }) as unknown as CursorEventStream<ProtocolIngressEvent>),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+
+    await expect(ingress.openSession("se_1", undefined, ["th_2"]))
+      .resolves.toBe("th_1");
+    expect(protocol.threadView).toHaveBeenCalledWith("th_1");
+
+    await expect(ingress.openSession("se_1", undefined, ["th_1", "th_2"]))
+      .resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledOnce();
+    expect(protocol.threadView).toHaveBeenCalledTimes(1);
+  });
+
   it("discards a delayed snapshot after navigation changes generation", async () => {
     const store = new AppStore();
     let resolveFirst:

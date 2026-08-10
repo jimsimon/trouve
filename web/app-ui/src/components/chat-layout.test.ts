@@ -83,6 +83,46 @@ describe("buildChatLayout", () => {
     });
   });
 
+  it("suppresses a todo tool card once lifecycle rows represent the update", () => {
+    const todoTool: ThreadChatItem = {
+      id: "todo-tool",
+      kind: "tool",
+      callId: "todo-call",
+      tool: "mcpToolCall",
+      args: {
+        tool: "mcp__trouve__todo_write",
+        arguments: {
+          todos: [{ id: "verify", content: "Run checks", status: "completed" }],
+        },
+      },
+      status: "ok",
+      result: null,
+      output,
+    };
+    const lifecycle: ThreadChatItem = {
+      id: "todo-completed",
+      kind: "todo",
+      turn: 4,
+      todoId: "verify",
+      content: "Run checks",
+      state: "completed",
+    };
+
+    const projected = buildChatLayout([
+      { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      todoTool,
+      lifecycle,
+    ]);
+    expect(projected.units[0]?.items).toEqual([lifecycle]);
+    expect(projected.unitIdForItem.has("todo-tool")).toBe(false);
+
+    const legacy = buildChatLayout([
+      { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      todoTool,
+    ]);
+    expect(legacy.units[0]?.items).toEqual([todoTool]);
+  });
+
   it("keeps steering in its active turn between the output it redirects", () => {
     const items: ThreadChatItem[] = [
       { id: "u5", kind: "user", turn: 5, content: "Begin", attachments: [] },
@@ -105,6 +145,38 @@ describe("buildChatLayout", () => {
       items: [{ id: "x1" }, { id: "st5" }, { id: "x2" }],
     });
     expect(layout.unitIdForItem.get("st5")).toBe("turn:5");
+  });
+
+  it("promotes a linked subagent and suppresses its redundant spawn tool row", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u6", kind: "user", turn: 6, content: "Delegate", attachments: [] },
+      {
+        id: "spawn-tool",
+        kind: "tool",
+        callId: "call_spawn",
+        tool: "spawn_thread",
+        args: { prompt: "Review the host" },
+        status: "ok",
+        result: { thread_id: "th_child" },
+        output,
+      },
+      {
+        id: "subagent",
+        kind: "subagent",
+        turn: 6,
+        threadId: "th_child",
+        sessionId: "se_parent",
+        prompt: "Review the host",
+        model: "codex/gpt-5.6-terra",
+        callId: "call_spawn",
+      },
+    ];
+
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      turn: 6,
+      items: [{ id: "subagent", kind: "subagent" }],
+    });
+    expect(buildChatLayout(items).unitIdForItem.has("spawn-tool")).toBe(false);
   });
 
   it("associates the event-folded leading status with its turn", () => {
@@ -165,6 +237,22 @@ describe("activityGroupSummary", () => {
     );
   });
 
+  it("counts every hashline section as an edit to its header path", () => {
+    const items: AgentActivityItem[] = [{
+      id: "h1",
+      kind: "tool",
+      callId: "h1",
+      tool: "hashline_edit",
+      args: {
+        input: "[src/lib.rs#A1B2C3D4E5F6]\nPUT 1:\n+updated\n[README.md#123456789ABC]\nCUT 2\n",
+      },
+      status: "ok",
+      result: null,
+      output,
+    }];
+    expect(activityGroupSummary(items)).toBe("Edited 2 files");
+  });
+
   it("recognizes legacy context-compaction tool names", () => {
     const item = (tool: string): AgentActivityItem => ({
       id: tool,
@@ -217,7 +305,7 @@ describe("activityGroupSummary", () => {
         content: "Run the checks",
         state: "completed",
       },
-    ])).toBe("Updated 1 todo");
+    ])).toBe("Updated 1 TODO");
   });
 
   it("describes repeated same-state todo updates with their lifecycle action", () => {

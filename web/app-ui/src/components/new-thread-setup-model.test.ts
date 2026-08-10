@@ -140,6 +140,7 @@ describe("new thread setup model", () => {
       sessionId: "se-main",
       request: {
         session_id: "se-main",
+        title: "Review this change.",
         mode: "review",
         model: "provider/review",
         permission_mode: "allow_list",
@@ -162,6 +163,7 @@ describe("new thread setup model", () => {
       catalog,
     });
     expect(empty.initialMessage).toBeUndefined();
+    expect(empty.request.title).toBe("New thread");
 
     const attachmentOnly = createNewThreadSetupSubmission({
       workspaceId: "ws-main",
@@ -173,6 +175,7 @@ describe("new thread setup model", () => {
       content: "",
       attachments: [upload.upload],
     });
+    expect(attachmentOnly.request.title).toBe("New thread");
   });
 
   it("drops tampered mode/model/thinking selections instead of inventing request fields", () => {
@@ -188,7 +191,7 @@ describe("new thread setup model", () => {
       },
       catalog,
     });
-    expect(detail.request).toEqual({ session_id: "se-main" });
+    expect(detail.request).toEqual({ session_id: "se-main", title: "New thread" });
   });
 
   it("enforces per-item, count, and aggregate attachment budgets", () => {
@@ -215,13 +218,12 @@ describe("new thread setup model", () => {
     );
   });
 
-  it("derives distinct ready, loading, disabled, and busy control states", () => {
+  it("derives distinct ready, attachment-loading, disabled, and busy control states", () => {
     const ready = newThreadSetupControls({
       sessionId: "se-main",
       workspaceId: "ws-main",
       disabled: false,
       busy: false,
-      optionsLoading: false,
       attachmentLoading: false,
     });
     expect(ready).toEqual({
@@ -236,11 +238,10 @@ describe("new thread setup model", () => {
       workspaceId: "ws-main",
       disabled: false,
       busy: false,
-      optionsLoading: true,
-      attachmentLoading: false,
+      attachmentLoading: true,
     })).toMatchObject({
       formDisabled: false,
-      optionControlsDisabled: true,
+      optionControlsDisabled: false,
       canSubmit: false,
       canCancel: true,
     });
@@ -249,7 +250,6 @@ describe("new thread setup model", () => {
       workspaceId: "ws-main",
       disabled: true,
       busy: false,
-      optionsLoading: false,
       attachmentLoading: false,
     })).toMatchObject({ formDisabled: true, canSubmit: false, canCancel: true });
     expect(newThreadSetupControls({
@@ -257,7 +257,6 @@ describe("new thread setup model", () => {
       workspaceId: "ws-main",
       disabled: false,
       busy: true,
-      optionsLoading: false,
       attachmentLoading: false,
     })).toMatchObject({
       formDisabled: true,

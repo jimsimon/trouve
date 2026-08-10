@@ -77,6 +77,7 @@ import {
 import {
   chatBookmarkForNavigation,
   createBrowserResumePreferencesController,
+  preferredSessionThreadId,
   type ChatScrollBookmark,
 } from "../services/resume-preferences.js";
 import {
@@ -100,6 +101,7 @@ import {
 } from "../services/protocol-client.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
+import { ModelCatalogController } from "../services/model-catalog-controller.js";
 import {
   createBrowserThemeController,
   isThemePreference,
@@ -160,7 +162,6 @@ const INSPECTION_PANELS = [
   "diff",
   "files",
   "pr",
-  "plan",
   "terminal",
 ] as const satisfies readonly InspectionPanel[];
 
@@ -172,12 +173,11 @@ const INSPECTION_PANEL_LABELS: Readonly<Record<
   InspectionPanel,
   { readonly icon: FontAwesomeIconName; readonly label: string }
 >> = {
-  info: { icon: "circle-info", label: "Info" },
+  info: { icon: "circle-info", label: "Details" },
   diff: { icon: "code-compare", label: "Diff" },
   files: { icon: "file-lines", label: "Files" },
   pr: { icon: "code-pull-request", label: "Pull Requests" },
   terminal: { icon: "terminal", label: "Terminal" },
-  plan: { icon: "list-check", label: "Todos" },
 };
 
 export class TrouveApp extends withSignalTracking(LitElement) {
@@ -241,6 +241,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #subscriptionHealth = new SubscriptionHealthController(
     this.#protocolClient,
   );
+  readonly #modelCatalog = new ModelCatalogController(this.#protocolClient);
   readonly #sessionNotifications = new SessionNotificationCoordinator(
     this.#notificationPreferences.current,
     this.#hostClient === undefined
@@ -318,7 +319,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     setChatPreferences: (patch: Partial<ChatPreferences>) =>
       this.#updateChatPreferences(patch),
     composerDrafts: this.#composerDrafts,
+    resumePreferences: this.#resume.current,
+    setThreadTabClosed: (threadId: string, closed: boolean) =>
+      this.#setThreadTabClosed(threadId, closed),
     protocol: this.#protocolClient,
+    modelCatalog: this.#modelCatalog,
     subscriptionHealth: this.#subscriptionHealth,
     pullRequestGroupOrder: this.#pullRequestGroupOrder.order,
     setPullRequestGroupOrder: (order: readonly string[]) =>
@@ -872,6 +877,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (after !== before) this.#flushResumePreferences();
   }
 
+  #setThreadTabClosed(threadId: string, closed: boolean): void {
+    const before = readSignal(this.#resume.current);
+    const after = this.#resume.setThreadTabClosed(threadId, closed, false);
+    if (after !== before) this.#flushResumePreferences();
+  }
+
   readonly #chatPositionChanged = (event: CustomEvent<{
     readonly threadId: string;
     readonly bookmark: ChatScrollBookmark | undefined;
@@ -1115,7 +1126,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       if (inspection === "diff" || inspection === "files") {
         void import("../components/inspection-workspace.js");
       }
-      if (inspection === "plan") void import("../components/todo-plan-panel.js");
       if (inspection === "pr") void import("../components/session-pr-panel.js");
     }
     const sessions = readSignal(this.#store.sessions);
@@ -1125,7 +1135,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     ) ?? inboxRecoverySession(sessions);
     if (route.kind === "inbox" && recoverySession !== undefined) {
       const session = recoverySession;
-      const threadId = resume.sessionThreads[session.id] ?? session.latestThreadId;
+      const threadId = preferredSessionThreadId(
+        resume,
+        session.id,
+        session.latestThreadId,
+        this.#store.threadsForSession(session.id).map((thread) => thread.id),
+      );
       this.#router.navigate(
         {
           kind: "session",
@@ -1177,6 +1192,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       const selected = await this.#threadIngress.openSession(
         route.sessionId,
         route.threadId,
+        readSignal(this.#resume.current).closedThreadTabs,
       );
       if (generation !== this.#routeGeneration) return;
       if (selected !== undefined && selected !== route.threadId) {
@@ -1260,7 +1276,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
+    this.#newSessionModeId = "";
+    this.#newSessionModelId = "";
     this.#newSessionPermissionMode = "";
+    this.#newSessionThinking = "";
     this.#newSessionWorkspaceId = workspace.id;
     this.#newSessionPreferredBaseRef = preferredBaseRef;
     this.#newSessionOpen = true;
@@ -1555,26 +1574,45 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const generation = ++this.#newSessionOptionsGeneration;
     this.#newSessionOptionsPending = true;
     this.#newSessionOptionsError = "";
-    this.#newSessionModes = [];
-    this.#newSessionModels = [];
-    this.#newSessionProviders = undefined;
-    this.#newSessionSubscriptionHealth = [];
-    this.#newSessionModeId = "";
-    this.#newSessionModelId = "";
-    this.#newSessionThinking = "";
+    this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current);
     this.requestUpdate();
+
+    // Provider usage may launch vendor helpers. It decorates the model picker
+    // but is not part of the static setup catalog, so refresh it independently
+    // and never hold the form behind it.
+    void this.#subscriptionHealth.refresh("if-stale").then(
+      (subscriptionHealth) => {
+        if (generation !== this.#newSessionOptionsGeneration) return;
+        this.#newSessionSubscriptionHealth = subscriptionHealth;
+        this.requestUpdate();
+      },
+      () => undefined,
+    );
     try {
-      const [modes, models, providers, subscriptionHealth] = await Promise.all([
+      const [modes, models, providers] = await Promise.all([
         this.#protocolClient.modes(workspaceId),
-        this.#protocolClient.models(),
+        this.#modelCatalog.refresh("if-stale"),
         this.#protocolClient.providers(),
-        this.#subscriptionHealth.refresh("if-stale").catch(() => []),
       ]);
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
-      this.#newSessionSubscriptionHealth = subscriptionHealth;
+      if (!modes.some((mode) => mode.id === this.#newSessionModeId)) {
+        this.#newSessionModeId = "";
+      }
+      if (!models.some((model) => model.id === this.#newSessionModelId)) {
+        this.#newSessionModelId = "";
+      }
+      const thinking = thinkingOption(models.find((model) =>
+        model.id === resolveNewSessionModel(
+          this.#newSessionModelId,
+          modes.find((mode) => mode.id === this.#newSessionModeId),
+          providers,
+        )));
+      if (thinking?.values.includes(this.#newSessionThinking) !== true) {
+        this.#newSessionThinking = "";
+      }
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionOptionsError =
@@ -1585,6 +1623,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.requestUpdate();
       }
     }
+  }
+
+  #availableNewSessionModels(): readonly ProtocolModelInfo[] {
+    const current = readSignal(this.#modelCatalog.current);
+    return current.length > 0 ? current : this.#newSessionModels;
   }
 
   /** Match the retained controller's bounded title-model request. Session
@@ -1814,13 +1857,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         selectedMode,
         this.#newSessionProviders,
       );
-      const modelInfo = this.#newSessionModels.find(
+      const modelInfo = this.#availableNewSessionModels().find(
         (model) => model.id === effectiveModel,
       );
       const permissionMode = String(data.get("permission_mode") ?? "");
       const thread = await this.#protocolClient.createThread(
         createNewSessionThreadRequest({
           sessionId: session.id,
+          title: session.title,
           mode: this.#newSessionModeId,
           model: this.#newSessionModelId,
           ...(
@@ -1944,6 +1988,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
       const thread = await this.#protocolClient.createThread({
         session_id: sessionId,
+        title: sessionTitleFallback(detail.prompt),
         mode: "code",
       });
       this.#store.upsertThread(thread);
@@ -1998,7 +2043,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (session === undefined) {
       this.#router.navigate({ kind: "inbox" });
     } else {
-      const threadId = resume.sessionThreads[session.id] ?? session.latestThreadId;
+      const threadId = preferredSessionThreadId(
+        resume,
+        session.id,
+        session.latestThreadId,
+        this.#store.threadsForSession(session.id).map((thread) => thread.id),
+      );
       this.#router.navigate({
         kind: "session",
         workspaceId: session.workspaceId,
@@ -2216,12 +2266,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       selectedNewSessionMode,
       this.#newSessionProviders,
     );
+    const newSessionModels = this.#availableNewSessionModels();
     const newSessionModelHealth = modelHealthPresentations(
-      this.#newSessionModels,
+      newSessionModels,
       this.#newSessionSubscriptionHealth,
     );
     const newSessionThinkingOption = thinkingOption(
-      this.#newSessionModels.find((model) => model.id === effectiveNewSessionModel),
+      newSessionModels.find((model) => model.id === effectiveNewSessionModel),
     );
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
     const connectionLabel = this.#hostError
@@ -2557,10 +2608,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 class="inspection-content"
                 panel=${selectedInspection}
               ></trouve-inspection-workspace>`
-            : route.kind === "session" && selectedInspection === "plan"
-            ? html`<trouve-todo-plan-panel
-                class="inspection-content"
-              ></trouve-todo-plan-panel>`
             : route.kind === "session" && selectedInspection === "pr"
             ? html`<trouve-session-pr-panel
                 class="inspection-content"
@@ -2678,13 +2725,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 @change=${this.#newSessionFilesSelected}
               />
             </label>
-            <div class="dialog-option-grid ${newSessionThinkingOption === undefined ? "no-thinking" : ""}">
+            <div class="dialog-option-grid">
               <label class="new-session-mode">
                 <span>Agent mode</span>
                 <select
                   name="mode"
                   .value=${this.#newSessionModeId}
-                  ?disabled=${this.#newSessionPending || this.#newSessionOptionsPending}
+                  ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
                     this.#newSessionModeId = (event.currentTarget as HTMLSelectElement).value;
                     this.#newSessionThinking = "";
@@ -2705,9 +2752,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   placeholder=${`Mode or server default${this.#newSessionProviders?.default_model ? ` · ${this.#newSessionProviders.default_model}` : ""}`}
                   empty-label=${`Mode or server default${this.#newSessionProviders?.default_model ? ` · ${this.#newSessionProviders.default_model}` : ""}`}
                   .value=${this.#newSessionModelId}
-                  .models=${this.#newSessionModels}
+                  .models=${newSessionModels}
                   .health=${newSessionModelHealth}
-                  .disabled=${this.#newSessionPending || this.#newSessionOptionsPending}
+                  .disabled=${this.#newSessionPending}
                   @trouve-model-picked=${(event: CustomEvent<{ readonly modelId: string }>) => {
                     this.#newSessionModelId = event.detail.modelId;
                     this.#newSessionThinking = "";
@@ -2721,7 +2768,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   name="permission_mode"
                   class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}
                   .value=${this.#newSessionPermissionMode}
-                  ?disabled=${this.#newSessionPending || this.#newSessionOptionsPending}
+                  ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
                     this.#newSessionPermissionMode = (event.currentTarget as HTMLSelectElement).value;
                     this.requestUpdate();
@@ -2733,24 +2780,22 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   <option value="yolo">Yolo</option>
                 </select>
               </label>
-              ${newSessionThinkingOption === undefined
-                ? nothing
-                : html`<label class="new-session-thinking">
-                    <span>Thinking level</span>
-                    <select
-                      name="thinking"
-                      .value=${this.#newSessionThinking}
-                      ?disabled=${this.#newSessionPending}
-                      @change=${(event: Event) => {
-                        this.#newSessionThinking = (event.currentTarget as HTMLSelectElement).value;
-                      }}
-                    >
-                      <option value="">Model default</option>
-                      ${newSessionThinkingOption.values.map(
-                        (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
-                      )}
-                    </select>
-                  </label>`}
+              <label class="new-session-thinking">
+                <span>Thinking level</span>
+                <select
+                  name="thinking"
+                  .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
+                  ?disabled=${this.#newSessionPending}
+                  @change=${(event: Event) => {
+                    this.#newSessionThinking = (event.currentTarget as HTMLSelectElement).value;
+                  }}
+                >
+                  <option value="">Model default</option>
+                  ${(newSessionThinkingOption?.values ?? []).map(
+                    (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                  )}
+                </select>
+              </label>
             </div>
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`

@@ -1,7 +1,7 @@
 //! Fold durable thread events into a protocol-level current-state snapshot.
 //! The event log remains authoritative; this projection is rebuildable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use trouve_protocol::{
@@ -24,6 +24,11 @@ pub struct ThreadProjection {
     /// refresh still receives an accurate duration when it completes.
     #[serde(default)]
     tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Normally capacity follows turn.started. Retain an early capacity event
+    /// until its shell arrives so replay remains deterministic even when
+    /// importing historical streams with the opposite ordering.
+    #[serde(default)]
+    capacity_acquired_before_start: HashSet<u64>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -45,6 +50,24 @@ impl ThreadProjection {
         self.ensure_indexes();
         self.cursor = envelope.cursor;
         match &envelope.event {
+            Event::TurnCapacityAcquired { turn, .. } => {
+                if let Some(&idx) = self.indexes.turns.get(turn) {
+                    if matches!(
+                        self.snapshot.items.get(idx),
+                        Some(ThreadViewItem::TurnStatus {
+                            state: ThreadTurnState::WaitingForCapacity,
+                            ..
+                        })
+                    ) {
+                        self.snapshot.items[idx] = ThreadViewItem::TurnStatus {
+                            turn: *turn,
+                            state: ThreadTurnState::Running,
+                        };
+                    }
+                } else {
+                    self.capacity_acquired_before_start.insert(*turn);
+                }
+            }
             Event::TurnStarted {
                 turn,
                 model,
@@ -63,10 +86,12 @@ impl ThreadProjection {
                     .turn_steerable
                     .insert(*turn, *supports_steering);
                 self.snapshot.turn_started_at.insert(*turn, envelope.ts);
-                let idx = self.push(ThreadViewItem::TurnStatus {
-                    turn: *turn,
-                    state: ThreadTurnState::Running,
-                });
+                let state = if self.capacity_acquired_before_start.remove(turn) {
+                    ThreadTurnState::Running
+                } else {
+                    ThreadTurnState::WaitingForCapacity
+                };
+                let idx = self.push(ThreadViewItem::TurnStatus { turn: *turn, state });
                 self.indexes.turns.insert(*turn, idx);
             }
             Event::CompactionStarted { turn } => {
@@ -139,6 +164,25 @@ impl ThreadProjection {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                });
+            }
+            Event::SubagentSpawned {
+                turn,
+                thread_id,
+                session_id,
+                prompt,
+                model,
+                call_id,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_thinking();
+                self.push(ThreadViewItem::Subagent {
+                    turn: *turn,
+                    thread_id: thread_id.clone(),
+                    session_id: session_id.clone(),
+                    prompt: prompt.clone(),
+                    model: model.clone(),
+                    call_id: call_id.clone(),
                 });
             }
             Event::AssistantThinking { turn, text } => {
@@ -399,7 +443,7 @@ impl ThreadProjection {
             .find_map(|item| match item {
                 ThreadViewItem::TurnStatus {
                     turn,
-                    state: ThreadTurnState::Running,
+                    state: ThreadTurnState::WaitingForCapacity | ThreadTurnState::Running,
                 } => Some(*turn),
                 _ => None,
             })
@@ -427,10 +471,11 @@ impl ThreadProjection {
                 .rposition(|item| {
                     matches!(
                         item,
-                        ThreadViewItem::TurnStatus {
-                            state: ThreadTurnState::Running,
-                            ..
-                        }
+                        ThreadViewItem::TurnStatus { state, .. }
+                            if matches!(
+                                state,
+                                ThreadTurnState::WaitingForCapacity | ThreadTurnState::Running
+                            )
                     )
                 })
                 .unwrap_or(0)
@@ -474,6 +519,7 @@ impl ThreadProjection {
     }
 
     fn finish_turn(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
+        self.capacity_acquired_before_start.remove(&turn);
         self.snapshot.turn_running = false;
         self.fail_open_compaction(turn);
         self.finish_thinking();
@@ -521,6 +567,7 @@ impl ThreadProjection {
                 }
                 ThreadViewItem::User { .. }
                 | ThreadViewItem::Steered { .. }
+                | ThreadViewItem::Subagent { .. }
                 | ThreadViewItem::Assistant { .. }
                 | ThreadViewItem::TodoUpdate { .. }
                 | ThreadViewItem::Compaction { .. } => {}
@@ -595,6 +642,78 @@ mod tests {
             ThreadViewItem::ToolCall { duration_ms, .. } => *duration_ms,
             item => panic!("expected tool call, got {item:?}"),
         }
+    }
+
+    #[test]
+    fn turn_transitions_from_waiting_to_running_when_capacity_arrives() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 7,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 7,
+                state: ThreadTurnState::WaitingForCapacity,
+            })
+        ));
+
+        projection.apply(&envelope(
+            2,
+            20,
+            Event::TurnCapacityAcquired {
+                turn: 7,
+                wait_ms: 20,
+                background: false,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 7,
+                state: ThreadTurnState::Running,
+            })
+        ));
+    }
+
+    #[test]
+    fn capacity_before_start_replays_as_running() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnCapacityAcquired {
+                turn: 9,
+                wait_ms: 0,
+                background: false,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TurnStarted {
+                turn: 9,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 9,
+                state: ThreadTurnState::Running,
+            })
+        ));
     }
 
     #[test]
@@ -832,6 +951,50 @@ mod tests {
     }
 
     #[test]
+    fn subagent_spawn_is_a_durable_parent_turn_boundary() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 7,
+                text: "Delegating the review.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::SubagentSpawned {
+                turn: 7,
+                thread_id: "th_child".into(),
+                session_id: "se_child".into(),
+                prompt: "Review the host lifecycle.".into(),
+                model: "codex/gpt-5.6-terra".into(),
+                call_id: Some("call_spawn".into()),
+            },
+        ));
+
+        assert_eq!(
+            projection.snapshot.items,
+            vec![
+                ThreadViewItem::Thinking {
+                    turn: 7,
+                    content: "Delegating the review.".into(),
+                    complete: true,
+                },
+                ThreadViewItem::Subagent {
+                    turn: 7,
+                    thread_id: "th_child".into(),
+                    session_id: "se_child".into(),
+                    prompt: "Review the host lifecycle.".into(),
+                    model: "codex/gpt-5.6-terra".into(),
+                    call_id: Some("call_spawn".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn live_usage_updates_context_without_finishing_the_turn() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
@@ -856,6 +1019,15 @@ mod tests {
         projection.apply(&envelope(
             2,
             10,
+            Event::TurnCapacityAcquired {
+                turn: 7,
+                wait_ms: 10,
+                background: false,
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            11,
             Event::TurnUsageUpdated {
                 turn: 7,
                 usage: usage.clone(),
@@ -1026,7 +1198,7 @@ mod tests {
             projection.snapshot.items.first(),
             Some(ThreadViewItem::TurnStatus {
                 turn: 2,
-                state: ThreadTurnState::Running,
+                state: ThreadTurnState::WaitingForCapacity,
             })
         ));
 

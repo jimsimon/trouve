@@ -1208,6 +1208,9 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"root-turn"}}}'
 # the parent stream. The adapter must replay it once ownership is announced.
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"child","turnId":"child-turn","itemId":"child-command","command":"pwd"}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"spawn-1","type":"collabToolCall","tool":"spawn_agent","senderThreadId":"root","newThreadId":"child"}}}'
+IFS= read -r prompt_lookup
+printf '%s\n' "$prompt_lookup" > "$0.prompt-lookup"
+echo '{"jsonrpc":"2.0","id":4,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"text","text":"Inspect the child task."}]}]}]}}'
 IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}'
@@ -1297,6 +1300,12 @@ cat > /dev/null
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("\"id\":100"), "{reply}");
     assert!(reply.contains("\"decision\":\"accept\""), "{reply}");
+    let lookup = std::fs::read_to_string(format!("{stub}.prompt-lookup")).unwrap();
+    assert!(
+        lookup.contains("\"method\":\"thread/turns/list\""),
+        "{lookup}"
+    );
+    assert!(lookup.contains("\"threadId\":\"child\""), "{lookup}");
 }
 
 #[tokio::test]

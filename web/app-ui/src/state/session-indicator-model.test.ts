@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  attentionOrUnreadIndicatorPresentation,
   sessionIndicatorPresentation,
   type SessionIndicatorFields,
 } from "./session-indicator-model.js";
@@ -64,5 +65,27 @@ describe("session indicator presentation", () => {
       outcome: "failed",
       unread: true,
     }).kind).toBe("question");
+  });
+
+  it("aggregates only actionable or unread states for hidden-thread badges", () => {
+    expect(attentionOrUnreadIndicatorPresentation([
+      { ...idle, active: true, outcome: "running" },
+    ]).kind).toBe("none");
+    expect(attentionOrUnreadIndicatorPresentation([
+      { ...idle, outcome: "succeeded", unread: true },
+    ]).kind).toBe("unread");
+    expect(attentionOrUnreadIndicatorPresentation([
+      { ...idle, outcome: "failed", unread: true },
+      { ...idle, outcome: "succeeded", unread: true },
+    ]).kind).toBe("error");
+    expect(attentionOrUnreadIndicatorPresentation([
+      { ...idle, attention: "approval" },
+      { ...idle, attention: "question" },
+      { ...idle, outcome: "failed", unread: true },
+    ])).toEqual({
+      kind: "both",
+      icon: "triangle-exclamation",
+      tooltip: "Approval and question need attention",
+    });
   });
 });

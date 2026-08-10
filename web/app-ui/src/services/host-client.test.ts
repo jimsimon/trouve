@@ -657,6 +657,7 @@ describe("HostClient", () => {
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
+      closedThreadTabs: ["th-2"],
     });
     expect(next.general?.prevent_sleep_while_running).toBe(false);
     expect(next.chat?.collapse_sequential_tool_calls).toBe(true);
@@ -677,7 +678,9 @@ describe("HostClient", () => {
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
+      closedThreadTabs: ["th-2"],
     });
+    expect(next.resume?.closed_thread_tabs).toEqual(["th-2"]);
   });
 
   it("refuses an external URL action the host did not advertise", async () => {

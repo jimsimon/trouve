@@ -11,6 +11,7 @@ import type {
   ProtocolModelInfo,
   ProtocolReviewerProfile,
 } from "../services/protocol-client.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   repositoryDraft,
   repositoryKey,
@@ -57,7 +58,7 @@ const emptyOverride = (reviewerId: string): ReviewerOverrideDraft => ({
   prompt: "",
 });
 
-export class TrouveCodeReviewConfiguration extends LitElement {
+export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement) {
   static override styles = css`
     :host { display: block; color: var(--trouve-text); }
     * { box-sizing: border-box; }
@@ -259,6 +260,13 @@ export class TrouveCodeReviewConfiguration extends LitElement {
   #loadGeneration = 0;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
 
+  #availableModels(): readonly ProtocolModelInfo[] {
+    const catalog = this.#services.value?.modelCatalog.current;
+    if (catalog === undefined) return this.#models;
+    const models = readSignal(catalog);
+    return models.length === 0 ? this.#models : models;
+  }
+
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
     this.#loadedServices = undefined;
@@ -276,6 +284,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
 
   override render() {
     const services = this.#services.value;
+    const models = this.#availableModels();
     if (services === undefined || (this.#loading && this.#app === undefined)) {
       return html`<div class="settings-card" role="status">Loading code-review configuration…</div>`;
     }
@@ -290,7 +299,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     return html`
       <section class="settings-stack" aria-labelledby="code-review-configuration-title">
         <datalist id="code-review-models">
-          ${this.#models.map((model) => html`<option value=${model.id}>${model.display_name}</option>`)}
+          ${models.map((model) => html`<option value=${model.id}>${model.display_name}</option>`)}
         </datalist>
         <header class="section-heading">
           <div>
@@ -650,7 +659,7 @@ export class TrouveCodeReviewConfiguration extends LitElement {
     this.#loading = true;
     this.requestUpdate();
 
-    const modelsPromise: Promise<{ readonly models: readonly ProtocolModelInfo[]; readonly unavailable: boolean }> = services.protocol.models()
+    const modelsPromise: Promise<{ readonly models: readonly ProtocolModelInfo[]; readonly unavailable: boolean }> = services.modelCatalog.refresh("if-stale")
       .then((models) => ({ models, unavailable: false }))
       .catch(() => ({ models: [], unavailable: true }));
     try {

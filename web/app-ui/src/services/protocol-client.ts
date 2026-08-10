@@ -53,6 +53,7 @@ export type ProtocolSetDefaultPermissionModeRequest =
   ProtocolComponents["schemas"]["SetDefaultPermissionModeRequest"];
 export type ProtocolModelInfo = ProtocolComponents["schemas"]["ModelInfo"];
 export type ProtocolThread = ProtocolComponents["schemas"]["Thread"];
+export type ProtocolThreadStatus = ProtocolComponents["schemas"]["ThreadStatus"];
 export type ProtocolThreadViewSnapshot =
   ProtocolComponents["schemas"]["ThreadViewSnapshot"];
 export type ProtocolThreadToolDetails =
@@ -160,6 +161,8 @@ export type ProtocolMcpServerInfo =
   ProtocolComponents["schemas"]["McpServerInfo"];
 export type ProtocolUpsertMcpServerRequest =
   ProtocolComponents["schemas"]["UpsertMcpServerRequest"];
+export type ProtocolSetMcpServerEnabledRequest =
+  ProtocolComponents["schemas"]["SetMcpServerEnabledRequest"];
 export type ProtocolMcpLogs = ProtocolComponents["schemas"]["McpLogs"];
 export type ProtocolCliInfo = ProtocolComponents["schemas"]["CliInfo"];
 export type ProtocolCliList = ProtocolComponents["schemas"]["CliList"];
@@ -195,6 +198,7 @@ interface ProtocolValidators {
   readonly models: ValidateFunction;
   readonly thread: ValidateFunction;
   readonly threads: ValidateFunction;
+  readonly threadStatuses: ValidateFunction;
   readonly queuedPrompts: ValidateFunction;
   readonly turnAccepted: ValidateFunction;
   readonly usageSummary: ValidateFunction;
@@ -323,6 +327,7 @@ const validateResponse = async <T>(
     | "ModelInfo[]"
     | "Thread"
     | "Thread[]"
+    | "ThreadStatus[]"
     | "ThreadViewSnapshot"
     | "QueuedPrompt[]"
     | "TurnAccepted"
@@ -998,6 +1003,29 @@ export class ProtocolClient {
     );
   }
 
+  async refreshModels(): Promise<readonly ProtocolModelInfo[]> {
+    let result;
+    try {
+      result = await this.#client.GET("/v1/models/refresh");
+    } catch {
+      throw new ProtocolClientError(
+        "request-failed",
+        "live model refresh failed",
+      );
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError(
+        "request-failed",
+        "live model refresh failed",
+      );
+    }
+    return validateResponse<readonly ProtocolModelInfo[]>(
+      "ModelInfo[]",
+      result.data,
+      (loaded) => loaded.models,
+    );
+  }
+
   async providers(): Promise<ProtocolProvidersResponse> {
     return this.#validatedJson(
       "/v1/providers",
@@ -1436,6 +1464,18 @@ export class ProtocolClient {
     );
   }
 
+  async setMcpServerEnabled(
+    name: string,
+    request: ProtocolSetMcpServerEnabledRequest,
+  ): Promise<void> {
+    await this.#mutation(
+      `/v1/mcp-servers/${encodeURIComponent(name)}/enabled`,
+      "update MCP server enablement",
+      "PUT",
+      request,
+    );
+  }
+
   async deleteMcpServer(
     name: string,
     scope: string,
@@ -1520,6 +1560,34 @@ export class ProtocolClient {
     );
   }
 
+  async threadSubagents(threadId: string): Promise<readonly ProtocolThread[]> {
+    return this.#validatedJson(
+      `/v1/threads/${encodeURIComponent(threadId)}/subagents`,
+      "thread subagent",
+      "Thread[]",
+      (loaded) => loaded.threads,
+    );
+  }
+
+  async threadStatuses(sessionId: string): Promise<readonly ProtocolThreadStatus[]> {
+    let result;
+    try {
+      result = await this.#client.GET("/v1/thread-statuses", {
+        params: { query: { session_id: sessionId } },
+      });
+    } catch {
+      throw new ProtocolClientError("request-failed", "thread status request failed");
+    }
+    if (!result.response.ok || result.data === undefined) {
+      throw new ProtocolClientError("request-failed", "thread status request failed");
+    }
+    return validateResponse<readonly ProtocolThreadStatus[]>(
+      "ThreadStatus[]",
+      result.data,
+      (loaded) => loaded.threadStatuses,
+    );
+  }
+
   /** Seed a thread from its bounded folded tail before following live SSE.
    * The response cursor is the exact snapshot/stream handoff boundary. */
   async threadView(
@@ -1529,6 +1597,7 @@ export class ProtocolClient {
     const { threadView } = await import("../generated/thread-view-validator.js");
     const query = new URLSearchParams({
       limit: String(THREAD_VIEW_PAGE_SIZE),
+      turn_aligned: "true",
     });
     if (before !== undefined) query.set("before", String(before));
     return this.#validatedCursorJson(

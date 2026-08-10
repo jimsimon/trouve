@@ -56,14 +56,14 @@ impl Tool for TodoWrite {
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
         if ctx.cancel.is_cancelled() {
-            return ToolResult::error("todo update cancelled");
+            return ToolResult::error("TODO update cancelled");
         }
         let Some(items) = args.get("todos").and_then(Value::as_array) else {
             return ToolResult::error("missing required argument: todos");
         };
         if items.len() > MAX_TODOS {
             return ToolResult::error(format!(
-                "too many todos: {} (maximum {MAX_TODOS})",
+                "too many TODOs: {} (maximum {MAX_TODOS})",
                 items.len()
             ));
         }
@@ -71,17 +71,17 @@ impl Tool for TodoWrite {
         for item in items {
             let todo: TodoItem = match serde_json::from_value(item.clone()) {
                 Ok(t) => t,
-                Err(e) => return ToolResult::error(format!("bad todo item: {e}")),
+                Err(e) => return ToolResult::error(format!("bad TODO item: {e}")),
             };
             if todo.id.len() > MAX_TODO_ID_BYTES {
                 return ToolResult::error(format!(
-                    "todo id is {} bytes (maximum {MAX_TODO_ID_BYTES})",
+                    "TODO ID is {} bytes (maximum {MAX_TODO_ID_BYTES})",
                     todo.id.len()
                 ));
             }
             if todo.content.len() > MAX_TODO_CONTENT_BYTES {
                 return ToolResult::error(format!(
-                    "todo content is {} bytes (maximum {MAX_TODO_CONTENT_BYTES})",
+                    "TODO content is {} bytes (maximum {MAX_TODO_CONTENT_BYTES})",
                     todo.content.len()
                 ));
             }
@@ -110,11 +110,11 @@ impl Tool for TodoWrite {
             updated = incoming;
         }
         if updated.is_empty() {
-            return ToolResult::error("todos must not be empty");
+            return ToolResult::error("TODOs must not be empty");
         }
         if updated.len() > MAX_TODOS {
             return ToolResult::error(format!(
-                "merged todo list has {} items (maximum {MAX_TODOS})",
+                "merged TODO list has {} items (maximum {MAX_TODOS})",
                 updated.len()
             ));
         }

@@ -35,7 +35,9 @@ import type {
 import type { AppStore } from "../state/app-store.js";
 import type { ReadonlySignal } from "../state/reactivity.js";
 import type { SubscriptionHealthController } from "../services/subscription-health-controller.js";
+import type { ModelCatalogController } from "../services/model-catalog-controller.js";
 import type { ComposerDraftController } from "../services/composer-drafts.js";
+import type { ResumePreferences } from "../services/resume-preferences.js";
 
 export interface NativeHostActions {
   /** Opens the desktop host's directory picker. `undefined` means cancel. */
@@ -94,7 +96,10 @@ export interface AppServices {
     patch: Partial<ChatPreferences>,
   ) => void;
   readonly composerDrafts: ComposerDraftController;
+  readonly resumePreferences: ReadonlySignal<ResumePreferences>;
+  readonly setThreadTabClosed: (threadId: string, closed: boolean) => void;
   readonly protocol: ProtocolClient;
+  readonly modelCatalog: ModelCatalogController;
   readonly subscriptionHealth: SubscriptionHealthController;
   readonly pullRequestGroupOrder: ReadonlySignal<readonly string[]>;
   readonly setPullRequestGroupOrder: (order: readonly string[]) => void;

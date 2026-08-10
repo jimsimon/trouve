@@ -31,9 +31,9 @@ use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
-    AgentBackend, BackendCollaboratorEvent, BackendError, BackendEvent, BackendEventStream,
-    BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn, async_stream,
-    binary_on_path, format_reset,
+    AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
+    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn,
+    async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -470,6 +470,21 @@ fn collaborator_user_message(item: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Recover the prompt that opened a collaborator's latest turn. Codex's
+/// `subAgentActivity` announcement identifies the child thread but currently
+/// omits the spawn prompt, and the child route does not replay its initial
+/// `userMessage` item. A one-turn full listing is therefore the authoritative
+/// fallback without loading the collaborator's complete transcript.
+fn collaborator_prompt_from_turn_page(response: &Value) -> Option<String> {
+    response["data"].as_array()?.iter().find_map(|turn| {
+        turn["items"].as_array()?.iter().find_map(|item| {
+            (item["type"].as_str() == Some("userMessage"))
+                .then(|| collaborator_user_message(item))
+                .flatten()
+        })
+    })
+}
+
 /// Translate one child-thread notification without allowing it to mutate the
 /// root turn's parser state or terminal lifecycle.
 fn collaborator_notification(
@@ -664,6 +679,20 @@ fn turn_id_of(result: &Value) -> Result<String, BackendError> {
         .ok_or_else(|| BackendError::Protocol("turn/start result missing turn.id".into()))
 }
 
+/// Parse the acknowledgement returned by `turn/steer`.
+///
+/// Current Codex app-server releases return a flat `turnId`, unlike the
+/// nested `turn.id` returned by `turn/start`. Retain the nested fallback for
+/// older app-server builds so updating trouve does not force a coordinated
+/// vendor CLI upgrade.
+fn steered_turn_id_of(result: &Value) -> Result<String, BackendError> {
+    result["turnId"]
+        .as_str()
+        .or_else(|| result["turn"]["id"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| BackendError::Protocol("turn/steer result missing turnId".into()))
+}
+
 /// Translate routed app-server messages into `BackendEvent`s until the turn
 /// completes.
 fn turn_stream(
@@ -704,6 +733,7 @@ fn turn_stream(
         let mut route_closed = false;
         let mut terminal_params = None;
         let mut announced_collaborators = HashSet::<(String, String)>::new();
+        let mut collaborator_prompt_lookups = HashSet::<String>::new();
         let mut collaborator_states = HashMap::<String, CollaboratorStreamState>::new();
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
@@ -720,17 +750,29 @@ fn turn_stream(
                     ServerMsg::Notification { method, params } => {
                         let announcement_id =
                             params["item"]["id"].as_str().unwrap_or("").to_string();
-                        for collaborator in collaborator_announcements(&params) {
+                        for mut collaborator in collaborator_announcements(&params) {
                             if announced_collaborators
                                 .insert((collaborator.session_id.clone(), announcement_id.clone()))
                             {
+                                if collaborator.prompt.is_some() {
+                                    collaborator_prompt_lookups
+                                        .insert(collaborator.session_id.clone());
+                                } else if collaborator_prompt_lookups
+                                    .insert(collaborator.session_id.clone())
+                                {
+                                    collaborator.prompt = server
+                                        .collaborator_prompt(&collaborator.session_id, &cancel)
+                                        .await;
+                                }
                                 let _ = tx
                                     .send(Ok(BackendEvent::CollaboratorStarted {
                                         session_id: collaborator.session_id,
                                         parent_session_id: collaborator.parent_session_id,
+                                        name: collaborator.name,
                                         prompt: collaborator.prompt,
                                         model: collaborator.model,
                                         thinking_level: collaborator.thinking_level,
+                                        access: collaborator.access,
                                     }))
                                     .await;
                             }
@@ -1146,9 +1188,133 @@ fn announced_child_threads(message: &ServerMsg) -> Vec<&str> {
 struct CollaboratorAnnouncement {
     session_id: String,
     parent_session_id: String,
+    name: Option<String>,
     prompt: Option<String>,
     model: Option<String>,
     thinking_level: Option<String>,
+    access: BackendCollaboratorAccess,
+}
+
+fn collaborator_access_label(value: &str) -> BackendCollaboratorAccess {
+    let tokens = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let read_only_phrase = tokens.windows(2).any(|pair| {
+        matches!(pair, [first, second] if
+            (first == "read" || first == "transcript") && second == "only")
+    });
+    if read_only_phrase
+        || tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "audit"
+                    | "auditor"
+                    | "auditing"
+                    | "explore"
+                    | "explorer"
+                    | "exploration"
+                    | "inspect"
+                    | "inspector"
+                    | "inspection"
+                    | "research"
+                    | "researcher"
+                    | "researching"
+                    | "review"
+                    | "reviewer"
+                    | "reviewing"
+                    | "readonly"
+            )
+        })
+    {
+        BackendCollaboratorAccess::ReadOnly
+    } else if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "build"
+                | "builder"
+                | "code"
+                | "coder"
+                | "general"
+                | "implement"
+                | "implementer"
+                | "implementation"
+                | "interactive"
+                | "worker"
+                | "write"
+                | "writer"
+        )
+    }) {
+        BackendCollaboratorAccess::Interactive
+    } else {
+        BackendCollaboratorAccess::Inherit
+    }
+}
+
+fn collaborator_access(item: &Value, session_id: &str) -> BackendCollaboratorAccess {
+    let state = item
+        .get("agentsStates")
+        .and_then(Value::as_object)
+        .and_then(|states| states.get(session_id));
+    for source in state.into_iter().chain(std::iter::once(item)) {
+        for key in ["readOnly", "read_only"] {
+            if let Some(read_only) = source.get(key).and_then(Value::as_bool) {
+                return if read_only {
+                    BackendCollaboratorAccess::ReadOnly
+                } else {
+                    BackendCollaboratorAccess::Interactive
+                };
+            }
+        }
+        for key in [
+            "access",
+            "mode",
+            "agentType",
+            "agent_type",
+            "role",
+            "name",
+            "agentName",
+            "taskName",
+            "agentPath",
+        ] {
+            let Some(label) = source.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let access = collaborator_access_label(label);
+            if access != BackendCollaboratorAccess::Inherit {
+                return access;
+            }
+        }
+    }
+    BackendCollaboratorAccess::Inherit
+}
+
+fn collaborator_name(item: &Value, session_id: &str) -> Option<String> {
+    let state = item
+        .get("agentsStates")
+        .and_then(Value::as_object)
+        .and_then(|states| states.get(session_id));
+    for source in state.into_iter().chain(std::iter::once(item)) {
+        for key in ["name", "agentName", "taskName", "nickname", "role"] {
+            if let Some(name) = source
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+    state
+        .into_iter()
+        .chain(std::iter::once(item))
+        .filter_map(|source| source.get("agentPath").and_then(Value::as_str))
+        .filter_map(|path| path.rsplit('/').find(|segment| !segment.is_empty()))
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// Rich counterpart to `announced_child_threads`, used by the backend event
@@ -1200,12 +1366,17 @@ fn collaborator_announcements(params: &Value) -> Vec<CollaboratorAnnouncement> {
     session_ids
         .into_iter()
         .filter(|session_id| session_id != &parent_session_id)
-        .map(|session_id| CollaboratorAnnouncement {
-            session_id,
-            parent_session_id: parent_session_id.clone(),
-            prompt: item["prompt"].as_str().map(str::to_string),
-            model: item["model"].as_str().map(str::to_string),
-            thinking_level: item["reasoningEffort"].as_str().map(str::to_string),
+        .map(|session_id| {
+            let access = collaborator_access(item, &session_id);
+            CollaboratorAnnouncement {
+                name: collaborator_name(item, &session_id),
+                session_id,
+                parent_session_id: parent_session_id.clone(),
+                prompt: item["prompt"].as_str().map(str::to_string),
+                model: item["model"].as_str().map(str::to_string),
+                thinking_level: item["reasoningEffort"].as_str().map(str::to_string),
+                access,
+            }
         })
         .collect()
 }
@@ -2672,7 +2843,8 @@ impl Drop for TransportWriteGuard<'_> {
 
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
-        let mut child = tokio::process::Command::new(command)
+        let mut command_process = crate::process_env::tokio_command(command);
+        let mut child = command_process
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2891,6 +3063,35 @@ impl AppServer {
         self.request_with_cancel(method, params, Some(cancel)).await
     }
 
+    async fn collaborator_prompt(
+        &self,
+        thread_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<String> {
+        match self
+            .request_cancellable(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                }),
+                cancel,
+            )
+            .await
+        {
+            Ok(response) => collaborator_prompt_from_turn_page(&response),
+            Err(BackendError::Cancelled) => None,
+            Err(error) => {
+                tracing::warn!(
+                    "codex: unable to load initial collaborator prompt for {thread_id}: {error}"
+                );
+                None
+            }
+        }
+    }
+
     async fn request_with_cancel(
         &self,
         method: &str,
@@ -2973,7 +3174,7 @@ impl AppServer {
                 cancel,
             )
             .await?;
-        let returned_turn_id = turn_id_of(&response)?;
+        let returned_turn_id = steered_turn_id_of(&response)?;
         if returned_turn_id != expected_turn_id {
             return Err(BackendError::Protocol(format!(
                 "turn/steer returned turn {returned_turn_id}, expected {expected_turn_id}"
@@ -4307,7 +4508,12 @@ mod tests {
                 "prompt": "Inspect the router",
                 "model": "gpt-5.6-sol",
                 "reasoningEffort": "max",
-                "agentsStates": { "child": { "status": "running" } }
+                "agentsStates": {
+                    "child": {
+                        "status": "running",
+                        "name": "Router reviewer"
+                    }
+                }
             }
         });
 
@@ -4316,9 +4522,11 @@ mod tests {
         let child = &announcements[0];
         assert_eq!(child.session_id, "child");
         assert_eq!(child.parent_session_id, "root");
+        assert_eq!(child.name.as_deref(), Some("Router reviewer"));
         assert_eq!(child.prompt.as_deref(), Some("Inspect the router"));
         assert_eq!(child.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(child.thinking_level.as_deref(), Some("max"));
+        assert_eq!(child.access, BackendCollaboratorAccess::ReadOnly);
 
         let current = json!({
             "threadId": "root",
@@ -4345,6 +4553,113 @@ mod tests {
             }),
             vec!["current-child"]
         );
+
+        let live_activity = json!({
+            "threadId": "root",
+            "item": {
+                "id": "spawn-call",
+                "type": "subAgentActivity",
+                "kind": "started",
+                "agentThreadId": "activity-child",
+                "agentPath": "/root/reviewer"
+            }
+        });
+        let announcements = collaborator_announcements(&live_activity);
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].session_id, "activity-child");
+        assert_eq!(announcements[0].parent_session_id, "root");
+        assert_eq!(announcements[0].name.as_deref(), Some("reviewer"));
+        assert_eq!(announcements[0].prompt, None);
+        assert_eq!(announcements[0].access, BackendCollaboratorAccess::ReadOnly);
+
+        let worker = json!({
+            "threadId": "root",
+            "item": {
+                "type": "collabToolCall",
+                "tool": "spawn_agent",
+                "senderThreadId": "root",
+                "newThreadId": "worker-child",
+                "agent_type": "worker",
+                "prompt": "Implement the focused fix"
+            }
+        });
+        let announcements = collaborator_announcements(&worker);
+        assert_eq!(
+            announcements[0].access,
+            BackendCollaboratorAccess::Interactive
+        );
+    }
+
+    #[test]
+    fn collaborator_access_labels_cover_provider_role_variants() {
+        for label in [
+            "exploration",
+            "auditing",
+            "implementation reviewer",
+            "read-only",
+            "transcript_only",
+        ] {
+            assert_eq!(
+                collaborator_access_label(label),
+                BackendCollaboratorAccess::ReadOnly,
+                "{label}"
+            );
+        }
+        for label in ["implementation", "interactive worker", "general"] {
+            assert_eq!(
+                collaborator_access_label(label),
+                BackendCollaboratorAccess::Interactive,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            collaborator_access_label("specialist"),
+            BackendCollaboratorAccess::Inherit
+        );
+    }
+
+    #[test]
+    fn collaborator_turn_page_recovers_latest_user_prompt() {
+        let response = json!({
+            "data": [{
+                "id": "turn-2",
+                "items": [
+                    { "type": "agentMessage", "id": "old-output" },
+                    {
+                        "type": "userMessage",
+                        "id": "spawn-prompt",
+                        "content": [
+                            { "type": "text", "text": "Inspect the router." },
+                            { "type": "image", "url": "file:///tmp/reference.png" },
+                            { "type": "text", "text": "Report only actionable issues." }
+                        ]
+                    },
+                    {
+                        "type": "userMessage",
+                        "id": "later-steer",
+                        "content": [{ "type": "text", "text": "Also inspect the tests." }]
+                    },
+                    { "type": "reasoning", "id": "thought" }
+                ]
+            }]
+        });
+
+        assert_eq!(
+            collaborator_prompt_from_turn_page(&response).as_deref(),
+            Some("Inspect the router.\nReport only actionable issues.")
+        );
+    }
+
+    #[test]
+    fn collaborator_turn_page_without_user_message_has_no_prompt() {
+        let response = json!({
+            "data": [{
+                "id": "turn-2",
+                "items": [{ "type": "agentMessage", "id": "output" }]
+            }]
+        });
+
+        assert_eq!(collaborator_prompt_from_turn_page(&response), None);
     }
 
     #[test]
@@ -4467,7 +4782,7 @@ mod tests {
             r#"#!/bin/sh
 IFS= read -r request
 printf '%s\n' "$request" > "$0.request"
-echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-1"}}}'
+echo '{"jsonrpc":"2.0","id":1,"result":{"turnId":"turn-1"}}'
 cat > /dev/null
 "#,
         )

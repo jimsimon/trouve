@@ -9,6 +9,7 @@ mod diff;
 mod fs;
 mod glob;
 mod grep;
+mod hashline;
 mod patch;
 mod search;
 mod shell;
@@ -285,6 +286,7 @@ impl LocalToolExecutor {
             Arc::new(fs::ReadFile),
             Arc::new(fs::WriteFile),
             Arc::new(fs::EditFile),
+            Arc::new(hashline::HashlineEdit),
             Arc::new(patch::ApplyPatch),
             Arc::new(fs::ListDir),
             Arc::new(diff::GitDiff),
@@ -579,5 +581,11 @@ mod tests {
         };
         let res = exec.execute(&ctx, "nope", &serde_json::json!({})).await;
         assert_eq!(res.status, ToolStatus::Error);
+    }
+
+    #[test]
+    fn executor_classifies_hashline_edits_as_mutations() {
+        let exec = LocalToolExecutor::default();
+        assert_eq!(exec.tool_mutates("hashline_edit"), Some(true));
     }
 }

@@ -17,6 +17,58 @@ const envelope = (
   ({ cursor, scope: { thread: "th_1" }, ts, ...event }) as ProtocolEventEnvelope;
 
 describe("ThreadViewModel", () => {
+  it("distinguishes scheduler waiting from an actively running provider turn", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+      thinking_level: "max",
+      supports_steering: true,
+    }));
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 4,
+      state: { kind: "waiting-for-capacity" },
+    });
+
+    vm.apply(envelope(2, {
+      type: "turn.capacity_acquired",
+      turn: 4,
+      wait_ms: 125,
+      background: false,
+    }));
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 4,
+      state: { kind: "running" },
+    });
+  });
+
+  it("replays an early capacity event without regressing the visible state", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.capacity_acquired",
+      turn: 4,
+      wait_ms: 0,
+      background: false,
+    }));
+    vm.apply(envelope(2, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+      thinking_level: "max",
+      supports_steering: true,
+    }));
+    expect(vm.items.at(-1)).toMatchObject({
+      kind: "turn-status",
+      turn: 4,
+      state: { kind: "running" },
+    });
+  });
+
   it("matches the shared Rust/web projection fixture", () => {
     const fixture = JSON.parse(
       readFileSync(
@@ -110,6 +162,38 @@ describe("ThreadViewModel", () => {
         turn: 3,
         content: "Prioritize the narrow layout.",
         attachments: [],
+      },
+    ]);
+  });
+
+  it("projects a linked subagent as a top-level parent-turn boundary", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 3,
+      text: "Delegating the focused review.",
+    }));
+    vm.apply(envelope(2, {
+      type: "subagent.spawned",
+      turn: 3,
+      thread_id: "th_child",
+      session_id: "se_child",
+      prompt: "Review the native host lifecycle.",
+      model: "codex/gpt-5.6-terra",
+      call_id: "call_spawn",
+    }));
+
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", complete: true },
+      {
+        kind: "subagent",
+        turn: 3,
+        threadId: "th_child",
+        sessionId: "se_child",
+        prompt: "Review the native host lifecycle.",
+        model: "codex/gpt-5.6-terra",
+        callId: "call_spawn",
       },
     ]);
   });
@@ -481,6 +565,12 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(2, {
+      type: "turn.capacity_acquired",
+      turn: 1,
+      wait_ms: 0,
+      background: false,
+    }));
+    vm.apply(envelope(3, {
       type: "turn.usage_updated",
       turn: 1,
       usage: {
@@ -493,7 +583,7 @@ describe("ThreadViewModel", () => {
     }));
 
     expect(vm.turnRunning).toBe(true);
-    expect(vm.lastUsageCursor).toBe(2);
+    expect(vm.lastUsageCursor).toBe(3);
     expect(vm.lastUsage?.context_input_tokens).toBe(90_000);
     expect(vm.items).toMatchObject([
       {

@@ -109,7 +109,13 @@ available in this turn. In particular, do not use Codex's built-in \
 MCP tools. A read-only error from a vendor-native tool does not mean the \
 trouve thread or Code mode is read-only. Independent read-only tool calls may \
 run in parallel; trouve serializes mutation-capable calls within the session \
-worktree.";
+worktree.
+
+Editing strategies are additive: use `apply_patch` when the model is trained \
+on that format (especially Codex). Use `read_file` with `format=hashline` \
+followed by `hashline_edit` when line-numbered snapshot edits avoid repeating \
+substantial old text. Never invent or reuse a hashline snapshot tag after the \
+file changes.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks

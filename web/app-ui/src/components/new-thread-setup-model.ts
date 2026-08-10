@@ -1,6 +1,7 @@
 import {
   createNewSessionThreadRequest,
   resolveNewSessionModel,
+  threadTitleFallback,
   thinkingOption,
   type ThinkingOption,
 } from "../app/new-session-model.js";
@@ -203,7 +204,6 @@ export const newThreadSetupControls = (input: {
   readonly workspaceId: string;
   readonly disabled: boolean;
   readonly busy: boolean;
-  readonly optionsLoading: boolean;
   readonly attachmentLoading: boolean;
 }): NewThreadSetupControls => {
   const validScope = nonEmpty(input.sessionId) !== undefined
@@ -211,11 +211,13 @@ export const newThreadSetupControls = (input: {
   const formDisabled = input.disabled || input.busy;
   return {
     formDisabled,
-    optionControlsDisabled: formDisabled || input.optionsLoading,
+    // Catalog refreshes only enrich these controls. Server defaults are a
+    // valid immediate choice, so waiting for static mode/model metadata must
+    // never make the setup form inert.
+    optionControlsDisabled: formDisabled,
     canSubmit:
       validScope
       && !formDisabled
-      && !input.optionsLoading
       && !input.attachmentLoading,
     canCancel: !input.busy,
     submitLabel: input.busy ? "Starting…" : "Start thread",
@@ -257,15 +259,16 @@ export const createNewThreadSetupSubmission = (input: {
     },
     input.catalog,
   );
+  const prompt = input.draft.prompt.trim();
   const request = createNewSessionThreadRequest({
     sessionId: input.sessionId,
+    title: threadTitleFallback(prompt),
     ...(mode === undefined ? {} : { mode: mode.id }),
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,
     thinking: input.draft.thinking,
     ...(effectiveModel === undefined ? {} : { modelInfo: effectiveModel }),
   });
-  const prompt = input.draft.prompt.trim();
   const initialMessage = prompt === "" && input.draft.attachments.length === 0
     ? undefined
     : {

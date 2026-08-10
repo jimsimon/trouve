@@ -766,6 +766,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/mcp-servers/{name}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_mcp_server_enabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/mcp-servers/{name}/logs": {
         parameters: {
             query?: never;
@@ -806,6 +822,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["list_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/models/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["refresh_models"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1433,6 +1465,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/thread-statuses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_thread_statuses"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/threads": {
         parameters: {
             query?: never;
@@ -1544,6 +1592,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["steer_turn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/threads/{id}/subagents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_thread_subagents"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2446,6 +2510,8 @@ export interface components {
             };
             permission_mode?: null | components["schemas"]["PermissionMode"];
             session_id: components["schemas"]["String"];
+            /** @description Concise user-visible title for navigation surfaces. */
+            title?: string | null;
         };
         DirEntry: {
             is_dir: boolean;
@@ -2527,6 +2593,16 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "turn.steered";
+        } | {
+            call_id?: null | components["schemas"]["String"];
+            model: string;
+            prompt: string;
+            session_id: components["schemas"]["String"];
+            thread_id: components["schemas"]["String"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "subagent.spawned";
         } | {
             text: string;
             /** Format: int64 */
@@ -2738,6 +2814,10 @@ export interface components {
             thread_id: components["schemas"]["String"];
             /** @enum {string} */
             type: "thread.updated";
+        } | {
+            status: components["schemas"]["ThreadStatus"];
+            /** @enum {string} */
+            type: "thread.status_updated";
         } | {
             active: boolean;
             session_id: components["schemas"]["String"];
@@ -3129,13 +3209,19 @@ export interface components {
             command: string;
             /** @description "5 tools" when healthy, the failure reason when not, "" for unknown. */
             detail: string;
+            /**
+             * @description Whether this definition participates in the effective MCP config.
+             *     Older servers omit the field, which clients interpret as enabled.
+             */
+            enabled?: boolean | null;
             /** @description Values may be `${VAR}` references resolved at spawn time. */
             env?: {
                 [key: string]: string;
             };
             /**
              * @description "ok" / "error" / "unknown" (unknown when listing skipped the probe) /
-             *     "untrusted" (a repo-scoped server that is never auto-run).
+             *     "untrusted" (a repo-scoped server that is never auto-run) /
+             *     "disabled" (this definition is persistently disabled).
              */
             health: string;
             name: string;
@@ -4040,6 +4126,14 @@ export interface components {
         SetLocalEnabledRequest: {
             enabled: boolean;
         };
+        /** @description Persistently enable or disable an existing user-managed MCP definition. */
+        SetMcpServerEnabledRequest: {
+            enabled: boolean;
+            /** @description "user" or "workspace". */
+            scope: string;
+            /** @description Required for workspace scope: whose `.agents/.mcp.json` to edit. */
+            workspace_id?: string | null;
+        };
         /**
          * @description A steering message accepted by the active vendor turn. Durable display
          *     state follows as `turn.steered` on the thread event stream.
@@ -4128,6 +4222,11 @@ export interface components {
              */
             spawned?: boolean;
             /**
+             * @description Concise user-visible title. Older threads may not have one; clients
+             *     fall back to the session title or mode/model metadata.
+             */
+            title?: string | null;
+            /**
              * @description Current todo snapshot for this thread. Tool-call events retain the
              *     history of how the list changed; this field is the initial-load view.
              */
@@ -4144,6 +4243,32 @@ export interface components {
         } | {
             /** @enum {string} */
             state: "failed";
+        };
+        /**
+         * @description Compact durable execution state for one thread. This lets clients render
+         *     background-thread status without retaining or streaming every transcript.
+         */
+        ThreadStatus: {
+            active: boolean;
+            attention: components["schemas"]["SessionAttention"];
+            /**
+             * Format: date-time
+             * @description End of the latest turn. Absent while that turn is still active.
+             */
+            completed_at?: string | null;
+            /**
+             * Format: int64
+             * @description Cursor of the durable source event that produced this state.
+             */
+            latest_cursor: number;
+            outcome: components["schemas"]["SessionOutcome"];
+            session_id: components["schemas"]["String"];
+            /**
+             * Format: date-time
+             * @description Start of the latest turn, when this thread has run at least once.
+             */
+            started_at?: string | null;
+            thread_id: components["schemas"]["String"];
         };
         /**
          * @description One user-visible transition in a todo's lifecycle. `Skipped` is derived
@@ -4164,6 +4289,9 @@ export interface components {
         /** @enum {string} */
         ThreadToolStatus: "awaiting_approval" | "running" | "ok" | "error" | "denied" | "aborted";
         ThreadTurnState: {
+            /** @enum {string} */
+            state: "waiting_for_capacity";
+        } | {
             /** @enum {string} */
             state: "running";
         } | {
@@ -4192,6 +4320,16 @@ export interface components {
             content: string;
             /** @enum {string} */
             kind: "steered";
+            /** Format: int64 */
+            turn: number;
+        } | {
+            call_id?: null | components["schemas"]["String"];
+            /** @enum {string} */
+            kind: "subagent";
+            model: string;
+            prompt: string;
+            session_id: components["schemas"]["String"];
+            thread_id: components["schemas"]["String"];
             /** Format: int64 */
             turn: number;
         } | {
@@ -4271,9 +4409,15 @@ export interface components {
             before?: number | null;
             /**
              * Format: int32
-             * @description Requested item count; the server applies a safe upper bound.
+             * @description Maximum item count; the server applies a safe upper bound.
              */
             limit?: number | null;
+            /**
+             * @description Expand the page backward to the beginning of its oldest turn. This can
+             *     return more than `limit` items, but prevents a paged turn from changing
+             *     shape when its preceding history is loaded.
+             */
+            turn_aligned?: boolean | null;
         };
         /**
          * @description Folded current thread state and one transcript item page at the cursor
@@ -4375,6 +4519,7 @@ export interface components {
          */
         TurnAccepted: {
             queued?: boolean;
+            queued_prompt?: null | components["schemas"]["QueuedPrompt"];
             thread_id: components["schemas"]["String"];
             /** Format: int64 */
             turn: number;
@@ -4459,6 +4604,11 @@ export interface components {
         UpsertMcpServerRequest: {
             args?: string[];
             command: string;
+            /**
+             * @description Preserve a disabled definition while editing or importing it. Omitted
+             *     requests retain the historical behavior of creating an enabled server.
+             */
+            enabled?: boolean | null;
             env?: {
                 [key: string]: string;
             };
@@ -6213,6 +6363,45 @@ export interface operations {
             };
         };
     };
+    set_mcp_server_enabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetMcpServerEnabledRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     mcp_server_logs: {
         parameters: {
             query?: never;
@@ -6257,6 +6446,25 @@ export interface operations {
         };
     };
     list_models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelInfo"][];
+                };
+            };
+        };
+    };
+    refresh_models: {
         parameters: {
             query?: never;
             header?: never;
@@ -7704,6 +7912,27 @@ export interface operations {
             };
         };
     };
+    list_thread_statuses: {
+        parameters: {
+            query: {
+                session_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadStatus"][];
+                };
+            };
+        };
+    };
     list_threads: {
         parameters: {
             query: {
@@ -8034,6 +8263,35 @@ export interface operations {
             };
         };
     };
+    list_thread_subagents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Thread"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_thread_tool_details: {
         parameters: {
             query?: never;
@@ -8098,8 +8356,10 @@ export interface operations {
             query?: {
                 /** @description Exclusive folded-item offset for backward pagination */
                 before?: number;
-                /** @description Requested item count; capped by the server */
+                /** @description Maximum item count, capped by the server */
                 limit?: number;
+                /** @description Expand backward to a complete turn boundary; the response may exceed limit */
+                turn_aligned?: boolean;
             };
             header?: never;
             path: {

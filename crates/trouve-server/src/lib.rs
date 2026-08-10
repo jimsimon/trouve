@@ -43,12 +43,13 @@ use trouve_protocol::{
     ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SteerAccepted, SteerTurnRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SetMcpServerEnabledRequest,
+    SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
+    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -118,7 +119,9 @@ impl IntoResponse for ApiError {
         fork_checkpoint,
         create_thread,
         list_threads,
+        list_thread_statuses,
         get_thread,
+        list_thread_subagents,
         get_thread_view,
         get_thread_tool_details,
         update_thread,
@@ -135,6 +138,7 @@ impl IntoResponse for ApiError {
         resolve_approval,
         resolve_question,
         list_models,
+        refresh_models,
         list_modes,
         list_mode_infos,
         upsert_mode,
@@ -196,6 +200,7 @@ impl IntoResponse for ApiError {
         remove_github_host,
         list_mcp_servers,
         upsert_mcp_server,
+        set_mcp_server_enabled,
         delete_mcp_server,
         mcp_server_logs,
         subscription_health,
@@ -239,6 +244,7 @@ impl IntoResponse for ApiError {
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
+        ThreadStatus,
         ThreadViewQuery,
         ThreadViewSnapshot,
         trouve_protocol::ThreadViewItem,
@@ -328,6 +334,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::AddGithubHostRequest,
         McpServerInfo,
         UpsertMcpServerRequest,
+        SetMcpServerEnabledRequest,
         McpLogs,
         SubscriptionHealth,
         trouve_protocol::SubscriptionWindow,
@@ -586,9 +593,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/mcp-servers/{name}",
             axum::routing::put(upsert_mcp_server).delete(delete_mcp_server),
         )
+        .route(
+            "/v1/mcp-servers/{name}/enabled",
+            axum::routing::put(set_mcp_server_enabled),
+        )
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/refresh", get(refresh_models))
         .route("/v1/modes", get(list_modes))
         .route("/v1/mode-infos", get(list_mode_infos))
         .route(
@@ -706,7 +718,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(install_title_model).delete(cancel_title_model_install),
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
+        .route("/v1/thread-statuses", get(list_thread_statuses))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/subagents", get(list_thread_subagents))
         .route("/v1/threads/{id}/view", get(get_thread_view))
         .route(
             "/v1/threads/{id}/tools/{call_id}",
@@ -1388,6 +1402,16 @@ async fn list_threads(
     Ok(Json(engine.list_threads(&q.session_id)?))
 }
 
+#[utoipa::path(get, path = "/v1/thread-statuses",
+    params(("session_id" = String, Query,)),
+    responses((status = 200, body = [ThreadStatus])))]
+async fn list_thread_statuses(
+    State(engine): State<Arc<Engine>>,
+    Query(q): Query<ListThreadsQuery>,
+) -> Result<Json<Vec<ThreadStatus>>, ApiError> {
+    Ok(Json(engine.list_thread_statuses(&q.session_id)?))
+}
+
 #[utoipa::path(get, path = "/v1/threads/{id}", params(("id" = String, Path,)),
     responses((status = 200, body = Thread), (status = 404, body = ErrorBody)))]
 async fn get_thread(
@@ -1397,11 +1421,22 @@ async fn get_thread(
     Ok(Json(engine.get_thread(&id)?))
 }
 
+#[utoipa::path(get, path = "/v1/threads/{id}/subagents",
+    params(("id" = String, Path,)),
+    responses((status = 200, body = [Thread]), (status = 404, body = ErrorBody)))]
+async fn list_thread_subagents(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<Thread>>, ApiError> {
+    Ok(Json(engine.list_thread_subagents(&id)?))
+}
+
 #[utoipa::path(get, path = "/v1/threads/{id}/view",
     params(
         ("id" = String, Path,),
         ("before" = Option<u64>, Query, description = "Exclusive folded-item offset for backward pagination"),
-        ("limit" = Option<u32>, Query, description = "Requested item count; capped by the server")
+        ("limit" = Option<u32>, Query, description = "Maximum item count, capped by the server"),
+        ("turn_aligned" = Option<bool>, Query, description = "Expand backward to a complete turn boundary; the response may exceed limit")
     ),
     responses(
         (status = 200, body = ThreadViewSnapshot,
@@ -1420,14 +1455,16 @@ async fn get_thread_view(
         .limit
         .map(|limit| (limit as usize).clamp(1, MAX_ITEMS))
         .unwrap_or(usize::MAX);
-    let (cursor, snapshot) =
-        tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id, query.before, limit))
-            .await
-            .map_err(|error| {
-                ApiError(EngineError::Internal(anyhow::anyhow!(
-                    "thread view worker failed: {error}"
-                )))
-            })??;
+    let turn_aligned = query.turn_aligned.unwrap_or(false);
+    let (cursor, snapshot) = tokio::task::spawn_blocking(move || {
+        engine.thread_view_snapshot(&id, query.before, limit, turn_aligned)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(EngineError::Internal(anyhow::anyhow!(
+            "thread view worker failed: {error}"
+        )))
+    })??;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
 }
 
@@ -1549,6 +1586,7 @@ async fn dispatch_queue(
             thread_id: id,
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
+            queued_prompt: None,
         }),
     ))
 }
@@ -1624,6 +1662,11 @@ async fn resolve_question(
 #[utoipa::path(get, path = "/v1/models", responses((status = 200, body = [ModelInfo])))]
 async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
     Json(engine.list_models().await)
+}
+
+#[utoipa::path(get, path = "/v1/models/refresh", responses((status = 200, body = [ModelInfo])))]
+async fn refresh_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
+    Json(engine.refresh_models().await)
 }
 
 #[utoipa::path(get, path = "/v1/providers", responses((status = 200, body = ProvidersResponse)))]
@@ -2422,6 +2465,22 @@ async fn upsert_mcp_server(
     Json(req): Json<UpsertMcpServerRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     engine.upsert_mcp_server(&name, &req)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/mcp-servers/{name}/enabled", params(("name" = String, Path,)),
+    request_body = SetMcpServerEnabledRequest,
+    responses(
+        (status = 204),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn set_mcp_server_enabled(
+    State(engine): State<Arc<Engine>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetMcpServerEnabledRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.set_mcp_server_enabled(&name, &req)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

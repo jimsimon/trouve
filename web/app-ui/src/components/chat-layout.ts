@@ -1,8 +1,9 @@
 import type { ThreadChatItem } from "../state/thread-view-model.js";
+import { isTodoToolCall } from "./tool-presentation.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
+  { readonly kind: "assistant" | "steered" | "subagent" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -39,6 +40,7 @@ export interface ChatLayout {
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
   || item.kind === "steered"
+  || item.kind === "subagent"
   || item.kind === "thinking"
   || item.kind === "compaction"
   || item.kind === "todo"
@@ -66,18 +68,29 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     if (current === undefined) return;
     const turn = current.turn ?? lastExplicitTurn ?? 0;
     const id = turn === 0 ? `turn:0:${current.firstId}` : `turn:${turn}`;
+    const linkedSpawnCalls = new Set(
+      current.items.flatMap((item) =>
+        item.kind === "subagent" && item.callId !== undefined ? [item.callId] : []),
+    );
+    const hasTodoLifecycle = current.items.some((item) => item.kind === "todo");
+    const visibleItems = current.items.filter((item) =>
+      item.kind !== "tool"
+      || (
+        !linkedSpawnCalls.has(item.callId)
+        && (!hasTodoLifecycle || !isTodoToolCall(item.tool, item.args))
+      ));
     const unit: ChatRenderUnit = Object.freeze({
       id,
       kind: "turn",
       turn,
       divider: units.length > 0,
       prompt: current.prompt,
-      items: Object.freeze([...current.items]),
+      items: Object.freeze(visibleItems),
       status: current.status,
     });
     units.push(unit);
     if (current.prompt !== undefined) unitIdForItem.set(current.prompt.id, id);
-    for (const item of current.items) unitIdForItem.set(item.id, id);
+    for (const item of visibleItems) unitIdForItem.set(item.id, id);
     if (current.status !== undefined) unitIdForItem.set(current.status.id, id);
     current = undefined;
   };
@@ -111,6 +124,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
       const explicitTurn =
         item.kind === "assistant"
         || item.kind === "steered"
+        || item.kind === "subagent"
         || item.kind === "thinking"
         || item.kind === "compaction"
         || item.kind === "todo"
@@ -137,11 +151,21 @@ const nestedMcpTool = (item: Extract<AgentChatItem, { readonly kind: "tool" }>) 
   };
 };
 
-const argumentPath = (args: unknown): string | undefined => {
-  if (args === null || typeof args !== "object") return undefined;
+const argumentPaths = (args: unknown, tool = ""): string[] => {
+  if (args === null || typeof args !== "object") return [];
   const object = args as Record<string, unknown>;
   const value = object["file_path"] ?? object["path"];
-  return typeof value === "string" && value !== "" ? value : undefined;
+  if (typeof value === "string" && value !== "") return [value];
+  if ((tool.split("__").at(-1) ?? tool) !== "hashline_edit") return [];
+  const input = object["input"];
+  if (typeof input !== "string") return [];
+  return input.split("\n").flatMap((line) => {
+    const header = line.trim();
+    if (!header.startsWith("[") || !header.endsWith("]")) return [];
+    const inner = header.slice(1, -1);
+    const separator = inner.lastIndexOf("#");
+    return separator > 0 ? [inner.slice(0, separator)] : [];
+  });
 };
 
 const plural = (count: number, one: string, many: string): string =>
@@ -192,13 +216,14 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
     if (item.kind !== "tool") continue;
     const effective = nestedMcpTool(item);
     const base = effective.tool.split("__").at(-1) ?? effective.tool;
-    const path = argumentPath(effective.args);
+    const paths = argumentPaths(effective.args, effective.tool);
+    const path = paths[0];
     if ([
       "edit", "Edit", "MultiEdit", "NotebookEdit", "Write", "write",
-      "edit_file", "write_file", "create_file", "apply_patch", "delete", "delete_file",
+      "edit_file", "hashline_edit", "write_file", "create_file", "apply_patch", "delete", "delete_file",
     ].includes(base)) {
-      if (path === undefined) editsWithoutPath += 1;
-      else edited.add(path);
+      if (paths.length === 0) editsWithoutPath += 1;
+      else for (const editedPath of paths) edited.add(editedPath);
     } else if (["read", "Read", "read_file"].includes(base)) {
       if (path === undefined) readsWithoutPath += 1;
       else read.add(path);
@@ -236,7 +261,7 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   if (compactions > 0) {
     parts.push(compactions === 1 ? "compacted context" : `compacted context ${compactions} times`);
   }
-  if (todos.size > 0) parts.push(`updated ${plural(todos.size, "todo", "todos")}`);
+  if (todos.size > 0) parts.push(`updated ${plural(todos.size, "TODO", "TODOs")}`);
   const summary = parts.join(", ");
   return summary === "" ? "Worked" : `${summary[0]?.toUpperCase() ?? ""}${summary.slice(1)}`;
 };

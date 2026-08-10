@@ -116,6 +116,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         created_at: "2026-08-04T08:00:00Z",
       }],
       "GET /v1/threads": [],
+      "GET /v1/thread-statuses": [],
       "GET /v1/sessions/se_1/prs": [pr],
       "GET /v1/workspaces": [{ id: "ws_1", name: "trouve", path: "/src/trouve" }],
       "GET /v1/providers": {

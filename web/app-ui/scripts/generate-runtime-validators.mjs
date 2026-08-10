@@ -160,6 +160,7 @@ const protocolValidators = {
   models: componentArray(protocolSchemaId, "ModelInfo"),
   thread: componentRef(protocolSchemaId, "Thread"),
   threads: componentArray(protocolSchemaId, "Thread"),
+  threadStatuses: componentArray(protocolSchemaId, "ThreadStatus"),
   queuedPrompts: componentArray(protocolSchemaId, "QueuedPrompt"),
   turnAccepted: componentRef(protocolSchemaId, "TurnAccepted"),
   usageSummary: componentRef(protocolSchemaId, "UsageSummary"),

@@ -121,6 +121,17 @@ const effectiveToolCall = (
   return { tool: nestedTool ?? tool, args: nestedArgs };
 };
 
+/** Dedicated TODO lifecycle rows supersede the low-level tool card once the
+ * server has projected the list transition. Keep this matcher aligned with
+ * the native and wrapped tool identifiers accepted by `presentToolCall`. */
+export const isTodoToolCall = (tool: string, argsValue: unknown): boolean => {
+  const effective = effectiveToolCall(tool, record(argsValue) ?? {});
+  const normalized = baseToolName(effective.tool)
+    .replaceAll(/[^a-z0-9]/giu, "")
+    .toLowerCase();
+  return normalized === "todowrite";
+};
+
 /** Match the established tool naming contract across native and vendor
  * harness identifiers. */
 export const toolDisplayName = (tool: string): string => {
@@ -316,18 +327,31 @@ interface EditPresentation {
   readonly lines: readonly ToolDiffLine[];
 }
 
+const hashlineSectionPath = (input: string): string | undefined => {
+  const header = input.split("\n", 1)[0]?.trim();
+  if (header === undefined || !header.startsWith("[") || !header.endsWith("]")) return undefined;
+  const inner = header.slice(1, -1);
+  const separator = inner.lastIndexOf("#");
+  if (separator <= 0) return undefined;
+  const snapshot = inner.slice(separator + 1);
+  if (!/^[0-9a-f]{12}$/iu.test(snapshot)) return undefined;
+  return inner.slice(0, separator);
+};
+
 const editPresentation = (tool: string, args: JsonRecord): EditPresentation | undefined => {
   const base = baseToolName(tool);
   const verb = [
-    "edit", "Edit", "MultiEdit", "NotebookEdit", "edit_file", "apply_patch", "fileChange",
+    "edit", "Edit", "MultiEdit", "NotebookEdit", "edit_file", "hashline_edit", "apply_patch", "fileChange",
   ].includes(base)
     ? "Edit"
     : ["write", "Write", "write_file", "create_file"].includes(base)
       ? "Write"
       : undefined;
   if (verb === undefined) return undefined;
-  const path = firstString(args, ["file_path", "path", "abs_path", "target_file", "filePath"]) ?? "";
   const patch = firstString(args, ["diff", "patch", "unified_diff", "unifiedDiff", "input"]);
+  const path = firstString(args, ["file_path", "path", "abs_path", "target_file", "filePath"])
+    ?? (base === "hashline_edit" && patch !== undefined ? hashlineSectionPath(patch) : undefined)
+    ?? "";
   if (patch !== undefined) {
     const lines = patchDiff(patch);
     if (lines.length > 0) return { verb, path, lines };
@@ -498,7 +522,7 @@ export const presentToolCall = (
       const done = todos.filter((todo) => todo.status === "completed" || todo.status === "cancelled").length;
       const current = todos.find((todo) => todo.status === "in_progress")?.content;
       return {
-        ...emptyPresentation("Todos"),
+        ...emptyPresentation("TODOs"),
         subject: current ?? `${done}/${todos.length} done`,
         meta: `${done}/${todos.length}`,
         todos,

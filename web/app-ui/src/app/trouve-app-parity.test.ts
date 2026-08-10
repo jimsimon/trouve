@@ -5,10 +5,11 @@ import { describe, expect, it } from "vitest";
 const source = readFileSync(new URL("./trouve-app.ts", import.meta.url), "utf8");
 
 describe("root shell parity wiring", () => {
-  it("uses the dedicated todo projection in the inspection shell", () => {
-    expect(source).toContain('void import("../components/todo-plan-panel.js")');
-    expect(source).toContain("<trouve-todo-plan-panel");
-    expect(source).not.toContain(".todos=${activeView.todos}");
+  it("keeps TODO state in the session overview instead of a duplicate pane", () => {
+    expect(source).toContain('void import("../components/session-info-panel.js")');
+    expect(source).toContain("<trouve-session-info-panel");
+    expect(source).not.toContain("todo-plan-panel");
+    expect(source).not.toContain('inspection === "plan"');
   });
 
   it("contains chat file actions to session metadata before revealing them", () => {
@@ -37,5 +38,20 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("const SLEEP_ACTIVITY_RECONCILE_INTERVAL_MS = 15_000");
     expect(source).toContain("this.#protocolIngress.reconcileSessionActivity()");
     expect(source).toContain("this.#scheduleSleepActivityReconciliation(shouldPreventSleep)");
+  });
+
+  it("renders new-session agent controls without waiting for catalog refreshes", () => {
+    expect(source).toContain('name="mode"');
+    expect(source).toContain('name="thinking"');
+    expect(source).toContain('name="permission_mode"');
+    expect(source).not.toContain(
+      '?disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
+    );
+    expect(source).not.toContain(
+      '.disabled=${this.#newSessionPending || this.#newSessionOptionsPending}',
+    );
+    expect(source).toContain(
+      'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
+    );
   });
 });

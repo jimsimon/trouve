@@ -926,6 +926,7 @@ export const resumePreferencesFromHost = (
       }],
     ),
   ),
+  closedThreadTabs: preferences.resume?.closed_thread_tabs ?? [],
 });
 
 export const withHostGeneralPreferences = (
@@ -995,6 +996,7 @@ export const withHostResumePreferences = (
           { item_id: bookmark.itemId, offset: bookmark.offset },
         ]),
       ),
+      closed_thread_tabs: [...normalized.closedThreadTabs],
     },
   };
 };

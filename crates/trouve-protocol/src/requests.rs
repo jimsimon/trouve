@@ -270,6 +270,9 @@ pub struct UpdateSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateThreadRequest {
     pub session_id: SessionId,
+    /// Concise user-visible title for navigation surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Agent mode id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -317,6 +320,10 @@ pub struct TodoItem {
 pub struct Thread {
     pub id: ThreadId,
     pub session_id: SessionId,
+    /// Concise user-visible title. Older threads may not have one; clients
+    /// fall back to the session title or mode/model metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub mode: String,
     pub model: String,
     /// Current values for the model's options (thinking level, etc.);
@@ -349,6 +356,18 @@ pub enum ThreadViewItem {
         turn: u64,
         content: String,
         attachments: Vec<Attachment>,
+    },
+    /// A separately navigable child agent transcript spawned from this parent
+    /// turn. Children in read-only modes are transcript-only; other child
+    /// threads can accept follow-up prompts after their initial turn.
+    Subagent {
+        turn: u64,
+        thread_id: ThreadId,
+        session_id: SessionId,
+        prompt: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
     },
     Assistant {
         turn: u64,
@@ -435,6 +454,9 @@ pub enum ThreadToolStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ThreadTurnState {
+    /// The durable turn shell exists, but shared/provider scheduler capacity
+    /// has not yet been acquired.
+    WaitingForCapacity,
     Running,
     Completed {
         usage: crate::Usage,
@@ -513,9 +535,14 @@ pub struct ThreadViewQuery {
     /// newest page.
     #[serde(default)]
     pub before: Option<u64>,
-    /// Requested item count; the server applies a safe upper bound.
+    /// Maximum item count; the server applies a safe upper bound.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Expand the page backward to the beginning of its oldest turn. This can
+    /// return more than `limit` items, but prevents a paged turn from changing
+    /// shape when its preceding history is loaded.
+    #[serde(default)]
+    pub turn_aligned: Option<bool>,
 }
 
 /// Partial thread update between turns (mode/model switching). Rejected with
@@ -596,6 +623,11 @@ pub struct TurnAccepted {
     pub turn: u64,
     #[serde(default)]
     pub queued: bool,
+    /// The newly accepted durable queue row when this prompt remains queued.
+    /// Clients can use its stable id immediately instead of waiting for the
+    /// matching `thread.queue_updated` event before enabling queue mutations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_prompt: Option<QueuedPrompt>,
 }
 
 // --- queued prompts --------------------------------------------------------
@@ -1445,8 +1477,13 @@ pub struct McpServerInfo {
     /// Values may be `${VAR}` references resolved at spawn time.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Whether this definition participates in the effective MCP config.
+    /// Older servers omit the field, which clients interpret as enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// "ok" / "error" / "unknown" (unknown when listing skipped the probe) /
-    /// "untrusted" (a repo-scoped server that is never auto-run).
+    /// "untrusted" (a repo-scoped server that is never auto-run) /
+    /// "disabled" (this definition is persistently disabled).
     pub health: String,
     /// "5 tools" when healthy, the failure reason when not, "" for unknown.
     pub detail: String,
@@ -1464,6 +1501,21 @@ pub struct UpsertMcpServerRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Preserve a disabled definition while editing or importing it. Omitted
+    /// requests retain the historical behavior of creating an enabled server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Persistently enable or disable an existing user-managed MCP definition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetMcpServerEnabledRequest {
+    /// "user" or "workspace".
+    pub scope: String,
+    /// Required for workspace scope: whose `.agents/.mcp.json` to edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub enabled: bool,
 }
 
 /// Recent stderr and lifecycle lines for one MCP server.

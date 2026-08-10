@@ -28,6 +28,12 @@ describe("application routes", () => {
       sessionId: "se",
       inspection: "info",
     });
+    expect(parseRoute("/workspaces/ws/sessions/se/inspect/plan")).toEqual({
+      kind: "session",
+      workspaceId: "ws",
+      sessionId: "se",
+      inspection: "info",
+    });
   });
 
   it("rejects malformed escapes and unknown inspection panels", () => {

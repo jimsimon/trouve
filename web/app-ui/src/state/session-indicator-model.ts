@@ -68,3 +68,29 @@ export const sessionIndicatorPresentation = (
   }
   return { kind: "none", icon: undefined, tooltip: "" };
 };
+
+/** Summarize only states that require the user to revisit hidden content.
+ * Live activity is intentionally excluded: a closed thread gets a menu badge
+ * for actionable attention or an unread terminal outcome, not merely because
+ * it is still processing in the background. */
+export const attentionOrUnreadIndicatorPresentation = (
+  sessions: readonly SessionIndicatorFields[],
+): SessionIndicatorPresentation => {
+  const approval = sessions.some((session) =>
+    session.attention === "approval" || session.attention === "both");
+  const question = sessions.some((session) =>
+    session.attention === "question" || session.attention === "both");
+  const attention = approval
+    ? question ? "both" : "approval"
+    : question ? "question" : "none";
+  const failed = sessions.some((session) =>
+    session.unread && session.outcome === "failed");
+  const succeeded = sessions.some((session) =>
+    session.unread && session.outcome === "succeeded");
+  return sessionIndicatorPresentation({
+    active: false,
+    attention,
+    outcome: failed ? "failed" : succeeded ? "succeeded" : "idle",
+    unread: failed || succeeded,
+  });
+};

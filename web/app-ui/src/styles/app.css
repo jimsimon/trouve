@@ -194,15 +194,42 @@ trouve-session-list { display: block; }
 .session-pr-badge.merged { color: var(--trouve-merged); }
 .session-pr-badge.closed { color: var(--trouve-err); }
 .thread-header { position: relative; z-index: 1; padding: 10px; border-bottom: 1px solid var(--trouve-border); background: var(--trouve-panel-bg); box-shadow: 0 1px 5px var(--trouve-scrim); }
+.thread-tab-header { z-index: 8; display: flex; align-items: center; gap: 6px; }
 .thread-tabs { height: 30px; display: flex; align-items: stretch; gap: 6px; min-width: 0; overflow-x: auto; }
+.thread-tab-header > .thread-tabs { flex: 1 1 auto; }
 .thread-tabs button { width: 145px; height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 145px; overflow: hidden; border: 0; border-radius: var(--trouve-radius); padding: 0 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; white-space: nowrap; }
 .thread-tabs button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .thread-tabs button[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
-.thread-tabs button:last-child { width: 30px; flex-basis: 30px; padding: 0; font-size: 15px; }
-.thread-tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.thread-tabs > .new-thread-tab { width: 30px; flex-basis: 30px; padding: 0; font-size: 15px; }
+.thread-tab-item { position: relative; width: 145px; height: 30px; flex: 0 0 145px; }
+.thread-tab-item > .thread-tab-main { width: 100%; height: 100%; flex: none; padding-inline-end: 25px; }
+.thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
+.thread-tab-item > .thread-tab-close:hover, .thread-tab-item > .thread-tab-close:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.thread-tab-label { min-width: 0; display: inline-flex; flex: 1; align-items: center; gap: 5px; overflow: hidden; }
+.session-indicator.thread-tab-indicator { width: 14px; height: 18px; flex: 0 0 14px; margin: 0; border-radius: 3px; }
+.session-indicator.thread-tab-indicator.approval, .session-indicator.thread-tab-indicator.question, .session-indicator.thread-tab-indicator.both { font-size: 10px; }
+.session-indicator.thread-tab-indicator.error { font-size: 12px; }
+.session-indicator.thread-tab-indicator.unread { font-size: 7px; }
+.session-indicator.thread-tab-indicator.busy::before { width: 8px; height: 8px; }
+.thread-tab-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-tab-provisional { border: 1px solid var(--trouve-border); border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 600; }
 .thread-todo-progress { min-width: 34px; flex: none; border-radius: 9px; padding: 2px 5px; color: var(--trouve-text-mid); background: var(--trouve-pill-bg); font-size: 10px; }
 .thread-tabs button[aria-selected="true"] .thread-todo-progress { background: var(--trouve-accent-dim); }
+.closed-thread-tabs { position: relative; flex: none; }
+.closed-thread-tabs-toggle { position: relative; width: 34px; height: 30px; display: grid; place-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 13px; }
+.closed-thread-tabs-toggle:hover:not(:disabled), .closed-thread-tabs-toggle:focus-visible, .closed-thread-tabs-toggle[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.closed-thread-tabs-toggle:disabled { color: var(--trouve-text-ghost); opacity: .62; }
+.closed-thread-tabs-count { position: absolute; inset-block-start: -4px; inset-inline-end: -4px; min-width: 15px; height: 15px; display: grid; place-items: center; border: 2px solid var(--trouve-panel-bg); border-radius: 999px; padding-inline: 2px; color: var(--trouve-text-hi); background: var(--trouve-accent); font-size: 8px; font-weight: 700; line-height: 1; }
+.session-indicator.closed-thread-tabs-status { position: absolute; inset-block-end: -4px; inset-inline-start: -4px; width: 15px; height: 15px; border: 2px solid var(--trouve-panel-bg); border-radius: 999px; background: var(--trouve-control-bg); pointer-events: none; }
+.closed-thread-tabs-menu { position: absolute; z-index: 30; inset-block-start: calc(100% + 6px); inset-inline-end: 0; width: min(280px, calc(100vw - 32px)); display: grid; gap: 2px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px; background: var(--trouve-panel-bg); box-shadow: 0 8px 24px var(--trouve-scrim); }
+.closed-thread-tabs-menu button { width: 100%; min-width: 0; display: grid; grid-template-columns: 14px 14px minmax(0, 1fr) 18px; align-items: center; gap: 7px; border: 0; border-radius: var(--trouve-radius-sm); padding: 7px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
+.closed-thread-kind { width: 14px; display: grid; place-items: center; color: var(--trouve-text-dim); }
+.closed-thread-tabs-menu button:hover, .closed-thread-tabs-menu button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.closed-thread-tabs-copy { min-width: 0; display: grid; gap: 2px; }
+.closed-thread-tabs-copy strong, .closed-thread-tabs-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.closed-thread-tabs-copy strong { font-size: 11px; font-weight: 600; }
+.closed-thread-tabs-copy small { color: var(--trouve-text-dim); font-size: 9px; }
+.closed-thread-reopen-icon { color: var(--trouve-text-dim); }
 .inspection-tabs { height: 38px; display: flex; align-items: end; gap: 2px; padding: 0 8px; }
 .inspection-tabs button, .thread-options button { border: 0; padding: 8px 10px 7px; color: var(--trouve-text-dim); background: transparent; }
 .inspection-tabs button { display: inline-flex; align-items: center; gap: 5px; }
@@ -326,7 +353,18 @@ trouve-session-list { display: block; }
 .turn-rail-marker.response.failed, .turn-rail-marker.failed { color: var(--trouve-err); }
 .turn-rail-marker.response.cancelled, .turn-rail-marker.cancelled { color: var(--trouve-text-dim); }
 .turn-rail-marker.transient { color: var(--trouve-accent); }
+.turn-rail-marker.subagent { color: var(--trouve-accent); }
 .turn-transient-spinner { --trouve-icon-width: 12px; }
+.subagent-rail-item { width: 100%; min-height: 46px; display: flex; align-items: center; gap: 10px; overflow: visible; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 7px 10px; color: var(--trouve-text); background: var(--trouve-accent-bg); font: inherit; text-align: start; cursor: pointer; }
+.subagent-rail-item:hover { border-color: var(--trouve-accent); background: var(--trouve-accent-bg); }
+.subagent-rail-item:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: 1px; border-color: var(--trouve-accent); background: var(--trouve-accent-bg); }
+.subagent-rail-content { min-width: 0; display: grid; flex: 1; gap: 2px; }
+.subagent-rail-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.subagent-rail-heading strong { color: var(--trouve-accent-tint); font-size: 11px; }
+.subagent-rail-heading small { min-width: 0; overflow: hidden; color: var(--trouve-text-dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-rail-prompt { min-width: 0; overflow: hidden; color: var(--trouve-text-mid); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-rail-open { display: inline-flex; flex: none; align-items: center; gap: 5px; color: var(--trouve-text-dim); font-size: 10px; }
+.subagent-rail-item:hover .subagent-rail-open, .subagent-rail-item:focus-visible .subagent-rail-open { color: var(--trouve-accent-tint); }
 .turn-node-header { min-width: 0; min-height: 27px; display: flex; align-items: center; gap: 6px; padding: 2px 8px; }
 .turn-node-header strong { color: var(--trouve-text-mid); font-size: 10px; font-weight: 650; }
 .turn-transient-activity .turn-node-header strong { color: var(--trouve-text-dim); font-size: 11px; font-weight: 500; }
@@ -556,6 +594,9 @@ trouve-session-list { display: block; }
 .attachment-actions a { color: var(--trouve-accent); text-decoration: none; }
 .attachment-actions a:hover { text-decoration: underline; }
 .composer { position: relative; margin: 8px 10px 10px; border: 0; border-radius: 0; background: transparent; }
+.subagent-readonly { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 10px 10px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 8px 12px; color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 11px; }
+.subagent-readonly .trouve-icon { color: var(--trouve-accent); font-size: 13px; }
+.subagent-readonly strong { margin-inline-end: 4px; color: var(--trouve-text-mid); }
 .composer-completions { position: absolute; z-index: 5; inset-inline: -1px auto; bottom: calc(100% + 6px); width: min(480px, calc(100% + 2px)); max-height: min(300px, 40dvh); overflow: auto; padding: 6px; border: 1px solid var(--trouve-border-strong); border-radius: 8px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 8px 28px var(--trouve-scrim); }
 .composer-completion-option { width: 100%; min-height: 30px; display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: center; gap: 10px; border: 0; border-radius: 5px; padding: 5px 8px; color: var(--trouve-text-hi); background: transparent; text-align: start; }
 .composer-completion-option:hover { background: var(--trouve-hover-bg); }
@@ -622,6 +663,14 @@ trouve-session-list { display: block; }
 .model-health-pill.tone-ok { border-color: var(--trouve-agent-border); background: var(--trouve-agent-bg); }
 .model-health-pill.tone-warning { border-color: var(--trouve-warn); background: var(--trouve-warn-bg); }
 .model-health-pill.tone-error { border-color: var(--trouve-err); background: var(--trouve-err-bg); }
+.model-health-pill.loading, .model-health-pill.unavailable { color: var(--trouve-text-dim); cursor: default; }
+.model-health-pill.loading { cursor: progress; }
+.model-health-placeholder-dot { width: 9px; height: 9px; display: inline-block; flex: none; border: 2px solid var(--trouve-text-faint); border-radius: 50%; }
+.model-health-pill.loading .model-health-placeholder-dot { border-color: var(--trouve-accent-dim); border-inline-end-color: transparent; animation: model-health-spin .8s linear infinite; }
+@keyframes model-health-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .model-health-pill.loading .model-health-placeholder-dot { animation: none; }
+}
 .permission-option select { width: 105px; }
 .permission-option > span.permission-yolo { color: var(--trouve-err) !important; }
 .permission-option select.permission-yolo:not(:disabled), .permission-option select.permission-yolo:not(:disabled):hover { border-color: var(--trouve-err); color: var(--trouve-err); -webkit-text-fill-color: var(--trouve-err); font-weight: 700; }
@@ -712,21 +761,6 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .todo-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--trouve-rule); }
 .todo-list li small { color: var(--trouve-text-dim); text-transform: capitalize; }
 .todo-list li.completed span { color: var(--trouve-text-dim); text-decoration: line-through; }
-trouve-todo-plan-panel { display: block; min-height: 0; }
-.todo-plan-surface { display: flex; min-height: 100%; flex-direction: column; gap: 8px; padding: 10px; }
-.todo-plan-header { display: flex; align-items: center; gap: 8px; }
-.todo-plan-header h2 { flex: 1; margin: 0; color: var(--trouve-text-hi); font-size: 14px; }
-.todo-plan-header small { color: var(--trouve-text-dim); }
-.todo-plan-list { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 0; border-radius: var(--trouve-radius); background: var(--trouve-surface); list-style: none; }
-.todo-plan-list li { display: grid; grid-template-columns: 16px minmax(0, 1fr); min-height: 34px; align-items: center; gap: 8px; padding: 7px 10px; }
-.todo-plan-icon { color: var(--trouve-text-dim); font-family: var(--trouve-font-mono); text-align: center; }
-.todo-plan-list li.in_progress .todo-plan-icon { color: var(--trouve-accent); }
-.todo-plan-list li.completed .todo-plan-icon { color: var(--trouve-ok); }
-.todo-plan-list li.cancelled .todo-plan-icon { color: var(--trouve-text-disabled); }
-.todo-plan-content { min-width: 0; overflow-wrap: anywhere; }
-.todo-plan-list li.completed .todo-plan-content, .todo-plan-list li.cancelled .todo-plan-content { color: var(--trouve-text-disabled); }
-.todo-plan-empty { min-height: 14rem; }
-.todo-plan-empty-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 50%; color: var(--trouve-text-faint); background: var(--trouve-raised-bg); font-size: 18px; }
 .inspection-split { display: grid; grid-template-rows: auto minmax(70px, 28%) minmax(0, 1fr); height: 100%; min-height: 0; }
 .inspection-summary { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border-bottom: 1px solid var(--trouve-rule); }
 .inspection-summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

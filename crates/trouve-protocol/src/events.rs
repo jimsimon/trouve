@@ -83,6 +83,25 @@ pub struct SessionSummary {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Compact durable execution state for one thread. This lets clients render
+/// background-thread status without retaining or streaming every transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadStatus {
+    pub thread_id: ThreadId,
+    pub session_id: SessionId,
+    pub active: bool,
+    pub attention: SessionAttention,
+    pub outcome: SessionOutcome,
+    /// Cursor of the durable source event that produced this state.
+    pub latest_cursor: u64,
+    /// Start of the latest turn, when this thread has run at least once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// End of the latest turn. Absent while that turn is still active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Atomic session-summary snapshot plus the server-scope cursor after which a
 /// client resumes the existing durable event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -245,6 +264,22 @@ pub enum Event {
         content: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
+    },
+    /// A child agent became part of this parent turn. The child transcript
+    /// remains independently addressable while this durable boundary lets
+    /// clients render and navigate the relationship from the parent rail.
+    #[serde(rename = "subagent.spawned")]
+    SubagentSpawned {
+        turn: u64,
+        thread_id: ThreadId,
+        session_id: SessionId,
+        prompt: String,
+        model: String,
+        /// The trouve spawn tool call represented by this node, when one
+        /// exists. Provider-native collaborators do not have a parent tool
+        /// call. Clients may suppress the redundant spawn tool presentation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
     },
     /// Streamed model output. Replaying all deltas of a turn reproduces the
     /// final message exactly.
@@ -446,6 +481,10 @@ pub enum Event {
         thread_id: ThreadId,
         session_id: SessionId,
     },
+    /// Transactionally derived status for one thread. Open and closed tabs can
+    /// fold this server-scope event without opening a transcript SSE stream.
+    #[serde(rename = "thread.status_updated")]
+    ThreadStatusUpdated { status: ThreadStatus },
     /// A session started or stopped actively processing prompts (one of its
     /// threads began running turns, or the last active one went idle).
     /// Drives the activity indicator in session lists; `Session.active`

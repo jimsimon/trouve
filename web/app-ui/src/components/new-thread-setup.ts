@@ -64,6 +64,9 @@ export class TrouveNewThreadSetup extends LitElement {
     disabledMessage: { type: String, attribute: "disabled-message" },
     busy: { type: Boolean, reflect: true },
     errorMessage: { type: String, attribute: "error-message" },
+    catalogModes: { attribute: false },
+    catalogModels: { attribute: false },
+    subscriptionHealth: { attribute: false },
   };
 
   static override styles = css`
@@ -241,6 +244,9 @@ export class TrouveNewThreadSetup extends LitElement {
   disabledMessage = "";
   busy = false;
   errorMessage = "";
+  catalogModes: NewThreadSetupCatalog["modes"] = [];
+  catalogModels: NewThreadSetupCatalog["models"] = [];
+  subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
 
   #catalog = emptyCatalog();
   #draft: NewThreadSetupDraft = createInitialNewThreadDraft(this.#catalog);
@@ -255,6 +261,7 @@ export class TrouveNewThreadSetup extends LitElement {
   #attachmentGeneration = 0;
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
   #optionsRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #optionsTouched = false;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -299,9 +306,20 @@ export class TrouveNewThreadSetup extends LitElement {
       this.#attachmentGeneration += 1;
       this.#observedSessionId = sessionId;
       this.#draft = createInitialNewThreadDraft(this.#catalog);
+      this.#optionsTouched = false;
       this.#attachmentLoading = false;
       this.#attachmentError = "";
       this.#internalError = "";
+    }
+    if (changed.has("catalogModes") || changed.has("catalogModels")) {
+      this.#adoptCatalog({
+        modes: this.catalogModes,
+        models: this.catalogModels,
+        providers: this.#catalog.providers,
+      });
+    }
+    if (changed.has("subscriptionHealth")) {
+      this.#subscriptionHealth = this.subscriptionHealth;
     }
   }
 
@@ -321,12 +339,11 @@ export class TrouveNewThreadSetup extends LitElement {
       workspaceId: this.#effectiveWorkspaceId,
       disabled: this.disabled || unavailable,
       busy: this.busy,
-      optionsLoading: this.#optionsLoading,
       attachmentLoading: this.#attachmentLoading,
     });
     const thinking = newThreadThinkingOption(this.#draft, this.#catalog);
     const describedBy = [
-      this.#optionsLoading || this.busy ? "new-thread-progress" : "",
+      this.busy ? "new-thread-progress" : "",
       this.disabled || unavailable ? "new-thread-disabled" : "",
       this.#optionsError === "" ? "" : "new-thread-options-error",
       this.#attachmentError === "" && this.#internalError === "" && this.errorMessage === ""
@@ -349,7 +366,7 @@ export class TrouveNewThreadSetup extends LitElement {
     return html`
       <form
         aria-label="New thread setup (provisional)"
-        aria-busy=${this.busy || this.#optionsLoading || this.#attachmentLoading}
+        aria-busy=${this.busy || this.#attachmentLoading}
         aria-describedby=${describedBy === "" ? nothing : describedBy}
         @submit=${this.#submit}
       >
@@ -358,13 +375,11 @@ export class TrouveNewThreadSetup extends LitElement {
           <p>Threads share the session worktree; pick the agent setup for this one.</p>
         </header>
 
-        ${this.#optionsLoading
-          ? html`<p id="new-thread-progress" class="notice" role="status">Loading modes and models…</p>`
-          : this.busy
-            ? html`<p id="new-thread-progress" class="notice" role="status">Starting thread…</p>`
-            : nothing}
+        ${this.busy
+          ? html`<p id="new-thread-progress" class="notice" role="status">Starting thread…</p>`
+          : nothing}
 
-        <div class=${`option-grid ${thinking === undefined ? "no-thinking" : ""}`}>
+        <div class="option-grid">
           <label>
             <span>Agent mode</span>
             <select
@@ -393,24 +408,20 @@ export class TrouveNewThreadSetup extends LitElement {
               @trouve-model-picked=${this.#modelPicked}
             ></trouve-model-picker>
           </div>
-          ${thinking === undefined
-            ? nothing
-            : html`
-                <label>
-                  <span>Thinking level</span>
-                  <select
-                    name="thinking"
-                    .value=${this.#draft.thinking}
-                    ?disabled=${controls.optionControlsDisabled}
-                    @change=${this.#thinkingChanged}
-                  >
-                    <option value="">Model default</option>
-                    ${thinking.values.map(
-                      (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
-                    )}
-                  </select>
-                </label>
-              `}
+          <label>
+            <span>Thinking level</span>
+            <select
+              name="thinking"
+              .value=${thinking === undefined ? "" : this.#draft.thinking}
+              ?disabled=${controls.optionControlsDisabled}
+              @change=${this.#thinkingChanged}
+            >
+              <option value="">Model default</option>
+              ${(thinking?.values ?? []).map(
+                (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+              )}
+            </select>
+          </label>
           <label class=${`permission-field ${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}`}>
             <span>${this.#draft.permissionMode === "yolo"
               ? fontAwesomeIcon("triangle-exclamation")
@@ -555,26 +566,13 @@ export class TrouveNewThreadSetup extends LitElement {
     try {
       const [modes, models, providers] = await Promise.all([
         services.protocol.modes(workspaceId),
-        services.protocol.models(),
+        services.modelCatalog.refresh("if-stale"),
         services.protocol.providers(),
       ]);
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
-      this.#catalog = { modes, models, providers };
-      const initial = createInitialNewThreadDraft(this.#catalog);
-      this.#draft = {
-        ...initial,
-        prompt: this.#draft.prompt,
-        attachments: this.#draft.attachments,
-      };
+      this.#adoptCatalog({ modes, models, providers });
     } catch {
       if (generation !== this.#loadGeneration || workspaceId !== this.#effectiveWorkspaceId) return;
-      this.#catalog = emptyCatalog();
-      this.#subscriptionHealth = [];
-      this.#draft = {
-        ...createInitialNewThreadDraft(this.#catalog),
-        prompt: this.#draft.prompt,
-        attachments: this.#draft.attachments,
-      };
       this.#optionsError =
         "Mode and model choices could not be loaded. Server defaults remain available while trouve retries automatically.";
       this.#scheduleOptionsRetry();
@@ -584,6 +582,31 @@ export class TrouveNewThreadSetup extends LitElement {
         this.requestUpdate();
       }
     }
+  }
+
+  #adoptCatalog(catalog: NewThreadSetupCatalog): void {
+    const draft = this.#draft;
+    this.#catalog = catalog;
+    const refreshedInitial = createInitialNewThreadDraft(catalog);
+    this.#draft = this.#optionsTouched
+      ? {
+          ...draft,
+          modeId: catalog.modes.some((mode) => mode.id === draft.modeId)
+            ? draft.modeId
+            : "",
+          modelId: catalog.models.some((model) => model.id === draft.modelId)
+            ? draft.modelId
+            : "",
+          thinking: newThreadThinkingOption(draft, catalog)?.values.includes(draft.thinking)
+            ? draft.thinking
+            : "",
+        }
+      : {
+          ...refreshedInitial,
+          permissionMode: draft.permissionMode,
+          prompt: draft.prompt,
+          attachments: draft.attachments,
+        };
   }
 
   #scheduleOptionsRetry(): void {
@@ -600,6 +623,7 @@ export class TrouveNewThreadSetup extends LitElement {
   }
 
   readonly #modeChanged = (event: Event): void => {
+    this.#optionsTouched = true;
     this.#draft = selectNewThreadMode(
       this.#draft,
       (event.currentTarget as HTMLSelectElement).value,
@@ -610,6 +634,7 @@ export class TrouveNewThreadSetup extends LitElement {
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
+    this.#optionsTouched = true;
     this.#draft = selectNewThreadModel(
       this.#draft,
       event.detail.modelId,
@@ -620,6 +645,7 @@ export class TrouveNewThreadSetup extends LitElement {
   };
 
   readonly #thinkingChanged = (event: Event): void => {
+    this.#optionsTouched = true;
     this.#draft = {
       ...this.#draft,
       thinking: (event.currentTarget as HTMLSelectElement).value,
@@ -628,6 +654,7 @@ export class TrouveNewThreadSetup extends LitElement {
   };
 
   readonly #permissionChanged = (event: Event): void => {
+    this.#optionsTouched = true;
     const value = (event.currentTarget as HTMLSelectElement).value;
     const permissionMode: NewThreadPermissionSelection =
       value === "ask" || value === "allow_list" || value === "yolo" ? value : "";
@@ -831,7 +858,6 @@ export class TrouveNewThreadSetup extends LitElement {
       workspaceId: this.#effectiveWorkspaceId,
       disabled: this.disabled || this.#services.value === undefined,
       busy: this.busy,
-      optionsLoading: this.#optionsLoading,
       attachmentLoading: this.#attachmentLoading,
     });
     if (

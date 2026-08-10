@@ -5,6 +5,7 @@ import type {
   ProtocolPrInfo,
   ProtocolServerProjection,
   ProtocolThread,
+  ProtocolThreadStatus,
   ProtocolThreadViewSnapshot,
 } from "../services/protocol-client.js";
 import { readSignal } from "./reactivity.js";
@@ -40,6 +41,19 @@ const thread = (id: string, todos?: ProtocolThread["todos"]): ProtocolThread => 
   permission_mode: "ask",
   created_at: "2026-08-01T12:02:00Z",
   ...(todos === undefined ? {} : { todos }),
+});
+
+const threadStatus = (
+  threadId: string,
+  overrides: Partial<ProtocolThreadStatus> = {},
+): ProtocolThreadStatus => ({
+  thread_id: threadId,
+  session_id: "se_1",
+  active: false,
+  attention: "none",
+  outcome: "idle",
+  latest_cursor: 1,
+  ...overrides,
 });
 
 const todoEvent = (
@@ -226,6 +240,86 @@ describe("AppStore", () => {
       },
     });
     expect(readSignal(store.sessions)[0]).toMatchObject({ state: "done", unread: true });
+  });
+
+  it("tracks independent live, attention, and unread terminal states for thread tabs", () => {
+    const store = new AppStore();
+    store.replaceThreadsForSession("se_1", [thread("th_1"), thread("th_2")]);
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_1", { outcome: "succeeded", latest_cursor: 5 }),
+      threadStatus("th_2", { latest_cursor: 5 }),
+    ]);
+    expect(store.threadIndicatorState("th_1")).toEqual({
+      active: false,
+      attention: "none",
+      outcome: "succeeded",
+      unread: false,
+    });
+    expect(store.threadStatus("th_1")).toMatchObject({
+      thread_id: "th_1",
+      outcome: "succeeded",
+    });
+
+    store.applyServerEvent({
+      cursor: 7,
+      scope: "server",
+      ts: "2026-08-01T12:07:00Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_1", {
+        active: true,
+        outcome: "running",
+        latest_cursor: 6,
+      }),
+    });
+    expect(store.threadIndicatorState("th_1")).toMatchObject({
+      active: true,
+      outcome: "running",
+      unread: false,
+    });
+
+    store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:08:00Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_1", {
+        outcome: "succeeded",
+        latest_cursor: 8,
+      }),
+    });
+    expect(store.threadIndicatorState("th_1")).toMatchObject({
+      active: false,
+      outcome: "succeeded",
+      unread: true,
+    });
+    expect(store.markThreadRead("th_1")).toBe(true);
+    expect(store.threadIndicatorState("th_1").unread).toBe(false);
+    expect(store.markThreadRead("th_1")).toBe(false);
+
+    store.applyServerEvent({
+      cursor: 11,
+      scope: "server",
+      ts: "2026-08-01T12:09:00Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_2", {
+        attention: "question",
+        latest_cursor: 10,
+      }),
+    });
+    expect(store.threadIndicatorState("th_2")).toMatchObject({
+      attention: "question",
+      unread: false,
+    });
+
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_1", { active: true, outcome: "running", latest_cursor: 6 }),
+      threadStatus("th_2", { latest_cursor: 5 }),
+    ]);
+    expect(store.threadIndicatorState("th_1")).toMatchObject({
+      active: false,
+      outcome: "succeeded",
+    });
+    expect(store.threadIndicatorState("th_2").attention).toBe("question");
   });
 
   it("folds durable account PR snapshots independently per GitHub host", () => {

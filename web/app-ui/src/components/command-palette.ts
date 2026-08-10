@@ -3,6 +3,7 @@ import { html, LitElement, nothing } from "lit";
 
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import { filterCommandPaletteItemsOffThread } from "../services/content-worker-client.js";
+import { preferredSessionThreadId } from "../services/resume-preferences.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   buildCommandPaletteItems,
@@ -195,13 +196,23 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
     const store = this.#store.value;
     if (services === undefined || store === undefined) return [];
     const route = readSignal(services.router.route);
+    const resume = readSignal(services.resumePreferences);
     return buildCommandPaletteItems({
       route,
       workspaces: readSignal(store.workspaces),
-      sessions: readSignal(store.sessions).map((session) => ({
-        ...session,
-        pullRequests: store.sessionPullRequests(session.id),
-      })),
+      sessions: readSignal(store.sessions).map((session) => {
+        const navigationThreadId = preferredSessionThreadId(
+          resume,
+          session.id,
+          session.latestThreadId,
+          store.threadsForSession(session.id).map((thread) => thread.id),
+        );
+        return {
+          ...session,
+          ...(navigationThreadId === undefined ? {} : { navigationThreadId }),
+          pullRequests: store.sessionPullRequests(session.id),
+        };
+      }),
       activeThreads:
         route.kind === "session" ? store.threadsForSession(route.sessionId) : [],
     });

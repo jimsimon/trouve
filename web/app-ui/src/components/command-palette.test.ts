@@ -55,6 +55,7 @@ const input: CommandPaletteInput = {
       outcome: "running",
       unread: false,
       latestThreadId: "th-code",
+      navigationThreadId: "th-code",
       pullRequests: [],
       state: "running",
     },
@@ -69,6 +70,7 @@ const input: CommandPaletteInput = {
       outcome: "idle",
       unread: false,
       latestThreadId: "th-review",
+      navigationThreadId: "th-review",
       pullRequests: [pr(3183)],
       state: "attention",
     },
@@ -107,7 +109,7 @@ describe("command palette model", () => {
       });
     expect(items.find((item) => item.id === "thread:th-code")).toMatchObject({
       group: "Threads",
-      label: "code · claude-sonnet",
+      label: "Subagent: code · claude-sonnet",
       icon: "code-branch",
       detail: "Thread 2",
       current: true,
@@ -142,6 +144,9 @@ describe("command palette model", () => {
 
   it("routes inspection commands to the mobile inspection pane", () => {
     const items = buildCommandPaletteItems(input);
+    expect(items.find((item) => item.id === "view:inspection:plan")).toBeUndefined();
+    expect(items.find((item) => item.id === "view:inspection:info")?.label)
+      .toBe("Open Details");
     expect(items.find((item) => item.id === "view:inspection:info")?.action)
       .toEqual({
         kind: "navigate",

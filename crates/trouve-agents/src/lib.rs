@@ -14,6 +14,7 @@ pub mod codex;
 pub mod cursor;
 pub mod install;
 mod login;
+pub mod process_env;
 mod route;
 
 use std::collections::VecDeque;
@@ -213,9 +214,15 @@ pub enum BackendEvent {
     CollaboratorStarted {
         session_id: String,
         parent_session_id: String,
+        /// Provider-owned human-readable collaborator name, when the harness
+        /// exposes one. Core preserves this ahead of prompt-derived naming.
+        name: Option<String>,
         prompt: Option<String>,
         model: Option<String>,
         thinking_level: Option<String>,
+        /// Whether the harness describes this child as transcript-only or as
+        /// an interactive worker. Unknown roles inherit their parent's mode.
+        access: BackendCollaboratorAccess,
     },
     /// One event produced by a vendor-native collaborator. Keeping the child
     /// vocabulary separate prevents a nested collaborator from accidentally
@@ -228,6 +235,19 @@ pub enum BackendEvent {
     Completed {
         usage: Usage,
     },
+}
+
+/// Interaction contract advertised for a vendor-native collaborator.
+///
+/// This is intentionally separate from provider-specific role names. Core
+/// maps it onto the workspace's data-driven modes when materializing the
+/// durable child thread.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCollaboratorAccess {
+    #[default]
+    Inherit,
+    ReadOnly,
+    Interactive,
 }
 
 /// Stream events scoped to one vendor-native collaborator.
@@ -439,13 +459,7 @@ pub trait AgentBackend: Send + Sync {
 
 /// Locate a binary on PATH (absolute/relative paths pass through).
 pub(crate) fn binary_on_path(command: &str) -> bool {
-    if command.contains('/') {
-        return std::path::Path::new(command).exists();
-    }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
+    process_env::find_executable(command).is_some()
 }
 
 const BACKEND_STREAM_CAPACITY: usize = 64;
@@ -857,12 +871,15 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
         Ok(BackendEvent::CollaboratorStarted {
             session_id,
             parent_session_id,
+            name,
             prompt,
             model,
             thinking_level,
+            access: _,
         }) => {
             session_id.len()
                 + parent_session_id.len()
+                + name.as_ref().map_or(0, String::len)
                 + prompt.as_ref().map_or(0, String::len)
                 + model.as_ref().map_or(0, String::len)
                 + thinking_level.as_ref().map_or(0, String::len)

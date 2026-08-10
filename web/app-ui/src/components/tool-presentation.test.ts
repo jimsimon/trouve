@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isTodoToolCall,
   presentToolCall,
   runningActivityLabel,
   toolExecutionMetadata,
@@ -68,6 +69,18 @@ describe("tool presentation", () => {
     ]);
   });
 
+  it("presents hashline edits as file edits with compact payload additions", () => {
+    const presentation = presentToolCall("hashline_edit", {
+      input: "[src/lib.rs#A1B2C3D4E5F6]\nPUT 8.=9:\n+fn replacement() {}\n",
+    });
+    expect(presentation).toMatchObject({
+      title: "Edit",
+      subject: "lib.rs",
+      filePath: "src/lib.rs",
+      additions: 1,
+    });
+  });
+
   it("uses result-backed todo state for the card summary", () => {
     expect(presentToolCall("todo_write", { todos: [{ status: "pending", content: "old" }] }, {
       todos: [
@@ -75,7 +88,7 @@ describe("tool presentation", () => {
         { status: "in_progress", content: "Port tool cards" },
       ],
     })).toMatchObject({
-      title: "Todos",
+      title: "TODOs",
       subject: "Port tool cards",
       meta: "1/2",
       todos: [
@@ -83,6 +96,17 @@ describe("tool presentation", () => {
         { status: "in_progress", icon: "play", content: "Port tool cards" },
       ],
     });
+  });
+
+  it("recognizes native and wrapped todo tool identifiers", () => {
+    expect(isTodoToolCall("todo_write", {})).toBe(true);
+    expect(isTodoToolCall("TodoWrite", {})).toBe(true);
+    expect(isTodoToolCall("mcp__trouve__todo_write", {})).toBe(true);
+    expect(isTodoToolCall("mcpToolCall", {
+      tool: "mcp__trouve__todo_write",
+      arguments: { todos: [] },
+    })).toBe(true);
+    expect(isTodoToolCall("read_file", {})).toBe(false);
   });
 
   it("formats human-readable bounded tool detail without JSON noise", () => {

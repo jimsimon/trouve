@@ -27,14 +27,42 @@ export interface ResumePreferences {
   readonly selectedSessionId: string;
   readonly sessionThreads: Readonly<Record<string, string>>;
   readonly threadScroll: Readonly<Record<string, ChatScrollBookmark>>;
+  readonly closedThreadTabs: readonly string[];
 }
 
+/** Pick an already-open tab when navigation targets a session rather than a
+ * specific thread. Explicit thread routes are handled separately and reopen
+ * that tab; session-level navigation must never undo a prior close. */
+export const preferredSessionThreadId = (
+  preferences: ResumePreferences,
+  sessionId: string,
+  latestThreadId: string | undefined,
+  availableThreadIds: readonly string[],
+): string | undefined => {
+  const closed = new Set(preferences.closedThreadTabs);
+  const available = new Set(availableThreadIds);
+  const known = (threadId: string | undefined): threadId is string =>
+    threadId !== undefined
+    && !closed.has(threadId)
+    && (available.size === 0 || available.has(threadId));
+  const remembered = preferences.sessionThreads[sessionId];
+  if (known(remembered)) return remembered;
+  if (known(latestThreadId)) return latestThreadId;
+  for (let index = availableThreadIds.length - 1; index >= 0; index -= 1) {
+    const threadId = availableThreadIds[index];
+    if (threadId !== undefined && !closed.has(threadId)) return threadId;
+  }
+  return undefined;
+};
+
 const emptyRecord = <T>(): Readonly<Record<string, T>> => Object.freeze({});
+const emptyList = <T>(): readonly T[] => Object.freeze([]);
 
 export const DEFAULT_RESUME_PREFERENCES: ResumePreferences = Object.freeze({
   selectedSessionId: "",
   sessionThreads: emptyRecord<string>(),
   threadScroll: emptyRecord<ChatScrollBookmark>(),
+  closedThreadTabs: emptyList<string>(),
 });
 
 export interface ResumePreferenceStorage {
@@ -104,6 +132,20 @@ const normalizeThreadScroll = (
   return Object.freeze(normalized);
 };
 
+const normalizeClosedThreadTabs = (value: unknown): readonly string[] => {
+  if (!Array.isArray(value)) return emptyList<string>();
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const threadId of value) {
+    if (normalized.length >= MAX_ENTRIES) break;
+    if (validProtocolId(threadId) && !seen.has(threadId)) {
+      normalized.push(threadId);
+      seen.add(threadId);
+    }
+  }
+  return Object.freeze(normalized);
+};
+
 export const normalizeResumePreferences = (value: unknown): ResumePreferences => {
   const source = objectRecord(value);
   if (source === undefined) return DEFAULT_RESUME_PREFERENCES;
@@ -113,6 +155,7 @@ export const normalizeResumePreferences = (value: unknown): ResumePreferences =>
       : "",
     sessionThreads: normalizeSessionThreads(source["sessionThreads"]),
     threadScroll: normalizeThreadScroll(source["threadScroll"]),
+    closedThreadTabs: normalizeClosedThreadTabs(source["closedThreadTabs"]),
   });
 };
 
@@ -126,6 +169,10 @@ const sameResumePreferences = (
   if (
     leftThreads.length !== rightThreads.length ||
     leftThreads.some(([sessionId, threadId]) => right.sessionThreads[sessionId] !== threadId)
+  ) return false;
+  if (
+    left.closedThreadTabs.length !== right.closedThreadTabs.length ||
+    left.closedThreadTabs.some((threadId, index) => right.closedThreadTabs[index] !== threadId)
   ) return false;
   const leftScroll = Object.entries(left.threadScroll);
   const rightScroll = Object.entries(right.threadScroll);
@@ -211,8 +258,30 @@ export class ResumePreferencesController {
         ? current.sessionThreads
         : appendBounded(current.sessionThreads, sessionId, threadId),
       threadScroll: current.threadScroll,
+      closedThreadTabs: current.closedThreadTabs,
     });
     return this.#commit(next, persist);
+  }
+
+  setThreadTabClosed(
+    threadId: string,
+    closed: boolean,
+    persist = true,
+  ): ResumePreferences {
+    const current = this.#current.get();
+    if (!validProtocolId(threadId)) return current;
+    const existingIndex = current.closedThreadTabs.indexOf(threadId);
+    if ((closed && existingIndex >= 0) || (!closed && existingIndex < 0)) return current;
+    const closedThreadTabs = closed
+      ? Object.freeze([
+          ...current.closedThreadTabs.slice(-(MAX_ENTRIES - 1)),
+          threadId,
+        ])
+      : Object.freeze(current.closedThreadTabs.filter((candidate) => candidate !== threadId));
+    return this.#commit(Object.freeze({
+      ...current,
+      closedThreadTabs,
+    }), persist);
   }
 
   setThreadScroll(

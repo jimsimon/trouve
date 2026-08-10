@@ -12,7 +12,7 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("new ContextConsumer");
     expect(component).toContain("context: appServicesContext");
     expect(component).toContain("services.protocol.modes(workspaceId)");
-    expect(component).toContain("services.protocol.models()");
+    expect(component).toContain('services.modelCatalog.refresh("if-stale")');
     expect(component).toContain("services.protocol.providers()");
     expect(component).not.toContain("services.protocol.createThread(");
     expect(component).not.toContain("services.protocol.sendMessage(");
@@ -58,9 +58,10 @@ describe("new thread setup component contract", () => {
     expect(component).toContain('types.includes("text/plain")');
   });
 
-  it("surfaces loading, disabled, busy, warning, and error states with trouve tokens", () => {
+  it("keeps static controls immediate while surfacing busy, warning, and error states", () => {
     expect(component).toContain("newThreadSetupControls({");
-    expect(component).toContain('aria-busy=${this.busy || this.#optionsLoading || this.#attachmentLoading}');
+    expect(component).toContain('aria-busy=${this.busy || this.#attachmentLoading}');
+    expect(component).not.toContain("Loading modes and models…");
     expect(component).toContain('role="status"');
     expect(component).toContain('role="alert"');
     expect(component).toContain("disabledMessage");

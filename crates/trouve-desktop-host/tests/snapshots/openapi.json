@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "10"
+    "version": "11"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -1059,6 +1059,12 @@
         "type": "object",
         "description": "Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.",
         "properties": {
+          "closed_thread_tabs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "selected_session_id": {
             "type": "string"
           },

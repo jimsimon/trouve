@@ -831,7 +831,7 @@ return errors === 0;
 }
 validate70.evaluated = {"props":{"enabled":true,"on_attention":true,"on_fail":true,"on_finish":true,"sound":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema31 = {"type":"object","description":"Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.","properties":{"selected_session_id":{"type":"string"},"session_threads":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string"}},"thread_scroll":{"type":"object","additionalProperties":{"$ref":"#/components/schemas/ChatScrollBookmark"},"propertyNames":{"type":"string"}}}};
+const schema31 = {"type":"object","description":"Client-owned navigation and row-anchored chat position restored when the\nshared frontend starts again. This is presentation state only: it never\ncarries durable harness state around the HTTP protocol.","properties":{"closed_thread_tabs":{"type":"array","items":{"type":"string"}},"selected_session_id":{"type":"string"},"session_threads":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string"}},"thread_scroll":{"type":"object","additionalProperties":{"$ref":"#/components/schemas/ChatScrollBookmark"},"propertyNames":{"type":"string"}}}};
 const schema32 = {"type":"object","description":"Stable first-visible chat item plus its non-negative offset into the item.\nUnlike raw scroll pixels, this survives font and window-size changes.","required":["item_id","offset"],"properties":{"item_id":{"type":"string"},"offset":{"type":"number","format":"float"}}};
 
 function validate73(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -903,11 +903,29 @@ evaluated0.items = undefined;
 }
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
-if(data.selected_session_id !== undefined){
+if(data.closed_thread_tabs !== undefined){
+let data0 = data.closed_thread_tabs;
 const _errs1 = errors;
-if(typeof data.selected_session_id !== "string"){
-validate72.errors = [{instancePath:instancePath+"/selected_session_id",schemaPath:"#/properties/selected_session_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(errors === _errs1){
+if(Array.isArray(data0)){
+var valid1 = true;
+const len0 = data0.length;
+for(let i0=0; i0<len0; i0++){
+const _errs3 = errors;
+if(typeof data0[i0] !== "string"){
+validate72.errors = [{instancePath:instancePath+"/closed_thread_tabs/" + i0,schemaPath:"#/properties/closed_thread_tabs/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
+}
+var valid1 = _errs3 === errors;
+if(!valid1){
+break;
+}
+}
+}
+else {
+validate72.errors = [{instancePath:instancePath+"/closed_thread_tabs",schemaPath:"#/properties/closed_thread_tabs/type",keyword:"type",params:{type: "array"},message:"must be array"}];
+return false;
+}
 }
 var valid0 = _errs1 === errors;
 }
@@ -915,13 +933,25 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.session_threads !== undefined){
-let data1 = data.session_threads;
-const _errs3 = errors;
-if(errors === _errs3){
-if(data1 && typeof data1 == "object" && !Array.isArray(data1)){
-for(const key0 in data1){
+if(data.selected_session_id !== undefined){
 const _errs5 = errors;
+if(typeof data.selected_session_id !== "string"){
+validate72.errors = [{instancePath:instancePath+"/selected_session_id",schemaPath:"#/properties/selected_session_id/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs5 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.session_threads !== undefined){
+let data3 = data.session_threads;
+const _errs7 = errors;
+if(errors === _errs7){
+if(data3 && typeof data3 == "object" && !Array.isArray(data3)){
+for(const key0 in data3){
+const _errs9 = errors;
 if(typeof key0 !== "string"){
 const err0 = {instancePath:instancePath+"/session_threads",schemaPath:"#/properties/session_threads/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key0};
 if(vErrors === null){
@@ -932,8 +962,8 @@ vErrors.push(err0);
 }
 errors++;
 }
-var valid1 = _errs5 === errors;
-if(!valid1){
+var valid2 = _errs9 === errors;
+if(!valid2){
 const err1 = {instancePath:instancePath+"/session_threads",schemaPath:"#/properties/session_threads/propertyNames",keyword:"propertyNames",params:{propertyName: key0},message:"property name must be valid"};
 if(vErrors === null){
 vErrors = [err1];
@@ -947,15 +977,15 @@ return false;
 break;
 }
 }
-if(valid1){
-for(const key1 in data1){
-const _errs8 = errors;
-if(typeof data1[key1] !== "string"){
+if(valid2){
+for(const key1 in data3){
+const _errs12 = errors;
+if(typeof data3[key1] !== "string"){
 validate72.errors = [{instancePath:instancePath+"/session_threads/" + key1.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/session_threads/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid2 = _errs8 === errors;
-if(!valid2){
+var valid3 = _errs12 === errors;
+if(!valid3){
 break;
 }
 }
@@ -966,19 +996,19 @@ validate72.errors = [{instancePath:instancePath+"/session_threads",schemaPath:"#
 return false;
 }
 }
-var valid0 = _errs3 === errors;
+var valid0 = _errs7 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.thread_scroll !== undefined){
-let data3 = data.thread_scroll;
-const _errs10 = errors;
-if(errors === _errs10){
-if(data3 && typeof data3 == "object" && !Array.isArray(data3)){
-for(const key2 in data3){
-const _errs12 = errors;
+let data5 = data.thread_scroll;
+const _errs14 = errors;
+if(errors === _errs14){
+if(data5 && typeof data5 == "object" && !Array.isArray(data5)){
+for(const key2 in data5){
+const _errs16 = errors;
 if(typeof key2 !== "string"){
 const err2 = {instancePath:instancePath+"/thread_scroll",schemaPath:"#/properties/thread_scroll/propertyNames/type",keyword:"type",params:{type: "string"},message:"must be string",propertyName:key2};
 if(vErrors === null){
@@ -989,8 +1019,8 @@ vErrors.push(err2);
 }
 errors++;
 }
-var valid3 = _errs12 === errors;
-if(!valid3){
+var valid4 = _errs16 === errors;
+if(!valid4){
 const err3 = {instancePath:instancePath+"/thread_scroll",schemaPath:"#/properties/thread_scroll/propertyNames",keyword:"propertyNames",params:{propertyName: key2},message:"property name must be valid"};
 if(vErrors === null){
 vErrors = [err3];
@@ -1004,15 +1034,15 @@ return false;
 break;
 }
 }
-if(valid3){
-for(const key3 in data3){
-const _errs15 = errors;
-if(!(validate73(data3[key3], {instancePath:instancePath+"/thread_scroll/" + key3.replace(/~/g, "~0").replace(/\//g, "~1"),parentData:data3,parentDataProperty:key3,rootData,dynamicAnchors}))){
+if(valid4){
+for(const key3 in data5){
+const _errs19 = errors;
+if(!(validate73(data5[key3], {instancePath:instancePath+"/thread_scroll/" + key3.replace(/~/g, "~0").replace(/\//g, "~1"),parentData:data5,parentDataProperty:key3,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate73.errors : vErrors.concat(validate73.errors);
 errors = vErrors.length;
 }
-var valid4 = _errs15 === errors;
-if(!valid4){
+var valid5 = _errs19 === errors;
+if(!valid5){
 break;
 }
 }
@@ -1023,10 +1053,11 @@ validate72.errors = [{instancePath:instancePath+"/thread_scroll",schemaPath:"#/p
 return false;
 }
 }
-var valid0 = _errs10 === errors;
+var valid0 = _errs14 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -1039,7 +1070,7 @@ return false;
 validate72.errors = vErrors;
 return errors === 0;
 }
-validate72.evaluated = {"props":{"selected_session_id":true,"session_threads":true,"thread_scroll":true},"dynamicProps":false,"dynamicItems":false};
+validate72.evaluated = {"props":{"closed_thread_tabs":true,"selected_session_id":true,"session_threads":true,"thread_scroll":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate61(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

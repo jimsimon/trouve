@@ -14,6 +14,7 @@ import type {
 } from "../services/protocol-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
+  MCP_CONFIG_CHANGED_EVENT,
   parseMcpCommandLine,
   parseMcpConfigJson,
   sessionMcpCommandLine,
@@ -97,16 +98,26 @@ const panelStyles = css`
   .additive-action:focus-visible { position: static; width: auto; height: 30px; min-height: 30px; overflow: visible; padding: 4px 9px; clip: auto; }
   .mcp-list { height: 180px; overflow: auto; border-radius: 7px; background: var(--trouve-surface); }
   .mcp-empty { height: 100%; display: grid; place-items: center; color: var(--trouve-muted); }
-  .mcp-row { min-height: 40px; display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; }
+  .mcp-row { min-height: 40px; display: grid; grid-template-columns: 12px minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; }
   .mcp-health { color: var(--trouve-muted); font-size: 12px; }
   .mcp-health.ok { color: var(--trouve-ok); }
   .mcp-health.error { color: var(--trouve-err); }
+  .mcp-health.disabled { color: var(--trouve-muted); }
   .mcp-copy { min-width: 0; }
   .mcp-copy > span { display: flex; align-items: center; gap: 6px; min-width: 0; }
   .mcp-copy strong, .mcp-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mcp-copy strong { color: var(--trouve-text-hi); font-size: 13px; }
   .mcp-copy small { display: block; color: var(--trouve-muted); font-size: 11px; }
   .mcp-scope { color: var(--trouve-accent); font-size: 10px; }
+  .mcp-toggle { position: relative; display: inline-flex; align-items: center; cursor: pointer; }
+  .mcp-toggle input { position: absolute; width: 1px; min-height: 1px; margin: -1px; padding: 0; opacity: 0; }
+  .mcp-toggle input:focus-visible { outline: none; }
+  .mcp-toggle-track { position: relative; display: block; width: 30px; height: 17px; border: 1px solid var(--trouve-border-strong, var(--trouve-border)); border-radius: 999px; background: var(--trouve-control-bg, var(--trouve-surface)); transition: background-color 120ms ease, border-color 120ms ease; }
+  .mcp-toggle-track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--trouve-muted); transition: transform 120ms ease, background-color 120ms ease; }
+  .mcp-toggle input:checked + .mcp-toggle-track { border-color: var(--trouve-accent); background: color-mix(in srgb, var(--trouve-accent) 35%, var(--trouve-control-bg, var(--trouve-surface))); }
+  .mcp-toggle input:checked + .mcp-toggle-track::after { transform: translateX(13px); background: var(--trouve-accent); }
+  .mcp-toggle input:focus-visible + .mcp-toggle-track { outline: 2px solid var(--trouve-focus, var(--trouve-accent)); outline-offset: 2px; }
+  .mcp-toggle input:disabled + .mcp-toggle-track { cursor: default; opacity: .55; }
   .mcp-actions { display: flex; gap: 5px; }
   .mcp-form { border: 0; padding: 14px; }
   .mcp-import textarea { min-height: 150px; font-family: var(--trouve-font-mono, monospace); }
@@ -486,6 +497,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
   #importJson = "";
   #formScope: "user" | "workspace" = "user";
   #editingServer: ProtocolMcpServerInfo | undefined;
+  #togglePending = new Set<string>();
   #refreshTimer: ReturnType<typeof setInterval> | undefined;
   #logsRefreshTimer: ReturnType<typeof setInterval> | undefined;
   #logsLoading = false;
@@ -496,6 +508,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     this.#refreshTimer ??= globalThis.setInterval(() => {
       if (
         this.#busy
+        || this.#togglePending.size > 0
         || (typeof document !== "undefined" && document.visibilityState === "hidden")
       ) return;
       void this.#load(true);
@@ -518,7 +531,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     super.disconnectedCallback();
   }
 
-  async #load(silent = false): Promise<void> {
+  async #load(silent = false, probe = true): Promise<void> {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || (silent && this.#busy)) return;
     if (!silent) this.#busy = true;
@@ -528,7 +541,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       this.requestUpdate();
     }
     try {
-      this.#servers = await protocol.mcpServers(this.#workspaceId || undefined, true);
+      this.#servers = await protocol.mcpServers(this.#workspaceId || undefined, probe);
       this.#message = "";
     } catch {
       this.#message = "MCP servers could not be loaded. Retrying automatically.";
@@ -581,6 +594,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       command: parsedCommand.command,
       args: [...parsedCommand.args],
       env,
+      enabled: this.#editingServer?.enabled ?? true,
       ...(scope === "workspace" ? { workspace_id: workspaceId } : {}),
     };
     this.#busy = true;
@@ -592,6 +606,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       form.reset();
       this.#formOpen = false;
       this.#editingServer = undefined;
+      this.#notifyMcpConfigChanged();
       await this.#load();
       this.#message = `Saved ${name}.`;
       this.requestUpdate();
@@ -611,6 +626,7 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       await protocol.deleteMcpServer(server.name, server.scope, server.workspace_id || undefined);
+      this.#notifyMcpConfigChanged();
       await this.#load();
       this.#message = `Removed ${server.name}.`;
       this.requestUpdate();
@@ -618,6 +634,57 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
       this.#message = genericFailure("Removing MCP server");
       this.#error = true;
       this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  #serverKey(server: Pick<ProtocolMcpServerInfo, "name" | "scope" | "workspace_id">): string {
+    return `${server.scope}\u0000${server.workspace_id ?? ""}\u0000${server.name}`;
+  }
+
+  #notifyMcpConfigChanged(): void {
+    globalThis.dispatchEvent(new Event(MCP_CONFIG_CHANGED_EVENT));
+  }
+
+  async #setEnabled(server: ProtocolMcpServerInfo, enabled: boolean): Promise<void> {
+    const protocol = this.#services.value?.protocol;
+    const key = this.#serverKey(server);
+    if (protocol === undefined || this.#busy || this.#togglePending.has(key)) return;
+    const previous = this.#servers;
+    this.#togglePending.add(key);
+    this.#servers = this.#servers.map((candidate) =>
+      this.#serverKey(candidate) === key
+        ? {
+            ...candidate,
+            enabled,
+            health: enabled
+              ? candidate.scope === "workspace" ? "untrusted" : "unknown"
+              : "disabled",
+            detail: enabled ? "" : "disabled in this scope",
+          }
+        : candidate
+    );
+    this.#message = `${enabled ? "Enabling" : "Disabling"} ${server.name}…`;
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      await protocol.setMcpServerEnabled(server.name, {
+        scope: server.scope,
+        enabled,
+        ...(server.scope === "workspace" && server.workspace_id
+          ? { workspace_id: server.workspace_id }
+          : {}),
+      });
+      this.#notifyMcpConfigChanged();
+      await this.#load(true, false);
+      this.#message = `${enabled ? "Enabled" : "Disabled"} ${server.name}.`;
+      this.#error = false;
+    } catch {
+      this.#servers = previous;
+      this.#message = genericFailure(`${enabled ? "Enabling" : "Disabling"} MCP server`);
+      this.#error = true;
+    } finally {
+      this.#togglePending.delete(key);
       this.requestUpdate();
     }
   }
@@ -662,11 +729,13 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
           command: server.command,
           args: [...server.args],
           env: { ...server.env },
+          enabled: server.enabled,
           ...(scope === "workspace" ? { workspace_id: workspaceId } : {}),
         });
       }
       this.#importOpen = false;
       this.#importJson = "";
+      this.#notifyMcpConfigChanged();
       await this.#load();
       this.#message = `Imported ${servers.length} MCP server${servers.length === 1 ? "" : "s"}.`;
     } catch (error) {
@@ -725,13 +794,29 @@ export class TrouveMcpSettings extends withSignalTracking(LitElement) {
                       ? "check"
                       : server.health === "error"
                         ? "xmark"
-                        : server.health === "untrusted" ? "ban" : "circle-question",
+                        : server.health === "disabled"
+                          ? "pause"
+                          : server.health === "untrusted" ? "ban" : "circle-question",
                     { label: `MCP server health: ${server.health}` },
                   )}</span>
                   <div class="mcp-copy">
                     <span><strong>${server.name}</strong><span class="mcp-scope">${server.scope === "workspace" ? `workspace · ${server.workspace_name ?? ""}` : "app-wide"}</span></span>
                     <small>${server.command} ${(server.args ?? []).join(" ")}${server.detail ? ` · ${server.detail}` : ""}</small>
                   </div>
+                  <label class="mcp-toggle" title=${`${server.enabled === false ? "Enable" : "Disable"} ${server.name}`}>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-label=${`${server.enabled === false ? "Enable" : "Disable"} MCP server ${server.name}`}
+                      .checked=${server.enabled !== false}
+                      ?disabled=${this.#busy || this.#togglePending.has(this.#serverKey(server))}
+                      @change=${(event: Event) => void this.#setEnabled(
+                        server,
+                        (event.currentTarget as HTMLInputElement).checked,
+                      )}
+                    />
+                    <span class="mcp-toggle-track" aria-hidden="true"></span>
+                  </label>
                   <div class="mcp-actions"><button type="button" @click=${() => void this.#showLogs(server.name)}>Logs</button><button type="button" @click=${() => this.#openMcpForm(server.scope === "workspace" ? "workspace" : "user", server)}>Edit</button><button type="button" @click=${() => void this.#remove(server)} ?disabled=${this.#busy}>Remove</button></div>
                 </article>
               `)}

@@ -9,9 +9,11 @@ import {
   createNewSessionThreadRequest,
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
+  NEW_THREAD_TITLE_FALLBACK,
   resolveNewSessionModel,
   sessionTitleFallback,
   thinkingOption,
+  threadTitleFallback,
 } from "./new-session-model.js";
 
 const model = (
@@ -53,6 +55,14 @@ describe("new session model", () => {
     const title = sessionTitleFallback(`🙂${"é".repeat(80)}`);
     expect(Array.from(title)).toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
     expect(title.startsWith("🙂é")).toBe(true);
+  });
+
+  it("derives bounded thread titles from the first prompt line", () => {
+    expect(threadTitleFallback("  Review the parser edge cases\nIgnore this line"))
+      .toBe("Review the parser edge cases");
+    expect(threadTitleFallback("\u0000\u202e\t")).toBe(NEW_THREAD_TITLE_FALLBACK);
+    expect(Array.from(threadTitleFallback(`🙂${"é".repeat(80)}`)))
+      .toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
   });
 
   it("prefers a valid thinking_level schema and reports its enum and default", () => {
@@ -131,6 +141,7 @@ describe("new session model", () => {
     });
     expect(createNewSessionThreadRequest({
       sessionId: " session-1 ",
+      title: " Review parser edge cases ",
       mode: " plan ",
       model: "provider/model",
       permissionMode: "allow_list",
@@ -138,6 +149,7 @@ describe("new session model", () => {
       modelInfo,
     })).toEqual({
       session_id: "session-1",
+      title: "Review parser edge cases",
       mode: "plan",
       model: "provider/model",
       permission_mode: "allow_list",

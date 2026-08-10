@@ -3,6 +3,7 @@ import { html, LitElement, nothing } from "lit";
 import { repeat } from "lit/directives/repeat.js";
 
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
+import { preferredSessionThreadId } from "../services/resume-preferences.js";
 import type { SessionListItem } from "../state/app-store.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
@@ -268,14 +269,21 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     readonly workspaceId: string;
     readonly latestThreadId: string | undefined;
   }): void {
-    this.#store.value?.markSessionRead(session.id);
-    this.#services.value?.router.navigate({
+    const store = this.#store.value;
+    const services = this.#services.value;
+    store?.markSessionRead(session.id);
+    if (services === undefined) return;
+    const threadId = preferredSessionThreadId(
+      readSignal(services.resumePreferences),
+      session.id,
+      session.latestThreadId,
+      store?.threadsForSession(session.id).map((thread) => thread.id) ?? [],
+    );
+    services.router.navigate({
       kind: "session",
       workspaceId: session.workspaceId,
       sessionId: session.id,
-      ...(session.latestThreadId === undefined
-        ? {}
-        : { threadId: session.latestThreadId }),
+      ...(threadId === undefined ? {} : { threadId }),
     });
     this.dispatchEvent(
       new CustomEvent("trouve-session-open", { bubbles: true, composed: true }),

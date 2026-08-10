@@ -80,7 +80,7 @@ fn auth_status_is_logged_in(output: &[u8]) -> bool {
 }
 
 fn claude_is_logged_in(command: &str) -> bool {
-    std::process::Command::new(command)
+    crate::process_env::std_command(command)
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -514,7 +514,8 @@ impl ClaudeBackend {
     /// dialog shows (which has no headless equivalent). Returns the inner
     /// response payload (`subscription_type`, `rate_limits`, ...).
     async fn query_usage(&self) -> Result<Value, BackendError> {
-        let mut child = Command::new(&self.command)
+        let mut command = crate::process_env::tokio_command(&self.command);
+        let mut child = command
             .arg("-p")
             .args(["--input-format", "stream-json"])
             .args(["--output-format", "stream-json"])
@@ -626,7 +627,7 @@ impl ClaudeBackend {
     /// Spawn a persistent `claude` process configured for this turn's
     /// thread. The prompt is NOT passed here; turns arrive over stdin.
     fn spawn(&self, turn: &BackendTurn, config_fp: String) -> Result<ClaudeProc, BackendError> {
-        let mut cmd = Command::new(&self.command);
+        let mut cmd = crate::process_env::tokio_command(&self.command);
         let mut mcp_config_file = None;
         cmd.arg("-p")
             .args(["--input-format", "stream-json"])
@@ -1076,7 +1077,7 @@ mod tests {
 
     #[test]
     fn adaptive_models_use_cli_effort_flag() {
-        let mut cmd = Command::new("claude");
+        let mut cmd = tokio::process::Command::new("claude");
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
         configure_thinking(
             &mut cmd,
@@ -1107,7 +1108,7 @@ mod tests {
 
     #[test]
     fn legacy_off_explicitly_disables_thinking() {
-        let mut cmd = Command::new("claude");
+        let mut cmd = tokio::process::Command::new("claude");
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
         configure_thinking(
             &mut cmd,

@@ -3266,6 +3266,7 @@ impl Engine {
             .await?;
         let coordinator = self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
+            title: Some(session.title.clone()),
             mode: Some("review".into()),
             model: Some(coordinator_model),
             model_options: thinking_model_options(job.coordinator_thinking_level.as_deref()),
@@ -3526,6 +3527,7 @@ impl Engine {
                     let result = async {
                         let thread = engine.create_thread(CreateThreadRequest {
                             session_id,
+                            title: None,
                             mode: Some("review".into()),
                             model: Some(reviewer_model(&job, &reviewer)?),
                             model_options: reviewer_model_options(&reviewer),
@@ -4101,6 +4103,7 @@ impl Engine {
                     engine.emit_code_review_task(&job.id, task.clone())?;
                     let thread = match engine.create_thread(CreateThreadRequest {
                         session_id,
+                        title: None,
                         mode: Some("review".into()),
                         model: Some(routing_model),
                         model_options: thinking_model_options(job.router_thinking_level.as_deref()),
@@ -7466,6 +7469,7 @@ mod tests {
         let thread = Thread {
             id: "th_progress".into(),
             session_id: session.id.clone(),
+            title: None,
             mode: "review".into(),
             model: "provider/progress".into(),
             model_options: Default::default(),

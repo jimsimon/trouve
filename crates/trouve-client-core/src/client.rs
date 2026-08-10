@@ -243,12 +243,25 @@ impl ProtocolClient {
             .await
     }
 
+    pub async fn list_thread_subagents(&self, thread_id: &str) -> Result<Vec<Thread>> {
+        self.get_json(&format!("/threads/{thread_id}/subagents"))
+            .await
+    }
+
+    pub async fn list_thread_statuses(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::ThreadStatus>> {
+        self.get_json(&format!("/thread-statuses?session_id={session_id}"))
+            .await
+    }
+
     pub async fn thread_view(
         &self,
         thread_id: &str,
         before: Option<u64>,
     ) -> Result<(u64, ThreadViewSnapshot)> {
-        let mut path = format!("/threads/{thread_id}/view?limit=256");
+        let mut path = format!("/threads/{thread_id}/view?limit=256&turn_aligned=true");
         if let Some(before) = before {
             path.push_str(&format!("&before={before}"));
         }
@@ -929,6 +942,29 @@ impl ProtocolClient {
                 .map(|e| e.message)
                 .unwrap_or_else(|_| status.to_string());
             bail!("saving MCP server failed: {message}");
+        }
+        Ok(())
+    }
+
+    pub async fn set_mcp_server_enabled(
+        &self,
+        name: &str,
+        req: &SetMcpServerEnabledRequest,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!("{}/mcp-servers/{name}/enabled", self.base))
+            .json(req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|e| e.message)
+                .unwrap_or_else(|_| status.to_string());
+            bail!("updating MCP server enablement failed: {message}");
         }
         Ok(())
     }

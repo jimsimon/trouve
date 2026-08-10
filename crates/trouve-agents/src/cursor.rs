@@ -1341,7 +1341,7 @@ struct AcpServer {
 
 impl AcpServer {
     async fn spawn(command: &str, api_key: Option<&str>, cwd: &Path) -> Result<Self, BackendError> {
-        let mut cmd = tokio::process::Command::new(command);
+        let mut cmd = crate::process_env::tokio_command(command);
         cmd.arg("acp");
         // The ACP session `cwd` should govern, but cursor-agent falls back
         // to the process cwd for some path resolution — pin it so those

@@ -7,6 +7,7 @@ import type {
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
+export const NEW_THREAD_TITLE_FALLBACK = "New thread";
 
 type ThinkingOptionKey =
   | "thinking_level"
@@ -22,6 +23,7 @@ export interface ThinkingOption {
 
 export interface NewSessionThreadRequestInput {
   readonly sessionId: string;
+  readonly title?: string | null;
   readonly mode?: string | null;
   readonly model?: string | null;
   /** Raw form value; only protocol-advertised permission modes are emitted. */
@@ -46,21 +48,27 @@ const nonEmpty = (value: string | null | undefined): string | undefined => {
  * while additionally removing invisible controls and avoiding a split UTF-16
  * surrogate pair at the title boundary.
  */
-export const sessionTitleFallback = (prompt: string): string => {
+const promptTitleFallback = (prompt: string, fallback: string): string => {
   const sanitized = prompt
     .replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu, " ")
     .trim();
   const normalized = (sanitized.split(/\r\n?|\n/u)[0] ?? "")
     .replace(/\s+/gu, " ")
     .trim();
-  if (normalized === "") return NEW_SESSION_TITLE_FALLBACK;
+  if (normalized === "") return fallback;
 
   const title = Array.from(normalized)
     .slice(0, NEW_SESSION_TITLE_MAX_LENGTH)
     .join("")
     .trimEnd();
-  return title === "" ? NEW_SESSION_TITLE_FALLBACK : title;
+  return title === "" ? fallback : title;
 };
+
+export const sessionTitleFallback = (prompt: string): string =>
+  promptTitleFallback(prompt, NEW_SESSION_TITLE_FALLBACK);
+
+export const threadTitleFallback = (prompt: string): string =>
+  promptTitleFallback(prompt, NEW_THREAD_TITLE_FALLBACK);
 
 /** Returns the first valid thinking option in the established precedence. */
 export const thinkingOption = (
@@ -136,6 +144,7 @@ export const createNewSessionThreadRequest = (
 
   const mode = nonEmpty(input.mode);
   const model = nonEmpty(input.model);
+  const title = nonEmpty(input.title);
   const permissionMode = input.permissionMode;
   const validPermission = permissionMode === "ask"
     || permissionMode === "allow_list"
@@ -152,6 +161,7 @@ export const createNewSessionThreadRequest = (
 
   return {
     session_id: sessionId,
+    ...(title === undefined ? {} : { title }),
     ...(mode === undefined ? {} : { mode }),
     ...(model === undefined ? {} : { model }),
     ...(validPermission ? { permission_mode: permissionMode } : {}),

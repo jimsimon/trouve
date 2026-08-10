@@ -2,7 +2,7 @@
 //! `ChatItem`s onto their widgets; the folding logic lives here once, and is
 //! plain Rust (testable without any UI).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use trouve_protocol::{
     ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadCompactionState,
@@ -122,6 +122,15 @@ pub enum ChatItem {
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
     },
+    /// A child-agent transcript linked from its parent turn.
+    Subagent {
+        turn: u64,
+        thread_id: String,
+        session_id: String,
+        prompt: String,
+        model: String,
+        call_id: Option<String>,
+    },
     /// Streaming or final assistant text (grows in place from deltas).
     Assistant {
         turn: u64,
@@ -183,6 +192,7 @@ pub enum ToolCallStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnState {
+    WaitingForCapacity,
     Running,
     Completed {
         usage: Usage,
@@ -213,6 +223,10 @@ pub struct ThreadViewModel {
     /// the server projection. Completed snapshot rows carry the result.
     #[doc(hidden)]
     pub tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Handles imported/replayed streams where capacity precedes the durable
+    /// turn shell. Ordinary live streams transition the visible row directly.
+    #[doc(hidden)]
+    pub capacity_acquired_before_start: HashSet<u64>,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
@@ -257,6 +271,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             cursor: 0,
             tool_outputs: HashMap::new(),
             tool_started_at: HashMap::new(),
+            capacity_acquired_before_start: HashSet::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage: snapshot.last_usage,
@@ -295,6 +310,21 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 attachments,
+            },
+            ThreadViewItem::Subagent {
+                turn,
+                thread_id,
+                session_id,
+                prompt,
+                model,
+                call_id,
+            } => Self::Subagent {
+                turn,
+                thread_id,
+                session_id,
+                prompt,
+                model,
+                call_id,
             },
             ThreadViewItem::Assistant {
                 turn,
@@ -361,6 +391,7 @@ impl From<ThreadViewItem> for ChatItem {
             ThreadViewItem::TurnStatus { turn, state } => Self::TurnStatus {
                 turn,
                 state: match state {
+                    ThreadTurnState::WaitingForCapacity => TurnState::WaitingForCapacity,
                     ThreadTurnState::Running => TurnState::Running,
                     ThreadTurnState::Completed {
                         usage,
@@ -450,7 +481,7 @@ impl ThreadViewModel {
         self.items.iter().rev().find_map(|item| match item {
             ChatItem::TurnStatus {
                 turn,
-                state: TurnState::Running,
+                state: TurnState::WaitingForCapacity | TurnState::Running,
             } => Some(*turn),
             _ => None,
         })
@@ -461,6 +492,26 @@ impl ThreadViewModel {
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
         self.cursor = envelope.cursor;
         match &envelope.event {
+            Event::TurnCapacityAcquired { turn, .. } => {
+                if let Some(idx) = self.items.iter().rposition(|item| {
+                    matches!(
+                        item,
+                        ChatItem::TurnStatus {
+                            turn: candidate,
+                            state: TurnState::WaitingForCapacity,
+                        } if candidate == turn
+                    )
+                }) {
+                    self.items[idx] = ChatItem::TurnStatus {
+                        turn: *turn,
+                        state: TurnState::Running,
+                    };
+                    Some(idx)
+                } else {
+                    self.capacity_acquired_before_start.insert(*turn);
+                    None
+                }
+            }
             Event::TurnStarted {
                 turn,
                 model,
@@ -476,10 +527,12 @@ impl ThreadViewModel {
                 }
                 self.turn_steerable.insert(*turn, *supports_steering);
                 self.turn_started_at.insert(*turn, envelope.ts);
-                self.items.push(ChatItem::TurnStatus {
-                    turn: *turn,
-                    state: TurnState::Running,
-                });
+                let state = if self.capacity_acquired_before_start.remove(turn) {
+                    TurnState::Running
+                } else {
+                    TurnState::WaitingForCapacity
+                };
+                self.items.push(ChatItem::TurnStatus { turn: *turn, state });
                 Some(self.items.len() - 1)
             }
             Event::CompactionStarted { turn } => {
@@ -582,6 +635,26 @@ impl ThreadViewModel {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                });
+                Some(self.items.len() - 1)
+            }
+            Event::SubagentSpawned {
+                turn,
+                thread_id,
+                session_id,
+                prompt,
+                model,
+                call_id,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_thinking();
+                self.items.push(ChatItem::Subagent {
+                    turn: *turn,
+                    thread_id: thread_id.clone(),
+                    session_id: session_id.clone(),
+                    prompt: prompt.clone(),
+                    model: model.clone(),
+                    call_id: call_id.clone(),
                 });
                 Some(self.items.len() - 1)
             }
@@ -842,6 +915,7 @@ impl ThreadViewModel {
                 usage,
                 checkpoint_id,
             } => {
+                self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
@@ -849,7 +923,13 @@ impl ThreadViewModel {
                 self.last_usage = Some(usage.clone());
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
-                    matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
+                    matches!(
+                        i,
+                        ChatItem::TurnStatus {
+                            turn: t,
+                            state: TurnState::WaitingForCapacity | TurnState::Running,
+                        } if t == turn
+                    )
                 });
                 if let Some(idx) = idx {
                     self.items[idx] = ChatItem::TurnStatus {
@@ -863,13 +943,20 @@ impl ThreadViewModel {
                 idx
             }
             Event::TurnFailed { turn, error } => {
+                self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
-                    matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
+                    matches!(
+                        i,
+                        ChatItem::TurnStatus {
+                            turn: t,
+                            state: TurnState::WaitingForCapacity | TurnState::Running,
+                        } if t == turn
+                    )
                 });
                 if let Some(idx) = idx {
                     self.items[idx] = ChatItem::TurnStatus {
@@ -882,13 +969,20 @@ impl ThreadViewModel {
                 idx
             }
             Event::TurnCancelled { turn } => {
+                self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().position(|i| {
-                    matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
+                    matches!(
+                        i,
+                        ChatItem::TurnStatus {
+                            turn: t,
+                            state: TurnState::WaitingForCapacity | TurnState::Running,
+                        } if t == turn
+                    )
                 });
                 if let Some(idx) = idx {
                     self.items.remove(idx);
@@ -922,6 +1016,7 @@ mod tests {
             .map(|item| match item {
                 ChatItem::User { .. } => "user",
                 ChatItem::Steered { .. } => "steered",
+                ChatItem::Subagent { .. } => "subagent",
                 ChatItem::Assistant { .. } => "assistant",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",
@@ -933,6 +1028,7 @@ mod tests {
             .collect::<Vec<_>>();
         let turn_state = vm.items.iter().find_map(|item| match item {
             ChatItem::TurnStatus { state, .. } => Some(match state {
+                TurnState::WaitingForCapacity => "waiting-for-capacity",
                 TurnState::Running => "running",
                 TurnState::Completed { .. } => "completed",
                 TurnState::Failed { .. } => "failed",
@@ -1038,6 +1134,62 @@ mod tests {
 
     fn chrono_now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    #[test]
+    fn turn_waits_until_capacity_is_acquired() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::TurnStatus {
+                turn: 1,
+                state: TurnState::WaitingForCapacity,
+            })
+        ));
+
+        vm.apply(&env(Event::TurnCapacityAcquired {
+            turn: 1,
+            wait_ms: 42,
+            background: false,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::TurnStatus {
+                turn: 1,
+                state: TurnState::Running,
+            })
+        ));
+    }
+
+    #[test]
+    fn capacity_before_turn_start_replays_as_running() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnCapacityAcquired {
+            turn: 3,
+            wait_ms: 0,
+            background: false,
+        }));
+        vm.apply(&env(Event::TurnStarted {
+            turn: 3,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::TurnStatus {
+                turn: 3,
+                state: TurnState::Running,
+            })
+        ));
     }
 
     #[test]

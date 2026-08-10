@@ -250,7 +250,7 @@ impl Tool for Shell {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
         );
-        let mut command_process = tokio::process::Command::new("sh");
+        let mut command_process = trouve_agents::process_env::tokio_command("sh");
         command_process
             .arg("-c")
             .arg(command)
@@ -328,7 +328,7 @@ impl Shell {
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("command cancelled");
         }
-        let mut command_process = tokio::process::Command::new("sh");
+        let mut command_process = trouve_agents::process_env::tokio_command("sh");
         command_process
             .arg("-c")
             .arg(command)

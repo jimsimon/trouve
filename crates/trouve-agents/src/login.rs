@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 use crate::{BackendError, BackendLogin};
 
@@ -47,9 +46,14 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
         })
         .map_err(pty_error)?;
 
-    let mut cmd = CommandBuilder::new(command);
+    let executable = crate::process_env::find_executable(command)
+        .unwrap_or_else(|| std::path::PathBuf::from(command));
+    let mut cmd = CommandBuilder::new(executable);
     cmd.args(["auth", "login", "--claudeai"]);
     cmd.env("TERM", "xterm-256color");
+    if let Some(path) = crate::process_env::effective_path() {
+        cmd.env("PATH", path);
+    }
     // The review client opens the captured URL in the user's browser.
     #[cfg(unix)]
     cmd.env("BROWSER", "true");
@@ -124,7 +128,7 @@ async fn spawn_login_inner(
     args: &[&str],
     require_user_code: bool,
 ) -> Result<BackendLogin, BackendError> {
-    let mut cmd = Command::new(command);
+    let mut cmd = crate::process_env::tokio_command(command);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -16,8 +16,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
-    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadToolDetails,
-    ThreadViewItem, ThreadViewSnapshot, Workspace,
+    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
+    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
 use trouve_thread_view::ThreadProjection;
 
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id),
+  title TEXT,
   mode TEXT NOT NULL,
   model TEXT NOT NULL,
   permission_mode TEXT NOT NULL,
@@ -144,6 +145,17 @@ CREATE TABLE IF NOT EXISTS thread_tool_details (
   result TEXT,
   PRIMARY KEY (thread_id, call_id)
 );
+CREATE TABLE IF NOT EXISTS thread_statuses (
+  thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  active INTEGER NOT NULL DEFAULT 0,
+  attention TEXT NOT NULL DEFAULT 'none',
+  last_outcome TEXT NOT NULL DEFAULT 'idle',
+  latest_cursor INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS thread_statuses_session ON thread_statuses (session_id);
 CREATE TABLE IF NOT EXISTS session_summaries (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   workspace_id TEXT NOT NULL,
@@ -422,6 +434,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE threads ADD COLUMN title TEXT",
+    "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
+    "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
     "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
     "ALTER TABLE code_review_repositories ADD COLUMN semantic_routing INTEGER NOT NULL DEFAULT 0",
@@ -508,6 +523,8 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
     migrate_session_summary_projection(conn)?;
+    migrate_thread_status_projection(conn)?;
+    recover_interrupted_session_summaries(conn)?;
     Ok(())
 }
 
@@ -641,6 +658,83 @@ struct SessionSummaryChange {
     notification: Option<Event>,
 }
 
+struct ThreadStatusChange {
+    statuses: Vec<ThreadStatus>,
+}
+
+/// Build the compact per-thread projection once for existing databases. New
+/// writes update it in the same transaction as their source event.
+fn migrate_thread_status_projection(conn: &Connection) -> Result<()> {
+    // v2 rebuilds the projection once so databases created before timing was
+    // retained gain accurate latest-turn timestamps from the durable log.
+    const MIGRATION_ID: &str = "thread-status-projection-v2";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM thread_statuses", [])?;
+    let threads_have_session_id = {
+        let mut stmt = tx.prepare("PRAGMA table_info(threads)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "session_id")
+    };
+    if threads_have_session_id {
+        tx.execute(
+            "INSERT INTO thread_statuses
+               (thread_id, session_id, active, attention, last_outcome, latest_cursor)
+             SELECT id, session_id, 0, 'none', 'idle', 0 FROM threads",
+            [],
+        )?;
+    }
+    let mut after = 0u64;
+    loop {
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT cursor, scope_kind, scope_id, ts, payload
+                 FROM events WHERE cursor > ?1 ORDER BY cursor LIMIT 512",
+            )?;
+            let mapped = stmt.query_map([after as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for (cursor, kind, id, timestamp, payload) in &rows {
+            after = *cursor;
+            let Ok(event) = serde_json::from_str::<Event>(payload) else {
+                continue;
+            };
+            let scope = scope_from_cols(kind, id.clone());
+            let _ = project_thread_status(&tx, &scope, &event, *cursor, timestamp)?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Build the projection once for existing databases. Afterwards the sole
 /// event-writer transaction updates it and appends its durable replacement.
 fn migrate_session_summary_projection(conn: &Connection) -> Result<()> {
@@ -712,7 +806,7 @@ fn migrate_session_summary_projection(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
-    recover_interrupted_session_summaries(conn)
+    Ok(())
 }
 
 /// Process-owned turns and response channels do not survive restart. Record
@@ -989,6 +1083,207 @@ fn project_session_summary(
             session_id,
             summary: Some(summary),
             notification,
+        }),
+    )
+}
+
+fn ensure_thread_status(conn: &Connection, thread_id: &str) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO thread_statuses
+           (thread_id, session_id, active, attention, last_outcome, latest_cursor)
+         SELECT id, session_id, 0, 'none', 'idle', 0
+         FROM threads WHERE id = ?1",
+        [thread_id],
+    )?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thread_statuses WHERE thread_id = ?1)",
+        [thread_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn thread_attention(conn: &Connection, thread_id: &str) -> Result<SessionAttention> {
+    let (approval, question) = conn.query_row(
+        "SELECT
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE thread_id = ?1 AND kind = 'approval'),
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE thread_id = ?1 AND kind = 'question')",
+        [thread_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )?;
+    Ok(match (approval, question) {
+        (false, false) => SessionAttention::None,
+        (true, false) => SessionAttention::Approval,
+        (false, true) => SessionAttention::Question,
+        (true, true) => SessionAttention::Both,
+    })
+}
+
+fn thread_status(conn: &Connection, thread_id: &str) -> Result<Option<ThreadStatus>> {
+    conn.query_row(
+        "SELECT session_id, active, attention, last_outcome, latest_cursor,
+                started_at, completed_at
+         FROM thread_statuses WHERE thread_id = ?1",
+        [thread_id],
+        |row| {
+            let active = row.get::<_, i64>(1)? != 0;
+            let attention = match row.get::<_, String>(2)?.as_str() {
+                "approval" => SessionAttention::Approval,
+                "question" => SessionAttention::Question,
+                "both" => SessionAttention::Both,
+                _ => SessionAttention::None,
+            };
+            let outcome = if active {
+                SessionOutcome::Running
+            } else {
+                match row.get::<_, String>(3)?.as_str() {
+                    "succeeded" => SessionOutcome::Succeeded,
+                    "failed" => SessionOutcome::Failed,
+                    _ => SessionOutcome::Idle,
+                }
+            };
+            Ok(ThreadStatus {
+                thread_id: thread_id.to_owned(),
+                session_id: row.get(0)?,
+                active,
+                attention,
+                outcome,
+                latest_cursor: row.get::<_, i64>(4)? as u64,
+                started_at: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|value| value.parse().ok()),
+                completed_at: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|value| value.parse().ok()),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn thread_statuses(conn: &Connection, session_id: &str) -> Result<Vec<ThreadStatus>> {
+    let mut stmt = conn.prepare(
+        "SELECT thread_id FROM thread_statuses
+         WHERE session_id = ?1 ORDER BY thread_id",
+    )?;
+    let ids = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statuses = Vec::with_capacity(ids.len());
+    for thread_id in ids {
+        if let Some(status) = thread_status(conn, &thread_id)? {
+            statuses.push(status);
+        }
+    }
+    Ok(statuses)
+}
+
+fn project_thread_status(
+    conn: &Connection,
+    scope: &Scope,
+    event: &Event,
+    cursor: u64,
+    timestamp: &str,
+) -> Result<Option<ThreadStatusChange>> {
+    if matches!(event, Event::ThreadStatusUpdated { .. }) {
+        return Ok(None);
+    }
+    if let Event::SessionRecovered { session_id, .. } = event {
+        conn.execute(
+            "UPDATE thread_statuses
+             SET completed_at = CASE WHEN active != 0 THEN ?3 ELSE completed_at END,
+                 active = 0, attention = 'none', last_outcome = 'failed', latest_cursor = ?2
+             WHERE session_id = ?1",
+            params![session_id, cursor as i64, timestamp],
+        )?;
+        return Ok(Some(ThreadStatusChange {
+            statuses: thread_statuses(conn, session_id)?,
+        }));
+    }
+
+    let thread_id = match event {
+        Event::ThreadCreated { thread_id, .. } => thread_id.clone(),
+        Event::TurnStarted { .. }
+        | Event::TurnCompleted { .. }
+        | Event::TurnFailed { .. }
+        | Event::TurnCancelled { .. }
+        | Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ToolCompleted { .. }
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. } => {
+            let Scope::Thread(thread_id) = scope else {
+                return Ok(None);
+            };
+            thread_id.clone()
+        }
+        _ => return Ok(None),
+    };
+    if !ensure_thread_status(conn, &thread_id)? {
+        return Ok(None);
+    }
+
+    match event {
+        Event::ThreadCreated { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, attention = 'none', last_outcome = 'idle',
+                     started_at = NULL, completed_at = NULL
+                 WHERE thread_id = ?1",
+                [&thread_id],
+            )?;
+        }
+        Event::TurnStarted { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 1, last_outcome = 'running', started_at = ?2,
+                     completed_at = NULL
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnCompleted { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'succeeded', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnFailed { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'failed', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnCancelled { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'idle', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        _ => {}
+    }
+    let attention = match thread_attention(conn, &thread_id)? {
+        SessionAttention::None => "none",
+        SessionAttention::Approval => "approval",
+        SessionAttention::Question => "question",
+        SessionAttention::Both => "both",
+    };
+    conn.execute(
+        "UPDATE thread_statuses SET attention = ?2, latest_cursor = ?3
+         WHERE thread_id = ?1",
+        params![thread_id, attention, cursor as i64],
+    )?;
+    Ok(
+        thread_status(conn, &thread_id)?.map(|status| ThreadStatusChange {
+            statuses: vec![status],
         }),
     )
 }
@@ -2493,6 +2788,29 @@ fn insert_event_batch<'a>(
                 });
             }
         }
+        if let Some(change) = project_thread_status(
+            &tx,
+            &event.scope,
+            &event.event,
+            source_cursor,
+            &event.ts.to_rfc3339(),
+        )? {
+            for status in change.statuses {
+                let derived = Event::ThreadStatusUpdated { status };
+                let payload = serde_json::to_string(&derived)?;
+                tx.execute(
+                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                     VALUES ('server', '', ?1, ?2)",
+                    params![event.ts.to_rfc3339(), payload],
+                )?;
+                published.push(EventEnvelope {
+                    cursor: tx.last_insert_rowid() as u64,
+                    scope: Scope::Server,
+                    ts: event.ts,
+                    event: derived,
+                });
+            }
+        }
     }
     update_thread_view_caches(&tx, &thread_events)?;
     tx.commit()?;
@@ -2633,6 +2951,69 @@ fn load_materialized_thread_items(
         |row| row.get::<_, String>(0),
     )?;
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn materialized_thread_turn_boundary(
+    conn: &Connection,
+    thread_id: &str,
+    at_or_before: u64,
+) -> Result<Option<u64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT item_index, item FROM thread_view_items
+         WHERE thread_id = ?1 AND item_index <= ?2
+         ORDER BY item_index DESC",
+    )?;
+    let mut rows = stmt.query(params![
+        thread_id,
+        i64::try_from(at_or_before).context("thread-view boundary exceeds SQLite")?
+    ])?;
+    while let Some(row) = rows.next()? {
+        let index = row.get::<_, i64>(0)? as u64;
+        let encoded = row.get::<_, String>(1)?;
+        if matches!(
+            serde_json::from_str::<ThreadViewItem>(&encoded)?,
+            ThreadViewItem::TurnStatus { .. }
+        ) {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// Expand a requested backward page to the beginning of its oldest turn.
+/// The web renderer virtualizes complete turns; splitting one across pages
+/// would mutate the visible row when the preceding page is prepended.
+fn thread_view_page_start(
+    conn: &Connection,
+    thread_id: &str,
+    requested_start: u64,
+    materialized: u64,
+    live_items: &[ThreadViewItem],
+) -> Result<u64> {
+    if requested_start == 0 {
+        return Ok(0);
+    }
+    if requested_start >= materialized {
+        let relative = usize::try_from(requested_start - materialized)
+            .context("live thread-view boundary exceeds memory")?;
+        if let Some(boundary) = live_items
+            .get(..=relative.min(live_items.len().saturating_sub(1)))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .rposition(|item| matches!(item, ThreadViewItem::TurnStatus { .. }))
+            })
+        {
+            return Ok(materialized + boundary as u64);
+        }
+        if materialized == 0 {
+            return Ok(0);
+        }
+        return Ok(
+            materialized_thread_turn_boundary(conn, thread_id, materialized - 1)?.unwrap_or(0),
+        );
+    }
+    Ok(materialized_thread_turn_boundary(conn, thread_id, requested_start)?.unwrap_or(0))
 }
 
 fn update_thread_view_caches(
@@ -2906,6 +3287,7 @@ impl Store {
         thread_id: &str,
         before: Option<u64>,
         limit: usize,
+        turn_aligned: bool,
     ) -> Result<(u64, ThreadViewSnapshot)> {
         let (mut projection, cache_valid, observed_cache, rows) = {
             let conn = self.conn.lock().unwrap();
@@ -3041,15 +3423,27 @@ impl Store {
         let materialized = projection.materialized_items();
         let total = projection.total_items();
         let end = before.unwrap_or(total).min(total);
-        let start = end.saturating_sub(u64::try_from(limit.max(1)).unwrap_or(u64::MAX));
-        let mut items = {
+        let requested_start = end.saturating_sub(u64::try_from(limit.max(1)).unwrap_or(u64::MAX));
+        let (start, mut items) = {
             let conn = self.conn.lock().unwrap();
-            load_materialized_thread_items(
+            let start = if turn_aligned {
+                thread_view_page_start(
+                    &conn,
+                    thread_id,
+                    requested_start,
+                    materialized,
+                    &projection.snapshot.items,
+                )?
+            } else {
+                requested_start
+            };
+            let items = load_materialized_thread_items(
                 &conn,
                 thread_id,
                 start.min(materialized),
                 end.min(materialized),
-            )?
+            )?;
+            (start, items)
         };
         if end > materialized {
             let tail_start = start.saturating_sub(materialized) as usize;
@@ -3530,11 +3924,12 @@ impl Store {
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO threads
-                (id, session_id, mode, model, permission_mode, model_options, todos, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (id, session_id, title, mode, model, permission_mode, model_options, todos, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 t.id,
                 t.session_id,
+                t.title,
                 t.mode,
                 t.model,
                 permission_mode_str(t.permission_mode),
@@ -3577,6 +3972,11 @@ impl Store {
         ))?;
         let rows = stmt.query_map(params![session_id], row_to_thread)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn list_thread_statuses(&self, session_id: &str) -> Result<Vec<ThreadStatus>> {
+        let conn = self.conn.lock().unwrap();
+        thread_statuses(&conn, session_id)
     }
 
     /// Update thread settings between turns. `None` fields are unchanged.
@@ -7231,12 +7631,13 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 /// Columns matching `row_to_thread`, including the agent-spawned flag.
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
      created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
-     todos";
+     todos, title";
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
         session_id: r.get(1)?,
+        title: r.get(9)?,
         mode: r.get(2)?,
         model: r.get(3)?,
         permission_mode: permission_mode_from(&r.get::<_, String>(4)?),
@@ -7309,25 +7710,32 @@ mod tests {
             store.append_event(scope.clone(), event).unwrap();
         }
 
-        let (first_cursor, first) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (first_cursor, first) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert_eq!(first.items.len(), 3);
         assert_eq!(first.item_offset, 0);
         assert_eq!(first.total_items, 3);
         assert!(!first.has_older);
         assert!(first.turn_running);
 
-        let (_, tail) = store.thread_view_snapshot("th_view", None, 2).unwrap();
-        assert_eq!(tail.item_offset, 1);
-        assert_eq!(tail.total_items, 3);
-        assert!(tail.has_older);
-        assert_eq!(tail.items, first.items[1..]);
-        let (_, older) = store
-            .thread_view_snapshot("th_view", Some(tail.item_offset), 2)
+        let (_, legacy_tail) = store
+            .thread_view_snapshot("th_view", None, 2, false)
             .unwrap();
-        assert_eq!(older.item_offset, 0);
-        assert_eq!(older.total_items, 3);
-        assert!(!older.has_older);
-        assert_eq!(older.items, first.items[..1]);
+        assert_eq!(legacy_tail.item_offset, 1);
+        assert_eq!(legacy_tail.items.len(), 2);
+        assert!(legacy_tail.has_older);
+
+        let (_, tail) = store
+            .thread_view_snapshot("th_view", None, 2, true)
+            .unwrap();
+        // Pages expand to the beginning of the oldest included turn. Even a
+        // tiny target cannot split the live turn that the client renders as
+        // one stable virtual row.
+        assert_eq!(tail.item_offset, 0);
+        assert_eq!(tail.total_items, 3);
+        assert!(!tail.has_older);
+        assert_eq!(tail.items, first.items);
 
         store
             .append_event(
@@ -7350,13 +7758,16 @@ mod tests {
             )
             .unwrap() as u64;
         assert!(cached_cursor > first_cursor);
-        let (second_cursor, second) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (second_cursor, second) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert!(second_cursor > first_cursor);
         assert!(!second.turn_running);
         assert_eq!(second.items.len(), 3);
         let changes_before = store.conn.lock().unwrap().total_changes();
-        let (unchanged_cursor, unchanged) =
-            store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (unchanged_cursor, unchanged) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         let changes_after = store.conn.lock().unwrap().total_changes();
         assert_eq!(unchanged_cursor, second_cursor);
         assert_eq!(unchanged.items, second.items);
@@ -7371,7 +7782,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (rebuilt_cursor, rebuilt) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (rebuilt_cursor, rebuilt) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert_eq!(rebuilt_cursor, second_cursor);
         assert_eq!(rebuilt.items, second.items);
 
@@ -7384,27 +7797,56 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (repaired_cursor, repaired) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (repaired_cursor, repaired) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert_eq!(repaired_cursor, second_cursor);
         assert_eq!(repaired.items, second.items);
 
-        for index in 0..300 {
-            store
-                .append_event(
-                    scope.clone(),
-                    Event::UserMessage {
-                        turn: 2,
-                        content: format!("historical message {index}"),
-                        attachments: Vec::new(),
-                    },
-                )
-                .unwrap();
+        for turn in 2..=101 {
+            for event in [
+                Event::TurnStarted {
+                    turn,
+                    mode: "code".into(),
+                    model: "test/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+                Event::UserMessage {
+                    turn,
+                    content: format!("historical prompt {turn}"),
+                    attachments: Vec::new(),
+                },
+                Event::AssistantMessage {
+                    turn,
+                    content: format!("historical response {turn}"),
+                },
+                Event::TurnCompleted {
+                    turn,
+                    usage: Default::default(),
+                    checkpoint_id: None,
+                },
+            ] {
+                store.append_event(scope.clone(), event).unwrap();
+            }
         }
-        let (_, bounded) = store.thread_view_snapshot("th_view", None, 256).unwrap();
-        assert_eq!(bounded.items.len(), 256);
+        let (_, bounded) = store
+            .thread_view_snapshot("th_view", None, 256, true)
+            .unwrap();
+        assert_eq!(bounded.items.len(), 258);
         assert_eq!(bounded.total_items, 303);
-        assert_eq!(bounded.item_offset, 47);
+        assert_eq!(bounded.item_offset, 45);
         assert!(bounded.has_older);
+        assert!(matches!(
+            bounded.items.first(),
+            Some(ThreadViewItem::TurnStatus { .. })
+        ));
+        let (_, older) = store
+            .thread_view_snapshot("th_view", Some(bounded.item_offset), 256, true)
+            .unwrap();
+        assert_eq!(older.item_offset, 0);
+        assert_eq!(older.items.len(), 45);
+        assert!(!older.has_older);
     }
 
     #[test]
@@ -7457,7 +7899,7 @@ mod tests {
         }
 
         let (_, snapshot) = store
-            .thread_view_snapshot("th_tool_details", None, 256)
+            .thread_view_snapshot("th_tool_details", None, 256, false)
             .unwrap();
         let compact_tool = snapshot
             .items
@@ -8006,6 +8448,113 @@ mod tests {
     }
 
     #[test]
+    fn thread_status_projection_tracks_concurrent_threads_independently() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_waiting");
+        seed_thread(&store, "th_finished");
+
+        for thread_id in ["th_waiting", "th_finished"] {
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::ThreadCreated {
+                        thread_id: thread_id.into(),
+                        session_id: "se_q".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread(thread_id.into()),
+                    Event::TurnStarted {
+                        turn: 1,
+                        mode: "code".into(),
+                        model: "p/m".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+        }
+        let approval = store
+            .append_event(
+                Scope::Thread("th_waiting".into()),
+                Event::ApprovalRequested {
+                    turn: 1,
+                    call_id: "call_waiting".into(),
+                },
+            )
+            .unwrap();
+        let completed = store
+            .append_event(
+                Scope::Thread("th_finished".into()),
+                Event::TurnCompleted {
+                    turn: 1,
+                    usage: Default::default(),
+                    checkpoint_id: None,
+                },
+            )
+            .unwrap();
+
+        let statuses = store.list_thread_statuses("se_q").unwrap();
+        let waiting = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_waiting")
+            .unwrap();
+        assert!(waiting.active);
+        assert_eq!(waiting.attention, SessionAttention::Approval);
+        assert_eq!(waiting.outcome, SessionOutcome::Running);
+        assert_eq!(waiting.latest_cursor, approval.cursor);
+        assert!(waiting.started_at.is_some());
+        assert!(waiting.completed_at.is_none());
+        let finished = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_finished")
+            .unwrap();
+        assert!(!finished.active);
+        assert_eq!(finished.attention, SessionAttention::None);
+        assert_eq!(finished.outcome, SessionOutcome::Succeeded);
+        assert_eq!(finished.latest_cursor, completed.cursor);
+        assert!(finished.started_at.is_some());
+        assert!(finished.completed_at.is_some());
+        assert!(finished.completed_at >= finished.started_at);
+
+        let replacements = store.events_after(&Scope::Server, 0).unwrap();
+        assert!(replacements.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_waiting"
+                    && status.attention == SessionAttention::Approval
+        )));
+        assert!(replacements.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_finished"
+                    && status.outcome == SessionOutcome::Succeeded
+        )));
+
+        store
+            .append_event(
+                Scope::Thread("th_waiting".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "approval no longer actionable".into(),
+                },
+            )
+            .unwrap();
+        let waiting = store
+            .list_thread_statuses("se_q")
+            .unwrap()
+            .into_iter()
+            .find(|status| status.thread_id == "th_waiting")
+            .unwrap();
+        assert!(!waiting.active);
+        assert_eq!(waiting.attention, SessionAttention::None);
+        assert_eq!(waiting.outcome, SessionOutcome::Failed);
+        assert!(waiting.completed_at.is_some());
+    }
+
+    #[test]
     fn session_notification_edges_preserve_native_category_detail_and_order() {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_notice");
@@ -8146,6 +8695,14 @@ mod tests {
                 && summary.attention == SessionAttention::None
                 && summary.outcome == SessionOutcome::Failed
         ));
+        assert!(replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_recovery"
+                    && !status.active
+                    && status.attention == SessionAttention::None
+                    && status.outcome == SessionOutcome::Failed
+        )));
     }
 
     #[test]
@@ -8628,6 +9185,7 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),
@@ -8661,6 +9219,7 @@ mod tests {
         let child = Thread {
             id: "th_child".into(),
             session_id: "se_1".into(),
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),
@@ -8792,6 +9351,7 @@ mod tests {
                 &Thread {
                     id: thread_id.into(),
                     session_id: "se_q".into(),
+                    title: None,
                     mode: "code".into(),
                     model: "p/m".into(),
                     model_options: serde_json::Map::new(),
@@ -8803,6 +9363,32 @@ mod tests {
                 &serde_json::Map::new(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn thread_titles_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_seed");
+        let named = Thread {
+            id: "th_named".into(),
+            session_id: "se_q".into(),
+            title: Some("Review the parser edge cases".into()),
+            mode: "review".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+
+        store
+            .insert_thread(&named, &serde_json::Map::new())
+            .unwrap();
+
+        let loaded = store.thread("th_named").unwrap().unwrap();
+        assert_eq!(loaded.id, named.id);
+        assert_eq!(loaded.title, named.title);
     }
 
     #[test]
@@ -9230,6 +9816,7 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),

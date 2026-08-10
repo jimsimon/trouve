@@ -432,6 +432,7 @@ export interface components {
          *     carries durable harness state around the HTTP protocol.
          */
         ResumePreferences: {
+            closed_thread_tabs?: string[];
             selected_session_id?: string;
             session_threads?: {
                 [key: string]: string;

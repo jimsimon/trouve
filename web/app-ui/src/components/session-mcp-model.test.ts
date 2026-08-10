@@ -55,6 +55,7 @@ describe("session MCP presentation", () => {
       command: "npx",
       args: ["-y", "docs-mcp"],
       env: { TOKEN: "${TOKEN}" },
+      enabled: true,
     }]);
     expect(parseMcpConfigJson(JSON.stringify({
       servers: { local: { type: "stdio", command: "local-mcp" } },
@@ -63,6 +64,16 @@ describe("session MCP presentation", () => {
       command: "local-mcp",
       args: [],
       env: {},
+      enabled: true,
+    }]);
+    expect(parseMcpConfigJson(JSON.stringify({
+      mcpServers: { paused: { command: "paused-mcp", disabled: true } },
+    }))).toEqual([{
+      name: "paused",
+      command: "paused-mcp",
+      args: [],
+      env: {},
+      enabled: false,
     }]);
   });
 

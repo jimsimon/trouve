@@ -194,14 +194,19 @@ const installEventStream = async (page: Page): Promise<void> => {
 
 interface ProtocolFixtureOptions {
   readonly sentMessages?: Array<Record<string, unknown>>;
+  readonly createdThreadRequests?: Array<Record<string, unknown>>;
+  readonly generatedThreadTitle?: string;
   readonly steeredMessages?: Array<Record<string, unknown>>;
   readonly dispatchedQueuePromptIds?: string[];
   readonly messageDelayMs?: number;
   readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
   readonly messageFailureAt?: number;
+  readonly queuedMessageAcceptance?: Readonly<Record<string, unknown>>;
   readonly threadViewFixture?: ThreadViewFixtureLoader;
   readonly permissionMode?: "ask" | "allow_list" | "yolo";
   readonly additionalThreads?: readonly Record<string, unknown>[];
+  readonly threadSubagents?: readonly Record<string, unknown>[];
+  readonly threadStatuses?: readonly Record<string, unknown>[];
   readonly additionalSessions?: readonly Record<string, unknown>[];
   readonly additionalSessionSummaries?: readonly Record<string, unknown>[];
   readonly restoredCheckpointIds?: string[];
@@ -217,14 +222,19 @@ const installProtocolFixtures = async (
   page: Page,
   {
     sentMessages = [],
+    createdThreadRequests = [],
+    generatedThreadTitle = "Generated thread title",
     steeredMessages = [],
     dispatchedQueuePromptIds = [],
     messageDelayMs = 0,
     beforeMessageResponse,
     messageFailureAt,
+    queuedMessageAcceptance,
     threadViewFixture,
     permissionMode = "ask",
     additionalThreads = [],
+    threadSubagents = [],
+    threadStatuses = [],
     additionalSessions = [],
     additionalSessionSummaries = [],
     restoredCheckpointIds = [],
@@ -267,7 +277,31 @@ const installProtocolFixtures = async (
       });
       return;
     }
-    if (key === "POST /v1/threads/th_fixture/messages") {
+    if (key === "POST /v1/session-title") {
+      await route.fulfill({
+        json: { title: generatedThreadTitle, source: "model" },
+      });
+      return;
+    }
+    if (key === "POST /v1/threads") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      createdThreadRequests.push(body);
+      await route.fulfill({
+        json: {
+          id: "th_created",
+          session_id: body["session_id"],
+          title: body["title"],
+          mode: body["mode"] ?? "code",
+          model: body["model"] ?? "test/model",
+          model_options: body["model_options"] ?? {},
+          permission_mode: body["permission_mode"] ?? "ask",
+          created_at: "2026-08-05T08:00:00Z",
+        },
+      });
+      return;
+    }
+    const threadMessageMatch = /^\/v1\/threads\/([^/]+)\/messages$/u.exec(url.pathname);
+    if (request.method() === "POST" && threadMessageMatch !== null) {
       sentMessages.push(request.postDataJSON() as Record<string, unknown>);
       messageCount += 1;
       await beforeMessageResponse?.(messageCount);
@@ -283,8 +317,9 @@ const installProtocolFixtures = async (
       }
       await route.fulfill({
         json: messageCount === 1
-          ? { thread_id: "th_fixture", turn: 8 }
-          : { thread_id: "th_fixture", turn: 0, queued: true },
+          ? { thread_id: threadMessageMatch[1], turn: 8 }
+          : queuedMessageAcceptance
+            ?? { thread_id: threadMessageMatch[1], turn: 0, queued: true },
       });
       return;
     }
@@ -344,6 +379,13 @@ const installProtocolFixtures = async (
       await route.fulfill({ json: editedQueue });
       return;
     }
+    const threadSubagentsMatch = /^\/v1\/threads\/([^/]+)\/subagents$/u.exec(url.pathname);
+    if (request.method() === "GET" && threadSubagentsMatch !== null) {
+      await route.fulfill({
+        json: threadSubagentsMatch[1] === "th_fixture" ? threadSubagents : [],
+      });
+      return;
+    }
     if (
       key === "GET /v1/attachments/att_queue_1"
       || key === "GET /v1/attachments/att_preview_1"
@@ -385,16 +427,28 @@ const installProtocolFixtures = async (
       const threads = [{
         id: "th_fixture",
         session_id: "se_1",
+        title: "Chat rendering",
         mode: "code",
         model: "test/model",
         model_options: { reasoning_effort: "max", context: "1m" },
         permission_mode: permissionMode,
         created_at: "2026-08-04T08:00:00Z",
-      }, ...additionalThreads];
+      }, ...additionalThreads, ...threadSubagents.filter((subagent) =>
+        !additionalThreads.some((thread) => thread["id"] === subagent["id"])
+      )];
       await route.fulfill({
         json: sessionId === null
           ? threads
           : threads.filter((thread) => thread.session_id === sessionId),
+      });
+      return;
+    }
+    if (key === "GET /v1/thread-statuses") {
+      const sessionId = url.searchParams.get("session_id");
+      await route.fulfill({
+        json: sessionId === null
+          ? threadStatuses
+          : threadStatuses.filter((status) => status["session_id"] === sessionId),
       });
       return;
     }
@@ -675,7 +729,7 @@ test.beforeEach(async ({ page }, testInfo) => {
   await installEventStream(page);
 });
 
-test("the persistent TODO pane follows durable state and opens from rail updates", async ({
+test("the session overview follows durable TODO state and opens from rail updates", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-chromium", "Desktop owns the inspection layout");
@@ -684,12 +738,18 @@ test("the persistent TODO pane follows durable state and opens from rail updates
   await replayHistory(page);
 
   await expect(page.locator(".inspection-todo-switch")).toHaveCount(0);
-  const todoTab = page.getByRole("tab", { name: "Todos" });
-  await expect(todoTab).toBeVisible();
-  await todoTab.click();
-  const plan = page.locator("trouve-todo-plan-panel");
-  await expect(plan.getByText("No todos yet", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: "Info" }).click();
+  await expect(page.getByRole("tab", { name: "TODOs" })).toHaveCount(0);
+  const infoTab = page.getByRole("tab", { name: "Details" });
+  const overview = page.locator("trouve-session-info-panel");
+  await expect(infoTab).toHaveAttribute("aria-selected", "true");
+  await expect(overview.getByText("No TODOs are defined for this thread.", {
+    exact: true,
+  })).toBeVisible();
+  await page.getByRole("tab", { name: "Diff" }).click();
+  await expect(page.getByRole("tab", { name: "Diff" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
 
   await emit(page, threadEvent(16, {
     type: "turn.started",
@@ -698,6 +758,26 @@ test("the persistent TODO pane follows durable state and opens from rail updates
     model: "test/model",
   }));
   await emit(page, threadEvent(17, {
+    type: "tool.requested",
+    turn: 2,
+    call_id: "call_todo_update",
+    tool: "todo_write",
+    args: {
+      todos: [
+        { id: "inspect", content: "Inspect the adapter", status: "completed" },
+        { id: "publish", content: "Publish the todo snapshot", status: "in_progress" },
+        { id: "skip", content: "Skip the obsolete check", status: "pending" },
+      ],
+    },
+    requires_approval: false,
+  }));
+  await emit(page, threadEvent(18, {
+    type: "tool.completed",
+    call_id: "call_todo_update",
+    status: "ok",
+    result: null,
+  }));
+  await emit(page, threadEvent(19, {
     type: "thread.todos_updated",
     todos: [
       { id: "inspect", content: "Inspect the adapter", status: "completed" },
@@ -711,16 +791,14 @@ test("the persistent TODO pane follows durable state and opens from rail updates
   await expect(page.locator(".todo-rail-item.completed")).toContainText(
     "Inspect the adapter",
   );
+  await expect(page.locator('[data-call-id="call_todo_update"]')).toHaveCount(0);
   await startedUpdate.click();
-  await expect(todoTab).toHaveAttribute("aria-selected", "true");
-  await expect(plan.getByText("Todos", { exact: true })).toBeVisible();
-  await expect(plan.locator("[data-todo-id=inspect]")).toContainText("Inspect the adapter");
-  await expect(plan.locator("[data-todo-id=publish]")).toHaveAttribute(
-    "aria-current",
-    "step",
-  );
+  await expect(infoTab).toHaveAttribute("aria-selected", "true");
+  await expect(overview.getByText("TODOs", { exact: true })).toBeVisible();
+  await expect(overview.locator("[data-todo-id=inspect]")).toContainText("Inspect the adapter");
+  await expect(overview.locator("[data-todo-id=publish]")).toHaveClass(/in_progress/u);
 
-  await emit(page, threadEvent(18, {
+  await emit(page, threadEvent(20, {
     type: "thread.todos_updated",
     todos: [
       { id: "inspect", content: "Inspect the adapter", status: "completed" },
@@ -738,9 +816,11 @@ test("the persistent TODO pane follows durable state and opens from rail updates
     "Skip the obsolete check",
   );
 
-  await emit(page, threadEvent(19, { type: "thread.todos_updated", todos: [] }));
-  await expect(plan.getByText("No todos yet", { exact: true })).toBeVisible();
-  await expect(todoTab).toHaveAttribute("aria-selected", "true");
+  await emit(page, threadEvent(21, { type: "thread.todos_updated", todos: [] }));
+  await expect(overview.getByText("No TODOs are defined for this thread.", {
+    exact: true,
+  })).toBeVisible();
+  await expect(infoTab).toHaveAttribute("aria-selected", "true");
 });
 
 test("TODO lifecycle updates can collapse with sequential tool activity", async ({
@@ -768,7 +848,7 @@ test("TODO lifecycle updates can collapse with sequential tool activity", async 
   }));
 
   const group = page.locator(".activity-group").last();
-  await expect(group.locator(":scope > summary")).toContainText("Updated 1 todo");
+  await expect(group.locator(":scope > summary")).toContainText("Updated 1 TODO");
   await expect(group.locator(".todo-rail-item")).toBeHidden();
   await group.locator(":scope > summary").click();
   await expect(group.locator(".todo-rail-item.started")).toContainText("Build the pane");
@@ -899,6 +979,32 @@ test("Info combines session identity, changes, pull requests, and effective MCP 
   page,
 }, testInfo) => {
   await installProtocolFixtures(page, {
+    threadViewFixture: () => ({
+      cursor: 0,
+      snapshot: {
+        item_offset: 0,
+        total_items: 0,
+        has_older: false,
+        items: [],
+        todos: [{
+          id: "todo_info",
+          content: "Verify the thread overview",
+          status: "in_progress",
+        }],
+      },
+    }),
+    threadSubagents: [{
+      id: "th_info_subagent",
+      session_id: "se_1",
+      title: "Subagent: Inspect the overview",
+      mode: "code",
+      model: "test/subagent",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-04T08:01:00Z",
+      spawned: true,
+      todos: [],
+    }],
     sessionDiff: [
       "diff --git a/src/app.ts b/src/app.ts",
       "--- a/src/app.ts",
@@ -951,11 +1057,17 @@ test("Info combines session identity, changes, pull requests, and effective MCP 
   await expect(overview.getByRole("heading", { name: "Session overview" })).toBeVisible();
   await expect(overview.getByText("Chat rendering", { exact: true })).toBeVisible();
   await expect(overview.getByText("feature/chat", { exact: true })).toBeVisible();
+  await expect(overview.getByRole("heading", { name: "Thread overview" })).toBeVisible();
+  await expect(overview.getByText("Verify the thread overview", { exact: true })).toBeVisible();
+  await expect(overview.getByText("Subagent: Inspect the overview", { exact: true }))
+    .toBeVisible();
   await expect(overview.getByText("+1", { exact: true })).toBeVisible();
   await expect(overview.getByText("−1", { exact: true })).toBeVisible();
   await expect(overview.getByText("#42 Improve session overview", { exact: true })).toBeVisible();
   await expect(overview.getByText("docs", { exact: true })).toBeVisible();
   await expect(overview.getByText("Active", { exact: true })).toBeVisible();
+  await overview.getByRole("button", { name: "Open Subagent: Inspect the overview" }).click();
+  await expect(page).toHaveURL(/\/threads\/th_info_subagent\/inspect\/info/u);
 });
 
 test("turn separators retain even, comfortable vertical spacing", async ({ page }) => {
@@ -1295,6 +1407,26 @@ test("new-thread model choices do not wait for subscription health", async ({ pa
   }
 });
 
+test("new user threads use the shared server title generator", async ({ page }) => {
+  const createdThreadRequests: Array<Record<string, unknown>> = [];
+  await installProtocolFixtures(page, {
+    createdThreadRequests,
+    generatedThreadTitle: "Review streaming cancellation behavior",
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "New thread", exact: true }).click();
+
+  const setup = page.locator("trouve-new-thread-setup");
+  await setup.getByRole("textbox", { name: "First message" }).fill(
+    "Please investigate why cancelling a streaming turn sometimes waits for provider cleanup",
+  );
+  await setup.getByRole("button", { name: "Start thread" }).click();
+
+  await expect.poll(() => createdThreadRequests.length).toBe(1);
+  expect(createdThreadRequests[0]?.["title"])
+    .toBe("Review streaming cancellation behavior");
+});
+
 test("the YOLO warning remains centered and exposes its hover text", async ({ page }) => {
   await installProtocolFixtures(page, { permissionMode: "yolo" });
   await page.goto("/");
@@ -1459,11 +1591,12 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
       additionalThreads: [{
       id: "th_second",
       session_id: "se_1",
+      title: "Draft follow-up thread",
       mode: "code",
       model: "test/second",
       model_options: {},
       permission_mode: "ask",
-      created_at: "2026-08-03T08:00:00Z",
+      created_at: "2026-08-05T08:00:00Z",
     }, {
       id: "th_third",
       session_id: "se_2",
@@ -1511,7 +1644,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   };
   await page.goto("/");
   await openSession(/^Chat rendering/u);
-  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
 
   const textarea = page.locator('textarea[name="message"]');
   await textarea.fill("Draft for the first thread");
@@ -1522,7 +1655,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   });
   await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
 
-  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await page.getByRole("tab", { name: "Draft follow-up thread", exact: true }).click();
   await expect(textarea).toHaveValue("");
   await expect(page.locator(".pending-attachments")).toHaveCount(0);
   await textarea.fill("Draft for the second thread");
@@ -1533,7 +1666,7 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await openSession(/^Chat rendering/u);
   await expect(textarea).toHaveValue("Draft for the second thread");
 
-  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
   await expect(textarea).toHaveValue("Draft for the first thread");
   await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
 
@@ -1569,13 +1702,13 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await page.reload();
   await expect(textarea).toHaveValue("Draft for the first thread");
   await expect(page.locator(".pending-attachments")).toContainText("draft-notes.txt");
-  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await page.getByRole("tab", { name: "Draft follow-up thread", exact: true }).click();
   await expect(textarea).toHaveValue("Draft for the second thread");
   await openSession(/^Second session/u);
   await expect(textarea).toHaveValue("Draft in a different session");
 
   await openSession(/^Chat rendering/u);
-  await page.getByRole("tab", { name: "Code · model", exact: true }).click();
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(textarea).toHaveValue("");
   await expect(page.locator(".pending-attachments")).toHaveCount(0);
@@ -1583,10 +1716,254 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await page.reload();
   await expect(textarea).toHaveValue("");
   await expect(page.locator(".pending-attachments")).toHaveCount(0);
-  await page.getByRole("tab", { name: "Code · second", exact: true }).click();
+  await page.getByRole("tab", { name: "Draft follow-up thread", exact: true }).click();
   await expect(textarea).toHaveValue("Draft for the second thread");
   await openSession(/^Second session/u);
   await expect(textarea).toHaveValue("Draft in a different session");
+});
+
+test("subagent rail nodes open closeable read-only exploration tabs", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_subagent",
+      session_id: "se_1",
+      title: "Subagent: Review the native host lifecycle and report only concrete issues.",
+      mode: "plan",
+      model: "test/subagent",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+      spawned: true,
+    }],
+    threadViewFixture: () => ({
+      cursor: 16,
+      snapshot: {
+        item_offset: 0,
+        total_items: 1,
+        has_older: false,
+        items: [{
+          kind: "subagent",
+          turn: 7,
+          thread_id: "th_subagent",
+          session_id: "se_1",
+          prompt: "Review the native host lifecycle and report only concrete issues.",
+          model: "test/subagent",
+          call_id: "call_spawn",
+        }],
+      },
+    }),
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+
+  const railNode = page.getByRole("button", {
+    name: /Open subagent transcript: Review the native host lifecycle/u,
+  });
+  await expect(railNode).toBeVisible();
+  await expect(railNode).toContainText("Subagent");
+  await expect(railNode).toContainText("test/subagent");
+
+  await railNode.click();
+  await expect(page).toHaveURL(/\/threads\/th_subagent/u);
+  const fullSubagentTitle =
+    "Subagent: Review the native host lifecycle and report only concrete issues.";
+  const subagentTab = page.getByRole("tab", { name: fullSubagentTitle, exact: true });
+  await expect(subagentTab).toHaveAttribute("data-thread-tab-id", "th_subagent");
+  await expect(subagentTab).toHaveAttribute("title", fullSubagentTitle);
+  await expect(subagentTab.locator(".thread-tab-title")).toHaveText(fullSubagentTitle);
+  expect(await subagentTab.locator(".thread-tab-title").evaluate((label) =>
+    label.scrollWidth > label.clientWidth
+  )).toBe(true);
+  await subagentTab.focus();
+  await expect(subagentTab).toBeFocused();
+  await expect(page.locator(".subagent-readonly")).toContainText(
+    "Exploration, audit, and review modes do not accept follow-up prompts.",
+  );
+  await expect(page.locator('textarea[name="message"]')).toHaveCount(0);
+
+  await page.locator(
+    '.thread-tab-item:has([data-thread-tab-id="th_subagent"]) .thread-tab-close',
+  ).click();
+  await expect(page).toHaveURL(/\/threads\/th_fixture/u);
+  await expect(page.locator('[data-thread-tab-id="th_subagent"]')).toHaveCount(0);
+
+  const closedThreads = page.getByRole("button", { name: "Closed threads (1)" });
+  await expect(closedThreads).toBeVisible();
+  await closedThreads.click();
+  const reopenThread = page.getByRole("menuitem", {
+    name: /Subagent: Review the native host lifecycle/u,
+  });
+  await expect(reopenThread).toContainText("Read-only subagent thread");
+  await reopenThread.click();
+  await expect(page).toHaveURL(/\/threads\/th_subagent/u);
+  await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
+    .toHaveAttribute("data-thread-tab-id", "th_subagent");
+  await expect(page.locator(
+    '.thread-tab-item:has([data-thread-tab-id="th_subagent"]) .thread-tab-close',
+  )).toBeVisible();
+  await expect(page.getByRole("button", { name: "No closed threads" })).toBeDisabled();
+});
+
+test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_interactive_subagent",
+      session_id: "se_1",
+      title: "Subagent: Implement the focused follow-up",
+      mode: "code",
+      model: "test/subagent",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+      spawned: true,
+    }],
+    threadViewFixture: () => ({
+      cursor: 16,
+      snapshot: {
+        item_offset: 0,
+        total_items: 1,
+        has_older: false,
+        items: [{
+          kind: "subagent",
+          turn: 7,
+          thread_id: "th_interactive_subagent",
+          session_id: "se_1",
+          prompt: "Implement the focused follow-up",
+          model: "test/subagent",
+          call_id: "call_spawn_interactive",
+        }],
+      },
+    }),
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+  await page.getByRole("button", {
+    name: "Open subagent transcript: Implement the focused follow-up",
+  }).click();
+
+  await expect(page).toHaveURL(/\/threads\/th_interactive_subagent/u);
+  await expect(page.locator(".subagent-readonly")).toHaveCount(0);
+  await expect(page.locator('textarea[name="message"]')).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+});
+
+test("regular thread tabs can be closed and reopened from the session menu", async ({
+  page,
+}) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_second",
+      session_id: "se_1",
+      title: "Review follow-up",
+      mode: "review",
+      model: "test/second",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }],
+  });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Chat rendering", exact: true }).click();
+
+  await page.locator(
+    '.thread-tab-item:has([data-thread-tab-id="th_fixture"]) .thread-tab-close',
+  ).click();
+  await expect(page).toHaveURL(/\/threads\/th_second/u);
+  await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
+
+  await page.reload();
+  await expect(page).toHaveURL(/\/threads\/th_second/u);
+  await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
+
+  await page.locator(
+    '.thread-tab-item:has([data-thread-tab-id="th_second"]) .thread-tab-close',
+  ).click();
+  await expect(page.getByRole("form", { name: "New thread setup (provisional)" }))
+    .toBeVisible();
+  await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
+  await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByRole("form", { name: "New thread setup (provisional)" }))
+    .toBeVisible();
+  await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
+  await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
+  await page.getByRole("button", { name: "Closed threads (2)" }).click();
+  const reopenThread = page.getByRole("menuitem", { name: /Chat rendering/u });
+  await expect(reopenThread).toContainText("Conversation thread");
+  await reopenThread.click();
+
+  await expect(page).toHaveURL(/\/threads\/th_fixture/u);
+  await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
+    .toHaveAttribute("data-thread-tab-id", "th_fixture");
+  await page.getByRole("button", { name: "Closed threads (1)" }).click();
+  await page.getByRole("menuitem", { name: /Review follow-up/u }).click();
+  await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
+    .toHaveAttribute("data-thread-tab-id", "th_second");
+  await expect(page.getByRole("button", { name: "No closed threads" })).toBeDisabled();
+});
+
+test("thread tabs and the closed-thread menu share session status indicators", async ({ page }) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_attention",
+      session_id: "se_1",
+      title: "Waiting for a decision",
+      mode: "code",
+      model: "test/model",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }],
+    threadStatuses: [{
+      thread_id: "th_fixture",
+      session_id: "se_1",
+      active: true,
+      attention: "none",
+      outcome: "running",
+      latest_cursor: 20,
+    }, {
+      thread_id: "th_attention",
+      session_id: "se_1",
+      active: false,
+      attention: "question",
+      outcome: "idle",
+      latest_cursor: 21,
+    }],
+  });
+  await page.goto("/");
+
+  const running = page.locator(
+    '.thread-tab-main[data-thread-tab-id="th_fixture"] .thread-tab-indicator.busy',
+  );
+  await expect(running).toBeVisible();
+  await expect(running).toHaveAttribute("title", "Processing");
+  const attention = page.locator(
+    '.thread-tab-main[data-thread-tab-id="th_attention"] .thread-tab-indicator.question',
+  );
+  await expect(attention).toBeVisible();
+  await expect(attention).toHaveAttribute("title", "Question awaiting an answer");
+
+  await page.locator(
+    '.thread-tab-item:has([data-thread-tab-id="th_attention"]) .thread-tab-close',
+  ).click();
+  const closedThreadsToggle = page.getByRole("button", {
+    name: "Closed threads (1), Question awaiting an answer",
+  });
+  const closedThreadsStatus = closedThreadsToggle.locator(
+    ".closed-thread-tabs-status.question",
+  );
+  await expect(closedThreadsStatus).toBeVisible();
+  await expect(closedThreadsStatus)
+    .toHaveAttribute("title", "Question awaiting an answer");
+  await closedThreadsToggle.click();
+  const closed = page.locator(
+    '[data-closed-thread-id="th_attention"] .thread-tab-indicator.question',
+  );
+  await expect(closed).toBeVisible();
+  await expect(closed).toHaveAttribute("title", "Question awaiting an answer");
 });
 
 test("turn cards unify prompt, activity, and response while preserving copy actions", async ({ page }) => {
@@ -4164,6 +4541,81 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   expect(olderBoundaries).toHaveLength(requestedBoundaries.length);
 });
 
+test("keeps the visible turn fixed when a prepended row lays out during wheel scrolling", async ({
+  page,
+}) => {
+  const historyPage = (start: number, end: number, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 25,
+    has_older: hasOlder,
+    items: Array.from({ length: end - start }, (_, index) => ({
+      kind: "user",
+      turn: 1_000 + start + index,
+      content: `History prompt ${start + index} ${
+        "Variable-height content keeps this history row measurable. ".repeat(
+          4 + index % 3,
+        )
+      }`,
+      attachments: [],
+    })),
+  });
+  let olderRequests = 0;
+  let releaseOlderPage: (() => void) | undefined;
+  const olderPageReleased = new Promise<void>((resolve) => {
+    releaseOlderPage = resolve;
+  });
+  await installProtocolFixtures(page, { threadViewFixture: async (before) => {
+    if (before === undefined) return { snapshot: historyPage(5, 25, true) };
+    if (before === 5) {
+      olderRequests += 1;
+      await olderPageReleased;
+      return { snapshot: historyPage(0, 5, false) };
+    }
+    throw new Error(`unexpected history boundary ${before}`);
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+  const viewport = page.locator(".chat-stream");
+  await viewport.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -2_000 }));
+    element.scrollTop = 0;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(() => olderRequests).toBe(1);
+  releaseOlderPage?.();
+  await expect(viewport.locator('[data-virtual-id="turn:1004"]')).toBeAttached();
+  await expect(viewport.locator('[data-virtual-id="turn:1005"]')).toBeAttached();
+
+  const anchor = await viewport.evaluate((element) => {
+    element.scrollTop += 3;
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 3 }));
+    element.dispatchEvent(new Event("scroll"));
+    const row = element.querySelector<HTMLElement>('[data-virtual-id="turn:1005"]');
+    const preceding = element.querySelector<HTMLElement>('[data-virtual-id="turn:1004"]');
+    if (row === null || preceding === null) throw new Error("missing history turn rows");
+    const offset = row.getBoundingClientRect().top - element.getBoundingClientRect().top;
+    const delayedContent = document.createElement("div");
+    delayedContent.dataset["historyDelayedContent"] = "";
+    delayedContent.style.height = "180px";
+    preceding.append(delayedContent);
+    return { id: "turn:1005", offset, scrollTop: element.scrollTop };
+  });
+  await expect.poll(() => viewport.evaluate((element, expected) => {
+    const row = element.querySelector<HTMLElement>(
+      `[data-virtual-id="${expected.id}"]`,
+    );
+    return row === null
+      ? Number.POSITIVE_INFINITY
+      : Math.abs(
+          row.getBoundingClientRect().top
+            - element.getBoundingClientRect().top
+            - expected.offset,
+        );
+  }, anchor)).toBeLessThanOrEqual(2);
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(anchor.scrollTop + 150);
+});
+
 test("keeps a nested thought anchored when history extends the same agent turn", async ({
   page,
 }) => {
@@ -4317,6 +4769,97 @@ test("a queued prompt can interrupt the active turn and run next", async ({ page
 
   await expect.poll(() => dispatchedQueuePromptIds).toEqual(["qp_1"]);
   await expect(page.locator("wa-button.composer-submit")).toHaveText("Stopping…");
+});
+
+test("a newly accepted queued prompt can reorder before its queue event arrives", async ({ page }) => {
+  const existingPrompt = {
+    id: "qp_existing",
+    thread_id: "th_fixture",
+    content: "Already queued",
+    position: 0,
+    created_at: "2026-08-04T08:00:19Z",
+    attachments: [],
+  };
+  const acceptedPrompt = {
+    id: "qp_new",
+    thread_id: "th_fixture",
+    content: "Move me immediately",
+    position: 1,
+    created_at: "2026-08-04T08:00:20Z",
+    attachments: [],
+  };
+  const submittedOrders: string[][] = [];
+  await installProtocolFixtures(page, {
+    queuedMessageAcceptance: {
+      thread_id: "th_fixture",
+      turn: 0,
+      queued: true,
+      queued_prompt: acceptedPrompt,
+    },
+  });
+  await page.route("**/v1/threads/th_fixture/queue", async (route) => {
+    if (route.request().method() !== "PUT") {
+      await route.fallback();
+      return;
+    }
+    const { ids } = route.request().postDataJSON() as { readonly ids: string[] };
+    submittedOrders.push(ids);
+    const byId = new Map([
+      [existingPrompt.id, existingPrompt],
+      [acceptedPrompt.id, acceptedPrompt],
+    ]);
+    await route.fulfill({
+      json: ids.map((id, position) => ({ ...byId.get(id)!, position })),
+    });
+  });
+  await page.goto("/");
+  await replayHistory(page);
+
+  const composer = page.getByRole("textbox", { name: "Message", exact: true });
+  const submit = page.locator("wa-button.composer-submit");
+  await composer.fill("Start the active turn");
+  await submit.click();
+  await expect(submit).toHaveText("Starting…");
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Start the active turn",
+      attachments: [],
+    }),
+    threadEvent(18, {
+      type: "thread.queue_updated",
+      prompts: [existingPrompt],
+    }),
+  ]);
+
+  await composer.fill("Move me immediately");
+  await expect(submit).toHaveText("Queue");
+  await submit.click();
+
+  // No queue_updated event containing qp_new is emitted in this test. The
+  // acceptance response alone must replace the optimistic id so the row is
+  // immediately eligible for durable queue mutations.
+  const rows = page.locator(".queue-panel li[data-queue-id]");
+  await expect(rows).toHaveCount(2);
+  const source = page.locator('[data-queue-id="qp_new"]');
+  const target = page.locator('[data-queue-id="qp_existing"]');
+  await expect(source).toHaveAttribute("draggable", "true");
+  const targetBounds = await target.boundingBox();
+  if (targetBounds === null) throw new Error("missing queued prompt row geometry");
+  await source.dragTo(target, {
+    targetPosition: {
+      x: Math.min(120, targetBounds.width - 2),
+      y: 2,
+    },
+  });
+  await expect.poll(() => submittedOrders).toEqual([["qp_new", "qp_existing"]]);
 });
 
 test("queued prompts drag by the full row and adjacent drops always move", async ({ page }) => {

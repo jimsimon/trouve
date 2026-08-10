@@ -8,6 +8,7 @@ import type {
   ProtocolProvidersResponse,
   ProtocolUpsertModeRequest,
 } from "../services/protocol-client.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   modelOptionLabel,
   modelSelectorLabel,
@@ -35,7 +36,7 @@ const thinkingOptions = (model: ProtocolModelInfo | undefined): readonly string[
 const splitTools = (value: string): string[] =>
   value.split(/[\n,]/u).map((tool) => tool.trim()).filter(Boolean);
 
-export class TrouveModeSettings extends LitElement {
+export class TrouveModeSettings extends withSignalTracking(LitElement) {
   static override styles = css`
     :host { display: block; color: var(--trouve-text); font: var(--trouve-font-size, 13px)/1.35 var(--trouve-font-sans, system-ui); }
     h2, h3, p { margin-block: 0; }
@@ -105,14 +106,22 @@ export class TrouveModeSettings extends LitElement {
   #modeFormModelId = "";
   #modeFormThinkingDraft: string | undefined;
 
+  #availableModels(): readonly ProtocolModelInfo[] {
+    const catalog = this.#services.value?.modelCatalog.current;
+    if (catalog === undefined) return this.#models;
+    const models = readSignal(catalog);
+    return models.length === 0 ? this.#models : models;
+  }
+
   override connectedCallback(): void {
     super.connectedCallback();
     queueMicrotask(() => void this.#load());
   }
 
   async #load(): Promise<void> {
-    const protocol = this.#services.value?.protocol;
-    if (protocol === undefined) return;
+    const services = this.#services.value;
+    if (services === undefined) return;
+    const { protocol } = services;
     this.#busy = true;
     this.#message = "Loading modes and models…";
     this.#error = false;
@@ -120,7 +129,7 @@ export class TrouveModeSettings extends LitElement {
     try {
       [this.#providers, this.#models, this.#modes] = await Promise.all([
         protocol.providers(),
-        protocol.models(),
+        services.modelCatalog.refresh("if-stale"),
         protocol.modeInfos(),
       ]);
       this.#defaultModelDraft = this.#providers.default_model ?? "";
@@ -241,7 +250,7 @@ export class TrouveModeSettings extends LitElement {
     const readOnly = info?.origin === "workspace";
     const selectedModelId = this.#modeFormModelId || mode?.default_model || this.#providers?.default_model || "";
     const editorThinking = thinkingOptions(
-      this.#models.find((candidate) => candidate.id === selectedModelId),
+      this.#availableModels().find((candidate) => candidate.id === selectedModelId),
     );
     return html`
       <form class="mode-editor" @submit=${(event: SubmitEvent) => void this.#saveMode(event, info)}>
@@ -255,13 +264,13 @@ export class TrouveModeSettings extends LitElement {
         <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
         <div class="grid mode-default-grid">
           <label><span>Default permissions</span><select name="default_permission_mode" .value=${mode?.default_permission_mode ?? ""} ?disabled=${readOnly}><option value="">Global default</option><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
-          <label><span>Default model</span><select name="default_model" .value=${this.#modeFormModelId || mode?.default_model || ""} ?disabled=${readOnly || this.#models.length === 0} @change=${(event: Event) => {
+          <label><span>Default model</span><select name="default_model" .value=${this.#modeFormModelId || mode?.default_model || ""} ?disabled=${readOnly || this.#availableModels().length === 0} @change=${(event: Event) => {
             this.#modeFormModelId = (event.currentTarget as HTMLSelectElement).value;
-            const options = thinkingOptions(this.#models.find((candidate) => candidate.id === this.#modeFormModelId));
+            const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === this.#modeFormModelId));
             const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
             this.#modeFormThinkingDraft = options.includes(current) ? current : "";
             this.requestUpdate();
-          }}><option value="">Global default</option>${this.#models.map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
+          }}><option value="">Global default</option>${this.#availableModels().map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
           ${editorThinking.length === 0
             ? html`<input type="hidden" name="default_thinking_level" value="" />`
             : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
@@ -311,7 +320,7 @@ export class TrouveModeSettings extends LitElement {
   #modeRow(info: ProtocolModeInfo) {
     const mode = info.mode;
     const modelId = mode.default_model ?? "";
-    const thinkingModel = this.#models.find((model) => model.id === (modelId || this.#providers?.default_model));
+    const thinkingModel = this.#availableModels().find((model) => model.id === (modelId || this.#providers?.default_model));
     const thinking = thinkingOptions(thinkingModel);
     const readOnly = info.origin === "workspace";
     return html`
@@ -324,12 +333,12 @@ export class TrouveModeSettings extends LitElement {
           <select
             aria-label=${`Default model for ${mode.display_name}`}
             .value=${modelId}
-            ?disabled=${readOnly || this.#busy || this.#models.length === 0}
+            ?disabled=${readOnly || this.#busy || this.#availableModels().length === 0}
             @change=${(event: Event) => void this.#updateModeDefaults(info, {
               model: (event.currentTarget as HTMLSelectElement).value || null,
               thinking: null,
             })}
-          ><option value="">Global default</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}</option>`)}</select>
+          ><option value="">Global default</option>${this.#availableModels().map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}</option>`)}</select>
           ${thinking.length === 0
             ? nothing
             : html`<select
@@ -352,28 +361,29 @@ export class TrouveModeSettings extends LitElement {
   }
 
   override render() {
-    const selected = this.#models.find((model) => model.id === (this.#defaultModelDraft || this.#providers?.default_model));
+    const models = this.#availableModels();
+    const selected = models.find((model) => model.id === (this.#defaultModelDraft || this.#providers?.default_model));
     const thinking = thinkingOptions(selected);
     return html`
       <div class="stack">
         <h2>Modes &amp; Models</h2>
-        ${this.#models.length === 0 && !this.#busy
+        ${models.length === 0 && !this.#busy
           ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
           : nothing}
         <form class="defaults-form" @submit=${(event: SubmitEvent) => void this.#saveDefaults(event)}>
           <p class="meta">Global default model — used by new threads whose mode has no default of its own.</p>
           <div class="row">
-            <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || this.#models.length === 0} @change=${(event: Event) => {
+            <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || models.length === 0} @change=${(event: Event) => {
               this.#defaultModelDraft = (event.currentTarget as HTMLSelectElement).value;
-              const options = thinkingOptions(this.#models.find((model) => model.id === this.#defaultModelDraft));
+              const options = thinkingOptions(this.#availableModels().find((model) => model.id === this.#defaultModelDraft));
               if (!options.includes(this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
               this.requestUpdate();
-            }}><option value="" disabled>Choose model</option>${this.#models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
+            }}><option value="" disabled>Choose model</option>${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
           </div>
           ${thinking.length === 0
             ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
             : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
-          <div class="row"><button type="submit" ?disabled=${this.#busy || this.#models.length === 0}>Set defaults</button></div>
+          <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
           <p class="meta">Global default permissions — used by new threads whose mode has no default of its own.</p>
           <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
         </form>

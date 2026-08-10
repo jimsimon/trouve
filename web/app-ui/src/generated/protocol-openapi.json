@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.24"
+    "version": "3.34"
   },
   "paths": {
     "/v1/approvals": {
@@ -1991,6 +1991,57 @@
         }
       }
     },
+    "/v1/mcp-servers/{name}/enabled": {
+      "put": {
+        "tags": [],
+        "operationId": "set_mcp_server_enabled",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetMcpServerEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/mcp-servers/{name}/logs": {
       "get": {
         "tags": [],
@@ -2055,6 +2106,27 @@
       "get": {
         "tags": [],
         "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/refresh": {
+      "get": {
+        "tags": [],
+        "operationId": "refresh_models",
         "responses": {
           "200": {
             "description": "",
@@ -3976,6 +4048,37 @@
         }
       }
     },
+    "/v1/thread-statuses": {
+      "get": {
+        "tags": [],
+        "operationId": "list_thread_statuses",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ThreadStatus"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads": {
       "get": {
         "tags": [],
@@ -4423,6 +4526,47 @@
         }
       }
     },
+    "/v1/threads/{id}/subagents": {
+      "get": {
+        "tags": [],
+        "operationId": "list_thread_subagents",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/tools/{call_id}": {
       "get": {
         "tags": [],
@@ -4534,12 +4678,21 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Requested item count; capped by the server",
+            "description": "Maximum item count, capped by the server",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int32",
               "minimum": 0
+            }
+          },
+          {
+            "name": "turn_aligned",
+            "in": "query",
+            "description": "Expand backward to a complete turn boundary; the response may exceed limit",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -6737,6 +6890,13 @@
           },
           "session_id": {
             "$ref": "#/components/schemas/String"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Concise user-visible title for navigation surfaces."
           }
         }
       },
@@ -7005,6 +7165,54 @@
                 "type": "string",
                 "enum": [
                   "turn.steered"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A child agent became part of this parent turn. The child transcript\nremains independently addressable while this durable boundary lets\nclients render and navigate the relationship from the parent rail.",
+            "required": [
+              "turn",
+              "thread_id",
+              "session_id",
+              "prompt",
+              "model",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String",
+                    "description": "The trouve spawn tool call represented by this node, when one\nexists. Provider-native collaborators do not have a parent tool\ncall. Clients may suppress the redundant spawn tool presentation."
+                  }
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "subagent.spawned"
                 ]
               }
             }
@@ -7898,6 +8106,25 @@
                 "type": "string",
                 "enum": [
                   "thread.updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Transactionally derived status for one thread. Open and closed tabs can\nfold this server-scope event without opening a transcript SSE stream.",
+            "required": [
+              "status",
+              "type"
+            ],
+            "properties": {
+              "status": {
+                "$ref": "#/components/schemas/ThreadStatus"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.status_updated"
                 ]
               }
             }
@@ -8848,6 +9075,13 @@
             "type": "string",
             "description": "\"5 tools\" when healthy, the failure reason when not, \"\" for unknown."
           },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this definition participates in the effective MCP config.\nOlder servers omit the field, which clients interpret as enabled."
+          },
           "env": {
             "type": "object",
             "description": "Values may be `${VAR}` references resolved at spawn time.",
@@ -8860,7 +9094,7 @@
           },
           "health": {
             "type": "string",
-            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe) /\n\"untrusted\" (a repo-scoped server that is never auto-run)."
+            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe) /\n\"untrusted\" (a repo-scoped server that is never auto-run) /\n\"disabled\" (this definition is persistently disabled)."
           },
           "name": {
             "type": "string"
@@ -11454,6 +11688,30 @@
           }
         }
       },
+      "SetMcpServerEnabledRequest": {
+        "type": "object",
+        "description": "Persistently enable or disable an existing user-managed MCP definition.",
+        "required": [
+          "scope",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "scope": {
+            "type": "string",
+            "description": "\"user\" or \"workspace\"."
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
+          }
+        }
+      },
       "SteerAccepted": {
         "type": "object",
         "description": "A steering message accepted by the active vendor turn. Durable display\nstate follows as `turn.steered` on the thread event stream.",
@@ -11661,6 +11919,13 @@
             "type": "boolean",
             "description": "True when an agent spawned this thread (spawn_thread/spawn_session\ntools) rather than the user; clients mark such threads visually."
           },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Concise user-visible title. Older threads may not have one; clients\nfall back to the session title or mode/model metadata."
+          },
           "todos": {
             "type": "array",
             "items": {
@@ -11723,6 +11988,57 @@
           }
         ]
       },
+      "ThreadStatus": {
+        "type": "object",
+        "description": "Compact durable execution state for one thread. This lets clients render\nbackground-thread status without retaining or streaming every transcript.",
+        "required": [
+          "thread_id",
+          "session_id",
+          "active",
+          "attention",
+          "outcome",
+          "latest_cursor"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "attention": {
+            "$ref": "#/components/schemas/SessionAttention"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "End of the latest turn. Absent while that turn is still active."
+          },
+          "latest_cursor": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cursor of the durable source event that produced this state.",
+            "minimum": 0
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/SessionOutcome"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Start of the latest turn, when this thread has run at least once."
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
       "ThreadTodoState": {
         "type": "string",
         "description": "One user-visible transition in a todo's lifecycle. `Skipped` is derived\nwhen an unfinished todo disappears from a replacement snapshot; it is not\na current-list status because skipped items are no longer in that list.",
@@ -11761,6 +12077,21 @@
       },
       "ThreadTurnState": {
         "oneOf": [
+          {
+            "type": "object",
+            "description": "The durable turn shell exists, but shared/provider scheduler capacity\nhas not yet been acquired.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "waiting_for_capacity"
+                ]
+              }
+            }
+          },
           {
             "type": "object",
             "required": [
@@ -11880,6 +12211,53 @@
                 "enum": [
                   "steered"
                 ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A separately navigable child agent transcript spawned from this parent\nturn. Children in read-only modes are transcript-only; other child\nthreads can accept follow-up prompts after their initial turn.",
+            "required": [
+              "turn",
+              "thread_id",
+              "session_id",
+              "prompt",
+              "model",
+              "kind"
+            ],
+            "properties": {
+              "call_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String"
+                  }
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "subagent"
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
               },
               "turn": {
                 "type": "integer",
@@ -12133,8 +12511,15 @@
               "null"
             ],
             "format": "int32",
-            "description": "Requested item count; the server applies a safe upper bound.",
+            "description": "Maximum item count; the server applies a safe upper bound.",
             "minimum": 0
+          },
+          "turn_aligned": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Expand the page backward to the beginning of its oldest turn. This can\nreturn more than `limit` items, but prevents a paged turn from changing\nshape when its preceding history is loaded."
           }
         }
       },
@@ -12386,6 +12771,17 @@
         "properties": {
           "queued": {
             "type": "boolean"
+          },
+          "queued_prompt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QueuedPrompt",
+                "description": "The newly accepted durable queue row when this prompt remains queued.\nClients can use its stable id immediately instead of waiting for the\nmatching `thread.queue_updated` event before enabling queue mutations."
+              }
+            ]
           },
           "thread_id": {
             "$ref": "#/components/schemas/String"
@@ -12654,6 +13050,13 @@
           },
           "command": {
             "type": "string"
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Preserve a disabled definition while editing or importing it. Omitted\nrequests retain the historical behavior of creating an enabled server."
           },
           "env": {
             "type": "object",

@@ -1344,6 +1344,7 @@ fn validate_preferences(preferences: &HostPreferences) -> Result<(), HostValidat
     let resume = &preferences.resume;
     let mut workspace_ids = std::collections::HashSet::new();
     let mut pull_request_group_ids = std::collections::HashSet::new();
+    let mut closed_thread_ids = std::collections::HashSet::new();
     let valid = THEMES.contains(&appearance.theme.as_str())
         && (10..=32).contains(&appearance.font_size)
         && appearance.font_family.len() <= 256
@@ -1380,7 +1381,12 @@ fn validate_preferences(preferences: &HostPreferences) -> Result<(), HostValidat
                 && valid_chat_item_id(&bookmark.item_id)
                 && bookmark.offset.is_finite()
                 && (0.0..=1_000_000.0).contains(&bookmark.offset)
-        });
+        })
+        && resume.closed_thread_tabs.len() <= 1_000
+        && resume
+            .closed_thread_tabs
+            .iter()
+            .all(|thread_id| valid_bridge_id(thread_id) && closed_thread_ids.insert(thread_id));
     if valid {
         Ok(())
     } else {
@@ -3387,6 +3393,7 @@ mod tests {
                 offset: 18.5,
             },
         );
+        preferences.resume.closed_thread_tabs.push("th-2".into());
         assert!(validate_preferences(&preferences).is_ok());
 
         preferences
@@ -3408,6 +3415,14 @@ mod tests {
             .get_mut("th-1")
             .unwrap()
             .item_id = "bad\nitem".into();
+        assert!(validate_preferences(&preferences).is_err());
+        preferences
+            .resume
+            .thread_scroll
+            .get_mut("th-1")
+            .unwrap()
+            .item_id = "assistant:42".into();
+        preferences.resume.closed_thread_tabs.push("th-2".into());
         assert!(validate_preferences(&preferences).is_err());
     }
 

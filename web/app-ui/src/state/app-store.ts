@@ -8,6 +8,7 @@ import type {
   ProtocolServerInfo,
   ProtocolSessionSummary,
   ProtocolThread,
+  ProtocolThreadStatus,
   ProtocolThreadViewSnapshot,
   ProtocolThreadToolDetails,
   ProtocolTodoItem,
@@ -50,6 +51,13 @@ export interface SessionListItem {
   readonly unread: boolean;
 }
 
+export interface ThreadIndicatorState {
+  readonly active: boolean;
+  readonly attention: ProtocolThreadStatus["attention"];
+  readonly outcome: ProtocolThreadStatus["outcome"];
+  readonly unread: boolean;
+}
+
 export interface SessionPullRequestIdentity {
   readonly workspaceId: string;
   readonly branch: string;
@@ -80,7 +88,12 @@ const visualState = (
   return "idle";
 };
 
-const terminalSummary = (summary: ProtocolSessionSummary): boolean =>
+interface TerminalStatusFields {
+  readonly active: boolean;
+  readonly outcome: ProtocolSessionSummary["outcome"];
+}
+
+const terminalSummary = (summary: TerminalStatusFields): boolean =>
   !summary.active
   && (summary.outcome === "succeeded" || summary.outcome === "failed");
 
@@ -89,8 +102,8 @@ const terminalSummary = (summary: ProtocolSessionSummary): boolean =>
  * summary updates may advance latest_cursor for metadata/attention changes and
  * must not resurrect a terminal badge the user already saw. */
 const liveTerminalTransition = (
-  previous: ProtocolSessionSummary | undefined,
-  next: ProtocolSessionSummary,
+  previous: TerminalStatusFields | undefined,
+  next: TerminalStatusFields,
 ): boolean => terminalSummary(next) && (
   previous === undefined
   || previous.active
@@ -187,6 +200,9 @@ export class AppStore {
   #sessionSummaryInitialized = false;
   readonly #workspaces = new Map<string, ProtocolWorkspace>();
   readonly #threads = new Map<string, ProtocolThread>();
+  readonly #threadStatuses = new Map<string, ProtocolThreadStatus>();
+  readonly #seenThreadCursors = new Map<string, number>();
+  readonly #initializedThreadStatusSessions = new Set<string>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
   #serverProjectionCursor = 0;
@@ -347,6 +363,8 @@ export class AppStore {
         if (!nextThreadIds.has(threadId)) {
           this.#threadViews.delete(threadId);
           this.#threadTodoEvents.delete(threadId);
+          this.#threadStatuses.delete(threadId);
+          this.#seenThreadCursors.delete(threadId);
         }
       }
     }
@@ -356,6 +374,35 @@ export class AppStore {
 
   upsertThread(thread: ProtocolThread): void {
     this.#storeThreadSnapshot(thread);
+    this.#touch();
+  }
+
+  replaceThreadStatusesForSession(
+    sessionId: string,
+    statuses: readonly ProtocolThreadStatus[],
+  ): void {
+    const firstSnapshot = !this.#initializedThreadStatusSessions.has(sessionId);
+    const nextIds = new Set(statuses.map((status) => status.thread_id));
+    for (const [threadId, status] of this.#threadStatuses) {
+      if (status.session_id === sessionId && !nextIds.has(threadId)) {
+        this.#threadStatuses.delete(threadId);
+        this.#seenThreadCursors.delete(threadId);
+      }
+    }
+    for (const status of statuses) {
+      const current = this.#threadStatuses.get(status.thread_id);
+      if (current !== undefined && current.latest_cursor > status.latest_cursor) continue;
+      this.#threadStatuses.set(status.thread_id, status);
+      if (firstSnapshot) {
+        this.#seenThreadCursors.set(status.thread_id, status.latest_cursor);
+      } else if (!this.#seenThreadCursors.has(status.thread_id)) {
+        this.#seenThreadCursors.set(
+          status.thread_id,
+          status.active || status.outcome === "running" ? status.latest_cursor : 0,
+        );
+      }
+    }
+    this.#initializedThreadStatusSessions.add(sessionId);
     this.#touch();
   }
 
@@ -372,6 +419,28 @@ export class AppStore {
   thread(threadId: string): ProtocolThread | undefined {
     this.#revision.get();
     return this.#threads.get(threadId);
+  }
+
+  threadIndicatorState(threadId: string): ThreadIndicatorState {
+    this.#revision.get();
+    const status = this.#threadStatuses.get(threadId);
+    if (status === undefined) {
+      return { active: false, attention: "none", outcome: "idle", unread: false };
+    }
+    const unread = !status.active
+      && (status.outcome === "succeeded" || status.outcome === "failed")
+      && status.latest_cursor > (this.#seenThreadCursors.get(threadId) ?? status.latest_cursor);
+    return {
+      active: status.active,
+      attention: status.attention,
+      outcome: status.outcome,
+      unread,
+    };
+  }
+
+  threadStatus(threadId: string): ProtocolThreadStatus | undefined {
+    this.#revision.get();
+    return this.#threadStatuses.get(threadId);
   }
 
   session(sessionId: string): SessionListItem | undefined {
@@ -635,6 +704,29 @@ export class AppStore {
         this.#touch();
         return !this.#sessionMetadata.has(envelope.session_id);
       }
+      case "thread.status_updated": {
+        const next = envelope.status;
+        const previous = this.#threadStatuses.get(next.thread_id);
+        if (previous !== undefined && previous.latest_cursor >= next.latest_cursor) return false;
+        this.#initializedThreadStatusSessions.add(next.session_id);
+        if (!this.#seenThreadCursors.has(next.thread_id)) {
+          this.#seenThreadCursors.set(
+            next.thread_id,
+            next.active || next.outcome === "running" ? next.latest_cursor : 0,
+          );
+        } else {
+          const seen = this.#seenThreadCursors.get(next.thread_id) ?? 0;
+          const alreadyUnread = previous !== undefined
+            && terminalSummary(previous)
+            && previous.latest_cursor > seen;
+          if (!alreadyUnread && !liveTerminalTransition(previous, next)) {
+            this.#seenThreadCursors.set(next.thread_id, next.latest_cursor);
+          }
+        }
+        this.#threadStatuses.set(next.thread_id, next);
+        this.#touch();
+        return false;
+      }
       case "session.created":
       case "session.updated":
       case "session.deleted":
@@ -688,6 +780,16 @@ export class AppStore {
     const seen = this.#seenSessionCursors.get(sessionId) ?? 0;
     if (seen >= summary.latest_cursor) return false;
     this.#seenSessionCursors.set(sessionId, summary.latest_cursor);
+    this.#touch();
+    return true;
+  }
+
+  markThreadRead(threadId: string): boolean {
+    const status = this.#threadStatuses.get(threadId);
+    if (status === undefined) return false;
+    const seen = this.#seenThreadCursors.get(threadId) ?? 0;
+    if (seen >= status.latest_cursor) return false;
+    this.#seenThreadCursors.set(threadId, status.latest_cursor);
     this.#touch();
     return true;
   }
