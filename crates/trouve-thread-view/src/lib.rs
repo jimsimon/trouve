@@ -249,7 +249,11 @@ impl ThreadProjection {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
-                self.finish_thinking();
+                // Tool lifecycle events can interleave with deltas from the
+                // same provider-owned thinking item. Only the explicit
+                // AssistantThinkingCompleted edge closes that item; otherwise
+                // a sentence split around a tool request renders as two
+                // separate thoughts.
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -1259,6 +1263,60 @@ mod tests {
             projection.snapshot.items.last(),
             Some(ThreadViewItem::Thinking { complete: true, .. })
         ));
+    }
+
+    #[test]
+    fn tool_request_does_not_split_one_explicitly_bounded_thinking_item() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 4,
+                text: "The final overlap pass is still".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            10,
+            Event::ToolRequested {
+                turn: 4,
+                call_id: "search".into(),
+                tool: "search_transcript".into(),
+                args: serde_json::json!({ "query": "Stopping" }),
+                requires_approval: false,
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            20,
+            Event::AssistantThinking {
+                turn: 4,
+                text: " running.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            4,
+            30,
+            Event::AssistantThinkingCompleted { turn: 4 },
+        ));
+
+        let thoughts = projection
+            .snapshot
+            .items
+            .iter()
+            .filter(|item| matches!(item, ThreadViewItem::Thinking { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        assert!(matches!(
+            thoughts[0],
+            ThreadViewItem::Thinking {
+                content,
+                complete: true,
+                ..
+            } if content == "The final overlap pass is still running."
+        ));
+        assert!(!projection.snapshot.thinking);
     }
 
     #[test]

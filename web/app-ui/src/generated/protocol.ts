@@ -8265,7 +8265,10 @@ export interface operations {
     };
     list_thread_subagents: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Include nested descendants instead of only direct children */
+                recursive?: boolean;
+            };
             header?: never;
             path: {
                 id: string;

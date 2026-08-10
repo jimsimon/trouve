@@ -514,7 +514,7 @@ describe("Trouve visual contract", () => {
       /\.activity-group-timeline > \.tool-card > summary > \.activity-rail-disclosure \{[^}]*position:\s*static[^}]*transform:\s*none/s,
     );
     expect(app).toMatch(
-      /\.activity-group > summary:focus \{[^}]*background:\s*var\(--trouve-accent-bg\)/s,
+      /\.activity-group > summary:focus-visible \{[^}]*outline:\s*2px solid var\(--trouve-focus\)[^}]*outline-offset:\s*-2px/s,
     );
     expect(app).toMatch(
       /\.tool-card summary::before \{[^}]*inset-inline:\s*0[^}]*border-radius:\s*var\(--trouve-radius-sm\)[^}]*background:\s*transparent/s,
@@ -523,7 +523,7 @@ describe("Trouve visual contract", () => {
       /\.activity-group-timeline > \.tool-card > summary::before \{[^}]*inset-inline-start:\s*22px/s,
     );
     expect(app).toMatch(
-      /\.tool-card summary:focus::before \{[^}]*background:\s*var\(--trouve-accent-bg\)/s,
+      /\.tool-card summary:focus-visible::before \{[^}]*box-shadow:\s*inset 0 0 0 2px var\(--trouve-focus\)/s,
     );
     expect(app).toMatch(
       /\.tool-inline-status \{[^}]*width:\s*12px[^}]*height:\s*12px[^}]*display:\s*inline-grid/s,

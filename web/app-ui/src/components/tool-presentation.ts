@@ -341,7 +341,7 @@ const hashlineSectionPath = (input: string): string | undefined => {
 const editPresentation = (tool: string, args: JsonRecord): EditPresentation | undefined => {
   const base = baseToolName(tool);
   const verb = [
-    "edit", "Edit", "MultiEdit", "NotebookEdit", "edit_file", "hashline_edit", "apply_patch", "fileChange",
+    "edit", "Edit", "MultiEdit", "NotebookEdit", "edit_file", "hashline_edit", "apply_patch", "apply_patch_fallback", "fileChange",
   ].includes(base)
     ? "Edit"
     : ["write", "Write", "write_file", "create_file"].includes(base)

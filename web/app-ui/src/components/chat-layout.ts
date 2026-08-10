@@ -194,6 +194,8 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   const read = new Set<string>();
   let editsWithoutPath = 0;
   let readsWithoutPath = 0;
+  let codeSearches = 0;
+  let transcriptSearches = 0;
   let commands = 0;
   let tools = 0;
   let thoughts = 0;
@@ -220,13 +222,17 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
     const path = paths[0];
     if ([
       "edit", "Edit", "MultiEdit", "NotebookEdit", "Write", "write",
-      "edit_file", "hashline_edit", "write_file", "create_file", "apply_patch", "delete", "delete_file",
+      "edit_file", "hashline_edit", "write_file", "create_file", "apply_patch", "apply_patch_fallback", "delete", "delete_file",
     ].includes(base)) {
       if (paths.length === 0) editsWithoutPath += 1;
       else for (const editedPath of paths) edited.add(editedPath);
     } else if (["read", "Read", "read_file"].includes(base)) {
       if (path === undefined) readsWithoutPath += 1;
       else read.add(path);
+    } else if (["search", "find_related"].includes(base)) {
+      codeSearches += 1;
+    } else if (base === "search_transcript") {
+      transcriptSearches += 1;
     } else if (["shell", "bash", "Bash", "execute", "commandExecution"].includes(base)) {
       commands += 1;
     } else if (base === "fileChange") {
@@ -255,6 +261,10 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   const readCount = read.size + readsWithoutPath;
   if (editCount > 0) parts.push(`edited ${plural(editCount, "file", "files")}`);
   if (readCount > 0) parts.push(`read ${plural(readCount, "file", "files")}`);
+  if (codeSearches > 0) parts.push(`ran ${plural(codeSearches, "code search", "code searches")}`);
+  if (transcriptSearches > 0) {
+    parts.push(`ran ${plural(transcriptSearches, "transcript search", "transcript searches")}`);
+  }
   if (commands > 0) parts.push(`ran ${plural(commands, "command", "commands")}`);
   if (tools > 0) parts.push(`called ${plural(tools, "tool", "tools")}`);
   if (thoughts > 0) parts.push(`thought ${plural(thoughts, "time", "times")}`);

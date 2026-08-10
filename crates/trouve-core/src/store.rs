@@ -30,7 +30,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // expose exact restore/fork actions after an upgrade.
 // v4 stores completed folded rows independently and keeps only the live tail
 // in the serialized projection cache.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 5;
+// v5 adds durable TODO lifecycle rows. v6 keeps explicitly bounded provider
+// thinking intact when tool lifecycle events interleave with its deltas.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -4027,8 +4029,8 @@ impl Store {
 
     // --- spawned threads --------------------------------------------------
     // Parentage of agent-spawned children (spawn_thread / spawn_session
-    // tools): drives the depth guard (children don't spawn grandchildren)
-    // and the concurrency cap.
+    // tools): drives bounded recursive delegation, hierarchy projections,
+    // and per-parent/per-tree concurrency caps.
 
     pub fn insert_spawned(&self, child: &str, parent: &str, kind: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();

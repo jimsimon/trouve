@@ -39,6 +39,12 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "find_related".into(),
                 "git_diff".into(),
                 "todo_write".into(),
+                // Delegation is orchestration rather than a worktree
+                // mutation. Read-only children may fan out only into the
+                // same read-only mode; `handle_spawn_tool` enforces that
+                // invariant and intentionally withholds `spawn_session`.
+                "spawn_thread".into(),
+                "spawn_output".into(),
             ],
             read_only: true,
             default_permission_mode: None,
@@ -64,6 +70,8 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "find_related".into(),
                 "git_diff".into(),
                 "todo_write".into(),
+                "spawn_thread".into(),
+                "spawn_output".into(),
             ],
             read_only: true,
             default_permission_mode: None,
@@ -101,6 +109,8 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "search".into(),
                 "find_related".into(),
                 "todo_write".into(),
+                "spawn_thread".into(),
+                "spawn_output".into(),
             ],
             read_only: true,
             default_permission_mode: None,
@@ -307,6 +317,23 @@ mod tests {
                 .default_thinking_level
                 .is_none()
         );
+    }
+
+    #[test]
+    fn read_only_builtin_modes_can_delegate_without_spawning_sessions() {
+        let modes = builtin_modes();
+        for id in ["plan", "review", "question"] {
+            let mode = find_mode(&modes, id).unwrap();
+            assert!(mode.read_only);
+            assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_thread"));
+            assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_output"));
+            assert!(
+                !mode
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "spawn_session")
+            );
+        }
     }
 
     #[test]

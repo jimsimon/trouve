@@ -789,7 +789,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
       ),
       threadId === ""
         ? Promise.resolve({ status: "fulfilled" as const, value: [] })
-        : Promise.resolve(services.protocol.threadSubagents(threadId)).then(
+        : Promise.resolve(services.protocol.threadSubagents(threadId, true)).then(
             (value) => ({ status: "fulfilled" as const, value }),
             (reason: unknown) => ({ status: "rejected" as const, reason }),
           ),

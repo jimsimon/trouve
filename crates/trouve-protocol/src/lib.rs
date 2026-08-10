@@ -247,7 +247,9 @@ pub use requests::*;
 // 3.34: GET /v1/models/refresh resolves live account and vendor-CLI model
 // availability separately from the instant static GET /v1/models snapshot
 // (additive).
-pub const PROTOCOL_VERSION: &str = "3.34";
+// 3.35: GET /v1/threads/{id}/subagents accepts recursive=true so parent
+// overviews can include active nested collaborator descendants (additive).
+pub const PROTOCOL_VERSION: &str = "3.35";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

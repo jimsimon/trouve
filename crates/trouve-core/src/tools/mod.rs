@@ -6,6 +6,7 @@
 //! container-backed implementation without touching the loop.
 
 mod diff;
+mod edit_strategy;
 mod fs;
 mod glob;
 mod grep;
@@ -21,6 +22,7 @@ pub use search::{
     warm_index_in_background,
 };
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +31,9 @@ use futures::StreamExt as _;
 use serde_json::Value;
 use trouve_protocol::ToolStatus;
 use trouve_providers::ToolSpec;
+
+pub use edit_strategy::EditStrategy;
+pub use edit_strategy::for_model as edit_strategy_for_model;
 
 /// Execution context: everything a tool may touch. All paths resolve inside
 /// the session worktree.
@@ -52,6 +57,9 @@ pub struct ToolCtx {
     /// Registered workspace repo root: its `.agents/.mcp.json` applies even
     /// before it is committed to the session branch.
     pub workspace_root: Option<PathBuf>,
+    /// Model-specific editing policy used for both tool advertisement and
+    /// execution enforcement.
+    pub edit_strategy: EditStrategy,
 }
 
 impl ToolCtx {
@@ -265,6 +273,7 @@ pub struct LocalToolExecutor {
     built_in_specs: Vec<ToolSpec>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    hashline_failures: Mutex<HashMap<String, u8>>,
 }
 
 impl Default for LocalToolExecutor {
@@ -286,8 +295,10 @@ impl LocalToolExecutor {
             Arc::new(fs::ReadFile),
             Arc::new(fs::WriteFile),
             Arc::new(fs::EditFile),
+            Arc::new(fs::DeleteFile),
             Arc::new(hashline::HashlineEdit),
             Arc::new(patch::ApplyPatch),
+            Arc::new(patch::ApplyPatchFallback),
             Arc::new(fs::ListDir),
             Arc::new(diff::GitDiff),
             Arc::new(glob::Glob),
@@ -317,18 +328,95 @@ impl LocalToolExecutor {
             built_in_specs,
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            hashline_failures: Mutex::new(HashMap::new()),
         }
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name)
     }
+
+    fn failure_key(ctx: &ToolCtx) -> String {
+        if ctx.thread_id.is_empty() {
+            format!("worktree:{}", ctx.worktree.display())
+        } else {
+            ctx.thread_id.clone()
+        }
+    }
+
+    fn hashline_failure_count(&self, ctx: &ToolCtx) -> u8 {
+        self.hashline_failures
+            .lock()
+            .unwrap()
+            .get(&Self::failure_key(ctx))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_hashline_result(&self, ctx: &ToolCtx, result: &ToolResult) -> u8 {
+        let key = Self::failure_key(ctx);
+        let mut failures = self.hashline_failures.lock().unwrap();
+        if result.status == ToolStatus::Ok {
+            failures.remove(&key);
+            return 0;
+        }
+        let cancelled = result
+            .result
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("cancelled"));
+        if cancelled {
+            return failures.get(&key).copied().unwrap_or(0);
+        }
+        let count = failures.entry(key).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    fn edit_policy_denial(&self, ctx: &ToolCtx, name: &str, args: &Value) -> Option<ToolResult> {
+        if name == "apply_patch_fallback" {
+            if ctx.edit_strategy != EditStrategy::EnforceHashline {
+                return Some(ToolResult::error(
+                    "apply_patch_fallback is not available for this model's edit strategy",
+                ));
+            }
+            let failures = self.hashline_failure_count(ctx);
+            if failures < edit_strategy::HASHLINE_FALLBACK_FAILURES {
+                return Some(ToolResult::error(format!(
+                    "apply_patch_fallback is locked until {} hashline_edit attempts fail (currently {failures})",
+                    edit_strategy::HASHLINE_FALLBACK_FAILURES
+                )));
+            }
+        }
+        if ctx.edit_strategy != EditStrategy::EnforceHashline {
+            return None;
+        }
+        if matches!(name, "edit_file" | "apply_patch") {
+            return Some(ToolResult::error(format!(
+                "{name} is unavailable for this model; read the file with format=\"hashline\" and use hashline_edit"
+            )));
+        }
+        if name == "write_file"
+            && let Some(path) = args.get("path").and_then(Value::as_str)
+            && ctx.resolve(path).is_ok_and(|path| path.exists())
+        {
+            return Some(ToolResult::error(
+                "write_file may only create new files under the enforced hashline strategy; use hashline_edit for an existing file",
+            ));
+        }
+        None
+    }
 }
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalToolExecutor {
     async fn specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
-        let mut specs = self.built_in_specs.clone();
+        let mut specs = self
+            .built_in_specs
+            .iter()
+            .cloned()
+            .filter_map(|spec| edit_strategy::advertise(ctx.edit_strategy, spec))
+            .collect::<Vec<_>>();
         specs.extend(
             self.mcp
                 .specs(
@@ -375,8 +463,48 @@ impl ToolExecutor for LocalToolExecutor {
                 Err(e) => ToolResult::error(format!("{e:#}")),
             };
         }
+        if let Some(denial) = self.edit_policy_denial(ctx, name, args) {
+            return denial;
+        }
         match self.find(name) {
-            Some(tool) => tool.run(ctx, args).await,
+            Some(tool) => {
+                let started = std::time::Instant::now();
+                let result = tool.run(ctx, args).await;
+                let failure_count = if name == "hashline_edit"
+                    && ctx.edit_strategy == EditStrategy::EnforceHashline
+                {
+                    self.record_hashline_result(ctx, &result)
+                } else if name == "apply_patch_fallback" && result.status == ToolStatus::Ok {
+                    self.hashline_failures
+                        .lock()
+                        .unwrap()
+                        .remove(&Self::failure_key(ctx));
+                    0
+                } else {
+                    self.hashline_failure_count(ctx)
+                };
+                if matches!(
+                    name,
+                    "edit_file"
+                        | "hashline_edit"
+                        | "apply_patch"
+                        | "apply_patch_fallback"
+                        | "write_file"
+                        | "delete_file"
+                ) {
+                    tracing::info!(
+                        target: "trouve::edit_strategy",
+                        thread_id = %ctx.thread_id,
+                        strategy = ?ctx.edit_strategy,
+                        tool = name,
+                        status = ?result.status,
+                        execution_ms = started.elapsed().as_millis(),
+                        hashline_failures = failure_count,
+                        "model edit strategy tool result"
+                    );
+                }
+                result
+            }
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
     }
@@ -587,5 +715,114 @@ mod tests {
     fn executor_classifies_hashline_edits_as_mutations() {
         let exec = LocalToolExecutor::default();
         assert_eq!(exec.tool_mutates("hashline_edit"), Some(true));
+    }
+
+    fn spec_names(specs: Vec<ToolSpec>) -> Vec<String> {
+        specs.into_iter().map(|spec| spec.name).collect()
+    }
+
+    #[tokio::test]
+    async fn enforced_hashline_catalog_retains_create_delete_and_controlled_fallback() {
+        let exec = LocalToolExecutor::default();
+        let ctx = ToolCtx {
+            worktree: std::env::temp_dir(),
+            edit_strategy: EditStrategy::EnforceHashline,
+            ..Default::default()
+        };
+        let names = spec_names(exec.specs(&ctx).await);
+        assert!(names.contains(&"hashline_edit".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"delete_file".to_string()));
+        assert!(names.contains(&"apply_patch_fallback".to_string()));
+        assert!(!names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"apply_patch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ordinary_catalogs_do_not_expose_the_controlled_fallback_alias() {
+        let exec = LocalToolExecutor::default();
+        for edit_strategy in [
+            EditStrategy::Auto,
+            EditStrategy::PreferApplyPatch,
+            EditStrategy::PreferHashline,
+        ] {
+            let ctx = ToolCtx {
+                worktree: std::env::temp_dir(),
+                edit_strategy,
+                ..Default::default()
+            };
+            let names = spec_names(exec.specs(&ctx).await);
+            assert!(names.contains(&"apply_patch".to_string()));
+            assert!(!names.contains(&"apply_patch_fallback".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn enforced_hashline_fallback_unlocks_after_repeated_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "old\n").unwrap();
+        let exec = LocalToolExecutor::default();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            thread_id: "thread-fallback".into(),
+            edit_strategy: EditStrategy::EnforceHashline,
+            ..Default::default()
+        };
+        let fallback = "*** Begin Patch\n*** Update File: f.txt\n-old\n+new\n*** End Patch";
+        let locked = exec
+            .execute(
+                &ctx,
+                "apply_patch_fallback",
+                &serde_json::json!({"input": fallback}),
+            )
+            .await;
+        assert_eq!(locked.status, ToolStatus::Error);
+
+        for _ in 0..edit_strategy::HASHLINE_FALLBACK_FAILURES {
+            let failed = exec
+                .execute(
+                    &ctx,
+                    "hashline_edit",
+                    &serde_json::json!({"input": "not hashline"}),
+                )
+                .await;
+            assert_eq!(failed.status, ToolStatus::Error);
+        }
+        let applied = exec
+            .execute(
+                &ctx,
+                "apply_patch_fallback",
+                &serde_json::json!({"input": fallback}),
+            )
+            .await;
+        assert_eq!(applied.status, ToolStatus::Ok, "{:?}", applied.result);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_hashline_write_file_cannot_overwrite_existing_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("existing.txt"), "keep").unwrap();
+        let exec = LocalToolExecutor::default();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            edit_strategy: EditStrategy::EnforceHashline,
+            ..Default::default()
+        };
+        let denied = exec
+            .execute(
+                &ctx,
+                "write_file",
+                &serde_json::json!({"path": "existing.txt", "content": "replace"}),
+            )
+            .await;
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("existing.txt")).unwrap(),
+            "keep"
+        );
     }
 }

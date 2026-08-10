@@ -668,7 +668,9 @@ export class ThreadViewModel {
       }
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
-        this.finishThinking();
+        // Provider tool lifecycle can interleave with deltas from one
+        // explicitly bounded thinking item. Do not turn that transport
+        // interleaving into a second Thought row.
         this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",

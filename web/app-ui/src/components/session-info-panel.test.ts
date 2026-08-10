@@ -79,6 +79,7 @@ describe("session information overview", () => {
     expect(source).toContain("services.protocol.sessionDiffSummary(sessionId)");
     expect(source).not.toContain("services.protocol.sessionDiff(sessionId)");
     expect(source).toContain("services.protocol.sessionMcpServers(sessionId)");
+    expect(source).toContain("services.protocol.threadSubagents(threadId, true)");
     expect(source).not.toContain("services.protocol.sessionPrs(sessionId)");
     expect(source).not.toContain("services.protocol.refreshGithubPrs(true)");
     expect(source).toContain("RESOURCE_REFRESH_MS");

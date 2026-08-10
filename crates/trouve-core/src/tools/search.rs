@@ -111,11 +111,11 @@ trouve thread or Code mode is read-only. Independent read-only tool calls may \
 run in parallel; trouve serializes mutation-capable calls within the session \
 worktree.
 
-Editing strategies are additive: use `apply_patch` when the model is trained \
-on that format (especially Codex). Use `read_file` with `format=hashline` \
-followed by `hashline_edit` when line-numbered snapshot edits avoid repeating \
-substantial old text. Never invent or reuse a hashline snapshot tag after the \
-file changes.";
+The advertised edit-tool catalog is model-specific and authoritative. Use its \
+preferred existing-file editor. When `hashline_edit` is advertised as required, \
+use `read_file` with `format=hashline` first and never invent or reuse a snapshot \
+tag after the file changes. Creation, deletion, and any controlled fallback are \
+advertised separately when available.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them. The cache locks

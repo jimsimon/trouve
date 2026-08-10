@@ -729,7 +729,9 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
-                self.finish_thinking();
+                // A provider tool event may arrive between deltas belonging
+                // to one thinking item. Keep that item open until its durable
+                // explicit completion edge arrives.
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
                 self.tool_outputs.remove(call_id);
@@ -1772,6 +1774,43 @@ mod tests {
             vm.items.first(),
             Some(ChatItem::Thinking { complete: true, .. })
         ));
+    }
+
+    #[test]
+    fn tool_request_does_not_split_one_explicitly_bounded_thinking_item() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "The final overlap pass is still".into(),
+        }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "search".into(),
+            tool: "search_transcript".into(),
+            args: serde_json::json!({ "query": "Stopping" }),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: " running.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+
+        let thoughts = vm
+            .items
+            .iter()
+            .filter(|item| matches!(item, ChatItem::Thinking { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        assert!(matches!(
+            thoughts[0],
+            ChatItem::Thinking {
+                content,
+                complete: true,
+                ..
+            } if content == "The final overlap pass is still running."
+        ));
+        assert!(!vm.thinking);
     }
 
     #[test]

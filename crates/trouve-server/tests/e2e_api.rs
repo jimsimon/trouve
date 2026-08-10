@@ -4977,8 +4977,8 @@ async fn search_transcript_recovers_history() {
 
 /// Drives the spawn tool family end-to-end. The parent turn spawns a child
 /// agent, pokes spawn_output with a bogus id (denied: not its child), waits
-/// on the real child, then summarizes. The child turn first tries to spawn
-/// a grandchild (denied: depth guard) and then answers.
+/// on the real child, then summarizes. The child delegates to a grandchild
+/// and collects that result before answering.
 struct SpawnProvider {
     /// "spawn_thread" (same session) or "spawn_session" (fresh worktree).
     spawn_tool: &'static str,
@@ -5020,17 +5020,25 @@ impl Provider for SpawnProvider {
                 ..Default::default()
             },
         });
-        let events: Vec<Result<ProviderEvent, ProviderError>> = if users.contains("child task") {
-            // The child agent's turn.
-            if results.contains("cannot spawn") {
+        let events: Vec<Result<ProviderEvent, ProviderError>> = if users.contains("grandchild task")
+        {
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "Grandchild done: the nested answer is 21.".into(),
+                )),
+                done,
+            ]
+        } else if users.contains("child task") {
+            // The child agent delegates once, waits for that grandchild, then
+            // completes its own durable transcript.
+            if results.contains("Grandchild done") {
                 vec![
                     Ok(ProviderEvent::TextDelta(
                         "Child done: the answer is 42.".into(),
                     )),
                     done,
                 ]
-            } else {
-                // Try (and fail) to spawn a grandchild: the depth guard.
+            } else if !results.contains("thread_id") {
                 vec![
                     Ok(ProviderEvent::ToolCall(ToolCallRequest {
                         id: "c1".into(),
@@ -5039,14 +5047,31 @@ impl Provider for SpawnProvider {
                     })),
                     done,
                 ]
+            } else {
+                let grandchild_id = results
+                    .split("\"thread_id\":\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "c2".into(),
+                        name: "spawn_output".into(),
+                        arguments: serde_json::json!({
+                            "thread_id": grandchild_id,
+                            "wait_ms": 25_000
+                        }),
+                    })),
+                    done,
+                ]
             }
         } else if !results.contains("thread_id") {
             // Parent iteration 1: spawn the child.
             let mut args = serde_json::json!({"prompt": "child task: compute the answer"});
-            if self.spawn_tool == "spawn_thread" {
-                // Read-only children run concurrently with this very turn.
-                args["mode"] = "plan".into();
-            } else {
+            if self.spawn_tool == "spawn_session" {
                 args["title"] = "Sub experiment".into();
             }
             vec![
@@ -5159,8 +5184,8 @@ fn tool_results(events: &[serde_json::Value]) -> Vec<(&str, &serde_json::Value)>
 }
 
 /// spawn_thread: a child agent on a new thread in the same session, running
-/// concurrently with the parent's turn (read-only child), collected with
-/// spawn_output — plus the authorization and depth guardrails.
+/// concurrently with the parent's turn, recursively delegating once, and
+/// collected with spawn_output — plus authorization and hierarchy checks.
 #[tokio::test]
 async fn spawn_thread_child_agent_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5208,8 +5233,7 @@ async fn spawn_thread_child_agent_end_to_end() {
     assert!(events.iter().any(|e| e["type"] == "assistant.message"
         && e["content"].as_str().unwrap().contains("child reported 42")));
 
-    // The child rides the same session, marked as agent-spawned, in the
-    // requested read-only mode.
+    // The child rides the same session and is marked as agent-spawned.
     let threads: Vec<serde_json::Value> = client
         .get(format!("{base}/threads?session_id={session_id}"))
         .send()
@@ -5220,7 +5244,7 @@ async fn spawn_thread_child_agent_end_to_end() {
         .unwrap();
     let child = threads.iter().find(|t| t["id"] == child_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
-    assert_eq!(child["mode"], "plan");
+    assert_eq!(child["mode"], "code");
     assert_eq!(child["title"], "Subagent: Child task compute answer");
     let subagents: Vec<serde_json::Value> = client
         .get(format!("{base}/threads/{thread_id}/subagents"))
@@ -5235,6 +5259,37 @@ async fn spawn_thread_child_agent_end_to_end() {
     assert_eq!(subagents.len(), 1, "{subagents:?}");
     assert_eq!(subagents[0]["id"], child_id);
     assert_eq!(subagents[0]["spawned"], true);
+    let descendants: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/threads/{thread_id}/subagents?recursive=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(descendants.len(), 2, "{descendants:?}");
+    assert!(descendants.iter().any(|thread| thread["id"] == child_id));
+    let grandchild = descendants
+        .iter()
+        .find(|thread| thread["id"] != child_id)
+        .expect("recursive listing should include the grandchild");
+    let grandchild_id = grandchild["id"].as_str().unwrap();
+    let child_subagents: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{child_id}/subagents"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(child_subagents.len(), 1, "{child_subagents:?}");
+    assert_eq!(child_subagents[0]["id"], grandchild_id);
     let subagent = events
         .iter()
         .find(|event| event["type"] == "subagent.spawned")
@@ -5249,40 +5304,18 @@ async fn spawn_thread_child_agent_end_to_end() {
         .unwrap();
     assert!(!parent["spawned"].as_bool().unwrap_or(false));
 
-    // Spawned transcripts remain inspectable but no client can turn one into
-    // a second interactive conversation, even by bypassing the web UI.
-    for response in [
-        client
-            .post(format!("{base}/threads/{child_id}/messages"))
-            .json(&serde_json::json!({"content": "continue independently"}))
-            .send()
-            .await
-            .unwrap(),
-        client
-            .patch(format!("{base}/threads/{child_id}"))
-            .json(&serde_json::json!({"permission_mode": "yolo"}))
-            .send()
-            .await
-            .unwrap(),
-        client
-            .post(format!("{base}/threads/{child_id}/steer"))
-            .json(&serde_json::json!({"content": "change direction"}))
-            .send()
-            .await
-            .unwrap(),
-    ] {
-        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
-    }
-
-    // Depth guard: the child's own spawn attempt was refused.
-    let child_events = wait_for_event(&client, &format!("{base}/threads/{child_id}/events"), |e| {
-        e["type"] == "tool.completed"
-            && e["result"]["error"]
-                .as_str()
-                .is_some_and(|s| s.contains("cannot spawn"))
-    })
+    let grandchild_events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{grandchild_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
     .await;
-    assert!(!child_events.is_empty());
+    assert!(grandchild_events.iter().any(|event| {
+        event["type"] == "assistant.message"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Grandchild done"))
+    }));
 }
 
 /// spawn_session: a child agent in a fresh worktree session branched from

@@ -92,9 +92,8 @@ impl Tool for HashlineEdit {
          read_file with format=\"hashline\". Supports multi-file [path#TAG] \
          sections with PUT N.=M:, PUT <N:, PUT >N:, PUT >$:, and CUT N.=M. \
          Every section is preflighted before any file is changed; stale tags \
-         return refreshed compact context. Never invent a tag. Keep apply_patch \
-         for models trained on that format (especially Codex) and use hashline \
-         when avoiding repeated old text reduces output."
+         return refreshed compact context. Never invent or reuse a tag after \
+         the target file changes."
     }
 
     fn parameters(&self) -> Value {

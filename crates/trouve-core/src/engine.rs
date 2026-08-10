@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
@@ -27,7 +27,7 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult};
+use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
@@ -101,6 +101,24 @@ const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duratio
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Codex collaborators inherit the root thread's MCP URL. App-server emits a
+/// separate `mcpToolCall` item with the actual owner thread, normally within
+/// the same event-loop tick. Wait briefly for that authoritative ownership
+/// signal before falling back to the URL's root thread.
+#[cfg(not(test))]
+const BRIDGED_TOOL_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const BRIDGED_TOOL_OWNER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+const BRIDGED_TOOL_OWNER_HINT_TTL: Duration = Duration::from_secs(5);
+
+/// Bounded recursive delegation. Depth counts spawn edges from the root
+/// conversation thread, so a value of four permits root → child → grandchild
+/// → great-grandchild → great-great-grandchild. The active-tree cap prevents
+/// breadth at several levels from multiplying without bound.
+const MAX_SUBAGENT_DEPTH: usize = 4;
+const MAX_CONCURRENT_CHILDREN: usize = 4;
+const MAX_ACTIVE_DESCENDANTS: usize = 16;
+
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
 const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
@@ -153,8 +171,217 @@ struct BackendCollaboratorProjection {
     usage: Usage,
     tool_calls: HashMap<String, (String, serde_json::Value)>,
     tool_started_at: HashMap<String, Instant>,
+    /// Codex emits a presentation wrapper around every MCP call in addition
+    /// to the canonical ToolExecutor lifecycle. Retain its ids only long
+    /// enough to suppress output/completion after ownership is correlated.
+    suppressed_bridge_calls: HashSet<String>,
     persisted: Vec<Event>,
     terminal: bool,
+}
+
+struct PendingBridgedToolOwner {
+    id: u64,
+    tool: String,
+    arguments: serde_json::Value,
+    sender: tokio::sync::oneshot::Sender<String>,
+    created_at: Instant,
+}
+
+struct BridgedToolOwnerHint {
+    tool: String,
+    arguments: serde_json::Value,
+    owner_thread_id: String,
+    created_at: Instant,
+}
+
+struct AbandonedBridgedToolOwner {
+    tool: String,
+    arguments: serde_json::Value,
+    created_at: Instant,
+}
+
+#[derive(Default)]
+struct BridgedToolOwnerState {
+    next_id: u64,
+    pending: HashMap<String, Vec<PendingBridgedToolOwner>>,
+    hints: HashMap<String, Vec<BridgedToolOwnerHint>>,
+    abandoned: HashMap<String, Vec<AbandonedBridgedToolOwner>>,
+}
+
+impl BridgedToolOwnerState {
+    fn prune(&mut self, now: Instant) {
+        self.pending.retain(|_, pending| {
+            pending.retain(|entry| {
+                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
+            });
+            !pending.is_empty()
+        });
+        self.hints.retain(|_, hints| {
+            hints.retain(|entry| {
+                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
+            });
+            !hints.is_empty()
+        });
+        self.abandoned.retain(|_, abandoned| {
+            abandoned.retain(|entry| {
+                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
+            });
+            !abandoned.is_empty()
+        });
+    }
+}
+
+enum BridgedToolOwnerRegistration {
+    Immediate(String),
+    Pending {
+        id: u64,
+        receiver: tokio::sync::oneshot::Receiver<String>,
+    },
+}
+
+/// Correlates Codex's inherited MCP request with the app-server item carrying
+/// its real root-or-collaborator owner. Both arrival orders are supported.
+#[derive(Default)]
+struct BridgedToolOwnerRouter {
+    state: Mutex<BridgedToolOwnerState>,
+}
+
+impl BridgedToolOwnerRouter {
+    fn register(
+        &self,
+        root_thread_id: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> BridgedToolOwnerRegistration {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.prune(now);
+        if let Some(hints) = state.hints.get_mut(root_thread_id)
+            && let Some(index) = hints
+                .iter()
+                .position(|hint| hint.tool == tool && hint.arguments == *arguments)
+        {
+            let owner_thread_id = hints.remove(index).owner_thread_id;
+            if hints.is_empty() {
+                state.hints.remove(root_thread_id);
+            }
+            return BridgedToolOwnerRegistration::Immediate(owner_thread_id);
+        }
+        state.next_id = state.next_id.wrapping_add(1);
+        let id = state.next_id;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .entry(root_thread_id.to_string())
+            .or_default()
+            .push(PendingBridgedToolOwner {
+                id,
+                tool: tool.to_string(),
+                arguments: arguments.clone(),
+                sender,
+                created_at: now,
+            });
+        BridgedToolOwnerRegistration::Pending { id, receiver }
+    }
+
+    fn announce(
+        &self,
+        root_thread_id: &str,
+        owner_thread_id: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.prune(now);
+        if let Some(abandoned) = state.abandoned.get_mut(root_thread_id)
+            && let Some(index) = abandoned
+                .iter()
+                .position(|entry| entry.tool == tool && entry.arguments == *arguments)
+        {
+            abandoned.remove(index);
+            if abandoned.is_empty() {
+                state.abandoned.remove(root_thread_id);
+            }
+            return;
+        }
+        if let Some(pending) = state.pending.get_mut(root_thread_id) {
+            while let Some(index) = pending
+                .iter()
+                .position(|entry| entry.tool == tool && entry.arguments == *arguments)
+            {
+                let entry = pending.remove(index);
+                if entry.sender.send(owner_thread_id.to_string()).is_ok() {
+                    if pending.is_empty() {
+                        state.pending.remove(root_thread_id);
+                    }
+                    return;
+                }
+            }
+            if pending.is_empty() {
+                state.pending.remove(root_thread_id);
+            }
+        }
+        state
+            .hints
+            .entry(root_thread_id.to_string())
+            .or_default()
+            .push(BridgedToolOwnerHint {
+                tool: tool.to_string(),
+                arguments: arguments.clone(),
+                owner_thread_id: owner_thread_id.to_string(),
+                created_at: now,
+            });
+    }
+
+    fn abandon(&self, root_thread_id: &str, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pending) = state.pending.get_mut(root_thread_id) {
+            let abandoned = pending
+                .iter()
+                .position(|entry| entry.id == id)
+                .map(|index| pending.remove(index));
+            if pending.is_empty() {
+                state.pending.remove(root_thread_id);
+            }
+            if let Some(abandoned) = abandoned {
+                state
+                    .abandoned
+                    .entry(root_thread_id.to_string())
+                    .or_default()
+                    .push(AbandonedBridgedToolOwner {
+                        tool: abandoned.tool,
+                        arguments: abandoned.arguments,
+                        created_at: Instant::now(),
+                    });
+            }
+        }
+    }
+}
+
+/// Return the canonical trouve tool nested in a Codex MCP presentation item.
+/// User-configured MCP servers retain their vendor wrapper; only the reserved
+/// first-party `trouve` server is projected through ToolExecutor instead.
+fn trouve_bridge_wrapper_call<'a>(
+    tool: &str,
+    args: &'a serde_json::Value,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    if tool != "mcpToolCall" {
+        return None;
+    }
+    let server = args
+        .get("server")
+        .or_else(|| args.get("serverName"))?
+        .as_str()?;
+    if server != "trouve" {
+        return None;
+    }
+    let nested_tool = args
+        .get("tool")
+        .or_else(|| args.get("toolName"))?
+        .as_str()?;
+    let arguments = args.get("arguments")?;
+    Some((nested_tool, arguments))
 }
 
 struct BackendApprovalOutcome {
@@ -790,6 +1017,11 @@ pub struct Engine {
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// Per-root delegation lanes. Providers may request multiple spawn tools
+    /// in one parallel batch; serializing only the admission/create window
+    /// for one tree makes the depth and active-descendant caps atomic without
+    /// blocking unrelated subagent trees.
+    subagent_tree_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Threads with a dispatcher currently running turns, mapped to their
     /// session. A thread in this map drains its own prompt queue; sends
     /// while present just enqueue. The session ids feed `Session.active`
@@ -878,6 +1110,9 @@ pub struct Engine {
     base_url: RwLock<Option<String>>,
     /// Ephemeral credential appended only to internal MCP bridge URLs.
     bridge_token: RwLock<Option<String>>,
+    /// Routes Codex MCP calls from the inherited root URL to the root or
+    /// collaborator thread identified by app-server's item lifecycle.
+    bridged_tool_owners: BridgedToolOwnerRouter,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
     /// embedding model; the server enables it (`with_index_hooks`).
@@ -1185,6 +1420,7 @@ impl Engine {
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
+            subagent_tree_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
             prompt_queue_mutations: Mutex::new(()),
@@ -1228,6 +1464,7 @@ impl Engine {
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             bridge_token: RwLock::new(None),
+            bridged_tool_owners: BridgedToolOwnerRouter::default(),
             index_hooks: false,
             mcp_logs,
             terminals: crate::terminal::TerminalManager::default(),
@@ -5513,6 +5750,68 @@ impl Engine {
         Ok(children)
     }
 
+    /// List every durable provider-native or trouve-owned descendant below a
+    /// thread. The direct-child endpoint remains the default contract; the
+    /// Details panel opts into this recursive projection so a nested worker
+    /// cannot remain active while disappearing from the parent's overview.
+    pub fn list_thread_descendants(&self, thread_id: &str) -> Result<Vec<Thread>, EngineError> {
+        self.get_thread(thread_id)?;
+        let mut pending = self.store.spawned_children(thread_id)?;
+        let mut seen = HashSet::new();
+        let mut descendants = Vec::new();
+        while let Some(child_id) = pending.pop() {
+            if !seen.insert(child_id.clone()) {
+                continue;
+            }
+            pending.extend(self.store.spawned_children(&child_id)?);
+            if let Some(child) = self.store.thread(&child_id)? {
+                descendants.push(child);
+            }
+        }
+        descendants.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(descendants)
+    }
+
+    /// Root thread and number of spawn edges above `thread_id`. Parentage is
+    /// persisted across sessions, so this works for mixed spawn_thread /
+    /// spawn_session trees. Corrupt cycles fail closed instead of permitting
+    /// an unbounded delegation loop.
+    fn subagent_root_and_depth(&self, thread_id: &str) -> Result<(String, usize), EngineError> {
+        self.get_thread(thread_id)?;
+        let mut current = thread_id.to_string();
+        let mut depth = 0usize;
+        let mut seen = HashSet::from([current.clone()]);
+        while let Some(parent) = self.store.spawn_parent(&current)? {
+            if !seen.insert(parent.clone()) {
+                return Err(EngineError::Internal(anyhow!(
+                    "cycle in spawned-thread parentage at {parent}"
+                )));
+            }
+            current = parent;
+            depth += 1;
+        }
+        Ok((current, depth))
+    }
+
+    fn thread_can_spawn_subagents(&self, thread_id: &str) -> Result<bool, EngineError> {
+        Ok(self.subagent_root_and_depth(thread_id)?.1 < MAX_SUBAGENT_DEPTH)
+    }
+
+    fn subagent_tree_lock(&self, root_thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.subagent_tree_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(root_thread_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(root_thread_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     pub fn list_thread_statuses(
         &self,
         session_id: &str,
@@ -6930,6 +7229,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            edit_strategy: edit_strategy_for_model(&thread.model),
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
@@ -7049,14 +7349,13 @@ impl Engine {
             specs.push(ask_question_spec());
             specs.push(search_transcript_spec());
         }
-        // Spawn tools are for top-level agents only: children don't get to
-        // spawn grandchildren (also enforced at execution). They also respect
-        // the mode's tool policy, so restrictive/read-only modes that don't
-        // list them can't create branches or child agents.
+        // Recursive spawn tools remain bounded by the durable tree depth and
+        // also respect the mode policy, so restrictive/read-only modes that
+        // do not list them cannot create child agents.
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
         };
-        if tools_enabled && self.store.spawn_parent(&thread.id)?.is_none() {
+        if tools_enabled && self.thread_can_spawn_subagents(&thread.id)? {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
@@ -7146,6 +7445,7 @@ impl Engine {
             // persist and replay verbatim — Anthropic rejects a follow-up
             // tool-use turn whose thinking blocks aren't preserved.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
+            let mut thinking_streamed = false;
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
             loop {
@@ -7175,6 +7475,7 @@ impl Engine {
                     }
                     // Display-only; never joins the provider transcript.
                     ProviderEvent::ThinkingDelta(delta) => {
+                        thinking_streamed = true;
                         pending_events.push(Event::AssistantThinking { turn, text: delta });
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
@@ -7196,6 +7497,9 @@ impl Engine {
                 } else if !pending_events.is_empty() && persist_deadline.is_none() {
                     persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                 }
+            }
+            if thinking_streamed {
+                pending_events.push(Event::AssistantThinkingCompleted { turn });
             }
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
@@ -7315,6 +7619,7 @@ impl Engine {
                 None => {}
                 Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
+                    let mut thinking_streamed = false;
                     let mut pending_events = Vec::new();
                     let mut persist_deadline = None;
                     loop {
@@ -7338,6 +7643,7 @@ impl Engine {
                                 pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
                             Ok(ProviderEvent::ThinkingDelta(delta)) => {
+                                thinking_streamed = true;
                                 pending_events.push(Event::AssistantThinking { turn, text: delta });
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
@@ -7366,6 +7672,9 @@ impl Engine {
                         } else if !pending_events.is_empty() && persist_deadline.is_none() {
                             persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                         }
+                    }
+                    if thinking_streamed {
+                        pending_events.push(Event::AssistantThinkingCompleted { turn });
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
@@ -7526,11 +7835,21 @@ impl Engine {
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
-        // Spawn tools: top-level agents only, same as native turns.
-        if self.store.spawn_parent(thread_id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+        // Recursive spawn tools use the same mode and depth policy as native
+        // provider turns.
+        let spawn_allowed = |name: &str| {
+            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
+        };
+        if self.thread_can_spawn_subagents(thread_id)? {
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
         Ok(specs)
     }
@@ -7538,6 +7857,66 @@ impl Engine {
     /// Execute one tool call on behalf of a bridged vendor agent, through
     /// the same gate/approval/event chokepoint as native tool calls.
     pub async fn bridged_tool_call(
+        self: &Arc<Self>,
+        thread_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, EngineError> {
+        self.bridged_tool_call_for(thread_id, name, arguments).await
+    }
+
+    /// Execute a Codex MCP call after correlating app-server's authoritative
+    /// root-or-collaborator owner. Spawned Codex agents inherit the root MCP
+    /// URL, so the URL path alone is not a safe persistence scope.
+    pub async fn bridged_codex_tool_call(
+        self: &Arc<Self>,
+        root_thread_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, EngineError> {
+        let registration = self
+            .bridged_tool_owners
+            .register(root_thread_id, name, arguments);
+        let root_cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(root_thread_id)
+            .cloned()
+            .unwrap_or_default();
+        let owner_thread_id = match registration {
+            BridgedToolOwnerRegistration::Immediate(owner) => owner,
+            BridgedToolOwnerRegistration::Pending { id, receiver } => {
+                let outcome = tokio::select! {
+                    biased;
+                    _ = root_cancel.cancelled() => {
+                        self.bridged_tool_owners.abandon(root_thread_id, id);
+                        return Err(EngineError::Internal(anyhow!("tool call cancelled")));
+                    }
+                    owner = receiver => owner.ok(),
+                    _ = tokio::time::sleep(BRIDGED_TOOL_OWNER_WAIT_TIMEOUT) => None,
+                };
+                match outcome {
+                    Some(owner) => owner,
+                    None => {
+                        self.bridged_tool_owners.abandon(root_thread_id, id);
+                        tracing::error!(
+                            root_thread_id,
+                            tool = name,
+                            "Codex MCP owner notification was not observed; refusing to misroute the call"
+                        );
+                        return Err(EngineError::Internal(anyhow!(
+                            "Codex tool owner could not be identified"
+                        )));
+                    }
+                }
+            }
+        };
+        self.bridged_tool_call_for(&owner_thread_id, name, arguments)
+            .await
+    }
+
+    async fn bridged_tool_call_for(
         self: &Arc<Self>,
         thread_id: &str,
         name: &str,
@@ -7568,6 +7947,59 @@ impl Engine {
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
+    }
+
+    fn announce_trouve_bridge_wrapper(
+        &self,
+        root_thread_id: &str,
+        owner_thread_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        let Some((nested_tool, nested_arguments)) = trouve_bridge_wrapper_call(tool, args) else {
+            return false;
+        };
+        self.bridged_tool_owners.announce(
+            root_thread_id,
+            owner_thread_id,
+            nested_tool,
+            nested_arguments,
+        );
+        true
+    }
+
+    /// Consume Codex's MCP presentation lifecycle. The matching ToolExecutor
+    /// call writes the sole durable card in the collaborator thread.
+    fn suppress_collaborator_bridge_wrapper(
+        &self,
+        root_thread_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        event: &BackendCollaboratorEvent,
+    ) -> bool {
+        match event {
+            BackendCollaboratorEvent::ToolStarted {
+                call_id,
+                tool,
+                args,
+            } if trouve_bridge_wrapper_call(tool, args).is_some() => {
+                if collaborator.suppressed_bridge_calls.insert(call_id.clone()) {
+                    self.announce_trouve_bridge_wrapper(
+                        root_thread_id,
+                        &collaborator.thread.id,
+                        tool,
+                        args,
+                    );
+                }
+                true
+            }
+            BackendCollaboratorEvent::ToolOutput { call_id, .. } => {
+                collaborator.suppressed_bridge_calls.contains(call_id)
+            }
+            BackendCollaboratorEvent::ToolCompleted { call_id, .. } => {
+                collaborator.suppressed_bridge_calls.remove(call_id)
+            }
+            _ => false,
+        }
     }
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
@@ -7822,6 +8254,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            edit_strategy: edit_strategy_for_model(&thread.model),
         };
         Ok((session, thread, mode, ctx))
     }
@@ -7914,6 +8347,7 @@ impl Engine {
         collaborator.usage = Usage::default();
         collaborator.tool_calls.clear();
         collaborator.tool_started_at.clear();
+        collaborator.suppressed_bridge_calls.clear();
         collaborator.terminal = false;
         self.store.append_event(
             Scope::Thread(collaborator.thread.id.clone()),
@@ -8035,6 +8469,7 @@ impl Engine {
             usage: Usage::default(),
             tool_calls: HashMap::new(),
             tool_started_at: HashMap::new(),
+            suppressed_bridge_calls: HashSet::new(),
             persisted: Vec::new(),
             terminal: true,
         };
@@ -8547,6 +8982,7 @@ impl Engine {
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
         let mut seen_tool_cards = HashSet::new();
+        let mut suppressed_bridge_calls = HashSet::new();
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_mutation_permits =
             HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
@@ -8716,6 +9152,14 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
+                    if trouve_bridge_wrapper_call(&tool, &args).is_some() {
+                        if suppressed_bridge_calls.insert(call_id.clone()) {
+                            self.announce_trouve_bridge_wrapper(
+                                &thread.id, &thread.id, &tool, &args,
+                            );
+                        }
+                        continue;
+                    }
                     if !tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
@@ -8753,6 +9197,9 @@ impl Engine {
                     persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
+                    if suppressed_bridge_calls.contains(&call_id) {
+                        continue;
+                    }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                         && requests_pull_request_creation(tool, args, owner, repo)
@@ -8924,14 +9371,20 @@ impl Engine {
                                 turn_id.as_deref(),
                             )
                             .await?;
-                            self.persist_backend_collaborator_event(
-                                session,
-                                mode,
-                                backend_id,
+                            if !self.suppress_collaborator_bridge_wrapper(
+                                &thread.id,
                                 collaborator,
-                                event,
-                            )
-                            .await?;
+                                &event,
+                            ) {
+                                self.persist_backend_collaborator_event(
+                                    session,
+                                    mode,
+                                    backend_id,
+                                    collaborator,
+                                    event,
+                                )
+                                .await?;
+                            }
                             collaborator
                                 .terminal
                                 .then(|| collaborator.thread.id.clone())
@@ -8951,6 +9404,9 @@ impl Engine {
                     ok,
                     result,
                 } => {
+                    if suppressed_bridge_calls.remove(&call_id) {
+                        continue;
+                    }
                     // The vendor has finished touching the worktree. Release
                     // its exclusive lane before persistence/network-derived
                     // bookkeeping so the next approved mutation can start.
@@ -9904,10 +10360,10 @@ impl Engine {
     /// thread in the caller's session, `spawn_session` starts one in a fresh
     /// worktree session branched from the caller's branch, and
     /// `spawn_output` reports (and optionally waits for) a child's result.
-    /// Guardrails: children never spawn grandchildren, at most
-    /// `MAX_CONCURRENT_CHILDREN` children run at once, children inherit the
-    /// parent's permission mode, and read-only parents can't escalate a
-    /// child into a writing mode.
+    /// Guardrails: delegation depth and active tree size are bounded, at most
+    /// `MAX_CONCURRENT_CHILDREN` direct children run per parent, children
+    /// inherit the parent's permission mode, and read-only parents cannot
+    /// escalate a child into a writing mode.
     async fn handle_spawn_tool(
         self: &Arc<Self>,
         session: &Session,
@@ -9916,8 +10372,6 @@ impl Engine {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        const MAX_CONCURRENT_CHILDREN: usize = 4;
-
         if name == "spawn_output" {
             let child_id = args
                 .get("thread_id")
@@ -9944,12 +10398,14 @@ impl Engine {
             }
         }
 
-        // Depth guard: one level only. Fan-out stays useful; runaway
-        // recursive spawning does not. Checked before the mode policy so a
-        // child always gets the depth message regardless of its mode.
-        if self.store.spawn_parent(&thread.id)?.is_some() {
-            bail!("spawned agents cannot spawn further agents");
+        let (root_thread_id, depth) = self.subagent_root_and_depth(&thread.id)?;
+        if depth >= MAX_SUBAGENT_DEPTH {
+            bail!(
+                "subagent nesting is limited to {MAX_SUBAGENT_DEPTH} levels below the root thread"
+            );
         }
+        let tree_lock = self.subagent_tree_lock(&root_thread_id);
+        let _tree_spawn = tree_lock.lock().await;
 
         // Respect the mode's tool policy: a restrictive/read-only mode that
         // doesn't list the spawn tool can't create branches or child agents
@@ -9959,11 +10415,22 @@ impl Engine {
             bail!("{name} is not permitted in {} mode", mode.id);
         }
         let children = self.store.spawned_children(&thread.id)?;
+        let descendants = self.list_thread_descendants(&root_thread_id)?;
         {
             let active = self.active_threads.lock().unwrap();
             let running = children.iter().filter(|c| active.contains_key(*c)).count();
             if running >= MAX_CONCURRENT_CHILDREN {
                 bail!("already {running} children running; collect some with spawn_output first");
+            }
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            if active_descendants >= MAX_ACTIVE_DESCENDANTS {
+                bail!(
+                    "the root subagent tree already has {active_descendants} active descendants; \
+                     wait for some to finish before spawning more"
+                );
             }
         }
 
@@ -10102,9 +10569,22 @@ impl Engine {
     /// A child agent's status, folded from its event log: running (its
     /// dispatcher is live), failed (last turn errored), completed (ran and
     /// idle), or pending (never ran). Includes the latest assistant message
-    /// and aggregate token usage so the parent sees what its money bought.
+    /// and aggregate subtree token usage so the parent sees what nested
+    /// delegation cost. An active descendant keeps the collected child in
+    /// `running` state even if the child's own provider turn has returned.
     fn spawn_status(&self, thread_id: &str) -> Result<serde_json::Value> {
-        let running = self.active_threads.lock().unwrap().contains_key(thread_id);
+        let descendants = self.list_thread_descendants(thread_id)?;
+        let (running, active_descendants) = {
+            let active = self.active_threads.lock().unwrap();
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            (
+                active.contains_key(thread_id) || active_descendants > 0,
+                active_descendants,
+            )
+        };
         let mut last_message = String::new();
         let mut completed_turns = 0u64;
         let mut failure: Option<String> = None;
@@ -10131,14 +10611,24 @@ impl Engine {
         } else {
             "pending"
         };
-        let usage = self
+        let mut usage = self
             .store
             .usage_summary(crate::store::UsageScope::Thread(thread_id))?;
+        for descendant in &descendants {
+            let child_usage = self
+                .store
+                .usage_summary(crate::store::UsageScope::Thread(&descendant.id))?;
+            usage.input_tokens += child_usage.input_tokens;
+            usage.output_tokens += child_usage.output_tokens;
+            usage.cost_usd += child_usage.cost_usd;
+        }
         let mut out = serde_json::json!({
             "thread_id": thread_id,
             "status": status,
             "turns": completed_turns,
             "last_message": last_message,
+            "descendants": descendants.len(),
+            "active_descendants": active_descendants,
             "usage": {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
@@ -11118,8 +11608,8 @@ pub fn ask_question_spec() -> ToolSpec {
 }
 
 /// Spec for the engine-served `spawn_thread` tool (child agent, same
-/// session/worktree). Offered only to threads that aren't themselves
-/// spawned children.
+/// session/worktree). Offered while the caller remains below the bounded
+/// recursive delegation depth.
 pub fn spawn_thread_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_thread".into(),
@@ -11691,6 +12181,91 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bridged_tool_owner_router_correlates_both_arrival_orders() {
+        let router = BridgedToolOwnerRouter::default();
+        let args = serde_json::json!({ "query": "ownership" });
+
+        let BridgedToolOwnerRegistration::Pending { receiver, .. } =
+            router.register("root", "search", &args)
+        else {
+            panic!("request-first registration should wait for an owner");
+        };
+        router.announce("root", "child-a", "search", &args);
+        assert_eq!(receiver.await.unwrap(), "child-a");
+
+        router.announce("root", "child-b", "search", &args);
+        let BridgedToolOwnerRegistration::Immediate(owner) =
+            router.register("root", "search", &args)
+        else {
+            panic!("notification-first registration should consume its hint");
+        };
+        assert_eq!(owner, "child-b");
+
+        let BridgedToolOwnerRegistration::Pending {
+            id,
+            receiver: abandoned,
+        } = router.register("root", "search", &args)
+        else {
+            panic!("a fresh request should wait for its owner");
+        };
+        router.abandon("root", id);
+        assert!(abandoned.await.is_err());
+        router.announce("root", "late-child", "search", &args);
+        let BridgedToolOwnerRegistration::Pending {
+            id,
+            receiver: replacement,
+        } = router.register("root", "search", &args)
+        else {
+            panic!("a late hint for an abandoned request must not route its replacement");
+        };
+        router.abandon("root", id);
+        assert!(replacement.await.is_err());
+        router.announce("root", "replacement-late", "search", &args);
+
+        let BridgedToolOwnerRegistration::Pending {
+            receiver: first, ..
+        } = router.register("root", "search", &args)
+        else {
+            panic!("first parallel request should wait");
+        };
+        let BridgedToolOwnerRegistration::Pending {
+            receiver: second, ..
+        } = router.register("root", "search", &args)
+        else {
+            panic!("second parallel request should wait");
+        };
+        router.announce("root", "child-c", "search", &args);
+        router.announce("root", "child-d", "search", &args);
+        assert_eq!(first.await.unwrap(), "child-c");
+        assert_eq!(second.await.unwrap(), "child-d");
+    }
+
+    #[test]
+    fn only_first_party_codex_mcp_items_are_bridge_wrappers() {
+        let args = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "read_file",
+            "arguments": { "path": "README.md" }
+        });
+        let (tool, nested) = trouve_bridge_wrapper_call("mcpToolCall", &args).unwrap();
+        assert_eq!(tool, "read_file");
+        assert_eq!(nested, &serde_json::json!({ "path": "README.md" }));
+        assert!(
+            trouve_bridge_wrapper_call(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "server": "github",
+                    "tool": "get_issue",
+                    "arguments": {}
+                })
+            )
+            .is_none()
+        );
+        assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
+    }
+
     struct CatalogTestProvider {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -12237,6 +12812,71 @@ default_permission_mode = "ask"
         let mode = modes::find_mode(&modes::builtin_modes(), "code")
             .unwrap()
             .clone();
+        std::fs::write(data.path().join("bridge-owner.txt"), "owned by the child").unwrap();
+        let bridge_arguments = serde_json::json!({ "path": "bridge-owner.txt" });
+        let bridge_wrapper = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "read_file",
+            "arguments": bridge_arguments.clone()
+        });
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "codex-wrapper".into(),
+                    tool: "mcpToolCall".into(),
+                    args: bridge_wrapper,
+                },
+            ));
+        }
+        let bridge_output = engine
+            .bridged_codex_tool_call(&parent.id, "read_file", &bridge_arguments)
+            .await
+            .unwrap();
+        assert!(bridge_output.contains("owned by the child"));
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                projection,
+                &BackendCollaboratorEvent::ToolCompleted {
+                    call_id: "codex-wrapper".into(),
+                    ok: true,
+                    result: serde_json::json!({ "status": "completed" }),
+                },
+            ));
+        }
+        let child_bridge_events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            child_bridge_events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    Event::ToolRequested { tool, .. } if tool == "read_file"
+                ))
+                .count(),
+            1
+        );
+        assert!(child_bridge_events.iter().all(|event| !matches!(
+            &event.event,
+            Event::ToolRequested { tool, .. } if tool == "mcpToolCall"
+        )));
+        assert!(
+            store
+                .events_after(&Scope::Thread(parent.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    &event.event,
+                    Event::ToolRequested { tool, .. } if tool == "read_file"
+                ))
+        );
+
         let projection = collaborators.get_mut("vendor-child").unwrap();
         engine
             .persist_backend_collaborator_event(
@@ -12510,6 +13150,47 @@ default_permission_mode = "ask"
             store.thread_model_options(&grandchild.id).unwrap()["thinking_level"],
             "high"
         );
+        let direct_children = engine.list_thread_subagents(&parent.id).unwrap();
+        assert!(direct_children.iter().any(|thread| thread.id == child.id));
+        assert!(
+            direct_children
+                .iter()
+                .any(|thread| thread.id == audit_child.id)
+        );
+        assert!(
+            direct_children
+                .iter()
+                .all(|thread| thread.id != grandchild.id),
+            "the existing subagents API remains direct-child-only"
+        );
+        let descendants = engine.list_thread_descendants(&parent.id).unwrap();
+        assert!(descendants.iter().any(|thread| thread.id == child.id));
+        assert!(descendants.iter().any(|thread| thread.id == audit_child.id));
+        assert!(descendants.iter().any(|thread| thread.id == grandchild.id));
+        assert!(engine.thread_can_spawn_subagents(&grandchild.id).unwrap());
+
+        let mut deepest = grandchild;
+        for title in ["Great grandchild", "Great great grandchild"] {
+            let nested = engine
+                .create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    title: Some(title.into()),
+                    mode: Some("code".into()),
+                    model: Some("codex/gpt-5.6-terra".into()),
+                    model_options: serde_json::Map::new(),
+                    permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+                })
+                .unwrap();
+            store
+                .insert_spawned(&nested.id, &deepest.id, "thread")
+                .unwrap();
+            deepest = nested;
+        }
+        assert_eq!(
+            engine.subagent_root_and_depth(&deepest.id).unwrap(),
+            (parent.id.clone(), MAX_SUBAGENT_DEPTH)
+        );
+        assert!(!engine.thread_can_spawn_subagents(&deepest.id).unwrap());
     }
 
     fn projection_pr(number: u64, workspace_id: &str, head: &str) -> trouve_protocol::PrInfo {

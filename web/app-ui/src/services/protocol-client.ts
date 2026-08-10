@@ -1560,9 +1560,13 @@ export class ProtocolClient {
     );
   }
 
-  async threadSubagents(threadId: string): Promise<readonly ProtocolThread[]> {
+  async threadSubagents(
+    threadId: string,
+    recursive = false,
+  ): Promise<readonly ProtocolThread[]> {
+    const query = recursive ? "?recursive=true" : "";
     return this.#validatedJson(
-      `/v1/threads/${encodeURIComponent(threadId)}/subagents`,
+      `/v1/threads/${encodeURIComponent(threadId)}/subagents${query}`,
       "thread subagent",
       "Thread[]",
       (loaded) => loaded.threads,

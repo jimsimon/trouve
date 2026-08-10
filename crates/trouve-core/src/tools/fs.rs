@@ -379,6 +379,57 @@ impl Tool for EditFile {
     }
 }
 
+pub struct DeleteFile;
+
+#[async_trait::async_trait]
+impl Tool for DeleteFile {
+    fn name(&self) -> &'static str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete one workspace file. Directories are rejected."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative file path"}
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return ToolResult::error("missing required argument: path");
+        };
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("delete cancelled");
+        }
+        let full = match ctx.resolve(path) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(error),
+        };
+        let metadata = match tokio::fs::symlink_metadata(&full).await {
+            Ok(metadata) => metadata,
+            Err(error) => return ToolResult::error(format!("cannot delete {path}: {error}")),
+        };
+        if metadata.is_dir() {
+            return ToolResult::error(format!("cannot delete {path}: path is a directory"));
+        }
+        match tokio::fs::remove_file(&full).await {
+            Ok(()) => ToolResult::ok(json!({"path": path, "action": "delete"})),
+            Err(error) => ToolResult::error(format!("cannot delete {path}: {error}")),
+        }
+    }
+}
+
 pub struct ListDir;
 
 #[async_trait::async_trait]
@@ -641,5 +692,24 @@ mod tests {
             )
             .await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_only_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("gone.txt"), "gone").unwrap();
+        std::fs::create_dir(tmp.path().join("kept")).unwrap();
+
+        let result = DeleteFile.run(&ctx, &json!({"path": "gone.txt"})).await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        assert!(!tmp.path().join("gone.txt").exists());
+
+        let result = DeleteFile.run(&ctx, &json!({"path": "kept"})).await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(tmp.path().join("kept").is_dir());
     }
 }

@@ -79,7 +79,12 @@ pub(crate) async fn mcp_endpoint(
         "tools/call" if msg["params"]["name"] == "approval_prompt" => {
             approval_prompt(&engine, &thread_id, &msg["params"]).await
         }
-        "tools/call" => tools_call(&engine, &thread_id, &msg["params"]).await,
+        "tools/call" => {
+            // `approval=0` is the existing Codex-specific bridge mode.
+            // Codex collaborators inherit this root-scoped URL, so correlate
+            // the call with app-server's owner notification before executing.
+            tools_call(&engine, &thread_id, &msg["params"], q.approval == 0).await
+        }
         _ => Err(format!("method not supported: {method}")),
     };
     let response = match result {
@@ -168,10 +173,18 @@ async fn tools_call(
     engine: &Arc<Engine>,
     thread_id: &str,
     params: &Value,
+    correlate_codex_owner: bool,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    match engine.bridged_tool_call(thread_id, name, &arguments).await {
+    let result = if correlate_codex_owner {
+        engine
+            .bridged_codex_tool_call(thread_id, name, &arguments)
+            .await
+    } else {
+        engine.bridged_tool_call(thread_id, name, &arguments).await
+    };
+    match result {
         Ok(content) => Ok(json!({
             "content": [ { "type": "text", "text": content } ],
             "isError": false,

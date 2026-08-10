@@ -446,6 +446,47 @@ struct CollaboratorStreamState {
     streamed_raw_reasoning: HashSet<String>,
 }
 
+/// Tracks every provider-native collaborator announced anywhere below the
+/// root turn. Codex can announce grandchildren on the root event route; the
+/// root completion is therefore only a terminal *candidate* until every
+/// announced descendant has emitted its own terminal turn event.
+#[derive(Default)]
+struct CollaboratorLifecycle {
+    active: HashSet<String>,
+    terminal: HashSet<String>,
+}
+
+impl CollaboratorLifecycle {
+    fn announce(&mut self, session_id: &str) {
+        if !self.terminal.contains(session_id) {
+            self.active.insert(session_id.to_string());
+        }
+    }
+
+    fn observe(&mut self, session_id: &str, event: &BackendCollaboratorEvent) {
+        match event {
+            BackendCollaboratorEvent::TurnStarted => {
+                self.terminal.remove(session_id);
+                self.active.insert(session_id.to_string());
+            }
+            BackendCollaboratorEvent::Completed { .. }
+            | BackendCollaboratorEvent::Failed { .. } => {
+                self.active.remove(session_id);
+                self.terminal.insert(session_id.to_string());
+            }
+            _ => {
+                if !self.terminal.contains(session_id) {
+                    self.active.insert(session_id.to_string());
+                }
+            }
+        }
+    }
+
+    fn root_can_finish(&self) -> bool {
+        self.active.is_empty()
+    }
+}
+
 fn add_usage(total: &mut Usage, current: &Usage) {
     total.input_tokens += current.input_tokens;
     total.cached_input_tokens += current.cached_input_tokens;
@@ -735,6 +776,7 @@ fn turn_stream(
         let mut announced_collaborators = HashSet::<(String, String)>::new();
         let mut collaborator_prompt_lookups = HashSet::<String>::new();
         let mut collaborator_states = HashMap::<String, CollaboratorStreamState>::new();
+        let mut collaborator_lifecycle = CollaboratorLifecycle::default();
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
@@ -754,6 +796,7 @@ fn turn_stream(
                             if announced_collaborators
                                 .insert((collaborator.session_id.clone(), announcement_id.clone()))
                             {
+                                collaborator_lifecycle.announce(&collaborator.session_id);
                                 if collaborator.prompt.is_some() {
                                     collaborator_prompt_lookups
                                         .insert(collaborator.session_id.clone());
@@ -786,6 +829,7 @@ fn turn_stream(
                                 .or_default();
                             let turn_id = params_turn_id(&params).map(str::to_string);
                             for event in collaborator_notification(&method, &params, state) {
+                                collaborator_lifecycle.observe(session_id, &event);
                                 let _ = tx
                                     .send(Ok(BackendEvent::CollaboratorEvent {
                                         session_id: session_id.to_string(),
@@ -793,6 +837,10 @@ fn turn_stream(
                                         event,
                                     }))
                                     .await;
+                            }
+                            if terminal_params.is_some() && collaborator_lifecycle.root_can_finish()
+                            {
+                                break;
                             }
                             continue;
                         }
@@ -926,11 +974,16 @@ fn turn_stream(
                                 let _ = tx.send(Ok(BackendEvent::UsageUpdated { usage: u })).await;
                             }
                             "turn/completed" => {
-                                // Record terminal state without awaiting. Once the
-                                // event is dequeued, transport closure must not
-                                // cancel its lifecycle cleanup or publication.
+                                // Root completion does not imply descendant
+                                // completion. Keep this route subscribed while
+                                // any direct or nested collaborator is active so
+                                // capacity-delayed grandchildren can finish and
+                                // publish their terminal transcript instead of
+                                // being failed during core cleanup.
                                 terminal_params = Some(params);
-                                break;
+                                if collaborator_lifecycle.root_can_finish() {
+                                    break;
+                                }
                             }
                             _ => {}
                         }
@@ -4616,6 +4669,45 @@ mod tests {
             collaborator_access_label("specialist"),
             BackendCollaboratorAccess::Inherit
         );
+    }
+
+    #[test]
+    fn root_completion_waits_for_every_nested_collaborator() {
+        let mut lifecycle = CollaboratorLifecycle::default();
+        lifecycle.announce("direct-a");
+        lifecycle.announce("direct-b");
+        lifecycle.announce("nested-b-1");
+        assert!(!lifecycle.root_can_finish());
+
+        lifecycle.observe(
+            "direct-a",
+            &BackendCollaboratorEvent::Completed {
+                usage: Usage::default(),
+            },
+        );
+        lifecycle.observe(
+            "direct-b",
+            &BackendCollaboratorEvent::Completed {
+                usage: Usage::default(),
+            },
+        );
+        assert!(
+            !lifecycle.root_can_finish(),
+            "a terminal direct-child set must not hide an active grandchild"
+        );
+
+        lifecycle.observe(
+            "nested-b-1",
+            &BackendCollaboratorEvent::Completed {
+                usage: Usage::default(),
+            },
+        );
+        assert!(lifecycle.root_can_finish());
+
+        // Repeated late ownership announcements must not resurrect a turn
+        // that has already published its terminal event.
+        lifecycle.announce("nested-b-1");
+        assert!(lifecycle.root_can_finish());
     }
 
     #[test]

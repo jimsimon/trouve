@@ -1392,6 +1392,12 @@ struct ListThreadsQuery {
     session_id: String,
 }
 
+#[derive(Default, Deserialize)]
+struct ListThreadSubagentsQuery {
+    #[serde(default)]
+    recursive: bool,
+}
+
 #[utoipa::path(get, path = "/v1/threads",
     params(("session_id" = String, Query,)),
     responses((status = 200, body = [Thread])))]
@@ -1422,13 +1428,22 @@ async fn get_thread(
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/subagents",
-    params(("id" = String, Path,)),
+    params(
+        ("id" = String, Path,),
+        ("recursive" = Option<bool>, Query, description = "Include nested descendants instead of only direct children")
+    ),
     responses((status = 200, body = [Thread]), (status = 404, body = ErrorBody)))]
 async fn list_thread_subagents(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
+    Query(query): Query<ListThreadSubagentsQuery>,
 ) -> Result<Json<Vec<Thread>>, ApiError> {
-    Ok(Json(engine.list_thread_subagents(&id)?))
+    let subagents = if query.recursive {
+        engine.list_thread_descendants(&id)?
+    } else {
+        engine.list_thread_subagents(&id)?
+    };
+    Ok(Json(subagents))
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/view",

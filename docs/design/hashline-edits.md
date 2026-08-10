@@ -1,7 +1,8 @@
 # Hashline edits
 
-Hashline is an additive, model-facing edit strategy for compact line-oriented
-changes. It does not replace `apply_patch`, `edit_file`, or `write_file`.
+Hashline is a model-facing edit strategy for compact line-oriented changes.
+The executor selects and enforces a model profile; it does not rely on prompt
+instructions to make a required strategy reliable.
 Every mutation still executes through `ToolExecutor` and therefore inherits
 the permission gate, cancellation contract, durable audit events, and the
 session mutation lane described by ADR 0030.
@@ -78,30 +79,44 @@ promoted files are restored from their retained preimages.
 The tool preserves the source file's UTF-8 BOM, CRLF/LF convention, final
 newline shape, and permissions.
 
-## Strategy selection
+## Strategy selection and enforcement
 
-No provider is switched to hashline by default.
+`ToolCtx` carries one of four model edit profiles. `ToolExecutor::specs`
+applies it to both raw-provider tool schemas and the vendor MCP bridge:
 
-- Codex-family models should normally keep using `apply_patch`, whose V4A
-  format is part of their trained tool distribution.
-- Models that reliably follow line-anchored formats may opt into
-  `read_file(format="hashline")` plus `hashline_edit`, especially when an
-  exact replacement would repeat a large preimage.
-- `edit_file` remains appropriate for small, unique exact substitutions.
-- `write_file` remains appropriate for new files or complete regeneration.
+- `auto` advertises all normal edit strategies without preferring one.
+- `prefer_apply_patch` keeps alternatives available but marks `apply_patch`
+  as preferred. `codex/*` uses this profile because V4A is in distribution.
+- `prefer_hashline` keeps alternatives available but marks hashline as
+  preferred for existing files.
+- `enforce_hashline` removes `edit_file` and ordinary `apply_patch` from the
+  catalog. `write_file` can create but cannot overwrite, and `delete_file`
+  retains explicit deletion. A separately named patch fallback is advertised
+  but remains locked until two non-cancellation hashline failures in the
+  thread, after which it can recover from repeated stale or malformed edits.
+
+Execution applies the same policy, so a model cannot bypass it by emitting a
+hidden tool name. No production model is assigned a hashline-enforced profile
+until it passes the benchmark gate below.
 
 A model must never invent a tag or reuse one after the target file changes.
 
 ## Benchmark gate
 
-Hashline must remain opt-in until a representative per-model benchmark shows a
-benefit. Compare it with that model's current preferred strategy and record:
+Hashline enforcement must remain opt-in until a representative per-model
+benchmark shows a benefit. Compare it with that model's current preferred
+strategy and record:
 
 - output tokens used to express edits;
 - edit retries and stale-snapshot retries;
 - final patch correctness and test pass rate;
 - tool executor latency (the durable tool event already records this);
 - concurrent-edit outcomes under the session mutation lane.
+
+Edit-strategy execution logs record the selected profile, tool, executor
+latency, outcome, and current hashline-failure count. Correlate those records
+with the turn's durable token-usage events to compare output tokens, then add a
+passing model to the benchmark-owned profile table.
 
 Use the same tasks, prompts, repository state, temperature, and model version.
 Report medians and tail latency, not only a single best run. A model-specific

@@ -44,3 +44,4 @@ sequentially.
 | [0032](0032-single-local-server-owner.md) | Single local server owner per data directory | Accepted |
 | [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |
 | [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Accepted |
+| [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |

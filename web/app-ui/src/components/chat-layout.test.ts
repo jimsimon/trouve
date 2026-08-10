@@ -253,6 +253,32 @@ describe("activityGroupSummary", () => {
     expect(activityGroupSummary(items)).toBe("Edited 2 files");
   });
 
+  it("separates code and transcript searches from generic tool calls", () => {
+    const tool = (id: string, name: string, args: unknown = {}): AgentActivityItem => ({
+      id,
+      kind: "tool",
+      callId: id,
+      tool: name,
+      args,
+      status: "ok",
+      result: null,
+      output,
+    });
+    const items: AgentActivityItem[] = [
+      tool("search", "mcp__trouve__search"),
+      tool("related", "mcpToolCall", {
+        tool: "mcp__trouve__find_related",
+        arguments: { file_path: "src/main.ts", line: 10 },
+      }),
+      tool("transcript", "mcp__trouve__search_transcript"),
+      tool("other", "mcp__example__custom_tool"),
+    ];
+
+    expect(activityGroupSummary(items)).toBe(
+      "Ran 2 code searches, ran 1 transcript search, called 1 tool",
+    );
+  });
+
   it("recognizes legacy context-compaction tool names", () => {
     const item = (tool: string): AgentActivityItem => ({
       id: tool,

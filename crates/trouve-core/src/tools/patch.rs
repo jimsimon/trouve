@@ -24,6 +24,8 @@ const MAX_PATCH_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub struct ApplyPatch;
 
+pub struct ApplyPatchFallback;
+
 #[async_trait::async_trait]
 impl Tool for ApplyPatch {
     fn name(&self) -> &'static str {
@@ -68,6 +70,31 @@ impl Tool for ApplyPatch {
             Ok(result) => result,
             Err(error) => ToolResult::error(format!("patch worker failed: {error}")),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ApplyPatchFallback {
+    fn name(&self) -> &'static str {
+        "apply_patch_fallback"
+    }
+
+    fn description(&self) -> &'static str {
+        "Controlled fallback for a hashline-enforced model. This tool remains locked until two \
+         hashline_edit attempts fail, then accepts the same V4A envelope as apply_patch. Use it \
+         only to recover from repeated stale or malformed hashline edits."
+    }
+
+    fn parameters(&self) -> Value {
+        ApplyPatch.parameters()
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        ApplyPatch.run(ctx, args).await
     }
 }
 

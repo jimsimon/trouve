@@ -556,6 +556,41 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("keeps one explicitly bounded thought intact across an interleaved tool request", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      text: "The final overlap pass is still",
+    }));
+    vm.apply(envelope(2, {
+      type: "tool.requested",
+      turn: 2,
+      call_id: "search",
+      tool: "search_transcript",
+      args: { query: "Stopping" },
+      requires_approval: false,
+    }));
+    vm.apply(envelope(3, {
+      type: "assistant.thinking",
+      turn: 2,
+      text: " running.",
+    }));
+    vm.apply(envelope(4, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+    }));
+
+    expect(vm.items.filter((item) => item.kind === "thinking")).toMatchObject([
+      {
+        kind: "thinking",
+        content: "The final overlap pass is still running.",
+        complete: true,
+      },
+    ]);
+    expect(vm.thinking).toBe(false);
+  });
+
   it("applies live context usage without completing the running turn", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
