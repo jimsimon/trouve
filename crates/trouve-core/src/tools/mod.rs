@@ -388,21 +388,38 @@ impl LocalToolExecutor {
                 )));
             }
         }
-        if ctx.edit_strategy != EditStrategy::EnforceHashline {
-            return None;
-        }
-        if matches!(name, "edit_file" | "apply_patch") {
-            return Some(ToolResult::error(format!(
-                "{name} is unavailable for this model; read the file with format=\"hashline\" and use hashline_edit"
-            )));
-        }
-        if name == "write_file"
-            && let Some(path) = args.get("path").and_then(Value::as_str)
-            && ctx.resolve(path).is_ok_and(|path| path.exists())
-        {
-            return Some(ToolResult::error(
-                "write_file may only create new files under the enforced hashline strategy; use hashline_edit for an existing file",
-            ));
+        match ctx.edit_strategy {
+            EditStrategy::EnforceApplyPatch => {
+                if matches!(name, "edit_file" | "hashline_edit") {
+                    return Some(ToolResult::error(format!(
+                        "{name} is unavailable in an enforced apply_patch benchmark run"
+                    )));
+                }
+                if name == "write_file"
+                    && let Some(path) = args.get("path").and_then(Value::as_str)
+                    && ctx.resolve(path).is_ok_and(|path| path.exists())
+                {
+                    return Some(ToolResult::error(
+                        "write_file may only create new files in an enforced apply_patch benchmark run",
+                    ));
+                }
+            }
+            EditStrategy::EnforceHashline => {
+                if matches!(name, "edit_file" | "apply_patch") {
+                    return Some(ToolResult::error(format!(
+                        "{name} is unavailable for this model; read the file with format=\"hashline\" and use hashline_edit"
+                    )));
+                }
+                if name == "write_file"
+                    && let Some(path) = args.get("path").and_then(Value::as_str)
+                    && ctx.resolve(path).is_ok_and(|path| path.exists())
+                {
+                    return Some(ToolResult::error(
+                        "write_file may only create new files under the enforced hashline strategy; use hashline_edit for an existing file",
+                    ));
+                }
+            }
+            EditStrategy::Auto | EditStrategy::PreferApplyPatch | EditStrategy::PreferHashline => {}
         }
         None
     }
@@ -736,6 +753,23 @@ mod tests {
         assert!(names.contains(&"apply_patch_fallback".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"apply_patch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn enforced_apply_patch_catalog_hides_alternative_existing_file_editors() {
+        let exec = LocalToolExecutor::default();
+        let ctx = ToolCtx {
+            worktree: std::env::temp_dir(),
+            edit_strategy: EditStrategy::EnforceApplyPatch,
+            ..Default::default()
+        };
+        let names = spec_names(exec.specs(&ctx).await);
+        assert!(names.contains(&"apply_patch".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"delete_file".to_string()));
+        assert!(!names.contains(&"hashline_edit".to_string()));
+        assert!(!names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"apply_patch_fallback".to_string()));
     }
 
     #[tokio::test]

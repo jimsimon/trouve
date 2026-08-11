@@ -20,6 +20,10 @@ pub enum EditStrategy {
     /// Keep every normal strategy available, with hashline identified as the
     /// preferred existing-file editor.
     PreferHashline,
+    /// Require the model's trained apply-patch format for existing files.
+    /// Used only by isolated benchmark processes; creation and deletion remain
+    /// available, while alternative overwrite paths are hidden and denied.
+    EnforceApplyPatch,
     /// Require hashline for existing-file edits. File creation and deletion
     /// remain available; a separately named patch fallback is gated until
     /// repeated hashline failures.
@@ -42,11 +46,25 @@ const TRAINED_FORMAT_PROFILES: &[ModelEditProfile] = &[ModelEditProfile {
 const BENCHMARKED_HASHLINE_PROFILES: &[ModelEditProfile] = &[];
 
 pub fn for_model(model: &str) -> EditStrategy {
+    if let Some(strategy) = std::env::var("TROUVE_EDIT_BENCHMARK_STRATEGY")
+        .ok()
+        .and_then(|value| benchmark_override(&value))
+    {
+        return strategy;
+    }
     BENCHMARKED_HASHLINE_PROFILES
         .iter()
         .chain(TRAINED_FORMAT_PROFILES)
         .find(|profile| model.starts_with(profile.prefix))
         .map_or(EditStrategy::Auto, |profile| profile.strategy)
+}
+
+fn benchmark_override(value: &str) -> Option<EditStrategy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "apply_patch" => Some(EditStrategy::EnforceApplyPatch),
+        "hashline" => Some(EditStrategy::EnforceHashline),
+        _ => None,
+    }
 }
 
 pub(super) fn advertise(strategy: EditStrategy, mut spec: ToolSpec) -> Option<ToolSpec> {
@@ -89,6 +107,17 @@ pub(super) fn advertise(strategy: EditStrategy, mut spec: ToolSpec) -> Option<To
                 );
             }
         }
+        EditStrategy::EnforceApplyPatch => {
+            if matches!(name, "edit_file" | "hashline_edit" | "apply_patch_fallback") {
+                return None;
+            }
+            if name == "apply_patch" {
+                spec.description = format!(
+                    "Required existing-file edit strategy for this benchmark run. {}",
+                    spec.description
+                );
+            }
+        }
         EditStrategy::EnforceHashline => {
             if matches!(name, "edit_file" | "apply_patch") {
                 return None;
@@ -120,5 +149,18 @@ mod tests {
             EditStrategy::PreferApplyPatch
         );
         assert_eq!(for_model("openai/gpt-5.6-sol"), EditStrategy::Auto);
+    }
+
+    #[test]
+    fn benchmark_overrides_are_strict_and_explicit() {
+        assert_eq!(
+            benchmark_override("apply_patch"),
+            Some(EditStrategy::EnforceApplyPatch)
+        );
+        assert_eq!(
+            benchmark_override("HASHLINE"),
+            Some(EditStrategy::EnforceHashline)
+        );
+        assert_eq!(benchmark_override("automatic"), None);
     }
 }

@@ -5,7 +5,8 @@
 //! operations. Every file and operation is validated before staged writes are
 //! promoted, and the engine's normal mutation lane surrounds the entire call.
 //!
-//! Supported operations:
+//! Supported operations mirror Oh My Pi's compact edit language while
+//! retaining trouve's stricter all-file preflight and mutation-lane safety:
 //!
 //! ```text
 //! [src/lib.rs#A1B2C3D4E5F6]
@@ -17,15 +18,22 @@
 //! PUT >$:
 //! +appended at end of file
 //! CUT 30.=32
+//! CUT 40* @handler
+//! PUT <80 @handler
+//! REM
+//! MV "src/new name.rs"
 //! ```
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use trouve_protocol::ToolStatus;
+use trouve_search::chunk::syntactic_block_range;
+use trouve_search::languages::detect_language;
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -33,6 +41,9 @@ const SNAPSHOT_HEX_LEN: usize = 12;
 const MAX_HASHLINE_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HASHLINE_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const STALE_CONTEXT_LINES: usize = 7;
+const MAX_REGISTER_BYTES: usize = 1024 * 1024;
+const MAX_NAMED_REGISTERS_PER_SCOPE: usize = 64;
+const MAX_REGISTER_SCOPES: usize = 256;
 
 /// Render a text-file page in hashline form. The tag covers the complete file,
 /// while only the requested lines count against the response-size limit.
@@ -90,7 +101,8 @@ impl Tool for HashlineEdit {
     fn description(&self) -> &'static str {
         "Apply compact, line-numbered edits using snapshot tags returned by \
          read_file with format=\"hashline\". Supports multi-file [path#TAG] \
-         sections with PUT N.=M:, PUT <N:, PUT >N:, PUT >$:, and CUT N.=M. \
+         sections with range and syntactic-block PUT/CUT, register paste, \
+         whole-file REM, and MV. \
          Every section is preflighted before any file is changed; stale tags \
          return refreshed compact context. Never invent or reuse a tag after \
          the target file changes."
@@ -136,7 +148,58 @@ impl Tool for HashlineEdit {
 struct Section {
     path: String,
     expected_snapshot: String,
-    operations: Vec<Operation>,
+    operations: Vec<ParsedOperation>,
+    action: FileAction,
+}
+
+#[derive(Debug)]
+enum ParsedOperation {
+    Replace {
+        target: SpanTarget,
+        body: Vec<String>,
+    },
+    Insert {
+        gap: ParsedGap,
+        body: Vec<String>,
+    },
+    Cut {
+        target: SpanTarget,
+        register: Option<String>,
+    },
+    Paste {
+        target: PasteTarget,
+        register: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpanTarget {
+    Range { start: usize, end: usize },
+    Block { start: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PasteTarget {
+    Span(SpanTarget),
+    Gap(ParsedGap),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParsedGap {
+    Before(usize),
+    After(usize),
+    AfterBlock(usize),
+    End,
+}
+
+#[derive(Debug, Default)]
+enum FileAction {
+    #[default]
+    Update,
+    Remove,
+    Move {
+        destination: String,
+    },
 }
 
 #[derive(Debug)]
@@ -172,7 +235,26 @@ struct PreparedFile {
     adds: usize,
     deletes: usize,
     old_snapshot: String,
-    new_snapshot: String,
+    new_snapshot: Option<String>,
+    action: PreparedAction,
+    permissions: std::fs::Permissions,
+}
+
+#[derive(Debug)]
+struct LoadedFile {
+    full_path: PathBuf,
+    original: String,
+    permissions: std::fs::Permissions,
+}
+
+#[derive(Debug)]
+enum PreparedAction {
+    Update,
+    Remove,
+    Move {
+        destination: String,
+        destination_full_path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -182,6 +264,26 @@ struct StaleFile {
     current: String,
     context: String,
 }
+
+#[derive(Debug, Default)]
+struct RegisterBank {
+    values: HashMap<String, Vec<String>>,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct RegisterStore {
+    scopes: HashMap<String, RegisterBank>,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct CallRegisters {
+    anonymous: Option<Vec<String>>,
+    named: HashMap<String, Vec<String>>,
+}
+
+static REGISTERS: OnceLock<Mutex<RegisterStore>> = OnceLock::new();
 
 fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
     if ctx.cancel.is_cancelled() {
@@ -196,7 +298,8 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
     };
 
     let mut canonical_paths = HashSet::new();
-    let mut prepared = Vec::with_capacity(sections.len());
+    let mut resolved_sources = HashSet::new();
+    let mut loaded = Vec::with_capacity(sections.len());
     let mut stale = Vec::new();
 
     // The engine acquires the per-session mutation lane before invoking this
@@ -209,6 +312,12 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
+        if !resolved_sources.insert(resolved.clone()) {
+            return ToolResult::error(format!(
+                "{} is targeted by more than one hashline section",
+                section.path
+            ));
+        }
         let full_path = match std::fs::canonicalize(&resolved) {
             Ok(path) if path.is_file() => path,
             Ok(_) => {
@@ -246,26 +355,19 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             stale.push(stale_file(section, &original, current));
             continue;
         }
-        let (updated, adds, deletes) = match apply_operations(section, &original) {
-            Ok(result) => result,
-            Err(error) => return ToolResult::error(format!("{}: {error}", section.path)),
+        let permissions = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata.permissions(),
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "cannot inspect permissions for {}: {error}",
+                    section.path
+                ));
+            }
         };
-        if updated == original {
-            return ToolResult::error(format!(
-                "{}: hashline operations produce no changes",
-                section.path
-            ));
-        }
-        let new_snapshot = snapshot_tag(&updated);
-        prepared.push(PreparedFile {
-            path: section.path.clone(),
+        loaded.push(LoadedFile {
             full_path,
             original,
-            updated,
-            adds,
-            deletes,
-            old_snapshot: current,
-            new_snapshot,
+            permissions,
         });
     }
 
@@ -276,12 +378,118 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         return ToolResult::error("hashline edit cancelled");
     }
 
-    // Stage every output beside its destination before promoting any write.
+    let mut destinations = HashSet::new();
+    for section in &sections {
+        let FileAction::Move { destination } = &section.action else {
+            continue;
+        };
+        let destination_path = match ctx.resolve(destination) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(error),
+        };
+        if resolved_sources.contains(&destination_path) {
+            return ToolResult::error(format!(
+                "cannot move {} to {destination}: the destination is also targeted as a source",
+                section.path
+            ));
+        }
+        if !destinations.insert(destination_path.clone()) {
+            return ToolResult::error(format!(
+                "more than one hashline section moves to {destination}"
+            ));
+        }
+        if destination_path.symlink_metadata().is_ok() {
+            return ToolResult::error(format!(
+                "cannot move {} to {destination}: destination already exists",
+                section.path
+            ));
+        }
+        if !destination_path.parent().is_some_and(Path::is_dir) {
+            return ToolResult::error(format!(
+                "cannot move {} to {destination}: destination parent does not exist",
+                section.path
+            ));
+        }
+    }
+
+    let mut registers = CallRegisters {
+        anonymous: None,
+        named: load_named_registers(ctx),
+    };
+    let mut prepared = Vec::with_capacity(sections.len());
+    for (section, loaded) in sections.iter().zip(&loaded) {
+        let operations = match materialize_operations(section, &loaded.original, &mut registers) {
+            Ok(operations) => operations,
+            Err(error) => return ToolResult::error(format!("{}: {error}", section.path)),
+        };
+        let (updated, adds, deletes) = match &section.action {
+            FileAction::Remove => (
+                String::new(),
+                0,
+                TextShape::from_content(&loaded.original).lines.len(),
+            ),
+            FileAction::Update | FileAction::Move { .. } => {
+                if operations.is_empty() {
+                    (loaded.original.clone(), 0, 0)
+                } else {
+                    match apply_operations(&operations, &loaded.original) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return ToolResult::error(format!("{}: {error}", section.path));
+                        }
+                    }
+                }
+            }
+        };
+        if matches!(section.action, FileAction::Update) && updated == loaded.original {
+            return ToolResult::error(format!(
+                "{}: hashline operations produce no changes",
+                section.path
+            ));
+        }
+        let action = match &section.action {
+            FileAction::Update => PreparedAction::Update,
+            FileAction::Remove => PreparedAction::Remove,
+            FileAction::Move { destination } => PreparedAction::Move {
+                destination: destination.clone(),
+                destination_full_path: ctx.resolve(destination).expect("destination was validated"),
+            },
+        };
+        let new_snapshot =
+            (!matches!(section.action, FileAction::Remove)).then(|| snapshot_tag(&updated));
+        prepared.push(PreparedFile {
+            path: section.path.clone(),
+            full_path: loaded.full_path.clone(),
+            original: loaded.original.clone(),
+            updated,
+            adds,
+            deletes,
+            old_snapshot: snapshot_tag(&loaded.original),
+            new_snapshot,
+            action,
+            permissions: loaded.permissions.clone(),
+        });
+    }
+
+    // Stage every update or move beside its destination before promoting any
+    // write. REM has no staged payload, but remains part of the same preflight.
     // This catches allocation, permissions, and disk-space failures before the
     // first live file changes.
     let mut staged = Vec::with_capacity(prepared.len());
     for file in &prepared {
-        let Some(parent) = file.full_path.parent() else {
+        let target = match &file.action {
+            PreparedAction::Update => Some(&file.full_path),
+            PreparedAction::Remove => None,
+            PreparedAction::Move {
+                destination_full_path,
+                ..
+            } => Some(destination_full_path),
+        };
+        let Some(target) = target else {
+            staged.push(None);
+            continue;
+        };
+        let Some(parent) = target.parent() else {
             return ToolResult::error(format!("cannot resolve parent for {}", file.path));
         };
         let mut temp = match tempfile::NamedTempFile::new_in(parent) {
@@ -290,9 +498,7 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 return ToolResult::error(format!("cannot stage {}: {error}", file.path));
             }
         };
-        if let Ok(metadata) = std::fs::metadata(&file.full_path)
-            && let Err(error) = temp.as_file().set_permissions(metadata.permissions())
-        {
+        if let Err(error) = temp.as_file().set_permissions(file.permissions.clone()) {
             return ToolResult::error(format!(
                 "cannot preserve permissions for {}: {error}",
                 file.path
@@ -327,6 +533,17 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 snapshot_tag(&current_content),
             ));
         }
+        if let PreparedAction::Move {
+            destination,
+            destination_full_path,
+        } = &file.action
+            && destination_full_path.symlink_metadata().is_ok()
+        {
+            return ToolResult::error(format!(
+                "cannot move {} to {destination}: destination appeared during preflight",
+                file.path
+            ));
+        }
     }
     if !raced.is_empty() {
         return stale_result(raced);
@@ -335,16 +552,13 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         return ToolResult::error("hashline edit cancelled");
     }
 
-    // Promotion is atomic per file. If a later promotion fails, restore every
-    // previously promoted file from the already-retained preimage.
+    // Promotion is atomic per update/move destination. If a later operation
+    // fails, restore every previously committed source from its preimage.
     for (index, file) in prepared.iter().enumerate() {
-        let temp = staged[index].take().expect("staged file is present");
-        if let Err(error) = temp.persist(&file.full_path) {
+        if let Err(error) = commit_prepared(file, staged[index].take()) {
             let mut rollback_errors = Vec::new();
             for restored in prepared[..index].iter().rev() {
-                if let Err(rollback) =
-                    std::fs::write(&restored.full_path, restored.original.as_bytes())
-                {
+                if let Err(rollback) = rollback_prepared(restored) {
                     rollback_errors.push(format!("{}: {rollback}", restored.path));
                 }
             }
@@ -354,22 +568,82 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 format!("rollback also failed for {}", rollback_errors.join(", "))
             };
             return ToolResult::error(format!(
-                "cannot promote staged {}: {}; {rollback}",
-                file.path, error.error
+                "cannot commit hashline operation for {}: {error}; {rollback}",
+                file.path
             ));
         }
     }
 
+    persist_named_registers(ctx, registers.named);
+
     ToolResult::ok(json!({
-        "files": prepared.iter().map(|file| json!({
-            "path": file.path,
-            "action": "update",
-            "adds": file.adds,
-            "dels": file.deletes,
-            "previous_snapshot": file.old_snapshot,
-            "snapshot": file.new_snapshot,
-        })).collect::<Vec<_>>()
+        "files": prepared.iter().map(prepared_result).collect::<Vec<_>>()
     }))
+}
+
+fn commit_prepared(
+    file: &PreparedFile,
+    staged: Option<tempfile::NamedTempFile>,
+) -> Result<(), String> {
+    match &file.action {
+        PreparedAction::Update => staged
+            .expect("updated file has a staged payload")
+            .persist(&file.full_path)
+            .map(|_| ())
+            .map_err(|error| error.error.to_string()),
+        PreparedAction::Remove => std::fs::remove_file(&file.full_path).map_err(|e| e.to_string()),
+        PreparedAction::Move {
+            destination_full_path,
+            ..
+        } => {
+            staged
+                .expect("moved file has a staged payload")
+                .persist(destination_full_path)
+                .map_err(|error| error.error.to_string())?;
+            if let Err(error) = std::fs::remove_file(&file.full_path) {
+                let cleanup = std::fs::remove_file(destination_full_path);
+                return Err(match cleanup {
+                    Ok(()) => format!("cannot remove move source: {error}"),
+                    Err(cleanup) => format!(
+                        "cannot remove move source: {error}; destination cleanup also failed: {cleanup}"
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn rollback_prepared(file: &PreparedFile) -> Result<(), String> {
+    if let PreparedAction::Move {
+        destination_full_path,
+        ..
+    } = &file.action
+        && let Err(error) = std::fs::remove_file(destination_full_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!("cannot remove moved destination: {error}"));
+    }
+    std::fs::write(&file.full_path, file.original.as_bytes()).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(&file.full_path, file.permissions.clone())
+        .map_err(|error| error.to_string())
+}
+
+fn prepared_result(file: &PreparedFile) -> Value {
+    let (action, destination) = match &file.action {
+        PreparedAction::Update => ("update", None),
+        PreparedAction::Remove => ("delete", None),
+        PreparedAction::Move { destination, .. } => ("move", Some(destination.as_str())),
+    };
+    json!({
+        "path": file.path,
+        "action": action,
+        "destination": destination,
+        "adds": file.adds,
+        "dels": file.deletes,
+        "previous_snapshot": file.old_snapshot,
+        "snapshot": file.new_snapshot,
+    })
 }
 
 fn parse(input: &str) -> Result<Vec<Section>, String> {
@@ -387,6 +661,7 @@ fn parse(input: &str) -> Result<Vec<Section>, String> {
             parse_header(line).map_err(|error| format!("line {}: {error}", index + 1))?;
         index += 1;
         let mut operations = Vec::new();
+        let mut action = FileAction::Update;
 
         while index < lines.len() {
             let raw = lines[index];
@@ -398,50 +673,86 @@ fn parse(input: &str) -> Result<Vec<Section>, String> {
                 index += 1;
                 continue;
             }
+            if !matches!(action, FileAction::Update) {
+                return Err(format!(
+                    "line {}: REM or MV must be the final operation in its file section",
+                    index + 1
+                ));
+            }
             if let Some(target) = line.strip_prefix("PUT ") {
                 let operation_line = index + 1;
-                let Some(target) = target.strip_suffix(':') else {
-                    return Err(format!(
-                        "line {}: PUT requires ':' followed by '+' payload rows",
-                        operation_line
-                    ));
-                };
-                index += 1;
-                let mut body = Vec::new();
-                while index < lines.len() {
-                    let payload = lines[index];
-                    let Some(payload) = payload.strip_prefix('+') else {
-                        break;
-                    };
-                    body.push(payload.to_owned());
+                let body_form = target.ends_with(':');
+                let target = target.strip_suffix(':').unwrap_or(target).trim();
+                let (target, register) = parse_target_and_register(target)
+                    .map_err(|error| format!("line {operation_line}: {error}"))?;
+                let target = parse_paste_target(target)
+                    .map_err(|error| format!("line {operation_line}: {error}"))?;
+                if body_form {
+                    if register.is_some() {
+                        return Err(format!(
+                            "line {operation_line}: register PUT is bodyless and must not end with ':'"
+                        ));
+                    }
+                    index += 1;
+                    let mut body = Vec::new();
+                    while index < lines.len() {
+                        let payload = lines[index];
+                        let Some(payload) = payload.strip_prefix('+') else {
+                            break;
+                        };
+                        body.push(payload.to_owned());
+                        index += 1;
+                    }
+                    if body.is_empty() {
+                        return Err(format!(
+                            "line {operation_line}: PUT requires at least one '+' payload row; use CUT to delete"
+                        ));
+                    }
+                    operations.push(match target {
+                        PasteTarget::Span(target) => ParsedOperation::Replace { target, body },
+                        PasteTarget::Gap(gap) => ParsedOperation::Insert { gap, body },
+                    });
+                } else {
+                    if matches!(target, PasteTarget::Span(_)) && register.is_none() {
+                        return Err(format!(
+                            "line {operation_line}: range and block PUT pastes require a named @register"
+                        ));
+                    }
+                    operations.push(ParsedOperation::Paste { target, register });
                     index += 1;
                 }
-                if body.is_empty() {
-                    return Err(format!(
-                        "line {}: PUT requires at least one '+' payload row; use CUT to delete",
-                        operation_line
-                    ));
-                }
-                operations.push(
-                    parse_put(target.trim(), body)
-                        .map_err(|error| format!("line {operation_line}: {error}"))?,
-                );
                 continue;
             }
             if let Some(target) = line.strip_prefix("CUT ") {
-                let (start, end) = parse_range(target.trim())
-                    .map_err(|error| format!("line {}: {error}", index + 1))?;
-                operations.push(Operation::Cut { start, end });
+                let operation_line = index + 1;
+                let (target, register) = parse_target_and_register(target.trim())
+                    .map_err(|error| format!("line {operation_line}: {error}"))?;
+                let target = parse_span_target(target)
+                    .map_err(|error| format!("line {operation_line}: {error}"))?;
+                operations.push(ParsedOperation::Cut { target, register });
+                index += 1;
+                continue;
+            }
+            if line == "REM" {
+                action = FileAction::Remove;
+                index += 1;
+                continue;
+            }
+            if let Some(destination) = line.strip_prefix("MV ") {
+                action = FileAction::Move {
+                    destination: parse_path_operand(destination)
+                        .map_err(|error| format!("line {}: {error}", index + 1))?,
+                };
                 index += 1;
                 continue;
             }
             return Err(format!(
-                "line {}: expected PUT, CUT, or another [path#TAG] section; got {raw:?}",
+                "line {}: expected PUT, CUT, REM, MV, or another [path#TAG] section; got {raw:?}",
                 index + 1
             ));
         }
 
-        if operations.is_empty() {
+        if operations.is_empty() && matches!(action, FileAction::Update) {
             return Err(format!(
                 "[{path}#{expected_snapshot}] contains no operations"
             ));
@@ -450,6 +761,7 @@ fn parse(input: &str) -> Result<Vec<Section>, String> {
             path,
             expected_snapshot,
             operations,
+            action,
         });
     }
 
@@ -478,27 +790,83 @@ fn parse_header(line: &str) -> Result<(String, String), String> {
     Ok((path.to_owned(), snapshot))
 }
 
-fn parse_put(target: &str, body: Vec<String>) -> Result<Operation, String> {
-    if target == ">$" {
-        return Ok(Operation::Insert {
-            gap: Gap::End,
-            body,
+fn parse_target_and_register(value: &str) -> Result<(&str, Option<String>), String> {
+    let mut pieces = value.split_whitespace();
+    let Some(target) = pieces.next() else {
+        return Err("operation target must not be empty".into());
+    };
+    let register = pieces.next().map(parse_register_name).transpose()?;
+    if pieces.next().is_some() {
+        return Err("operation has too many target/register fields".into());
+    }
+    Ok((target, register))
+}
+
+fn parse_register_name(value: &str) -> Result<String, String> {
+    let Some(name) = value.strip_prefix('@') else {
+        return Err(format!("expected a named @register; got {value:?}"));
+    };
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!("invalid register name {value:?}"));
+    }
+    Ok(name.to_owned())
+}
+
+fn parse_paste_target(value: &str) -> Result<PasteTarget, String> {
+    if value == ">$" {
+        return Ok(PasteTarget::Gap(ParsedGap::End));
+    }
+    if let Some(line) = value.strip_prefix('<') {
+        return Ok(PasteTarget::Gap(ParsedGap::Before(parse_line_number(
+            line,
+        )?)));
+    }
+    if let Some(line) = value.strip_prefix('>') {
+        if let Some(line) = line.strip_suffix('*') {
+            return Ok(PasteTarget::Gap(ParsedGap::AfterBlock(parse_line_number(
+                line,
+            )?)));
+        }
+        return Ok(PasteTarget::Gap(ParsedGap::After(parse_line_number(line)?)));
+    }
+    Ok(PasteTarget::Span(parse_span_target(value)?))
+}
+
+fn parse_span_target(value: &str) -> Result<SpanTarget, String> {
+    if let Some(line) = value.strip_suffix('*') {
+        return Ok(SpanTarget::Block {
+            start: parse_line_number(line)?,
         });
     }
-    if let Some(line) = target.strip_prefix('<') {
-        return Ok(Operation::Insert {
-            gap: Gap::Before(parse_line_number(line)?),
-            body,
-        });
+    let (start, end) = parse_range(value)?;
+    Ok(SpanTarget::Range { start, end })
+}
+
+fn parse_path_operand(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("MV destination must not be empty".into());
     }
-    if let Some(line) = target.strip_prefix('>') {
-        return Ok(Operation::Insert {
-            gap: Gap::After(parse_line_number(line)?),
-            body,
-        });
+    let parsed = if value.starts_with('"') {
+        serde_json::from_str::<String>(value)
+            .map_err(|error| format!("invalid quoted MV destination: {error}"))?
+    } else if value.starts_with('\'') {
+        value
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+            .ok_or_else(|| "single-quoted MV destination is not terminated".to_owned())?
+            .replace("\\'", "'")
+    } else {
+        value.to_owned()
+    };
+    if parsed.is_empty() {
+        return Err("MV destination must not be empty".into());
     }
-    let (start, end) = parse_range(target)?;
-    Ok(Operation::Replace { start, end, body })
+    Ok(parsed)
 }
 
 fn parse_range(value: &str) -> Result<(usize, usize), String> {
@@ -526,7 +894,206 @@ fn parse_line_number(value: &str) -> Result<usize, String> {
     Ok(line)
 }
 
-fn apply_operations(section: &Section, original: &str) -> Result<(String, usize, usize), String> {
+fn materialize_operations(
+    section: &Section,
+    original: &str,
+    registers: &mut CallRegisters,
+) -> Result<Vec<Operation>, String> {
+    let lines = logical_lines(original);
+    let mut operations = Vec::with_capacity(section.operations.len());
+    for operation in &section.operations {
+        match operation {
+            ParsedOperation::Replace { target, body } => {
+                let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                operations.push(Operation::Replace {
+                    start,
+                    end,
+                    body: body.clone(),
+                });
+            }
+            ParsedOperation::Insert { gap, body } => {
+                operations.push(Operation::Insert {
+                    gap: resolve_parsed_gap(&section.path, original, *gap)?,
+                    body: body.clone(),
+                });
+            }
+            ParsedOperation::Cut { target, register } => {
+                let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                validate_range(start, end, lines.len())?;
+                store_register(
+                    register.as_deref(),
+                    lines[start - 1..end].to_vec(),
+                    registers,
+                )?;
+                operations.push(Operation::Cut { start, end });
+            }
+            ParsedOperation::Paste { target, register } => {
+                let body = read_register(register.as_deref(), registers)?;
+                match target {
+                    PasteTarget::Span(target) => {
+                        let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                        operations.push(Operation::Replace { start, end, body });
+                    }
+                    PasteTarget::Gap(gap) => operations.push(Operation::Insert {
+                        gap: resolve_parsed_gap(&section.path, original, *gap)?,
+                        body,
+                    }),
+                }
+            }
+        }
+    }
+    Ok(operations)
+}
+
+fn resolve_span_target(
+    path: &str,
+    original: &str,
+    target: SpanTarget,
+) -> Result<(usize, usize), String> {
+    match target {
+        SpanTarget::Range { start, end } => Ok((start, end)),
+        SpanTarget::Block { start } => {
+            let language = detect_language(Path::new(path)).ok_or_else(|| {
+                format!("cannot resolve block {start}*: unknown language for {path}")
+            })?;
+            let range = if language == "markdown" {
+                markdown_section_range(original, start)
+            } else {
+                syntactic_block_range(original, language, start)
+            };
+            range.ok_or_else(|| {
+                format!(
+                    "cannot resolve a multi-line {language} block beginning on line {start}; use an explicit N.=M range"
+                )
+            })
+        }
+    }
+}
+
+fn resolve_parsed_gap(path: &str, original: &str, gap: ParsedGap) -> Result<Gap, String> {
+    match gap {
+        ParsedGap::Before(line) => Ok(Gap::Before(line)),
+        ParsedGap::After(line) => Ok(Gap::After(line)),
+        ParsedGap::End => Ok(Gap::End),
+        ParsedGap::AfterBlock(start) => {
+            let (_, end) = resolve_span_target(path, original, SpanTarget::Block { start })?;
+            Ok(Gap::After(end))
+        }
+    }
+}
+
+fn markdown_section_range(source: &str, start: usize) -> Option<(usize, usize)> {
+    let lines = logical_lines(source);
+    let heading = lines.get(start.checked_sub(1)?)?.trim_start();
+    let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+    if level == 0 || level > 6 || heading.as_bytes().get(level) != Some(&b' ') {
+        return None;
+    }
+    let mut end = lines.len();
+    for (offset, line) in lines.iter().enumerate().skip(start) {
+        let line = line.trim_start();
+        let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
+        if (1..=level).contains(&next_level) && line.as_bytes().get(next_level) == Some(&b' ') {
+            end = offset;
+            break;
+        }
+    }
+    (end > start).then_some((start, end))
+}
+
+fn store_register(
+    name: Option<&str>,
+    content: Vec<String>,
+    registers: &mut CallRegisters,
+) -> Result<(), String> {
+    let bytes = content.iter().map(String::len).sum::<usize>() + content.len();
+    if bytes > MAX_REGISTER_BYTES {
+        return Err(format!(
+            "captured register is {bytes} bytes; the limit is {MAX_REGISTER_BYTES}"
+        ));
+    }
+    if let Some(name) = name {
+        if !registers.named.contains_key(name)
+            && registers.named.len() >= MAX_NAMED_REGISTERS_PER_SCOPE
+        {
+            return Err(format!(
+                "named register limit ({MAX_NAMED_REGISTERS_PER_SCOPE}) reached"
+            ));
+        }
+        registers.named.insert(name.to_owned(), content);
+    } else {
+        registers.anonymous = Some(content);
+    }
+    Ok(())
+}
+
+fn read_register(name: Option<&str>, registers: &CallRegisters) -> Result<Vec<String>, String> {
+    match name {
+        Some(name) => registers
+            .named
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("named register @{name} is empty")),
+        None => registers
+            .anonymous
+            .clone()
+            .ok_or_else(|| "anonymous register is empty; CUT content first".to_owned()),
+    }
+}
+
+fn register_scope(ctx: &ToolCtx) -> String {
+    if ctx.thread_id.is_empty() {
+        format!("worktree:{}", ctx.worktree.display())
+    } else {
+        format!("thread:{}", ctx.thread_id)
+    }
+}
+
+fn load_named_registers(ctx: &ToolCtx) -> HashMap<String, Vec<String>> {
+    let key = register_scope(ctx);
+    let mut store = REGISTERS
+        .get_or_init(|| Mutex::new(RegisterStore::default()))
+        .lock()
+        .unwrap();
+    store.sequence = store.sequence.wrapping_add(1);
+    let sequence = store.sequence;
+    let bank = store.scopes.entry(key).or_default();
+    bank.last_used = sequence;
+    bank.values.clone()
+}
+
+fn persist_named_registers(ctx: &ToolCtx, values: HashMap<String, Vec<String>>) {
+    let key = register_scope(ctx);
+    let mut store = REGISTERS
+        .get_or_init(|| Mutex::new(RegisterStore::default()))
+        .lock()
+        .unwrap();
+    store.sequence = store.sequence.wrapping_add(1);
+    let sequence = store.sequence;
+    store.scopes.insert(
+        key,
+        RegisterBank {
+            values,
+            last_used: sequence,
+        },
+    );
+    while store.scopes.len() > MAX_REGISTER_SCOPES {
+        let Some(oldest) = store
+            .scopes
+            .iter()
+            .min_by_key(|(_, bank)| bank.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        store.scopes.remove(&oldest);
+    }
+}
+
+fn apply_operations(
+    operations: &[Operation],
+    original: &str,
+) -> Result<(String, usize, usize), String> {
     let shape = TextShape::from_content(original);
     let line_count = shape.lines.len();
     let mut ranges = BTreeMap::<usize, (usize, Vec<String>)>::new();
@@ -535,7 +1102,7 @@ fn apply_operations(section: &Section, original: &str) -> Result<(String, usize,
     let mut adds = 0usize;
     let mut deletes = 0usize;
 
-    for operation in &section.operations {
+    for operation in operations {
         match operation {
             Operation::Replace { start, end, body } => {
                 validate_range(*start, *end, line_count)?;
@@ -640,16 +1207,14 @@ fn stale_file(section: &Section, content: &str, current: String) -> StaleFile {
         .operations
         .first()
         .map(|operation| match operation {
-            Operation::Replace { start, .. } | Operation::Cut { start, .. } => *start,
-            Operation::Insert {
-                gap: Gap::Before(line),
-                ..
-            } => *line,
-            Operation::Insert {
-                gap: Gap::After(line),
-                ..
-            } => *line,
-            Operation::Insert { gap: Gap::End, .. } => lines.len().max(1),
+            ParsedOperation::Replace { target, .. } | ParsedOperation::Cut { target, .. } => {
+                span_start(*target)
+            }
+            ParsedOperation::Insert { gap, .. } => parsed_gap_focus(*gap, lines.len()),
+            ParsedOperation::Paste { target, .. } => match target {
+                PasteTarget::Span(target) => span_start(*target),
+                PasteTarget::Gap(gap) => parsed_gap_focus(*gap, lines.len()),
+            },
         })
         .unwrap_or(1);
     let start = focus.saturating_sub(STALE_CONTEXT_LINES / 2).max(1);
@@ -665,6 +1230,19 @@ fn stale_file(section: &Section, content: &str, current: String) -> StaleFile {
         expected: section.expected_snapshot.clone(),
         current,
         context,
+    }
+}
+
+fn span_start(target: SpanTarget) -> usize {
+    match target {
+        SpanTarget::Range { start, .. } | SpanTarget::Block { start } => start,
+    }
+}
+
+fn parsed_gap_focus(gap: ParsedGap, line_count: usize) -> usize {
+    match gap {
+        ParsedGap::Before(line) | ParsedGap::After(line) | ParsedGap::AfterBlock(line) => line,
+        ParsedGap::End => line_count.max(1),
     }
 }
 
@@ -816,6 +1394,149 @@ mod tests {
         );
         assert_eq!(result.result["files"][0]["adds"], 4);
         assert_eq!(result.result["files"][0]["dels"], 3);
+    }
+
+    #[tokio::test]
+    async fn resolves_syntactic_blocks_and_after_block_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = "fn old() {\n    work();\n}\n\nfn keep() {}\n";
+        std::fs::write(tmp.path().join("lib.rs"), original).unwrap();
+        let input = tagged(
+            "lib.rs",
+            original,
+            "PUT 1*:\n+fn new() {\n+    better_work();\n+}\nPUT >1*:\n+// between functions\n",
+        );
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap(),
+            "fn new() {\n    better_work();\n}\n// between functions\n\nfn keep() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_and_anonymous_registers_move_content_across_files_and_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "alpha\nbeta\ngamma\n";
+        let target = "start\nend\n";
+        std::fs::write(tmp.path().join("source.txt"), source).unwrap();
+        std::fs::write(tmp.path().join("target.txt"), target).unwrap();
+        let input = format!(
+            "{}\n{}",
+            tagged("source.txt", source, "CUT 1.=1 @saved\nCUT 2.=2\nPUT >3\n"),
+            tagged("target.txt", target, "PUT <2 @saved\n")
+        );
+        let tool = HashlineEdit;
+
+        let result = tool.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("source.txt")).unwrap(),
+            "gamma\nbeta\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+            "start\nalpha\nend\n"
+        );
+
+        let current = "start\nalpha\nend\n";
+        let second = tagged("target.txt", current, "PUT >$ @saved\n");
+        let result = tool.run(&ctx(&tmp), &json!({"input": second})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+            "start\nalpha\nend\nalpha\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_and_moves_files_in_one_preflighted_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remove = "obsolete\n";
+        let moving = "old\n";
+        std::fs::write(tmp.path().join("remove.txt"), remove).unwrap();
+        std::fs::write(tmp.path().join("moving.txt"), moving).unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        let input = format!(
+            "{}\n{}",
+            tagged("remove.txt", remove, "REM\n"),
+            tagged(
+                "moving.txt",
+                moving,
+                "PUT 1.=1:\n+new\nMV \"nested/moved file.txt\"\n"
+            )
+        );
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert!(!tmp.path().join("remove.txt").exists());
+        assert!(!tmp.path().join("moving.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("nested/moved file.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(result.result["files"][0]["action"], "delete");
+        assert_eq!(result.result["files"][1]["action"], "move");
+        assert_eq!(
+            result.result["files"][1]["destination"],
+            "nested/moved file.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn cut_register_can_capture_content_before_removing_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "move me\nremove me\n";
+        let target = "keep\n";
+        std::fs::write(tmp.path().join("source.txt"), source).unwrap();
+        std::fs::write(tmp.path().join("target.txt"), target).unwrap();
+        let input = format!(
+            "{}\n{}",
+            tagged("source.txt", source, "CUT 1.=1 @saved\nREM\n"),
+            tagged("target.txt", target, "PUT <1 @saved\n")
+        );
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert!(!tmp.path().join("source.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+            "move me\nkeep\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_move_destination_prevents_every_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remove = "keep me\n";
+        let moving = "source\n";
+        std::fs::write(tmp.path().join("remove.txt"), remove).unwrap();
+        std::fs::write(tmp.path().join("moving.txt"), moving).unwrap();
+        std::fs::write(tmp.path().join("occupied.txt"), "occupied\n").unwrap();
+        let input = format!(
+            "{}\n{}",
+            tagged("remove.txt", remove, "REM\n"),
+            tagged("moving.txt", moving, "MV occupied.txt\n")
+        );
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("remove.txt")).unwrap(),
+            remove
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("moving.txt")).unwrap(),
+            moving
+        );
+    }
+
+    #[test]
+    fn markdown_blocks_cover_their_section() {
+        let source = "# Top\nintro\n## Child\nbody\n# Next\nend\n";
+        assert_eq!(markdown_section_range(source, 1), Some((1, 4)));
+        assert_eq!(markdown_section_range(source, 3), Some((3, 4)));
     }
 
     #[tokio::test]

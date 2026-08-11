@@ -90,6 +90,63 @@ pub fn is_supported_language(name: &str) -> bool {
     language_for(name).is_some()
 }
 
+/// Resolve the inclusive line range of the multi-line syntactic construct
+/// that begins on `start_line`.
+///
+/// Hashline block edits use this to let a model name a function, class,
+/// section, or other complete construct without reproducing its closing line.
+/// The outermost named node at the smallest source column wins, so a function
+/// item is preferred over its body and a decorated definition is preferred
+/// over the decorator alone. The root node is deliberately excluded.
+pub fn syntactic_block_range(
+    source: &str,
+    language: &str,
+    start_line: usize,
+) -> Option<(usize, usize)> {
+    if start_line == 0 || source.trim().is_empty() {
+        return None;
+    }
+    with_parser(language, |parser| {
+        let tree = parser.parse(source.as_bytes(), None)?;
+        let root = tree.root_node();
+        let mut stack = root.named_children(&mut root.walk()).collect::<Vec<_>>();
+        let mut best: Option<(usize, usize, usize)> = None;
+
+        while let Some(node) = stack.pop() {
+            let start = node.start_position();
+            let end = node.end_position();
+            let inclusive_end = if end.column == 0 {
+                end.row
+            } else {
+                end.row + 1
+            };
+            if start.row + 1 == start_line && inclusive_end > start_line {
+                let candidate = (
+                    start.column,
+                    inclusive_end,
+                    node.end_byte() - node.start_byte(),
+                );
+                let replace = best.is_none_or(|current| {
+                    candidate.0 < current.0
+                        || (candidate.0 == current.0 && candidate.1 > current.1)
+                        || (candidate.0 == current.0
+                            && candidate.1 == current.1
+                            && candidate.2 > current.2)
+                });
+                if replace {
+                    best = Some(candidate);
+                }
+            }
+
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+
+        best.map(|(_, end, _)| (start_line, end))
+    })
+    .flatten()
+}
+
 thread_local! {
     static PARSERS: RefCell<HashMap<&'static str, Option<Parser>>> = RefCell::new(HashMap::new());
 }
@@ -381,6 +438,21 @@ mod tests {
         assert!(is_supported_language("rust"));
         assert!(is_supported_language("tsx"));
         assert!(!is_supported_language("cobol"));
+    }
+
+    #[test]
+    fn syntactic_block_range_selects_the_outer_rust_item() {
+        let source = "fn greet(name: &str) {\n    if !name.is_empty() {\n        println!(\"hello {name}\");\n    }\n}\n\nfn next() {}\n";
+        assert_eq!(syntactic_block_range(source, "rust", 1), Some((1, 5)));
+        assert_eq!(syntactic_block_range(source, "rust", 2), Some((2, 4)));
+        assert_eq!(syntactic_block_range(source, "rust", 5), None);
+    }
+
+    #[test]
+    fn syntactic_block_range_includes_python_decorators() {
+        let source = "@cache\ndef load(key):\n    return store[key]\n\nvalue = load(\"a\")\n";
+        assert_eq!(syntactic_block_range(source, "python", 1), Some((1, 3)));
+        assert_eq!(syntactic_block_range(source, "python", 2), Some((2, 3)));
     }
 
     #[test]
