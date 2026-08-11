@@ -81,6 +81,19 @@ impl Drop for PreparedAttachmentCleanup {
 const STREAM_EVENT_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
+/// checkpoint is post-response bookkeeping, so briefly retry those transient
+/// conflicts instead of turning an otherwise successful model turn into a
+/// failure. The total delay is bounded below one second.
+const CHECKPOINT_SQLITE_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
+
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
 const COMPACTION_THRESHOLD: f64 = 0.8;
@@ -9643,6 +9656,9 @@ impl Engine {
             self.maybe_checkpoint(session, thread, turn, &cancel)
                 .await?
         };
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         self.store.append_event(
             scope,
             Event::TurnCompleted {
@@ -10835,7 +10851,29 @@ impl Engine {
         if !dirty {
             return Ok(None);
         }
-        let seq = self.store.latest_checkpoint_seq(&session.id)?.unwrap_or(-1) + 1;
+        let latest = match retry_checkpoint_sqlite(
+            cancel,
+            "reading the latest checkpoint sequence",
+            &CHECKPOINT_SQLITE_RETRY_DELAYS,
+            || self.store.latest_checkpoint_seq(&session.id),
+        )
+        .await
+        {
+            Ok(Some(latest)) => latest,
+            Ok(None) => return Ok(None),
+            Err(error) if is_transient_sqlite_contention(&error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    thread_id = %thread.id,
+                    turn,
+                    error = %error,
+                    "skipping checkpoint after repeated SQLite contention"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let seq = latest.unwrap_or(-1) + 1;
         let message = format!("trouve: turn {turn} of {}", thread.id);
         let commit = self
             .executor
@@ -10843,24 +10881,115 @@ impl Engine {
             .await
             .map_err(anyhow::Error::msg)?;
         let checkpoint_id = new_id("cp");
-        self.store.append_checkpoint(&CheckpointRow {
+        let row = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session.id.clone(),
             thread_id: Some(thread.id.clone()),
             turn,
             seq,
             commit_hash: commit.clone(),
-        })?;
-        self.store.append_event(
-            Scope::Session(session.id.clone()),
-            Event::CheckpointCreated {
-                checkpoint_id: checkpoint_id.clone(),
-                thread_id: thread.id.clone(),
-                turn,
-                commit,
+        };
+        let checkpoint_event = Event::CheckpointCreated {
+            checkpoint_id: checkpoint_id.clone(),
+            thread_id: thread.id.clone(),
+            turn,
+            commit,
+        };
+        match retry_checkpoint_sqlite(
+            cancel,
+            "persisting the checkpoint and lifecycle event",
+            &CHECKPOINT_SQLITE_RETRY_DELAYS,
+            || {
+                self.store.append_checkpoint_with_event(
+                    &row,
+                    Scope::Session(session.id.clone()),
+                    checkpoint_event.clone(),
+                )
             },
-        )?;
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            Err(error) if is_transient_sqlite_contention(&error) => {
+                // The Git ref is harmless without its database row. A later
+                // checkpoint reuses this sequence and replaces the ref.
+                tracing::warn!(
+                    session_id = %session.id,
+                    thread_id = %thread.id,
+                    turn,
+                    error = %error,
+                    "checkpoint remained locked after bounded retries; completing the turn without an undo checkpoint"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
         Ok(Some(checkpoint_id))
+    }
+}
+
+fn is_transient_sqlite_contention(error: &anyhow::Error) -> bool {
+    sqlite_error_code(error).is_some_and(|code| {
+        matches!(
+            code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    })
+}
+
+fn is_immediate_sqlite_lock(error: &anyhow::Error) -> bool {
+    sqlite_error_code(error) == Some(rusqlite::ErrorCode::DatabaseLocked)
+}
+
+fn sqlite_error_code(error: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|error| match error {
+                rusqlite::Error::SqliteFailure(details, _) => Some(details.code),
+                _ => None,
+            })
+    })
+}
+
+/// Retry one short synchronous checkpoint-store operation without retaining a
+/// connection or mutex guard across the delay. `None` means cancellation won
+/// while waiting; the caller can then skip optional checkpoint bookkeeping.
+async fn retry_checkpoint_sqlite<T>(
+    cancel: &tokio_util::sync::CancellationToken,
+    operation: &'static str,
+    delays: &[Duration],
+    mut call: impl FnMut() -> Result<T>,
+) -> Result<Option<T>> {
+    let mut retry = 0usize;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        match call() {
+            Ok(value) => return Ok(Some(value)),
+            // `busy_timeout` already waits for SQLITE_BUSY on every Store
+            // connection. Only SQLITE_LOCKED bypasses that handler and should
+            // receive this additional bounded retry schedule.
+            Err(error) if is_immediate_sqlite_lock(&error) && retry < delays.len() => {
+                let delay = delays[retry];
+                retry += 1;
+                tracing::debug!(
+                    operation,
+                    retry,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "retrying checkpoint SQLite contention"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -12180,6 +12309,97 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sqlite_busy_error() -> anyhow::Error {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("checkpoint-contention.sqlite3");
+        let holder = rusqlite::Connection::open(&database).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE value (id INTEGER); BEGIN EXCLUSIVE; INSERT INTO value VALUES (1);",
+            )
+            .unwrap();
+        let contender = rusqlite::Connection::open(&database).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let error = contender
+            .query_row("SELECT COUNT(*) FROM value", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        holder.execute_batch("ROLLBACK").unwrap();
+        anyhow::Error::new(error)
+    }
+
+    fn sqlite_locked_error() -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sqlite_retry_recovers_from_transient_contention() {
+        let mut first_error = Some(sqlite_locked_error());
+        let mut calls = 0usize;
+        let result = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "test checkpoint operation",
+            &[Duration::ZERO],
+            || {
+                calls += 1;
+                match first_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(42),
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, Some(42));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sqlite_retry_is_bounded_and_cancellation_aware() {
+        let mut errors = [sqlite_locked_error(), sqlite_locked_error()].into_iter();
+        let error = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "test checkpoint operation",
+            &[Duration::ZERO],
+            || Err::<(), _>(errors.next().unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_transient_sqlite_contention(&error));
+
+        // SQLITE_BUSY has already exhausted the connection's busy timeout,
+        // so it is skippable checkpoint contention but is not multiplied by
+        // the SQLITE_LOCKED retry schedule.
+        let mut busy = Some(sqlite_busy_error());
+        let mut busy_calls = 0usize;
+        let error = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "busy checkpoint operation",
+            &[Duration::ZERO],
+            || {
+                busy_calls += 1;
+                Err::<(), _>(busy.take().unwrap())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_transient_sqlite_contention(&error));
+        assert!(!is_immediate_sqlite_lock(&error));
+        assert_eq!(busy_calls, 1);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let skipped = retry_checkpoint_sqlite(&cancel, "cancelled operation", &[], || {
+            panic!("a cancelled checkpoint operation must not run")
+        })
+        .await
+        .unwrap();
+        assert_eq!(skipped, None::<()>);
+    }
 
     #[tokio::test]
     async fn bridged_tool_owner_router_correlates_both_arrival_orders() {

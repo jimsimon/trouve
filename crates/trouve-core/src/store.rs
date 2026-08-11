@@ -2328,6 +2328,9 @@ enum StoreMutation {
         claim_prompt_id: Option<String>,
         expected_previous_turn: Option<u64>,
     },
+    AppendCheckpoint {
+        checkpoint: Box<CheckpointRow>,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
@@ -2584,6 +2587,43 @@ fn insert_initial_checkpoint_row(
     Ok(())
 }
 
+fn append_checkpoint_row(
+    conn: &Connection,
+    row: &CheckpointRow,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let undo_pos: Option<i64> = conn.query_row(
+        "SELECT undo_pos FROM sessions WHERE id = ?1",
+        params![row.session_id],
+        |r| r.get(0),
+    )?;
+    if let Some(pos) = undo_pos {
+        conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
+            params![row.session_id, pos],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
+            params![row.session_id],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
+         VALUES (?1, ?2, ?3, ?4,
+                 (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
+                 ?5, ?6)",
+        params![
+            row.id,
+            row.session_id,
+            row.thread_id,
+            row.turn as i64,
+            row.commit_hash,
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 fn update_session_row(
     conn: &Connection,
     id: &str,
@@ -2720,6 +2760,9 @@ fn apply_store_mutation(
                 )?;
                 anyhow::ensure!(updated == 1, "turn changed while accepting message");
             }
+        }
+        StoreMutation::AppendCheckpoint { checkpoint } => {
+            append_checkpoint_row(conn, checkpoint, timestamp)?;
         }
     }
     Ok(())
@@ -7512,37 +7555,30 @@ impl Store {
         // inserting the checkpoint must be all-or-nothing, or a crash between
         // them loses the redo tail without recording the new checkpoint.
         let tx = conn.unchecked_transaction()?;
-        let undo_pos: Option<i64> = tx.query_row(
-            "SELECT undo_pos FROM sessions WHERE id = ?1",
-            params![row.session_id],
-            |r| r.get(0),
-        )?;
-        if let Some(pos) = undo_pos {
-            tx.execute(
-                "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
-                params![row.session_id, pos],
-            )?;
-            tx.execute(
-                "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
-                params![row.session_id],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4,
-                     (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
-                     ?5, ?6)",
-            params![
-                row.id,
-                row.session_id,
-                row.thread_id,
-                row.turn as i64,
-                row.commit_hash,
-                chrono::Utc::now().to_rfc3339()
-            ],
-        )?;
+        append_checkpoint_row(&tx, row, chrono::Utc::now())?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist a checkpoint and its lifecycle event in the event writer's one
+    /// transaction. This keeps the relational undo stack and durable event
+    /// log in sync while concurrent threads are streaming events.
+    pub(crate) fn append_checkpoint_with_event(
+        &self,
+        row: &CheckpointRow,
+        scope: Scope,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::AppendCheckpoint {
+                checkpoint: Box::new(row.clone()),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one checkpoint event returns one envelope"))
     }
 
     pub fn checkpoint_at(&self, session_id: &str, seq: i64) -> Result<Option<CheckpointRow>> {
@@ -9885,16 +9921,30 @@ mod tests {
         assert_eq!(store.latest_checkpoint_seq("se_1").unwrap(), Some(2));
         // Simulate undo to seq 0, then a new checkpoint: seq 1-2 replaced.
         store.set_undo_pos("se_1", Some(0)).unwrap();
-        store
-            .append_checkpoint(&CheckpointRow {
-                id: "cp_new".into(),
-                session_id: "se_1".into(),
-                thread_id: None,
-                turn: 9,
-                seq: 0,
-                commit_hash: "c1b".into(),
-            })
+        let replacement = CheckpointRow {
+            id: "cp_new".into(),
+            session_id: "se_1".into(),
+            thread_id: None,
+            turn: 9,
+            seq: 0,
+            commit_hash: "c1b".into(),
+        };
+        let envelope = store
+            .append_checkpoint_with_event(
+                &replacement,
+                Scope::Session("se_1".into()),
+                Event::CheckpointCreated {
+                    checkpoint_id: replacement.id.clone(),
+                    thread_id: "th_1".into(),
+                    turn: replacement.turn,
+                    commit: replacement.commit_hash.clone(),
+                },
+            )
             .unwrap();
+        assert!(matches!(
+            envelope.event,
+            Event::CheckpointCreated { checkpoint_id, .. } if checkpoint_id == "cp_new"
+        ));
         assert_eq!(store.latest_checkpoint_seq("se_1").unwrap(), Some(1));
         assert_eq!(store.undo_pos("se_1").unwrap(), None);
         assert_eq!(
@@ -9905,6 +9955,16 @@ mod tests {
         assert_eq!(checkpoint.session_id, "se_1");
         assert_eq!(checkpoint.turn, 9);
         assert_eq!(checkpoint.seq, 1);
+        assert!(
+            store
+                .events_after(&Scope::Session("se_1".into()), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    Event::CheckpointCreated { checkpoint_id, .. } if checkpoint_id == "cp_new"
+                ))
+        );
     }
 
     #[test]
