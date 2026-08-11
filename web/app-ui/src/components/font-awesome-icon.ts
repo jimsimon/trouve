@@ -64,6 +64,7 @@ export const FONT_AWESOME_CODEPOINTS = Object.freeze({
   "square-check": 0xf14a,
   stopwatch: 0xf2f2,
   terminal: 0xf120,
+  thumbtack: 0xf08d,
   "trash-can": 0xf2ed,
   "triangle-exclamation": 0xf071,
   user: 0xf007,

@@ -630,7 +630,6 @@ impl ThreadViewModel {
                 content,
                 attachments,
             } => {
-                self.finish_thinking();
                 self.items.push(ChatItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -1727,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_closes_thinking_and_preserves_capability_and_content() {
+    fn steering_preserves_capability_and_does_not_split_active_thinking() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 4,
@@ -1745,6 +1744,11 @@ mod tests {
             content: "Check the smaller-screen layout too.".into(),
             attachments: Vec::new(),
         }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 4,
+            text: " Continue with the revised direction.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 4 }));
 
         assert_eq!(vm.turn_steerable.get(&4), Some(&true));
         assert!(!vm.thinking);
@@ -1752,9 +1756,11 @@ mod tests {
             vm.items.as_slice(),
             [
                 ChatItem::TurnStatus { .. },
-                ChatItem::Thinking { complete: true, .. },
+                ChatItem::Thinking { content: thought, complete: true, .. },
                 ChatItem::Steered { turn: 4, content, attachments },
-            ] if content == "Check the smaller-screen layout too." && attachments.is_empty()
+            ] if thought == "Original direction. Continue with the revised direction."
+                && content == "Check the smaller-screen layout too."
+                && attachments.is_empty()
         ));
     }
 

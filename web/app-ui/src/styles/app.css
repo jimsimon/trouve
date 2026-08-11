@@ -195,13 +195,14 @@ trouve-session-list { display: block; }
 .session-pr-badge.closed { color: var(--trouve-err); }
 .thread-header { position: relative; z-index: 1; padding: 10px; border-bottom: 1px solid var(--trouve-border); background: var(--trouve-panel-bg); box-shadow: 0 1px 5px var(--trouve-scrim); }
 .thread-tab-header { z-index: 8; display: flex; align-items: center; gap: 6px; }
-.thread-tabs { height: 30px; display: flex; align-items: stretch; gap: 6px; min-width: 0; overflow-x: auto; }
-.thread-tab-header > .thread-tabs { flex: 1 1 auto; }
-.thread-tabs button { width: 145px; height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 145px; overflow: hidden; border: 0; border-radius: var(--trouve-radius); padding: 0 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; white-space: nowrap; }
+.thread-tabs { --thread-tab-width: 145px; height: 30px; display: flex; flex: 1 1 auto; align-items: stretch; gap: 6px; min-width: 0; overflow: hidden; }
+.thread-tabs button { width: var(--thread-tab-width); height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; flex: 0 0 var(--thread-tab-width); overflow: hidden; border: 0; border-radius: var(--trouve-radius); padding: 0 6px; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 12px; white-space: nowrap; }
 .thread-tabs button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .thread-tabs button[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
-.thread-tabs > .new-thread-tab { width: 30px; flex-basis: 30px; padding: 0; font-size: 15px; }
-.thread-tab-item { position: relative; width: 145px; height: 30px; flex: 0 0 145px; }
+.thread-tab-tail { display: flex; align-items: stretch; gap: 6px; flex: none; }
+.thread-tab-header > .new-thread-tab { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 30px; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text); background: var(--trouve-control-bg); font-size: 15px; }
+.thread-tab-header > .new-thread-tab:hover:not(:disabled), .thread-tab-header > .new-thread-tab:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-tab-item { position: relative; width: var(--thread-tab-width); height: 30px; flex: 0 0 var(--thread-tab-width); }
 .thread-tab-item > .thread-tab-main { width: 100%; height: 100%; flex: none; padding-inline-end: 25px; }
 .thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
 .thread-tab-item > .thread-tab-close:hover, .thread-tab-item > .thread-tab-close:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
@@ -212,24 +213,47 @@ trouve-session-list { display: block; }
 .session-indicator.thread-tab-indicator.unread { font-size: 7px; }
 .session-indicator.thread-tab-indicator.busy::before { width: 8px; height: 8px; }
 .thread-tab-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-tab-pin { color: var(--trouve-accent); font-size: 9px; }
 .thread-tab-provisional { border: 1px solid var(--trouve-border); border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 600; }
 .thread-todo-progress { min-width: 34px; flex: none; border-radius: 9px; padding: 2px 5px; color: var(--trouve-text-mid); background: var(--trouve-pill-bg); font-size: 10px; }
 .thread-tabs button[aria-selected="true"] .thread-todo-progress { background: var(--trouve-accent-dim); }
-.closed-thread-tabs { position: relative; flex: none; }
-.closed-thread-tabs-toggle { position: relative; width: 34px; height: 30px; display: grid; place-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 13px; }
-.closed-thread-tabs-toggle:hover:not(:disabled), .closed-thread-tabs-toggle:focus-visible, .closed-thread-tabs-toggle[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.closed-thread-tabs-toggle:disabled { color: var(--trouve-text-ghost); opacity: .62; }
-.closed-thread-tabs-count { position: absolute; inset-block-start: -4px; inset-inline-end: -4px; min-width: 15px; height: 15px; display: grid; place-items: center; border: 2px solid var(--trouve-panel-bg); border-radius: 999px; padding-inline: 2px; color: var(--trouve-text-hi); background: var(--trouve-accent); font-size: 8px; font-weight: 700; line-height: 1; }
-.session-indicator.closed-thread-tabs-status { position: absolute; inset-block-end: -4px; inset-inline-start: -4px; width: 15px; height: 15px; border: 2px solid var(--trouve-panel-bg); border-radius: 999px; background: var(--trouve-control-bg); pointer-events: none; }
-.closed-thread-tabs-menu { position: absolute; z-index: 30; inset-block-start: calc(100% + 6px); inset-inline-end: 0; width: min(280px, calc(100vw - 32px)); display: grid; gap: 2px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px; background: var(--trouve-panel-bg); box-shadow: 0 8px 24px var(--trouve-scrim); }
-.closed-thread-tabs-menu button { width: 100%; min-width: 0; display: grid; grid-template-columns: 14px 14px minmax(0, 1fr) 18px; align-items: center; gap: 7px; border: 0; border-radius: var(--trouve-radius-sm); padding: 7px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
-.closed-thread-kind { width: 14px; display: grid; place-items: center; color: var(--trouve-text-dim); }
-.closed-thread-tabs-menu button:hover, .closed-thread-tabs-menu button:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.closed-thread-tabs-copy { min-width: 0; display: grid; gap: 2px; }
-.closed-thread-tabs-copy strong, .closed-thread-tabs-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.closed-thread-tabs-copy strong { font-size: 11px; font-weight: 600; }
-.closed-thread-tabs-copy small { color: var(--trouve-text-dim); font-size: 9px; }
-.closed-thread-reopen-icon { color: var(--trouve-text-dim); }
+.thread-switcher { position: relative; flex: none; }
+.thread-switcher-toggle { position: relative; height: 30px; display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: var(--trouve-radius); padding: 0 8px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); font-size: 11px; }
+.thread-switcher-toggle:hover, .thread-switcher-toggle:focus-visible, .thread-switcher-toggle[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-switcher-total { min-width: 18px; border-radius: 999px; padding: 1px 5px; color: var(--trouve-text-mid); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 700; text-align: center; }
+.session-indicator.thread-switcher-status { position: absolute; inset-block-end: -4px; inset-inline-start: -4px; width: 15px; height: 15px; border: 2px solid var(--trouve-panel-bg); border-radius: 999px; background: var(--trouve-control-bg); pointer-events: none; }
+.thread-switcher-panel { position: absolute; z-index: 30; inset-block-start: calc(100% + 6px); inset-inline-end: 0; width: min(430px, calc(100vw - 32px)); max-height: min(68vh, 560px); display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-panel-bg); box-shadow: 0 10px 30px var(--trouve-scrim); }
+.thread-switcher-panel-header { display: grid; gap: 6px; border-bottom: 1px solid var(--trouve-rule); padding: 8px; }
+.thread-switcher-panel-header label { min-width: 0; display: flex; align-items: center; gap: 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 0 8px; color: var(--trouve-text-dim); background: var(--trouve-control-bg); }
+.thread-switcher-search { width: 100%; height: 30px; min-width: 0; border: 0; padding: 0; color: var(--trouve-text); background: transparent; outline: 0; font: inherit; }
+.thread-switcher-panel-header small { color: var(--trouve-text-dim); font-size: 9px; }
+.thread-switcher-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+.thread-switcher-filters button { min-height: 24px; border: 1px solid transparent; border-radius: 999px; padding: 2px 8px; color: var(--trouve-text-dim); background: var(--trouve-pill-bg); font-size: 9px; }
+.thread-switcher-filters button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-switcher-filters button:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: 1px; }
+.thread-switcher-filters button[aria-pressed="true"] { border-color: var(--trouve-accent); color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
+.thread-switcher-sections { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 5px; }
+.thread-switcher-sections section + section { margin-block-start: 7px; border-block-start: 1px solid var(--trouve-rule); padding-block-start: 5px; }
+.thread-switcher-sections h3 { margin: 0; padding: 4px 7px; color: var(--trouve-text-dim); font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.thread-switcher-tree { display: grid; gap: 1px; }
+.thread-switcher-row { --thread-depth: 0; min-width: 0; min-height: 34px; display: grid; grid-template-columns: 14px 14px minmax(0, 1fr) auto; align-items: center; gap: 7px; border-radius: var(--trouve-radius-sm); padding: 4px 5px 4px calc(7px + var(--thread-depth) * 17px); color: var(--trouve-text); background: transparent; cursor: pointer; }
+.thread-switcher-row:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.thread-switcher-row:focus-visible { outline: 2px solid var(--trouve-focus); outline-offset: -2px; color: var(--trouve-text-hi); background: var(--trouve-control-bg); }
+.thread-switcher-row.current { background: var(--trouve-accent-bg); }
+.thread-switcher-branch { width: 14px; display: grid; place-items: center; color: var(--trouve-text-faint); font-size: 10px; }
+.thread-switcher-copy { min-width: 0; display: grid; gap: 2px; }
+.thread-switcher-copy strong, .thread-switcher-copy small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-switcher-copy strong { font-size: 11px; font-weight: 600; }
+.thread-switcher-copy small { display: flex; align-items: center; gap: 5px; color: var(--trouve-text-dim); font-size: 9px; }
+.thread-switcher-current, .thread-switcher-removed, .thread-switcher-pinned { border-radius: 999px; padding: 1px 5px; font-size: 8px; font-weight: 700; }
+.thread-switcher-current { color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
+.thread-switcher-removed { color: var(--trouve-text-dim); background: var(--trouve-pill-bg); }
+.thread-switcher-pinned { color: var(--trouve-accent-tint); background: var(--trouve-accent-dim); }
+.thread-switcher-row-actions { display: inline-flex; align-items: center; gap: 2px; }
+.thread-switcher-row-action { width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-faint); background: transparent; font-size: 10px; }
+.thread-switcher-row-action:hover, .thread-switcher-row-action:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.thread-switcher-row-action.active { color: var(--trouve-accent); }
+.thread-switcher-empty { margin: 0; padding: 9px 8px; color: var(--trouve-text-dim); font-size: 10px; }
 .inspection-tabs { height: 38px; display: flex; align-items: end; gap: 2px; padding: 0 8px; }
 .inspection-tabs button, .thread-options button { border: 0; padding: 8px 10px 7px; color: var(--trouve-text-dim); background: transparent; }
 .inspection-tabs button { display: inline-flex; align-items: center; gap: 5px; }
@@ -1114,7 +1138,17 @@ trouve-command-palette { display: contents; }
   .queue-actions button, .queue-panel > footer button { min-height: 38px; }
   .thread-options { overflow-x: auto; }
   .thread-options select { max-width: 150px; min-height: 38px; }
-  .thread-tabs { height: 42px; }
+  .thread-tabs { --thread-tab-width: 128px; height: 42px; }
+  .thread-tab-item { height: 42px; }
+  .thread-tab-item > .thread-tab-close { inset-block: 10px; }
+  .thread-tab-header > .new-thread-tab, .thread-switcher-toggle { height: 42px; }
+  .thread-switcher-toggle-label { display: none; }
+  .thread-switcher-panel { position: fixed; z-index: 40; inset: auto max(8px, env(safe-area-inset-right)) calc(58px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); width: auto; max-height: min(72dvh, 600px); border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; }
+  .thread-switcher-panel-header { padding: 10px; }
+  .thread-switcher-search { height: 40px; font-size: 16px; }
+  .thread-switcher-filters button { min-height: 36px; padding-inline: 11px; font-size: 11px; }
+  .thread-switcher-row { min-height: 44px; }
+  .thread-switcher-row-action { width: 36px; height: 36px; }
   .thread-tabs button, .inspection-tabs button { min-height: 42px; }
   .diff-summary-actions button { min-height: 42px; }
   .files-inspection, .diff-inspection { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }

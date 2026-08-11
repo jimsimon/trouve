@@ -159,7 +159,6 @@ impl ThreadProjection {
                 content,
                 attachments,
             } => {
-                self.finish_thinking();
                 self.push(ThreadViewItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -1058,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_is_a_durable_top_level_boundary_inside_the_running_turn() {
+    fn steering_is_durable_without_splitting_explicitly_bounded_thinking() {
         let mut projection = ThreadProjection::default();
         for (cursor, event) in [
             Event::TurnStarted {
@@ -1086,6 +1085,7 @@ mod tests {
                 turn: 7,
                 text: "After steering.".into(),
             },
+            Event::AssistantThinkingCompleted { turn: 7 },
         ]
         .into_iter()
         .enumerate()
@@ -1101,21 +1101,16 @@ mod tests {
                 ThreadViewItem::TurnStatus { .. },
                 ThreadViewItem::User { content: prompt, .. },
                 ThreadViewItem::Thinking {
-                    content: before,
+                    content: thought,
                     complete: true,
                     ..
                 },
                 ThreadViewItem::Steered { content: steering, .. },
-                ThreadViewItem::Thinking {
-                    content: after,
-                    complete: false,
-                    ..
-                },
             ] if prompt == "Start here."
-                && before == "Before steering."
+                && thought == "Before steering.After steering."
                 && steering == "Prioritize the regression."
-                && after == "After steering."
         ));
+        assert!(!projection.snapshot.thinking);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 11;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 12;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -226,6 +226,8 @@ pub struct ResumePreferences {
     pub thread_scroll: BTreeMap<String, ChatScrollBookmark>,
     #[serde(default)]
     pub closed_thread_tabs: Vec<String>,
+    #[serde(default)]
+    pub pinned_thread_tabs: Vec<String>,
 }
 
 /// Stable first-visible chat item plus its non-negative offset into the item.

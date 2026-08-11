@@ -1,5 +1,5 @@
 import type { ThreadChatItem } from "../state/thread-view-model.js";
-import { isTodoToolCall } from "./tool-presentation.js";
+import { isSpawnOutputToolCall, isTodoToolCall } from "./tool-presentation.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
@@ -77,6 +77,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
       item.kind !== "tool"
       || (
         !linkedSpawnCalls.has(item.callId)
+        && !isSpawnOutputToolCall(item.tool, item.args)
         && (!hasTodoLifecycle || !isTodoToolCall(item.tool, item.args))
       ));
     const unit: ChatRenderUnit = Object.freeze({

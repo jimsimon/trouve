@@ -380,9 +380,17 @@ describe("Trouve visual contract", () => {
   });
 
   it("keeps the thread, turn-card, and composer geometry", () => {
-    expect(app).toMatch(/\.thread-tabs button \{[^}]*width:\s*145px[^}]*height:\s*30px/s);
+    expect(app).toMatch(
+      /\.thread-tabs \{[^}]*--thread-tab-width:\s*145px[^}]*height:\s*30px[^}]*overflow:\s*hidden/s,
+    );
+    expect(app).toMatch(
+      /\.thread-tabs button \{[^}]*width:\s*var\(--thread-tab-width\)[^}]*height:\s*30px/s,
+    );
     expect(app).toMatch(/\.thread-header \{[^}]*padding:\s*10px[^}]*box-shadow:/s);
-    expect(app).toMatch(/\.thread-tab-header \{[^}]*z-index:\s*8/s);
+    expect(app).toMatch(/\.thread-tab-header \{[^}]*z-index:\s*8[^}]*align-items:\s*center/s);
+    expect(app).toMatch(
+      /\.thread-switcher-panel \{[^}]*width:\s*min\(430px, calc\(100vw - 32px\)\)[^}]*overflow:\s*hidden/s,
+    );
     expect(app).toMatch(
       /\.thread-tab-title \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
     );
@@ -625,7 +633,10 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain('fontAwesomeIcon("code-branch")');
     expect(thread).toContain('event.key !== "Enter" || event.shiftKey');
     expect(app).toMatch(
-      /@media \(max-width: 760px\)[\s\S]*\.thread-tabs \{[^}]*height:\s*42px/,
+      /@media \(max-width: 760px\)[\s\S]*\.thread-tabs \{[^}]*--thread-tab-width:\s*128px[^}]*height:\s*42px/,
+    );
+    expect(app).toMatch(
+      /@media \(max-width: 760px\)[\s\S]*\.thread-switcher-panel \{[^}]*position:\s*fixed[^}]*max-height:\s*min\(72dvh, 600px\)/,
     );
   });
 

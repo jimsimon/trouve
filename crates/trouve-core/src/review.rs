@@ -7469,6 +7469,7 @@ mod tests {
         let thread = Thread {
             id: "th_progress".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "review".into(),
             model: "provider/progress".into(),

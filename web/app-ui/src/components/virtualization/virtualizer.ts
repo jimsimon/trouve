@@ -57,7 +57,10 @@ export class Virtualizer<T extends VirtualItem> {
   readonly #overscanPx: number;
   readonly #tailTolerancePx: number;
   readonly #measurements = new Map<string, number>();
+  readonly #indexById = new Map<string, number>();
   #items: readonly T[] = [];
+  #heights: number[] = [];
+  #heightTree: number[] = [0];
   #scrollTop = 0;
   #viewportHeight = 0;
   #mode: VirtualizationMode;
@@ -103,11 +106,12 @@ export class Virtualizer<T extends VirtualItem> {
     for (const id of this.#measurements.keys()) {
       if (!ids.has(id)) this.#measurements.delete(id);
     }
+    this.#rebuildGeometry();
 
     if (this.#followingTail) {
       this.#scrollTop = this.#tailScrollTop();
     } else if (anchor !== undefined) {
-      const anchorIndex = this.#items.findIndex((item) => item.id === anchor.id);
+      const anchorIndex = this.#indexById.get(anchor.id) ?? -1;
       if (anchorIndex >= 0) {
         this.#scrollTop = this.#clampScroll(this.#offsetAt(anchorIndex) + anchor.offset);
         this.#anchor = anchor;
@@ -199,7 +203,7 @@ export class Virtualizer<T extends VirtualItem> {
     const anchor = Object.freeze({ id: bookmark.id, offset: bookmark.offset });
     this.#followingTail = false;
     this.#anchor = anchor;
-    const anchorIndex = this.#items.findIndex((item) => item.id === anchor.id);
+    const anchorIndex = this.#indexById.get(anchor.id) ?? -1;
     if (anchorIndex >= 0) {
       this.#scrollTop = this.#clampScroll(
         this.#offsetAt(anchorIndex) + anchor.offset,
@@ -211,13 +215,18 @@ export class Virtualizer<T extends VirtualItem> {
     return correction(previousScrollTop, this.#scrollTop);
   }
 
+  hasMeasurement(id: string): boolean {
+    return this.#measurements.has(id);
+  }
+
   measure(id: string, height: number): ScrollCorrection {
     checkedHeight(height, `measured height for ${id}`);
-    const index = this.#items.findIndex((item) => item.id === id);
+    const index = this.#indexById.get(id) ?? -1;
     if (index < 0) throw new TypeError(`cannot measure unknown virtual item: ${id}`);
     const previousHeight = this.#heightAt(index);
     const previousScrollTop = this.#scrollTop;
     this.#measurements.set(id, height);
+    this.#updateHeight(index, height);
     this.#window = undefined;
     const delta = height - previousHeight;
     if (delta === 0) return correction(previousScrollTop, this.#scrollTop);
@@ -229,7 +238,7 @@ export class Virtualizer<T extends VirtualItem> {
       const anchorIndex =
         anchor === undefined
           ? -1
-          : this.#items.findIndex((item) => item.id === anchor.id);
+          : this.#indexById.get(anchor.id) ?? -1;
       if (anchorIndex >= 0 && index < anchorIndex) {
         this.#scrollTop = this.#clampScroll(this.#scrollTop + delta);
       } else {
@@ -259,21 +268,14 @@ export class Virtualizer<T extends VirtualItem> {
       totalHeight,
       this.#scrollTop + this.#viewportHeight + this.#overscanPx,
     );
-    let startIndex = 0;
-    let start = 0;
-    while (
-      startIndex < this.#items.length &&
-      start + this.#heightAt(startIndex) <= from
-    ) {
-      start += this.#heightAt(startIndex);
-      startIndex += 1;
-    }
-    let endIndex = startIndex;
-    let end = start;
-    while (endIndex < this.#items.length && end < through) {
-      end += this.#heightAt(endIndex);
-      endIndex += 1;
-    }
+    const startIndex = this.#indexAtOffset(from);
+    const start = this.#offsetAt(startIndex);
+    const throughIndex = this.#indexAtOffset(through);
+    const endIndex = Math.min(
+      this.#items.length,
+      throughIndex + (this.#offsetAt(throughIndex) < through ? 1 : 0),
+    );
+    const end = this.#offsetAt(endIndex);
     this.#window = {
       items: this.#positionedRange(startIndex, endIndex),
       paddingBefore: start,
@@ -286,26 +288,22 @@ export class Virtualizer<T extends VirtualItem> {
   }
 
   isMounted(id: string): boolean {
-    if (this.#mode === "accessible") return this.#items.some((item) => item.id === id);
+    if (this.#mode === "accessible") return this.#indexById.has(id);
     return this.window().items.some(({ item }) => item.id === id);
   }
 
   shouldUnmountHeavyweight(id: string): boolean {
-    const item = this.#items.find((candidate) => candidate.id === id);
+    const index = this.#indexById.get(id);
+    const item = index === undefined ? undefined : this.#items[index];
     return item?.heavyweight === true && !this.isMounted(id);
   }
 
   #captureAnchor(): Anchor | undefined {
     if (this.#items.length === 0) return undefined;
-    let start = 0;
-    for (let index = 0; index < this.#items.length; index += 1) {
-      const item = this.#items[index];
-      if (item === undefined) break;
-      const end = start + this.#heightAt(index);
-      if (end > this.#scrollTop) {
-        return { id: item.id, offset: this.#scrollTop - start };
-      }
-      start = end;
+    const index = this.#indexAtOffset(this.#scrollTop);
+    const item = this.#items[index];
+    if (item !== undefined) {
+      return { id: item.id, offset: this.#scrollTop - this.#offsetAt(index) };
     }
     const last = this.#items.at(-1);
     return last === undefined
@@ -327,19 +325,18 @@ export class Virtualizer<T extends VirtualItem> {
   }
 
   #heightAt(index: number): number {
-    const item = this.#items[index];
-    if (item === undefined) return 0;
-    return (
-      this.#measurements.get(item.id) ??
-      item.estimatedHeight ??
-      this.#defaultEstimatedHeight
-    );
+    return this.#heights[index] ?? 0;
   }
 
   #offsetAt(index: number): number {
     let offset = 0;
-    const limit = Math.min(index, this.#items.length);
-    for (let cursor = 0; cursor < limit; cursor += 1) offset += this.#heightAt(cursor);
+    for (
+      let cursor = Math.min(Math.max(0, Math.floor(index)), this.#items.length);
+      cursor > 0;
+      cursor -= cursor & -cursor
+    ) {
+      offset += this.#heightTree[cursor] ?? 0;
+    }
     return offset;
   }
 
@@ -353,5 +350,64 @@ export class Virtualizer<T extends VirtualItem> {
 
   #clampScroll(scrollTop: number): number {
     return Math.min(Math.max(0, scrollTop), this.#tailScrollTop());
+  }
+
+  /** Rebuild indexed geometry after an item-list change. Scroll events then
+   * locate the visible window and anchor in O(log n), instead of repeatedly
+   * walking every historical turn from the beginning. */
+  #rebuildGeometry(): void {
+    this.#indexById.clear();
+    this.#heights = new Array<number>(this.#items.length);
+    this.#heightTree = new Array<number>(this.#items.length + 1).fill(0);
+    for (let index = 0; index < this.#items.length; index += 1) {
+      const item = this.#items[index];
+      if (item === undefined) continue;
+      this.#indexById.set(item.id, index);
+      const height = this.#measurements.get(item.id)
+        ?? item.estimatedHeight
+        ?? this.#defaultEstimatedHeight;
+      this.#heights[index] = height;
+      const cursor = index + 1;
+      this.#heightTree[cursor] = (this.#heightTree[cursor] ?? 0) + height;
+      const parent = cursor + (cursor & -cursor);
+      if (parent < this.#heightTree.length) {
+        this.#heightTree[parent] = (this.#heightTree[parent] ?? 0)
+          + (this.#heightTree[cursor] ?? 0);
+      }
+    }
+  }
+
+  #updateHeight(index: number, height: number): void {
+    const previous = this.#heights[index];
+    if (previous === undefined || previous === height) return;
+    const delta = height - previous;
+    this.#heights[index] = height;
+    for (
+      let cursor = index + 1;
+      cursor < this.#heightTree.length;
+      cursor += cursor & -cursor
+    ) {
+      this.#heightTree[cursor] = (this.#heightTree[cursor] ?? 0) + delta;
+    }
+  }
+
+  /** Return the first item whose end lies beyond `offset`. The Fenwick-tree
+   * search mirrors the former `end <= offset` scan at exact row boundaries. */
+  #indexAtOffset(offset: number): number {
+    const itemCount = this.#items.length;
+    if (itemCount === 0) return 0;
+    let index = 0;
+    let accumulated = 0;
+    let step = 1;
+    while (step * 2 <= itemCount) step *= 2;
+    for (; step > 0; step = Math.floor(step / 2)) {
+      const next = index + step;
+      const height = this.#heightTree[next];
+      if (next <= itemCount && height !== undefined && accumulated + height <= offset) {
+        index = next;
+        accumulated += height;
+      }
+    }
+    return index;
   }
 }

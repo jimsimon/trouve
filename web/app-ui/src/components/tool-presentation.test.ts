@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   isTodoToolCall,
+  isSpawnOutputToolCall,
   presentToolCall,
+  presentToolDetail,
   runningActivityLabel,
   toolExecutionMetadata,
   toolDetailText,
@@ -20,16 +22,18 @@ describe("tool presentation", () => {
   });
 
   it("puts commands and bounded queries in the collapsed title", () => {
-    expect(toolLabel("Bash", { command: "wc -l  bench.rs\n" })).toBe("Bash (wc -l bench.rs)");
-    expect(toolLabel("search", { query: "markdown renderer" })).toBe("Code Search markdown renderer");
-    expect(toolLabel("Bash", { command: "é".repeat(100) })).toBe(`Bash (${"é".repeat(29)}…)`);
+    expect(toolLabel("Bash", { command: "wc -l  bench.rs\n" })).toBe("Bash: wc -l bench.rs");
+    expect(toolLabel("search", { query: "markdown renderer" })).toBe("Code Search: markdown renderer");
+    expect(toolLabel("find_related", { file_path: "src/render.rs" }))
+      .toBe("Find Related: src/render.rs");
+    expect(toolLabel("Bash", { command: "é".repeat(100) })).toBe(`Bash: ${"é".repeat(29)}…`);
   });
 
   it("unwraps Codex MCP calls for the same title contract", () => {
     expect(toolLabel("mcpToolCall", {
       tool: "mcp__trouve__search",
       arguments: { query: "settings panel" },
-    })).toBe("Code Search settings panel");
+    })).toBe("Code Search: settings panel");
   });
 
   it("presents read targets and inclusive line ranges", () => {
@@ -44,6 +48,191 @@ describe("tool presentation", () => {
       lineFrom: 100,
       lineTo: 149,
       meta: "L100-149",
+    });
+  });
+
+  it("presents plain and hashline reads as source excerpts", () => {
+    expect(presentToolDetail("read_file", {
+      path: "src/main.rs",
+      offset: 40,
+      limit: 2,
+    }, {
+      content: "pub fn main() {}\n// tail\n",
+      lines_read: 2,
+      total_lines: 90,
+      truncated: true,
+    })).toEqual({
+      kind: "source",
+      inputs: [],
+      source: {
+        path: "src/main.rs",
+        content: "pub fn main() {}\n// tail",
+        startLine: 40,
+        totalLines: 90,
+        truncated: true,
+      },
+    });
+    expect(presentToolDetail("mcpToolCall", {
+      tool: "mcp__trouve__read_file",
+      arguments: { path: "src/main.rs", format: "hashline" },
+    }, {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          content: "8:fn answer() -> u32 {\n9:  42\n10:}\n",
+          format: "hashline",
+          snapshot: "abc123",
+          truncated: false,
+          lines_read: 3,
+          total_lines: 10,
+        }),
+      }],
+    })).toMatchObject({
+      kind: "source",
+      source: {
+        content: "fn answer() -> u32 {\n  42\n}",
+        startLine: 8,
+      },
+    });
+    expect(presentToolDetail("Read", {
+      file_path: "src/native.ts",
+      offset: 7,
+    }, "const native = true;\n")).toMatchObject({
+      kind: "source",
+      inputs: [],
+      source: {
+        path: "src/native.ts",
+        content: "const native = true;",
+        startLine: 7,
+      },
+    });
+  });
+
+  it("splits semantic-search inputs from ranked result snippets", () => {
+    const detail = presentToolDetail("search", {
+      query: "thread virtualizer",
+      top_k: 2,
+      max_snippet_lines: 12,
+    }, JSON.stringify({
+      query: "thread virtualizer",
+      results: [{
+        file_path: "src/thread-screen.ts",
+        start_line: 10,
+        end_line: 20,
+        score: 0.75,
+        content: "class ThreadScreen {}",
+      }],
+    }));
+    expect(detail).toEqual({
+      kind: "search",
+      inputs: [
+        { label: "Query", value: "thread virtualizer" },
+        { label: "Repository", value: ".", code: true },
+        { label: "Results", value: "2" },
+        { label: "Snippet lines", value: "12" },
+      ],
+      results: [{
+        path: "src/thread-screen.ts",
+        startLine: 10,
+        endLine: 20,
+        score: 0.75,
+        content: "class ThreadScreen {}",
+      }],
+      truncated: false,
+    });
+  });
+
+  it("uses bounded tables and streams for grep, paths, and shell results", () => {
+    expect(presentToolDetail("grep", { pattern: "needle" }, {
+      matches: [{ path: "src/lib.rs", line: 7, text: "let needle = true;" }],
+      truncated: false,
+    })).toMatchObject({
+      kind: "matches",
+      matches: [{ path: "src/lib.rs", line: 7, text: "let needle = true;" }],
+    });
+    expect(presentToolDetail("glob", { pattern: "**/*.rs" }, {
+      files: ["src/lib.rs", "src/main.rs"],
+      truncated: false,
+    })).toMatchObject({ kind: "paths", paths: ["src/lib.rs", "src/main.rs"] });
+    expect(presentToolDetail("shell", { command: "cargo test" }, {
+      exit_code: 1,
+      stdout: "running tests",
+      stderr: "one test failed",
+      truncated: false,
+    })).toMatchObject({
+      kind: "command",
+      stdout: "running tests",
+      stderr: "one test failed",
+    });
+    expect(presentToolDetail("shell", {
+      command: "vite",
+      run_in_background: true,
+    }, {
+      job_id: "bg-1",
+      pid: 42,
+      note: "running in background",
+    })).toMatchObject({
+      kind: "command",
+      inputs: [
+        { label: "Command", value: "vite", code: true },
+        { label: "Job", value: "bg-1", code: true },
+        { label: "Process", value: "42" },
+        { label: "Background", value: "true" },
+        { label: "Note", value: "running in background" },
+      ],
+    });
+  });
+
+  it("presents transcript matches and generic MCP content without JSON wrappers", () => {
+    expect(presentToolDetail("search_transcript", { query: "checkpoint", scope: "session" }, {
+      query: "checkpoint",
+      scope: "session",
+      matches: [{
+        thread_id: "th_1",
+        turn: 12,
+        role: "assistant",
+        ts: "2026-08-10T00:00:00Z",
+        snippet: "…checkpoint complete…",
+      }],
+      truncated: false,
+    })).toMatchObject({
+      kind: "transcript",
+      matches: [{ threadId: "th_1", turn: 12, role: "assistant" }],
+    });
+    expect(presentToolDetail("mcp__example__lookup", { id: "42" }, {
+      content: [{ type: "text", text: "Found the requested record." }],
+      isError: false,
+    })).toEqual({
+      kind: "structured",
+      inputs: [{ label: "Id", value: "42" }],
+      resultText: "Found the requested record.",
+      error: false,
+    });
+  });
+
+  it("presents pageable Git diffs without exposing the result envelope", () => {
+    expect(presentToolDetail("git_diff", {
+      base: "main",
+      path: "src/lib.rs",
+      limit: 4_096,
+    }, {
+      diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+      offset: 0,
+      next_offset: 101,
+      total_bytes: 202,
+      truncated: true,
+    })).toEqual({
+      kind: "diff",
+      inputs: [
+        { label: "Base", value: "main", code: true },
+        { label: "Path", value: "src/lib.rs", code: true },
+        { label: "Byte offset", value: "0" },
+        { label: "Byte limit", value: "4096" },
+      ],
+      diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+      truncated: true,
+      nextOffset: 101,
+      totalBytes: 202,
     });
   });
 
@@ -107,6 +296,16 @@ describe("tool presentation", () => {
       arguments: { todos: [] },
     })).toBe(true);
     expect(isTodoToolCall("read_file", {})).toBe(false);
+  });
+
+  it("recognizes native and wrapped child-agent collection calls", () => {
+    expect(isSpawnOutputToolCall("spawn_output", {})).toBe(true);
+    expect(isSpawnOutputToolCall("mcp__trouve__spawn_output", {})).toBe(true);
+    expect(isSpawnOutputToolCall("mcpToolCall", {
+      tool: "mcp__trouve__spawn_output",
+      arguments: { thread_id: "th_child" },
+    })).toBe(true);
+    expect(isSpawnOutputToolCall("spawn_thread", {})).toBe(false);
   });
 
   it("formats human-readable bounded tool detail without JSON noise", () => {

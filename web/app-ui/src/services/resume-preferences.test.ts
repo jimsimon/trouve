@@ -24,6 +24,7 @@ describe("resume preferences", () => {
         "th-3": { itemId: "assistant:43", offset: Number.POSITIVE_INFINITY },
       },
       closedThreadTabs: ["th-2", "bad/thread", "th-2", "th-3"],
+      pinnedThreadTabs: ["th-1", "bad/thread", "th-1", "th-2"],
     });
 
     expect(normalized).toEqual({
@@ -31,6 +32,7 @@ describe("resume preferences", () => {
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "assistant:42", offset: 18.5 } },
       closedThreadTabs: ["th-2", "th-3"],
+      pinnedThreadTabs: ["th-1"],
     });
     expect(Object.isFrozen(normalized)).toBe(true);
     expect(Object.isFrozen(normalized.threadScroll["th-1"])).toBe(true);
@@ -49,12 +51,14 @@ describe("resume preferences", () => {
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "user:1", offset: 4 } },
       closedThreadTabs: ["th-2"],
+      pinnedThreadTabs: ["th-1"],
     });
     expect(adapter.load()).toEqual({
       selectedSessionId: "se-1",
       sessionThreads: { "se-1": "th-1" },
       threadScroll: { "th-1": { itemId: "user:1", offset: 4 } },
       closedThreadTabs: ["th-2"],
+      pinnedThreadTabs: ["th-1"],
     });
     values.set("trouve.resume.v1", "{");
     expect(adapter.load()).toBeUndefined();
@@ -78,6 +82,13 @@ describe("resume preferences", () => {
     expect(closed.closedThreadTabs).toEqual(["th-2"]);
     expect(controller.setThreadTabClosed("th-2", true)).toBe(closed);
     expect(controller.setThreadTabClosed("th-2", false).closedThreadTabs).toEqual([]);
+
+    const pinned = controller.setThreadTabPinned("th-1", true);
+    expect(pinned.pinnedThreadTabs).toEqual(["th-1"]);
+    expect(controller.setThreadTabPinned("th-1", true)).toBe(pinned);
+    const closedPinned = controller.setThreadTabClosed("th-1", true);
+    expect(closedPinned.pinnedThreadTabs).toEqual([]);
+    expect(controller.setThreadTabPinned("th-1", true)).toBe(closedPinned);
   });
 
   it("opens running and queued threads at the tail instead of parked history", () => {

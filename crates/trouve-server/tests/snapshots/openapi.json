@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "3.35"
+    "version": "3.36"
   },
   "paths": {
     "/v1/approvals": {
@@ -11917,6 +11917,17 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "parent_thread_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/String",
+                "description": "Direct parent when this thread was spawned by another thread. The\nrelation is optional so user-created threads and older servers remain\ncompatible; clients can use it to render nested collaborator trees."
+              }
+            ]
           },
           "permission_mode": {
             "$ref": "#/components/schemas/PermissionMode"

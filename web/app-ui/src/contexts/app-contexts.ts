@@ -98,6 +98,7 @@ export interface AppServices {
   readonly composerDrafts: ComposerDraftController;
   readonly resumePreferences: ReadonlySignal<ResumePreferences>;
   readonly setThreadTabClosed: (threadId: string, closed: boolean) => void;
+  readonly setThreadTabPinned: (threadId: string, pinned: boolean) => void;
   readonly protocol: ProtocolClient;
   readonly modelCatalog: ModelCatalogController;
   readonly subscriptionHealth: SubscriptionHealthController;

@@ -4214,6 +4214,7 @@ export interface components {
             model_options?: {
                 [key: string]: unknown;
             };
+            parent_thread_id?: null | components["schemas"]["String"];
             permission_mode: components["schemas"]["PermissionMode"];
             session_id: components["schemas"]["String"];
             /**

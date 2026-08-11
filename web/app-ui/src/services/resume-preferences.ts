@@ -28,6 +28,7 @@ export interface ResumePreferences {
   readonly sessionThreads: Readonly<Record<string, string>>;
   readonly threadScroll: Readonly<Record<string, ChatScrollBookmark>>;
   readonly closedThreadTabs: readonly string[];
+  readonly pinnedThreadTabs: readonly string[];
 }
 
 /** Pick an already-open tab when navigation targets a session rather than a
@@ -63,6 +64,7 @@ export const DEFAULT_RESUME_PREFERENCES: ResumePreferences = Object.freeze({
   sessionThreads: emptyRecord<string>(),
   threadScroll: emptyRecord<ChatScrollBookmark>(),
   closedThreadTabs: emptyList<string>(),
+  pinnedThreadTabs: emptyList<string>(),
 });
 
 export interface ResumePreferenceStorage {
@@ -132,7 +134,7 @@ const normalizeThreadScroll = (
   return Object.freeze(normalized);
 };
 
-const normalizeClosedThreadTabs = (value: unknown): readonly string[] => {
+const normalizeThreadTabIds = (value: unknown): readonly string[] => {
   if (!Array.isArray(value)) return emptyList<string>();
   const normalized: string[] = [];
   const seen = new Set<string>();
@@ -149,13 +151,19 @@ const normalizeClosedThreadTabs = (value: unknown): readonly string[] => {
 export const normalizeResumePreferences = (value: unknown): ResumePreferences => {
   const source = objectRecord(value);
   if (source === undefined) return DEFAULT_RESUME_PREFERENCES;
+  const closedThreadTabs = normalizeThreadTabIds(source["closedThreadTabs"]);
+  const closed = new Set(closedThreadTabs);
   return Object.freeze({
     selectedSessionId: validProtocolId(source["selectedSessionId"])
       ? source["selectedSessionId"]
       : "",
     sessionThreads: normalizeSessionThreads(source["sessionThreads"]),
     threadScroll: normalizeThreadScroll(source["threadScroll"]),
-    closedThreadTabs: normalizeClosedThreadTabs(source["closedThreadTabs"]),
+    closedThreadTabs,
+    pinnedThreadTabs: Object.freeze(
+      normalizeThreadTabIds(source["pinnedThreadTabs"]).filter((threadId) =>
+        !closed.has(threadId)),
+    ),
   });
 };
 
@@ -173,6 +181,10 @@ const sameResumePreferences = (
   if (
     left.closedThreadTabs.length !== right.closedThreadTabs.length ||
     left.closedThreadTabs.some((threadId, index) => right.closedThreadTabs[index] !== threadId)
+  ) return false;
+  if (
+    left.pinnedThreadTabs.length !== right.pinnedThreadTabs.length ||
+    left.pinnedThreadTabs.some((threadId, index) => right.pinnedThreadTabs[index] !== threadId)
   ) return false;
   const leftScroll = Object.entries(left.threadScroll);
   const rightScroll = Object.entries(right.threadScroll);
@@ -259,6 +271,7 @@ export class ResumePreferencesController {
         : appendBounded(current.sessionThreads, sessionId, threadId),
       threadScroll: current.threadScroll,
       closedThreadTabs: current.closedThreadTabs,
+      pinnedThreadTabs: current.pinnedThreadTabs,
     });
     return this.#commit(next, persist);
   }
@@ -281,6 +294,32 @@ export class ResumePreferencesController {
     return this.#commit(Object.freeze({
       ...current,
       closedThreadTabs,
+      pinnedThreadTabs: closed
+        ? Object.freeze(current.pinnedThreadTabs.filter((candidate) => candidate !== threadId))
+        : current.pinnedThreadTabs,
+    }), persist);
+  }
+
+  setThreadTabPinned(
+    threadId: string,
+    pinned: boolean,
+    persist = true,
+  ): ResumePreferences {
+    const current = this.#current.get();
+    if (!validProtocolId(threadId) || current.closedThreadTabs.includes(threadId)) {
+      return current;
+    }
+    const existingIndex = current.pinnedThreadTabs.indexOf(threadId);
+    if ((pinned && existingIndex >= 0) || (!pinned && existingIndex < 0)) return current;
+    const pinnedThreadTabs = pinned
+      ? Object.freeze([
+          ...current.pinnedThreadTabs.slice(-(MAX_ENTRIES - 1)),
+          threadId,
+        ])
+      : Object.freeze(current.pinnedThreadTabs.filter((candidate) => candidate !== threadId));
+    return this.#commit(Object.freeze({
+      ...current,
+      pinnedThreadTabs,
     }), persist);
   }
 

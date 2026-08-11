@@ -26,6 +26,7 @@ import type {
   ProtocolResolveApprovalRequest,
   ProtocolResolveQuestionRequest,
   ProtocolSubscriptionHealth,
+  ProtocolThread,
   ProtocolUpdateThreadRequest,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
@@ -139,6 +140,13 @@ import {
   rovingTabIndex,
 } from "./tab-navigation.js";
 import { threadNavigationTitle } from "./thread-title.js";
+import {
+  threadSwitcherRows,
+  threadWorkingSet,
+  type ThreadSwitcherFilter,
+  type ThreadSwitcherEntry,
+  type ThreadSwitcherRow,
+} from "./thread-switcher-model.js";
 import { subagentThreadIsReadOnly } from "./subagent-access.js";
 import type {
   NewThreadSetupCancelEvent,
@@ -218,8 +226,15 @@ interface ActiveComposerCompletion {
 interface MarkdownContextMenu {
   readonly markdown: string;
   readonly selection: string;
+  readonly selectionRanges: readonly Range[];
   readonly x: number;
   readonly y: number;
+}
+
+interface PendingMarkdownContextSelection {
+  readonly source: HTMLElement;
+  readonly text: string;
+  readonly ranges: readonly Range[];
 }
 
 interface ChatDomAnchor {
@@ -377,6 +392,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #restoredScrollThreadId: string | undefined;
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
+  #toolDetailRequested = false;
   #queueEditId = "";
   #queueEditRetainedAttachments: ProtocolAttachment[] = [];
   #queueEditReturnDraft: ComposerDraft | undefined;
@@ -436,6 +452,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #usageGeneration = 0;
   #copyFeedbackGeneration = 0;
   #markdownContextMenu: MarkdownContextMenu | undefined;
+  #pendingMarkdownContextSelection: PendingMarkdownContextSelection | undefined;
   #markdownContextMenuStatus = "";
   #markdownContextMenuReturnFocus: HTMLElement | undefined;
   readonly #approvalSubmissions = new ApprovalSubmissionTracker();
@@ -447,7 +464,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   readonly #toolDetailErrors = new Map<string, string>();
   readonly #questionWizards = new Map<string, QuestionWizardState>();
   readonly #questionSubmissions = new Set<string>();
-  #closedThreadMenuOpen = false;
+  #threadSwitcherOpen = false;
+  #threadSwitcherQuery = "";
+  #threadSwitcherFilter: ThreadSwitcherFilter = "all";
+  #threadTabCapacity = 4;
+  #recentThreadIds: readonly string[] = [];
+  #threadTabResizeObserver: ResizeObserver | undefined;
+  #observedThreadTabs: HTMLElement | undefined;
   #pendingThreadTabFocus = "";
 
   readonly #services = new ContextConsumer(this, {
@@ -485,7 +508,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#observedSubscriptionUsageCursor = 0;
     }
     if (changed.has("sessionId")) {
-      this.#closedThreadMenuOpen = false;
+      this.#threadSwitcherOpen = false;
+      this.#threadSwitcherQuery = "";
+      this.#threadSwitcherFilter = "all";
+      this.#recentThreadIds = [];
       this.#sessionProvider.setValue({ sessionId: this.sessionId });
       this.#newThreadSetupOpen = false;
       this.#newThreadBusy = false;
@@ -524,8 +550,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (changed.has("threadId")) {
       if (this.threadId !== "") {
         this.#services.value?.setThreadTabClosed(this.threadId, false);
+        this.#recentThreadIds = [
+          this.threadId,
+          ...this.#recentThreadIds.filter((id) => id !== this.threadId),
+        ].slice(0, 32);
       }
-      this.#closedThreadMenuOpen = false;
+      this.#threadSwitcherOpen = false;
       this.#observedSubscriptionUsageCursor = 0;
       this.#turnRequestGeneration += 1;
       this.#attachmentGeneration += 1;
@@ -571,6 +601,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#copyFeedbackGeneration += 1;
       this.#copyFeedback.clear();
       this.#markdownContextMenu = undefined;
+      this.#pendingMarkdownContextSelection = undefined;
       this.#markdownContextMenuStatus = "";
       this.#markdownContextMenuReturnFocus = undefined;
       this.#messageDisclosure.clear();
@@ -627,6 +658,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#restoreComposerDraft(draftThreadId);
     }
     this.#resizeComposer();
+    this.#observeThreadWorkingSet();
     if (this.#pendingThreadTabFocus !== "") {
       const threadId = this.#pendingThreadTabFocus;
       const tab = [...this.querySelectorAll<HTMLButtonElement>("[data-thread-tab-id]")]
@@ -704,40 +736,47 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && globalThis.performance.now() < this.#nativeScrollCorrectionBlockedUntil;
       let measured = false;
       let scrollCorrected = false;
-      let historyScrollCorrected = false;
+      let historyLayoutChanged = false;
       for (const entry of entries) {
         const element = entry.target as HTMLElement;
         const id = element.dataset["virtualId"];
         if (id === undefined || entry.contentRect.height <= 0) continue;
         measured = true;
         try {
+          const previouslyMeasured = this.#virtualizer.hasMeasurement(id);
           const correction = this.#virtualizer.measure(id, entry.contentRect.height);
           if (correction.delta !== 0) {
             scrollCorrected = true;
-            if (id.startsWith("turn:")) historyScrollCorrected = true;
+            // The first observation of a newly mounted history row only
+            // replaces its estimate; compensating for that during wheel
+            // momentum produces a micro-stutter. A later size change is real
+            // visible layout (Markdown, an attachment, disclosure content)
+            // and must retain the reader's anchor.
+            if (id.startsWith("turn:") && previouslyMeasured) {
+              historyLayoutChanged = true;
+            }
           }
         } catch {
           // A row may have unmounted between delivery and measurement.
         }
       }
       let expectedScrollTop: number | undefined;
-      if (!followingTail && historyScrollCorrected) {
-        // Complete turn rows begin with estimates and can lay out again when
-        // Markdown or attachments mount. Preserve the current virtual anchor
-        // for changes above it even during wheel or scrollbar momentum;
-        // otherwise newly discovered height visibly replaces the content
-        // under the reader.
-        expectedScrollTop = this.#virtualizer.window().scrollTop;
-      } else if (!followingTail && layoutAnchor === undefined && measured && nativeScrollActive) {
-        // A native scroll clears the settled DOM anchor. During wheel, touch,
-        // keyboard, or scrollbar momentum, measurements may update geometry
-        // but must never write a compensating scroll position. Re-anchor the
-        // model to the browser's live position and wait until scrolling has
-        // settled before permitting layout correction again.
+      if (!followingTail && measured && nativeScrollActive && !historyLayoutChanged) {
+        // Native wheel, touch, keyboard, and scrollbar movement is
+        // authoritative while momentum is active. Measurements may update
+        // cached geometry, but never compensate scrollTop during that window:
+        // doing so creates a small reverse jump that the next native scroll
+        // event immediately undoes. Re-anchor the model to the browser and
+        // defer precise DOM-anchor correction until scrolling has settled.
         this.#virtualizer.setViewport(activeViewport.scrollTop, activeViewport.clientHeight, {
           userInitiated: true,
           atTail: false,
         });
+      } else if (!followingTail && historyLayoutChanged) {
+        // Complete turn rows begin with estimates and can lay out again when
+        // Markdown or attachments mount. Once native scrolling has settled,
+        // preserve the current virtual anchor for changes above it.
+        expectedScrollTop = this.#virtualizer.window().scrollTop;
       } else if (!followingTail && layoutAnchor === undefined && scrollCorrected) {
         // If a nested DOM anchor is temporarily unavailable after scrolling
         // has settled, the virtualizer's stable row anchor is the fallback.
@@ -794,7 +833,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   override connectedCallback(): void {
     super.connectedCallback();
     document.addEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
-    document.addEventListener("pointerdown", this.#dismissClosedThreadMenuFromPointer, true);
+    document.addEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
+    document.addEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
+    document.addEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
     document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.addEventListener("pagehide", this.#persistComposerDraftFromPageHide);
@@ -803,12 +844,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   override disconnectedCallback(): void {
     this.#persistComposerDraftNow();
     document.removeEventListener("pointerdown", this.#dismissMarkdownContextMenuFromPointer, true);
-    document.removeEventListener("pointerdown", this.#dismissClosedThreadMenuFromPointer, true);
+    document.removeEventListener("pointerup", this.#restoreMarkdownContextMenuSelectionFromPointer, true);
+    document.removeEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
+    document.removeEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
     document.removeEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.removeEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.removeEventListener("pagehide", this.#persistComposerDraftFromPageHide);
     this.#resizeObserver?.disconnect();
     this.#resizeObserver = undefined;
+    this.#threadTabResizeObserver?.disconnect();
+    this.#threadTabResizeObserver = undefined;
+    this.#observedThreadTabs = undefined;
     this.#observedVirtualRows.clear();
     this.#cancelProgrammaticScrollWindow();
     this.#cancelTailConvergence();
@@ -833,6 +879,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#clearMentionPathsRetry();
     this.#clearQueueDragImage();
     this.#markdownContextMenu = undefined;
+    this.#pendingMarkdownContextSelection = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     super.disconnectedCallback();
   }
@@ -859,6 +906,32 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
+  #observeThreadWorkingSet(): void {
+    const tabs = this.querySelector<HTMLElement>(".thread-tabs");
+    if (tabs === null || tabs === this.#observedThreadTabs) return;
+    this.#threadTabResizeObserver?.disconnect();
+    this.#observedThreadTabs = tabs;
+    const synchronize = (): void => {
+      if (!tabs.isConnected || tabs.clientWidth <= 0) return;
+      const style = getComputedStyle(tabs);
+      const tabWidth = Number.parseFloat(
+        style.getPropertyValue("--thread-tab-width"),
+      ) || 145;
+      const gap = Number.parseFloat(style.columnGap) || 6;
+      const capacity = Math.max(
+        1,
+        Math.floor((tabs.clientWidth + gap) / (tabWidth + gap)),
+      );
+      if (capacity === this.#threadTabCapacity) return;
+      this.#threadTabCapacity = capacity;
+      this.requestUpdate();
+    };
+    synchronize();
+    if (typeof ResizeObserver === "undefined") return;
+    this.#threadTabResizeObserver ??= new ResizeObserver(synchronize);
+    this.#threadTabResizeObserver.observe(tabs);
+  }
+
   override render() {
     const store = this.#store.value;
     const services = this.#services.value;
@@ -866,15 +939,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       return html`<div class="screen-empty" role="status">Loading thread…</div>`;
     }
     const sessionThreads = store.threadsForSession(this.sessionId);
-    const closedThreadTabs = new Set(
-      readSignal(services.resumePreferences).closedThreadTabs,
-    );
+    const resumePreferences = readSignal(services.resumePreferences);
+    const closedThreadTabs = new Set(resumePreferences.closedThreadTabs);
+    const pinnedThreadTabs = new Set(resumePreferences.pinnedThreadTabs);
     const closedThreads = sessionThreads.filter((candidate) =>
       closedThreadTabs.has(candidate.id));
-    const closedThreadIndicator = attentionOrUnreadIndicatorPresentation(
-      closedThreads.map((candidate) => store.threadIndicatorState(candidate.id)),
-    );
-    const closedThreadStatusLabel = closedThreadIndicator.tooltip;
     const threads = sessionThreads.filter((candidate) =>
       candidate.id === this.threadId
       || !closedThreadTabs.has(candidate.id));
@@ -892,11 +961,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       view?.turnThinkingLevels,
     );
     this.#reconcileTurnAcknowledgements(view?.items ?? [], view?.turnRunning ?? false);
-    const selectedThreadIndex = threads.findIndex((candidate) => candidate.id === this.threadId);
-    const selectedTabIndex = newThreadSetupOpen
-      ? threads.length
-      : selectedThreadIndex;
-    const threadTabCount = threads.length + (newThreadSetupOpen ? 1 : 0);
     const session = readSignal(store.sessions).find(
       (session) => session.id === this.sessionId,
     );
@@ -909,6 +973,66 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         initialThreadId,
         modeDisplayName: this.#modes.find((mode) => mode.id === candidate.mode)?.display_name,
       });
+    const workingThreadIds = threadWorkingSet(
+      threads.map((candidate) => candidate.id),
+      this.threadId,
+      resumePreferences.pinnedThreadTabs,
+      this.#recentThreadIds,
+      Math.max(1, this.#threadTabCapacity - (newThreadSetupOpen ? 1 : 0)),
+    );
+    const workingThreadIdSet = new Set(workingThreadIds);
+    const workingThreads = workingThreadIds
+      .map((id) => threads.find((candidate) => candidate.id === id))
+      .filter((candidate): candidate is ProtocolThread => candidate !== undefined);
+    const selectedThreadIndex = workingThreads.findIndex(
+      (candidate) => candidate.id === this.threadId,
+    );
+    const selectedTabIndex = newThreadSetupOpen
+      ? workingThreads.length
+      : selectedThreadIndex;
+    const threadTabCount = workingThreads.length + (newThreadSetupOpen ? 1 : 0);
+    const hiddenThreads = sessionThreads.filter(
+      (candidate) => !workingThreadIdSet.has(candidate.id),
+    );
+    const overflowThreads = threads.filter(
+      (candidate) => !workingThreadIdSet.has(candidate.id),
+    );
+    const hiddenThreadIndicator = attentionOrUnreadIndicatorPresentation(
+      hiddenThreads.map((candidate) => store.threadIndicatorState(candidate.id)),
+    );
+    const hiddenThreadStatusLabel = hiddenThreadIndicator.tooltip;
+    const switcherEntries: readonly ThreadSwitcherEntry[] = sessionThreads.map(
+      (candidate) => {
+        const indicatorState = store.threadIndicatorState(candidate.id);
+        return {
+        id: candidate.id,
+        parentThreadId: candidate.parent_thread_id,
+        title: labelForThread(candidate),
+        detail: `${candidate.model} ${candidate.mode}`,
+        closed: closedThreadTabs.has(candidate.id),
+        pinned: pinnedThreadTabs.has(candidate.id),
+        active: indicatorState.active || indicatorState.outcome === "running",
+        needsAttention: indicatorState.attention !== "none"
+          || indicatorState.outcome === "failed"
+          || indicatorState.unread,
+        };
+      },
+    );
+    const pinnedSwitcherRows = threadSwitcherRows(
+      switcherEntries.filter((entry) => !entry.closed && entry.pinned),
+      this.#threadSwitcherQuery,
+      this.#threadSwitcherFilter,
+    );
+    const openSwitcherRows = threadSwitcherRows(
+      switcherEntries.filter((entry) => !entry.closed && !entry.pinned),
+      this.#threadSwitcherQuery,
+      this.#threadSwitcherFilter,
+    );
+    const closedSwitcherRows = threadSwitcherRows(
+      switcherEntries.filter((entry) => entry.closed),
+      this.#threadSwitcherQuery,
+      this.#threadSwitcherFilter,
+    );
     const serverOnline = readSignal(store.serverInfo)?.online;
     const models = this.#availableModels();
     const connectivityBlocked = serverOnline === false && models.length === 0;
@@ -964,170 +1088,287 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       thread?.model.startsWith("codex/") ?? false,
     );
     const sessionUsageText = formatSessionUsage(this.#sessionUsage);
+    const leadingThreads = newThreadSetupOpen
+      ? workingThreads
+      : workingThreads.slice(0, -1);
+    const trailingThread = newThreadSetupOpen ? undefined : workingThreads.at(-1);
+    const renderThreadTab = (
+      candidate: (typeof threads)[number],
+      index: number,
+    ) => {
+      const label = labelForThread(candidate);
+      const indicator = sessionIndicatorPresentation(
+        store.threadIndicatorState(candidate.id),
+      );
+      const statusLabel = indicator.tooltip
+        || (indicator.kind === "busy" ? "Processing" : "");
+      return html`
+        <span class="thread-tab-item" role="presentation">
+          <button
+            class="thread-tab-main"
+            type="button"
+            role="tab"
+            aria-label=${statusLabel === "" ? label : `${label}, ${statusLabel}`}
+            title=${label}
+            data-thread-tab-id=${candidate.id}
+            aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
+            tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
+            @keydown=${(event: KeyboardEvent) =>
+              this.#selectThreadWithKeyboard(event, index, workingThreads, newThreadSetupOpen)}
+            @click=${() => this.#selectThread(candidate.id)}
+          >
+            <span class="thread-tab-label"><span
+              class=${`session-indicator thread-tab-indicator ${indicator.kind}`}
+              title=${statusLabel}
+              aria-hidden="true"
+            >${indicator.icon === undefined
+              ? nothing
+              : fontAwesomeIcon(indicator.icon)}</span>${candidate.spawned === true
+              ? fontAwesomeIcon("code-branch")
+              : nothing}${pinnedThreadTabs.has(candidate.id)
+              ? fontAwesomeIcon("thumbtack", { className: "thread-tab-pin" })
+              : nothing}<span class="thread-tab-title">${label}</span></span>
+            ${threadTodoProgress(candidate.todos) === ""
+              ? nothing
+              : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
+          </button>
+          <button
+            class="thread-tab-close"
+            type="button"
+            aria-label=${`Close thread tab ${label}`}
+            title="Close thread tab"
+            @click=${(event: MouseEvent) =>
+              this.#closeThreadTab(event, candidate.id)}
+          >${fontAwesomeIcon("xmark")}</button>
+        </span>
+      `;
+    };
+    const renderSwitcherRow = (
+      row: ThreadSwitcherRow,
+      removed: boolean,
+    ) => {
+      const candidate = sessionThreads.find(
+        (threadCandidate) => threadCandidate.id === row.entry.id,
+      );
+      if (candidate === undefined) return nothing;
+      const indicator = sessionIndicatorPresentation(
+        store.threadIndicatorState(candidate.id),
+      );
+      const statusLabel = indicator.tooltip
+        || (indicator.kind === "busy" ? "Processing" : "");
+      const current = candidate.id === this.threadId;
+      const kindLabel = candidate.spawned === true
+        ? subagentThreadIsReadOnly(candidate, this.#modes)
+          ? "Read-only subagent"
+          : "Interactive subagent"
+        : "Conversation";
+      return html`
+        <div
+          class=${`thread-switcher-row${current ? " current" : ""}`}
+          role="treeitem"
+          aria-level=${row.depth + 1}
+          aria-current=${current ? "page" : nothing}
+          aria-label=${statusLabel === ""
+            ? row.entry.title
+            : `${row.entry.title}, ${statusLabel}`}
+          title=${row.entry.title}
+          data-thread-switcher-id=${candidate.id}
+          style=${`--thread-depth: ${Math.min(row.depth, 8)}`}
+          tabindex="-1"
+          @click=${() => this.#activateThreadSwitcherRow(candidate.id, removed)}
+          @keydown=${this.#threadSwitcherRowKeydown}
+        >
+          <span class="thread-switcher-branch" aria-hidden="true">${row.depth > 0
+            ? fontAwesomeIcon("code-branch")
+            : nothing}</span>
+          <span
+            class=${`session-indicator thread-tab-indicator ${indicator.kind}`}
+            title=${statusLabel}
+            aria-hidden="true"
+          >${indicator.icon === undefined
+            ? nothing
+            : fontAwesomeIcon(indicator.icon)}</span>
+          <span class="thread-switcher-copy">
+            <strong>${row.entry.title}</strong>
+            <small>${kindLabel} · ${candidate.model}${row.entry.pinned
+              ? html`<span class="thread-switcher-pinned">Pinned</span>`
+              : nothing}${current
+              ? html`<span class="thread-switcher-current">Current</span>`
+              : nothing}${removed
+              ? html`<span class="thread-switcher-removed">Removed from bar</span>`
+              : nothing}</small>
+          </span>
+          <span class="thread-switcher-row-actions">
+            ${removed ? nothing : html`<button
+              class=${`thread-switcher-row-action${row.entry.pinned ? " active" : ""}`}
+              type="button"
+              aria-label=${row.entry.pinned
+                ? `Unpin ${row.entry.title}`
+                : `Pin ${row.entry.title}`}
+              aria-pressed=${row.entry.pinned ? "true" : "false"}
+              title=${row.entry.pinned ? "Unpin thread" : "Pin thread"}
+              @click=${(event: MouseEvent) =>
+                this.#setThreadTabPinned(event, candidate.id, !row.entry.pinned)}
+            >${fontAwesomeIcon("thumbtack")}</button>`}
+            <button
+              class="thread-switcher-row-action"
+              type="button"
+              aria-label=${removed
+                ? `Add ${row.entry.title} to the working bar`
+                : `Remove ${row.entry.title} from the working bar`}
+              title=${removed ? "Add to working bar" : "Remove from working bar"}
+              @click=${(event: MouseEvent) => {
+                event.stopPropagation();
+                if (removed) this.#reopenClosedThread(candidate.id);
+                else this.#closeThreadTab(event, candidate.id);
+              }}
+            >${fontAwesomeIcon(removed ? "rotate-left" : "xmark")}</button>
+          </span>
+        </div>
+      `;
+    };
     return html`
       <header class="thread-header thread-tab-header">
         <div class="thread-tabs" role="tablist" aria-label="Threads">
           ${repeat(
-            threads,
+            leadingThreads,
             (candidate) => candidate.id,
-            (candidate, index) => {
-              const label = labelForThread(candidate);
-              const indicator = sessionIndicatorPresentation(
-                store.threadIndicatorState(candidate.id),
-              );
-              const statusLabel = indicator.tooltip
-                || (indicator.kind === "busy" ? "Processing" : "");
-              return html`
-              <span class="thread-tab-item" role="presentation">
-                <button
-                  class="thread-tab-main"
-                  type="button"
-                  role="tab"
-                  aria-label=${statusLabel === "" ? label : `${label}, ${statusLabel}`}
-                  title=${label}
-                  data-thread-tab-id=${candidate.id}
-                  aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
-                  tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
-                  @keydown=${(event: KeyboardEvent) =>
-                    this.#selectThreadWithKeyboard(event, index, threads, newThreadSetupOpen)}
-                  @click=${() => this.#selectThread(candidate.id)}
-                >
-                  <span class="thread-tab-label"><span
-                    class=${`session-indicator thread-tab-indicator ${indicator.kind}`}
-                    title=${statusLabel}
-                    aria-hidden="true"
-                  >${indicator.icon === undefined
-                    ? nothing
-                    : fontAwesomeIcon(indicator.icon)}</span>${candidate.spawned === true
-                    ? fontAwesomeIcon("code-branch")
-                    : nothing}<span class="thread-tab-title">${label}</span></span>
-                  ${threadTodoProgress(candidate.todos) === ""
-                    ? nothing
-                    : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
-                </button>
-                <button
-                  class="thread-tab-close"
-                  type="button"
-                  aria-label=${`Close thread tab ${label}`}
-                  title="Close thread tab"
-                  @click=${(event: MouseEvent) =>
-                    this.#closeThreadTab(event, candidate.id)}
-                >${fontAwesomeIcon("xmark")}</button>
-              </span>
-            `;
-            },
+            renderThreadTab,
           )}
-          ${newThreadSetupOpen
-            ? html`
+          <span class="thread-tab-tail" role="presentation">
+            ${trailingThread === undefined
+              ? nothing
+              : renderThreadTab(trailingThread, workingThreads.length - 1)}
+            ${newThreadSetupOpen
+              ? html`
                 <button
                   type="button"
                   role="tab"
                   class="provisional-thread-tab"
                   aria-selected="true"
-                  tabindex=${rovingTabIndex(threads.length, selectedTabIndex, threadTabCount)}
+                  tabindex=${rovingTabIndex(workingThreads.length, selectedTabIndex, threadTabCount)}
                   @keydown=${(event: KeyboardEvent) =>
-                    this.#selectThreadWithKeyboard(event, threads.length, threads, newThreadSetupOpen)}
+                    this.#selectThreadWithKeyboard(
+                      event,
+                      workingThreads.length,
+                      workingThreads,
+                      newThreadSetupOpen,
+                    )}
                 >
                   <span class="thread-tab-label">New Thread</span>
                 </button>
               `
-            : nothing}
-          <button
-            class="new-thread-tab"
-            type="button"
-            aria-label="New thread"
-            title="New thread"
-            ?disabled=${this.sessionId === "" || newThreadSetupOpen || this.#newThreadBusy}
-            @click=${this.openNewThreadSetup}
-          >${fontAwesomeIcon("plus")}</button>
+              : nothing}
+          </span>
         </div>
-        <div class="closed-thread-tabs">
+        <button
+          class="new-thread-tab"
+          type="button"
+          aria-label="New thread"
+          title="New thread"
+          ?disabled=${this.sessionId === "" || newThreadSetupOpen || this.#newThreadBusy}
+          @click=${this.openNewThreadSetup}
+        >${fontAwesomeIcon("plus")}</button>
+        <div class="thread-switcher">
           <button
-            class="closed-thread-tabs-toggle"
+            class="thread-switcher-toggle"
             type="button"
-            aria-label=${closedThreads.length === 0
-              ? "No closed threads"
-              : `Closed threads (${closedThreads.length})${closedThreadStatusLabel === ""
-                ? ""
-                : `, ${closedThreadStatusLabel}`}`}
-            title=${closedThreads.length === 0
-              ? "No closed threads"
-              : closedThreadStatusLabel === ""
-                ? "Reopen a closed thread"
-                : `${closedThreadStatusLabel}. Reopen a closed thread`}
-            aria-haspopup="menu"
-            aria-expanded=${this.#closedThreadMenuOpen && closedThreads.length > 0 ? "true" : "false"}
-            aria-controls="closed-thread-tabs-menu"
-            ?disabled=${closedThreads.length === 0}
-            @click=${this.#toggleClosedThreadMenu}
+            aria-label=${`Threads (${sessionThreads.length})${hiddenThreadStatusLabel === ""
+              ? ""
+              : `, ${hiddenThreadStatusLabel}`}`}
+            title="Browse all threads"
+            aria-haspopup="dialog"
+            aria-expanded=${this.#threadSwitcherOpen ? "true" : "false"}
+            aria-controls="thread-switcher-panel"
+            @click=${this.#toggleThreadSwitcher}
           >
-            ${fontAwesomeIcon("folder-open")}
-            ${closedThreads.length === 0
-              ? nothing
-              : html`<span class="closed-thread-tabs-count">${closedThreads.length}</span>`}
-            ${closedThreadIndicator.kind === "none"
+            ${fontAwesomeIcon("folder-tree")}
+            <span class="thread-switcher-toggle-label">Threads</span>
+            <span class="thread-switcher-total">${sessionThreads.length}</span>
+            ${hiddenThreadIndicator.kind === "none"
               ? nothing
               : html`<span
-                  class=${`session-indicator thread-tab-indicator closed-thread-tabs-status ${closedThreadIndicator.kind}`}
-                  title=${closedThreadStatusLabel}
+                  class=${`session-indicator thread-tab-indicator thread-switcher-status ${hiddenThreadIndicator.kind}`}
+                  title=${hiddenThreadStatusLabel}
                   aria-hidden="true"
-                >${closedThreadIndicator.icon === undefined
+                >${hiddenThreadIndicator.icon === undefined
                   ? nothing
-                  : fontAwesomeIcon(closedThreadIndicator.icon)}</span>`}
+                  : fontAwesomeIcon(hiddenThreadIndicator.icon)}</span>`}
           </button>
-          ${this.#closedThreadMenuOpen && closedThreads.length > 0
+          ${this.#threadSwitcherOpen
             ? html`
                 <div
-                  id="closed-thread-tabs-menu"
-                  class="closed-thread-tabs-menu"
-                  role="menu"
-                  aria-label="Closed threads"
-                  @keydown=${this.#closedThreadMenuKeydown}
+                  id="thread-switcher-panel"
+                  class="thread-switcher-panel"
+                  role="dialog"
+                  aria-label="Threads"
+                  @keydown=${this.#threadSwitcherKeydown}
                 >
-                  ${repeat(
-                    closedThreads,
-                    (candidate) => candidate.id,
-                    (candidate) => {
-                      const label = labelForThread(candidate);
-                      const indicator = sessionIndicatorPresentation(
-                        store.threadIndicatorState(candidate.id),
-                      );
-                      const statusLabel = indicator.tooltip
-                        || (indicator.kind === "busy" ? "Processing" : "");
-                      return html`
-                      <button
-                        type="button"
-                        role="menuitem"
-                        aria-label=${statusLabel === ""
-                          ? `Reopen ${label}`
-                          : `Reopen ${label}, ${statusLabel}`}
-                        title=${label}
-                        data-closed-thread-id=${candidate.id}
-                        @click=${() => this.#reopenClosedThread(candidate.id)}
-                      >
-                        <span
-                          class=${`session-indicator thread-tab-indicator ${indicator.kind}`}
-                          title=${statusLabel}
-                          aria-hidden="true"
-                        >${indicator.icon === undefined
-                          ? nothing
-                          : fontAwesomeIcon(indicator.icon)}</span>
-                        <span class="closed-thread-kind" aria-hidden="true">${candidate.spawned === true
-                          ? fontAwesomeIcon("code-branch")
-                          : fontAwesomeIcon("message")}</span>
-                        <span class="closed-thread-tabs-copy">
-                          <strong>${label}</strong>
-                          <small>${candidate.spawned === true
-                            ? subagentThreadIsReadOnly(candidate, this.#modes)
-                              ? "Read-only subagent thread"
-                              : "Interactive subagent thread"
-                            : "Conversation thread"}</small>
-                        </span>
-                        ${fontAwesomeIcon("rotate-left", { className: "closed-thread-reopen-icon" })}
-                      </button>
-                    `;
-                    },
-                  )}
+                  <header class="thread-switcher-panel-header">
+                    <label>
+                      <span class="sr-only">Search threads</span>
+                      ${fontAwesomeIcon("magnifying-glass")}
+                      <input
+                        class="thread-switcher-search"
+                        type="search"
+                        placeholder="Search threads…"
+                        autocomplete="off"
+                        .value=${this.#threadSwitcherQuery}
+                        @input=${this.#threadSwitcherSearchChanged}
+                      />
+                    </label>
+                    <div class="thread-switcher-filters" role="group" aria-label="Filter threads">
+                      ${(["all", "running", "attention", "removed"] as const).map((filter) =>
+                        html`<button
+                          type="button"
+                          data-thread-filter=${filter}
+                          aria-pressed=${this.#threadSwitcherFilter === filter ? "true" : "false"}
+                          @click=${this.#threadSwitcherFilterChanged}
+                        >${filter === "all" ? "All" : filter === "running"
+                          ? "Running" : filter === "attention" ? "Needs attention" : "Removed"}</button>`)}
+                    </div>
+                    <small>${workingThreads.length} visible · ${overflowThreads.length} overflow · ${closedThreads.length} removed</small>
+                  </header>
+                  <div class="thread-switcher-sections">
+                    <section aria-labelledby="pinned-threads-heading">
+                      <h3 id="pinned-threads-heading">Pinned</h3>
+                      <div class="thread-switcher-tree" role="tree" aria-label="Pinned threads">
+                        ${pinnedSwitcherRows.length === 0
+                          ? html`<p class="thread-switcher-empty">No matching pinned threads.</p>`
+                          : repeat(
+                              pinnedSwitcherRows,
+                              (row) => row.entry.id,
+                              (row) => renderSwitcherRow(row, false),
+                            )}
+                      </div>
+                    </section>
+                    <section aria-labelledby="open-threads-heading">
+                      <h3 id="open-threads-heading">Open threads</h3>
+                      <div class="thread-switcher-tree" role="tree" aria-label="Open threads">
+                        ${openSwitcherRows.length === 0
+                          ? html`<p class="thread-switcher-empty">No matching open threads.</p>`
+                          : repeat(
+                              openSwitcherRows,
+                              (row) => row.entry.id,
+                              (row) => renderSwitcherRow(row, false),
+                            )}
+                      </div>
+                    </section>
+                    <section aria-labelledby="removed-threads-heading">
+                      <h3 id="removed-threads-heading">Removed from bar</h3>
+                      <div class="thread-switcher-tree" role="tree" aria-label="Removed threads">
+                        ${closedSwitcherRows.length === 0
+                          ? html`<p class="thread-switcher-empty">${this.#threadSwitcherQuery === ""
+                              ? "No threads have been removed."
+                              : "No matching removed threads."}</p>`
+                          : repeat(
+                              closedSwitcherRows,
+                              (row) => row.entry.id,
+                              (row) => renderSwitcherRow(row, true),
+                            )}
+                      </div>
+                    </section>
+                  </div>
                 </div>
               `
             : nothing}
@@ -2533,6 +2774,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             class=${`turn-rail-node turn-response-node agent-text-block ${tone}`}
             data-chat-anchor-id=${`assistant:${anchor}`}
             aria-label=${response ? "Response" : "Agent update"}
+            @pointerdown=${this.#captureMarkdownContextMenuSelection}
+            @mousedown=${this.#captureMarkdownContextMenuSelection}
             @contextmenu=${(event: MouseEvent) =>
               this.#openMarkdownContextMenu(event, content)}
           >
@@ -3183,20 +3426,58 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const viewportRect = viewport.getBoundingClientRect();
     const viewportTop = viewportRect.top;
     const viewportBottom = viewportRect.bottom;
-    const visible = [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
-      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-      .filter(({ element, rect }) =>
-        element.dataset["chatAnchorId"] !== undefined
-        && rect.height > 0
-        && rect.bottom > viewportTop
-        && rect.top < viewportBottom
-      );
-    const crossingTop = visible
-      .filter(({ rect }) => rect.top <= viewportTop + 0.5 && rect.bottom > viewportTop + 0.5)
-      .sort((left, right) => left.rect.height - right.rect.height)[0];
-    const nextVisible = visible
-      .filter(({ rect }) => rect.top > viewportTop + 0.5)
-      .sort((left, right) => left.rect.top - right.rect.top)[0];
+    // A history response can arrive during wheel momentum. In the common
+    // case, hit-testing at the viewport edge finds the precise nested anchor
+    // without synchronously measuring every thought/tool node in a very large
+    // mounted turn. Fall back to the exhaustive scan only when the edge lands
+    // in whitespace or the host does not expose `elementsFromPoint`.
+    if (typeof viewport.ownerDocument.elementsFromPoint === "function") {
+      const width = Math.max(1, viewportRect.width);
+      const sampleXs = [0.5, 0.25, 0.75].map((ratio) =>
+        viewportRect.left + width * ratio);
+      const maximumY = Math.max(viewportTop, viewportBottom - 0.5);
+      for (const yOffset of [0.5, 4, 12, 24]) {
+        const y = Math.min(maximumY, viewportTop + yOffset);
+        for (const x of sampleXs) {
+          for (const hit of viewport.ownerDocument.elementsFromPoint(x, y)) {
+            const element = hit.closest<HTMLElement>(
+              "[data-chat-anchor-id], [data-virtual-id]",
+            );
+            const chatId = element?.dataset["chatAnchorId"];
+            const virtualId = element?.dataset["virtualId"];
+            const id = chatId ?? (virtualId === undefined ? undefined : `virtual:${virtualId}`);
+            if (element === null || element === undefined || id === undefined) continue;
+            if (!viewport.contains(element)) continue;
+            const rect = element.getBoundingClientRect();
+            if (rect.height > 0 && rect.bottom > viewportTop && rect.top < viewportBottom) {
+              return { id, offset: rect.top - viewportTop };
+            }
+          }
+        }
+      }
+    }
+
+    let crossingTop:
+      | { readonly element: HTMLElement; readonly rect: DOMRect }
+      | undefined;
+    let nextVisible:
+      | { readonly element: HTMLElement; readonly rect: DOMRect }
+      | undefined;
+    for (const element of viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")) {
+      if (element.dataset["chatAnchorId"] === undefined) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.height <= 0 || rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+      if (rect.top <= viewportTop + 0.5 && rect.bottom > viewportTop + 0.5) {
+        if (crossingTop === undefined || rect.height < crossingTop.rect.height) {
+          crossingTop = { element, rect };
+        }
+      } else if (
+        rect.top > viewportTop + 0.5
+        && (nextVisible === undefined || rect.top < nextVisible.rect.top)
+      ) {
+        nextVisible = { element, rect };
+      }
+    }
     const candidate = crossingTop ?? nextVisible;
     if (candidate !== undefined) {
       const id = candidate.element.dataset["chatAnchorId"];
@@ -3205,19 +3486,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       }
     }
 
-    const virtualRow = [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
-      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-      .filter(({ rect }) =>
-        rect.height > 0
-        && rect.bottom > viewportTop
-        && rect.top < viewportBottom
-      )
-      .sort((left, right) => {
-        const leftCrosses = left.rect.top <= viewportTop && left.rect.bottom > viewportTop;
-        const rightCrosses = right.rect.top <= viewportTop && right.rect.bottom > viewportTop;
-        if (leftCrosses !== rightCrosses) return leftCrosses ? -1 : 1;
-        return left.rect.top - right.rect.top;
-      })[0];
+    let virtualRow:
+      | { readonly element: HTMLElement; readonly rect: DOMRect }
+      | undefined;
+    for (const element of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
+      const rect = element.getBoundingClientRect();
+      if (rect.height <= 0 || rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+      const crosses = rect.top <= viewportTop && rect.bottom > viewportTop;
+      const selectedCrosses = virtualRow !== undefined
+        && virtualRow.rect.top <= viewportTop
+        && virtualRow.rect.bottom > viewportTop;
+      if (
+        virtualRow === undefined
+        || (crosses && !selectedCrosses)
+        || (crosses === selectedCrosses && rect.top < virtualRow.rect.top)
+      ) {
+        virtualRow = { element, rect };
+      }
+    }
     const id = virtualRow?.element.dataset["virtualId"];
     return id === undefined || virtualRow === undefined
       ? undefined
@@ -3290,11 +3576,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const virtualId = anchor.id.startsWith("virtual:")
       ? anchor.id.slice("virtual:".length)
       : undefined;
-    return virtualId === undefined
-      ? [...viewport.querySelectorAll<HTMLElement>("[data-chat-anchor-id]")]
-        .find((element) => element.dataset["chatAnchorId"] === anchor.id)
-      : [...viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")]
-        .find((element) => element.dataset["virtualId"] === virtualId);
+    const selector = virtualId === undefined ? "[data-chat-anchor-id]" : "[data-virtual-id]";
+    const expected = virtualId ?? anchor.id;
+    for (const element of viewport.querySelectorAll<HTMLElement>(selector)) {
+      const candidate = virtualId === undefined
+        ? element.dataset["chatAnchorId"]
+        : element.dataset["virtualId"];
+      if (candidate === expected) return element;
+    }
+    return undefined;
   }
 
   #cancelHistoryAnchorCorrection(): void {
@@ -3828,14 +4118,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const toolPresentation = presentToolCall(item.tool, item.args, item.result);
         const toolOpen = approvalRequired
           || (this.#toolDisclosure.get(item.callId) ?? false);
-        const toolDetail = toolOpen && !raw && !item.detailsDeferred
-          ? toolDetailText(item.args, item.result)
-          : "";
         const toolDuration = toolExecutionMetadata(item.result, item.durationMs);
         const toolTargetMeta = [
           toolPresentation.meta,
           toolDuration,
         ].filter((part) => part !== "").join(" · ");
+        if (
+          toolOpen
+          && !raw
+          && toolPresentation.diff.length === 0
+          && toolPresentation.todos.length === 0
+        ) this.#ensureToolDetail();
         return html`
           <details
             class=${`message tool-card tool-${item.status} ${approvalRequired ? "approval-required" : ""}`}
@@ -3854,7 +4147,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                   className: "activity-rail-disclosure-icon",
                 })}
               </span>
-              <strong>${toolPresentation.title}</strong>
+              <strong>${toolPresentation.title}${toolPresentation.subject === "" ? "" : ":"}</strong>
               ${toolPresentation.subject === ""
                 ? nothing
                 : toolPresentation.filePath === ""
@@ -3970,11 +4263,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                                 ${fontAwesomeIcon(todo.icon)}<span>${todo.content}</span>
                               </li>`)}
                             </ul>`}
-                        ${toolPresentation.diff.length > 0 || toolPresentation.todos.length > 0 || toolDetail === ""
+                        ${toolPresentation.diff.length > 0 || toolPresentation.todos.length > 0
                           ? nothing
-                          : html`<pre aria-label="Tool details">${toolDetail}</pre>`}
+                          : html`<trouve-tool-detail-view
+                              .tool=${item.tool}
+                              .args=${item.args}
+                              .result=${item.result}
+                              .output=${item.output.text}
+                              .outputOmitted=${item.output.omitted}
+                            ></trouve-tool-detail-view>`}
                       `}
-                  ${item.output.text === "" && !item.output.omitted
+                  ${toolPresentation.diff.length === 0 && toolPresentation.todos.length === 0
+                    ? nothing
+                    : item.output.text === "" && !item.output.omitted
                     ? nothing
                     : html`<pre aria-label="Live tool output">Output\n${item.output.omitted
                         ? TOOL_OUTPUT_OMITTED_MESSAGE
@@ -4188,6 +4489,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-label="Message actions"
         style=${`left:${menu.x}px;top:${menu.y}px`}
         @contextmenu=${(event: Event) => event.preventDefault()}
+        @mousedown=${this.#preserveMarkdownContextMenuSelection}
         @keydown=${this.#markdownContextMenuKeydown}
       >
         ${menu.selection === ""
@@ -4216,19 +4518,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (markdown === "") return;
     const source = event.currentTarget;
     if (!(source instanceof HTMLElement)) return;
-    const preserveNativeMenu = event.composedPath().some((target) =>
-      target instanceof Element
-      && target.matches(
-        "a, img, video, input, textarea, select, .tool-card, .thinking-card, .thinking-output, .context-compaction-marker, .question-card",
-      )
-    );
+    const pendingSelection = this.#pendingMarkdownContextSelection;
+    this.#pendingMarkdownContextSelection = undefined;
+    const preserveNativeMenu = this.#preservesNativeMarkdownContextMenu(event);
     if (preserveNativeMenu) {
       this.#dismissMarkdownContextMenu();
       return;
     }
 
     event.preventDefault();
-    const selection = this.#selectedTextWithin(source);
+    const selected = pendingSelection?.source === source
+      ? { text: pendingSelection.text, ranges: pendingSelection.ranges }
+      : this.#selectionWithin(source);
+    const selection = selected.text;
     const sourceBounds = source.getBoundingClientRect();
     const keyboardPosition = event.clientX === 0 && event.clientY === 0;
     const requestedX = keyboardPosition ? sourceBounds.left + 24 : event.clientX;
@@ -4240,6 +4542,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const menu: MarkdownContextMenu = {
       markdown,
       selection,
+      selectionRanges: selected.ranges,
       x: Math.max(8, Math.min(requestedX, viewportWidth - estimatedWidth - 8)),
       y: Math.max(8, Math.min(requestedY, viewportHeight - estimatedHeight - 8)),
     };
@@ -4248,25 +4551,162 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#markdownContextMenuReturnFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : undefined;
+    this.#restoreMarkdownContextMenuSelection(menu);
     this.requestUpdate();
     void this.updateComplete.then(() => {
       if (this.#markdownContextMenu !== menu) return;
-      this.querySelector<HTMLButtonElement>(
-        '.message-context-menu [role="menuitem"]',
-      )?.focus();
+      // WebKit hides a shadow-root text selection when focus leaves that
+      // root. Pointer users can activate either command without transferring
+      // focus; keyboard-opened menus and menus without a selection retain the
+      // normal roving menu focus behavior.
+      if (keyboardPosition || selection === "") {
+        this.querySelector<HTMLButtonElement>(
+          '.message-context-menu [role="menuitem"]',
+        )?.focus({ preventScroll: true });
+      }
+      this.#restoreMarkdownContextMenuSelection(menu);
+      this.#restoreMarkdownContextMenuSelectionAfterBrowserDefault(menu, true);
     });
   }
 
-  #selectedTextWithin(source: HTMLElement): string {
-    const selection = globalThis.getSelection?.();
-    if (selection === undefined || selection === null || selection.rangeCount === 0) return "";
-    const range = selection.getRangeAt(0);
-    const commonAncestor = range.commonAncestorContainer;
-    const root = commonAncestor.getRootNode();
-    const inside = source.contains(commonAncestor)
-      || (root instanceof ShadowRoot && source.contains(root.host));
-    return inside ? selection.toString() : "";
+  #preservesNativeMarkdownContextMenu(event: Event): boolean {
+    return event.composedPath().some((target) =>
+      target instanceof Element
+      && target.matches(
+        "a, img, video, input, textarea, select, .tool-card, .thinking-card, .thinking-output, .context-compaction-marker, .question-card",
+      )
+    );
   }
+
+  readonly #captureMarkdownContextMenuSelection = (event: MouseEvent): void => {
+    if (event.button !== 2) return;
+    const source = event.currentTarget;
+    if (
+      !(source instanceof HTMLElement)
+      || this.#preservesNativeMarkdownContextMenu(event)
+    ) {
+      this.#pendingMarkdownContextSelection = undefined;
+      return;
+    }
+    const pendingSelection = this.#pendingMarkdownContextSelection;
+    if (event.type === "mousedown" && pendingSelection?.source === source) {
+      // WebKit may apply its right-button pointer default before dispatching
+      // the compatibility mousedown event. Restore the range captured during
+      // pointerdown before suppressing mousedown's own selection default.
+      this.#restoreSelectionRanges(pendingSelection.ranges);
+      event.preventDefault();
+      return;
+    }
+    const selected = this.#selectionWithin(source);
+    if (selected.text === "") {
+      this.#pendingMarkdownContextSelection = undefined;
+      return;
+    }
+    this.#pendingMarkdownContextSelection = {
+      source,
+      text: selected.text,
+      ranges: selected.ranges,
+    };
+    if (event.type === "mousedown") {
+      // Pointerdown records the range before WebKit's right-button default;
+      // mousedown suppresses the later compatibility-event default without
+      // preventing the contextmenu event itself.
+      event.preventDefault();
+    }
+  };
+
+  #selectionWithin(
+    source: HTMLElement,
+  ): { readonly text: string; readonly ranges: readonly Range[] } {
+    const selections = new Set<Selection>();
+    const addSelection = (selection: Selection | null | undefined): void => {
+      if (selection !== null && selection !== undefined) selections.add(selection);
+    };
+    addSelection(globalThis.getSelection?.());
+    for (const element of [source, ...source.querySelectorAll<HTMLElement>("*")]) {
+      const root = element.shadowRoot as (ShadowRoot & {
+        getSelection?: () => Selection | null;
+      }) | null;
+      addSelection(root?.getSelection?.());
+    }
+    for (const selection of selections) {
+      if (selection.rangeCount === 0) continue;
+      const range = selection.getRangeAt(0);
+      const commonAncestor = range.commonAncestorContainer;
+      const root = commonAncestor.getRootNode();
+      const inside = source.contains(commonAncestor)
+        || (root instanceof ShadowRoot && source.contains(root.host));
+      if (!inside) continue;
+      return {
+        text: selection.toString(),
+        ranges: Array.from(
+          { length: selection.rangeCount },
+          (_, index) => selection.getRangeAt(index).cloneRange(),
+        ),
+      };
+    }
+    return { text: "", ranges: [] };
+  }
+
+  #restoreMarkdownContextMenuSelection(menu: MarkdownContextMenu): void {
+    this.#restoreSelectionRanges(menu.selectionRanges);
+  }
+
+  #restoreMarkdownContextMenuSelectionAfterBrowserDefault(
+    menu: MarkdownContextMenu,
+    requireOpen: boolean,
+  ): void {
+    globalThis.setTimeout(() => {
+      if (
+        !this.isConnected
+        || (requireOpen
+          ? this.#markdownContextMenu !== menu
+          : this.#markdownContextMenu !== undefined)
+      ) return;
+      this.#restoreMarkdownContextMenuSelection(menu);
+    }, 0);
+  }
+
+  #restoreSelectionRanges(selectionRanges: readonly Range[]): void {
+    if (selectionRanges.length === 0) return;
+    const ranges = selectionRanges.filter((range) =>
+      range.startContainer.isConnected && range.endContainer.isConnected);
+    if (ranges.length === 0) return;
+    const root = ranges[0]?.commonAncestorContainer.getRootNode();
+    const shadowSelection = root instanceof ShadowRoot
+      ? (root as ShadowRoot & { getSelection?: () => Selection | null }).getSelection?.()
+      : undefined;
+    // The document selection remains authoritative for open shadow trees.
+    // Chromium and WebKit can expose ShadowRoot.getSelection() as a readable
+    // view that does not reliably accept addRange() after context-menu
+    // defaults, so use it only when the document API is unavailable.
+    const selection = globalThis.getSelection?.() ?? shadowSelection;
+    if (selection === undefined || selection === null) return;
+    selection.removeAllRanges();
+    for (const range of ranges) {
+      try {
+        selection.addRange(range);
+      } catch {
+        // A concurrent transcript update may have replaced a selected node.
+      }
+    }
+  }
+
+  readonly #preserveMarkdownContextMenuSelection = (event: MouseEvent): void => {
+    if (event.button === 0 && (this.#markdownContextMenu?.selectionRanges.length ?? 0) > 0) {
+      // Keep the browser selection painted while either menu command is
+      // clicked. Preventing mousedown focus does not suppress the click, and
+      // keyboard focus remains on the menu item established when it opened.
+      event.preventDefault();
+    }
+  };
+
+  readonly #restoreMarkdownContextMenuSelectionFromPointer = (event: PointerEvent): void => {
+    const menu = this.#markdownContextMenu;
+    if (event.button !== 2 || menu === undefined || menu.selection === "") return;
+    this.#restoreMarkdownContextMenuSelection(menu);
+    this.#restoreMarkdownContextMenuSelectionAfterBrowserDefault(menu, true);
+  };
 
   readonly #dismissMarkdownContextMenuFromPointer = (event: PointerEvent): void => {
     if (this.#markdownContextMenu === undefined) return;
@@ -4278,17 +4718,30 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#dismissMarkdownContextMenu();
   };
 
+  readonly #dismissMarkdownContextMenuFromKeyboard = (event: KeyboardEvent): void => {
+    if (this.#markdownContextMenu === undefined || event.key !== "Escape") return;
+    event.preventDefault();
+    this.#closeMarkdownContextMenu(true);
+  };
+
   readonly #dismissMarkdownContextMenu = (): void => {
     this.#closeMarkdownContextMenu(false);
   };
 
   #closeMarkdownContextMenu(restoreFocus: boolean): void {
     if (this.#markdownContextMenu === undefined) return;
+    const menu = this.#markdownContextMenu;
     const returnFocus = this.#markdownContextMenuReturnFocus;
     this.#markdownContextMenu = undefined;
+    this.#pendingMarkdownContextSelection = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     this.requestUpdate();
-    if (restoreFocus && returnFocus?.isConnected === true) returnFocus.focus();
+    if (restoreFocus) {
+      void this.updateComplete.then(() => {
+        if (returnFocus?.isConnected === true) returnFocus.focus({ preventScroll: true });
+        this.#restoreMarkdownContextMenuSelection(menu);
+      });
+    }
   }
 
   readonly #markdownContextMenuKeydown = (event: KeyboardEvent): void => {
@@ -4321,11 +4774,18 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const value = copySelection ? menu.selection : menu.markdown;
     const label = copySelection ? "Selection" : "Markdown";
     this.#markdownContextMenu = undefined;
+    this.#pendingMarkdownContextSelection = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
     this.requestUpdate();
     const result = await copyChatText(value, globalThis.navigator?.clipboard);
     this.#markdownContextMenuStatus = `${label}: ${copyActionLabel(result)}`;
     this.requestUpdate();
+    await this.updateComplete;
+    // Restore only after the final status render. Restoring between the menu
+    // removal and status updates creates a one-frame selection that the
+    // second render can clear, which is especially visible in WebKit/Wry.
+    this.#restoreMarkdownContextMenuSelection(menu);
+    this.#restoreMarkdownContextMenuSelectionAfterBrowserDefault(menu, false);
   }
 
   #renderCopyButton(key: string, text: string, accessibleLabel: string) {
@@ -4476,6 +4936,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (this.#markdownRequested) return;
     this.#markdownRequested = true;
     void import("./markdown-view.js");
+  }
+
+  #ensureToolDetail(): void {
+    if (this.#toolDetailRequested) return;
+    this.#toolDetailRequested = true;
+    void import("./tool-detail-view.js");
   }
 
   #currentSessionUsageKey(): string {
@@ -4686,55 +5152,115 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     });
   }
 
-  readonly #toggleClosedThreadMenu = (): void => {
-    this.#closedThreadMenuOpen = !this.#closedThreadMenuOpen;
+  readonly #toggleThreadSwitcher = (): void => {
+    this.#threadSwitcherOpen = !this.#threadSwitcherOpen;
+    if (!this.#threadSwitcherOpen) this.#threadSwitcherQuery = "";
     this.requestUpdate();
-    if (!this.#closedThreadMenuOpen) return;
+    if (!this.#threadSwitcherOpen) return;
     void this.updateComplete.then(() => {
-      this.querySelector<HTMLButtonElement>(
-        '.closed-thread-tabs-menu [role="menuitem"]',
-      )?.focus();
+      this.querySelector<HTMLInputElement>(".thread-switcher-search")?.focus();
     });
   };
 
-  readonly #dismissClosedThreadMenuFromPointer = (event: PointerEvent): void => {
-    if (!this.#closedThreadMenuOpen) return;
+  readonly #dismissThreadSwitcherFromPointer = (event: PointerEvent): void => {
+    if (!this.#threadSwitcherOpen) return;
     const target = event.target;
     if (
       target instanceof Element
-      && target.closest(".closed-thread-tabs") !== null
+      && target.closest(".thread-switcher") !== null
     ) return;
-    this.#closedThreadMenuOpen = false;
+    this.#threadSwitcherOpen = false;
+    this.#threadSwitcherQuery = "";
     this.requestUpdate();
   };
 
-  readonly #closedThreadMenuKeydown = (event: KeyboardEvent): void => {
-    const menuItems = [...this.querySelectorAll<HTMLButtonElement>(
-      '.closed-thread-tabs-menu [role="menuitem"]',
+  readonly #threadSwitcherSearchChanged = (event: Event): void => {
+    this.#threadSwitcherQuery = (event.currentTarget as HTMLInputElement).value;
+    this.requestUpdate();
+  };
+
+  readonly #threadSwitcherFilterChanged = (event: Event): void => {
+    const filter = (event.currentTarget as HTMLElement).dataset["threadFilter"];
+    if (
+      filter !== "all"
+      && filter !== "running"
+      && filter !== "attention"
+      && filter !== "removed"
+    ) return;
+    this.#threadSwitcherFilter = filter;
+    this.requestUpdate();
+  };
+
+  readonly #threadSwitcherKeydown = (event: KeyboardEvent): void => {
+    const rows = [...this.querySelectorAll<HTMLElement>(
+      ".thread-switcher-row",
     )];
     if (event.key === "Escape") {
       event.preventDefault();
-      this.#closedThreadMenuOpen = false;
+      this.#threadSwitcherOpen = false;
+      this.#threadSwitcherQuery = "";
       this.requestUpdate();
       void this.updateComplete.then(() => {
-        this.querySelector<HTMLButtonElement>(".closed-thread-tabs-toggle")?.focus();
+        this.querySelector<HTMLButtonElement>(".thread-switcher-toggle")?.focus();
       });
       return;
     }
-    const currentIndex = menuItems.indexOf(event.target as HTMLButtonElement);
+    const row = (event.target as Element | null)?.closest<HTMLElement>(
+      ".thread-switcher-row",
+    );
+    const currentIndex = row === null || row === undefined ? -1 : rows.indexOf(row);
     const nextIndex = event.key === "Home"
       ? 0
       : event.key === "End"
-        ? menuItems.length - 1
+        ? rows.length - 1
         : event.key === "ArrowDown"
-          ? (currentIndex + 1) % menuItems.length
+          ? Math.min(currentIndex + 1, rows.length - 1)
           : event.key === "ArrowUp"
-            ? (currentIndex - 1 + menuItems.length) % menuItems.length
+            ? Math.max(currentIndex - 1, 0)
             : undefined;
-    if (nextIndex === undefined || menuItems.length === 0) return;
+    if (nextIndex === undefined || rows.length === 0) return;
     event.preventDefault();
-    menuItems[nextIndex]?.focus();
+    rows[nextIndex]?.focus();
   };
+
+  readonly #threadSwitcherRowKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    if ((event.target as Element | null)?.closest("button") !== null) return;
+    const row = event.currentTarget as HTMLElement;
+    const threadId = row.dataset["threadSwitcherId"];
+    if (threadId === undefined) return;
+    event.preventDefault();
+    const closed = this.#services.value === undefined
+      ? false
+      : readSignal(this.#services.value.resumePreferences).closedThreadTabs.includes(threadId);
+    this.#activateThreadSwitcherRow(threadId, closed);
+  };
+
+  #activateThreadSwitcherRow(threadId: string, removed: boolean): void {
+    if (removed) {
+      this.#reopenClosedThread(threadId);
+      return;
+    }
+    this.#threadSwitcherOpen = false;
+    this.#threadSwitcherQuery = "";
+    this.#pendingThreadTabFocus = threadId;
+    this.#selectThread(threadId);
+    this.requestUpdate();
+  }
+
+  #setThreadTabPinned(event: MouseEvent, threadId: string, pinned: boolean): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const thread = this.#store.value?.thread(threadId);
+    const services = this.#services.value;
+    if (
+      thread === undefined
+      || thread.session_id !== this.sessionId
+      || services === undefined
+    ) return;
+    services.setThreadTabPinned(threadId, pinned);
+    this.requestUpdate();
+  }
 
   #reopenClosedThread(threadId: string): void {
     const thread = this.#store.value?.thread(threadId);
@@ -4745,7 +5271,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       || services === undefined
     ) return;
     services.setThreadTabClosed(threadId, false);
-    this.#closedThreadMenuOpen = false;
+    this.#threadSwitcherOpen = false;
+    this.#threadSwitcherQuery = "";
     this.#pendingThreadTabFocus = threadId;
     this.#selectThread(threadId);
     this.requestUpdate();

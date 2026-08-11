@@ -1345,6 +1345,7 @@ fn validate_preferences(preferences: &HostPreferences) -> Result<(), HostValidat
     let mut workspace_ids = std::collections::HashSet::new();
     let mut pull_request_group_ids = std::collections::HashSet::new();
     let mut closed_thread_ids = std::collections::HashSet::new();
+    let mut pinned_thread_ids = std::collections::HashSet::new();
     let valid = THEMES.contains(&appearance.theme.as_str())
         && (10..=32).contains(&appearance.font_size)
         && appearance.font_family.len() <= 256
@@ -1386,7 +1387,13 @@ fn validate_preferences(preferences: &HostPreferences) -> Result<(), HostValidat
         && resume
             .closed_thread_tabs
             .iter()
-            .all(|thread_id| valid_bridge_id(thread_id) && closed_thread_ids.insert(thread_id));
+            .all(|thread_id| valid_bridge_id(thread_id) && closed_thread_ids.insert(thread_id))
+        && resume.pinned_thread_tabs.len() <= 1_000
+        && resume.pinned_thread_tabs.iter().all(|thread_id| {
+            valid_bridge_id(thread_id)
+                && !closed_thread_ids.contains(thread_id)
+                && pinned_thread_ids.insert(thread_id)
+        });
     if valid {
         Ok(())
     } else {
@@ -3394,6 +3401,7 @@ mod tests {
             },
         );
         preferences.resume.closed_thread_tabs.push("th-2".into());
+        preferences.resume.pinned_thread_tabs.push("th-3".into());
         assert!(validate_preferences(&preferences).is_ok());
 
         preferences
@@ -3423,6 +3431,9 @@ mod tests {
             .unwrap()
             .item_id = "assistant:42".into();
         preferences.resume.closed_thread_tabs.push("th-2".into());
+        assert!(validate_preferences(&preferences).is_err());
+        preferences.resume.closed_thread_tabs.pop();
+        preferences.resume.pinned_thread_tabs.push("th-3".into());
         assert!(validate_preferences(&preferences).is_err());
     }
 

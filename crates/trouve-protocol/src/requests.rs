@@ -320,6 +320,11 @@ pub struct TodoItem {
 pub struct Thread {
     pub id: ThreadId,
     pub session_id: SessionId,
+    /// Direct parent when this thread was spawned by another thread. The
+    /// relation is optional so user-created threads and older servers remain
+    /// compatible; clients can use it to render nested collaborator trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<ThreadId>,
     /// Concise user-visible title. Older threads may not have one; clients
     /// fall back to the session title or mode/model metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]

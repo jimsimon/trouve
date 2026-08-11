@@ -591,7 +591,6 @@ export class ThreadViewModel {
         });
         return true;
       case "turn.steered":
-        this.finishThinking();
         this.appendItem({
           id: `steered:${envelope.turn}:${envelope.cursor}`,
           kind: "steered",

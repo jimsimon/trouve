@@ -5,6 +5,9 @@ import "./styles/themes.css";
 import "./styles/tokens.css";
 import "./styles/app.css";
 import "./app/trouve-app.js";
+import { installNativeTextHistoryShortcuts } from "./services/native-text-history.js";
+
+installNativeTextHistoryShortcuts();
 
 const pwaTarget = import.meta.env.MODE === "pwa";
 if (pwaTarget && "serviceWorker" in navigator) {

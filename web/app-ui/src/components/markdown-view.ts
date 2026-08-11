@@ -106,7 +106,6 @@ export class TrouveMarkdownView extends LitElement {
     if (anchor === undefined) return;
     const href = anchor.getAttribute("href");
     if (href === null || href === undefined) return;
-    if (href.startsWith("#")) return;
     const fileTarget = anchor.dataset.trouveFileTarget;
     if (fileTarget !== undefined) {
       const file = parseChatFileTarget(fileTarget);
@@ -121,6 +120,9 @@ export class TrouveMarkdownView extends LitElement {
       );
       return;
     }
+    // Sanitized workspace links deliberately use `href="#"`; the typed
+    // target must win over ordinary same-page fragment handling.
+    if (href.startsWith("#")) return;
     const kind = safeMarkdownHref(href);
     if (kind === undefined) return;
     event.preventDefault();

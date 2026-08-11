@@ -162,6 +162,34 @@ describe("Virtualizer", () => {
     expect(virtualizer.shouldUnmountHeavyweight("terminal")).toBe(false);
   });
 
+  it("indexes large histories instead of rescanning item ids on every scroll", () => {
+    let idReads = 0;
+    const largeHistory = Array.from({ length: 20_000 }, (_, index) => {
+      const id = `large-${index}`;
+      return {
+        get id() {
+          idReads += 1;
+          return id;
+        },
+        estimatedHeight: 20,
+      } satisfies VirtualItem;
+    });
+    const virtualizer = new Virtualizer({ estimatedHeight: 20, overscanPx: 40 });
+    virtualizer.setViewport(0, 400);
+    virtualizer.setItems(largeHistory);
+
+    idReads = 0;
+    virtualizer.setViewport(300_000, 400, { userInitiated: true });
+    const window = virtualizer.window();
+    expect(window.items[0]?.index).toBe(14_998);
+    expect(window.items.at(-1)?.index).toBe(15_021);
+    expect(idReads).toBeLessThan(10);
+
+    const correction = virtualizer.measure("large-10", 40);
+    expect(correction.delta).toBe(20);
+    expect(correction.scrollTop).toBe(300_020);
+  });
+
   it("rejects duplicate stable ids and invalid measurements", () => {
     const virtualizer = new Virtualizer({ estimatedHeight: 20 });
     expect(() => virtualizer.setItems([{ id: "" }])).toThrow(/must not be empty/);

@@ -130,7 +130,7 @@ describe("ThreadViewModel", () => {
     }).toEqual(fixture.expected);
   });
 
-  it("keeps steering as a top-level boundary and closes preceding thought output", () => {
+  it("keeps steering as a top-level boundary without splitting active thought output", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -151,12 +151,26 @@ describe("ThreadViewModel", () => {
       content: "Prioritize the narrow layout.",
       attachments: [],
     }));
+    vm.apply(envelope(4, {
+      type: "assistant.thinking",
+      turn: 3,
+      text: " Continue with the revised direction.",
+    }));
+    vm.apply(envelope(5, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+    }));
 
     expect(vm.turnSteerable.get(3)).toBe(true);
     expect(vm.thinking).toBe(false);
     expect(vm.items).toMatchObject([
       { kind: "turn-status", turn: 3 },
-      { kind: "thinking", turn: 3, complete: true },
+      {
+        kind: "thinking",
+        turn: 3,
+        content: "Following the original direction. Continue with the revised direction.",
+        complete: true,
+      },
       {
         kind: "steered",
         turn: 3,

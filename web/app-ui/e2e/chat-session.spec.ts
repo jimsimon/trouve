@@ -1722,6 +1722,32 @@ test("unsubmitted composer drafts persist per thread across navigation and reloa
   await expect(textarea).toHaveValue("Draft in a different session");
 });
 
+test("the prompt composer retains native undo and redo history", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+
+  const composer = page.getByRole("textbox", { name: "Message", exact: true });
+  await composer.click();
+  await composer.pressSequentially("First draft");
+  await expect(composer).toHaveValue("First draft");
+  await composer.press("Control+z");
+  await expect(composer).toHaveValue("");
+  await composer.press("Control+Shift+z");
+  await expect(composer).toHaveValue("First draft");
+
+  await page.keyboard.press("Control+k");
+  const search = page.getByRole("combobox", {
+    name: "Search commands, sessions, and threads",
+  });
+  await search.pressSequentially("q");
+  await expect(search).toHaveValue("q");
+  await search.press("Control+z");
+  await expect(search).toHaveValue("");
+  await search.press("Control+y");
+  await expect(search).toHaveValue("q");
+});
+
 test("subagent rail nodes open closeable read-only exploration tabs", async ({
   page,
 }) => {
@@ -1729,6 +1755,7 @@ test("subagent rail nodes open closeable read-only exploration tabs", async ({
     additionalThreads: [{
       id: "th_subagent",
       session_id: "se_1",
+      parent_thread_id: "th_fixture",
       title: "Subagent: Review the native host lifecycle and report only concrete issues.",
       mode: "plan",
       model: "test/subagent",
@@ -1789,13 +1816,14 @@ test("subagent rail nodes open closeable read-only exploration tabs", async ({
   await expect(page).toHaveURL(/\/threads\/th_fixture/u);
   await expect(page.locator('[data-thread-tab-id="th_subagent"]')).toHaveCount(0);
 
-  const closedThreads = page.getByRole("button", { name: "Closed threads (1)" });
-  await expect(closedThreads).toBeVisible();
-  await closedThreads.click();
-  const reopenThread = page.getByRole("menuitem", {
+  const threadSwitcher = page.getByRole("button", { name: "Threads (2)" });
+  await expect(threadSwitcher).toBeVisible();
+  await threadSwitcher.click();
+  const reopenThread = page.getByRole("treeitem", {
     name: /Subagent: Review the native host lifecycle/u,
   });
-  await expect(reopenThread).toContainText("Read-only subagent thread");
+  await expect(reopenThread).toContainText("Read-only subagent");
+  await expect(reopenThread).toHaveAttribute("aria-level", "1");
   await reopenThread.click();
   await expect(page).toHaveURL(/\/threads\/th_subagent/u);
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
@@ -1803,7 +1831,8 @@ test("subagent rail nodes open closeable read-only exploration tabs", async ({
   await expect(page.locator(
     '.thread-tab-item:has([data-thread-tab-id="th_subagent"]) .thread-tab-close',
   )).toBeVisible();
-  await expect(page.getByRole("button", { name: "No closed threads" })).toBeDisabled();
+  await threadSwitcher.click();
+  await expect(page.getByText("No threads have been removed.", { exact: true })).toBeVisible();
 });
 
 test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
@@ -1811,6 +1840,7 @@ test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
     additionalThreads: [{
       id: "th_interactive_subagent",
       session_id: "se_1",
+      parent_thread_id: "th_fixture",
       title: "Subagent: Implement the focused follow-up",
       mode: "code",
       model: "test/subagent",
@@ -1890,22 +1920,23 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
     .toBeVisible();
   await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
   await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
-  await page.getByRole("button", { name: "Closed threads (2)" }).click();
-  const reopenThread = page.getByRole("menuitem", { name: /Chat rendering/u });
-  await expect(reopenThread).toContainText("Conversation thread");
+  await page.getByRole("button", { name: "Threads (2)" }).click();
+  const reopenThread = page.getByRole("treeitem", { name: /Chat rendering/u });
+  await expect(reopenThread).toContainText("Conversation");
   await reopenThread.click();
 
   await expect(page).toHaveURL(/\/threads\/th_fixture/u);
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
     .toHaveAttribute("data-thread-tab-id", "th_fixture");
-  await page.getByRole("button", { name: "Closed threads (1)" }).click();
-  await page.getByRole("menuitem", { name: /Review follow-up/u }).click();
+  await page.getByRole("button", { name: "Threads (2)" }).click();
+  await page.getByRole("treeitem", { name: /Review follow-up/u }).click();
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
     .toHaveAttribute("data-thread-tab-id", "th_second");
-  await expect(page.getByRole("button", { name: "No closed threads" })).toBeDisabled();
+  await page.getByRole("button", { name: "Threads (2)" }).click();
+  await expect(page.getByText("No threads have been removed.", { exact: true })).toBeVisible();
 });
 
-test("thread tabs and the closed-thread menu share session status indicators", async ({ page }) => {
+test("thread tabs and the thread switcher share session status indicators", async ({ page }) => {
   await installProtocolFixtures(page, {
     additionalThreads: [{
       id: "th_attention",
@@ -1949,21 +1980,88 @@ test("thread tabs and the closed-thread menu share session status indicators", a
   await page.locator(
     '.thread-tab-item:has([data-thread-tab-id="th_attention"]) .thread-tab-close',
   ).click();
-  const closedThreadsToggle = page.getByRole("button", {
-    name: "Closed threads (1), Question awaiting an answer",
+  const threadSwitcher = page.getByRole("button", {
+    name: "Threads (2), Question awaiting an answer",
   });
-  const closedThreadsStatus = closedThreadsToggle.locator(
-    ".closed-thread-tabs-status.question",
+  const hiddenThreadStatus = threadSwitcher.locator(
+    ".thread-switcher-status.question",
   );
-  await expect(closedThreadsStatus).toBeVisible();
-  await expect(closedThreadsStatus)
+  await expect(hiddenThreadStatus).toBeVisible();
+  await expect(hiddenThreadStatus)
     .toHaveAttribute("title", "Question awaiting an answer");
-  await closedThreadsToggle.click();
-  const closed = page.locator(
-    '[data-closed-thread-id="th_attention"] .thread-tab-indicator.question',
+  await threadSwitcher.click();
+  const removed = page.locator(
+    '[data-thread-switcher-id="th_attention"] .thread-tab-indicator.question',
   );
-  await expect(closed).toBeVisible();
-  await expect(closed).toHaveAttribute("title", "Question awaiting an answer");
+  await expect(removed).toBeVisible();
+  await expect(removed).toHaveAttribute("title", "Question awaiting an answer");
+});
+
+test("the thread switcher pins working threads and filters durable status", async ({ page }) => {
+  await installProtocolFixtures(page, {
+    additionalThreads: [{
+      id: "th_running",
+      session_id: "se_1",
+      title: "Active implementation",
+      mode: "code",
+      model: "test/model",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:00:00Z",
+    }, {
+      id: "th_attention",
+      session_id: "se_1",
+      title: "Waiting for a decision",
+      mode: "code",
+      model: "test/model",
+      model_options: {},
+      permission_mode: "ask",
+      created_at: "2026-08-05T08:01:00Z",
+    }],
+    threadStatuses: [{
+      thread_id: "th_running",
+      session_id: "se_1",
+      active: true,
+      attention: "none",
+      outcome: "running",
+      latest_cursor: 20,
+    }, {
+      thread_id: "th_attention",
+      session_id: "se_1",
+      active: false,
+      attention: "question",
+      outcome: "idle",
+      latest_cursor: 21,
+    }],
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Threads \(3\)/u }).click();
+
+  await page.getByRole("button", { name: "Running", exact: true }).click();
+  await expect(page.locator('[data-thread-switcher-id="th_running"]')).toBeVisible();
+  await expect(page.locator('[data-thread-switcher-id="th_attention"]')).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Needs attention", exact: true }).click();
+  const attention = page.locator('[data-thread-switcher-id="th_attention"]');
+  await expect(attention).toBeVisible();
+  await expect(page.locator('[data-thread-switcher-id="th_running"]')).toHaveCount(0);
+  await attention.getByRole("button", { name: "Pin Waiting for a decision" }).click();
+
+  await page.getByRole("button", { name: "All", exact: true }).click();
+  await expect(page.locator(
+    '[aria-label="Pinned threads"] [data-thread-switcher-id="th_attention"]',
+  )).toBeVisible();
+  await expect(page.getByRole("button", { name: "Unpin Waiting for a decision" }))
+    .toHaveAttribute("aria-pressed", "true");
+
+  await page.reload();
+  await page.getByRole("button", { name: /Threads \(3\)/u }).click();
+  await expect(page.locator(
+    '[aria-label="Pinned threads"] [data-thread-switcher-id="th_attention"]',
+  )).toBeVisible();
+  await expect(page.locator(
+    '[data-thread-tab-id="th_attention"] .thread-tab-pin',
+  )).toBeVisible();
 });
 
 test("turn cards unify prompt, activity, and response while preserving copy actions", async ({ page }) => {
@@ -2191,7 +2289,7 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
       ? Number.NaN
       : Math.round(second.top - first.bottom);
   });
-  expect(groupedHeaderStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(groupedHeaderStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
   expect(groupedHeaderStyle.backgroundImage).toBe("none");
   expect(groupedHeaderStyle.borderLeftWidth).toBe("0px");
   expect(groupedHeaderStyle.borderTopWidth).toBe("0px");
@@ -2231,7 +2329,7 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
       summaryBackground: getComputedStyle(summary).backgroundColor,
     };
   });
-  expect(focusedToolInteraction.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(focusedToolInteraction.backgroundColor).toBe("rgba(0, 0, 0, 0)");
   expect(focusedToolInteraction.summaryBackground).toBe("rgba(0, 0, 0, 0)");
   expect(focusedToolInteraction.interactionLeft)
     .toBeGreaterThanOrEqual(focusedToolInteraction.disclosureRight - 2);
@@ -2252,9 +2350,20 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await page.mouse.move(0, 0);
   await expect.poll(() => editCard.locator(":scope > summary").evaluate(
     (summary) => getComputedStyle(summary, "::before").backgroundColor,
-  )).not.toBe("rgba(0, 0, 0, 0)");
+  )).toBe("rgba(0, 0, 0, 0)");
   await expect(editCard.getByLabel("Live tool output")).toHaveCount(0);
   await expect(editCard.locator(".tool-inline-diff")).toHaveCount(0);
+
+  const readCard = page.locator('.tool-card[data-call-id="call_read"]');
+  await readCard.locator(":scope > summary").click();
+  const readDetail = readCard.locator("trouve-tool-detail-view");
+  await expect(readDetail).toBeVisible();
+  await expect(readDetail.getByRole("heading", { name: "Request" })).toHaveCount(0);
+  const excerpt = readDetail.locator("trouve-source-excerpt");
+  await expect(excerpt.getByRole("table", { name: "src/app.ts source excerpt" })).toBeVisible();
+  await expect(excerpt.getByRole("rowheader", { name: "8" })).toBeVisible();
+  await expect(excerpt.getByRole("cell", { name: "const ready = true;" })).toBeVisible();
+  await readCard.locator(":scope > summary").click();
   await activityGroup.locator(":scope > summary").click();
   await expect(activityGroup.locator(".tool-card")).toHaveCount(0);
 
@@ -2324,7 +2433,9 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await messageMenu.press("Escape");
   await expect(messageMenu).toHaveCount(0);
   await expect(assistantCopy).toBeFocused();
-  await agentCard.locator(".agent-text-block").first().evaluate((block) => {
+  const selectedResponse = agentCard.locator(".agent-text-block").first();
+  const selectedParagraph = selectedResponse.locator("trouve-markdown-view p");
+  await selectedResponse.evaluate((block) => {
     const paragraph = block
       .querySelector("trouve-markdown-view")
       ?.shadowRoot?.querySelector("p");
@@ -2334,16 +2445,31 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
     const selection = globalThis.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
-    block.dispatchEvent(new MouseEvent("contextmenu", {
-      bubbles: true,
-      cancelable: true,
-      clientX: 80,
-      clientY: 80,
-      composed: true,
-    }));
   });
+  await selectedParagraph.click({ button: "right" });
+  const copySelection = messageMenu.getByRole("menuitem", { name: "Copy", exact: true });
+  await expect(copySelection).toBeVisible();
+  await expect.poll(() => page.evaluate(() => globalThis.getSelection()?.toString() ?? ""))
+    .toBe("I'll update it.");
+  await copySelection.click();
+  await expect(messageMenu).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => globalThis.getSelection()?.toString() ?? ""))
+    .toBe("I'll update it.");
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
+      .__trouveCopiedMarkdown
+  )).toBe("I'll update it.");
+  await expect.poll(() => page.evaluate(() => globalThis.getSelection()?.toString() ?? ""))
+    .toBe("I'll update it.");
+
+  await selectedParagraph.click({ button: "right" });
   await expect(messageMenu.getByRole("menuitem", { name: "Copy", exact: true })).toBeVisible();
+  await expect(messageMenu.getByRole("menuitem", { name: "Copy as markdown" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => globalThis.getSelection()?.toString() ?? ""))
+    .toBe("I'll update it.");
   await messageMenu.getByRole("menuitem", { name: "Copy as markdown" }).click();
+  await expect.poll(() => page.evaluate(() => globalThis.getSelection()?.toString() ?? ""))
+    .toBe("I'll update it.");
   await expect.poll(() => page.evaluate(() =>
     (globalThis as typeof globalThis & { __trouveCopiedMarkdown?: string })
       .__trouveCopiedMarkdown

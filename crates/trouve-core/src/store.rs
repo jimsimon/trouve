@@ -31,8 +31,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // v4 stores completed folded rows independently and keeps only the live tail
 // in the serialized projection cache.
 // v5 adds durable TODO lifecycle rows. v6 keeps explicitly bounded provider
-// thinking intact when tool lifecycle events interleave with its deltas.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 6;
+// thinking intact when tool lifecycle events interleave with its deltas. v7
+// applies the same explicit-boundary rule when steering interleaves with them.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -7666,15 +7667,17 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-/// Columns matching `row_to_thread`, including the agent-spawned flag.
+/// Columns matching `row_to_thread`, including durable spawn parentage.
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
      created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
-     todos, title";
+     todos, title, (SELECT st.parent_thread_id FROM spawned_threads st \
+       WHERE st.child_thread_id = threads.id LIMIT 1)";
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
         session_id: r.get(1)?,
+        parent_thread_id: r.get(10)?,
         title: r.get(9)?,
         mode: r.get(2)?,
         model: r.get(3)?,
@@ -9223,6 +9226,7 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "p/m".into(),
@@ -9257,6 +9261,7 @@ mod tests {
         let child = Thread {
             id: "th_child".into(),
             session_id: "se_1".into(),
+            parent_thread_id: Some("th_1".into()),
             title: None,
             mode: "code".into(),
             model: "p/m".into(),
@@ -9270,6 +9275,13 @@ mod tests {
             .insert_thread(&child, &serde_json::Map::new())
             .unwrap();
         store.insert_spawned("th_child", "th_1", "thread").unwrap();
+        assert_eq!(
+            store
+                .thread("th_child")
+                .unwrap()
+                .and_then(|thread| thread.parent_thread_id),
+            Some("th_1".into()),
+        );
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
@@ -9389,6 +9401,7 @@ mod tests {
                 &Thread {
                     id: thread_id.into(),
                     session_id: "se_q".into(),
+                    parent_thread_id: None,
                     title: None,
                     mode: "code".into(),
                     model: "p/m".into(),
@@ -9410,6 +9423,7 @@ mod tests {
         let named = Thread {
             id: "th_named".into(),
             session_id: "se_q".into(),
+            parent_thread_id: None,
             title: Some("Review the parser edge cases".into()),
             mode: "review".into(),
             model: "p/m".into(),
@@ -9854,6 +9868,7 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "p/m".into(),

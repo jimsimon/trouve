@@ -179,6 +179,39 @@ describe("buildChatLayout", () => {
     expect(buildChatLayout(items).unitIdForItem.has("spawn-tool")).toBe(false);
   });
 
+  it("suppresses child-agent output polling while retaining delegation nodes", () => {
+    const subagent: ThreadChatItem = {
+      id: "subagent",
+      kind: "subagent",
+      turn: 6,
+      threadId: "th_child",
+      sessionId: "se_parent",
+      prompt: "Review the host",
+      model: "codex/gpt-5.6-terra",
+    };
+    const collection: ThreadChatItem = {
+      id: "spawn-output",
+      kind: "tool",
+      callId: "call_output",
+      tool: "mcpToolCall",
+      args: {
+        tool: "mcp__trouve__spawn_output",
+        arguments: { thread_id: "th_child", wait_ms: 30_000 },
+      },
+      status: "ok",
+      result: { thread_id: "th_child", status: "completed" },
+      output,
+    };
+
+    const layout = buildChatLayout([
+      { id: "u6", kind: "user", turn: 6, content: "Delegate", attachments: [] },
+      subagent,
+      collection,
+    ]);
+    expect(layout.units[0]?.items).toEqual([subagent]);
+    expect(layout.unitIdForItem.has("spawn-output")).toBe(false);
+  });
+
   it("associates the event-folded leading status with its turn", () => {
     const items: ThreadChatItem[] = [
       { id: "s7", kind: "turn-status", turn: 7, state: { kind: "completed", usage: { input_tokens: 2, output_tokens: 1 } } },

@@ -322,6 +322,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     resumePreferences: this.#resume.current,
     setThreadTabClosed: (threadId: string, closed: boolean) =>
       this.#setThreadTabClosed(threadId, closed),
+    setThreadTabPinned: (threadId: string, pinned: boolean) =>
+      this.#setThreadTabPinned(threadId, pinned),
     protocol: this.#protocolClient,
     modelCatalog: this.#modelCatalog,
     subscriptionHealth: this.#subscriptionHealth,
@@ -880,6 +882,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #setThreadTabClosed(threadId: string, closed: boolean): void {
     const before = readSignal(this.#resume.current);
     const after = this.#resume.setThreadTabClosed(threadId, closed, false);
+    if (after !== before) this.#flushResumePreferences();
+  }
+
+  #setThreadTabPinned(threadId: string, pinned: boolean): void {
+    const before = readSignal(this.#resume.current);
+    const after = this.#resume.setThreadTabPinned(threadId, pinned, false);
     if (after !== before) this.#flushResumePreferences();
   }
 

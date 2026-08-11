@@ -5620,6 +5620,7 @@ impl Engine {
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: req
                 .title
                 .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -12724,6 +12725,7 @@ mod tests {
         let thread = Thread {
             id: "th_fast_accept".into(),
             session_id: session.id,
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),
@@ -12795,6 +12797,7 @@ mod tests {
         let thread = Thread {
             id: "th_fast_queue".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),
@@ -12871,6 +12874,7 @@ mod tests {
         let thread = Thread {
             id: "th_cancel_question".into(),
             session_id: session.id,
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),
@@ -14286,6 +14290,7 @@ default_permission_mode = "ask"
         let thread = Thread {
             id: "th_todo".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),
@@ -14831,6 +14836,7 @@ default_permission_mode = "ask"
         let thread = Thread {
             id: "th_vendor_lane".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "cursor/model".into(),
@@ -14897,6 +14903,7 @@ default_permission_mode = "ask"
         let thread = Thread {
             id: "th_cancel_tool".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),
@@ -15071,6 +15078,7 @@ default_permission_mode = "ask"
         let thread = Thread {
             id: "th_parallel_tools".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
             title: None,
             mode: "code".into(),
             model: "test/model".into(),

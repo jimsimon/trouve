@@ -249,7 +249,10 @@ pub use requests::*;
 // (additive).
 // 3.35: GET /v1/threads/{id}/subagents accepts recursive=true so parent
 // overviews can include active nested collaborator descendants (additive).
-pub const PROTOCOL_VERSION: &str = "3.35";
+// 3.36: thread projections include their optional direct parent id so clients
+// can render durable collaborator hierarchies without reconstructing them
+// from paged transcript events (additive).
+pub const PROTOCOL_VERSION: &str = "3.36";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 
