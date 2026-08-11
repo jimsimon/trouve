@@ -1210,13 +1210,23 @@ echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval"
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"spawn-1","type":"collabToolCall","tool":"spawn_agent","senderThreadId":"root","newThreadId":"child"}}}'
 IFS= read -r prompt_lookup
 printf '%s\n' "$prompt_lookup" > "$0.prompt-lookup"
-echo '{"jsonrpc":"2.0","id":4,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"text","text":"Inspect the child task."}]}]}]}}'
+# The collaboration announcement can race the child turn becoming visible.
+# Return an empty first page and expose the real Responses-style prompt on the
+# bounded retry.
+echo '{"jsonrpc":"2.0","id":4,"result":{"data":[]}}'
+IFS= read -r prompt_lookup_retry
+printf '%s\n' "$prompt_lookup_retry" >> "$0.prompt-lookup"
+echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Inspect the child task."}]}]}]}}'
 IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
+# Inter-agent communication from a child back to the root is activity, not a
+# nested spawn. Older routing treated the ancestor id as a fresh collaborator
+# and then waited forever for that phantom child to complete.
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"child","turnId":"child-turn","item":{"id":"child-to-root","type":"subAgentActivity","agentThreadId":"root","agentPath":"/root","kind":"interacted"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"followup-1","type":"collabToolCall","tool":"resume_agent","senderThreadId":"root","receiverThreadId":"child","prompt":"Double-check the result."}}}'
 echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn-2","status":"inProgress"}}}'
-echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"child","turnId":"child-turn-2","item":{"id":"child-prompt-2","type":"userMessage","content":[{"type":"text","text":"Double-check the result."}]}}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"child","turnId":"child-turn-2","item":{"id":"child-prompt-2","type":"userMessage","content":[{"type":"input_text","text":"Double-check the result."}]}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"child","turnId":"child-turn-2","itemId":"child-answer-2","delta":"Child checked again."}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn-2","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"answer","delta":"Parent finished."}}'
@@ -1232,69 +1242,80 @@ cat > /dev/null
 
     let mut saw_parent_text = false;
     let mut child_announcements = 0;
+    let mut saw_initial_child_prompt = false;
     let mut child_completions = 0;
     let mut saw_child_followup = false;
     let mut saw_child_text = false;
     let mut completed = false;
-    while let Some(event) = stream.next().await {
-        match event.unwrap() {
-            BackendEvent::CollaboratorStarted { session_id, .. } => {
-                child_announcements += usize::from(session_id == "child");
-            }
-            BackendEvent::CollaboratorEvent {
-                session_id,
-                turn_id,
-                event:
-                    BackendCollaboratorEvent::ApprovalNeeded {
-                        call_id,
-                        tool,
-                        responder,
-                        ..
-                    },
-                ..
-            } => {
-                assert_eq!(session_id, "child");
-                assert_eq!(turn_id.as_deref(), Some("child-turn"));
-                assert_eq!(call_id, "child-command");
-                assert_eq!(tool, "commandExecution");
-                responder.send(true).unwrap();
-            }
-            BackendEvent::CollaboratorEvent {
-                session_id,
-                turn_id,
-                event: BackendCollaboratorEvent::Completed { .. },
-                ..
-            } => {
-                if session_id == "child" {
-                    assert!(matches!(
-                        turn_id.as_deref(),
-                        Some("child-turn" | "child-turn-2")
-                    ));
-                    child_completions += 1;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                BackendEvent::CollaboratorStarted {
+                    session_id, prompt, ..
+                } => {
+                    assert_eq!(session_id, "child", "an ancestor was projected as a child");
+                    child_announcements += 1;
+                    saw_initial_child_prompt |=
+                        prompt.as_deref() == Some("Inspect the child task.");
                 }
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id,
+                    event:
+                        BackendCollaboratorEvent::ApprovalNeeded {
+                            call_id,
+                            tool,
+                            responder,
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(session_id, "child");
+                    assert_eq!(turn_id.as_deref(), Some("child-turn"));
+                    assert_eq!(call_id, "child-command");
+                    assert_eq!(tool, "commandExecution");
+                    responder.send(true).unwrap();
+                }
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id,
+                    event: BackendCollaboratorEvent::Completed { .. },
+                    ..
+                } => {
+                    if session_id == "child" {
+                        assert!(matches!(
+                            turn_id.as_deref(),
+                            Some("child-turn" | "child-turn-2")
+                        ));
+                        child_completions += 1;
+                    }
+                }
+                BackendEvent::CollaboratorEvent {
+                    turn_id: Some(turn_id),
+                    event: BackendCollaboratorEvent::UserMessage(content),
+                    ..
+                } => {
+                    saw_child_followup |=
+                        turn_id == "child-turn-2" && content == "Double-check the result.";
+                }
+                BackendEvent::CollaboratorEvent {
+                    turn_id: Some(turn_id),
+                    event: BackendCollaboratorEvent::TextDelta(text),
+                    ..
+                } => {
+                    saw_child_text |= turn_id == "child-turn-2" && text == "Child checked again.";
+                }
+                BackendEvent::TextDelta(text) => saw_parent_text |= text == "Parent finished.",
+                BackendEvent::Completed { .. } => completed = true,
+                _ => {}
             }
-            BackendEvent::CollaboratorEvent {
-                turn_id: Some(turn_id),
-                event: BackendCollaboratorEvent::UserMessage(content),
-                ..
-            } => {
-                saw_child_followup |=
-                    turn_id == "child-turn-2" && content == "Double-check the result.";
-            }
-            BackendEvent::CollaboratorEvent {
-                turn_id: Some(turn_id),
-                event: BackendCollaboratorEvent::TextDelta(text),
-                ..
-            } => {
-                saw_child_text |= turn_id == "child-turn-2" && text == "Child checked again.";
-            }
-            BackendEvent::TextDelta(text) => saw_parent_text |= text == "Parent finished.",
-            BackendEvent::Completed { .. } => completed = true,
-            _ => {}
         }
-    }
+    })
+    .await
+    .expect("the root turn should finish after its real child completes");
 
     assert_eq!(child_announcements, 2);
+    assert!(saw_initial_child_prompt);
     assert_eq!(child_completions, 2);
     assert!(saw_child_followup && saw_child_text && saw_parent_text && completed);
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();

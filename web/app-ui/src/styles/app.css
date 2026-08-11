@@ -767,10 +767,8 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .inspection-summary button { min-width: 26px; min-height: 26px; border: 0; border-radius: var(--trouve-radius-sm); background: var(--trouve-control-bg); }
 .diff-summary { flex-wrap: wrap; padding: 6px; }
 .diff-summary > strong { color: var(--trouve-text-dim); font-size: 12px; font-weight: 400; }
-.diff-summary .checkpoint-actions { flex: 0 1 auto; flex-wrap: wrap; margin-inline-start: auto; }
-.checkpoint-actions { display: flex; align-items: center; gap: 5px; }
-.checkpoint-actions button { padding-inline: 7px; color: var(--trouve-text-mid); white-space: nowrap; }
-.checkpoint-actions button:disabled { cursor: not-allowed; opacity: .56; }
+.diff-summary .diff-summary-actions { display: flex; flex: 0 1 auto; align-items: center; gap: 5px; margin-inline-start: auto; }
+.diff-summary-actions button { padding-inline: 7px; color: var(--trouve-text-mid); white-space: nowrap; }
 .diff-notice { flex-basis: 100%; color: var(--trouve-text-dim); font-size: 10px; }
 .diff-notice.error { color: var(--trouve-err); }
 .inspection-file-list { min-height: 0; overflow: auto; border-bottom: 1px solid var(--trouve-border); }
@@ -1118,7 +1116,7 @@ trouve-command-palette { display: contents; }
   .thread-options select { max-width: 150px; min-height: 38px; }
   .thread-tabs { height: 42px; }
   .thread-tabs button, .inspection-tabs button { min-height: 42px; }
-  .checkpoint-actions button { min-height: 42px; }
+  .diff-summary-actions button { min-height: 42px; }
   .files-inspection, .diff-inspection { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .files-inspection > .inspection-summary, .diff-inspection > .inspection-summary { grid-column: 1; grid-row: 1; }
   .files-inspection > .inspection-file-list, .diff-inspection > .inspection-file-list { grid-column: 1; grid-row: 2; }

@@ -175,6 +175,11 @@ async fn flush_backend_event_batch(
 struct BackendCollaboratorProjection {
     thread: Thread,
     turn: u64,
+    /// Whether the durable parent-rail link for this collaborator has been
+    /// published. Child activity can arrive before the provider's formal
+    /// collaborator announcement, so projection existence alone is not proof
+    /// that the parent has seen `SubagentSpawned`.
+    spawn_link_published: bool,
     vendor_turn_id: Option<String>,
     thinking_level: Option<String>,
     last_user_message: Option<String>,
@@ -8344,7 +8349,7 @@ impl Engine {
         Ok(())
     }
 
-    fn begin_backend_collaborator_turn(
+    async fn begin_backend_collaborator_turn(
         &self,
         collaborator: &mut BackendCollaboratorProjection,
         vendor_turn_id: Option<String>,
@@ -8362,17 +8367,30 @@ impl Engine {
         collaborator.tool_started_at.clear();
         collaborator.suppressed_bridge_calls.clear();
         collaborator.terminal = false;
-        self.store.append_event(
-            Scope::Thread(collaborator.thread.id.clone()),
-            Event::TurnStarted {
-                turn: collaborator.turn,
-                mode: collaborator.thread.mode.clone(),
-                model: collaborator.thread.model.clone(),
-                thinking_level: collaborator.thinking_level.clone(),
-                // The containing app-server turn owns native child steering.
-                supports_steering: false,
-            },
-        )?;
+        // Provider-native collaborators execute inside the containing vendor
+        // turn and therefore inherit its already-acquired capacity. Publish
+        // that fact before `TurnStarted` so direct and nested children project
+        // as running instead of remaining in the scheduler's waiting state.
+        self.store
+            .append_events_async(
+                Scope::Thread(collaborator.thread.id.clone()),
+                vec![
+                    Event::TurnCapacityAcquired {
+                        turn: collaborator.turn,
+                        wait_ms: 0,
+                        background: false,
+                    },
+                    Event::TurnStarted {
+                        turn: collaborator.turn,
+                        mode: collaborator.thread.mode.clone(),
+                        model: collaborator.thread.model.clone(),
+                        thinking_level: collaborator.thinking_level.clone(),
+                        // The containing app-server turn owns native child steering.
+                        supports_steering: false,
+                    },
+                ],
+            )
+            .await?;
         self.record_backend_collaborator_input(collaborator, prompt)
     }
 
@@ -8401,6 +8419,19 @@ impl Engine {
                     self.record_backend_collaborator_input(collaborator, prompt)?;
                 }
             }
+            return Ok(());
+        }
+        if let Some(existing_thread_id) = vendor_threads.get(&vendor_session_id) {
+            // A provider-native activity notification can point from a child
+            // back to its parent/root. That vendor session is already bound;
+            // materializing it again would create a phantom descendant whose
+            // turn can never finish and would keep the real root active.
+            tracing::warn!(
+                vendor_session_id,
+                existing_thread_id,
+                parent_vendor_session_id,
+                "ignoring collaborator announcement for an already-bound vendor session"
+            );
             return Ok(());
         }
         let parent_thread_id = vendor_threads
@@ -8473,6 +8504,7 @@ impl Engine {
         let mut collaborator = BackendCollaboratorProjection {
             thread: child,
             turn: 0,
+            spawn_link_published: false,
             vendor_turn_id: None,
             thinking_level,
             last_user_message: None,
@@ -8486,8 +8518,57 @@ impl Engine {
             persisted: Vec::new(),
             terminal: true,
         };
-        self.begin_backend_collaborator_turn(&mut collaborator, None, prompt.unwrap_or_default())?;
+        self.begin_backend_collaborator_turn(&mut collaborator, None, prompt.unwrap_or_default())
+            .await?;
         collaborators.insert(vendor_session_id, collaborator);
+        Ok(())
+    }
+
+    async fn publish_backend_collaborator_spawn(
+        &self,
+        root_thread: &Thread,
+        root_turn: u64,
+        vendor_session_id: &str,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let Some(collaborator) = collaborators
+            .get(vendor_session_id)
+            .filter(|collaborator| !collaborator.spawn_link_published)
+        else {
+            return Ok(());
+        };
+        let child_thread_id = collaborator.thread.id.clone();
+        let child_session_id = collaborator.thread.session_id.clone();
+        let child_model = collaborator.thread.model.clone();
+        let child_prompt = collaborator.last_user_message.clone().unwrap_or_default();
+        let parent_thread_id = self
+            .store
+            .spawn_parent(&child_thread_id)?
+            .unwrap_or_else(|| root_thread.id.clone());
+        let parent_turn = if parent_thread_id == root_thread.id {
+            root_turn
+        } else {
+            collaborators
+                .values()
+                .find(|candidate| candidate.thread.id == parent_thread_id)
+                .map_or(root_turn, |candidate| candidate.turn)
+        };
+        self.store
+            .append_event_async(
+                Scope::Thread(parent_thread_id),
+                Event::SubagentSpawned {
+                    turn: parent_turn,
+                    thread_id: child_thread_id,
+                    session_id: child_session_id,
+                    prompt: child_prompt,
+                    model: child_model,
+                    call_id: None,
+                },
+            )
+            .await?;
+        if let Some(collaborator) = collaborators.get_mut(vendor_session_id) {
+            collaborator.spawn_link_published = true;
+        }
         Ok(())
     }
 
@@ -8598,6 +8679,7 @@ impl Engine {
         }
         let prompt = collaborator.pending_prompt.take().unwrap_or_default();
         self.begin_backend_collaborator_turn(collaborator, Some(vendor_turn_id.to_string()), prompt)
+            .await
     }
 
     async fn persist_backend_collaborator_event(
@@ -9268,7 +9350,6 @@ impl Engine {
                 } => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let vendor_session_id = session_id.clone();
-                    let newly_announced = !collaborators.contains_key(&vendor_session_id);
                     let prompt_announced =
                         prompt.as_deref().is_some_and(|prompt| !prompt.is_empty());
                     self.start_backend_collaborator(
@@ -9286,40 +9367,13 @@ impl Engine {
                         &mut collaborators,
                     )
                     .await?;
-                    if newly_announced
-                        && let Some(collaborator) = collaborators.get(&vendor_session_id)
-                    {
-                        let child_thread_id = collaborator.thread.id.clone();
-                        let child_session_id = collaborator.thread.session_id.clone();
-                        let child_model = collaborator.thread.model.clone();
-                        let child_prompt =
-                            collaborator.last_user_message.clone().unwrap_or_default();
-                        let parent_thread_id = self
-                            .store
-                            .spawn_parent(&child_thread_id)?
-                            .unwrap_or_else(|| thread.id.clone());
-                        let parent_turn = if parent_thread_id == thread.id {
-                            turn
-                        } else {
-                            collaborators
-                                .values()
-                                .find(|candidate| candidate.thread.id == parent_thread_id)
-                                .map_or(turn, |candidate| candidate.turn)
-                        };
-                        self.store
-                            .append_event_async(
-                                Scope::Thread(parent_thread_id),
-                                Event::SubagentSpawned {
-                                    turn: parent_turn,
-                                    thread_id: child_thread_id,
-                                    session_id: child_session_id,
-                                    prompt: child_prompt,
-                                    model: child_model,
-                                    call_id: None,
-                                },
-                            )
-                            .await?;
-                    }
+                    self.publish_backend_collaborator_spawn(
+                        thread,
+                        turn,
+                        &vendor_session_id,
+                        &mut collaborators,
+                    )
+                    .await?;
                     // The child route does not replay its initial user item.
                     // When the backend announcement supplies or recovers the
                     // spawn prompt, publish it immediately instead of waiting
@@ -12978,6 +13032,98 @@ mod tests {
             "high"
         );
 
+        // Inter-agent activity can name an ancestor as `agentThreadId`. The
+        // root vendor session is already bound to the parent trouve thread and
+        // must never be materialized again as a descendant of the child.
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-root".into(),
+                "vendor-child",
+                Some("root".into()),
+                BackendCollaboratorAccess::Inherit,
+                None,
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        assert!(!collaborators.contains_key("vendor-root"));
+        assert_eq!(vendor_threads["vendor-root"], parent.id);
+        assert_eq!(
+            engine
+                .list_thread_subagents(&parent.id)
+                .unwrap()
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![child.id.clone()]
+        );
+
+        let child_lifecycle = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        let capacity_cursor = child_lifecycle
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCapacityAcquired {
+                        turn: 1,
+                        wait_ms: 0,
+                        background: false,
+                    }
+                )
+                .then_some(event.cursor)
+            })
+            .expect("native collaborator inherits the parent turn's capacity");
+        let started_cursor = child_lifecycle
+            .iter()
+            .find_map(|event| {
+                matches!(event.event, Event::TurnStarted { turn: 1, .. }).then_some(event.cursor)
+            })
+            .expect("native collaborator turn starts");
+        assert!(capacity_cursor < started_cursor);
+
+        // Child activity can create the projection before Codex emits its
+        // formal collaborator-start notification. Publishing is tracked
+        // independently from projection existence, and remains idempotent.
+        assert!(
+            store
+                .events_after(&Scope::Thread(parent.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.event, Event::SubagentSpawned { .. }))
+        );
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-child", &mut collaborators)
+            .await
+            .unwrap();
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-child", &mut collaborators)
+            .await
+            .unwrap();
+        let parent_spawns = store
+            .events_after(&Scope::Thread(parent.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Event::SubagentSpawned {
+                    thread_id, prompt, ..
+                } => Some((thread_id, prompt)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_spawns,
+            vec![(child.id.clone(), "Investigate the failing test".into())]
+        );
+        assert!(collaborators["vendor-child"].spawn_link_published);
+
         let mut claims = BackendCollaboratorClaims::new(&engine.active_threads);
         claims.claim(&child.id, &session.id);
         assert!(!engine.subagent_is_read_only(&child).unwrap());
@@ -13369,6 +13515,46 @@ default_permission_mode = "ask"
         assert_eq!(
             store.thread_model_options(&grandchild.id).unwrap()["thinking_level"],
             "high"
+        );
+        let grandchild_events = store
+            .events_after(&Scope::Thread(grandchild.id.clone()), 0)
+            .unwrap();
+        let grandchild_capacity = grandchild_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCapacityAcquired {
+                        turn: 1,
+                        wait_ms: 0,
+                        background: false,
+                    }
+                )
+            })
+            .expect("nested collaborator inherits capacity");
+        let grandchild_started = grandchild_events
+            .iter()
+            .position(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
+            .expect("nested collaborator starts");
+        assert!(grandchild_capacity < grandchild_started);
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-grandchild", &mut collaborators)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .events_after(&Scope::Thread(child.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    Event::SubagentSpawned {
+                        turn: 2,
+                        thread_id,
+                        prompt,
+                        ..
+                    } if thread_id == &grandchild.id && prompt == "Verify one more edge case"
+                ))
         );
         let direct_children = engine.list_thread_subagents(&parent.id).unwrap();
         assert!(direct_children.iter().any(|thread| thread.id == child.id));

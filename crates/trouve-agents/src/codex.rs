@@ -504,8 +504,20 @@ fn collaborator_user_message(item: &Value) -> Option<String> {
     let text = item["content"]
         .as_array()?
         .iter()
-        .filter(|content| content["type"].as_str() == Some("text"))
+        // `thread/turns/list` currently returns the initial prompt with the
+        // Responses-style `input_text` discriminator, while live app-server
+        // notifications and older releases have used `text` or `inputText`.
+        // Treat all three as equivalent textual user content so a spawned
+        // collaborator always receives a durable Prompt node in its child
+        // thread projection.
+        .filter(|content| {
+            matches!(
+                content["type"].as_str(),
+                Some("text") | Some("input_text") | Some("inputText")
+            )
+        })
         .filter_map(|content| content["text"].as_str())
+        .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     (!text.is_empty()).then_some(text)
@@ -777,6 +789,7 @@ fn turn_stream(
         let mut collaborator_prompt_lookups = HashSet::<String>::new();
         let mut collaborator_states = HashMap::<String, CollaboratorStreamState>::new();
         let mut collaborator_lifecycle = CollaboratorLifecycle::default();
+        let mut collaborator_topology = CollaboratorTopology::default();
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
@@ -793,6 +806,19 @@ fn turn_stream(
                         let announcement_id =
                             params["item"]["id"].as_str().unwrap_or("").to_string();
                         for mut collaborator in collaborator_announcements(&params) {
+                            if !collaborator_topology.admit(
+                                &codex_thread_id,
+                                &collaborator.parent_session_id,
+                                &collaborator.session_id,
+                            ) {
+                                tracing::debug!(
+                                    root_session_id = %codex_thread_id,
+                                    parent_session_id = %collaborator.parent_session_id,
+                                    session_id = %collaborator.session_id,
+                                    "codex: ignoring cyclic or conflicting collaborator announcement"
+                                );
+                                continue;
+                            }
                             if announced_collaborators
                                 .insert((collaborator.session_id.clone(), announcement_id.clone()))
                             {
@@ -1246,6 +1272,55 @@ struct CollaboratorAnnouncement {
     model: Option<String>,
     thinking_level: Option<String>,
     access: BackendCollaboratorAccess,
+}
+
+/// The provider's collaboration stream contains both ownership announcements
+/// and ordinary inter-agent activity. Activity sent from a child back to one
+/// of its ancestors can name that ancestor in `agentThreadId`; treating it as
+/// a fresh child creates a cycle that can keep the root turn alive forever.
+/// Retain the first authenticated parent for each collaborator and reject any
+/// later edge that points at the root, reparents a collaborator, or closes a
+/// cycle in the known descendant graph.
+#[derive(Default)]
+struct CollaboratorTopology {
+    parents: HashMap<String, String>,
+}
+
+impl CollaboratorTopology {
+    fn admit(&mut self, root_session_id: &str, parent_session_id: &str, session_id: &str) -> bool {
+        if session_id.is_empty()
+            || parent_session_id.is_empty()
+            || session_id == root_session_id
+            || session_id == parent_session_id
+        {
+            return false;
+        }
+        if let Some(existing_parent) = self.parents.get(session_id) {
+            return existing_parent == parent_session_id;
+        }
+
+        let mut ancestor = parent_session_id;
+        let mut visited = HashSet::new();
+        loop {
+            if ancestor == session_id {
+                return false;
+            }
+            if ancestor == root_session_id {
+                break;
+            }
+            if !visited.insert(ancestor.to_string()) {
+                return false;
+            }
+            let Some(parent) = self.parents.get(ancestor) else {
+                break;
+            };
+            ancestor = parent;
+        }
+
+        self.parents
+            .insert(session_id.to_string(), parent_session_id.to_string());
+        true
+    }
 }
 
 fn collaborator_access_label(value: &str) -> BackendCollaboratorAccess {
@@ -3121,28 +3196,50 @@ impl AppServer {
         thread_id: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<String> {
-        match self
-            .request_cancellable(
-                "thread/turns/list",
-                json!({
-                    "threadId": thread_id,
-                    "limit": 1,
-                    "sortDirection": "desc",
-                    "itemsView": "full",
-                }),
-                cancel,
-            )
-            .await
-        {
-            Ok(response) => collaborator_prompt_from_turn_page(&response),
-            Err(BackendError::Cancelled) => None,
-            Err(error) => {
-                tracing::warn!(
-                    "codex: unable to load initial collaborator prompt for {thread_id}: {error}"
-                );
-                None
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self
+                .request_cancellable(
+                    "thread/turns/list",
+                    json!({
+                        "threadId": thread_id,
+                        "limit": 1,
+                        "sortDirection": "desc",
+                        "itemsView": "full",
+                    }),
+                    cancel,
+                )
+                .await
+            {
+                Ok(response) => {
+                    if let Some(prompt) = collaborator_prompt_from_turn_page(&response) {
+                        return Some(prompt);
+                    }
+                }
+                Err(BackendError::Cancelled) => return None,
+                Err(error) => {
+                    tracing::warn!(
+                        "codex: unable to load initial collaborator prompt for {thread_id}: {error}"
+                    );
+                    return None;
+                }
+            }
+
+            if attempt + 1 < MAX_ATTEMPTS {
+                let delay =
+                    tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)));
+                tokio::pin!(delay);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return None,
+                    () = &mut delay => {}
+                }
             }
         }
+        tracing::debug!(
+            "codex: initial collaborator prompt for {thread_id} was not visible after {MAX_ATTEMPTS} attempts"
+        );
+        None
     }
 
     async fn request_with_cancel(
@@ -3683,6 +3780,37 @@ mod tests {
             }),
         };
         assert_eq!(announced_child_threads(&activity), vec!["child-3"]);
+    }
+
+    #[test]
+    fn collaborator_topology_rejects_activity_that_points_back_to_an_ancestor() {
+        let mut topology = CollaboratorTopology::default();
+        assert!(topology.admit("root", "root", "child"));
+        assert!(topology.admit("root", "child", "grandchild"));
+        assert!(topology.admit("root", "root", "child"));
+
+        let child_to_root = json!({
+            "threadId": "child",
+            "item": {
+                "type": "subAgentActivity",
+                "agentThreadId": "root",
+                "agentPath": "/root",
+                "kind": "interacted"
+            }
+        });
+        let announcements = collaborator_announcements(&child_to_root);
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].parent_session_id, "child");
+        assert_eq!(announcements[0].session_id, "root");
+        assert!(!topology.admit(
+            "root",
+            &announcements[0].parent_session_id,
+            &announcements[0].session_id,
+        ));
+
+        assert!(!topology.admit("root", "grandchild", "child"));
+        assert!(!topology.admit("root", "child", "child"));
+        assert!(!topology.admit("root", "unrelated", "child"));
     }
 
     #[tokio::test]
@@ -4721,9 +4849,10 @@ mod tests {
                         "type": "userMessage",
                         "id": "spawn-prompt",
                         "content": [
-                            { "type": "text", "text": "Inspect the router." },
+                            { "type": "input_text", "text": "Inspect the router." },
                             { "type": "image", "url": "file:///tmp/reference.png" },
-                            { "type": "text", "text": "Report only actionable issues." }
+                            { "type": "inputText", "text": "Report only actionable issues." },
+                            { "type": "input_text", "text": "" }
                         ]
                     },
                     {
@@ -4773,7 +4902,7 @@ mod tests {
                     "item": {
                         "id": "prompt",
                         "type": "userMessage",
-                        "content": [{ "type": "text", "text": "Inspect the router" }]
+                        "content": [{ "type": "input_text", "text": "Inspect the router" }]
                     }
                 }),
                 &mut state,
@@ -4788,7 +4917,7 @@ mod tests {
                     "item": {
                         "id": "prompt",
                         "type": "userMessage",
-                        "content": [{ "type": "text", "text": "Inspect the router" }]
+                        "content": [{ "type": "input_text", "text": "Inspect the router" }]
                     }
                 }),
                 &mut state,

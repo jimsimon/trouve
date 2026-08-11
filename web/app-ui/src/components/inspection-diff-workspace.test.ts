@@ -34,14 +34,15 @@ describe("inspection diff workspace contract", () => {
     expect(source).not.toContain("Copy complete diff");
   });
 
-  it("does not present generic restore failures as authoritative boundaries", () => {
+  it("does not expose checkpoint restore controls in the diff pane", () => {
     const source = readFileSync(
       new URL("./inspection-workspace.ts", import.meta.url),
       "utf8",
     );
 
-    expect(source).toContain("Availability could not be determined");
-    expect(source).not.toContain("may already be at its earliest checkpoint");
-    expect(source).not.toContain("may already be at its latest checkpoint");
+    expect(source).not.toContain("#restoreCheckpoint");
+    expect(source).not.toContain("restoreSessionCheckpoint");
+    expect(source).not.toContain("Undo turn");
+    expect(source).not.toContain("Redoing…");
   });
 });

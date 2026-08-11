@@ -9,7 +9,6 @@ import {
 import {
   ProtocolClientError,
   type ProtocolFileContent,
-  type ProtocolRelativeRestoreDirection,
   type ProtocolSessionDiffFileSummary,
 } from "../services/protocol-client.js";
 import { prepareUnifiedDiffOffThread } from "../services/content-worker-client.js";
@@ -20,10 +19,7 @@ import {
 } from "./diff-parser.js";
 import type { DiffMode } from "./diff-mode.js";
 import {
-  checkpointAvailabilityDescription,
-  checkpointHintsAfterRestore,
   copyRawDiffToClipboard,
-  initialCheckpointHints,
   type ClipboardTextWriter,
 } from "./inspection-diff-controls.js";
 import {
@@ -61,7 +57,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #diffRequestActive = false;
   #diffLoaded = false;
   #refreshing = false;
-  #restorePending: ProtocolRelativeRestoreDirection | "" = "";
   #notice = "";
   #noticeIsError = false;
   #copyFeedback = "";
@@ -69,7 +64,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #copiedDiffPath = "";
   #copySequence = 0;
   #copyFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
-  #checkpointHints = initialCheckpointHints();
   #diffRefreshTimer: ReturnType<typeof setInterval> | undefined;
   #filesRefreshTimer: ReturnType<typeof setInterval> | undefined;
   #filesRefreshActive = false;
@@ -142,7 +136,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       if (
         this.panel !== "diff" ||
         this.#diffRequestActive ||
-        this.#restorePending !== "" ||
         (typeof document !== "undefined" && document.visibilityState === "hidden")
       ) return;
       void this.#refreshDiff({ silent: true });
@@ -185,14 +178,12 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.#diffRequestActive = false;
       this.#diffLoaded = false;
       this.#refreshing = false;
-      this.#restorePending = "";
       this.#notice = "";
       this.#noticeIsError = false;
       this.#copyFeedback = "";
       this.#copyFeedbackIsError = false;
       this.#copiedDiffPath = "";
       this.#clearCopyFeedbackTimer();
-      this.#checkpointHints = initialCheckpointHints();
       this.#error = "";
       this.#diffManifest = "";
       this.#diffFiles = [];
@@ -269,7 +260,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
         } ${this.#diffFiles.length === 0 ? "diff-empty-inspection" : ""}`}
         aria-busy=${
           this.#refreshing ||
-          this.#restorePending !== "" ||
           this.#diffFileLoadingPath !== ""
             ? "true"
             : "false"
@@ -291,37 +281,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
                 }}
               >${fontAwesomeIcon("folder-tree")}</button>
               <strong title=${selectedFile.path}>${selectedFile.path}</strong>`}
-          <span class="checkpoint-actions" role="group" aria-label="Diff actions">
-            <button
-              type="button"
-              aria-label=${`Undo turn. ${checkpointAvailabilityDescription(
-                "undo",
-                this.#checkpointHints.undo,
-              )}`}
-              title=${checkpointAvailabilityDescription(
-                "undo",
-                this.#checkpointHints.undo,
-              )}
-              ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
-              @click=${() => void this.#restoreCheckpoint("undo")}
-            >${this.#restorePending === "undo"
-              ? "Undoing…"
-              : html`${fontAwesomeIcon("rotate-left")} Undo turn`}</button>
-            <button
-              type="button"
-              aria-label=${`Redo. ${checkpointAvailabilityDescription(
-                "redo",
-                this.#checkpointHints.redo,
-              )}`}
-              title=${checkpointAvailabilityDescription(
-                "redo",
-                this.#checkpointHints.redo,
-              )}
-              ?disabled=${this.#loading || this.#refreshing || this.#restorePending !== ""}
-              @click=${() => void this.#restoreCheckpoint("redo")}
-            >${this.#restorePending === "redo"
-              ? "Redoing…"
-              : html`${fontAwesomeIcon("rotate-right")} Redo`}</button>
+          <span class="diff-summary-actions" role="group" aria-label="Diff actions">
             ${selectedPatch === undefined
               ? nothing
               : html`<button
@@ -1080,57 +1040,6 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       if (generation === this.#diffFileGeneration) {
         this.#diffFileLoadingPath = "";
         if (shouldRender) this.requestUpdate();
-      }
-    }
-  }
-
-  async #restoreCheckpoint(direction: ProtocolRelativeRestoreDirection): Promise<void> {
-    const services = this.#services.value;
-    if (
-      services === undefined ||
-      this.#effectiveSessionId === "" ||
-      this.#restorePending !== ""
-    ) return;
-    const sessionId = this.#effectiveSessionId;
-    this.#generation += 1;
-    this.#diffFileGeneration += 1;
-    this.#diffRequestActive = false;
-    this.#diffFileLoadingPath = "";
-    this.#loading = false;
-    this.#refreshing = false;
-    this.#restorePending = direction;
-    this.#notice = "";
-    this.#noticeIsError = false;
-    this.requestUpdate();
-    try {
-      await services.protocol.restoreSessionCheckpoint(sessionId, direction);
-      if (
-        sessionId !== this.#effectiveSessionId ||
-        this.panel !== "diff" ||
-        !this.isConnected
-      ) return;
-      this.#checkpointHints = checkpointHintsAfterRestore(
-        this.#checkpointHints,
-        direction,
-      );
-      const refreshed = await this.#refreshDiff({ silent: false, force: true });
-      if (refreshed && sessionId === this.#effectiveSessionId && this.isConnected) {
-        this.#notice = direction === "undo"
-          ? "Restored the previous checkpoint. Redo is now available."
-          : "Restored the next checkpoint. Undo is now available.";
-        this.#noticeIsError = false;
-      }
-    } catch {
-      if (sessionId === this.#effectiveSessionId && this.isConnected) {
-        this.#notice = direction === "undo"
-          ? "Undo was not completed. Availability could not be determined; retry after checking the connection and checkpoint history."
-          : "Redo was not completed. Availability could not be determined; retry after checking the connection and checkpoint history.";
-        this.#noticeIsError = true;
-      }
-    } finally {
-      if (sessionId === this.#effectiveSessionId) {
-        this.#restorePending = "";
-        this.requestUpdate();
       }
     }
   }

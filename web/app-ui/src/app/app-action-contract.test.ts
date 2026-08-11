@@ -486,8 +486,11 @@ const SURFACES: readonly CallbackSurface[] = [
         markers: [
           "#renderDiff",
           "#activateDiffFileTreeRow",
-          "restoreSessionCheckpoint",
         ],
+      },
+      {
+        path: "../components/thread-screen.ts",
+        markers: ["#restoreTurnCheckpoint", "restoreCheckpoint(boundary.checkpointId)"],
       },
     ],
   },

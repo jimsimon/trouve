@@ -1,34 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  checkpointAvailabilityDescription,
-  checkpointHintsAfterRestore,
   copyRawDiffToClipboard,
-  initialCheckpointHints,
 } from "./inspection-diff-controls.js";
-
-describe("checkpoint availability hints", () => {
-  it("only confirms the inverse direction after a successful restore", () => {
-    const initial = initialCheckpointHints();
-    expect(checkpointHintsAfterRestore(initial, "undo")).toEqual({
-      undo: "unknown",
-      redo: "available",
-    });
-    expect(checkpointHintsAfterRestore(initial, "redo")).toEqual({
-      undo: "available",
-      redo: "unknown",
-    });
-  });
-
-  it("describes unknown state without claiming a checkpoint boundary", () => {
-    expect(checkpointAvailabilityDescription("undo", "unknown")).toBe(
-      "Undo availability will be checked when used.",
-    );
-    expect(checkpointAvailabilityDescription("redo", "available")).toContain(
-      "confirmed",
-    );
-  });
-});
 
 describe("copyRawDiffToClipboard", () => {
   it("starts the Clipboard API write synchronously and reports success", async () => {
