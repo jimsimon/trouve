@@ -60,6 +60,29 @@ async fn start_turn<B: AgentBackend>(
     panic!("spawn kept hitting ETXTBSY");
 }
 
+#[cfg(target_os = "linux")]
+fn process_state(pid: u32) -> Option<char> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
+        .and_then(|tail| tail.chars().next())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_process_to_stop(pid: u32) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let state = process_state(pid);
+            if state.is_none() || state == Some('Z') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("descendant process {pid} survived Cursor recycle"));
+}
+
 #[tokio::test]
 async fn claude_adapter_maps_stream_json() {
     let tmp = tempfile::tempdir().unwrap();
@@ -732,6 +755,12 @@ while IFS= read -r dropped; do
         break
     fi
 done
+while IFS= read -r cancel; do
+    if [[ "$cancel" == *'"method":"session/cancel"'* ]]; then
+        echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"cancelled"}}'
+        break
+    fi
+done
 cat > /dev/null
 "#,
     );
@@ -786,6 +815,122 @@ cat > /dev/null
             .as_deref()
             .is_some_and(|error| error.contains("event backlog exceeded")),
         "{overload_error:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cursor_adapter_recycles_process_tree_when_eof_closes_cancel_waiter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "cursor-agent-eof-overload",
+        r#"#!/bin/bash
+spawns=$(($(cat "$0.spawns" 2>/dev/null || echo 0) + 1))
+printf '%s\n' "$spawns" > "$0.spawns.tmp"
+mv "$0.spawns.tmp" "$0.spawns"
+if (( spawns == 1 )); then
+    sleep 60 </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$0.descendant.tmp"
+    mv "$0.descendant.tmp" "$0.descendant"
+fi
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r line # session/new
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+IFS= read -r line # set mode
+echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
+IFS= read -r line # set model
+echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
+IFS= read -r line # session/prompt
+if (( spawns > 1 )); then
+    echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
+    cat > /dev/null
+    exit 0
+fi
+echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"hold route","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
+while [[ ! -f "$0.continue" ]]; do sleep 0.01; done
+for sequence in $(seq 1 1025); do
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
+done
+while IFS= read -r cancel; do
+    if [[ "$cancel" == *'"method":"session/cancel"'* ]]; then
+        printf '%s\n' "$cancel" > "$0.cancel.tmp"
+        mv "$0.cancel.tmp" "$0.cancel"
+        # Exit without a session/prompt response. Reader EOF clears the
+        # pending sender; that closed oneshot is not an acknowledgement.
+        exit 0
+    fi
+done
+"#,
+    );
+    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
+    let deadline = std::time::Duration::from_secs(3);
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let held_responder = loop {
+        let event = tokio::time::timeout(deadline, stream.next())
+            .await
+            .expect("permission request must arrive")
+            .expect("stream must remain open")
+            .expect("permission request must be valid");
+        if let BackendEvent::ApprovalNeeded { responder, .. } = event {
+            break responder;
+        }
+    };
+    let descendant_path = PathBuf::from(format!("{stub}.descendant"));
+    let descendant = tokio::time::timeout(deadline, async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&descendant_path)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Cursor stub did not publish its descendant pid");
+    std::fs::write(format!("{stub}.continue"), "").unwrap();
+
+    let mut overload_error = None;
+    while let Some(event) = tokio::time::timeout(deadline, stream.next())
+        .await
+        .expect("overloaded stream must terminate after EOF cleanup")
+    {
+        if let Err(error) = event {
+            overload_error = Some(error.to_string());
+        }
+    }
+    drop(held_responder);
+    assert!(
+        overload_error
+            .as_deref()
+            .is_some_and(|error| error.contains("event backlog exceeded")),
+        "{overload_error:?}"
+    );
+    assert!(PathBuf::from(format!("{stub}.cancel")).exists());
+    wait_for_process_to_stop(descendant).await;
+
+    // The closed transport must be removed from the pool, not reused.
+    let mut replacement = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+    while let Some(event) = tokio::time::timeout(deadline, replacement.next())
+        .await
+        .expect("replacement Cursor process must finish")
+    {
+        event.unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.spawns"))
+            .unwrap()
+            .trim(),
+        "2"
     );
 }
 
@@ -1214,11 +1359,22 @@ printf '%s\n' "$prompt_lookup" > "$0.prompt-lookup"
 # Return an empty first page and expose the real Responses-style prompt on the
 # bounded retry.
 echo '{"jsonrpc":"2.0","id":4,"result":{"data":[]}}'
-IFS= read -r prompt_lookup_retry
-printf '%s\n' "$prompt_lookup_retry" >> "$0.prompt-lookup"
-echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Inspect the child task."}]}]}]}}'
-IFS= read -r approval
-printf '%s\n' "$approval" > "$0.approval"
+# Prompt recovery no longer blocks child approvals, so these two client writes
+# may arrive in either order. Dispatch them by identity instead of assuming
+# the retry wins the race.
+lookup_done=0
+approval_done=0
+while (( !lookup_done || !approval_done )); do
+    IFS= read -r client_message
+    if [[ "$client_message" == *'"method":"thread/turns/list"'* ]]; then
+        printf '%s\n' "$client_message" >> "$0.prompt-lookup"
+        echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Inspect the child task."}]}]}]}}'
+        lookup_done=1
+    elif [[ "$client_message" == *'"id":100'* ]]; then
+        printf '%s\n' "$client_message" > "$0.approval"
+        approval_done=1
+    fi
+done
 # Inter-agent communication from a child back to the root is activity, not a
 # nested spawn. Older routing treated the ancestor id as a fresh collaborator
 # and then waited forever for that phantom child to complete.
@@ -1257,6 +1413,14 @@ cat > /dev/null
                     child_announcements += 1;
                     saw_initial_child_prompt |=
                         prompt.as_deref() == Some("Inspect the child task.");
+                }
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id: None,
+                    event: BackendCollaboratorEvent::UserMessage(content),
+                } => {
+                    assert_eq!(session_id, "child");
+                    saw_initial_child_prompt |= content == "Inspect the child task.";
                 }
                 BackendEvent::CollaboratorEvent {
                     session_id,
@@ -1306,7 +1470,13 @@ cat > /dev/null
                     saw_child_text |= turn_id == "child-turn-2" && text == "Child checked again.";
                 }
                 BackendEvent::TextDelta(text) => saw_parent_text |= text == "Parent finished.",
-                BackendEvent::Completed { .. } => completed = true,
+                BackendEvent::Completed { .. } => {
+                    assert!(
+                        saw_initial_child_prompt,
+                        "root completion overtook collaborator prompt recovery"
+                    );
+                    completed = true;
+                }
                 _ => {}
             }
         }
@@ -1327,6 +1497,77 @@ cat > /dev/null
         "{lookup}"
     );
     assert!(lookup.contains("\"threadId\":\"child\""), "{lookup}");
+    assert_eq!(
+        lookup.lines().count(),
+        2,
+        "empty collaborator pages must be retried"
+    );
+}
+
+#[tokio::test]
+async fn codex_adapter_holds_root_completion_for_late_prompt_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-late-child-prompt",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"root"}}}'
+IFS= read -r line # turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"root-turn"}}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"spawn-1","type":"collabToolCall","tool":"spawn_agent","senderThreadId":"root","newThreadId":"child"}}}'
+IFS= read -r prompt_lookup
+printf '%s\n' "$prompt_lookup" > "$0.prompt-lookup"
+echo '{"jsonrpc":"2.0","id":4,"result":{"data":[]}}'
+# Complete both turns while prompt recovery is sleeping before its bounded
+# retry. The root terminal event is only a candidate until that lookup lands.
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}'
+IFS= read -r prompt_lookup_retry
+printf '%s\n' "$prompt_lookup_retry" >> "$0.prompt-lookup"
+echo '{"jsonrpc":"2.0","id":5,"result":{"data":[{"id":"child-turn","items":[{"type":"userMessage","content":[{"type":"input_text","text":"Recovered after completion."}]}]}]}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let mut recovered_prompt = false;
+    let mut completed = false;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id: None,
+                    event: BackendCollaboratorEvent::UserMessage(prompt),
+                } => {
+                    assert_eq!(session_id, "child");
+                    recovered_prompt = prompt == "Recovered after completion.";
+                }
+                BackendEvent::Completed { .. } => {
+                    assert!(
+                        recovered_prompt,
+                        "root completion overtook its pending collaborator prompt lookup"
+                    );
+                    completed = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("root turn did not finish after collaborator prompt recovery");
+
+    assert!(recovered_prompt && completed);
+    let lookup = std::fs::read_to_string(format!("{stub}.prompt-lookup")).unwrap();
+    assert_eq!(lookup.lines().count(), 2, "{lookup}");
 }
 
 #[tokio::test]

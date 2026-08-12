@@ -48,6 +48,8 @@ describe("session pull-request workspace", () => {
     expect(source).toContain('["files", "Files"');
     expect(source).toContain('role="tablist"');
     expect(source).toContain('role="tabpanel"');
+    expect(source).toContain("nextHorizontalTabIndex(event.key, index, tabs.length)");
+    expect(source).toContain("rovingTabIndex(index, selectedIndex, tabs.length)");
     expect(source).toContain("services.protocol.sessionPrDetail(sessionId, number, section)");
     expect(source).toContain("detailSectionForTab");
     expect(source).toContain(

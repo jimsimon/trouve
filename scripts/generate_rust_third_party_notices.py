@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -14,6 +16,7 @@ OUTPUT = ROOT / "THIRD_PARTY_NOTICES.md"
 # Exact expressions are intentional: a dependency introducing a new license
 # must receive a human review before this allowlist and the notice are updated.
 APPROVED_LICENSES = {
+    "(Apache-2.0 OR MIT) AND BSD-3-Clause",
     "(MIT OR Apache-2.0) AND NCSA",
     "(MIT OR Apache-2.0) AND Unicode-3.0",
     "0BSD OR MIT OR Apache-2.0",
@@ -31,9 +34,12 @@ APPROVED_LICENSES = {
     "BSD-2-Clause",
     "BSD-2-Clause OR Apache-2.0",
     "BSD-2-Clause OR Apache-2.0 OR MIT",
+    "BSD-2-Clause OR MIT OR Apache-2.0",
     "BSD-3-Clause",
+    "BSD-3-Clause AND MIT",
     "BSD-3-Clause OR Apache-2.0",
     "BSD-3-Clause OR MIT OR Apache-2.0",
+    "BSD-3-Clause/MIT",
     "BSL-1.0",
     "CC0-1.0 OR Apache-2.0",
     "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
@@ -48,16 +54,30 @@ APPROVED_LICENSES = {
     "MIT OR Apache-2.0",
     "MIT OR Apache-2.0 OR BSD-1-Clause",
     "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+    "MIT OR Apache-2.0 OR MPL-2.0",
     "MIT OR Apache-2.0 OR Zlib",
     "MIT OR Zlib OR Apache-2.0",
     "MIT/Apache-2.0",
     "MPL-2.0",
+    "MPL-2.0 AND BSD-3-Clause",
     "Unicode-3.0",
     "Unlicense",
     "Unlicense OR MIT",
     "Unlicense/MIT",
     "Zlib",
     "Zlib OR Apache-2.0 OR MIT",
+}
+
+# Cargo accepts legacy slash-separated license metadata that CycloneDX's SPDX
+# expression field does not. Preserve the published text in notices, but emit
+# an equivalent valid SPDX expression in SBOMs.
+SPDX_NORMALIZATIONS = {
+    "Apache-2.0 / MIT": "Apache-2.0 OR MIT",
+    "Apache-2.0/MIT": "Apache-2.0 OR MIT",
+    "BSD-3-Clause/MIT": "BSD-3-Clause OR MIT",
+    "MIT / Apache-2.0": "MIT OR Apache-2.0",
+    "MIT/Apache-2.0": "MIT OR Apache-2.0",
+    "Unlicense/MIT": "Unlicense OR MIT",
 }
 
 # These crates publish a license file but omit an SPDX expression from Cargo
@@ -68,9 +88,12 @@ LICENSE_FILE_OVERRIDES = {
 }
 
 
-def cargo_metadata() -> dict[str, object]:
+def cargo_metadata(manifest_path: Path | None = None) -> dict[str, object]:
+    command = ["cargo", "metadata", "--locked", "--format-version", "1"]
+    if manifest_path is not None:
+        command.extend(["--manifest-path", str(manifest_path)])
     result = subprocess.run(
-        ["cargo", "metadata", "--locked", "--format-version", "1"],
+        command,
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -79,7 +102,39 @@ def cargo_metadata() -> dict[str, object]:
     return json.loads(result.stdout)
 
 
-def generate(metadata: dict[str, object]) -> str:
+def _repository_argument(path: Path) -> Path:
+    absolute = path if path.is_absolute() else ROOT / path
+    try:
+        return absolute.resolve().relative_to(ROOT.resolve())
+    except ValueError:
+        return path
+
+
+def notice_commands(manifest_path: Path | None, notice: Path) -> tuple[str, str]:
+    command = ["python3", "scripts/generate_rust_third_party_notices.py"]
+    if manifest_path is not None:
+        command.extend(["--manifest-path", str(_repository_argument(manifest_path))])
+    notice_argument = _repository_argument(notice)
+    if notice_argument != Path("THIRD_PARTY_NOTICES.md"):
+        command.extend(["--notice", str(notice_argument)])
+    return shlex.join(command), shlex.join([*command, "--check"])
+
+
+def frontend_notice_link(notice: Path) -> str:
+    absolute_notice = notice if notice.is_absolute() else ROOT / notice
+    relative = os.path.relpath(
+        ROOT / "web" / "app-ui" / "THIRD_PARTY_NOTICES.md",
+        absolute_notice.parent,
+    )
+    return Path(relative).as_posix()
+
+
+def generate(
+    metadata: dict[str, object],
+    graph_name: str = "root Cargo workspace",
+    manifest_path: Path | None = None,
+    notice: Path = OUTPUT,
+) -> str:
     packages = [
         package for package in metadata["packages"] if package.get("source")
     ]
@@ -101,16 +156,18 @@ def generate(metadata: dict[str, object]) -> str:
         raise SystemExit("\n".join(errors))
 
     rows.sort(key=lambda row: (row[0].casefold(), row[1], row[3]))
+    regenerate_command, check_command = notice_commands(manifest_path, notice)
+    frontend_link = frontend_notice_link(notice)
     lines = [
         "# Third-party notices — Rust workspace",
         "",
-        "This generated inventory covers every third-party package in the locked root",
-        "Cargo workspace graph, including development dependencies. Regenerate it with",
-        "`python3 scripts/generate_rust_third_party_notices.py` and verify it with",
-        "`python3 scripts/generate_rust_third_party_notices.py --check`.",
+        f"This generated inventory covers every third-party package in the locked {graph_name}",
+        "dependency graph, including development dependencies. Regenerate it with",
+        f"`{regenerate_command}` and verify it with",
+        f"`{check_command}`.",
         "",
         "The Lit frontend's npm inventory is generated separately in",
-        "[`web/app-ui/THIRD_PARTY_NOTICES.md`](web/app-ui/THIRD_PARTY_NOTICES.md).",
+        f"[`web/app-ui/THIRD_PARTY_NOTICES.md`]({frontend_link}).",
         "",
         "| Package | Version | License expression | Source |",
         "| --- | --- | --- | --- |",
@@ -134,6 +191,9 @@ def generate_sbom(metadata: dict[str, object]) -> str:
         name = str(package["name"])
         version = str(package["version"])
         license_name = package.get("license") or LICENSE_FILE_OVERRIDES.get((name, version))
+        if not isinstance(license_name, str):
+            raise SystemExit(f"{name}@{version}: missing reviewed license metadata")
+        license_name = SPDX_NORMALIZATIONS.get(license_name, license_name)
         source = str(package["source"])
         components.append(
             {
@@ -146,6 +206,19 @@ def generate_sbom(metadata: dict[str, object]) -> str:
                 "properties": [{"name": "cargo:source", "value": source}],
             }
         )
+    member_ids = set(metadata.get("workspace_members", []))
+    product_versions = {
+        str(package["version"])
+        for package in metadata["packages"]
+        if package.get("id") in member_ids
+    }
+    if len(product_versions) != 1:
+        raise SystemExit(
+            "workspace packages must expose one product version; found "
+            + ", ".join(sorted(product_versions))
+        )
+    product_version = product_versions.pop()
+    product_purl = f"pkg:cargo/trouve@{product_version}"
     document = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
@@ -153,8 +226,10 @@ def generate_sbom(metadata: dict[str, object]) -> str:
         "metadata": {
             "component": {
                 "type": "application",
-                "bom-ref": "pkg:cargo/trouve",
+                "bom-ref": product_purl,
                 "name": "trouve",
+                "version": product_version,
+                "purl": product_purl,
             }
         },
         "components": components,
@@ -166,18 +241,30 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--sbom", type=Path)
+    parser.add_argument("--manifest-path", type=Path)
+    parser.add_argument("--notice", type=Path, default=OUTPUT)
     args = parser.parse_args()
-    metadata = cargo_metadata()
-    generated = generate(metadata)
+    manifest_path = args.manifest_path
+    if manifest_path is not None and not manifest_path.is_absolute():
+        manifest_path = ROOT / manifest_path
+    metadata = cargo_metadata(manifest_path)
+    graph_name = (
+        str(args.manifest_path)
+        if args.manifest_path is not None
+        else "root Cargo workspace"
+    )
+    notice = args.notice if args.notice.is_absolute() else ROOT / args.notice
+    generated = generate(metadata, graph_name, manifest_path, notice)
     if args.check:
-        existing = OUTPUT.read_text() if OUTPUT.exists() else ""
+        existing = notice.read_text() if notice.exists() else ""
         if existing != generated:
+            regenerate_command, _ = notice_commands(manifest_path, notice)
             raise SystemExit(
-                "Rust third-party notices are stale; run "
-                "python3 scripts/generate_rust_third_party_notices.py"
+                f"Rust third-party notices are stale at {notice}; run {regenerate_command}"
             )
     else:
-        OUTPUT.write_text(generated)
+        notice.parent.mkdir(parents=True, exist_ok=True)
+        notice.write_text(generated)
     if args.sbom is not None:
         output = args.sbom if args.sbom.is_absolute() else ROOT / args.sbom
         output.parent.mkdir(parents=True, exist_ok=True)

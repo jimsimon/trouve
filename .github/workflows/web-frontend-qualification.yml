@@ -8,13 +8,23 @@ on:
     branches: [main]
     paths:
       - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-client-core/**"
       - "crates/trouve-desktop-host/**"
+      - "crates/trouve-protocol/**"
+      - "Cargo.toml"
+      - "scripts/generate_rust_third_party_notices.py"
+      - "scripts/sync_versions.py"
       - "web/app-ui/**"
       - ".github/workflows/web-frontend-qualification.yml"
   pull_request:
     paths:
       - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-client-core/**"
       - "crates/trouve-desktop-host/**"
+      - "crates/trouve-protocol/**"
+      - "Cargo.toml"
+      - "scripts/generate_rust_third_party_notices.py"
+      - "scripts/sync_versions.py"
       - "web/app-ui/**"
       - ".github/workflows/web-frontend-qualification.yml"
 
@@ -54,6 +64,8 @@ jobs:
           libxkbcommon-x11-0 libxkbcommon-x11-dev libxkbcommon0 libxmu-dev
           libxmu6 llvm-dev m4 pkg-config xorg-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: crates/trouve-servo-embed-preview -> target
@@ -63,6 +75,27 @@ jobs:
           cargo metadata
           --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
           --locked --no-deps --format-version 1 > /dev/null
+      - name: Verify Servo dependency licenses and notices
+        run: >-
+          python3 scripts/generate_rust_third_party_notices.py
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --notice crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md
+          --check --sbom target/servo-rust-sbom.cdx.json
+      - name: Install dependency security auditor
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
+        with:
+          tool: cargo-audit
+      - name: Audit isolated Servo lockfile
+        run: cargo audit --file crates/trouve-servo-embed-preview/Cargo.lock --deny warnings
+      - name: Format isolated Servo workspace
+        run: >-
+          cargo fmt --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --all -- --check
+      - name: Lint isolated Servo workspace
+        run: >-
+          cargo clippy
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --all-targets -- -D warnings
       - name: Compile and run Servo harness tests
         run: >-
           cargo test

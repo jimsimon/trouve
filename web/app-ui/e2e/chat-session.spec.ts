@@ -197,6 +197,7 @@ interface ProtocolFixtureOptions {
   readonly createdThreadRequests?: Array<Record<string, unknown>>;
   readonly generatedThreadTitle?: string;
   readonly steeredMessages?: Array<Record<string, unknown>>;
+  readonly cancelledThreadIds?: string[];
   readonly dispatchedQueuePromptIds?: string[];
   readonly messageDelayMs?: number;
   readonly beforeMessageResponse?: (messageCount: number) => Promise<void>;
@@ -225,6 +226,7 @@ const installProtocolFixtures = async (
     createdThreadRequests = [],
     generatedThreadTitle = "Generated thread title",
     steeredMessages = [],
+    cancelledThreadIds = [],
     dispatchedQueuePromptIds = [],
     messageDelayMs = 0,
     beforeMessageResponse,
@@ -332,6 +334,7 @@ const installProtocolFixtures = async (
       return;
     }
     if (key === "POST /v1/threads/th_fixture/cancel") {
+      cancelledThreadIds.push("th_fixture");
       await route.fulfill({ status: 204 });
       return;
     }
@@ -479,7 +482,7 @@ const installProtocolFixtures = async (
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "3.14",
+        protocol_version: "4.0",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -791,7 +794,7 @@ test("the session overview follows durable TODO state and opens from rail update
   await expect(page.locator(".todo-rail-item.completed")).toContainText(
     "Inspect the adapter",
   );
-  await expect(page.locator('[data-call-id="call_todo_update"]')).toHaveCount(0);
+  await expect(page.locator('[data-call-id="call_todo_update"]')).toBeVisible();
   await startedUpdate.click();
   await expect(infoTab).toHaveAttribute("aria-selected", "true");
   await expect(overview.getByText("TODOs", { exact: true })).toBeVisible();
@@ -975,7 +978,7 @@ test("Diff shows one changed file at a time from a diff-only file tree", async (
   }
 });
 
-test("Info combines session identity, changes, pull requests, and effective MCP tools", async ({
+test("Details combines session identity, changes, pull requests, and effective MCP tools", async ({
   page,
 }, testInfo) => {
   await installProtocolFixtures(page, {
@@ -1050,7 +1053,7 @@ test("Info combines session identity, changes, pull requests, and effective MCP 
   }
 
   const tabs = page.locator(".inspection-tabs").getByRole("tab");
-  await expect(tabs.first()).toHaveText(/Info/u);
+  await expect(tabs.first()).toHaveText(/Details/u);
   await expect(page.getByRole("tab", { name: "MCP" })).toHaveCount(0);
 
   const overview = page.locator("trouve-session-info-panel");
@@ -1065,7 +1068,8 @@ test("Info combines session identity, changes, pull requests, and effective MCP 
   await expect(overview.getByText("−1", { exact: true })).toBeVisible();
   await expect(overview.getByText("#42 Improve session overview", { exact: true })).toBeVisible();
   await expect(overview.getByText("docs", { exact: true })).toBeVisible();
-  await expect(overview.getByText("Active", { exact: true })).toBeVisible();
+  await expect(overview.getByText("Enabled", { exact: true })).toBeVisible();
+  await expect(overview.getByText("Unknown", { exact: true })).toBeVisible();
   await overview.getByRole("button", { name: "Open Subagent: Inspect the overview" }).click();
   await expect(page).toHaveURL(/\/threads\/th_info_subagent\/inspect\/info/u);
 });
@@ -1089,10 +1093,13 @@ test("turn separators retain even, comfortable vertical spacing", async ({ page 
     }),
   ]);
 
-  const rule = page.locator(".turn-rule").last();
+  const rule = page.getByRole("separator", { name: "Turn 7 checkpoint" });
   await expect(rule).toBeVisible();
   const geometry = await rule.evaluate((element) => {
-    const current = element.parentElement?.querySelector<HTMLElement>(".conversation-turn");
+    const ruleContainer = element.closest<HTMLElement>(".turn-rule");
+    const current = ruleContainer?.parentElement?.querySelector<HTMLElement>(
+      ".conversation-turn",
+    );
     const turns = [...document.querySelectorAll<HTMLElement>(".conversation-turn")];
     const currentIndex = current === null || current === undefined ? -1 : turns.indexOf(current);
     const previous = currentIndex > 0 ? turns[currentIndex - 1] : undefined;
@@ -1131,12 +1138,14 @@ test("turn separators expose exact restore and session-fork actions", async ({ p
     }),
   ]);
 
-  const rule = page.locator(".turn-rule").last();
-  const restore = rule.getByRole("button", {
+  const rule = page.getByRole("separator", { name: "Turn 7 checkpoint" });
+  const actions = page.getByRole("group", { name: "Actions after turn 7" });
+  await expect(rule.getByRole("button")).toHaveCount(0);
+  const restore = actions.getByRole("button", {
     name: "Restore after turn 7 once the current turn finishes",
   });
   await expect(restore).toBeDisabled();
-  await expect(rule.getByRole("button", {
+  await expect(actions.getByRole("button", {
     name: "Fork a new session from the checkpoint after turn 7",
   })).toBeVisible();
   const actionGeometry = await restore.evaluate((element) => {
@@ -1162,7 +1171,7 @@ test("turn separators expose exact restore and session-fork actions", async ({ p
     usage: { input_tokens: 2, output_tokens: 1 },
     checkpoint_id: "cp_turn_8",
   }));
-  const enabledRestore = rule.getByRole("button", {
+  const enabledRestore = actions.getByRole("button", {
     name: "Restore files to the checkpoint after turn 7",
   });
   await expect(enabledRestore).toBeEnabled();
@@ -1251,16 +1260,22 @@ test("the Agent header shows live token usage and elapsed time", async ({ page }
       attachments: [],
     }),
     threadEvent(18, {
+      type: "turn.capacity_acquired",
+      turn: 8,
+      wait_ms: 0,
+      background: false,
+    }),
+    threadEvent(19, {
       type: "assistant.thinking",
       turn: 8,
       text: "Still working",
     }),
-    threadEvent(19, {
+    threadEvent(20, {
       type: "turn.usage_updated",
       turn: 8,
       usage: { input_tokens: 900, output_tokens: 42, cost_usd: 0.01 },
     }),
-    threadEvent(20, {
+    threadEvent(21, {
       type: "assistant.delta",
       turn: 8,
       text: "Working on it.",
@@ -1277,13 +1292,13 @@ test("the Agent header shows live token usage and elapsed time", async ({ page }
   const first = await metadata.textContent();
   await expect.poll(() => metadata.textContent(), { timeout: 3_000 }).not.toBe(first);
   await emitBatch(page, [
-    threadEvent(21, {
+    threadEvent(22, {
       type: "assistant.message",
       turn: 8,
       content: "Working on it.",
     }),
     {
-      ...threadEvent(22, {
+      ...threadEvent(23, {
         type: "turn.completed",
         turn: 8,
         usage: { input_tokens: 1_000, output_tokens: 50, cost_usd: 0.012 },
@@ -1729,12 +1744,12 @@ test("the prompt composer retains native undo and redo history", async ({ page }
 
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
   await composer.click();
-  await composer.pressSequentially("First draft");
-  await expect(composer).toHaveValue("First draft");
+  await composer.pressSequentially("x");
+  await expect(composer).toHaveValue("x");
   await composer.press("Control+z");
   await expect(composer).toHaveValue("");
   await composer.press("Control+Shift+z");
-  await expect(composer).toHaveValue("First draft");
+  await expect(composer).toHaveValue("x");
 
   await page.keyboard.press("Control+k");
   const search = page.getByRole("combobox", {
@@ -2713,7 +2728,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
   expect(expandedGeometry.branchStartsAtRail).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.branchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
   expect(expandedGeometry.inlineStatusAfterRail).toBeGreaterThan(20);
-  expect(expandedGeometry.summaryBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(expandedGeometry.summaryBackground).toBe("rgba(0, 0, 0, 0)");
   expect(expandedGeometry.bodyPaddingLeft).toBe("0px");
   expect(expandedGeometry.nestedMarginLeft).toBe("0px");
   await expect(combinedGroup.locator(
@@ -3012,6 +3027,12 @@ test("active tools stay on the rail and join stable groups only after completion
       attachments: [],
     }),
     threadEvent(18, {
+      type: "turn.capacity_acquired",
+      turn: 8,
+      wait_ms: 0,
+      background: false,
+    }),
+    threadEvent(19, {
       type: "tool.requested",
       turn: 8,
       call_id: "call_group_1",
@@ -3019,14 +3040,14 @@ test("active tools stay on the rail and join stable groups only after completion
       args: { command: "first" },
       requires_approval: false,
     }),
-    threadEvent(19, { type: "tool.started", call_id: "call_group_1" }),
-    threadEvent(20, {
+    threadEvent(20, { type: "tool.started", call_id: "call_group_1" }),
+    threadEvent(21, {
       type: "tool.completed",
       call_id: "call_group_1",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(21, {
+    threadEvent(22, {
       type: "tool.requested",
       turn: 8,
       call_id: "call_group_2",
@@ -3034,7 +3055,7 @@ test("active tools stay on the rail and join stable groups only after completion
       args: { command: "second" },
       requires_approval: false,
     }),
-    threadEvent(22, { type: "tool.started", call_id: "call_group_2" }),
+    threadEvent(23, { type: "tool.started", call_id: "call_group_2" }),
   ]);
 
   const timeline = page.locator(".agent-turn-card").last().locator(
@@ -3049,13 +3070,13 @@ test("active tools stay on the rail and join stable groups only after completion
   )).toHaveCount(0);
 
   await emitBatch(page, [
-    threadEvent(23, {
+    threadEvent(24, {
       type: "tool.completed",
       call_id: "call_group_2",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(24, {
+    threadEvent(25, {
       type: "tool.requested",
       turn: 8,
       call_id: "call_group_3",
@@ -3063,7 +3084,7 @@ test("active tools stay on the rail and join stable groups only after completion
       args: { command: "third" },
       requires_approval: false,
     }),
-    threadEvent(25, { type: "tool.started", call_id: "call_group_3" }),
+    threadEvent(26, { type: "tool.started", call_id: "call_group_3" }),
   ]);
   const group = page.locator(".activity-group").last();
   await expect(group).toBeVisible();
@@ -3076,13 +3097,13 @@ test("active tools stay on the rail and join stable groups only after completion
   await group.locator(":scope > summary").click();
   await expect(group.locator(".tool-card")).toHaveCount(2);
   await emitBatch(page, [
-    threadEvent(26, {
+    threadEvent(27, {
       type: "tool.completed",
       call_id: "call_group_3",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(27, {
+    threadEvent(28, {
       type: "tool.requested",
       turn: 8,
       call_id: "call_group_4",
@@ -3090,7 +3111,7 @@ test("active tools stay on the rail and join stable groups only after completion
       args: { command: "fourth" },
       requires_approval: false,
     }),
-    threadEvent(28, { type: "tool.started", call_id: "call_group_4" }),
+    threadEvent(29, { type: "tool.started", call_id: "call_group_4" }),
   ]);
   await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".tool-card")).toHaveCount(3);
@@ -3100,7 +3121,7 @@ test("active tools stay on the rail and join stable groups only after completion
 
   await group.locator(":scope > summary").click();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
-  await emit(page, threadEvent(29, {
+  await emit(page, threadEvent(30, {
     type: "tool.completed",
     call_id: "call_group_4",
     status: "ok",
@@ -3131,6 +3152,12 @@ test("context compaction is an animated durable boundary between tool groups", a
       attachments: [],
     }),
     threadEvent(32, {
+      type: "turn.capacity_acquired",
+      turn: 10,
+      wait_ms: 0,
+      background: false,
+    }),
+    threadEvent(33, {
       type: "tool.requested",
       turn: 10,
       call_id: "before_compaction_1",
@@ -3138,13 +3165,13 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "first" },
       requires_approval: false,
     }),
-    threadEvent(33, {
+    threadEvent(34, {
       type: "tool.completed",
       call_id: "before_compaction_1",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(34, {
+    threadEvent(35, {
       type: "tool.requested",
       turn: 10,
       call_id: "before_compaction_2",
@@ -3152,13 +3179,13 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "second" },
       requires_approval: false,
     }),
-    threadEvent(35, {
+    threadEvent(36, {
       type: "tool.completed",
       call_id: "before_compaction_2",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(36, { type: "thread.compaction_started", turn: 10 }),
+    threadEvent(37, { type: "thread.compaction_started", turn: 10 }),
   ]);
 
   const agent = page.locator(".agent-turn-card").last();
@@ -3186,12 +3213,12 @@ test("context compaction is an animated durable boundary between tool groups", a
     .toHaveAttribute("aria-disabled", "true");
 
   await emitBatch(page, [
-    threadEvent(37, {
+    threadEvent(38, {
       type: "thread.compaction_completed",
       turn: 10,
       messages_compacted: 24,
     }),
-    threadEvent(38, {
+    threadEvent(39, {
       type: "turn.usage_updated",
       turn: 10,
       usage: {
@@ -3202,7 +3229,7 @@ test("context compaction is an animated durable boundary between tool groups", a
         context_window: 128_000,
       },
     }),
-    threadEvent(39, {
+    threadEvent(40, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_1",
@@ -3210,13 +3237,13 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "third" },
       requires_approval: false,
     }),
-    threadEvent(40, {
+    threadEvent(41, {
       type: "tool.completed",
       call_id: "after_compaction_1",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(41, {
+    threadEvent(42, {
       type: "tool.requested",
       turn: 10,
       call_id: "after_compaction_2",
@@ -3224,7 +3251,7 @@ test("context compaction is an animated durable boundary between tool groups", a
       args: { command: "fourth" },
       requires_approval: false,
     }),
-    threadEvent(42, {
+    threadEvent(43, {
       type: "tool.completed",
       call_id: "after_compaction_2",
       status: "ok",
@@ -3537,6 +3564,12 @@ test("thought completion clears stale activity while standalone and grouped tool
       attachments: [],
     }),
     threadEvent(72, {
+      type: "turn.capacity_acquired",
+      turn: 14,
+      wait_ms: 0,
+      background: false,
+    }),
+    threadEvent(73, {
       type: "assistant.thinking",
       turn: 14,
       text: "Waiting for a provider boundary.",
@@ -3549,7 +3582,7 @@ test("thought completion clears stale activity while standalone and grouped tool
   );
   await expect(agent.locator(".thinking-output.running")).toBeVisible();
   await expect(transientActivity).toHaveCount(0);
-  await emit(page, threadEvent(73, {
+  await emit(page, threadEvent(74, {
     type: "assistant.thinking_completed",
     turn: 14,
   }));
@@ -3558,7 +3591,7 @@ test("thought completion clears stale activity while standalone and grouped tool
     .toBeVisible();
 
   await emitBatch(page, [
-    threadEvent(74, {
+    threadEvent(75, {
       type: "tool.requested",
       turn: 14,
       call_id: "before_group",
@@ -3566,23 +3599,23 @@ test("thought completion clears stale activity while standalone and grouped tool
       args: { command: "printf first" },
       requires_approval: false,
     }),
-    threadEvent(75, { type: "tool.started", call_id: "before_group" }),
-    threadEvent(76, {
+    threadEvent(76, { type: "tool.started", call_id: "before_group" }),
+    threadEvent(77, {
       type: "tool.completed",
       call_id: "before_group",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(77, {
+    threadEvent(78, {
       type: "assistant.thinking",
       turn: 14,
       text: "Starting a command group.",
     }),
-    threadEvent(78, {
+    threadEvent(79, {
       type: "assistant.thinking_completed",
       turn: 14,
     }),
-    threadEvent(79, {
+    threadEvent(80, {
       type: "tool.requested",
       turn: 14,
       call_id: "group_one",
@@ -3590,13 +3623,13 @@ test("thought completion clears stale activity while standalone and grouped tool
       args: { command: "printf one" },
       requires_approval: false,
     }),
-    threadEvent(80, {
+    threadEvent(81, {
       type: "tool.completed",
       call_id: "group_one",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(81, {
+    threadEvent(82, {
       type: "tool.requested",
       turn: 14,
       call_id: "group_two",
@@ -3604,13 +3637,13 @@ test("thought completion clears stale activity while standalone and grouped tool
       args: { command: "sleep 1" },
       requires_approval: false,
     }),
-    threadEvent(82, {
+    threadEvent(83, {
       type: "tool.completed",
       call_id: "group_two",
       status: "ok",
       result: { exit_code: 0 },
     }),
-    threadEvent(83, {
+    threadEvent(84, {
       type: "tool.requested",
       turn: 14,
       call_id: "group_three",
@@ -4711,6 +4744,37 @@ test("keeps the visible turn fixed when a prepended row lays out during wheel sc
   releaseOlderPage?.();
   await expect(viewport.locator('[data-virtual-id="turn:1004"]')).toBeAttached();
   await expect(viewport.locator('[data-virtual-id="turn:1005"]')).toBeAttached();
+  await expect.poll(() => viewport.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(150);
+  await page.addStyleTag({
+    content: `
+      [data-virtual-id].history-delayed-layout::after {
+        display: block;
+        height: 180px;
+        content: "";
+      }
+    `,
+  });
+
+  await viewport.evaluate((element) => {
+    const row = element.querySelector<HTMLElement>('[data-virtual-id="turn:1005"]');
+    if (row === null) throw new Error("missing history anchor row");
+    element.scrollTop += row.getBoundingClientRect().top
+      - element.getBoundingClientRect().top
+      + 8;
+    element.dispatchEvent(new Event("scroll"));
+    element.dispatchEvent(new Event("scrollend"));
+  });
+  await expect.poll(() => viewport.evaluate((element) => {
+    const row = element.querySelector<HTMLElement>('[data-virtual-id="turn:1005"]');
+    const preceding = element.querySelector<HTMLElement>('[data-virtual-id="turn:1004"]');
+    if (row === null || preceding === null) return false;
+    const viewportRect = element.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    return preceding.getBoundingClientRect().bottom <= viewportRect.top + 0.5
+      && rowRect.top <= viewportRect.top
+      && rowRect.bottom > viewportRect.top;
+  })).toBe(true);
 
   const anchor = await viewport.evaluate((element) => {
     element.scrollTop += 3;
@@ -4720,26 +4784,25 @@ test("keeps the visible turn fixed when a prepended row lays out during wheel sc
     const preceding = element.querySelector<HTMLElement>('[data-virtual-id="turn:1004"]');
     if (row === null || preceding === null) throw new Error("missing history turn rows");
     const offset = row.getBoundingClientRect().top - element.getBoundingClientRect().top;
-    const delayedContent = document.createElement("div");
-    delayedContent.dataset["historyDelayedContent"] = "";
-    delayedContent.style.height = "180px";
-    preceding.append(delayedContent);
-    return { id: "turn:1005", offset, scrollTop: element.scrollTop };
+    const precedingHeight = preceding.getBoundingClientRect().height;
+    preceding.classList.add("history-delayed-layout");
+    return { id: "turn:1005", offset, precedingHeight, scrollTop: element.scrollTop };
   });
   await expect.poll(() => viewport.evaluate((element, expected) => {
     const row = element.querySelector<HTMLElement>(
       `[data-virtual-id="${expected.id}"]`,
     );
-    return row === null
-      ? Number.POSITIVE_INFINITY
-      : Math.abs(
-          row.getBoundingClientRect().top
-            - element.getBoundingClientRect().top
-            - expected.offset,
-        );
-  }, anchor)).toBeLessThanOrEqual(2);
-  await expect.poll(() => viewport.evaluate((element) => element.scrollTop))
-    .toBeGreaterThan(anchor.scrollTop + 150);
+    const preceding = element.querySelector<HTMLElement>('[data-virtual-id="turn:1004"]');
+    if (row === null || preceding === null) return false;
+    const anchorDeviation = Math.abs(
+      row.getBoundingClientRect().top
+        - element.getBoundingClientRect().top
+        - expected.offset,
+    );
+    return preceding.getBoundingClientRect().height >= expected.precedingHeight + 150
+      && anchorDeviation <= 2
+      && element.scrollTop >= expected.scrollTop + 150;
+  }, anchor)).toBe(true);
 });
 
 test("keeps a nested thought anchored when history extends the same agent turn", async ({
@@ -4870,11 +4933,17 @@ test("a queued prompt can interrupt the active turn and run next", async ({ page
       model: "test/model",
     }),
     threadEvent(17, {
+      type: "turn.capacity_acquired",
+      turn: 8,
+      wait_ms: 0,
+      background: false,
+    }),
+    threadEvent(18, {
       type: "assistant.delta",
       turn: 8,
       text: "Still working",
     }),
-    threadEvent(18, {
+    threadEvent(19, {
       type: "thread.queue_updated",
       prompts: [{
         id: "qp_1",
@@ -5207,6 +5276,12 @@ test("a steerable running turn accepts guidance and renders it on the turn rail"
     content: "Start the new turn",
     attachments: [],
   }));
+  await emit(page, threadEvent(18, {
+    type: "turn.capacity_acquired",
+    turn: 8,
+    wait_ms: 0,
+    background: false,
+  }));
 
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
   const steer = page.getByRole("button", { name: "Steer active turn" });
@@ -5218,7 +5293,7 @@ test("a steerable running turn accepts guidance and renders it on the turn rail"
   }]);
   await expect(composer).toHaveValue("");
 
-  await emit(page, threadEvent(18, {
+  await emit(page, threadEvent(19, {
     type: "turn.steered",
     turn: 8,
     content: "Prioritize the narrow layout",
@@ -5233,8 +5308,27 @@ test("a steerable running turn accepts guidance and renders it on the turn rail"
 test("turn controls cover start, queue, cancel, and send-after-cancel races", async ({ page }) => {
   const sentMessages: Array<Record<string, unknown>> = [];
   const messageReleases: Array<() => void> = [];
+  const queuedPrompt = {
+    id: "qp_1",
+    thread_id: "th_fixture",
+    content: "Queue this while startup is pending",
+    position: 0,
+    created_at: "2026-08-04T08:00:19Z",
+    attachments: [{
+      id: "att_queue_1",
+      name: "layout.png",
+      mime: "image/png",
+      size_bytes: 1024,
+    }],
+  };
   await installProtocolFixtures(page, {
     sentMessages,
+    queuedMessageAcceptance: {
+      thread_id: "th_fixture",
+      turn: 0,
+      queued: true,
+      queued_prompt: queuedPrompt,
+    },
     beforeMessageResponse: () => new Promise<void>((resolve) => {
       messageReleases.push(resolve);
     }),
@@ -5289,25 +5383,19 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
+    type: "turn.capacity_acquired",
+    turn: 8,
+    wait_ms: 0,
+    background: false,
+  }));
+  await emit(page, threadEvent(19, {
     type: "assistant.message",
     turn: 8,
     content: "Working",
   }));
-  await emit(page, threadEvent(19, {
+  await emit(page, threadEvent(20, {
     type: "thread.queue_updated",
-    prompts: [{
-      id: "qp_1",
-      thread_id: "th_fixture",
-      content: "Queue this while startup is pending",
-      position: 0,
-      created_at: "2026-08-04T08:00:19Z",
-      attachments: [{
-        id: "att_queue_1",
-        name: "layout.png",
-        mime: "image/png",
-        size_bytes: 1024,
-      }],
-    }],
+    prompts: [queuedPrompt],
   }));
 
   await expect(page.locator(".queue-panel [role=status]").first()).toHaveText("1 queued prompt");
@@ -5394,28 +5482,78 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   expect(messageReleases).toHaveLength(1);
   messageReleases.shift()?.();
   await expect(submit).toHaveText("Stopping…");
-  await emit(page, threadEvent(20, { type: "turn.cancelled", turn: 8 }));
-  await emit(page, threadEvent(21, {
+  await emit(page, threadEvent(21, { type: "turn.cancelled", turn: 8 }));
+  await emit(page, threadEvent(22, {
     type: "turn.started",
     turn: 9,
     mode: "code",
     model: "test/model",
   }));
-  await emit(page, threadEvent(22, {
+  await emit(page, threadEvent(23, {
     type: "user.message",
     turn: 9,
     content: "Continue after the cancellation",
     attachments: [],
   }));
-  await emit(page, threadEvent(23, { type: "assistant.thinking", turn: 9, text: "Resuming" }));
+  await emit(page, threadEvent(24, {
+    type: "turn.capacity_acquired",
+    turn: 9,
+    wait_ms: 0,
+    background: false,
+  }));
+  await emit(page, threadEvent(25, {
+    type: "assistant.thinking",
+    turn: 9,
+    text: "Resuming",
+  }));
 
-  await expect(page.getByText("Turn cancelled", { exact: true })).toBeVisible();
+  await expect(page.getByText("Turn cancelled", { exact: true })).toHaveCount(0);
   await expect(submit).toHaveText("Cancel");
   expect(sentMessages.map((message) => message.content)).toEqual([
     "Start another turn",
     "Queue this while startup is pending",
     "Continue after the cancellation",
   ]);
+});
+
+test("cancellation before capacity stays pending until the terminal event", async ({ page }) => {
+  const cancelledThreadIds: string[] = [];
+  await installProtocolFixtures(page, { cancelledThreadIds });
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(16, {
+      type: "turn.started",
+      turn: 8,
+      mode: "code",
+      model: "test/model",
+    }),
+    threadEvent(17, {
+      type: "user.message",
+      turn: 8,
+      content: "Wait for capacity",
+      attachments: [],
+    }),
+  ]);
+
+  const submit = page.locator("wa-button.composer-submit");
+  await expect(page.locator(".turn-transient-activity"))
+    .toContainText("Waiting for model capacity…");
+  await expect(submit).toHaveText("Cancel");
+  await submit.click();
+  await expect.poll(() => cancelledThreadIds).toEqual(["th_fixture"]);
+  await expect(submit).toHaveText("Stopping…");
+
+  await emit(page, threadEvent(18, {
+    type: "turn.capacity_acquired",
+    turn: 8,
+    wait_ms: 20,
+    background: false,
+  }));
+  await expect(submit).toHaveText("Stopping…");
+
+  await emit(page, threadEvent(19, { type: "turn.cancelled", turn: 8 }));
+  await expect(submit).toHaveText("Send");
 });
 
 test("failed optimistic acceptance restores the exact composer draft and attachments", async ({

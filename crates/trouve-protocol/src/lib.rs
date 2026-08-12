@@ -252,7 +252,10 @@ pub use requests::*;
 // 3.36: thread projections include their optional direct parent id so clients
 // can render durable collaborator hierarchies without reconstructing them
 // from paged transcript events (additive).
-pub const PROTOCOL_VERSION: &str = "3.36";
+// 4.0: acknowledge that the 3.25/3.26 closed-enum additions were breaking for
+// generated clients. Clients now require an exact protocol version instead of
+// assuming that every newer same-major schema is forward-compatible.
+pub const PROTOCOL_VERSION: &str = "4.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

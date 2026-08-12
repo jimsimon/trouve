@@ -204,7 +204,7 @@ trouve-session-list { display: block; }
 .thread-tab-header > .new-thread-tab:hover:not(:disabled), .thread-tab-header > .new-thread-tab:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .thread-tab-item { position: relative; width: var(--thread-tab-width); height: 30px; flex: 0 0 var(--thread-tab-width); }
 .thread-tab-item > .thread-tab-main { width: 100%; height: 100%; flex: none; padding-inline-end: 25px; }
-.thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
+.thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; cursor: pointer; font-size: 10px; }
 .thread-tab-item > .thread-tab-close:hover, .thread-tab-item > .thread-tab-close:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
 .thread-tab-label { min-width: 0; display: inline-flex; flex: 1; align-items: center; gap: 5px; overflow: hidden; }
 .session-indicator.thread-tab-indicator { width: 14px; height: 18px; flex: 0 0 14px; margin: 0; border-radius: 3px; }
@@ -317,6 +317,7 @@ trouve-session-list { display: block; }
    above and 14px below so the 1px rule has a balanced, comfortable gap on
    both sides and its centered checkpoint actions do not crowd either turn. */
 .turn-rule { position: relative; height: 1px; margin: 4px 0 14px; background: var(--trouve-rule); }
+.turn-rule-separator { position: absolute; inset: 0; pointer-events: none; }
 .turn-rule-actions { position: absolute; z-index: 2; inset-block-start: 50%; inset-inline-end: 8px; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px; translate: 0 -50%; color: var(--trouve-text-dim); background: var(--trouve-panel-bg); }
 .turn-rule-actions button { width: 24px; height: 24px; min-width: 24px; min-height: 24px; display: inline-grid; place-items: center; border: 0; border-radius: var(--trouve-radius-sm); padding: 2px; color: var(--trouve-text-dim); background: transparent; font-size: 12px; }
 .turn-rule-actions button:not(:disabled):hover { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }

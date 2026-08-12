@@ -979,16 +979,12 @@ describe("ProtocolClient", () => {
 });
 
 describe("protocol compatibility", () => {
-  it("accepts the supported 2.x and 3.x protocol generations", () => {
-    expect(() => assertProtocolCompatibility("2.9")).not.toThrow();
-    expect(() => assertProtocolCompatibility("2.19")).not.toThrow();
-    expect(() => assertProtocolCompatibility("3.0")).not.toThrow();
-    expect(() => assertProtocolCompatibility("3.14")).not.toThrow();
-    expect(() => assertProtocolCompatibility("3.99")).not.toThrow();
+  it("accepts the exact generated protocol version", () => {
+    expect(() => assertProtocolCompatibility("4.0")).not.toThrow();
   });
 
-  it("rejects older, malformed, and new-major servers", () => {
-    for (const version of ["2.8", "2.3", "1.99", "4.0", "unknown", ""]) {
+  it("rejects older, newer, other-major, and malformed servers", () => {
+    for (const version of ["3.36", "4.1", "5.0", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

@@ -54,6 +54,27 @@ describe("lazy content worker", () => {
     expect(activeContentWorkerCount()).toBe(0);
   });
 
+  it("rejects oversized work before a main-thread fallback can bypass worker bounds", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await expect(renderMarkdownOffThread("x".repeat(4 * 1024 * 1024 + 1)))
+      .rejects.toThrow("content exceeds worker bounds");
+    const item = {
+      id: "settings",
+      group: "Views",
+      label: "Settings",
+      detail: "Application settings",
+      keywords: "preferences",
+      icon: "gear" as const,
+      action: {
+        kind: "navigate" as const,
+        route: { kind: "settings" as const },
+        mobilePane: "thread" as const,
+      },
+    };
+    await expect(filterCommandPaletteItemsOffThread(Array(10_001).fill(item), "pref"))
+      .rejects.toThrow("too many fuzzy candidates");
+  });
+
   it("starts on demand and terminates after the configured idle period", async () => {
     let terminated = 0;
     let posted = 0;

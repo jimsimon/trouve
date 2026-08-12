@@ -54,6 +54,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["chrono"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+xattr = "1.6.1"
 
 # Internal crates
 trouve-protocol = { path = "crates/trouve-protocol", version = "3.7.0" }

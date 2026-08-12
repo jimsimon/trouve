@@ -19,7 +19,7 @@ use trouve_protocol::{
     SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
     ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
-use trouve_thread_view::ThreadProjection;
+use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -33,7 +33,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // v5 adds durable TODO lifecycle rows. v6 keeps explicitly bounded provider
 // thinking intact when tool lifecycle events interleave with its deltas. v7
 // applies the same explicit-boundary rule when steering interleaves with them.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 7;
+// v8 retains hidden turn boundaries after cancellation removes the visible
+// status row, keeping turn-aligned pages bounded across cancelled histories.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 8;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -139,6 +141,7 @@ CREATE TABLE IF NOT EXISTS thread_view_items (
   thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   item_index INTEGER NOT NULL,
   item TEXT NOT NULL,
+  turn_start INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (thread_id, item_index)
 );
 CREATE TABLE IF NOT EXISTS thread_tool_details (
@@ -440,6 +443,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE threads ADD COLUMN title TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
+    "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS thread_view_items_turn_start
+       ON thread_view_items (thread_id, turn_start, item_index)",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
     "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
     "ALTER TABLE code_review_repositories ADD COLUMN semantic_routing INTEGER NOT NULL DEFAULT 0",
@@ -1194,16 +1200,32 @@ fn project_thread_status(
         return Ok(None);
     }
     if let Event::SessionRecovered { session_id, .. } = event {
+        let interrupted_thread_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT thread_id FROM thread_statuses
+                 WHERE session_id = ?1 AND (active != 0 OR attention != 'none')
+                 ORDER BY thread_id",
+            )?;
+            stmt.query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if interrupted_thread_ids.is_empty() {
+            return Ok(None);
+        }
         conn.execute(
             "UPDATE thread_statuses
-             SET completed_at = CASE WHEN active != 0 THEN ?3 ELSE completed_at END,
-                 active = 0, attention = 'none', last_outcome = 'failed', latest_cursor = ?2
-             WHERE session_id = ?1",
+             SET completed_at = ?3, active = 0, attention = 'none',
+                 last_outcome = 'failed', latest_cursor = ?2
+             WHERE session_id = ?1 AND (active != 0 OR attention != 'none')",
             params![session_id, cursor as i64, timestamp],
         )?;
-        return Ok(Some(ThreadStatusChange {
-            statuses: thread_statuses(conn, session_id)?,
-        }));
+        let statuses = interrupted_thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                thread_status(conn, &thread_id)?.context("recovered thread status disappeared")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(ThreadStatusChange { statuses }));
     }
 
     let thread_id = match event {
@@ -2529,8 +2551,21 @@ fn spawn_event_writer(
                         // The transaction rolled back: every waiter's event
                         // was equally not persisted.
                         let message = format!("appending event batch: {e}");
+                        let sqlite_code = e.chain().find_map(|cause| {
+                            cause
+                                .downcast_ref::<rusqlite::Error>()
+                                .and_then(|error| match error {
+                                    rusqlite::Error::SqliteFailure(details, _) => {
+                                        Some(details.code)
+                                    }
+                                    _ => None,
+                                })
+                        });
                         for request in requests {
-                            request.reply.send(Err(anyhow::anyhow!(message.clone())));
+                            request.reply.send(Err(anyhow::Error::new(EventWriterError {
+                                message: message.clone(),
+                                sqlite_code,
+                            })));
                         }
                     }
                 }
@@ -2538,6 +2573,29 @@ fn spawn_event_writer(
         })
         .expect("spawning event writer thread");
     tx
+}
+
+#[derive(Debug, Clone)]
+struct EventWriterError {
+    message: String,
+    sqlite_code: Option<rusqlite::ErrorCode>,
+}
+
+impl std::fmt::Display for EventWriterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EventWriterError {}
+
+/// Recover the SQLite classification retained when the event-writer thread
+/// transported a transaction error back across its reply channel.
+pub(crate) fn event_writer_sqlite_error_code(error: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<EventWriterError>())
+        .and_then(|error| error.sqlite_code)
 }
 
 /// Insert a batch in queue order under one transaction, returning the
@@ -2922,13 +2980,13 @@ fn persist_materialized_thread_items(
     conn: &Connection,
     thread_id: &str,
     start: u64,
-    items: Vec<ThreadViewItem>,
+    items: Vec<MaterializedThreadItem>,
 ) -> Result<()> {
-    for (offset, item) in items.into_iter().enumerate() {
+    for (offset, materialized) in items.into_iter().enumerate() {
         let item_index = start
             .checked_add(offset as u64)
             .context("thread-view item index overflow")?;
-        let persisted = match item {
+        let persisted = match materialized.item {
             ThreadViewItem::ToolCall {
                 call_id,
                 tool,
@@ -2961,13 +3019,16 @@ fn persist_materialized_thread_items(
             item => item,
         };
         conn.execute(
-            "INSERT INTO thread_view_items (thread_id, item_index, item)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(thread_id, item_index) DO UPDATE SET item = excluded.item",
+            "INSERT INTO thread_view_items (thread_id, item_index, item, turn_start)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, item_index) DO UPDATE SET
+               item = excluded.item,
+               turn_start = excluded.turn_start",
             params![
                 thread_id,
                 i64::try_from(item_index).context("thread-view item index exceeds SQLite")?,
-                serde_json::to_string(&persisted)?
+                serde_json::to_string(&persisted)?,
+                i64::from(materialized.turn_start),
             ],
         )?;
     }
@@ -3004,26 +3065,18 @@ fn materialized_thread_turn_boundary(
     thread_id: &str,
     at_or_before: u64,
 ) -> Result<Option<u64>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT item_index, item FROM thread_view_items
-         WHERE thread_id = ?1 AND item_index <= ?2
-         ORDER BY item_index DESC",
-    )?;
-    let mut rows = stmt.query(params![
-        thread_id,
-        i64::try_from(at_or_before).context("thread-view boundary exceeds SQLite")?
-    ])?;
-    while let Some(row) = rows.next()? {
-        let index = row.get::<_, i64>(0)? as u64;
-        let encoded = row.get::<_, String>(1)?;
-        if matches!(
-            serde_json::from_str::<ThreadViewItem>(&encoded)?,
-            ThreadViewItem::TurnStatus { .. }
-        ) {
-            return Ok(Some(index));
-        }
-    }
-    Ok(None)
+    conn.query_row(
+        "SELECT item_index FROM thread_view_items
+         WHERE thread_id = ?1 AND turn_start = 1 AND item_index <= ?2
+         ORDER BY item_index DESC LIMIT 1",
+        params![
+            thread_id,
+            i64::try_from(at_or_before).context("thread-view boundary exceeds SQLite")?
+        ],
+        |row| Ok(row.get::<_, i64>(0)? as u64),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Expand a requested backward page to the beginning of its oldest turn.
@@ -3034,7 +3087,7 @@ fn thread_view_page_start(
     thread_id: &str,
     requested_start: u64,
     materialized: u64,
-    live_items: &[ThreadViewItem],
+    live_turn_starts: &[bool],
 ) -> Result<u64> {
     if requested_start == 0 {
         return Ok(0);
@@ -3042,13 +3095,9 @@ fn thread_view_page_start(
     if requested_start >= materialized {
         let relative = usize::try_from(requested_start - materialized)
             .context("live thread-view boundary exceeds memory")?;
-        if let Some(boundary) = live_items
-            .get(..=relative.min(live_items.len().saturating_sub(1)))
-            .and_then(|items| {
-                items
-                    .iter()
-                    .rposition(|item| matches!(item, ThreadViewItem::TurnStatus { .. }))
-            })
+        if let Some(boundary) = live_turn_starts
+            .get(..=relative.min(live_turn_starts.len().saturating_sub(1)))
+            .and_then(|items| items.iter().rposition(|turn_start| *turn_start))
         {
             return Ok(materialized + boundary as u64);
         }
@@ -3478,7 +3527,7 @@ impl Store {
                     thread_id,
                     requested_start,
                     materialized,
-                    &projection.snapshot.items,
+                    projection.live_turn_starts(),
                 )?
             } else {
                 requested_start
@@ -3968,22 +4017,28 @@ impl Store {
         t: &Thread,
         model_options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO threads
-                (id, session_id, title, mode, model, permission_mode, model_options, todos, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                t.id,
-                t.session_id,
-                t.title,
-                t.mode,
-                t.model,
-                permission_mode_str(t.permission_mode),
-                serde_json::to_string(model_options)?,
-                serde_json::to_string(&t.todos)?,
-                t.created_at.to_rfc3339()
-            ],
+        insert_thread_row(&self.conn.lock().unwrap(), t, model_options)
+    }
+
+    /// Insert a spawned thread and its parent edge in one transaction. A
+    /// concurrent reader can therefore never cache the child as an ordinary
+    /// root thread between the two writes.
+    pub fn insert_spawned_thread(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        parent: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        insert_thread_row(&tx, thread, model_options)?;
+        tx.execute(
+            "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
+             VALUES (?1, ?2, ?3)",
+            params![thread.id, parent, kind],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -4101,6 +4156,82 @@ impl Store {
         let mut stmt = conn
             .prepare("SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1")?;
         let rows = stmt.query_map(params![parent], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every descendant below `parent`, loaded in one recursive query. `UNION`
+    /// bounds corrupt cycles and deduplicates children with malformed legacy
+    /// parentage instead of turning hierarchy reads into unbounded N+1 walks.
+    pub fn spawned_descendants(&self, parent: &str) -> Result<Vec<Thread>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "WITH RECURSIVE descendant_ids(id) AS (
+                 SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN descendant_ids parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT {THREAD_COLUMNS} FROM threads
+             WHERE id IN (SELECT id FROM descendant_ids)
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map(params![parent], row_to_thread)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Aggregate usage for a spawned subtree (the root plus all descendants)
+    /// without one usage query per historical child.
+    pub fn spawned_subtree_usage(&self, root: &str) -> Result<trouve_protocol::UsageSummary> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "WITH RECURSIVE subtree(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN subtree parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM usage WHERE thread_id IN (SELECT id FROM subtree)",
+            params![root],
+            |row| {
+                Ok(trouve_protocol::UsageSummary {
+                    turns: row.get::<_, i64>(0)? as u64,
+                    input_tokens: row.get::<_, i64>(1)? as u64,
+                    output_tokens: row.get::<_, i64>(2)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(3)? as u64,
+                    cost_usd: row.get(4)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    /// Failed descendants in one subtree. The root's own detailed error is
+    /// folded from its event log by the caller; descendant status is enough to
+    /// prevent a failed nested worker from being reported as overall success.
+    pub fn failed_spawned_descendants(&self, root: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendant_ids(id) AS (
+                 SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN descendant_ids parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT statuses.thread_id
+             FROM thread_statuses statuses
+             WHERE statuses.thread_id IN (SELECT id FROM descendant_ids)
+               AND statuses.last_outcome = 'failed'
+             ORDER BY statuses.thread_id",
+        )?;
+        let rows = stmt.query_map(params![root], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -4277,6 +4408,72 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Update a visible queued prompt while atomically indexing newly staged
+    /// attachments and removing rows for attachments no longer retained.
+    /// The returned paths are safe for filesystem cleanup only after commit.
+    pub(crate) fn update_queued_prompt_attachments(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+        added: &[(trouve_protocol::Attachment, String)],
+        removed_ids: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some(thread_id) = tx
+            .query_row(
+                "SELECT thread_id FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        for (attachment, path) in added {
+            tx.execute(
+                "INSERT INTO attachments
+                   (id, thread_id, name, mime, size_bytes, path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    attachment.id,
+                    thread_id,
+                    attachment.name,
+                    attachment.mime,
+                    attachment.size_bytes as i64,
+                    path,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE queued_prompts SET content = ?2, attachments = ?3 WHERE id = ?1",
+            params![id, content, serde_json::to_string(attachments)?],
+        )?;
+
+        let mut removed_paths = Vec::with_capacity(removed_ids.len());
+        for attachment_id in removed_ids {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                )?;
+                removed_paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(Some(removed_paths))
+    }
+
     pub fn delete_queued_prompt(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
@@ -4284,6 +4481,52 @@ impl Store {
             params![id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Delete a visible queued prompt and every attachment-index row it owns
+    /// in one transaction. Returns the thread id and committed file paths for
+    /// post-transaction filesystem cleanup.
+    pub(crate) fn delete_queued_prompt_attachments(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some((thread_id, attachments_json)) = tx
+            .query_row(
+                "SELECT thread_id, attachments FROM queued_prompts
+                 WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let attachments = parse_attachments(&attachments_json);
+        let mut paths = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment.id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment.id, thread_id],
+                )?;
+                paths.push(path);
+            }
+        }
+        tx.execute(
+            "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(Some((thread_id, paths)))
     }
 
     /// Apply a full new order. `ids` must be exactly the thread's current
@@ -7668,6 +7911,30 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 }
 
 /// Columns matching `row_to_thread`, including durable spawn parentage.
+fn insert_thread_row(
+    conn: &Connection,
+    thread: &Thread,
+    model_options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO threads
+            (id, session_id, title, mode, model, permission_mode, model_options, todos, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            thread.id,
+            thread.session_id,
+            thread.title,
+            thread.mode,
+            thread.model,
+            permission_mode_str(thread.permission_mode),
+            serde_json::to_string(model_options)?,
+            serde_json::to_string(&thread.todos)?,
+            thread.created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
      created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
      todos, title, (SELECT st.parent_thread_id FROM spawned_threads st \
@@ -7707,6 +7974,77 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 mod tests {
     use super::*;
     use trouve_protocol::{Event, ToolStatus};
+
+    #[test]
+    fn event_writer_errors_preserve_sqlite_classification() {
+        let error = anyhow::Error::new(EventWriterError {
+            message: "database is locked".into(),
+            sqlite_code: Some(rusqlite::ErrorCode::DatabaseLocked),
+        });
+        assert_eq!(
+            event_writer_sqlite_error_code(&error),
+            Some(rusqlite::ErrorCode::DatabaseLocked)
+        );
+    }
+
+    #[test]
+    fn spawned_subtree_queries_include_nested_usage_and_failures() {
+        let store = Store::open_in_memory().unwrap();
+        for thread_id in ["root", "child", "grandchild"] {
+            seed_thread(&store, thread_id);
+        }
+        store.insert_spawned("child", "root", "thread").unwrap();
+        store
+            .insert_spawned("grandchild", "child", "thread")
+            .unwrap();
+        for (turn, thread_id, input_tokens) in
+            [(1, "root", 2), (1, "child", 3), (1, "grandchild", 5)]
+        {
+            store
+                .record_usage(
+                    "se_q",
+                    thread_id,
+                    turn,
+                    &trouve_protocol::Usage {
+                        input_tokens,
+                        output_tokens: 1,
+                        cached_input_tokens: 1,
+                        ..Default::default()
+                    },
+                    input_tokens + 1,
+                )
+                .unwrap();
+        }
+        store
+            .append_event(
+                Scope::Thread("grandchild".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "nested failure".into(),
+                },
+            )
+            .unwrap();
+
+        let descendant_ids = store
+            .spawned_descendants("root")
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            descendant_ids,
+            HashSet::from(["child".to_string(), "grandchild".to_string()])
+        );
+        let usage = store.spawned_subtree_usage("root").unwrap();
+        assert_eq!(usage.turns, 3);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(
+            store.failed_spawned_descendants("root").unwrap(),
+            vec!["grandchild".to_string()]
+        );
+    }
 
     #[test]
     fn compact_tool_argument_bounds_utf8_summary() {
@@ -7888,6 +8226,63 @@ mod tests {
         assert_eq!(older.item_offset, 0);
         assert_eq!(older.items.len(), 45);
         assert!(!older.has_older);
+    }
+
+    #[test]
+    fn turn_aligned_pages_do_not_backfill_across_cancelled_turns() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_cancelled_pages");
+        let scope = Scope::Thread("th_cancelled_pages".into());
+        for turn in 1..=200 {
+            for event in [
+                Event::TurnStarted {
+                    turn,
+                    mode: "code".into(),
+                    model: "test/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+                Event::UserMessage {
+                    turn,
+                    content: format!("cancelled prompt {turn}"),
+                    attachments: Vec::new(),
+                },
+                Event::AssistantMessage {
+                    turn,
+                    content: format!("partial response {turn}"),
+                },
+                Event::TurnCancelled { turn },
+            ] {
+                store.append_event(scope.clone(), event).unwrap();
+            }
+        }
+
+        let (_, newest) = store
+            .thread_view_snapshot("th_cancelled_pages", None, 1, true)
+            .unwrap();
+        assert_eq!(newest.total_items, 400);
+        assert_eq!(newest.item_offset, 398);
+        assert_eq!(newest.items.len(), 2);
+        assert!(matches!(
+            newest.items.as_slice(),
+            [
+                ThreadViewItem::User { turn: 200, .. },
+                ThreadViewItem::Assistant { turn: 200, .. },
+            ]
+        ));
+
+        let (_, previous) = store
+            .thread_view_snapshot("th_cancelled_pages", Some(newest.item_offset), 1, true)
+            .unwrap();
+        assert_eq!(previous.item_offset, 396);
+        assert_eq!(previous.items.len(), 2);
+        assert!(matches!(
+            previous.items.as_slice(),
+            [
+                ThreadViewItem::User { turn: 199, .. },
+                ThreadViewItem::Assistant { turn: 199, .. },
+            ]
+        ));
     }
 
     #[test]
@@ -8743,6 +9138,105 @@ mod tests {
                     && !status.active
                     && status.attention == SessionAttention::None
                     && status.outcome == SessionOutcome::Failed
+        )));
+    }
+
+    #[test]
+    fn reopening_marks_only_interrupted_thread_statuses_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sibling-recovery.db");
+        let (before_restart, finished_cursor, finished_completed_at) = {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_interrupted");
+            seed_thread(&store, "th_succeeded");
+            for thread_id in ["th_interrupted", "th_succeeded"] {
+                store
+                    .append_event(
+                        Scope::Thread(thread_id.into()),
+                        Event::TurnStarted {
+                            turn: 1,
+                            mode: "code".into(),
+                            model: "test/model".into(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .append_event(
+                    Scope::Thread("th_interrupted".into()),
+                    Event::ApprovalRequested {
+                        turn: 1,
+                        call_id: "call_interrupted".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread("th_succeeded".into()),
+                    Event::TurnCompleted {
+                        turn: 1,
+                        usage: Default::default(),
+                        checkpoint_id: None,
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionActivity {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                        active: true,
+                    },
+                )
+                .unwrap();
+            let finished = store
+                .list_thread_statuses("se_q")
+                .unwrap()
+                .into_iter()
+                .find(|status| status.thread_id == "th_succeeded")
+                .unwrap();
+            (
+                store.latest_event_cursor(&Scope::Server).unwrap(),
+                finished.latest_cursor,
+                finished.completed_at,
+            )
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let statuses = reopened.list_thread_statuses("se_q").unwrap();
+        let interrupted = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_interrupted")
+            .unwrap();
+        assert!(!interrupted.active);
+        assert_eq!(interrupted.attention, SessionAttention::None);
+        assert_eq!(interrupted.outcome, SessionOutcome::Failed);
+        assert!(interrupted.completed_at.is_some());
+        let succeeded = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_succeeded")
+            .unwrap();
+        assert!(!succeeded.active);
+        assert_eq!(succeeded.attention, SessionAttention::None);
+        assert_eq!(succeeded.outcome, SessionOutcome::Succeeded);
+        assert_eq!(succeeded.latest_cursor, finished_cursor);
+        assert_eq!(succeeded.completed_at, finished_completed_at);
+
+        let replay = reopened
+            .events_after(&Scope::Server, before_restart)
+            .unwrap();
+        assert!(replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_interrupted"
+                    && status.outcome == SessionOutcome::Failed
+        )));
+        assert!(!replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status } if status.thread_id == "th_succeeded"
         )));
     }
 
@@ -9718,6 +10212,103 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_attachment_changes_commit_rows_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_attachment_cleanup");
+        let old = trouve_protocol::Attachment {
+            id: "at_old".into(),
+            name: "old.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        let new = trouve_protocol::Attachment {
+            id: "at_new".into(),
+            name: "new.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        store
+            .add_attachment("th_attachment_cleanup", &old, "/tmp/at_old")
+            .unwrap();
+        let prompt = store
+            .enqueue_prompt("th_attachment_cleanup", "old", std::slice::from_ref(&old))
+            .unwrap();
+
+        let removed = store
+            .update_queued_prompt_attachments(
+                &prompt.id,
+                "new",
+                std::slice::from_ref(&new),
+                &[(new.clone(), "/tmp/at_new".into())],
+                std::slice::from_ref(&old.id),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed, ["/tmp/at_old"]);
+        assert!(store.attachment(&old.id).unwrap().is_none());
+        assert!(store.attachment(&new.id).unwrap().is_some());
+        assert_eq!(
+            store.queued_prompts("th_attachment_cleanup").unwrap()[0].attachments,
+            std::slice::from_ref(&new)
+        );
+
+        let (thread_id, removed) = store
+            .delete_queued_prompt_attachments(&prompt.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread_id, "th_attachment_cleanup");
+        assert_eq!(removed, ["/tmp/at_new"]);
+        assert!(store.attachment(&new.id).unwrap().is_none());
+        assert!(
+            store
+                .queued_prompts("th_attachment_cleanup")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn spawned_thread_insert_never_exposes_an_unparented_child() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_spawn_parent");
+        let child = Thread {
+            id: "th_spawn_child".into(),
+            session_id: "se_q".into(),
+            parent_thread_id: Some("th_spawn_parent".into()),
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: true,
+            todos: Vec::new(),
+        };
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), "th_spawn_parent", "thread")
+            .unwrap();
+        let loaded = store.thread(&child.id).unwrap().unwrap();
+        assert!(loaded.spawned);
+        assert_eq!(loaded.parent_thread_id.as_deref(), Some("th_spawn_parent"));
+
+        let orphan = Thread {
+            id: "th_spawn_orphan".into(),
+            ..child
+        };
+        assert!(
+            store
+                .insert_spawned_thread(
+                    &orphan,
+                    &serde_json::Map::new(),
+                    "th_missing_parent",
+                    "thread",
+                )
+                .is_err()
+        );
+        assert!(store.thread(&orphan.id).unwrap().is_none());
+    }
+
+    #[test]
     fn queued_prompts_survive_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("q.db");
@@ -10246,6 +10837,47 @@ mod tests {
                 trigger_key: "manual:comment:200".into(),
             }]
         );
+    }
+
+    #[test]
+    fn migrations_add_indexed_turn_boundaries_to_legacy_thread_view_items() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thread_view_items (
+               thread_id TEXT NOT NULL,
+               item_index INTEGER NOT NULL,
+               item TEXT NOT NULL,
+               PRIMARY KEY (thread_id, item_index)
+             );",
+        )
+        .unwrap();
+        assert!(!SCHEMA.contains("thread_view_items_turn_start"));
+
+        conn.execute_batch(SCHEMA).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let turn_start_columns = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(thread_view_items)")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|column| column == "turn_start")
+                .count()
+        };
+        assert_eq!(turn_start_columns, 1);
+        let indexed = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'thread_view_items_turn_start'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        apply_migrations(&mut conn).unwrap();
     }
 
     #[test]

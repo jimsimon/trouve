@@ -24,12 +24,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
+use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
     BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn,
@@ -37,6 +38,11 @@ use crate::{
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
+
+#[cfg(not(test))]
+const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
 
 pub struct CodexBackend {
     id: String,
@@ -74,8 +80,17 @@ fn sandbox_settings(
     } else {
         (permission_sandbox, permission_policy_type)
     };
-    let policy = if full_tool_bridge || matches!(permission, BackendPermission::ReadOnly) {
-        json!({ "type": policy_type, "networkAccess": true })
+    let policy = if full_tool_bridge {
+        // A read-only filesystem sandbox does not make outbound requests
+        // read-only: native commands can still push Git refs, call mutating
+        // APIs, or exfiltrate workspace content. Full-bridge turns route
+        // network reads through ToolExecutor's gated `web_fetch` tool instead.
+        json!({ "type": policy_type, "networkAccess": false })
+    } else if matches!(permission, BackendPermission::ReadOnly) {
+        // Read-only is an authorization boundary even when the bridge is
+        // temporarily unavailable. Fail closed instead of silently restoring
+        // an unaudited outbound side channel.
+        json!({ "type": policy_type, "networkAccess": false })
     } else {
         json!({ "type": policy_type })
     };
@@ -116,14 +131,70 @@ impl CodexBackend {
     }
 
     async fn server(&self) -> Result<Arc<AppServer>, BackendError> {
-        let mut guard = self.server.lock().await;
-        if let Some(s) = guard.as_ref()
-            && !s.is_closed()
-        {
-            return Ok(s.clone());
+        self.server_with_cancel(None).await
+    }
+
+    async fn server_cancellable(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<AppServer>, BackendError> {
+        self.server_with_cancel(Some(cancel)).await
+    }
+
+    async fn server_with_cancel(
+        &self,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<AppServer>, BackendError> {
+        let mut guard = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                guard = self.server.lock() => guard,
+            },
+            None => self.server.lock().await,
+        };
+        if let Some(cached) = guard.as_ref() {
+            if !cached.is_closed() {
+                if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    return Err(BackendError::Cancelled);
+                }
+                return Ok(cached.clone());
+            }
+
+            // EOF wakes routed streams before the reader's blocking process
+            // reap necessarily completes. Keep the closed entry installed
+            // while awaiting its idempotent cleanup: concurrent callers stay
+            // behind this spawn lock, and aborting this waiter leaves the
+            // stale entry for the next caller to finish instead of exposing an
+            // empty cache that could spawn an overlapping replacement.
+            cached.terminate_transport().await?;
+            guard.take();
+        }
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(BackendError::Cancelled);
         }
         let s = Arc::new(AppServer::spawn(&self.command).await?);
-        s.handshake().await?;
+        let handshake = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                result = s.handshake() => result,
+            },
+            None => s.handshake().await,
+        };
+        if let Err(error) = handshake {
+            // A well-formed initialize error leaves the process and both
+            // transport tasks alive. Cancellation can also drop the handshake
+            // future after initialize was flushed. Reap the complete tree
+            // before releasing the spawn lock so a retry cannot overlap it.
+            if let Err(cleanup_error) = s.terminate_transport().await {
+                let message =
+                    format!("{error}; app-server cleanup was not acknowledged: {cleanup_error}");
+                *guard = Some(s);
+                return Err(BackendError::Protocol(message));
+            }
+            return Err(error);
+        }
         *guard = Some(s.clone());
         Ok(s)
     }
@@ -181,11 +252,7 @@ impl AgentBackend for CodexBackend {
 
     async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
         let cancel = steer.cancel.clone();
-        let server = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            server = self.server() => server?,
-        };
+        let server = self.server_cancellable(&cancel).await?;
         let mut input = Vec::with_capacity(1 + steer.attachments.len());
         if !steer.prompt.is_empty() {
             input.push(json!({ "type": "text", "text": steer.prompt }));
@@ -202,11 +269,7 @@ impl AgentBackend for CodexBackend {
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         let cancel = turn.cancel.clone();
-        let server = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            server = self.server() => server?,
-        };
+        let mut server = self.server_cancellable(&cancel).await?;
 
         // Effort comes from the thread's model options; `@effort` model ids
         // from before the options split still resolve.
@@ -261,31 +324,42 @@ impl AgentBackend for CodexBackend {
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request_cancellable(
+                    .request_effect_cancellable(
                         "thread/resume",
                         with_thread_settings(json!({ "threadId": sid })),
                         &cancel,
                     )
                     .await;
                 match resumed {
-                    Ok(v) => thread_id_of(&v)?,
+                    Ok(v) => {
+                        server
+                            .validated_thread_id("thread/resume", &v, Some(sid))
+                            .await?
+                    }
                     Err(BackendError::Cancelled) => return Err(BackendError::Cancelled),
                     Err(e) => {
                         tracing::warn!("codex thread/resume failed ({e}); starting fresh");
+                        if server.is_closed() {
+                            server = self.server_cancellable(&cancel).await?;
+                        }
                         fresh_session = true;
                         let v = server
-                            .request_cancellable("thread/start", start_params.clone(), &cancel)
+                            .request_effect_cancellable(
+                                "thread/start",
+                                start_params.clone(),
+                                &cancel,
+                            )
                             .await?;
-                        thread_id_of(&v)?
+                        server.validated_thread_id("thread/start", &v, None).await?
                     }
                 }
             }
             None => {
                 fresh_session = true;
                 let v = server
-                    .request_cancellable("thread/start", start_params.clone(), &cancel)
+                    .request_effect_cancellable("thread/start", start_params.clone(), &cancel)
                     .await?;
-                thread_id_of(&v)?
+                server.validated_thread_id("thread/start", &v, None).await?
             }
         };
 
@@ -296,17 +370,31 @@ impl AgentBackend for CodexBackend {
         // completion is misattributed to the replacement.
         let lifecycle = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => lifecycle,
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            lifecycle = server.lock_turn_lifecycle(&codex_thread_id) => Ok(lifecycle),
         };
-        server.interrupt_active_turn(&codex_thread_id).await?;
+        let lifecycle = match lifecycle {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                return session_setup_failure(fresh_session, &codex_thread_id, error);
+            }
+        };
+        if let Err(error) = server.interrupt_active_turn(&codex_thread_id).await {
+            return session_setup_failure(fresh_session, &codex_thread_id, error);
+        }
         if cancel.is_cancelled() {
-            return Err(BackendError::Cancelled);
+            return session_setup_failure(fresh_session, &codex_thread_id, BackendError::Cancelled);
         }
         let route = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            route = server.subscribe(&codex_thread_id) => route?,
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
+            route = server.subscribe(&codex_thread_id) => route,
+        };
+        let route = match route {
+            Ok(route) => route,
+            Err(error) => {
+                return session_setup_failure(fresh_session, &codex_thread_id, error);
+            }
         };
 
         // A cold `thread/resume` accepts developerInstructions but some Codex
@@ -351,7 +439,7 @@ impl AgentBackend for CodexBackend {
         {
             Ok(started) => started,
             Err(error) => {
-                return Err(error);
+                return session_setup_failure(fresh_session, &codex_thread_id, error);
             }
         };
         if let Some(instructions) = &turn.instructions {
@@ -454,37 +542,72 @@ struct CollaboratorStreamState {
 struct CollaboratorLifecycle {
     active: HashSet<String>,
     terminal: HashSet<String>,
+    /// Announcements precede `turn/started`, but a provider can also announce
+    /// a child that never starts. Keep the root route alive for a bounded
+    /// handoff window instead of either closing immediately or hanging
+    /// forever.
+    pending_start: HashMap<String, tokio::time::Instant>,
 }
 
 impl CollaboratorLifecycle {
     fn announce(&mut self, session_id: &str) {
-        if !self.terminal.contains(session_id) {
-            self.active.insert(session_id.to_string());
-        }
+        self.terminal.remove(session_id);
+        self.pending_start.insert(
+            session_id.to_string(),
+            tokio::time::Instant::now() + COLLABORATOR_START_GRACE,
+        );
     }
 
     fn observe(&mut self, session_id: &str, event: &BackendCollaboratorEvent) {
         match event {
             BackendCollaboratorEvent::TurnStarted => {
+                self.pending_start.remove(session_id);
                 self.terminal.remove(session_id);
                 self.active.insert(session_id.to_string());
             }
             BackendCollaboratorEvent::Completed { .. }
             | BackendCollaboratorEvent::Failed { .. } => {
+                self.pending_start.remove(session_id);
                 self.active.remove(session_id);
                 self.terminal.insert(session_id.to_string());
             }
             _ => {
                 if !self.terminal.contains(session_id) {
+                    self.pending_start.remove(session_id);
                     self.active.insert(session_id.to_string());
                 }
             }
         }
     }
 
-    fn root_can_finish(&self) -> bool {
-        self.active.is_empty()
+    fn root_can_finish(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        self.pending_start.retain(|_, deadline| *deadline > now);
+        self.active.is_empty() && self.pending_start.is_empty()
     }
+
+    fn next_start_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending_start.values().copied().min()
+    }
+}
+
+enum CodexRouteInput {
+    Message(Option<ServerMsg>),
+    PromptLookup(Option<CollaboratorPromptLookup>),
+    StartGraceElapsed,
+}
+
+struct CollaboratorPromptLookup {
+    session_id: String,
+    generation: u64,
+    prompt: Option<String>,
+}
+
+fn root_route_can_finish(
+    lifecycle: &mut CollaboratorLifecycle,
+    prompt_lookups: &HashMap<String, u64>,
+) -> bool {
+    prompt_lookups.is_empty() && lifecycle.root_can_finish()
 }
 
 fn add_usage(total: &mut Usage, current: &Usage) {
@@ -669,6 +792,9 @@ fn collaborator_notification(
         }
         "turn/completed" => {
             match params["turn"]["status"].as_str() {
+                Some("completed") => events.push(BackendCollaboratorEvent::Completed {
+                    usage: state.usage.clone(),
+                }),
                 Some("failed") => events.push(BackendCollaboratorEvent::Failed {
                     error: params["turn"]["error"]["message"]
                         .as_str()
@@ -678,8 +804,11 @@ fn collaborator_notification(
                 Some("interrupted") => events.push(BackendCollaboratorEvent::Failed {
                     error: "turn cancelled".into(),
                 }),
-                _ => events.push(BackendCollaboratorEvent::Completed {
-                    usage: state.usage.clone(),
+                Some(status) => events.push(BackendCollaboratorEvent::Failed {
+                    error: format!("turn completed with unknown status '{status}'"),
+                }),
+                None => events.push(BackendCollaboratorEvent::Failed {
+                    error: "turn/completed omitted its terminal status".into(),
                 }),
             }
             *state = CollaboratorStreamState::default();
@@ -718,16 +847,18 @@ fn codex_plan_todos(params: &Value) -> Option<Vec<TodoItem>> {
         .collect()
 }
 
-fn thread_id_of(result: &Value) -> Result<String, BackendError> {
+fn thread_id_of(result: &Value, method: &str) -> Result<String, BackendError> {
     result["thread"]["id"]
         .as_str()
+        .filter(|id| !id.trim().is_empty())
         .map(str::to_string)
-        .ok_or_else(|| BackendError::Protocol("thread/start result missing thread.id".into()))
+        .ok_or_else(|| BackendError::Protocol(format!("{method} result missing thread.id")))
 }
 
 fn turn_id_of(result: &Value) -> Result<String, BackendError> {
     result["turn"]["id"]
         .as_str()
+        .filter(|id| !id.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| BackendError::Protocol("turn/start result missing turn.id".into()))
 }
@@ -742,8 +873,26 @@ fn steered_turn_id_of(result: &Value) -> Result<String, BackendError> {
     result["turnId"]
         .as_str()
         .or_else(|| result["turn"]["id"].as_str())
+        .filter(|id| !id.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| BackendError::Protocol("turn/steer result missing turnId".into()))
+}
+
+fn session_setup_failure(
+    fresh_session: bool,
+    session_id: &str,
+    error: BackendError,
+) -> Result<BackendEventStream, BackendError> {
+    if !fresh_session {
+        return Err(error);
+    }
+    Ok(futures::stream::iter(vec![
+        Ok(BackendEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        }),
+        Err(error),
+    ])
+    .boxed())
 }
 
 /// Translate routed app-server messages into `BackendEvent`s until the turn
@@ -786,14 +935,113 @@ fn turn_stream(
         let mut route_closed = false;
         let mut terminal_params = None;
         let mut announced_collaborators = HashSet::<(String, String)>::new();
-        let mut collaborator_prompt_lookups = HashSet::<String>::new();
+        let mut collaborator_prompt_lookups = HashMap::<String, u64>::new();
+        let mut next_prompt_lookup_generation = 0_u64;
         let mut collaborator_states = HashMap::<String, CollaboratorStreamState>::new();
         let mut collaborator_lifecycle = CollaboratorLifecycle::default();
         let mut collaborator_topology = CollaboratorTopology::default();
+        let (prompt_lookup_tx, mut prompt_lookup_rx) =
+            mpsc::unbounded_channel::<CollaboratorPromptLookup>();
         let mut overload_signal = rx.overload_signal();
         let mut close_signal = rx.close_signal();
         let process_route = async {
-            while let Some(msg) = rx.recv().await {
+            loop {
+                let input = if terminal_params.is_some() {
+                    if let Some(deadline) = collaborator_lifecycle.next_start_deadline() {
+                        tokio::select! {
+                            biased;
+                            prompt = prompt_lookup_rx.recv(), if !collaborator_prompt_lookups.is_empty() => {
+                                CodexRouteInput::PromptLookup(prompt)
+                            }
+                            message = rx.recv() => CodexRouteInput::Message(message),
+                            _ = tokio::time::sleep_until(deadline) => CodexRouteInput::StartGraceElapsed,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            prompt = prompt_lookup_rx.recv(), if !collaborator_prompt_lookups.is_empty() => {
+                                CodexRouteInput::PromptLookup(prompt)
+                            }
+                            message = rx.recv() => CodexRouteInput::Message(message),
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        prompt = prompt_lookup_rx.recv(), if !collaborator_prompt_lookups.is_empty() => {
+                            CodexRouteInput::PromptLookup(prompt)
+                        }
+                        message = rx.recv() => CodexRouteInput::Message(message),
+                    }
+                };
+                let msg = match input {
+                    CodexRouteInput::Message(Some(message)) => message,
+                    CodexRouteInput::Message(None) => break,
+                    CodexRouteInput::PromptLookup(Some(lookup)) => {
+                        if collaborator_prompt_lookups.get(&lookup.session_id)
+                            != Some(&lookup.generation)
+                        {
+                            tracing::debug!(
+                                session_id = %lookup.session_id,
+                                generation = lookup.generation,
+                                "codex: ignoring superseded collaborator prompt lookup"
+                            );
+                            continue;
+                        }
+                        collaborator_prompt_lookups.remove(&lookup.session_id);
+                        if let Some(prompt) = lookup.prompt {
+                            let _ = tx
+                                .send(Ok(BackendEvent::CollaboratorEvent {
+                                    session_id: lookup.session_id,
+                                    turn_id: None,
+                                    event: BackendCollaboratorEvent::UserMessage(prompt),
+                                }))
+                                .await;
+                        } else {
+                            tracing::debug!(
+                                session_id = %lookup.session_id,
+                                generation = lookup.generation,
+                                "codex: collaborator prompt lookup exhausted"
+                            );
+                        }
+                        if terminal_params.is_some()
+                            && root_route_can_finish(
+                                &mut collaborator_lifecycle,
+                                &collaborator_prompt_lookups,
+                            )
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    CodexRouteInput::PromptLookup(None) => {
+                        for (session_id, generation) in collaborator_prompt_lookups.drain() {
+                            tracing::debug!(
+                                %session_id,
+                                generation,
+                                "codex: collaborator prompt lookup channel closed before resolution"
+                            );
+                        }
+                        if terminal_params.is_some()
+                            && root_route_can_finish(
+                                &mut collaborator_lifecycle,
+                                &collaborator_prompt_lookups,
+                            )
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    CodexRouteInput::StartGraceElapsed => {
+                        if root_route_can_finish(
+                            &mut collaborator_lifecycle,
+                            &collaborator_prompt_lookups,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let root_message = message_belongs_to_thread(&msg, &codex_thread_id);
                 if root_message
                     && message_turn_id(&msg).is_some_and(|turn_id| turn_id != codex_turn_id)
@@ -805,7 +1053,7 @@ fn turn_stream(
                     ServerMsg::Notification { method, params } => {
                         let announcement_id =
                             params["item"]["id"].as_str().unwrap_or("").to_string();
-                        for mut collaborator in collaborator_announcements(&params) {
+                        for collaborator in collaborator_announcements(&params) {
                             if !collaborator_topology.admit(
                                 &codex_thread_id,
                                 &collaborator.parent_session_id,
@@ -823,16 +1071,10 @@ fn turn_stream(
                                 .insert((collaborator.session_id.clone(), announcement_id.clone()))
                             {
                                 collaborator_lifecycle.announce(&collaborator.session_id);
-                                if collaborator.prompt.is_some() {
-                                    collaborator_prompt_lookups
-                                        .insert(collaborator.session_id.clone());
-                                } else if collaborator_prompt_lookups
-                                    .insert(collaborator.session_id.clone())
-                                {
-                                    collaborator.prompt = server
-                                        .collaborator_prompt(&collaborator.session_id, &cancel)
-                                        .await;
-                                }
+                                let recover_prompt = collaborator.prompt.is_none()
+                                    && !collaborator_prompt_lookups
+                                        .contains_key(&collaborator.session_id);
+                                let lookup_session_id = collaborator.session_id.clone();
                                 let _ = tx
                                     .send(Ok(BackendEvent::CollaboratorStarted {
                                         session_id: collaborator.session_id,
@@ -844,6 +1086,26 @@ fn turn_stream(
                                         access: collaborator.access,
                                     }))
                                     .await;
+                                if recover_prompt {
+                                    next_prompt_lookup_generation =
+                                        next_prompt_lookup_generation.wrapping_add(1);
+                                    let lookup_generation = next_prompt_lookup_generation;
+                                    collaborator_prompt_lookups
+                                        .insert(lookup_session_id.clone(), lookup_generation);
+                                    let lookup_server = Arc::clone(&server);
+                                    let lookup_cancel = cancel.clone();
+                                    let lookup_tx = prompt_lookup_tx.clone();
+                                    tokio::spawn(async move {
+                                        let prompt = lookup_server
+                                            .collaborator_prompt(&lookup_session_id, &lookup_cancel)
+                                            .await;
+                                        let _ = lookup_tx.send(CollaboratorPromptLookup {
+                                            session_id: lookup_session_id,
+                                            generation: lookup_generation,
+                                            prompt,
+                                        });
+                                    });
+                                }
                             }
                         }
                         if !root_message {
@@ -864,7 +1126,11 @@ fn turn_stream(
                                     }))
                                     .await;
                             }
-                            if terminal_params.is_some() && collaborator_lifecycle.root_can_finish()
+                            if terminal_params.is_some()
+                                && root_route_can_finish(
+                                    &mut collaborator_lifecycle,
+                                    &collaborator_prompt_lookups,
+                                )
                             {
                                 break;
                             }
@@ -1007,7 +1273,10 @@ fn turn_stream(
                                 // publish their terminal transcript instead of
                                 // being failed during core cleanup.
                                 terminal_params = Some(params);
-                                if collaborator_lifecycle.root_can_finish() {
+                                if root_route_can_finish(
+                                    &mut collaborator_lifecycle,
+                                    &collaborator_prompt_lookups,
+                                ) {
                                     break;
                                 }
                             }
@@ -1142,7 +1411,12 @@ fn turn_stream(
                 route_closed = true;
             }
         }
-        if let Some(params) = terminal_params {
+        if !cancelled
+            && !client_gone
+            && !route_overloaded
+            && !route_closed
+            && let Some(params) = terminal_params
+        {
             // Publish completion only after active-turn cleanup is serialized
             // with any replacement startup.
             let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
@@ -1153,19 +1427,38 @@ fn turn_stream(
             // allowed to drop immediately after receiving the terminal event.
             server.unsubscribe(&codex_thread_id, &route_tx).await;
             cleanup.disarm();
-            let status = params["turn"]["status"].as_str().unwrap_or("completed");
-            if status == "failed" {
-                let message = params["turn"]["error"]["message"]
-                    .as_str()
-                    .unwrap_or("turn failed")
-                    .to_string();
-                let _ = tx.send(Err(BackendError::Protocol(message))).await;
-            } else {
-                let _ = tx
-                    .send(Ok(BackendEvent::Completed {
-                        usage: usage.clone(),
-                    }))
-                    .await;
+            match params["turn"]["status"].as_str() {
+                Some("completed") => {
+                    let _ = tx
+                        .send(Ok(BackendEvent::Completed {
+                            usage: usage.clone(),
+                        }))
+                        .await;
+                }
+                Some("failed") => {
+                    let message = params["turn"]["error"]["message"]
+                        .as_str()
+                        .unwrap_or("turn failed")
+                        .to_string();
+                    let _ = tx.send(Err(BackendError::Protocol(message))).await;
+                }
+                Some("interrupted") => {
+                    let _ = tx.send(Err(BackendError::Cancelled)).await;
+                }
+                Some(status) => {
+                    let _ = tx
+                        .send(Err(BackendError::Protocol(format!(
+                            "turn completed with unknown status '{status}'"
+                        ))))
+                        .await;
+                }
+                None => {
+                    let _ = tx
+                        .send(Err(BackendError::Protocol(
+                            "turn/completed omitted its terminal status".into(),
+                        )))
+                        .await;
+                }
             }
             return;
         }
@@ -1395,17 +1688,7 @@ fn collaborator_access(item: &Value, session_id: &str) -> BackendCollaboratorAcc
                 };
             }
         }
-        for key in [
-            "access",
-            "mode",
-            "agentType",
-            "agent_type",
-            "role",
-            "name",
-            "agentName",
-            "taskName",
-            "agentPath",
-        ] {
+        for key in ["access", "mode", "agentType", "agent_type", "role"] {
             let Some(label) = source.get(key).and_then(Value::as_str) else {
                 continue;
             };
@@ -1887,7 +2170,11 @@ impl Drop for StartedTurnGuard {
                                 tracing::warn!(
                                     "codex: cancelled turn/start response invalid: {error}"
                                 );
-                                server.terminate_transport().await;
+                                if let Err(cleanup_error) = server.terminate_transport().await {
+                                    tracing::warn!(
+                                        "codex: failed to acknowledge cancelled-start cleanup: {cleanup_error}"
+                                    );
+                                }
                                 None
                             }
                         },
@@ -1902,7 +2189,11 @@ impl Drop for StartedTurnGuard {
                              its app-server transport",
                                 CANCELLED_START_RESPONSE_TIMEOUT.as_secs()
                             );
-                            server.terminate_transport().await;
+                            if let Err(cleanup_error) = server.terminate_transport().await {
+                                tracing::warn!(
+                                    "codex: failed to acknowledge cancelled-start cleanup: {cleanup_error}"
+                                );
+                            }
                             None
                         }
                     }
@@ -2726,32 +3017,47 @@ async fn terminate_transport_parts(
     routing: Routing,
     active_turns: Option<ActiveTurns>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    child: Option<Arc<std::sync::Mutex<Child>>>,
-) {
+    child: Option<Arc<std::sync::Mutex<ProcessTreeChild>>>,
+) -> Result<(), BackendError> {
     // The detached task owns the complete invalidation sequence, so dropping
     // a caller cannot strand waiters after `closed` becomes visible.
     closed.store(true, Ordering::Relaxed);
     let cleanup = tokio::spawn(async move {
         close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
         if let Some(child) = child {
-            let _ = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
+            tokio::task::spawn_blocking(move || kill_and_reap_child(child))
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "app-server cleanup task failed before acknowledgement: {error}"
+                    ))
+                })??;
         }
+        Ok::<(), std::io::Error>(())
     });
-    let _ = cleanup.await;
+    cleanup
+        .await
+        .map_err(|error| {
+            BackendError::Protocol(format!(
+                "app-server cleanup coordinator failed before acknowledgement: {error}"
+            ))
+        })?
+        .map_err(BackendError::Io)
 }
 
-fn kill_and_reap_child(child: Arc<std::sync::Mutex<Child>>) {
+fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::io::Result<()> {
     let Ok(mut child) = child.lock() else {
         tracing::warn!("codex: app-server process lock is poisoned");
-        return;
+        return Err(std::io::Error::other("app-server process lock is poisoned"));
     };
-    if let Err(error) = child.start_kill() {
-        tracing::warn!("codex: failed to terminate unusable app-server: {error}");
+    let terminate_error = child.terminate_now().err();
+    if let Some(error) = terminate_error.as_ref() {
+        tracing::warn!("codex: failed to terminate unusable app-server tree: {error}");
     }
     let deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
+        match child.try_wait_tree() {
+            Ok(Some(_)) => return Ok(()),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -2760,21 +3066,29 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<Child>>) {
                     "codex: app-server did not exit within {}s",
                     CHILD_REAP_TIMEOUT.as_secs()
                 );
-                return;
+                return Err(terminate_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "app-server process tree did not exit within {}s",
+                            CHILD_REAP_TIMEOUT.as_secs()
+                        ),
+                    )
+                }));
             }
             Err(error) => {
                 tracing::warn!("codex: failed to reap app-server: {error}");
-                return;
+                return Err(error);
             }
         }
     }
 }
 
-fn start_kill_child_now(child: &std::sync::Mutex<Child>) {
+fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     match child.try_lock() {
         Ok(mut child) => {
-            if let Err(error) = child.start_kill() {
-                tracing::warn!("codex: failed to terminate unusable app-server: {error}");
+            if let Err(error) = child.terminate_now() {
+                tracing::warn!("codex: failed to terminate unusable app-server tree: {error}");
             }
         }
         Err(std::sync::TryLockError::WouldBlock) => {
@@ -2800,7 +3114,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     turn_state: ReaderTurnState,
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    child: Option<std::sync::Weak<std::sync::Mutex<Child>>>,
+    child: Option<std::sync::Weak<std::sync::Mutex<ProcessTreeChild>>>,
 ) {
     let ReaderTurnState {
         active_turns,
@@ -2887,14 +3201,17 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 tracing::error!(
                     "codex: terminating app-server after retired-response buffer overflow"
                 );
-                terminate_transport_parts(
+                if let Err(error) = terminate_transport_parts(
                     pending.clone(),
                     routing.clone(),
                     active_turns.clone(),
                     closed.clone(),
                     child.as_ref().and_then(std::sync::Weak::upgrade),
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!("codex: failed to acknowledge overflow cleanup: {error}");
+                }
                 return;
             }
             for response in responses {
@@ -2902,14 +3219,17 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                     tracing::error!(
                         "codex: terminating app-server after retired-response queue overflow"
                     );
-                    terminate_transport_parts(
+                    if let Err(error) = terminate_transport_parts(
                         pending.clone(),
                         routing.clone(),
                         active_turns.clone(),
                         closed.clone(),
                         child.as_ref().and_then(std::sync::Weak::upgrade),
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("codex: failed to acknowledge overflow cleanup: {error}");
+                    }
                     return;
                 }
             }
@@ -2921,7 +3241,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     // remaining active forever.
     close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
     if let Some(child) = child.and_then(|child| child.upgrade()) {
-        let _ = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
+        match tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("codex: stdout EOF cleanup was not acknowledged: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("codex: stdout EOF cleanup task failed: {error}");
+            }
+        }
     }
 }
 
@@ -2946,11 +3274,21 @@ struct AppServer {
     /// app-server process. This is intentionally process-local: an empty map
     /// after restart is what activates the cold-resume prompt fallback.
     thread_instructions: std::sync::Mutex<HashMap<String, String>>,
-    /// Held so the child (kill_on_drop) lives as long as the server handle.
-    child: Arc<std::sync::Mutex<Child>>,
+    /// Held so the complete owned process tree lives as long as the server
+    /// handle and can be synchronously signalled during Drop-time cleanup.
+    child: Arc<std::sync::Mutex<ProcessTreeChild>>,
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     transport_cleanup_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        // Startup may be cancelled while the handshake future owns the last
+        // server handle. Keep process-tree cleanup independent of that
+        // future's completion and of the Tokio runtime's lifetime.
+        self.invalidate_transport_now();
+    }
 }
 
 struct TransportWriteGuard<'a> {
@@ -2972,19 +3310,17 @@ impl Drop for TransportWriteGuard<'_> {
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
         let mut command_process = crate::process_env::tokio_command(command);
-        let mut child = command_process
+        command_process
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
-                _ => BackendError::Io(e),
-            })?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin piped")));
-        let stdout = child.stdout.take().expect("stdout piped");
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command_process).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
+            _ => BackendError::Io(e),
+        })?;
+        let stdin = Arc::new(Mutex::new(child.take_stdin().expect("stdin piped")));
+        let stdout = child.take_stdout().expect("stdout piped");
         let (retired_response_tx, retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let server = Self {
@@ -3066,7 +3402,7 @@ impl AppServer {
             let child = self.child.clone();
             if let Err(error) = spawn_cleanup(Box::new(move || {
                 close_transport_blocking(&pending, &routing, &active_turns, &closed);
-                kill_and_reap_child(child);
+                let _ = kill_and_reap_child(child);
             })) {
                 tracing::error!("codex: failed to start transport cleanup thread: {error}");
                 let pending = self.pending.clone();
@@ -3076,7 +3412,7 @@ impl AppServer {
                 let child = self.child.clone();
                 runtime.spawn_blocking(move || {
                     close_transport_blocking(&pending, &routing, &active_turns, &closed);
-                    kill_and_reap_child(child);
+                    let _ = kill_and_reap_child(child);
                 });
             }
             return;
@@ -3090,7 +3426,7 @@ impl AppServer {
             &self.active_turns,
             &self.closed,
         );
-        kill_and_reap_child(self.child.clone());
+        let _ = kill_and_reap_child(self.child.clone());
     }
 
     fn start_reader(&self, stdout: tokio::process::ChildStdout) {
@@ -3137,14 +3473,19 @@ impl AppServer {
                     tracing::error!(
                         "codex: terminating app-server after retired-response write failure"
                     );
-                    terminate_transport_parts(
+                    if let Err(error) = terminate_transport_parts(
                         pending.clone(),
                         routing.clone(),
                         Some(active_turns.clone()),
                         closed.clone(),
                         child.upgrade(),
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(
+                            "codex: retired-response writer cleanup was not acknowledged: {error}"
+                        );
+                    }
                     break;
                 }
             }
@@ -3157,7 +3498,7 @@ impl AppServer {
                 tracing::error!(
                     "codex: terminating app-server after retired-response queue overflow"
                 );
-                self.terminate_transport().await;
+                self.terminate_transport().await?;
                 return Err(BackendError::Protocol(
                     "app-server decline-response queue exceeded its limit".into(),
                 ));
@@ -3179,7 +3520,7 @@ impl AppServer {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, None).await
+        self.request_with_cancel(method, params, None, false).await
     }
 
     async fn request_cancellable(
@@ -3188,7 +3529,64 @@ impl AppServer {
         params: Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, Some(cancel)).await
+        self.request_with_cancel(method, params, Some(cancel), false)
+            .await
+    }
+
+    /// Cancellable before transmission, then fenced to the exact response.
+    /// Use only for requests whose vendor-side effect would otherwise outlive
+    /// the result reported to core.
+    async fn request_effect_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.request_with_cancel_timeout(
+            method,
+            params,
+            Some(cancel),
+            true,
+            REQUEST_RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn validate_effect_id(
+        &self,
+        method: &str,
+        parsed: Result<String, BackendError>,
+        expected: Option<&str>,
+    ) -> Result<String, BackendError> {
+        let id = match parsed {
+            Ok(id) => id,
+            Err(error) => {
+                // The provider reported success for an effect whose owner is
+                // unknowable. It may still be live, so this transport cannot
+                // safely serve another request.
+                self.terminate_transport().await?;
+                return Err(error);
+            }
+        };
+        if let Some(expected) = expected
+            && id != expected
+        {
+            self.terminate_transport().await?;
+            return Err(BackendError::Protocol(format!(
+                "{method} returned id {id}, expected {expected}"
+            )));
+        }
+        Ok(id)
+    }
+
+    async fn validated_thread_id(
+        &self,
+        method: &str,
+        result: &Value,
+        expected: Option<&str>,
+    ) -> Result<String, BackendError> {
+        self.validate_effect_id(method, thread_id_of(result, method), expected)
+            .await
     }
 
     async fn collaborator_prompt(
@@ -3247,6 +3645,25 @@ impl AppServer {
         method: &str,
         params: Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        fence_after_write: bool,
+    ) -> Result<Value, BackendError> {
+        self.request_with_cancel_timeout(
+            method,
+            params,
+            cancel,
+            fence_after_write,
+            REQUEST_RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn request_with_cancel_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        fence_after_write: bool,
+        response_timeout: std::time::Duration,
     ) -> Result<Value, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -3263,28 +3680,48 @@ impl AppServer {
         };
         if let Err(error) = written {
             self.pending.lock().await.remove(&id);
+            if self.is_closed() {
+                // Cancellation after write_all began invalidates framing via
+                // TransportWriteGuard. A detached Drop cleanup is not enough:
+                // acknowledge process-tree reaping before the caller can
+                // publish cancellation or spawn a replacement server.
+                self.terminate_transport().await?;
+            }
             return Err(error);
         }
         let response = async {
-            match tokio::time::timeout(REQUEST_RESPONSE_TIMEOUT, rx).await {
+            match tokio::time::timeout(response_timeout, rx).await {
                 Ok(response) => response.map_err(|_| {
                     BackendError::Protocol(format!("{method}: app-server closed before responding"))
                 }),
                 Err(_) => Err(BackendError::Protocol(format!(
                     "{method}: no response within {}s",
-                    REQUEST_RESPONSE_TIMEOUT.as_secs()
+                    response_timeout.as_secs_f64()
                 ))),
             }
         };
-        let response = match cancel {
-            Some(cancel) => tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(BackendError::Cancelled),
-                response = response => response,
-            },
-            None => response.await,
+        let response = if fence_after_write {
+            // Once the complete request has been flushed, its vendor-side
+            // effect may already be committed. Fence the exact response
+            // instead of reporting that a transmitted effect never happened.
+            response.await
+        } else {
+            match cancel {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                    response = response => response,
+                },
+                None => response.await,
+            }
         };
-        if response.is_err() {
+        if response.is_err() && fence_after_write {
+            // A transmitted effect with no exact response has an ambiguous
+            // vendor-side outcome. Invalidate and reap the shared app-server
+            // before returning so a late start/resume/steer cannot surface on
+            // a replacement turn or share its transport with later requests.
+            self.terminate_transport().await?;
+        } else if response.is_err() {
             self.pending.lock().await.remove(&id);
         }
         match response? {
@@ -3314,7 +3751,7 @@ impl AppServer {
                 ))
             })?;
         let response = self
-            .request_cancellable(
+            .request_effect_cancellable(
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
@@ -3324,12 +3761,12 @@ impl AppServer {
                 cancel,
             )
             .await?;
-        let returned_turn_id = steered_turn_id_of(&response)?;
-        if returned_turn_id != expected_turn_id {
-            return Err(BackendError::Protocol(format!(
-                "turn/steer returned turn {returned_turn_id}, expected {expected_turn_id}"
-            )));
-        }
+        self.validate_effect_id(
+            "turn/steer",
+            steered_turn_id_of(&response),
+            Some(&expected_turn_id),
+        )
+        .await?;
         Ok(())
     }
 
@@ -3414,15 +3851,9 @@ impl AppServer {
                 return Err(error);
             }
         };
-        let turn_id = match turn_id_of(&started) {
-            Ok(turn_id) => turn_id,
-            Err(error) => {
-                // A successful but unidentifiable start may already be
-                // running. The shared transport cannot be safely reused.
-                self.terminate_transport().await;
-                return Err(error);
-            }
-        };
+        let turn_id = self
+            .validate_effect_id("turn/start", turn_id_of(&started), None)
+            .await?;
         cleanup.turn_id = Some(turn_id.clone());
         self.register_active_turn(thread_id, &turn_id).await;
         let activated = tokio::select! {
@@ -3492,7 +3923,7 @@ impl AppServer {
             tracing::error!(
                 "codex: terminating app-server after activation response buffer overflow"
             );
-            self.terminate_transport().await;
+            self.terminate_transport().await?;
             return Err(BackendError::Protocol(
                 "app-server activation generated too many decline responses".into(),
             ));
@@ -3563,7 +3994,7 @@ impl AppServer {
                 // The interrupt may have been applied even though its response
                 // was lost. The transport is now ambiguous and cannot safely
                 // accept a replacement prompt.
-                self.terminate_transport().await;
+                self.terminate_transport().await?;
                 Err(BackendError::Protocol(format!(
                     "turn/interrupt: no response within {}s",
                     INTERRUPT_RESPONSE_TIMEOUT.as_secs()
@@ -3629,11 +4060,11 @@ impl AppServer {
                 Ok(())
             }
             Ok(Err(error)) => {
-                self.terminate_transport().await;
+                self.terminate_transport().await?;
                 Err(BackendError::Io(error))
             }
             Err(_) => {
-                self.terminate_transport().await;
+                self.terminate_transport().await?;
                 Err(BackendError::Protocol(format!(
                     "app-server stdin blocked for {}s",
                     TRANSPORT_WRITE_TIMEOUT.as_secs()
@@ -3642,7 +4073,7 @@ impl AppServer {
         }
     }
 
-    async fn terminate_transport(&self) {
+    async fn terminate_transport(&self) -> Result<(), BackendError> {
         terminate_transport_parts(
             self.pending.clone(),
             self.routing.clone(),
@@ -3650,7 +4081,7 @@ impl AppServer {
             self.closed.clone(),
             Some(self.child.clone()),
         )
-        .await;
+        .await
     }
 
     async fn subscribe(&self, thread_id: &str) -> Result<RouteSubscription, BackendError> {
@@ -3661,7 +4092,7 @@ impl AppServer {
             routing.take_retired_responses()
         };
         if response_overloaded {
-            self.terminate_transport().await;
+            self.terminate_transport().await?;
             return Err(BackendError::Protocol(
                 "app-server subscription generated too many decline responses".into(),
             ));
@@ -3677,7 +4108,9 @@ impl AppServer {
             routing.take_retired_responses()
         };
         if response_overloaded {
-            self.terminate_transport().await;
+            if let Err(error) = self.terminate_transport().await {
+                tracing::warn!("codex: unsubscribe cleanup was not acknowledged: {error}");
+            }
         } else if let Err(error) = self.send_retired_responses(responses).await {
             tracing::warn!("codex: failed to flush route-cleanup declines: {error}");
         }
@@ -4707,7 +5140,11 @@ mod tests {
         assert_eq!(child.prompt.as_deref(), Some("Inspect the router"));
         assert_eq!(child.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(child.thinking_level.as_deref(), Some("max"));
-        assert_eq!(child.access, BackendCollaboratorAccess::ReadOnly);
+        assert_eq!(
+            child.access,
+            BackendCollaboratorAccess::Inherit,
+            "a display name must not be interpreted as an authorization role"
+        );
 
         let current = json!({
             "threadId": "root",
@@ -4751,7 +5188,11 @@ mod tests {
         assert_eq!(announcements[0].parent_session_id, "root");
         assert_eq!(announcements[0].name.as_deref(), Some("reviewer"));
         assert_eq!(announcements[0].prompt, None);
-        assert_eq!(announcements[0].access, BackendCollaboratorAccess::ReadOnly);
+        assert_eq!(
+            announcements[0].access,
+            BackendCollaboratorAccess::Inherit,
+            "agentPath is presentation metadata, not an authorization input"
+        );
 
         let worker = json!({
             "threadId": "root",
@@ -4797,6 +5238,21 @@ mod tests {
             collaborator_access_label("specialist"),
             BackendCollaboratorAccess::Inherit
         );
+
+        let descriptive = json!({
+            "name": "implementation worker",
+            "taskName": "Write the patch",
+            "agentPath": "/root/code"
+        });
+        assert_eq!(
+            collaborator_access(&descriptive, "child"),
+            BackendCollaboratorAccess::Inherit,
+            "display names and task paths must not grant authority"
+        );
+        assert_eq!(
+            collaborator_access(&json!({ "readOnly": true }), "child"),
+            BackendCollaboratorAccess::ReadOnly
+        );
     }
 
     #[test]
@@ -4832,9 +5288,23 @@ mod tests {
         );
         assert!(lifecycle.root_can_finish());
 
-        // Repeated late ownership announcements must not resurrect a turn
-        // that has already published its terminal event.
+        // A follow-up announcement reopens a bounded handoff window so the
+        // root cannot close before the reused child publishes TurnStarted.
         lifecycle.announce("nested-b-1");
+        assert!(!lifecycle.root_can_finish());
+        std::thread::sleep(COLLABORATOR_START_GRACE + std::time::Duration::from_millis(5));
+        assert!(lifecycle.root_can_finish());
+
+        lifecycle.announce("nested-b-1");
+        lifecycle.observe("nested-b-1", &BackendCollaboratorEvent::TurnStarted);
+        std::thread::sleep(COLLABORATOR_START_GRACE + std::time::Duration::from_millis(5));
+        assert!(!lifecycle.root_can_finish());
+        lifecycle.observe(
+            "nested-b-1",
+            &BackendCollaboratorEvent::Completed {
+                usage: Usage::default(),
+            },
+        );
         assert!(lifecycle.root_can_finish());
     }
 
@@ -4988,6 +5458,22 @@ mod tests {
             .as_slice(),
             [BackendCollaboratorEvent::Failed { error }] if error == "turn cancelled"
         ));
+        assert!(matches!(
+            collaborator_notification(
+                "turn/completed",
+                &json!({ "turn": { "status": "mystery" } }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::Failed { error }]
+                if error.contains("unknown status 'mystery'")
+        ));
+        assert!(matches!(
+            collaborator_notification("turn/completed", &json!({ "turn": {} }), &mut state)
+                .as_slice(),
+            [BackendCollaboratorEvent::Failed { error }]
+                if error.contains("omitted its terminal status")
+        ));
     }
 
     #[cfg(unix)]
@@ -5054,17 +5540,20 @@ cat > /dev/null
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn steer_turn_wait_is_cancellation_aware() {
+    async fn transmitted_steer_fences_its_exact_response_after_cancellation() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let stub = temp.path().join("codex-steer-cancel");
         let request_marker = std::path::PathBuf::from(format!("{}.request", stub.display()));
+        let release_marker = std::path::PathBuf::from(format!("{}.release", stub.display()));
         std::fs::write(
             &stub,
             r#"#!/bin/sh
 IFS= read -r request
 printf '%s\n' "$request" > "$0.request"
+while [ ! -f "$0.release" ]; do sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turnId":"turn-1"}}'
 sleep 60
 "#,
         )
@@ -5100,14 +5589,527 @@ sleep 60
         .expect("steering request should reach Codex");
 
         cancel.cancel();
-        assert!(matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), steering)
+        tokio::task::yield_now().await;
+        assert!(
+            !steering.is_finished(),
+            "transmitted steer escaped its response fence"
+        );
+        std::fs::write(release_marker, b"release").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), steering)
+            .await
+            .expect("steering did not consume its exact response")
+            .unwrap()
+            .unwrap();
+        assert!(server.pending.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_collaborator_lookup_does_not_wait_for_response_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-collaborator-lookup-cancel");
+        let request_marker = std::path::PathBuf::from(format!("{}.request", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+IFS= read -r request
+printf '%s\n' "$request" > "$0.request"
+sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lookup = tokio::spawn({
+            let server = server.clone();
+            let cancel = cancel.clone();
+            async move { server.collaborator_prompt("child", &cancel).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !request_marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("collaborator lookup request did not reach app-server");
+
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
                 .await
-                .expect("steering wait should stop on cancellation")
+                .expect("cancelled collaborator lookup stalled stream draining")
+                .unwrap(),
+            None
+        );
+        assert!(server.pending.lock().await.is_empty());
+        assert!(
+            !server.is_closed(),
+            "read-only cancellation poisoned app-server"
+        );
+        server.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn initialize_error_reaps_the_app_server_before_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-initialize-error");
+        let starts_marker = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+starts_path = sys.argv[0] + ".starts"
+try:
+    with open(starts_path) as starts:
+        first_process = not starts.read().strip()
+except FileNotFoundError:
+    first_process = True
+with open(starts_path, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize" and first_process:
+        response = {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "error": {"code": -32000, "message": "initialize rejected"},
+        }
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+        time.sleep(60)
+        continue
+    if method == "initialize":
+        result = {}
+    elif method == "initialized":
+        continue
+    elif method == "account/rateLimits/read":
+        result = {"replacement": True}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let Err(error) = backend.server().await else {
+            panic!("first app-server unexpectedly completed its handshake");
+        };
+        assert!(
+            matches!(error, BackendError::Protocol(message) if message.contains("initialize rejected"))
+        );
+        let first_pid = std::fs::read_to_string(&starts_marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
+            "initialize error returned before the rejected app-server was reaped"
+        );
+
+        let replacement = backend.server().await.unwrap();
+        assert_eq!(
+            replacement
+                .request("account/rateLimits/read", Value::Null)
+                .await
+                .unwrap()["replacement"],
+            true
+        );
+        assert_eq!(
+            std::fs::read_to_string(&starts_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "a later request did not spawn a replacement app-server"
+        );
+        replacement.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Deliberately stalls cleanup while exercising cancellation.
+    async fn stdout_eof_reaps_cached_server_before_single_flight_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-eof-replacement");
+        let starts_marker = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+        let close_marker = std::path::PathBuf::from(format!("{}.close", stub.display()));
+        let overlap_marker = std::path::PathBuf::from(format!("{}.overlap", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+starts_path = sys.argv[0] + ".starts"
+close_path = sys.argv[0] + ".close"
+overlap_path = sys.argv[0] + ".overlap"
+try:
+    with open(starts_path) as starts:
+        prior_pids = [line.strip() for line in starts if line.strip()]
+except FileNotFoundError:
+    prior_pids = []
+first_process = not prior_pids
+if prior_pids and os.path.exists("/proc/" + prior_pids[0]):
+    with open(overlap_path, "w") as overlap:
+        overlap.write(prior_pids[0])
+        overlap.flush()
+with open(starts_path, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "initialized":
+        continue
+    elif method == "thread/start":
+        result = {"thread": {"id": "thread-1"}}
+    elif method == "turn/start":
+        result = {"turn": {"id": "turn-1"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+    if method == "turn/start" and first_process:
+        while not os.path.exists(close_path):
+            time.sleep(0.005)
+        os.close(1)
+        time.sleep(60)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CodexBackend::new(
+            "codex",
+            Some(stub.to_string_lossy().into_owned()),
+        ));
+        let first = backend.server().await.unwrap();
+        let first_pid = std::fs::read_to_string(&starts_marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let child = first.child.lock().unwrap();
+        let mut turn = bare_turn();
+        turn.worktree = temp.path().to_path_buf();
+        let mut stream = backend.run_turn(turn).await.unwrap();
+        std::fs::write(&close_marker, b"close stdout").unwrap();
+
+        let stream_error = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("turn stream ended without reporting stdout EOF"),
+                }
+            }
+        })
+        .await
+        .expect("turn stream did not observe stdout EOF");
+        assert!(matches!(
+            stream_error,
+            BackendError::Protocol(message) if message.contains("app-server closed")
+        ));
+        assert!(first.is_closed());
+        assert!(
+            std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
+            "test did not hold the stale process alive after stdout EOF"
+        );
+
+        let cleanup_cancel = tokio_util::sync::CancellationToken::new();
+        let cancelled_acquisition = tokio::spawn({
+            let backend = backend.clone();
+            let cleanup_cancel = cleanup_cancel.clone();
+            async move { backend.server_cancellable(&cleanup_cancel).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while backend.server.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement acquisition did not claim the spawn lock");
+        cleanup_cancel.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                loop {
+                    let starts = std::fs::read_to_string(&starts_marker).unwrap();
+                    if starts.lines().count() > 1 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement started while the stale process reap was blocked"
+        );
+        assert!(
+            !cancelled_acquisition.is_finished(),
+            "cancellation bypassed mandatory stale-process cleanup"
+        );
+
+        drop(child);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), cancelled_acquisition)
+                .await
+                .expect("cancelled acquisition waited too long for stale reap")
                 .unwrap(),
             Err(BackendError::Cancelled)
         ));
-        assert!(server.pending.lock().await.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&starts_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "cancellation during stale cleanup spawned a replacement process"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
+            "cancelled replacement acquisition returned before stale reap"
+        );
+        assert!(
+            !overlap_marker.exists(),
+            "cancelled acquisition started a process alongside the stale PID"
+        );
+
+        let first_acquisition = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.server().await }
+        });
+        let second_acquisition = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.server().await }
+        });
+        let replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(3), first_acquisition)
+                .await
+                .expect("first replacement acquisition waited too long for reap")
+                .unwrap()
+                .unwrap();
+        let shared_replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(3), second_acquisition)
+                .await
+                .expect("second replacement acquisition was not single-flight")
+                .unwrap()
+                .unwrap();
+
+        assert!(Arc::ptr_eq(&replacement, &shared_replacement));
+        assert_eq!(
+            std::fs::read_to_string(&starts_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "concurrent callers spawned more than one replacement"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
+            "replacement acquisition returned before the stale PID was reaped"
+        );
+        assert!(
+            !overlap_marker.exists(),
+            "replacement process observed the stale PID still alive"
+        );
+        replacement.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn transmitted_effect_timeout_reaps_and_replaces_the_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-effect-timeout");
+        let starts_marker = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+        let effect_marker = std::path::PathBuf::from(format!("{}.effect", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+starts_path = sys.argv[0] + ".starts"
+effect_path = sys.argv[0] + ".effect"
+try:
+    with open(starts_path) as starts:
+        first_process = len(starts.readlines()) == 0
+except FileNotFoundError:
+    first_process = True
+with open(starts_path, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "thread/start" and first_process:
+        with open(effect_path, "w") as effect:
+            effect.write("transmitted")
+            effect.flush()
+        time.sleep(60)
+        continue
+    elif method == "thread/start":
+        result = {"thread": {"id": "replacement-thread"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let first = backend.server().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = first
+            .request_with_cancel_timeout(
+                "thread/start",
+                json!({}),
+                Some(&cancel),
+                true,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, BackendError::Protocol(message) if message.contains("no response"))
+        );
+        assert!(
+            effect_marker.exists(),
+            "effect request did not reach the first app-server"
+        );
+        assert!(first.is_closed());
+        assert!(first.pending.lock().await.is_empty());
+        assert!(
+            first
+                .child
+                .lock()
+                .unwrap()
+                .try_wait_tree()
+                .unwrap()
+                .is_some(),
+            "effect timeout returned before reaping the stale process tree"
+        );
+        assert!(matches!(
+            first.request("account/rateLimits/read", Value::Null).await,
+            Err(BackendError::Protocol(message)) if message.contains("transport is closed")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&starts_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the stale handle unexpectedly spawned or accepted another request"
+        );
+
+        let replacement = backend.server().await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert_eq!(
+            replacement
+                .request_with_cancel_timeout(
+                    "thread/start",
+                    json!({}),
+                    Some(&tokio_util::sync::CancellationToken::new()),
+                    true,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap()["thread"]["id"],
+            "replacement-thread"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&starts_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "the closed app-server was reused instead of replaced"
+        );
+        replacement.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_only_response_timeout_keeps_the_app_server_reusable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-read-timeout");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys, time
+request_count = 0
+for line in sys.stdin:
+    msg = json.loads(line)
+    request_count += 1
+    if request_count == 1:
+        time.sleep(0.1)
+    result = {"request": request_count}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(matches!(
+            server
+                .request_with_cancel_timeout(
+                    "thread/turns/list",
+                    Value::Null,
+                    Some(&cancel),
+                    false,
+                    std::time::Duration::from_millis(25),
+                )
+                .await,
+            Err(BackendError::Protocol(message)) if message.contains("no response")
+        ));
+        assert!(
+            !server.is_closed(),
+            "read-only response timeout poisoned the shared transport"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+        assert_eq!(
+            server
+                .request_with_cancel_timeout(
+                    "account/rateLimits/read",
+                    Value::Null,
+                    None,
+                    false,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap()["request"],
+            2
+        );
+        assert!(!server.is_closed());
+        server.terminate_transport().await.unwrap();
     }
 
     #[tokio::test]
@@ -6033,6 +7035,54 @@ cat > /dev/null
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminating_app_server_reaps_its_descendant_process_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-process-tree");
+        let descendant_path = temp.path().join("descendant.pid");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! > '{}'\ncat > /dev/null\n",
+                descendant_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = AppServer::spawn(stub.to_str().unwrap()).await.unwrap();
+        let descendant = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&descendant_path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("app-server stub did not publish its descendant pid");
+
+        server.terminate_transport().await.unwrap();
+        assert!(
+            server
+                .child
+                .lock()
+                .unwrap()
+                .try_wait_tree()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{descendant}")).exists(),
+            "app-server descendant survived transport termination"
+        );
+    }
+
     #[tokio::test]
     async fn turn_route_burst_is_lossless_and_does_not_block_stdout_eof_cleanup() {
         let deadline = std::time::Duration::from_secs(1);
@@ -6124,7 +7174,7 @@ cat > /dev/null
         );
         assert_eq!(sandbox, "read-only");
         assert_eq!(policy["type"], "readOnly");
-        assert_eq!(policy["networkAccess"], true);
+        assert_eq!(policy["networkAccess"], false);
 
         let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, false);
         assert_eq!(
@@ -6134,6 +7184,11 @@ cat > /dev/null
         assert_eq!(sandbox, "danger-full-access");
         assert_eq!(policy["type"], "dangerFullAccess");
         assert!(policy["networkAccess"].is_null());
+
+        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::ReadOnly, false);
+        assert_eq!(sandbox, "read-only");
+        assert_eq!(policy["type"], "readOnly");
+        assert_eq!(policy["networkAccess"], false);
     }
 
     #[test]
@@ -6295,6 +7350,575 @@ cat > /dev/null
             luna.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
             Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+    }
+
+    #[test]
+    fn effect_ids_reject_blank_values() {
+        assert!(thread_id_of(&json!({ "thread": { "id": "  " } }), "thread/start").is_err());
+        assert!(turn_id_of(&json!({ "turn": { "id": "\n" } })).is_err());
+        assert!(steered_turn_id_of(&json!({ "turnId": "\t" })).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_hanging_handshake_reaps_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-hanging-initialize");
+        let marker = std::path::PathBuf::from(format!("{}.pid", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        with open(sys.argv[0] + ".pid", "w") as marker:
+            marker.write(str(os.getpid()))
+            marker.flush()
+        time.sleep(60)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CodexBackend::new(
+            "codex",
+            Some(stub.to_string_lossy().into_owned()),
+        ));
+        let startup = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.server().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initialize did not reach app-server");
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        startup.abort();
+        assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropped startup future left app-server alive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_hanging_handshake_reaps_app_server_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-cancelled-initialize");
+        let marker = std::path::PathBuf::from(format!("{}.pid", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    if json.loads(line).get("method") == "initialize":
+        with open(sys.argv[0] + ".pid", "w") as marker:
+            marker.write(str(os.getpid()))
+            marker.flush()
+        time.sleep(60)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CodexBackend::new(
+            "codex",
+            Some(stub.to_string_lossy().into_owned()),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let startup = tokio::spawn({
+            let backend = backend.clone();
+            let cancel = cancel.clone();
+            async move { backend.server_cancellable(&cancel).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initialize did not reach app-server");
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), startup)
+                .await
+                .expect("startup cancellation did not acknowledge cleanup")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "startup returned cancellation before reaping app-server"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn malformed_steer_acknowledgements_reap_and_replace_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, steer_result) in [
+            ("missing", json!({})),
+            ("wrong", json!({ "turnId": "other-turn" })),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let stub = temp.path().join(format!("codex-steer-{name}"));
+            let starts = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+            let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+starts_path = sys.argv[0] + ".starts"
+try:
+    with open(starts_path) as starts:
+        first = len(starts.readlines()) == 0
+except FileNotFoundError:
+    first = True
+with open(starts_path, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        result = {}
+    elif method == "turn/steer" and first:
+        result = __STEER_RESULT__
+    elif method == "account/rateLimits/read":
+        result = {"replacement": True}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#
+            .replace("__STEER_RESULT__", &steer_result.to_string());
+            std::fs::write(&stub, script).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+            let first = backend.server().await.unwrap();
+            first
+                .active_turns
+                .lock()
+                .await
+                .insert("thread-1".into(), "turn-1".into());
+            assert!(matches!(
+                first
+                    .steer_turn(
+                        "thread-1",
+                        vec![json!({ "type": "text", "text": "hi" })],
+                        &Default::default()
+                    )
+                    .await,
+                Err(BackendError::Protocol(_))
+            ));
+            assert!(first.is_closed());
+            assert!(
+                first
+                    .child
+                    .lock()
+                    .unwrap()
+                    .try_wait_tree()
+                    .unwrap()
+                    .is_some()
+            );
+
+            let replacement = backend.server().await.unwrap();
+            assert_eq!(
+                replacement
+                    .request("account/rateLimits/read", Value::Null)
+                    .await
+                    .unwrap()["replacement"],
+                true
+            );
+            assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 2);
+            replacement.terminate_transport().await.unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn malformed_thread_successes_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, session, result) in [
+            ("fresh", None, json!({ "thread": {} })),
+            (
+                "resume",
+                Some("persisted-thread".to_string()),
+                json!({ "thread": { "id": "wrong-thread" } }),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let stub = temp.path().join(format!("codex-malformed-{name}"));
+            let pid_marker = std::path::PathBuf::from(format!("{}.pid", stub.display()));
+            let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+with open(sys.argv[0] + ".pid", "w") as marker:
+    marker.write(str(os.getpid()))
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        result = {}
+    elif method in ("thread/start", "thread/resume"):
+        result = __THREAD_RESULT__
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+    time.sleep(0.01)
+"#
+            .replace("__THREAD_RESULT__", &result.to_string());
+            std::fs::write(&stub, script).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+            let mut turn = bare_turn();
+            turn.worktree = temp.path().to_path_buf();
+            turn.session = session;
+            assert!(matches!(
+                backend.run_turn(turn).await,
+                Err(BackendError::Protocol(_))
+            ));
+            let pid = std::fs::read_to_string(pid_marker)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_thread_is_reported_before_post_response_cancellation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-fresh-cancel");
+        let marker = std::path::PathBuf::from(format!("{}.started", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        result = {}
+    elif method == "thread/start":
+        result = {"thread": {"id": "fresh-thread"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+    if method == "thread/start":
+        open(sys.argv[0] + ".started", "w").close()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CodexBackend::new(
+            "codex",
+            Some(stub.to_string_lossy().into_owned()),
+        ));
+        let server = backend.server().await.unwrap();
+        let lifecycle = server.lock_turn_lifecycle("fresh-thread").await;
+        let mut turn = bare_turn();
+        turn.worktree = temp.path().to_path_buf();
+        let cancel = turn.cancel.clone();
+        let running = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run_turn(turn).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("thread/start did not complete");
+        cancel.cancel();
+        let mut events = running.await.unwrap().unwrap();
+        drop(lifecycle);
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(BackendEvent::SessionStarted { session_id })) if session_id == "fresh-thread"
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Err(BackendError::Cancelled))
+        ));
+        server.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_thread_is_reported_before_interrupt_setup_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-fresh-interrupt-error");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        response = {"jsonrpc": "2.0", "id": mid, "result": {}}
+    elif method == "thread/start":
+        response = {"jsonrpc": "2.0", "id": mid, "result": {"thread": {"id": "fresh-thread"}}}
+    elif method == "turn/interrupt":
+        response = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "interrupt rejected"}}
+    else:
+        response = {"jsonrpc": "2.0", "id": mid, "result": {}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let server = backend.server().await.unwrap();
+        server
+            .active_turns
+            .lock()
+            .await
+            .insert("fresh-thread".into(), "stale-turn".into());
+        let mut turn = bare_turn();
+        turn.worktree = temp.path().to_path_buf();
+        let mut events = backend.run_turn(turn).await.unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(BackendEvent::SessionStarted { session_id })) if session_id == "fresh-thread"
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Err(BackendError::Protocol(error))) if error.contains("interrupt rejected")
+        ));
+        server.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_resume_reacquires_replacement_before_starting_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-resume-replacement");
+        let starts = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+starts_path = sys.argv[0] + ".starts"
+try:
+    with open(starts_path) as starts:
+        first = len(starts.readlines()) == 0
+except FileNotFoundError:
+    first = True
+with open(starts_path, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "thread/resume" and first:
+        os._exit(0)
+    if method == "initialize":
+        result = {}
+    elif method == "thread/start":
+        result = {"thread": {"id": "replacement-thread"}}
+    elif method == "turn/start":
+        result = {"turn": {"id": "replacement-turn"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+    if method == "turn/start":
+        completed = {
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": "replacement-thread",
+                "turn": {"id": "replacement-turn", "status": "completed"},
+            },
+        }
+        sys.stdout.write(json.dumps(completed) + "\n")
+        sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let mut turn = bare_turn();
+        turn.worktree = temp.path().to_path_buf();
+        turn.session = Some("persisted-thread".into());
+        let mut events =
+            tokio::time::timeout(std::time::Duration::from_secs(3), backend.run_turn(turn))
+                .await
+                .expect("resume fallback stalled")
+                .unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(BackendEvent::SessionStarted { session_id })) if session_id == "replacement-thread"
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(BackendEvent::Completed { .. })) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => panic!("replacement turn failed: {error}"),
+                    None => panic!("replacement turn ended without completion"),
+                }
+            }
+        })
+        .await
+        .expect("replacement turn did not complete");
+        assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 2);
+        if let Some(server) = backend.server.lock().await.as_ref() {
+            server.terminate_transport().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_poison_keeps_closed_cached_server_and_denies_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-cleanup-poison");
+        let starts = std::path::PathBuf::from(format!("{}.starts", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+with open(sys.argv[0] + ".starts", "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialized":
+        continue
+    response = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let server = backend.server().await.unwrap();
+        server.closed.store(true, Ordering::Relaxed);
+        let child = server.child.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = child.lock().unwrap();
+            panic!("inject app-server child-lock poison");
+        });
+
+        let error = match backend.server().await {
+            Ok(_) => panic!("cleanup failure must deny replacement startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("poisoned"), "{error}");
+        assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1);
+        let retained = backend.server.lock().await.as_ref().cloned().unwrap();
+        assert!(Arc::ptr_eq(&server, &retained));
+
+        server.child.clear_poison();
+        server.terminate_transport().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_during_partial_effect_write_reaps_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-partial-effect-write");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = Arc::new(AppServer::spawn(stub.to_str().unwrap()).await.unwrap());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let request = tokio::spawn({
+            let server = server.clone();
+            let cancel = cancel.clone();
+            async move {
+                server
+                    .request_effect_cancellable(
+                        "thread/start",
+                        json!({ "padding": "x".repeat(4 * 1024 * 1024) }),
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if server.stdin.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("effect request never entered its transport write");
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), request)
+                .await
+                .expect("partial-write cancellation did not acknowledge cleanup")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        assert!(server.is_closed());
+        assert!(
+            server
+                .child
+                .lock()
+                .unwrap()
+                .try_wait_tree()
+                .unwrap()
+                .is_some()
         );
     }
 }

@@ -37,6 +37,24 @@ const viewSnapshot = (
 });
 
 describe("ThreadIngress", () => {
+  it("opens the conversation when auxiliary thread statuses are unavailable", async () => {
+    const store = new AppStore();
+    const start = vi.fn();
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadStatuses: vi.fn(async () => Promise.reject(new Error("unsupported"))),
+      threadView: vi.fn(async () => viewSnapshot()),
+      threadEvents: vi.fn(async () => ({
+        start,
+        close: vi.fn(),
+      }) as unknown as CursorEventStream<ProtocolIngressEvent>),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+    await expect(ingress.openSession("se_1", "th_1")).resolves.toBe("th_1");
+    expect(store.thread("th_1")).toBeDefined();
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("seeds the requested thread from its folded snapshot before folding live events", async () => {
     const store = new AppStore();
     let receivedOptions:

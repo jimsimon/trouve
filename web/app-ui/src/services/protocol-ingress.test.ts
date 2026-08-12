@@ -578,7 +578,7 @@ describe("ProtocolIngress", () => {
     const first = ingress.reconcileSessionActivity();
     const coalesced = ingress.reconcileSessionActivity();
     expect(coalesced).toBe(first);
-    await first;
+    await expect(first).resolves.toBe(true);
 
     expect(readSignal(store.sessions)[0]).toMatchObject({
       active: false,
@@ -590,6 +590,7 @@ describe("ProtocolIngress", () => {
     expect(sessionSummaries).toHaveBeenCalledTimes(2);
     expect(onSessionSummaries).toHaveBeenLastCalledWith([idleSummary], 11);
     ingress.stop();
+    await expect(ingress.reconcileSessionActivity()).resolves.toBe(false);
   });
 
   it("refreshes durable child threads and discards an in-flight stale list", async () => {

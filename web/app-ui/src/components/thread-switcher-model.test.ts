@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  durableThreadTabCapacity,
   threadSwitcherRows,
   threadWorkingSet,
   type ThreadSwitcherEntry,
@@ -60,6 +61,14 @@ describe("threadSwitcherRows", () => {
     );
   });
 
+  it("handles a deeply nested tree without recursive traversal", () => {
+    const entries = Array.from({ length: 10_000 }, (_, index) =>
+      entry(String(index), index === 0 ? undefined : String(index - 1)));
+    const rows = threadSwitcherRows(entries, "9999");
+    expect(rows).toHaveLength(10_000);
+    expect(rows.at(-1)).toMatchObject({ depth: 9_999 });
+  });
+
   it("filters by status while retaining matching descendants' ancestors", () => {
     const rows = threadSwitcherRows([
       entry("parent"),
@@ -78,6 +87,10 @@ describe("threadSwitcherRows", () => {
 });
 
 describe("threadWorkingSet", () => {
+  it("reserves the only tab slot for provisional thread setup", () => {
+    expect(durableThreadTabCapacity(1, true)).toBe(0);
+    expect(threadWorkingSet(["existing"], "existing", [], [], 0)).toEqual([]);
+  });
   it("always includes the current thread and fills from recent selections", () => {
     expect(threadWorkingSet(
       ["one", "two", "three", "four"],

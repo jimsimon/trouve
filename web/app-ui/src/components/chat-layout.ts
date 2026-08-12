@@ -1,5 +1,9 @@
 import type { ThreadChatItem } from "../state/thread-view-model.js";
-import { isSpawnOutputToolCall, isTodoToolCall } from "./tool-presentation.js";
+import {
+  effectiveToolCall,
+  isFirstPartyToolCall,
+  isSpawnOutputToolCall,
+} from "./tool-presentation.js";
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
@@ -16,7 +20,9 @@ export type AgentActivityItem = Extract<
  * same durable top-level boundary used by the current protocol lifecycle. */
 export const isContextCompactionTool = (item: AgentActivityItem): boolean => {
   if (item.kind !== "tool") return false;
-  const normalized = (item.tool.split("__").at(-1) ?? item.tool)
+  const effective = effectiveToolCall(item.tool, item.args);
+  if (!isFirstPartyToolCall(item.tool, item.args)) return false;
+  const normalized = (effective.tool.split("__").at(-1) ?? effective.tool)
     .replaceAll(/[^a-z0-9]/giu, "")
     .toLowerCase();
   return normalized === "contextcompaction" || normalized === "compactcontext";
@@ -66,33 +72,35 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
 
   const flush = (): void => {
     if (current === undefined) return;
-    const turn = current.turn ?? lastExplicitTurn ?? 0;
-    const id = turn === 0 ? `turn:0:${current.firstId}` : `turn:${turn}`;
+    const active = current;
+    const turn = active.turn ?? lastExplicitTurn ?? 0;
+    const id = turn === 0 ? `turn:0:${active.firstId}` : `turn:${turn}`;
     const linkedSpawnCalls = new Set(
-      current.items.flatMap((item) =>
+      active.items.flatMap((item) =>
         item.kind === "subagent" && item.callId !== undefined ? [item.callId] : []),
     );
-    const hasTodoLifecycle = current.items.some((item) => item.kind === "todo");
-    const visibleItems = current.items.filter((item) =>
+    // TODO lifecycle rows do not carry the tool call id that produced them.
+    // Parallel calls can interleave even when their folded rows are adjacent,
+    // so retain every low-level TODO tool card as unambiguous audit evidence.
+    const visibleItems = active.items.filter((item) =>
       item.kind !== "tool"
       || (
         !linkedSpawnCalls.has(item.callId)
-        && !isSpawnOutputToolCall(item.tool, item.args)
-        && (!hasTodoLifecycle || !isTodoToolCall(item.tool, item.args))
+        && !(item.status === "ok" && isSpawnOutputToolCall(item.tool, item.args))
       ));
     const unit: ChatRenderUnit = Object.freeze({
       id,
       kind: "turn",
       turn,
       divider: units.length > 0,
-      prompt: current.prompt,
+      prompt: active.prompt,
       items: Object.freeze(visibleItems),
-      status: current.status,
+      status: active.status,
     });
     units.push(unit);
-    if (current.prompt !== undefined) unitIdForItem.set(current.prompt.id, id);
+    if (active.prompt !== undefined) unitIdForItem.set(active.prompt.id, id);
     for (const item of visibleItems) unitIdForItem.set(item.id, id);
-    if (current.status !== undefined) unitIdForItem.set(current.status.id, id);
+    if (active.status !== undefined) unitIdForItem.set(active.status.id, id);
     current = undefined;
   };
 
@@ -139,17 +147,6 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
   flush();
 
   return Object.freeze({ units: Object.freeze(units), unitIdForItem });
-};
-
-const nestedMcpTool = (item: Extract<AgentChatItem, { readonly kind: "tool" }>) => {
-  if (item.tool !== "mcpToolCall" || item.args === null || typeof item.args !== "object") {
-    return { tool: item.tool, args: item.args };
-  }
-  const wrapped = item.args as Record<string, unknown>;
-  return {
-    tool: typeof wrapped["tool"] === "string" ? wrapped["tool"] : item.tool,
-    args: wrapped["arguments"] ?? item.args,
-  };
 };
 
 const argumentPaths = (args: unknown, tool = ""): string[] => {
@@ -217,26 +214,27 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
       continue;
     }
     if (item.kind !== "tool") continue;
-    const effective = nestedMcpTool(item);
+    const effective = effectiveToolCall(item.tool, item.args);
     const base = effective.tool.split("__").at(-1) ?? effective.tool;
+    const firstParty = isFirstPartyToolCall(item.tool, item.args);
     const paths = argumentPaths(effective.args, effective.tool);
     const path = paths[0];
-    if ([
+    if (firstParty && [
       "edit", "Edit", "MultiEdit", "NotebookEdit", "Write", "write",
       "edit_file", "hashline_edit", "write_file", "create_file", "apply_patch", "apply_patch_fallback", "delete", "delete_file",
     ].includes(base)) {
       if (paths.length === 0) editsWithoutPath += 1;
       else for (const editedPath of paths) edited.add(editedPath);
-    } else if (["read", "Read", "read_file"].includes(base)) {
+    } else if (firstParty && ["read", "Read", "read_file"].includes(base)) {
       if (path === undefined) readsWithoutPath += 1;
       else read.add(path);
-    } else if (["search", "find_related"].includes(base)) {
+    } else if (firstParty && ["search", "find_related"].includes(base)) {
       codeSearches += 1;
-    } else if (base === "search_transcript") {
+    } else if (firstParty && base === "search_transcript") {
       transcriptSearches += 1;
-    } else if (["shell", "bash", "Bash", "execute", "commandExecution"].includes(base)) {
+    } else if (firstParty && ["shell", "bash", "Bash", "execute", "commandExecution"].includes(base)) {
       commands += 1;
-    } else if (base === "fileChange") {
+    } else if (firstParty && base === "fileChange") {
       let found = false;
       if (effective.args !== null && typeof effective.args === "object") {
         const changes = (effective.args as Record<string, unknown>)["changes"];

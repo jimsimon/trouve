@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use trouve_agents::process_env::{ProcessTreeChild, spawn_process_tree};
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -19,7 +20,6 @@ const MAX_JOB_BYTES: usize = 1024 * 1024;
 /// Hard lifetime cap for a background job; runaway processes die with it.
 const MAX_JOB_SECS: u64 = 3600;
 const MAX_JOBS: usize = 16;
-const CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct CapturedOutput {
     bytes: Vec<u8>,
@@ -38,8 +38,7 @@ impl CapturedOutput {
 /// One background job: the child (for kill/wait), its captured output, and
 /// the model's read cursor.
 struct Job {
-    child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
-    pid: Option<u32>,
+    child: Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     output: Arc<Mutex<JobOutput>>,
     /// Worktree the job was started from; other sessions cannot touch it.
     worktree: std::path::PathBuf,
@@ -64,46 +63,24 @@ pub struct JobRegistry {
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(unix)]
-fn isolate_process_group(command: &mut tokio::process::Command) {
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn isolate_process_group(_command: &mut tokio::process::Command) {}
-
-async fn terminate_process(
-    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
-    pid: Option<u32>,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        // The shell is the process-group leader. Kill the whole group so
-        // backgrounded grandchildren cannot outlive a timeout/session.
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        return Err(error);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-    child.lock().await.start_kill()
-}
-
 async fn terminate_and_reap(
-    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
-    pid: Option<u32>,
-) {
-    let _ = terminate_process(child, pid).await;
-    let _ = tokio::time::timeout(CANCEL_REAP_TIMEOUT, async {
-        let _ = child.lock().await.wait().await;
-    })
-    .await;
+    child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+) -> std::io::Result<std::process::ExitStatus> {
+    child.lock().await.terminate_and_reap().await
+}
+
+async fn terminate_background_job(
+    child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+    output: &Arc<Mutex<JobOutput>>,
+) -> std::io::Result<()> {
+    output.lock().unwrap().killed = true;
+    let status = terminate_and_reap(child).await?;
+    output
+        .lock()
+        .unwrap()
+        .exit_code
+        .get_or_insert(status.code().unwrap_or(-1));
+    Ok(())
 }
 
 impl JobRegistry {
@@ -136,14 +113,11 @@ impl JobRegistry {
             jobs.values()
                 .filter(|job| job.worktree == worktree)
                 .filter(|job| job.output.lock().unwrap().exit_code.is_none())
-                .map(|job| {
-                    job.output.lock().unwrap().killed = true;
-                    (job.child.clone(), job.pid)
-                })
+                .map(|job| (job.child.clone(), job.output.clone()))
                 .collect()
         };
-        for (child, pid) in jobs {
-            let _ = terminate_process(&child, pid).await;
+        for (child, output) in jobs {
+            let _ = terminate_background_job(&child, &output).await;
         }
     }
 }
@@ -259,14 +233,12 @@ impl Tool for Shell {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        isolate_process_group(&mut command_process);
-        let mut child = match command_process.spawn() {
+        let mut child = match spawn_process_tree(&mut command_process) {
             Ok(child) => child,
             Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
         };
-        let pid = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
         let child = Arc::new(tokio::sync::Mutex::new(child));
         // Drain both pipes while the process runs; waiting first can
         // deadlock once a pipe fills its kernel buffer.
@@ -274,19 +246,19 @@ impl Tool for Shell {
         let stderr_task = tokio::spawn(read_capped(stderr));
         let wait = {
             let child = child.clone();
-            async move { child.lock().await.wait().await }
+            async move { child.lock().await.wait_and_cleanup().await }
         };
         tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
-                terminate_and_reap(&child, pid).await;
+                let _ = terminate_and_reap(&child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 ToolResult::error("command cancelled")
             }
             outcome = tokio::time::timeout(timeout, wait) => match outcome {
             Err(_) => {
-                terminate_and_reap(&child, pid).await;
+                let _ = terminate_and_reap(&child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 ToolResult::error(format!("command timed out after {}s", timeout.as_secs()))
@@ -325,6 +297,16 @@ impl Tool for Shell {
 
 impl Shell {
     async fn spawn_background(&self, ctx: &ToolCtx, command: &str) -> ToolResult {
+        self.spawn_background_with_lifetime(ctx, command, Duration::from_secs(MAX_JOB_SECS))
+            .await
+    }
+
+    async fn spawn_background_with_lifetime(
+        &self,
+        ctx: &ToolCtx,
+        command: &str,
+        lifetime: Duration,
+    ) -> ToolResult {
         if ctx.cancel.is_cancelled() {
             return ToolResult::error("command cancelled");
         }
@@ -337,48 +319,64 @@ impl Shell {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        isolate_process_group(&mut command_process);
-        let mut child = match command_process.spawn() {
+        let mut child = match spawn_process_tree(&mut command_process) {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
         };
         let pid = child.id();
         let output = Arc::new(Mutex::new(JobOutput::default()));
-        pump(child.stdout.take(), output.clone());
-        pump(child.stderr.take(), output.clone());
+        pump(child.take_stdout(), output.clone());
+        pump(child.take_stderr(), output.clone());
         let child = Arc::new(tokio::sync::Mutex::new(child));
+        let mutation_lease = ctx
+            .background_mutation_lease
+            .as_ref()
+            .and_then(|lease| lease.take());
 
-        // Waiter: record the exit code when the process ends (also fired by
-        // shell_kill and the lifetime cap below).
+        // Waiter: the job is complete only when the leader and every
+        // descendant have exited. In particular, a shell that daemonizes a
+        // child does not release the session mutation lane when the shell
+        // leader exits.
         {
             let child = child.clone();
             let output = output.clone();
             tokio::spawn(async move {
+                let _mutation_lease = mutation_lease;
                 loop {
-                    let status = child.lock().await.try_wait();
+                    let status = child.lock().await.try_wait_tree();
                     match status {
                         Ok(Some(status)) => {
-                            output.lock().unwrap().exit_code = Some(status.code().unwrap_or(-1));
+                            output
+                                .lock()
+                                .unwrap()
+                                .exit_code
+                                .get_or_insert(status.code().unwrap_or(-1));
                             break;
                         }
                         Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
                         Err(_) => {
-                            output.lock().unwrap().exit_code = Some(-1);
-                            break;
+                            // A liveness-query failure must not release the
+                            // mutation lane while an untracked descendant may
+                            // still be running.
+                            if terminate_background_job(&child, &output).await.is_ok() {
+                                output.lock().unwrap().exit_code.get_or_insert(-1);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
             });
         }
-        // Lifetime cap: kill anything still running after MAX_JOB_SECS.
+        // Lifetime cap: terminate and reap the complete owned tree, including
+        // descendants whose original shell leader has already exited.
         {
             let child = child.clone();
             let output = output.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(MAX_JOB_SECS)).await;
+                tokio::time::sleep(lifetime).await;
                 if output.lock().unwrap().exit_code.is_none() {
-                    output.lock().unwrap().killed = true;
-                    let _ = terminate_process(&child, pid).await;
+                    let _ = terminate_background_job(&child, &output).await;
                 }
             });
         }
@@ -389,8 +387,9 @@ impl Shell {
             if let Err(e) = self.jobs.make_room(&mut jobs) {
                 // Over the cap: don't leak the process we just started.
                 let child = child.clone();
+                let output = output.clone();
                 tokio::spawn(async move {
-                    let _ = terminate_process(&child, pid).await;
+                    let _ = terminate_background_job(&child, &output).await;
                 });
                 return ToolResult::error(e);
             }
@@ -398,7 +397,6 @@ impl Shell {
                 id.clone(),
                 Job {
                     child,
-                    pid,
                     output,
                     worktree: ctx.worktree.clone(),
                     command: command.to_string(),
@@ -553,7 +551,7 @@ impl Tool for ShellKill {
         let Some(id) = args.get("job_id").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: job_id");
         };
-        let (child, pid, output, command) = {
+        let (child, output, command) = {
             let jobs = self.jobs.jobs.lock().unwrap();
             let Some(job) = jobs.get(id) else {
                 return ToolResult::error(format!("unknown job: {id}"));
@@ -561,12 +559,7 @@ impl Tool for ShellKill {
             if job.worktree != ctx.worktree {
                 return ToolResult::error(format!("unknown job: {id}"));
             }
-            (
-                job.child.clone(),
-                job.pid,
-                job.output.clone(),
-                job.command.clone(),
-            )
+            (job.child.clone(), job.output.clone(), job.command.clone())
         };
         if output.lock().unwrap().exit_code.is_some() {
             return ToolResult::ok(json!({
@@ -575,8 +568,7 @@ impl Tool for ShellKill {
                 "already_finished": true,
             }));
         }
-        output.lock().unwrap().killed = true;
-        if let Err(e) = terminate_process(&child, pid).await {
+        if let Err(e) = terminate_background_job(&child, &output).await {
             return ToolResult::error(format!("cannot kill {id}: {e}"));
         }
         ToolResult::ok(json!({
@@ -814,6 +806,162 @@ mod tests {
             }
         }
         panic!("job never reported finished after kill");
+    }
+
+    #[tokio::test]
+    async fn background_job_holds_transferred_mutation_lease_until_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let guard = lane.clone().write_owned().await;
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
+                guard,
+            ))),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let launched = shell
+            .run(
+                &ctx,
+                &json!({"command": "sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let id = launched.result["job_id"].as_str().unwrap().to_string();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
+                .await
+                .is_err(),
+            "a live background mutation released its session lane"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            output.run(&ctx, &json!({"job_id": id})),
+        )
+        .await
+        .expect("shell_output must not wait on the background mutation lane");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            kill.run(&ctx, &json!({"job_id": id})),
+        )
+        .await
+        .expect("shell_kill must not wait on the background mutation lane");
+
+        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
+            .await
+            .expect("the waiter did not release the mutation lane after reaping");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path) {
+                    break pid.trim().parse::<u32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background shell should publish its descendant pid")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_exit(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("owned process did not exit");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shell_kill_owns_daemonized_descendant_after_leader_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let guard = lane.clone().write_owned().await;
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
+                guard,
+            ))),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let launched = shell
+            .run(
+                &ctx,
+                &json!({
+                    "command": "nohup sleep 60 </dev/null >/dev/null 2>&1 & echo $! > child.pid",
+                    "run_in_background": true
+                }),
+            )
+            .await;
+        let id = launched.result["job_id"].as_str().unwrap().to_string();
+        let leader_pid = launched.result["pid"].as_u64().unwrap() as u32;
+        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        wait_for_process_exit(leader_pid).await;
+
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
+                .await
+                .is_err(),
+            "leader exit released the descendant's mutation lease"
+        );
+
+        let killed = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(killed.status, trouve_protocol::ToolStatus::Ok);
+        wait_for_process_exit(child_pid).await;
+        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
+            .await
+            .expect("shell_kill did not release the daemonized descendant's lease");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn lifetime_cap_owns_daemonized_descendant_after_leader_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let guard = lane.clone().write_owned().await;
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
+                guard,
+            ))),
+            ..Default::default()
+        };
+        let (shell, output, _) = tools();
+        let launched = shell
+            .spawn_background_with_lifetime(
+                &ctx,
+                "nohup sleep 60 </dev/null >/dev/null 2>&1 & echo $! > child.pid",
+                Duration::from_secs(1),
+            )
+            .await;
+        let id = launched.result["job_id"].as_str().unwrap().to_string();
+        let leader_pid = launched.result["pid"].as_u64().unwrap() as u32;
+        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        wait_for_process_exit(leader_pid).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
+                .await
+                .is_err(),
+            "leader exit released the descendant before the lifetime cap"
+        );
+
+        wait_for_process_exit(child_pid).await;
+        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
+            .await
+            .expect("lifetime cap did not release the daemonized descendant's lease");
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], false);
+        assert_eq!(state.result["killed"], true);
     }
 
     #[cfg(target_os = "linux")]

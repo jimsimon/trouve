@@ -415,33 +415,17 @@ export class ProtocolClientError extends Error {
   }
 }
 
-// Protocol 2.9 is the oldest event/API surface supported by the web client.
-// The 3.0 break changed code-review routing semantics rather than the client
-// transport, so this client deliberately supports both generations. Keep this
-// range independent from the current server protocol so a Vite refresh can
-// continue to use an already-running desktop server while optional events
-// roll out.
-export const MINIMUM_PROTOCOL_VERSION = "2.9";
-const MAXIMUM_PROTOCOL_MAJOR = 3;
+// Generated protocol types and validators contain closed discriminated
+// unions. A newer schema can therefore add a value this bundle cannot decode
+// even when the server labels the change additive. Require the exact schema
+// version this client was generated and tested against.
+export const SUPPORTED_PROTOCOL_VERSION = "4.0";
 
 export const assertProtocolCompatibility = (version: string): void => {
-  const match = /^(\d+)\.(\d+)$/.exec(version);
-  const minimum = /^(\d+)\.(\d+)$/.exec(MINIMUM_PROTOCOL_VERSION)!;
-  const major = Number(match?.[1]);
-  const minor = Number(match?.[2]);
-  const minimumMajor = Number(minimum[1]);
-  const minimumMinor = Number(minimum[2]);
-  const olderThanMinimum =
-    major < minimumMajor || (major === minimumMajor && minor < minimumMinor);
-  if (
-    !Number.isSafeInteger(major) ||
-    !Number.isSafeInteger(minor) ||
-    olderThanMinimum ||
-    major > MAXIMUM_PROTOCOL_MAJOR
-  ) {
+  if (version !== SUPPORTED_PROTOCOL_VERSION) {
     throw new ProtocolClientError(
       "incompatible-protocol",
-      `server protocol ${version || "unknown"} is incompatible; expected ${MINIMUM_PROTOCOL_VERSION} or newer through ${MAXIMUM_PROTOCOL_MAJOR}.x`,
+      `server protocol ${version || "unknown"} is incompatible; expected exactly ${SUPPORTED_PROTOCOL_VERSION}`,
     );
   }
 };

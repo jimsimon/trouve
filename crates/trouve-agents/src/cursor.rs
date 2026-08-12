@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
@@ -151,10 +151,55 @@ impl CursorBackend {
     /// is evicted while over [`SERVER_CAP`]; busy children may overflow the
     /// cap rather than being killed mid-turn.
     async fn server_for(&self, worktree: &Path) -> Result<Arc<AcpServer>, BackendError> {
+        self.server_for_with_cancel(worktree, None).await
+    }
+
+    async fn server_for_cancellable(
+        &self,
+        worktree: &Path,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<AcpServer>, BackendError> {
+        self.server_for_with_cancel(worktree, Some(cancel)).await
+    }
+
+    async fn server_for_with_cancel(
+        &self,
+        worktree: &Path,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<AcpServer>, BackendError> {
         self.start_reaper();
-        let mut servers = self.pool.servers.lock().await;
-        servers.retain(|_, s| !s.is_closed());
+        let mut servers = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                servers = self.pool.servers.lock() => servers,
+            },
+            None => self.pool.servers.lock().await,
+        };
+        let closed = servers
+            .iter()
+            .filter_map(|(path, server)| server.is_closed().then_some(path.clone()))
+            .collect::<Vec<_>>();
+        for path in closed {
+            if let Some(server) = servers.get(&path).cloned() {
+                match server.terminate().await {
+                    Ok(()) => {
+                        servers.remove(&path);
+                    }
+                    Err(error) if path == worktree => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "cursor: retaining unrelated closed server after unacknowledged cleanup: {error}"
+                        );
+                    }
+                }
+            }
+        }
         if let Some(s) = servers.get(worktree) {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(BackendError::Cancelled);
+            }
             s.touch();
             return Ok(s.clone());
         }
@@ -172,10 +217,41 @@ impl CursorBackend {
                 }
             }
             let Some((path, _)) = lru else { break }; // all busy: allow overflow
-            servers.remove(&path); // last Arc drop kills the child
+            if let Some(server) = servers.get(&path).cloned() {
+                match server.terminate().await {
+                    Ok(()) => {
+                        servers.remove(&path);
+                    }
+                    Err(error) => {
+                        // This process remains quarantined under its own key.
+                        // Let the requested key overflow the soft pool cap
+                        // instead of turning an unrelated cleanup fault into
+                        // a process-wide availability failure.
+                        tracing::warn!(
+                            path = %path.display(),
+                            "cursor: retaining LRU server after unacknowledged cleanup: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
         }
         let s = Arc::new(AcpServer::spawn(&self.command, self.api_key.as_deref(), worktree).await?);
-        s.handshake().await?;
+        let handshake = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                result = s.handshake() => result,
+            },
+            None => s.handshake().await,
+        };
+        if let Err(error) = handshake {
+            if let Err(cleanup_error) = s.terminate().await {
+                servers.insert(worktree.to_path_buf(), s);
+                return Err(cleanup_error);
+            }
+            return Err(error);
+        }
         servers.insert(worktree.to_path_buf(), s.clone());
         Ok(s)
     }
@@ -203,12 +279,31 @@ impl CursorBackend {
                 tokio::time::sleep(REAP_INTERVAL).await;
                 let Some(pool) = pool.upgrade() else { break };
                 let mut servers = pool.servers.lock().await;
-                servers.retain(|_, s| {
-                    !(s.is_closed()
-                        || Arc::strong_count(s) == 1
-                            && s.is_idle()
-                            && s.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT)
-                });
+                let paths = servers
+                    .iter()
+                    .filter_map(|(path, server)| {
+                        (server.is_closed()
+                            || Arc::strong_count(server) == 1
+                                && server.is_idle()
+                                && server.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT)
+                            .then_some(path.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    let Some(server) = servers.get(&path).cloned() else {
+                        continue;
+                    };
+                    match server.terminate().await {
+                        Ok(()) => {
+                            servers.remove(&path);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "cursor: retaining pooled server after unacknowledged cleanup: {error}"
+                            );
+                        }
+                    }
+                }
             }
         });
     }
@@ -313,11 +408,7 @@ impl AgentBackend for CursorBackend {
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         let cancel = turn.cancel.clone();
-        let server = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            server = self.server_for(&turn.worktree) => server?,
-        };
+        let server = self.server_for_cancellable(&turn.worktree, &cancel).await?;
 
         // Resume the ACP session for this thread, or start a fresh one. A
         // failed load (e.g. server restarted and lost it) degrades to fresh.
@@ -337,6 +428,7 @@ impl AgentBackend for CursorBackend {
                 .await
             {
                 Ok(()) => sid.clone(),
+                Err(e) if server.is_closed() => return Err(e),
                 Err(e) => {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
@@ -368,7 +460,13 @@ impl AgentBackend for CursorBackend {
         let (route, prompt_rx) = {
             let _config = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                _ = cancel.cancelled() => {
+                    return session_setup_failure(
+                        fresh_session,
+                        &session_id,
+                        BackendError::Cancelled,
+                    );
+                }
                 config = server.config_lock.lock() => config,
             };
 
@@ -384,14 +482,17 @@ impl AgentBackend for CursorBackend {
                 .set_config_option(&session_id, "mode", mode, &cancel)
                 .await
             {
-                if matches!(e, BackendError::Cancelled) {
-                    return Err(e);
+                if matches!(e, BackendError::Cancelled) || server.is_closed() {
+                    return session_setup_failure(fresh_session, &session_id, e);
                 }
                 tracing::warn!("cursor set mode {mode} failed: {e}");
             }
 
-            if !turn.model.is_empty() && !matches!(turn.model.as_str(), "auto" | "default") {
-                apply_model_config(&server, &session_id, &turn, &cancel).await?;
+            if !turn.model.is_empty()
+                && !matches!(turn.model.as_str(), "auto" | "default")
+                && let Err(error) = apply_model_config(&server, &session_id, &turn, &cancel).await
+            {
+                return session_setup_failure(fresh_session, &session_id, error);
             }
 
             // ACP image content blocks carry base64 data inline.
@@ -423,7 +524,7 @@ impl AgentBackend for CursorBackend {
                 Ok(prompt_rx) => prompt_rx,
                 Err(error) => {
                     server.unsubscribe(&session_id).await;
-                    return Err(error);
+                    return session_setup_failure(fresh_session, &session_id, error);
                 }
             };
             (route, prompt_rx)
@@ -651,11 +752,12 @@ async fn apply_model_config(
     let result = server
         .set_config_option(session_id, "model", base, cancel)
         .await
-        .map_err(|e| {
-            BackendError::Protocol(format!(
-                "cursor-agent rejected model {base}: {e} \
+        .map_err(|error| match error {
+            BackendError::Cancelled => BackendError::Cancelled,
+            error => BackendError::Protocol(format!(
+                "cursor-agent rejected model {base}: {error} \
                  (if this persists, update the CLI in Settings → Vendor CLIs)"
-            ))
+            )),
         })?;
     // Old cursor-agent builds (< 2026.07) accept the call but silently keep
     // the previous model; the response snapshot betrays them.
@@ -793,40 +895,39 @@ fn turn_stream(
                 }
             } => {}
         }
-        if cancelled || client_gone {
+        if cancelled || client_gone || route_overloaded {
             // ACP cancellation itself is only a notification. Treat the
             // outstanding session/prompt response as the acknowledgement
             // that Cursor has actually stopped this turn. If it never
             // arrives, recycle the shared process before releasing the turn;
             // otherwise a replacement prompt could race stale mutation.
-            if let Err(error) = server
+            let acknowledged = match server
                 .notify("session/cancel", json!({ "sessionId": session_id }))
                 .await
             {
-                tracing::warn!("cursor cancellation transport cleanup failed: {error}");
-            } else if tokio::time::timeout(CANCEL_ACK_TIMEOUT, &mut prompt_rx)
-                .await
-                .is_err()
-            {
+                Ok(()) => cancellation_acknowledged(&mut prompt_rx).await,
+                Err(error) => {
+                    tracing::warn!("cursor cancellation transport cleanup failed: {error}");
+                    false
+                }
+            };
+            if !acknowledged {
                 tracing::warn!(
                     "cursor did not acknowledge cancellation within {}s; recycling cursor-agent",
                     CANCEL_ACK_TIMEOUT.as_secs(),
                 );
-                server.terminate().await;
+                if let Err(error) = server.terminate().await {
+                    let _ = tx.send(Err(error)).await;
+                    server.unsubscribe(&session_id).await;
+                    return;
+                }
             }
         }
         if route_overloaded {
-            // Cursor supports per-session cancellation, so stop only this
-            // overloaded turn while the shared ACP process keeps serving
-            // the worktree's other sessions. Do not let ACP stdin backpressure
-            // delay the overload error reaching the caller.
-            let cancel_server = server.clone();
-            let cancel_session_id = session_id.clone();
-            tokio::spawn(async move {
-                let _ = cancel_server
-                    .notify("session/cancel", json!({ "sessionId": cancel_session_id }))
-                    .await;
-            });
+            // Cancellation was acknowledged above (or the shared process was
+            // recycled) before this failure becomes visible to the caller.
+            // That prevents a replacement turn from overlapping stale work
+            // from the overloaded session.
             let _ = tx
                 .send(Err(BackendError::Protocol(format!(
                     "cursor-agent event backlog exceeded the per-turn limit of \
@@ -840,6 +941,34 @@ fn turn_stream(
         }
         server.unsubscribe(&session_id).await;
     })
+}
+
+fn session_setup_failure(
+    fresh_session: bool,
+    session_id: &str,
+    error: BackendError,
+) -> Result<BackendEventStream, BackendError> {
+    if !fresh_session {
+        return Err(error);
+    }
+    Ok(futures::stream::iter(vec![
+        Ok(BackendEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        }),
+        Err(error),
+    ])
+    .boxed())
+}
+
+async fn cancellation_acknowledged(
+    prompt_rx: &mut oneshot::Receiver<Result<Value, String>>,
+) -> bool {
+    // A closed sender means the reader cleared pending requests after EOF;
+    // only an actual JSON-RPC response proves Cursor stopped the turn.
+    matches!(
+        tokio::time::timeout(CANCEL_ACK_TIMEOUT, prompt_rx).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Map one routed ACP message to backend events. `Err(())` means the
@@ -1331,15 +1460,104 @@ struct AcpServer {
     /// `cursor/ask_question` find their route here, and permission requests
     /// recover rawInput when cursor omits it.
     calls: Arc<Mutex<HashMap<String, (String, Value)>>>,
-    /// Held so the child (kill_on_drop) lives as long as the server handle;
-    /// mutable ownership also lets a blocked transport be terminated.
-    child: Mutex<Child>,
+    /// Held so the complete process tree lives as long as the server handle;
+    /// mutable ownership also lets a blocked transport be terminated and
+    /// reaped. The reader holds only a `Weak`, so it cannot keep the child
+    /// alive after the pool and active turns release the server.
+    child: Arc<Mutex<crate::process_env::ProcessTreeChild>>,
     closed: Arc<AtomicBool>,
+    transport_cleanup_started: AtomicBool,
+    #[cfg(test)]
+    injected_terminate_failure: AtomicBool,
     /// When the pool last handed this child to a turn; feeds idle reaping.
     last_used: std::sync::Mutex<Instant>,
 }
 
+impl Drop for AcpServer {
+    fn drop(&mut self) {
+        self.invalidate_transport_now();
+    }
+}
+
+fn cleanup_cursor_transport_blocking(
+    pending: Pending,
+    routes: Routes,
+    child: Arc<Mutex<crate::process_env::ProcessTreeChild>>,
+) -> std::io::Result<()> {
+    pending.blocking_lock().clear();
+    routes.blocking_lock().clear();
+    let mut child = child.blocking_lock();
+    let terminate_error = child.terminate_now().err();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait_tree() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                return Err(terminate_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "cursor-agent process tree did not exit within 5s",
+                    )
+                }));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl AcpServer {
+    fn invalidate_transport_now(&self) {
+        self.invalidate_transport_now_with(|cleanup| {
+            std::thread::Builder::new()
+                .name("cursor-transport-cleanup".into())
+                .spawn(cleanup)
+                .map(|_| ())
+        });
+    }
+
+    fn invalidate_transport_now_with<F>(&self, spawn_cleanup: F)
+    where
+        F: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>,
+    {
+        self.closed.store(true, Ordering::Relaxed);
+        // Cancellation may drop the future that is handshaking a newly
+        // spawned server. Signal it synchronously, then release waiters and
+        // reap it from an OS thread that does not depend on Tokio surviving.
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.terminate_now();
+        }
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.clear();
+        }
+        if let Ok(mut routes) = self.routes.try_lock() {
+            routes.clear();
+        }
+        if self.transport_cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let child = self.child.clone();
+        let pending = self.pending.clone();
+        let routes = self.routes.clone();
+        if let Err(error) = spawn_cleanup(Box::new(move || {
+            let _ = cleanup_cursor_transport_blocking(pending, routes, child);
+        })) {
+            tracing::error!("cursor: failed to start transport cleanup thread: {error}");
+            let child = self.child.clone();
+            let pending = self.pending.clone();
+            let routes = self.routes.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || {
+                    let _ = cleanup_cursor_transport_blocking(pending, routes, child);
+                });
+            } else {
+                let _ = cleanup_cursor_transport_blocking(pending, routes, child);
+            }
+        }
+    }
+
     async fn spawn(command: &str, api_key: Option<&str>, cwd: &Path) -> Result<Self, BackendError> {
         let mut cmd = crate::process_env::tokio_command(command);
         cmd.arg("acp");
@@ -1351,18 +1569,16 @@ impl AcpServer {
         if let Some(key) = api_key {
             cmd.env("CURSOR_API_KEY", key);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| match e.kind() {
+            .stderr(Stdio::null());
+        let mut child =
+            crate::process_env::spawn_process_tree(&mut cmd).map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
                 _ => BackendError::Io(e),
             })?;
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
+        let stdin = child.take_stdin().expect("stdin piped");
+        let stdout = child.take_stdout().expect("stdout piped");
 
         let server = Self {
             stdin: Arc::new(Mutex::new(stdin)),
@@ -1373,8 +1589,11 @@ impl AcpServer {
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             closed: Arc::new(AtomicBool::new(false)),
+            transport_cleanup_started: AtomicBool::new(false),
+            #[cfg(test)]
+            injected_terminate_failure: AtomicBool::new(false),
             last_used: std::sync::Mutex::new(Instant::now()),
         };
         server.start_reader(stdout);
@@ -1406,6 +1625,7 @@ impl AcpServer {
         let plans = self.plans.clone();
         let calls = self.calls.clone();
         let stdin = self.stdin.clone();
+        let child = Arc::downgrade(&self.child);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -1547,6 +1767,9 @@ impl AcpServer {
             closed.store(true, Ordering::Relaxed);
             pending.lock().await.clear();
             routes.lock().await.clear();
+            if let Some(child) = child.upgrade() {
+                let _ = child.lock().await.terminate_and_reap().await;
+            }
         });
     }
 
@@ -1583,10 +1806,20 @@ impl AcpServer {
             )
             .await
             .map_err(auth_hint)?;
-        let id = result["sessionId"]
+        let id = match result["sessionId"]
             .as_str()
-            .ok_or_else(|| BackendError::Protocol("session/new result missing sessionId".into()))?
-            .to_string();
+            .filter(|id| !id.trim().is_empty())
+        {
+            Some(id) => id.to_string(),
+            None => {
+                // A successful session/new with no usable identity may have
+                // created resources that no future request can address.
+                self.terminate().await?;
+                return Err(BackendError::Protocol(
+                    "session/new result missing sessionId".into(),
+                ));
+            }
+        };
         self.sessions.lock().await.insert(id.clone());
         Ok(id)
     }
@@ -1643,6 +1876,17 @@ impl AcpServer {
         params: Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, BackendError> {
+        self.request_cancellable_with_timeout(method, params, cancel, REQUEST_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn request_cancellable_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+        response_timeout: Duration,
+    ) -> Result<Value, BackendError> {
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
         }
@@ -1656,25 +1900,46 @@ impl AcpServer {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
+        enum Response {
+            Received(std::result::Result<Result<Value, String>, oneshot::error::RecvError>),
+            Cancelled,
+            TimedOut,
+        }
         let response = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(BackendError::Cancelled),
-            response = tokio::time::timeout(REQUEST_RESPONSE_TIMEOUT, rx) => match response {
-                Ok(response) => response.map_err(|_| BackendError::Protocol(format!(
-                    "{method}: cursor-agent closed before responding"
-                ))),
-                Err(_) => Err(BackendError::Protocol(format!(
-                    "{method}: no response within {}s",
-                    REQUEST_RESPONSE_TIMEOUT.as_secs()
-                ))),
+            _ = cancel.cancelled() => Response::Cancelled,
+            response = tokio::time::timeout(response_timeout, rx) => match response {
+                Ok(response) => Response::Received(response),
+                Err(_) => Response::TimedOut,
             },
         };
-        if response.is_err() {
-            self.pending.lock().await.remove(&id);
-        }
-        match response? {
-            Ok(value) => Ok(value),
-            Err(error) => Err(BackendError::Protocol(format!("{method}: {error}"))),
+        match response {
+            Response::Received(Ok(Ok(value))) => Ok(value),
+            Response::Received(Ok(Err(error))) => {
+                Err(BackendError::Protocol(format!("{method}: {error}")))
+            }
+            Response::Received(Err(_)) => {
+                // EOF cleanup normally owns this already; await idempotent
+                // process-tree cleanup before the caller releases setup state.
+                self.terminate().await?;
+                Err(BackendError::Protocol(format!(
+                    "{method}: cursor-agent closed before responding"
+                )))
+            }
+            Response::Cancelled => {
+                // The complete request was flushed, so its session/config
+                // mutation may be applied later. Recycle the shared process
+                // and acknowledge reaping before another setup can proceed.
+                self.terminate().await?;
+                Err(BackendError::Cancelled)
+            }
+            Response::TimedOut => {
+                self.terminate().await?;
+                Err(BackendError::Protocol(format!(
+                    "{method}: no response within {}s",
+                    response_timeout.as_secs_f64()
+                )))
+            }
         }
     }
 
@@ -1731,11 +1996,11 @@ impl AcpServer {
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
-                self.terminate().await;
+                self.terminate().await?;
                 Err(BackendError::Io(error))
             }
             Err(_) => {
-                self.terminate().await;
+                self.terminate().await?;
                 Err(BackendError::Protocol(format!(
                     "cursor-agent stdin blocked for {}s",
                     TRANSPORT_WRITE_TIMEOUT.as_secs()
@@ -1744,11 +2009,18 @@ impl AcpServer {
         }
     }
 
-    async fn terminate(&self) {
+    async fn terminate(&self) -> Result<(), BackendError> {
         self.closed.store(true, Ordering::Relaxed);
-        let _ = self.child.lock().await.kill().await;
+        #[cfg(test)]
+        if self.injected_terminate_failure.load(Ordering::Relaxed) {
+            return Err(BackendError::Protocol(
+                "injected cursor-agent cleanup failure".into(),
+            ));
+        }
+        let cleanup = self.child.lock().await.terminate_and_reap().await;
         self.pending.lock().await.clear();
         self.routes.lock().await.clear();
+        cleanup.map(|_| ()).map_err(BackendError::Io)
     }
 
     async fn subscribe(&self, session_id: &str) -> RouteReceiver<ServerMsg> {
@@ -1800,6 +2072,14 @@ fn acp_mcp_servers(servers: &[crate::McpServerLaunch]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_prompt_channel_is_not_a_cancellation_acknowledgement() {
+        let (sender, mut receiver) = oneshot::channel::<Result<Value, String>>();
+        drop(sender); // Equivalent to the ACP reader clearing pending on EOF.
+
+        assert!(!cancellation_acknowledged(&mut receiver).await);
+    }
 
     #[test]
     fn parses_dashboard_usage() {
@@ -2145,5 +2425,619 @@ mod tests {
         );
         assert_eq!(config_snapshot_value(&result, "context"), None);
         assert_eq!(config_snapshot_value(&json!({}), "model"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_write_setup_cancellation_recycles_cursor_before_returning() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for method in ["session/new", "session/load", "session/set_config_option"] {
+            let directory = tempfile::tempdir().unwrap();
+            let script_path = directory.path().join("fake-cursor-agent");
+            let marker_path = directory.path().join("request.method");
+            let script = format!(
+                r#"#!/usr/bin/env python3
+import json, sys, time
+marker = {marker:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    with open(marker, "w") as output:
+        output.write(message.get("method", ""))
+        output.flush()
+    time.sleep(60)
+"#,
+                marker = marker_path.to_string_lossy(),
+            );
+            std::fs::write(&script_path, script).unwrap();
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let server = Arc::new(
+                AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+                    .await
+                    .unwrap(),
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let request = tokio::spawn({
+                let server = server.clone();
+                let cancel = cancel.clone();
+                let worktree = directory.path().to_path_buf();
+                async move {
+                    match method {
+                        "session/new" => server
+                            .new_session(&worktree, &[], &cancel)
+                            .await
+                            .map(|_| ()),
+                        "session/load" => {
+                            server
+                                .load_session("session-1", &worktree, &[], &cancel)
+                                .await
+                        }
+                        "session/set_config_option" => server
+                            .set_config_option("session-1", "model", "test", &cancel)
+                            .await
+                            .map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !marker_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{method} did not reach cursor-agent"));
+
+            cancel.cancel();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), request)
+                    .await
+                    .unwrap_or_else(|_| panic!("{method} cancellation did not reap cursor-agent"))
+                    .unwrap(),
+                Err(BackendError::Cancelled)
+            ));
+            assert!(
+                server.is_closed(),
+                "{method} left its shared process reusable"
+            );
+            assert!(server.child.lock().await.try_wait_tree().unwrap().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_config_post_write_cancellation_remains_cancelled() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("fake-cursor-agent");
+        let marker_path = directory.path().join("request.method");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, sys, time
+marker = {marker:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    with open(marker, "w") as output:
+        output.write(message.get("method", ""))
+        output.flush()
+    time.sleep(60)
+"#,
+            marker = marker_path.to_string_lossy(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = Arc::new(
+            AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+                .await
+                .unwrap(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let turn = BackendTurn {
+            cancel: cancel.clone(),
+            thread_id: "thread-1".into(),
+            worktree: directory.path().to_path_buf(),
+            session: Some("session-1".into()),
+            model: "test-model".into(),
+            model_options: serde_json::Map::new(),
+            prompt: String::new(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        };
+        let configuring = tokio::spawn({
+            let server = server.clone();
+            let cancel = cancel.clone();
+            async move { apply_model_config(&server, "session-1", &turn, &cancel).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !marker_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("model configuration did not reach cursor-agent");
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            "session/set_config_option"
+        );
+
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), configuring)
+                .await
+                .expect("model configuration cancellation did not reap cursor-agent")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        assert!(server.is_closed());
+        assert!(server.child.lock().await.try_wait_tree().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_write_setup_timeout_recycles_cursor_before_returning() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("fake-cursor-agent");
+        std::fs::write(&script_path, "#!/bin/sh\nIFS= read -r request\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+            .await
+            .unwrap();
+
+        let error = server
+            .request_cancellable_with_timeout(
+                "session/set_config_option",
+                json!({"sessionId": "session-1", "configId": "model", "value": "test"}),
+                &tokio_util::sync::CancellationToken::new(),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BackendError::Protocol(message) if message.contains("no response")
+        ));
+        assert!(server.is_closed());
+        assert!(server.child.lock().await.try_wait_tree().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overloaded_route_waits_for_cursor_cancellation_acknowledgement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("fake-cursor-agent");
+        let marker_path = directory.path().join("cancelled");
+        let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+prompt_id = None
+marker = os.path.join(os.path.dirname(__file__), "cancelled")
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "session/prompt":
+        prompt_id = message["id"]
+        session_id = message["params"]["sessionId"]
+        for index in range(__EVENT_COUNT__):
+            update = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": str(index)},
+                    },
+                },
+            }
+            sys.stdout.write(json.dumps(update) + "\n")
+        sys.stdout.flush()
+    elif method == "session/cancel":
+        time.sleep(0.15)
+        with open(marker, "w") as output:
+            output.write("acknowledged")
+        response = {"jsonrpc": "2.0", "id": prompt_id, "result": {"usage": {}}}
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+"#
+        .replace(
+            "__EVENT_COUNT__",
+            &(ROUTE_EVENT_BUDGET.saturating_add(1)).to_string(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = Arc::new(
+            AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+                .await
+                .unwrap(),
+        );
+        let session_id = "overloaded-session".to_string();
+        let route = server.subscribe(&session_id).await;
+        let mut overloaded = route.overload_signal();
+        let prompt_rx = server
+            .request_deferred(
+                "session/prompt",
+                json!({"sessionId": session_id, "prompt": []}),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), overloaded.wait())
+            .await
+            .expect("fake cursor route did not overload");
+
+        let mut events = Box::pin(turn_stream(
+            server.clone(),
+            session_id,
+            route,
+            prompt_rx,
+            false,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("overloaded stream did not finish cancellation cleanup")
+            .expect("overloaded stream ended without its protocol error");
+        assert!(matches!(
+            event,
+            Err(BackendError::Protocol(ref error))
+                if error.contains("event backlog exceeded")
+        ));
+        assert!(
+            marker_path.exists(),
+            "overload failure was published before cursor acknowledged cancellation"
+        );
+        server.terminate().await.unwrap();
+    }
+
+    fn bare_cursor_turn(worktree: &Path) -> BackendTurn {
+        BackendTurn {
+            cancel: Default::default(),
+            thread_id: "thread-1".into(),
+            worktree: worktree.to_path_buf(),
+            session: None,
+            model: "default".into(),
+            model_options: serde_json::Map::new(),
+            prompt: "hello".into(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_hanging_handshake_reaps_cursor_agent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("cursor-hanging-initialize");
+        let marker = directory.path().join("cursor.pid");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    if json.loads(line).get("method") == "initialize":
+        with open({marker:?}, "w") as output:
+            output.write(str(os.getpid()))
+            output.flush()
+        time.sleep(60)
+"#,
+            marker = marker.to_string_lossy(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CursorBackend::new(
+            "cursor",
+            Some(script_path.to_string_lossy().into_owned()),
+            None,
+        ));
+        let worktree = directory.path().to_path_buf();
+        let startup = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.server_for(&worktree).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initialize did not reach cursor-agent");
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        startup.abort();
+        assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropped startup future left cursor-agent alive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_hanging_handshake_reaps_cursor_agent_before_returning() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("cursor-cancelled-initialize");
+        let marker = directory.path().join("cursor.pid");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    if json.loads(line).get("method") == "initialize":
+        with open({marker:?}, "w") as output:
+            output.write(str(os.getpid()))
+            output.flush()
+        time.sleep(60)
+"#,
+            marker = marker.to_string_lossy(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CursorBackend::new(
+            "cursor",
+            Some(script_path.to_string_lossy().into_owned()),
+            None,
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worktree = directory.path().to_path_buf();
+        let startup = tokio::spawn({
+            let backend = backend.clone();
+            let cancel = cancel.clone();
+            async move { backend.server_for_cancellable(&worktree, &cancel).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initialize did not reach cursor-agent");
+        let pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), startup)
+                .await
+                .expect("startup cancellation did not acknowledge cleanup")
+                .unwrap(),
+            Err(BackendError::Cancelled)
+        ));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "startup returned cancellation before reaping cursor-agent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_new_session_success_reaps_cursor_agent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (name, result) in [
+            ("missing", json!({})),
+            ("blank", json!({ "sessionId": "  " })),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let script_path = directory.path().join(format!("cursor-new-{name}"));
+            let script = r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    response = {"jsonrpc": "2.0", "id": message["id"], "result": __RESULT__}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+    time.sleep(60)
+"#
+            .replace("__RESULT__", &result.to_string());
+            std::fs::write(&script_path, script).unwrap();
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let server = AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+                .await
+                .unwrap();
+            assert!(matches!(
+                server
+                    .new_session(
+                        directory.path(),
+                        &[],
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await,
+                Err(BackendError::Protocol(_))
+            ));
+            assert!(server.is_closed());
+            assert!(server.child.lock().await.try_wait_tree().unwrap().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_cursor_session_is_reported_before_setup_cancellation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("cursor-fresh-cancel");
+        let marker = directory.path().join("session.started");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{}}
+    elif method == "session/new":
+        result = {{"sessionId": "fresh-session"}}
+    else:
+        result = {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}) + "\n")
+    sys.stdout.flush()
+    if method == "session/new":
+        open({marker:?}, "w").close()
+"#,
+            marker = marker.to_string_lossy(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = Arc::new(CursorBackend::new(
+            "cursor",
+            Some(script_path.to_string_lossy().into_owned()),
+            None,
+        ));
+        let server = backend.server_for(directory.path()).await.unwrap();
+        let config = server.config_lock.lock().await;
+        let turn = bare_cursor_turn(directory.path());
+        let cancel = turn.cancel.clone();
+        let running = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run_turn(turn).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("session/new did not complete");
+        cancel.cancel();
+        let mut events = running.await.unwrap().unwrap();
+        drop(config);
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(BackendEvent::SessionStarted { session_id })) if session_id == "fresh-session"
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(Err(BackendError::Cancelled))
+        ));
+        server.terminate().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_failure_keeps_closed_pooled_server_and_denies_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("cursor-cleanup-failure");
+        let starts = directory.path().join("starts.txt");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys
+with open({starts:?}, "a") as starts:
+    starts.write(str(os.getpid()) + "\n")
+    starts.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    response = {{"jsonrpc": "2.0", "id": message["id"], "result": {{}}}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+            starts = starts.to_string_lossy(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = CursorBackend::new(
+            "cursor",
+            Some(script_path.to_string_lossy().into_owned()),
+            None,
+        );
+        let server = backend.server_for(directory.path()).await.unwrap();
+        server.closed.store(true, Ordering::Relaxed);
+        server
+            .injected_terminate_failure
+            .store(true, Ordering::Relaxed);
+
+        let error = match backend.server_for(directory.path()).await {
+            Ok(_) => panic!("cleanup failure must deny replacement startup"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected cursor-agent cleanup failure"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1);
+        let retained = backend
+            .pool
+            .servers
+            .lock()
+            .await
+            .get(directory.path())
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&server, &retained));
+
+        let unrelated_directory = tempfile::tempdir().unwrap();
+        let unrelated = backend
+            .server_for(unrelated_directory.path())
+            .await
+            .expect("one quarantined key must not block an unrelated worktree");
+        assert_eq!(
+            std::fs::read_to_string(&starts).unwrap().lines().count(),
+            2,
+            "unrelated worktree did not receive its own server"
+        );
+
+        server
+            .injected_terminate_failure
+            .store(false, Ordering::Relaxed);
+        server.terminate().await.unwrap();
+        unrelated.terminate().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_thread_spawn_failure_falls_back_for_cursor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script_path = directory.path().join("cursor-cleanup-fallback");
+        std::fs::write(&script_path, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
+            .await
+            .unwrap();
+        let routes = server.routes.lock().await;
+        server.invalidate_transport_now_with(|_| {
+            Err(std::io::Error::other("forced cleanup thread spawn failure"))
+        });
+        drop(routes);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.child.lock().await.try_wait_tree().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("runtime cleanup fallback did not reap cursor-agent");
+        assert!(server.is_closed());
+        assert!(server.transport_cleanup_started.load(Ordering::Acquire));
     }
 }

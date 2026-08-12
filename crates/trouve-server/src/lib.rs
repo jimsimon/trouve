@@ -2479,7 +2479,7 @@ async fn upsert_mcp_server(
     Path(name): Path<String>,
     Json(req): Json<UpsertMcpServerRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.upsert_mcp_server(&name, &req)?;
+    engine.upsert_mcp_server(&name, &req).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2495,7 +2495,7 @@ async fn set_mcp_server_enabled(
     Path(name): Path<String>,
     Json(req): Json<SetMcpServerEnabledRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.set_mcp_server_enabled(&name, &req)?;
+    engine.set_mcp_server_enabled(&name, &req).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2517,7 +2517,9 @@ async fn delete_mcp_server(
     Path(name): Path<String>,
     Query(q): Query<McpDeleteQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.delete_mcp_server(&name, &q.scope, q.workspace_id.as_deref())?;
+    engine
+        .delete_mcp_server(&name, &q.scope, q.workspace_id.as_deref())
+        .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

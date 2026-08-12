@@ -2,6 +2,20 @@ export interface QueueItemIdentity {
   readonly id: string;
 }
 
+/** A queued response may arrive after SSE has already added and dispatched
+ * the row. Only materialize the response row while the same optimistic
+ * submission is pending and its queue projection has not advanced. Once it
+ * has advanced, SSE remains authoritative for any still-live row. */
+export const shouldMaterializeAcceptedQueuedPrompt = (
+  submissionId: string,
+  pendingSubmissionId: string | undefined,
+  promptId: string,
+  queue: readonly QueueItemIdentity[],
+  queueChangedSinceSubmission = false,
+): boolean => pendingSubmissionId === submissionId
+  && !queueChangedSinceSubmission
+  && !queue.some((prompt) => prompt.id === promptId);
+
 /** Compact rows show the first meaningful line while editors and the title
  * retain the complete prompt. This avoids multiline overflow and large text
  * layout work in the queue list. */

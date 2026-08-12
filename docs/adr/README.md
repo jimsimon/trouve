@@ -31,8 +31,8 @@ sequentially.
 | [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
 | [0021](0021-derived-thread-view-snapshots.md) | Derived thread-view snapshots | Accepted |
-| [0022](0022-bounded-thread-view-pages.md) | Bounded thread-view pages | Accepted |
-| [0023](0023-lit-web-frontend-and-webview-host.md) | Lit web frontend and gated webview host | Accepted |
+| [0022](0022-bounded-thread-view-pages.md) | Bounded thread-view pages | Superseded by 0033 |
+| [0023](0023-lit-web-frontend-and-webview-host.md) | Lit web frontend and gated webview host | Partially superseded by 0028 |
 | [0024](0024-isolated-servo-embedding-qualification-workspace.md) | Isolated Servo embedding qualification workspace | Accepted |
 | [0025](0025-pin-servo-qualification-to-nightly-revision.md) | Pin Servo qualification to a nightly revision | Accepted |
 | [0026](0026-desktop-frontend-asset-sources.md) | Desktop frontend asset sources | Accepted |
@@ -45,3 +45,4 @@ sequentially.
 | [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |
 | [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Accepted |
 | [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |
+| [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |

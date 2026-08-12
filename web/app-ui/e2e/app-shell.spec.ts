@@ -90,7 +90,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "3.14",
+        protocol_version: "4.0",
         online: true,
       },
       "GET /v1/session-summaries": {
@@ -333,7 +333,9 @@ test("one durable pull-request projection drives the session badge and dashboard
     .toBeVisible();
   await create.click();
 
-  const openPullRequests = headingActions.getByRole("button", { name: "Open Pull Requests" });
+  const openPullRequests = headingActions.getByRole("button", {
+    name: "Open repository pull requests on GitHub",
+  });
   await expect(openPullRequests).toBeEnabled();
   await expect(openPullRequests.locator(
     '[data-font-awesome-icon="arrow-up-right-from-square"]',
@@ -410,7 +412,7 @@ test("an unconfigured GitHub integration stays aligned with the session empty st
   await page.goto("/");
 
   await page.getByRole("tab", { name: /Pull Requests/u }).click();
-  await expect(page.getByText("Connect GitHub to see this session's pull requests", {
+  await expect(page.getByText("Connect GitHub to manage this session's pull requests", {
     exact: true,
   })).toBeVisible();
   await page.getByRole("button", { name: "Set up GitHub integration" }).click();

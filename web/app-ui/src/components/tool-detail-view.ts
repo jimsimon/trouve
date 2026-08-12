@@ -7,6 +7,7 @@ import { languageForPath } from "./file-language.js";
 import "./markdown-view.js";
 import {
   presentToolDetail,
+  TRANSCRIPT_TRUNCATION_NOTICE,
   type ToolDetailField,
   type ToolDetailPresentation,
 } from "./tool-presentation.js";
@@ -303,7 +304,7 @@ export class TrouveToolDetailView extends LitElement {
       ${detail.matches.length === 0 && detail.messages.length === 0
         ? html`<p class="empty">No transcript content was returned.</p>`
         : nothing}
-      ${detail.truncated ? html`<p class="notice">Additional transcript matches were omitted.</p>` : nothing}
+      ${detail.truncated ? html`<p class="notice">${TRANSCRIPT_TRUNCATION_NOTICE}</p>` : nothing}
     `;
   }
 

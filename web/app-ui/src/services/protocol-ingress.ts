@@ -140,7 +140,7 @@ export class ProtocolIngress {
   #listenersAttached = false;
   #bootstrap: Promise<void> | undefined;
   #projectionRefresh: Promise<void> | undefined;
-  #activityReconciliation: Promise<void> | undefined;
+  #activityReconciliation: Promise<boolean> | undefined;
   #metadataRefresh: Promise<void> | undefined;
   #metadataRefreshPending = false;
   #metadataRevision = 0;
@@ -236,13 +236,13 @@ export class ProtocolIngress {
    * inhibition uses this narrow read as a safety net for a missed live event;
    * unlike a full foreground refresh it does not refetch workspace, metadata,
    * or GitHub state. Concurrent timers share one request. */
-  reconcileSessionActivity(): Promise<void> {
-    if (!this.#started) return Promise.resolve();
+  reconcileSessionActivity(): Promise<boolean> {
+    if (!this.#started) return Promise.resolve(false);
     if (this.#activityReconciliation !== undefined) {
       return this.#activityReconciliation;
     }
     const generation = this.#generation;
-    let reconciliation!: Promise<void>;
+    let reconciliation!: Promise<boolean>;
     reconciliation = this.#reconcileSessionActivityGeneration(generation).finally(() => {
       if (this.#activityReconciliation === reconciliation) {
         this.#activityReconciliation = undefined;
@@ -408,18 +408,19 @@ export class ProtocolIngress {
     }
   }
 
-  async #reconcileSessionActivityGeneration(generation: number): Promise<void> {
+  async #reconcileSessionActivityGeneration(generation: number): Promise<boolean> {
     const boundary = await this.#sessionSummaryBoundary();
-    if (!this.#isCurrentGeneration(generation)) return;
+    if (!this.#isCurrentGeneration(generation)) return false;
     const snapshot = boundary.kind === "atomic"
       ? boundary.snapshot
       : materializeSessionSnapshot(boundary, await this.#client.sessions());
-    if (!this.#isCurrentGeneration(generation)) return;
+    if (!this.#isCurrentGeneration(generation)) return false;
     const acceptedCursor =
       this.#stream === undefined ? 0 : readSignal(this.#stream.cursor);
-    if (snapshot.cursor < acceptedCursor) return;
+    if (snapshot.cursor < acceptedCursor) return false;
     this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
     this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
+    return true;
   }
 
   /** Early protocol 2.5 builds exposed session activity and cursor-bearing

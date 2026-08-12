@@ -630,6 +630,7 @@ impl ThreadViewModel {
                 content,
                 attachments,
             } => {
+                self.finish_thinking();
                 self.items.push(ChatItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -728,9 +729,7 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
-                // A provider tool event may arrive between deltas belonging
-                // to one thinking item. Keep that item open until its durable
-                // explicit completion edge arrives.
+                self.finish_thinking();
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
                 self.tool_outputs.remove(call_id);
@@ -1726,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_preserves_capability_and_does_not_split_active_thinking() {
+    fn steering_preserves_capability_and_splits_active_thinking() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 4,
@@ -1756,11 +1755,13 @@ mod tests {
             vm.items.as_slice(),
             [
                 ChatItem::TurnStatus { .. },
-                ChatItem::Thinking { content: thought, complete: true, .. },
+                ChatItem::Thinking { content: before, complete: true, .. },
                 ChatItem::Steered { turn: 4, content, attachments },
-            ] if thought == "Original direction. Continue with the revised direction."
+                ChatItem::Thinking { content: after, complete: true, .. },
+            ] if before == "Original direction."
                 && content == "Check the smaller-screen layout too."
                 && attachments.is_empty()
+                && after == " Continue with the revised direction."
         ));
     }
 
@@ -1783,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_does_not_split_one_explicitly_bounded_thinking_item() {
+    fn tool_request_splits_active_thinking_at_the_causal_boundary() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
@@ -1807,14 +1808,22 @@ mod tests {
             .iter()
             .filter(|item| matches!(item, ChatItem::Thinking { .. }))
             .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
             thoughts[0],
             ChatItem::Thinking {
                 content,
                 complete: true,
                 ..
-            } if content == "The final overlap pass is still running."
+            } if content == "The final overlap pass is still"
+        ));
+        assert!(matches!(
+            thoughts[1],
+            ChatItem::Thinking {
+                content,
+                complete: true,
+                ..
+            } if content == " running."
         ));
         assert!(!vm.thinking);
     }

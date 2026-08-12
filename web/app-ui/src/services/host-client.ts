@@ -109,6 +109,8 @@ const HOST_READ_CLIPBOARD_IMAGE_PATH =
   "/__trouve/host/v1/read-clipboard-image" as const;
 const HOST_OPEN_HTTPS_URL_PATH = "/__trouve/host/v1/open-https-url" as const;
 const HOST_LIFECYCLE_PATH = "/__trouve/host/v1/lifecycle" as const;
+const HOST_CLOSE_ACKNOWLEDGEMENT_PATH =
+  "/__trouve/host/v1/close-acknowledgement" as const;
 const HOST_CLOSE_DECISION_PATH = "/__trouve/host/v1/close-decision" as const;
 const HOST_SLEEP_INHIBITION_PATH =
   "/__trouve/host/v1/sleep-inhibition" as const;
@@ -122,6 +124,7 @@ const CSRF_HEADER = "x-trouve-host-csrf";
 const DIRECTORY_PICKER_BRIDGE_VERSION = 3;
 const NATIVE_ATTACHMENT_BRIDGE_VERSION = 4;
 const NATIVE_LIFECYCLE_BRIDGE_VERSION = 5;
+const CLOSE_ACKNOWLEDGEMENT_BRIDGE_VERSION = 13;
 const MAX_LIFECYCLE_WAIT_MS = 25_000;
 const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_HOST_ID_BYTES = 256;
@@ -217,6 +220,7 @@ export class HostClient {
   #openHttpsUrlAvailable = false;
   #lifecycleAvailable = false;
   #closeConfirmationAvailable = false;
+  #closeAcknowledgementAvailable = false;
   #sleepInhibitionAvailable = false;
   #nativeNotificationsAvailable = false;
   #userAttentionAvailable = false;
@@ -260,6 +264,8 @@ export class HostClient {
     this.#openHttpsUrlAvailable = capabilities.openHttpsUrl;
     this.#lifecycleAvailable = capabilities.lifecycleEvents;
     this.#closeConfirmationAvailable = capabilities.closeConfirmation;
+    this.#closeAcknowledgementAvailable = capabilities.closeConfirmation
+      && (bootstrap.capabilities.bridge_version ?? 0) >= CLOSE_ACKNOWLEDGEMENT_BRIDGE_VERSION;
     this.#sleepInhibitionAvailable = capabilities.sleepInhibition;
     this.#nativeNotificationsAvailable = capabilities.nativeNotifications;
     this.#userAttentionAvailable = capabilities.userAttention;
@@ -505,6 +511,29 @@ export class HostClient {
           headers: { [CSRF_HEADER]: csrfToken },
         }),
       "desktop close decision failed",
+    );
+  }
+
+  /** Confirm that the exact pending request reached frontend-owned close UI.
+   * This disarms the native broken-frontend watchdog without choosing. */
+  async acknowledgeClose(requestId: number): Promise<void> {
+    if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+      throw new HostClientError("invalid-request", "invalid desktop close request");
+    }
+    // Bridge 12 and earlier had no acknowledgement route and no healthy-UI
+    // watchdog to disarm. Preserve their existing decision-only workflow.
+    if (!this.#closeAcknowledgementAvailable) return;
+    const csrfToken = this.#nativeActionToken(
+      this.#closeConfirmationAvailable,
+      "desktop close confirmation is unavailable",
+    );
+    await this.#performNativeAction(
+      () =>
+        this.#client.POST(HOST_CLOSE_ACKNOWLEDGEMENT_PATH, {
+          body: { request_id: requestId },
+          headers: { [CSRF_HEADER]: csrfToken },
+        }),
+      "desktop close acknowledgement failed",
     );
   }
 

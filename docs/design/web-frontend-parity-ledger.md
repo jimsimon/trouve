@@ -5,7 +5,7 @@ frontend and removed the Slint rollback. Slint comparisons below are retained
 as historical migration evidence; current visual authority lives in Trouve's
 CSS themes, component gallery, and browser regression suite.
 
-**Status:** Existing Slint functionality ported; promotion qualification remains open
+**Status:** Historical migration complete under ADR 0028; ongoing Wry and Servo qualification remains tracked
 
 **Last updated:** 2026-08-07
 
@@ -29,9 +29,9 @@ established actions. The complementary
 inventories the remaining Rust desktop-host boundary and mechanically rejects
 an unreviewed native source or Rust/TypeScript thread-event reducer mismatch.
 
-This is still an implementation and evidence ledger, not a declaration that
-the web frontend is ready to replace Slint. Functional port closure and
-promotion qualification are deliberately separate claims.
+This remains an implementation and evidence ledger. ADR 0028 subsequently
+made Wry/Lit the sole product frontend; open qualification entries now track
+hardening and Servo evaluation rather than gating a Slint rollback.
 
 The current labels describe how much of a workflow can be exercised in the
 feature-gated preview:
@@ -56,20 +56,16 @@ Current status totals:
 | gated | 1 |
 | **Total** | **21** |
 
-## Non-negotiable parity contract
+## Historical migration parity contract
 
-The existing Slint frontend is the visual and interaction baseline throughout
-the migration. Wry/Lit is the staged default under ADR 0027; Slint remains the
-rollback frontend until the qualification and soak gates pass. The primary
-baseline sources are
-the [Slint application](../../crates/trouve-app/ui/app.slint), the
-[authoritative Slint theme definitions](../../crates/trouve-app/src/theme.rs),
-the retained generic
-[code](../../crates/trouve-slint-code-view),
-[diff](../../crates/trouve-slint-diff-view),
-[Markdown](../../crates/trouve-slint-markdown), and
-[terminal](../../crates/trouve-slint-terminal) widgets, and the
-[UX screen map](ux-screen-map.md).
+During the migration, the Slint frontend was the visual and interaction
+baseline. ADR 0028 completed that migration, retired the rollback, and made
+Trouve's CSS themes and browser regression suite authoritative. Historical
+baseline sources were the retired Slint application and theme definitions,
+its generic code, diff, Markdown, and terminal widgets, and the retained
+[UX screen map](ux-screen-map.md). Those Slint sources were removed when the
+rollback path retired under ADR 0028, so this ledger no longer links to paths
+that are absent from the current tree.
 
 The Lit frontend must preserve:
 
@@ -180,8 +176,9 @@ an explicit qualification item rather than a claimed engine capability.
 This establishes a real in-process, chrome-free embedding path; it does not
 close text-selection, accessibility-action, native-capability,
 renderer-recreation, lifecycle, crash/OOM-recovery, memory/performance,
-visual-parity, packaging, or six-platform gates. Wry is the staged default and
-remains incompletely qualified across that external matrix.
+visual-parity, packaging, or six-platform gates. Wry/Lit is the sole shipping
+desktop frontend under ADR 0028 and remains incompletely qualified across that
+external matrix.
 
 The Servo harness is an excluded nested Cargo workspace with its own lockfile,
 as recorded in [ADR 0024](../adr/0024-isolated-servo-embedding-qualification-workspace.md).
@@ -287,7 +284,7 @@ xterm input/resize are examples.
 | 2 | Session and thread management | Prompt-first session creation with workspace, branch/fetch, mode, model, thinking, permission, bounded attachments, provisional creation recovery, and cancelable new-thread setup with inherited defaults. Thread select, create, rename, archive, delete, and route restoration are wired. | [new-session model](../../web/app-ui/src/app/new-session-model.ts), [new-thread setup](../../web/app-ui/src/components/new-thread-setup.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts) | Failure-injection, slow/offline races, full keyboard/IME/AT runs, and visual evidence. |
 | 3 | Chat | Streaming user/assistant/thinking/tool/error turns, sanitized selectable Markdown, safe links, hover/focus response copy plus a **Copy as markdown** context action, attachments, disclosure state, raw and formatted tool regions, humanized tool names, file links, inline diffs, todos, timeline-based activity hierarchy, usage, tool/thought/attachment copy, Slint-shaped inline desktop approvals and a large-target mobile approval sheet, question interaction, bounded output, keyed virtualization, follow-tail, stable anchoring with invalid-bookmark recovery, tail-only live-log announcements, active-stream foreground resume, reduced motion, and an accessible full-history fallback. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [chat presentation](../../web/app-ui/src/components/chat-presentation.ts), [tool presentation](../../web/app-ui/src/components/tool-presentation.ts), [thread ingress](../../web/app-ui/src/services/thread-ingress.ts) | Large-history measurements, renderer/selection testing on both engines, screen readers, mobile memory, and screenshot comparison. |
 | 4 | Composer, completion, queue, and attachments | Autogrow input, IME-safe keyboard handling, slash and file completion with DOM UTF-16/protocol UTF-8 conversion, acknowledgement-aware start/cancel/queue/send-after-cancel controls, queued prompt edit/delete/reorder/send-now and paused-queue restart, durable thread-scoped unsubmitted text/cursor/attachment drafts, thread-scoped async mutation recovery, context and session usage, file picker, drag/drop, pasted images, attachment limits, and PWA quick replies. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [draft persistence](../../web/app-ui/src/services/composer-drafts.ts), [turn controls](../../web/app-ui/src/components/chat-turn-controls.ts), [completion model](../../web/app-ui/src/components/composer-completion.ts), [queue controls](../../web/app-ui/src/components/queue-controls.ts), [attachments service](../../web/app-ui/src/services/attachments.ts) | Cross-engine IME/dead-key/mobile-keyboard matrix, picker denial/cancel, queue recovery soak, and visual evidence. |
-| 5 | Diff | Unified/split modes, per-file grouping, line numbers, changed-file keyboard navigation, copy, responsive unified-only behavior, refresh, checkpoint undo/redo, expansion/collapse, and parsed status/error states. | [diff view](../../web/app-ui/src/components/diff-view.ts), [inspection diff controls](../../web/app-ui/src/components/inspection-diff-controls.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts) | Large-patch performance/memory, selection/AT alternatives, theme screenshots, touch, and engine disposal. |
+| 5 | Diff | Unified/split modes, per-file grouping, line numbers, changed-file keyboard navigation, copy, responsive unified-only behavior, refresh, exact turn-checkpoint restoration from transcript actions, expansion/collapse, and parsed status/error states. | [diff view](../../web/app-ui/src/components/diff-view.ts), [inspection diff controls](../../web/app-ui/src/components/inspection-diff-controls.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts) | Large-patch performance/memory, selection/AT alternatives, theme screenshots, touch, and engine disposal. |
 | 6 | Files and code | Lazy cached directory tree, roving keyboard navigation, retry/error/empty states, file loading, syntax-aware code view, line/range reveal, Markdown preview, selection/copy, capability-gated desktop open/reveal actions, and a narrow list-to-viewer flow whose tree toggle provides the return path. | [inspection file tree](../../web/app-ui/src/components/inspection-file-tree.ts), [code view](../../web/app-ui/src/components/code-view.ts), [file reveal model](../../web/app-ui/src/components/file-reveal.ts) | Large-tree/file budgets, binary fixtures, engine selection, mobile copy/scroll, visual and AT evidence. |
 | 7 | Terminal | Multiple PTY tabs, create/select/restart/close/exit state, xterm input/paste/copy/selection/search/links/mouse/wheel/resize/IME, offset resume, duplicate-free streaming, OSC 52 confirmation, and renderer disposal. | [terminal panel](../../web/app-ui/src/components/terminal-panel.ts), [terminal view](../../web/app-ui/src/components/terminal-view.ts), [terminal clipboard policy](../../web/app-ui/src/components/terminal-clipboard.ts) | Native clipboard and IME matrices, one/five-terminal budgets, suspend/resume and renderer recreation, AT alternative, touch controls. |
 | 8 | Todos and plan | Current plan snapshot, pending/in-progress/completed/cancelled semantics, progress summary, empty state, and conditional inspection tab. | [todo plan panel](../../web/app-ui/src/components/todo-plan-panel.ts), [todo plan model](../../web/app-ui/src/components/todo-plan-model.ts) | Streaming/stale fixture comparison, responsive screenshots, semantics and live-region verification. |
@@ -303,13 +300,13 @@ xterm input/resize are examples.
 | 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
 | 19 | Integrations | GitHub.com and enterprise host add/remove, configuration status, login/device/callback flows, polling/cancel, disconnect, health/errors, validated navigation, and integration deep links from PR surfaces. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts) | Live multi-host OAuth and re-auth, PWA redirect origins, cancellation/expiry, security and visual/AT evidence. |
 | 20 | About and licensing | Frontend/server/protocol/deployment/connectivity/version data, packaged dependency notices, conditional Slint attribution while shipped, and desktop/PWA capability/revision information. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [generated host schema](../../web/app-ui/src/generated/host.ts) | Packaged offline artifact inspection, final inventories, platform/version screenshots, link and compliance review. |
-| 21 | Desktop integration and web capabilities | Versioned typed host v8, hardened asset/API/SSE gateway, preferences, pickers, clipboard, validated file/HTTPS open, notifications, attention, sleep, focus/visibility/occlusion/window/quit lifecycle, Wry host, direct chrome-free Servo host, and PWA service worker/install/wake-lock/pull-refresh adapters are implemented. | [desktop host](../../crates/trouve-desktop-host/src/lib.rs), [Servo harness](../../crates/trouve-servo-embed-preview/src/main.rs), [Wry preview](../../crates/trouve-app/src/web_preview.rs), [PWA worker](../../web/app-ui/src/pwa/service-worker.ts) | **Gated:** Servo AT actions and complete engine matrix, Wry matrix, host security review, crash/OOM recovery, packaging/signing, six-platform artifacts, production PWA HTTPS/auth/update/deployment, and soak. |
+| 21 | Desktop integration and web capabilities | Versioned typed host v13, hardened asset/API/SSE gateway, preferences, pickers, clipboard, validated file/HTTPS open, notifications, attention, sleep, focus/visibility/occlusion/window lifecycle, exact close-request acknowledgement plus cancel/quit decisions, Wry host, direct chrome-free Servo host, and PWA service worker/install/wake-lock/pull-refresh adapters are implemented. | [desktop host](../../crates/trouve-desktop-host/src/lib.rs), [Servo harness](../../crates/trouve-servo-embed-preview/src/main.rs), [Wry preview](../../crates/trouve-app/src/web_preview.rs), [PWA worker](../../web/app-ui/src/pwa/service-worker.ts) | **Gated:** Servo AT actions and complete engine matrix, Wry matrix, host security review, crash/OOM recovery, packaging/signing, six-platform artifacts, production PWA HTTPS/auth/update/deployment, and soak. |
 
 Surfaces 1–20 are **functionally-ported**. Surface 21 is **gated** because its
-implementation exists but no desktop engine or production PWA deployment may
-be treated as fully qualified without the independent evidence above. ADR 0027
-authorizes a reversible Wry default, but this state does not authorize deleting
-Slint or publishing the PWA.
+implementation exists but Servo or a production PWA deployment may not be
+treated as fully qualified without the independent evidence above. ADR 0028
+already makes Wry/Lit the sole shipping desktop frontend; the remaining gates
+are hardening and alternative-engine/PWA publication gates.
 
 ## Historical detailed implementation record
 
@@ -599,8 +596,8 @@ open.
 - The inspection workspace can select a file and present diff content in the
   shared right-side workflow.
 - The workspace refreshes live while visible, preserves a selected path and
-  the last good diff across refreshes, and exposes checkpoint undo/redo with
-  immediate post-restore refresh and generic failure messages.
+  the last good diff across refreshes, and refreshes immediately after an
+  exact turn-checkpoint restore with generic failure messages.
 - A user-initiated Clipboard API action copies the exact last-good raw patch,
   reports generic success/unavailable/failure feedback, and avoids a legacy
   DOM fallback. The changed-file listbox has one roving tab stop with Arrow
@@ -617,7 +614,7 @@ open.
 **Missing parity and qualification work**
 
 - Complete and verify line numbers, editor selection/copy, expansion,
-  proactive undo/redo boundary state, PR navigation, broader file navigation,
+  checkpoint-restore boundary state, PR navigation, broader file navigation,
   malformed/binary fallbacks, and disposal. Qualify raw-diff Clipboard API
   denial, revocation, and platform behavior.
 - Preserve Slint addition/deletion semantics, gutter and header hierarchy,
@@ -1110,11 +1107,11 @@ remains open.
 - Complete product, workspace, engine, deployment, frontend, protocol, and
   service-worker build revisions; diagnostics; validated links; offline
   notices; full npm license inventory; and conditional attribution rules.
-- Match the existing Slint visual treatment, information hierarchy, link
-  styling, density, selectable/copyable version values, and every theme.
+- Preserve the authoritative Lit/CSS information hierarchy, link styling,
+  density, selectable/copyable version values, and every theme.
 - Verify packaged notices and inventory offline, source/version consistency,
   service-worker revision/update behavior, link capabilities, and attribution
-  in every artifact where Slint remains linked or distributed.
+  in every shipping artifact; retained Slint evidence is historical only.
 - Test keyboard/screen readers, copy/link feedback, narrow layouts, long
   versions/licenses, disconnected states, and desktop/PWA packaged builds.
 
@@ -1129,9 +1126,9 @@ remains open.
   snapshot.
 - The in-process Servo harness pinned to the exact 2026-08-02 nightly at
   revision `35672cc3d4beb768489f5218e73bee7aff0ddb01` exercises that packaged
-  gateway first; Wry is the staged default and also provides an explicit
-  comparison path. Qualification hosts connect to one explicitly selected
-  server. The nested Servo harness structurally cannot
+  gateway as a qualification-only path; Wry hosting Lit is the sole shipping
+  desktop frontend under ADR 0028. Qualification hosts connect to one
+  explicitly selected server. The nested Servo harness structurally cannot
   link or start `trouve-server`, uses temporary storage and host-preference
   directories, and cannot open the default database.
 - A native Wayland smoke run on 2026-08-02 created the window successfully and
@@ -1147,16 +1144,20 @@ remains open.
   attached a concrete opener. The mutation requires exact Origin and Host,
   the ephemeral CSRF credential, a bounded body, and an HTTPS URL without
   credentials or control characters; PWA-kind gateways cannot invoke it.
-- Desktop bridge version 8 includes a single-flight, typed native directory picker
-  behind the same exact Host, Origin, and CSRF boundary. Wry and Servo attach
-  platform dialogs to the application window and restore focus afterward. The
-  capability is advertised only for a local desktop gateway with a concrete
-  picker action and loopback protocol upstream; cancellation returns no path,
-  while PWA and remote deployments remain explicitly unsupported.
+- Desktop bridge version 13 exposes typed, capability-gated directory and file
+  pickers, clipboard images, lifecycle and close coordination, local-file
+  open/reveal, HTTPS navigation, notifications, attention, sleep inhibition,
+  geometry, and visibility. Each capability is advertised only when the app
+  attaches its concrete native action; path-bearing actions additionally
+  require a loopback protocol upstream. Exact Host, Origin, and CSRF checks
+  protect mutations, and unsupported PWA, remote, or host combinations fail
+  closed. Close coordination includes an exact request acknowledgement that
+  disarms the broken-frontend watchdog without choosing cancel or quit; bridge
+  12 and earlier retain their decision-only workflow.
 - The Lit client consumes a typed host/capability abstraction, while the PWA
   uses a separate adapter with no implied native access.
-- The desktop Wry host is the default, with Slint retained as the explicit
-  rollback path.
+- The desktop Wry host is the sole shipping product host. ADR 0028 retired the
+  native Slint rollback; ordinary source rollback remains available.
 
 **Primary Lit/host evidence**
 
@@ -1172,18 +1173,20 @@ remains open.
 - [Wry default and comparison host](../../crates/trouve-app/src/web_preview.rs)
 - [ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md)
 - [ADR 0024](../adr/0024-isolated-servo-embedding-qualification-workspace.md)
+- [ADR 0028](../adr/0028-retire-slint-frontend.md)
 
 **Missing parity and qualification work**
 
-- Complete and qualify the narrow typed bridge for attachment pickers,
-  clipboard images, validated local-file open, notifications, attention, sleep,
-  window/focus/visibility/occlusion, geometry, quit, lifecycle, and crash
-  recovery; qualify the implemented directory picker and HTTPS opener on every
-  target. Do not add
+- Qualify the implemented narrow typed bridge for attachment pickers,
+  clipboard images, validated local-file open/reveal, HTTPS navigation,
+  notifications, attention, sleep, window/focus/visibility, geometry, quit,
+  and lifecycle on every target; complete remaining occlusion and crash-
+  recovery gaps. Do not add
   durable agent state or arbitrary filesystem, shell, URL, git, MCP, tool, or
   Rust invocation to the host boundary.
-- Match the native-dialog/action placement, focus return, progress, warnings,
-  and lifecycle behavior users experience in Slint.
+- Qualify native-dialog/action placement, focus return, progress, warnings,
+  and lifecycle behavior against the current Lit product contract. Historical
+  Slint evidence remains a migration record, not a live rollback contract.
 - Test schema/version mismatch, exact origin/host/path/scheme controls, user
   gestures, DPI, IME, drag/drop, downloads, remote mode, shutdown, crashes,
   restart/recovery, and all supported desktop OS/webview combinations.
@@ -1191,8 +1194,8 @@ remains open.
   native capabilities, renderer recreation, crash/OOM containment, packaging,
   lifecycle, memory/performance budgets, visual parity, and the complete
   platform/display-backend matrix. The direct embedding smoke test is not an
-  engine-promotion result. Complete Wry's independent staged-default
-  qualification before retiring Slint.
+  engine-promotion result. Continue Wry's independent product-host
+  qualification without treating Servo as a promotion or rollback candidate.
 - Finish production PWA HTTPS authentication/deployment, allowed origins,
   service-worker scope/caching rules, OAuth behavior, offline shell, install/
   update behavior, and real phone/tablet/browser qualification. Never expose a
@@ -1200,10 +1203,10 @@ remains open.
   authenticated users, mutation CSRF protection, and deployment security
   headers in front of the protocol.
 
-**Qualification state:** Gated. The typed foundation is not a complete native
-capability implementation. The in-process Servo harness establishes an
-embedding path only; neither Servo, Wry, nor the PWA has passed its platform
-qualification matrix.
+**Qualification state:** Gated. Bridge v13 implements the current typed native
+capability set, but its platform matrix remains incomplete. The in-process
+Servo harness establishes a qualification path only; neither Servo, Wry, nor
+the PWA has passed its platform qualification matrix.
 
 ## Migration-added enhancements
 
@@ -1428,28 +1431,30 @@ reviewable artifact and reviewer/date.
 
 ## Promotion rule
 
-The functional inventory is closed by the source-derived callback manifest
-and the current closure table. That result is rerun in the ordinary Vitest
-suite so adding a new Slint callback without a Lit disposition fails CI.
-Functional closure does not advance any evidence field automatically: failure
-injection, lifecycle, visual, keyboard, accessibility, device, performance,
-memory, security, packaging, and soak results must be recorded independently.
+The historical functional inventory is closed by the retained migration
+callback manifest and closure table. The current Lit regression suite guards
+the shipping product surface. Functional closure does not advance any evidence
+field automatically: failure injection, lifecycle, visual, keyboard,
+accessibility, device, performance, memory, security, packaging, and soak
+results must be recorded independently.
 
-No surface may be treated as parity-qualified, and Slint may not be retired,
-until:
+No surface may be treated as parity-qualified until:
 
 1. every required evidence field has a linked artifact and reviewer;
-2. all five themes preserve the Slint visual/semantic contract;
+2. all five themes preserve the authoritative Lit/CSS visual and semantic
+   contract;
 3. keyboard and accessibility checks pass on the supported matrix;
 4. desktop and mobile-PWA device matrices pass for supported capabilities;
 5. performance, memory, failure, lifecycle, security, packaging, and soak
    budgets pass;
 6. every accepted variation is present in the approved-deviation register;
    and
-7. rollback remains proven until the migration plan explicitly retires it.
+7. product-host recovery and ordinary source rollback paths remain proven.
 
-ADR 0027 separately authorizes the reversible Wry default while this evidence
-is collected. The PWA can be evaluated and released on its own evidence path.
+ADR 0028 supersedes ADR 0027, makes Wry/Lit the sole shipping desktop frontend,
+and retires the native Slint rollback. This ledger tracks continuing product
+qualification rather than gating that completed architecture migration. The
+PWA can be evaluated and released on its own evidence path.
 A later decision to pursue another mobile packaging model requires evidence
 from the initial PWA and, when it changes the load-bearing architecture, a new
 or superseding ADR.

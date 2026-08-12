@@ -47,6 +47,61 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(analyze.paired_runs(runs, "example/model", "apply_patch", "hashline", "local"), [])
         self.assertEqual(len(analyze.paired_runs(runs, "example/model", "apply_patch", "hashline", "external")), 1)
 
+    def test_missing_origin_is_rejected(self):
+        candidate = row("hashline", 1, tokens=50)
+        candidate.pop("origin")
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "runs.jsonl")
+            path.write_text(json.dumps(candidate))
+            with self.assertRaisesRegex(analyze.DataError, "origin must be str"):
+                analyze.load(path)
+
+    def test_unmatched_rows_are_rejected(self):
+        runs = [analyze.Run(**row("hashline", 1, tokens=50))]
+        with self.assertRaisesRegex(analyze.DataError, "not fully paired"):
+            analyze.paired_runs(runs, "example/model", "apply_patch", "hashline", "local")
+
+    def test_corpus_shape_requires_tasks_and_repetitions(self):
+        pairs = [
+            (
+                analyze.Run(**row("apply_patch", run, tokens=100)),
+                analyze.Run(**row("hashline", run, tokens=50)),
+            )
+            for run in range(1, 3)
+        ]
+        self.assertIn("distinct tasks", analyze.corpus_shape_error(pairs, 10, 2))
+
+        repeated = []
+        for task in range(10):
+            baseline = row("apply_patch", 1, tokens=100)
+            candidate = row("hashline", 1, tokens=50)
+            baseline["task"] = candidate["task"] = f"task-{task}"
+            repeated.append((analyze.Run(**baseline), analyze.Run(**candidate)))
+        self.assertIn("independent runs", analyze.corpus_shape_error(repeated, 10, 2))
+
+    def test_report_records_thresholds_and_stale_retries(self):
+        pair = (
+            analyze.Run(**row("apply_patch", 1, tokens=100)),
+            analyze.Run(**{**row("hashline", 1, tokens=50), "stale_retries": 2}),
+        )
+        summary = analyze.summarize([pair])
+        rendered = analyze.report(
+            "example/model",
+            "apply_patch",
+            "hashline",
+            summary,
+            None,
+            "pass",
+            "test",
+            20,
+            10,
+            2,
+            0.05,
+        )
+        self.assertIn("Minimum paired local runs: 20", rendered)
+        self.assertIn("Mean stale retries", rendered)
+        self.assertIn("2.00", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

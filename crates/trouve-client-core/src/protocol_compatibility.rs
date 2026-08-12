@@ -2,29 +2,15 @@
 
 use anyhow::{Result, bail};
 
-/// Require the server to use the same major protocol version and at least the
-/// client's required additive minor version.
+/// Require the server to use the client's exact protocol version.
+///
+/// Generated clients contain closed enums and discriminated unions, so an
+/// otherwise additive schema revision can still add a value they cannot
+/// deserialize. Compatibility must therefore be declared by shipping a client
+/// for that exact schema, not inferred from a shared major version.
 pub fn ensure_compatible_protocol(server: &str, required: &str) -> Result<()> {
-    fn parse(version: &str) -> Option<(u64, u64)> {
-        let (major, minor) = version.split_once('.')?;
-        if minor.contains('.') {
-            return None;
-        }
-        Some((major.parse().ok()?, minor.parse().ok()?))
-    }
-
-    let compatible = match (parse(server), parse(required)) {
-        (Some((server_major, server_minor)), Some((required_major, required_minor))) => {
-            server_major == required_major && server_minor >= required_minor
-        }
-        _ => false,
-    };
-    if !compatible {
-        bail!(
-            "server protocol {server} is incompatible; expected {required} or newer {required_major}.x",
-            required_major =
-                parse(required).map_or("unknown".to_owned(), |(major, _)| major.to_string())
-        );
+    if server != required {
+        bail!("server protocol {server} is incompatible; expected exactly {required}");
     }
     Ok(())
 }
@@ -34,19 +20,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_current_and_newer_compatible_protocols() {
-        ensure_compatible_protocol("3.14", "3.14").unwrap();
-        ensure_compatible_protocol("3.99", "3.14").unwrap();
+    fn accepts_the_exact_required_protocol() {
+        ensure_compatible_protocol("4.0", "4.0").unwrap();
     }
 
     #[test]
-    fn rejects_older_other_major_and_malformed_protocols() {
-        for server in ["3.13", "2.99", "4.0", "unknown", "3.14.1"] {
-            let error = ensure_compatible_protocol(server, "3.14")
+    fn rejects_older_newer_other_major_and_malformed_protocols() {
+        for server in ["3.36", "4.1", "5.0", "unknown", "4.0.1"] {
+            let error = ensure_compatible_protocol(server, "4.0")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(server));
-            assert!(error.contains("3.14 or newer 3.x"));
+            assert!(error.contains("expected exactly 4.0"));
         }
     }
 }

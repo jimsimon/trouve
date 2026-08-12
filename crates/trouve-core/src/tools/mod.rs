@@ -35,6 +35,38 @@ use trouve_providers::ToolSpec;
 pub use edit_strategy::EditStrategy;
 pub use edit_strategy::for_model as edit_strategy_for_model;
 
+/// One session mutation lane that a tool may transfer to a background task.
+///
+/// The engine installs this only for a background `shell` call. The shell
+/// waiter takes ownership after the process starts and holds the write guard
+/// until that process exits or is killed and reaped. If the executor rejects
+/// the call before taking it, the guard is released when the call context is
+/// dropped.
+pub struct BackgroundMutationLease {
+    guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+}
+
+impl std::fmt::Debug for BackgroundMutationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackgroundMutationLease")
+            .field("available", &self.guard.lock().unwrap().is_some())
+            .finish()
+    }
+}
+
+impl BackgroundMutationLease {
+    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        Self {
+            guard: Mutex::new(Some(guard)),
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.guard.lock().unwrap().take()
+    }
+}
+
 /// Execution context: everything a tool may touch. All paths resolve inside
 /// the session worktree.
 #[derive(Debug, Clone, Default)]
@@ -60,6 +92,11 @@ pub struct ToolCtx {
     /// Model-specific editing policy used for both tool advertisement and
     /// execution enforcement.
     pub edit_strategy: EditStrategy,
+    /// Engine-owned session write lease available only to a background shell
+    /// launch. Kept public for `ToolCtx` construction compatibility; custom
+    /// executors must leave it untouched.
+    #[doc(hidden)]
+    pub background_mutation_lease: Option<Arc<BackgroundMutationLease>>,
 }
 
 impl ToolCtx {
@@ -146,6 +183,16 @@ pub trait ToolExecutor: Send + Sync {
     /// Tool specs visible from this context (built-ins + workspace MCP
     /// tools, hence async and context-dependent).
     async fn specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec>;
+    /// Native specs without consulting or launching external MCP servers.
+    ///
+    /// This deliberately fails closed. A custom executor that only implements
+    /// [`Self::specs`] may perform external discovery while building that
+    /// catalog, so callers that disabled bridge tools must not reach it through
+    /// this default. Executors with a trusted static catalog opt in by
+    /// overriding this method.
+    async fn native_specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     /// Execute one call. Long-running implementations must observe
@@ -185,6 +232,10 @@ pub trait ToolExecutor: Send + Sync {
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
+    /// Make every cached or in-flight instance of one user-managed MCP
+    /// server non-reusable, and acknowledge owned process cleanup before
+    /// returning. Custom executors without MCP state safely do nothing.
+    async fn invalidate_mcp_server(&self, _name: &str) {}
 }
 
 /// Inputs for one authenticated GitHub App fetch. Tokens are passed through
@@ -374,6 +425,11 @@ impl LocalToolExecutor {
     }
 
     fn edit_policy_denial(&self, ctx: &ToolCtx, name: &str, args: &Value) -> Option<ToolResult> {
+        if !edit_strategy::benchmark_tool_allowed(ctx.edit_strategy, name) {
+            return Some(ToolResult::error(format!(
+                "{name} is unavailable in an enforced edit-strategy benchmark run"
+            )));
+        }
         if name == "apply_patch_fallback" {
             if ctx.edit_strategy != EditStrategy::EnforceHashline {
                 return Some(ToolResult::error(
@@ -434,17 +490,27 @@ impl ToolExecutor for LocalToolExecutor {
             .cloned()
             .filter_map(|spec| edit_strategy::advertise(ctx.edit_strategy, spec))
             .collect::<Vec<_>>();
-        specs.extend(
-            self.mcp
-                .specs(
-                    ctx.config_dir.as_deref(),
-                    ctx.workspace_root.as_deref(),
-                    &ctx.worktree,
-                    &ctx.cancel,
-                )
-                .await,
-        );
+        if !edit_strategy::is_enforced_benchmark(ctx.edit_strategy) {
+            specs.extend(
+                self.mcp
+                    .specs(
+                        ctx.config_dir.as_deref(),
+                        ctx.workspace_root.as_deref(),
+                        &ctx.worktree,
+                        &ctx.cancel,
+                    )
+                    .await,
+            );
+        }
         specs
+    }
+
+    async fn native_specs(&self, ctx: &ToolCtx) -> Vec<ToolSpec> {
+        self.built_in_specs
+            .iter()
+            .cloned()
+            .filter_map(|spec| edit_strategy::advertise(ctx.edit_strategy, spec))
+            .collect()
     }
 
     fn tool_mutates(&self, name: &str) -> Option<bool> {
@@ -459,6 +525,9 @@ impl ToolExecutor for LocalToolExecutor {
     }
 
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult {
+        if let Some(denial) = self.edit_policy_denial(ctx, name, args) {
+            return denial;
+        }
         if name.starts_with(crate::mcp::TOOL_PREFIX) {
             return match self
                 .mcp
@@ -479,9 +548,6 @@ impl ToolExecutor for LocalToolExecutor {
                 },
                 Err(e) => ToolResult::error(format!("{e:#}")),
             };
-        }
-        if let Some(denial) = self.edit_policy_denial(ctx, name, args) {
-            return denial;
         }
         match self.find(name) {
             Some(tool) => {
@@ -663,11 +729,36 @@ impl ToolExecutor for LocalToolExecutor {
         self.jobs.kill_worktree(worktree).await;
         self.mcp.evict_worktree(worktree).await;
     }
+
+    async fn invalidate_mcp_server(&self, name: &str) {
+        self.mcp.evict_server(name).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SpecsOnlyExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SpecsOnlyExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "external_discovery".into(),
+                description: "would require external discovery".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(&self, _ctx: &ToolCtx, name: &str, _args: &Value) -> ToolResult {
+            ToolResult::error(format!("unknown tool: {name}"))
+        }
+    }
 
     #[test]
     fn path_resolution_rejects_escapes() {
@@ -728,6 +819,17 @@ mod tests {
         assert_eq!(res.status, ToolStatus::Error);
     }
 
+    #[tokio::test]
+    async fn native_specs_fail_closed_for_specs_only_custom_executors() {
+        let ctx = ToolCtx {
+            worktree: std::env::temp_dir(),
+            ..Default::default()
+        };
+
+        assert_eq!(SpecsOnlyExecutor.specs(&ctx).await.len(), 1);
+        assert!(SpecsOnlyExecutor.native_specs(&ctx).await.is_empty());
+    }
+
     #[test]
     fn executor_classifies_hashline_edits_as_mutations() {
         let exec = LocalToolExecutor::default();
@@ -739,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforced_hashline_catalog_retains_create_delete_and_controlled_fallback() {
+    async fn enforced_hashline_catalog_isolates_the_selected_editor() {
         let exec = LocalToolExecutor::default();
         let ctx = ToolCtx {
             worktree: std::env::temp_dir(),
@@ -748,15 +850,17 @@ mod tests {
         };
         let names = spec_names(exec.specs(&ctx).await);
         assert!(names.contains(&"hashline_edit".to_string()));
-        assert!(names.contains(&"write_file".to_string()));
-        assert!(names.contains(&"delete_file".to_string()));
-        assert!(names.contains(&"apply_patch_fallback".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"delete_file".to_string()));
+        assert!(!names.contains(&"apply_patch_fallback".to_string()));
+        assert!(!names.contains(&"shell".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"apply_patch".to_string()));
     }
 
     #[tokio::test]
-    async fn enforced_apply_patch_catalog_hides_alternative_existing_file_editors() {
+    async fn enforced_apply_patch_catalog_isolates_the_selected_editor() {
         let exec = LocalToolExecutor::default();
         let ctx = ToolCtx {
             worktree: std::env::temp_dir(),
@@ -765,8 +869,10 @@ mod tests {
         };
         let names = spec_names(exec.specs(&ctx).await);
         assert!(names.contains(&"apply_patch".to_string()));
-        assert!(names.contains(&"write_file".to_string()));
-        assert!(names.contains(&"delete_file".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"delete_file".to_string()));
+        assert!(!names.contains(&"shell".to_string()));
         assert!(!names.contains(&"hashline_edit".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"apply_patch_fallback".to_string()));
@@ -792,7 +898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforced_hashline_fallback_unlocks_after_repeated_failures() {
+    async fn enforced_hashline_denies_fallback_even_after_repeated_failures() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "old\n").unwrap();
         let exec = LocalToolExecutor::default();
@@ -822,17 +928,17 @@ mod tests {
                 .await;
             assert_eq!(failed.status, ToolStatus::Error);
         }
-        let applied = exec
+        let denied = exec
             .execute(
                 &ctx,
                 "apply_patch_fallback",
                 &serde_json::json!({"input": fallback}),
             )
             .await;
-        assert_eq!(applied.status, ToolStatus::Ok, "{:?}", applied.result);
+        assert_eq!(denied.status, ToolStatus::Error, "{:?}", denied.result);
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
-            "new\n"
+            "old\n"
         );
     }
 
@@ -857,6 +963,26 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("existing.txt")).unwrap(),
             "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_benchmark_denies_mcp_before_dispatch() {
+        let exec = LocalToolExecutor::default();
+        let ctx = ToolCtx {
+            worktree: std::env::temp_dir(),
+            edit_strategy: EditStrategy::EnforceApplyPatch,
+            ..Default::default()
+        };
+        let denied = exec
+            .execute(&ctx, "mcp__example__edit", &serde_json::json!({}))
+            .await;
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(
+            denied.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("benchmark")
         );
     }
 }

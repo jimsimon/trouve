@@ -5,7 +5,7 @@
 //! desired length, with a line-based fallback for languages without a grammar.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Language, Node, Parser};
 
@@ -103,14 +103,26 @@ pub fn syntactic_block_range(
     language: &str,
     start_line: usize,
 ) -> Option<(usize, usize)> {
-    if start_line == 0 || source.trim().is_empty() {
-        return None;
+    let starts = HashSet::from([start_line]);
+    syntactic_block_ranges(source, language, &starts).remove(&start_line)
+}
+
+/// Resolve several block starts with one tree-sitter parse and tree walk.
+/// Hashline batches use this to keep a request with many `N*` operations
+/// linear in the source size rather than reparsing the file for every target.
+pub fn syntactic_block_ranges(
+    source: &str,
+    language: &str,
+    start_lines: &HashSet<usize>,
+) -> HashMap<usize, (usize, usize)> {
+    if start_lines.is_empty() || start_lines.contains(&0) || source.trim().is_empty() {
+        return HashMap::new();
     }
     with_parser(language, |parser| {
         let tree = parser.parse(source.as_bytes(), None)?;
         let root = tree.root_node();
         let mut stack = root.named_children(&mut root.walk()).collect::<Vec<_>>();
-        let mut best: Option<(usize, usize, usize)> = None;
+        let mut best = HashMap::<usize, (usize, usize, usize)>::new();
 
         while let Some(node) = stack.pop() {
             let start = node.start_position();
@@ -120,13 +132,14 @@ pub fn syntactic_block_range(
             } else {
                 end.row + 1
             };
-            if start.row + 1 == start_line && inclusive_end > start_line {
+            let start_line = start.row + 1;
+            if start_lines.contains(&start_line) && inclusive_end > start_line {
                 let candidate = (
                     start.column,
                     inclusive_end,
                     node.end_byte() - node.start_byte(),
                 );
-                let replace = best.is_none_or(|current| {
+                let replace = best.get(&start_line).is_none_or(|current| {
                     candidate.0 < current.0
                         || (candidate.0 == current.0 && candidate.1 > current.1)
                         || (candidate.0 == current.0
@@ -134,7 +147,7 @@ pub fn syntactic_block_range(
                             && candidate.2 > current.2)
                 });
                 if replace {
-                    best = Some(candidate);
+                    best.insert(start_line, candidate);
                 }
             }
 
@@ -142,9 +155,14 @@ pub fn syntactic_block_range(
             stack.extend(node.named_children(&mut cursor));
         }
 
-        best.map(|(_, end, _)| (start_line, end))
+        Some(
+            best.into_iter()
+                .map(|(start, (_, end, _))| (start, (start, end)))
+                .collect(),
+        )
     })
     .flatten()
+    .unwrap_or_default()
 }
 
 thread_local! {
@@ -446,6 +464,14 @@ mod tests {
         assert_eq!(syntactic_block_range(source, "rust", 1), Some((1, 5)));
         assert_eq!(syntactic_block_range(source, "rust", 2), Some((2, 4)));
         assert_eq!(syntactic_block_range(source, "rust", 5), None);
+    }
+
+    #[test]
+    fn syntactic_block_ranges_parse_multiple_starts_together() {
+        let source = "fn one() {\n    work();\n}\n\nfn two() {\n    more();\n}\n";
+        let ranges = syntactic_block_ranges(source, "rust", &HashSet::from([1, 5]));
+        assert_eq!(ranges.get(&1), Some(&(1, 3)));
+        assert_eq!(ranges.get(&5), Some(&(5, 7)));
     }
 
     #[test]

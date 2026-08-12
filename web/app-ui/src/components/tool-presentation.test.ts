@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  isTodoToolCall,
+  TRANSCRIPT_TRUNCATION_NOTICE,
   isSpawnOutputToolCall,
   presentToolCall,
   presentToolDetail,
@@ -13,6 +13,11 @@ import {
 } from "./tool-presentation.js";
 
 describe("tool presentation", () => {
+  it("uses truncation copy that covers omitted transcript messages and matches", () => {
+    expect(TRANSCRIPT_TRUNCATION_NOTICE)
+      .toBe("Additional transcript results were omitted.");
+  });
+
   it("humanizes native, vendor, and MCP identifiers", () => {
     expect(toolDisplayName("search")).toBe("Code Search");
     expect(toolDisplayName("find_related")).toBe("Find Related");
@@ -34,6 +39,50 @@ describe("tool presentation", () => {
       tool: "mcp__trouve__search",
       arguments: { query: "settings panel" },
     })).toBe("Code Search: settings panel");
+  });
+
+  it("shows commands for qualified external MCP shell tools", () => {
+    expect(toolLabel("mcp__remote__execute", { command: "git status --short" }))
+      .toBe("remote: Shell: git status --short");
+    expect(toolLabel("mcpToolCall", {
+      serverName: "ops",
+      toolName: "bash",
+      arguments: { command: "uptime" },
+    })).toBe("ops: Bash: uptime");
+  });
+
+  it("retains the MCP namespace of generic provider wrappers", () => {
+    expect(toolLabel("mcpToolCall", {
+      serverName: "github",
+      toolName: "search",
+      arguments: { query: "issue 42" },
+    })).toBe("github: Code Search: issue 42");
+    expect(toolLabel("dynamicToolCall", {
+      server: "linear",
+      tool: "read_file",
+      arguments: { path: "ENG-42" },
+    })).toBe("linear: Read File: ENG-42");
+    expect(toolLabel("mcpToolCall", {
+      server: "external",
+      tool: "mcp__trouve__search",
+      arguments: { query: "spoofed" },
+    })).toBe("external: Code Search: spoofed");
+
+    expect(presentToolCall("mcpToolCall", {
+      server: "linear",
+      tool: "read_file",
+      arguments: { path: "ENG-42" },
+    })).toMatchObject({
+      title: "linear: Read File: ENG-42",
+      filePath: "",
+    });
+    expect(presentToolDetail("dynamicToolCall", {
+      server: "github",
+      tool: "search",
+      arguments: { query: "issue 42" },
+    }, {
+      results: [{ file_path: "not-a-code-result" }],
+    })).toMatchObject({ kind: "structured" });
   });
 
   it("presents read targets and inclusive line ranges", () => {
@@ -79,7 +128,7 @@ describe("tool presentation", () => {
       content: [{
         type: "text",
         text: JSON.stringify({
-          content: "8:fn answer() -> u32 {\n9:  42\n10:}\n",
+          content: "[src/main.rs#abc123]\n8:fn answer() -> u32 {\n9:  42\n10:}\n",
           format: "hashline",
           snapshot: "abc123",
           truncated: false,
@@ -210,6 +259,49 @@ describe("tool presentation", () => {
     });
   });
 
+  it("caps complete turn transcripts and reports local truncation", () => {
+    const messages = Array.from({ length: 101 }, (_, index) => ({
+      role: "assistant",
+      content: `message ${index}`,
+    }));
+    const detail = presentToolDetail("search_transcript", { turn: 4 }, {
+      messages,
+      truncated: false,
+    });
+    expect(detail).toMatchObject({
+      kind: "transcript",
+      truncated: true,
+    });
+    expect(detail.kind === "transcript" ? detail.messages : []).toHaveLength(100);
+    expect(detail.kind === "transcript" ? detail.messages.at(-1) : undefined)
+      .toEqual({ label: "Assistant", value: "message 99" });
+
+    expect(presentToolDetail("search_transcript", { turn: 4 }, {
+      messages: messages.slice(0, 1),
+      truncated: true,
+    })).toMatchObject({ kind: "transcript", truncated: true });
+
+    const matches = Array.from({ length: 101 }, (_, index) => ({
+      thread_id: "th_1",
+      turn: index,
+      role: "assistant",
+      snippet: `match ${index}`,
+    }));
+    const matchDetail = presentToolDetail("search_transcript", { query: "match" }, {
+      matches,
+      truncated: false,
+    });
+    expect(matchDetail).toMatchObject({ kind: "transcript", truncated: true });
+    expect(matchDetail.kind === "transcript" ? matchDetail.matches : []).toHaveLength(100);
+  });
+
+  it("keeps third-party MCP basename collisions in generic presentation", () => {
+    expect(presentToolDetail("mcp__example__search", { query: "record" }, {
+      results: [{ file_path: "should-not-be-code.ts" }],
+    })).toMatchObject({ kind: "structured" });
+    expect(isSpawnOutputToolCall("mcp__example__spawn_output", {})).toBe(false);
+  });
+
   it("presents pageable Git diffs without exposing the result envelope", () => {
     expect(presentToolDetail("git_diff", {
       base: "main",
@@ -270,6 +362,31 @@ describe("tool presentation", () => {
     });
   });
 
+  it("summarizes multi-file hashline edits without linking only the first file", () => {
+    const presentation = presentToolCall("hashline_edit", {
+      input: "[src/lib.rs#A1B2C3D4E5F6]\nPUT 8:\n+one\n[src/main.rs#010203040506]\nPUT 9:\n+two\n",
+    });
+    expect(presentation).toMatchObject({
+      title: "Edit",
+      subject: "2 files",
+      filePath: "",
+      additions: 2,
+    });
+  });
+
+  it("summarizes multi-file apply-patch fallbacks", () => {
+    const presentation = presentToolCall("apply_patch_fallback", {
+      input: "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: src/new.rs\n+created\n*** End Patch",
+    });
+    expect(presentation).toMatchObject({
+      title: "Edit",
+      subject: "2 files",
+      filePath: "",
+      additions: 2,
+      deletions: 1,
+    });
+  });
+
   it("uses result-backed todo state for the card summary", () => {
     expect(presentToolCall("todo_write", { todos: [{ status: "pending", content: "old" }] }, {
       todos: [
@@ -287,15 +404,17 @@ describe("tool presentation", () => {
     });
   });
 
-  it("recognizes native and wrapped todo tool identifiers", () => {
-    expect(isTodoToolCall("todo_write", {})).toBe(true);
-    expect(isTodoToolCall("TodoWrite", {})).toBe(true);
-    expect(isTodoToolCall("mcp__trouve__todo_write", {})).toBe(true);
-    expect(isTodoToolCall("mcpToolCall", {
-      tool: "mcp__trouve__todo_write",
-      arguments: { todos: [] },
-    })).toBe(true);
-    expect(isTodoToolCall("read_file", {})).toBe(false);
+  it("keeps third-party todo wrappers as ordinary tool cards", () => {
+    expect(presentToolCall("mcpToolCall", {
+      server: "linear",
+      tool: "todo_write",
+      arguments: {
+        todos: [{ status: "completed", content: "Close issue" }],
+      },
+    })).toMatchObject({
+      title: "linear: Todo Write",
+      todos: [],
+    });
   });
 
   it("recognizes native and wrapped child-agent collection calls", () => {

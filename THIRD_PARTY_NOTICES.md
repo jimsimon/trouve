@@ -1,7 +1,7 @@
 # Third-party notices — Rust workspace
 
-This generated inventory covers every third-party package in the locked root
-Cargo workspace graph, including development dependencies. Regenerate it with
+This generated inventory covers every third-party package in the locked root Cargo workspace
+dependency graph, including development dependencies. Regenerate it with
 `python3 scripts/generate_rust_third_party_notices.py` and verify it with
 `python3 scripts/generate_rust_third_party_notices.py --check`.
 

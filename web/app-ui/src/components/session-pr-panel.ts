@@ -20,6 +20,7 @@ import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import type { DiffMode } from "./diff-view.js";
 import { languageForPath } from "./file-language.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import { nextHorizontalTabIndex, rovingTabIndex } from "./tab-navigation.js";
 import "./diff-view.js";
 import "./markdown-view.js";
 import {
@@ -630,20 +631,39 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
       ["commits", "Commits", this.#detail?.commit_count ?? 0],
       ["files", "Files", this.#detail?.changed_files ?? 0],
     ] as const;
+    const selectedIndex = tabs.findIndex(([tab]) => tab === this.#activeTab);
     return html`
       <nav class="pr-tabs" role="tablist" aria-label="Pull request sections">
-        ${tabs.map(([tab, label, count]) => html`
+        ${tabs.map(([tab, label, count], index) => html`
           <button
             id=${`pr-tab-button-${tab}`}
             type="button"
             role="tab"
             aria-selected=${this.#activeTab === tab ? "true" : "false"}
             aria-controls=${`pr-tab-${tab}`}
+            tabindex=${rovingTabIndex(index, selectedIndex, tabs.length)}
+            @keydown=${(event: KeyboardEvent) => this.#selectTabWithKeyboard(event, index, tabs)}
             @click=${() => this.#selectTab(tab)}
           >${label} · ${count}</button>
         `)}
       </nav>
     `;
+  }
+
+  #selectTabWithKeyboard(
+    event: KeyboardEvent,
+    index: number,
+    tabs: readonly (readonly [PrTab, string, number])[],
+  ): void {
+    const target = nextHorizontalTabIndex(event.key, index, tabs.length);
+    if (target === undefined) return;
+    const tab = tabs[target];
+    if (tab === undefined) return;
+    event.preventDefault();
+    this.#selectTab(tab[0]);
+    void this.updateComplete.then(() => {
+      this.querySelectorAll<HTMLButtonElement>('.pr-tabs [role="tab"]')[target]?.focus();
+    });
   }
 
   #selectTab(tab: PrTab): void {

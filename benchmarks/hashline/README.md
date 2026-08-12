@@ -36,8 +36,12 @@ TROUVE_DATA_DIR=/tmp/trouve-edit-bench-hashline \
   TROUVE_EDIT_BENCHMARK_STRATEGY=hashline cargo run -p trouve-app
 ```
 
-The override accepts only `apply_patch` or `hashline`. It is intentionally
-process-wide so one concurrent turn cannot contaminate another arm.
+The override accepts only `apply_patch` or `hashline`; any other value is a
+fatal configuration error. It is intentionally process-wide so one concurrent
+turn cannot contaminate another arm. Enforced benchmark catalogs contain only
+read-only inspection tools and the selected editor. Shell, MCP, direct
+write/delete, and fallback editors are hidden and denied, so acceptance tests
+must run in the external benchmark driver rather than through the model.
 
 ## JSON Lines format
 
@@ -64,10 +68,13 @@ python3 benchmarks/hashline/analyze.py results.jsonl \
   --candidate hashline
 ```
 
-The default gate requires 20 paired local runs, no candidate correctness/test/
+The default gate requires 20 paired local runs comprising at least ten distinct
+tasks and two independent runs of every task, no candidate correctness/test/
 concurrency failures, no correctness regression, and either at least a 5%
-median token reduction or no token increase plus fewer retries. It also reports
-median and p95 executor latency. A passing report is evidence for adding a
+median token reduction or no token increase plus fewer retries. Every row must
+declare its evidence origin, and either arm missing from a pair invalidates the
+input instead of being discarded. The report records the exact gate thresholds,
+stale retries, and median/p95 executor latency. A passing report is evidence for adding a
 model to `BENCHMARKED_HASHLINE_PROFILES`; it is not an automatic source edit.
 
 Run the analyzer tests with:

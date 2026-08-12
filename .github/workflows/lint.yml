@@ -41,8 +41,13 @@ jobs:
         run: >-
           python3 scripts/generate_rust_third_party_notices.py
           --check --sbom target/compliance/rust-sbom.cdx.json
+      - name: Rust notice and SBOM generator tests
+        run: python3 -m unittest scripts/test_generate_rust_third_party_notices.py
       - name: benchmark gate tests
         run: python3 -m unittest benchmarks/test_compare_benchmarks.py
+      - name: hashline analyzer tests
+        working-directory: benchmarks/hashline
+        run: python3 -m unittest test_analyze.py
       # The test-with-model job in test.yml runs ignored tests from these two
       # crates, so an #[ignore]d test anywhere else would silently never run.
       # Keep them there, or widen that job's scope on purpose.

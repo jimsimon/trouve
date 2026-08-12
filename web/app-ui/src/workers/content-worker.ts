@@ -4,39 +4,31 @@ import { rankComposerCompletions } from "../components/composer-completion.js";
 import { parseUnifiedDiff } from "../components/diff-parser.js";
 import { filterFuzzyTextItems } from "../services/fuzzy-ranking.js";
 import { renderMarkdownDirect } from "../services/markdown-renderer.js";
-import type {
+import {
   ContentWorkerRequest,
-  ContentWorkerResponse,
-  ContentWorkerResult,
+  type ContentWorkerResponse,
+  type ContentWorkerResult,
+  validateContentWorkerRequest,
 } from "./content-worker-protocol.js";
 import { highlightSource } from "./source-highlighter.js";
 
 declare const self: DedicatedWorkerGlobalScope;
 
-const MAX_SOURCE_UNITS = 4 * 1024 * 1024;
-const MAX_FUZZY_ITEMS = 10_000;
-
-const boundedSource = (source: string): string => {
-  if (source.length > MAX_SOURCE_UNITS) throw new Error("content exceeds worker bounds");
-  return source;
-};
-
 const processRequest = async (
   request: ContentWorkerRequest,
 ): Promise<ContentWorkerResult> => {
+  validateContentWorkerRequest(request);
   switch (request.type) {
     case "markdown":
-      return renderMarkdownDirect(boundedSource(request.source));
+      return renderMarkdownDirect(request.source);
     case "diff":
-      return parseUnifiedDiff(boundedSource(request.source));
+      return parseUnifiedDiff(request.source);
     case "composer-fuzzy":
-      if (request.candidates.length > MAX_FUZZY_ITEMS) throw new Error("too many fuzzy candidates");
       return rankComposerCompletions(request.candidates, request.query, request.limit);
     case "palette-fuzzy":
-      if (request.items.length > MAX_FUZZY_ITEMS) throw new Error("too many fuzzy candidates");
       return filterFuzzyTextItems(request.items, request.query);
     case "highlight":
-      return highlightSource(boundedSource(request.source), request.language);
+      return highlightSource(request.source, request.language);
   }
 };
 

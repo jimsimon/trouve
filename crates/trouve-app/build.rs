@@ -135,6 +135,8 @@ fn generate_web_assets() {
             Some("js" | "mjs") => "text/javascript; charset=utf-8",
             Some("css") => "text/css; charset=utf-8",
             Some("json" | "webmanifest") => "application/json; charset=utf-8",
+            Some("map") => "application/json; charset=utf-8",
+            Some("wasm") => "application/wasm",
             Some("svg") => "image/svg+xml",
             Some("png") => "image/png",
             Some("ico") => "image/x-icon",

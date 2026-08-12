@@ -2,6 +2,8 @@ import { utf8Length, utf8Prefix } from "../services/utf8-text.js";
 import type { FontAwesomeIconName } from "./font-awesome-icon.js";
 import { todoStatusIcon } from "./todo-plan-model.js";
 
+export const TRANSCRIPT_TRUNCATION_NOTICE = "Additional transcript results were omitted.";
+
 export type ToolDiffLineKind = "separator" | "context" | "add" | "delete";
 
 export interface ToolDiffLine {
@@ -204,34 +206,59 @@ const firstString = (source: JsonRecord, keys: readonly string[]): string | unde
 
 const baseToolName = (tool: string): string => tool.split("__").at(-1) ?? tool;
 
-const effectiveToolCall = (
+const normalizedToolIdentifier = (tool: string): string =>
+  tool.replaceAll(/[^a-z0-9]/giu, "").toLowerCase();
+
+const isGenericToolWrapper = (tool: string): boolean => {
+  const normalized = normalizedToolIdentifier(tool);
+  return normalized === "mcptoolcall" || normalized === "dynamictoolcall";
+};
+
+/** Resolve provider wrapper calls without dropping their MCP server identity.
+ * A qualified identifier is the common input for labels, rich presentation,
+ * suppression, and activity classification. */
+export const effectiveToolCall = (
   tool: string,
-  args: JsonRecord,
+  argsValue: unknown,
 ): { readonly tool: string; readonly args: JsonRecord } => {
-  const normalized = tool.replaceAll(/[^a-z0-9]/giu, "").toLowerCase();
-  if (normalized !== "mcptoolcall" && normalized !== "dynamictoolcall") {
+  const args = record(argsValue) ?? {};
+  if (!isGenericToolWrapper(tool)) {
     return { tool, args };
   }
   const nestedTool = firstString(args, ["tool", "toolName", "name"]);
   const nestedArgs = record(args.arguments) ?? args;
-  return { tool: nestedTool ?? tool, args: nestedArgs };
+  const server = firstString(args, ["server", "serverName", "mcpServer", "mcpServerName"])
+    ?.trim();
+  if (nestedTool === undefined) return { tool, args: nestedArgs };
+  if (server === undefined || server === "") return { tool: nestedTool, args: nestedArgs };
+  const nestedName = nestedTool.startsWith("mcp__")
+    ? nestedTool.slice(5).split("__").slice(1).join("__")
+    : nestedTool;
+  return {
+    tool: `mcp__${server}__${nestedName}`,
+    args: nestedArgs,
+  };
 };
 
-/** Dedicated TODO lifecycle rows supersede the low-level tool card once the
- * server has projected the list transition. Keep this matcher aligned with
- * the native and wrapped tool identifiers accepted by `presentToolCall`. */
-export const isTodoToolCall = (tool: string, argsValue: unknown): boolean => {
+/** Whether a tool identifier belongs to the built-in/native catalog. MCP
+ * basenames are not globally unique, so only the trouve MCP namespace may
+ * opt into built-in presentation and suppression behavior. */
+export const isFirstPartyToolCall = (tool: string, argsValue: unknown): boolean => {
   const effective = effectiveToolCall(tool, record(argsValue) ?? {});
-  const normalized = baseToolName(effective.tool)
-    .replaceAll(/[^a-z0-9]/giu, "")
-    .toLowerCase();
-  return normalized === "todowrite";
+  if (effective.tool.startsWith("mcp__")) {
+    return effective.tool.startsWith("mcp__trouve__");
+  }
+  // An unqualified native identifier is first-party. An unqualified name
+  // extracted from a generic provider wrapper is ambiguous and must not opt
+  // into built-in rendering or suppression.
+  return !isGenericToolWrapper(tool);
 };
 
 /** `spawn_output` is model-side collection/polling plumbing. The durable
  * subagent node and thread own its user-visible status and response, so a
  * second low-level tool row would duplicate the same work. */
 export const isSpawnOutputToolCall = (tool: string, argsValue: unknown): boolean => {
+  if (!isFirstPartyToolCall(tool, argsValue)) return false;
   const effective = effectiveToolCall(tool, record(argsValue) ?? {});
   const normalized = baseToolName(effective.tool)
     .replaceAll(/[^a-z0-9]/giu, "")
@@ -271,7 +298,7 @@ const titleArgument = (text: string): string => {
 export const toolLabel = (tool: string, argsValue: unknown): string => {
   const rawArgs = record(argsValue) ?? {};
   const effective = effectiveToolCall(tool, rawArgs);
-  const command = ["shell", "Bash", "bash", "execute"].includes(effective.tool)
+  const command = ["shell", "Bash", "bash", "execute"].includes(baseToolName(effective.tool))
     ? stringValue(effective.args.command)
     : undefined;
   const display = toolDisplayName(effective.tool);
@@ -433,19 +460,28 @@ const patchDiff = (patch: string): ToolDiffLine[] => {
 
 interface EditPresentation {
   readonly verb: "Edit" | "Write";
-  readonly path: string;
+  readonly paths: readonly string[];
   readonly lines: readonly ToolDiffLine[];
 }
 
-const hashlineSectionPath = (input: string): string | undefined => {
-  const header = input.split("\n", 1)[0]?.trim();
-  if (header === undefined || !header.startsWith("[") || !header.endsWith("]")) return undefined;
-  const inner = header.slice(1, -1);
-  const separator = inner.lastIndexOf("#");
-  if (separator <= 0) return undefined;
-  const snapshot = inner.slice(separator + 1);
-  if (!/^[0-9a-f]{12}$/iu.test(snapshot)) return undefined;
-  return inner.slice(0, separator);
+const patchPaths = (base: string, patch: string): readonly string[] => {
+  const paths: string[] = [];
+  const add = (path: string): void => {
+    const normalized = path.trim();
+    if (normalized !== "" && !paths.includes(normalized)) paths.push(normalized);
+  };
+  if (base === "hashline_edit") {
+    for (const match of patch.matchAll(/^\[([^\]\n]+)#[0-9a-f]{12}\]$/gimu)) {
+      if (match[1] !== undefined) add(match[1]);
+    }
+  }
+  for (const match of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gmu)) {
+    if (match[1] !== undefined) add(match[1]);
+  }
+  for (const match of patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gmu)) {
+    if (match[2] !== undefined) add(match[2]);
+  }
+  return paths;
 };
 
 const editPresentation = (tool: string, args: JsonRecord): EditPresentation | undefined => {
@@ -459,12 +495,13 @@ const editPresentation = (tool: string, args: JsonRecord): EditPresentation | un
       : undefined;
   if (verb === undefined) return undefined;
   const patch = firstString(args, ["diff", "patch", "unified_diff", "unifiedDiff", "input"]);
-  const path = firstString(args, ["file_path", "path", "abs_path", "target_file", "filePath"])
-    ?? (base === "hashline_edit" && patch !== undefined ? hashlineSectionPath(patch) : undefined)
-    ?? "";
+  const explicitPath = firstString(args, ["file_path", "path", "abs_path", "target_file", "filePath"]);
+  const paths = explicitPath === undefined
+    ? patch === undefined ? [] : patchPaths(base, patch)
+    : [explicitPath];
   if (patch !== undefined) {
     const lines = patchDiff(patch);
-    if (lines.length > 0) return { verb, path, lines };
+    if (lines.length > 0) return { verb, paths, lines };
   }
 
   const pair = (value: unknown): readonly [string, string, number] | undefined => {
@@ -493,7 +530,7 @@ const editPresentation = (tool: string, args: JsonRecord): EditPresentation | un
     if (index > 0) lines.push(diffLine("separator", 0, 0, "···"));
     lines.push(...snippetDiff(oldText, newText, start));
   }
-  return { verb, path, lines };
+  return { verb, paths, lines };
 };
 
 const readRange = (args: JsonRecord): readonly [number, number] => {
@@ -707,6 +744,7 @@ const decodedReadSource = (
   }
   const rows = raw.split("\n");
   if (rows.at(-1) === "") rows.pop();
+  if (/^\[[^\n]+#[A-Za-z0-9]+\]$/u.test(rows[0] ?? "")) rows.shift();
   const decoded = rows.map((row) => /^(\d+):(.*)$/u.exec(row));
   if (decoded.some((match) => match === null)) {
     return { content: raw.endsWith("\n") ? raw.slice(0, -1) : raw, startLine: requestedReadStart(args) };
@@ -762,8 +800,9 @@ const transcriptPresentation = (
     detailField("Thread", args.thread_id, { code: true }),
     detailField("Turn", args.turn),
   ].filter((field): field is ToolDetailField => field !== undefined);
-  const matches = Array.isArray(result.matches)
-    ? result.matches.slice(0, 100).flatMap((value): readonly ToolTranscriptMatchDetail[] => {
+  const resultMatches = Array.isArray(result.matches) ? result.matches : [];
+  const matches = resultMatches
+    .slice(0, 100).flatMap((value): readonly ToolTranscriptMatchDetail[] => {
         const row = record(value);
         if (row === undefined) return [];
         return [{
@@ -773,23 +812,25 @@ const transcriptPresentation = (
           timestamp: stringValue(row.ts) ?? "",
           snippet: stringValue(row.snippet) ?? "",
         }];
-      })
-    : [];
-  const messages = Array.isArray(result.messages)
-    ? result.messages.slice(0, 100).flatMap((value): readonly ToolDetailField[] => {
+      });
+  const resultMessages = Array.isArray(result.messages) ? result.messages : [];
+  const messages = resultMessages
+    .slice(0, 100)
+    .flatMap((value): readonly ToolDetailField[] => {
         const row = record(value);
         if (row === undefined) return [];
         const role = stringValue(row.role) ?? "message";
         const body = firstString(row, ["content", "args"]) ?? compactDetailText(row, 2_000);
         return [{ label: role.replace(/^./u, (character) => character.toUpperCase()), value: body }];
-      })
-    : [];
+      });
   return {
     kind: "transcript",
     inputs,
     matches,
     messages,
-    truncated: booleanValue(result.truncated),
+    truncated: booleanValue(result.truncated)
+      || resultMatches.length > 100
+      || resultMessages.length > 100,
   };
 };
 
@@ -803,10 +844,11 @@ export const presentToolDetail = (
   const rawArgs = record(argsValue) ?? {};
   const effective = effectiveToolCall(tool, rawArgs);
   const normalized = normalizedToolName(effective.tool);
+  const firstParty = isFirstPartyToolCall(tool, argsValue);
   const result = resolvedToolResult(resultValue);
   const resultRecord = record(result);
 
-  if (["read", "readfile"].includes(normalized)) {
+  if (firstParty && ["read", "readfile"].includes(normalized)) {
     const source = resultRecord === undefined
       ? typeof result === "string"
         ? {
@@ -834,7 +876,7 @@ export const presentToolDetail = (
     }
   }
 
-  if (["search", "findrelated"].includes(normalized) && resultRecord !== undefined) {
+  if (firstParty && ["search", "findrelated"].includes(normalized) && resultRecord !== undefined) {
     return {
       kind: "search",
       inputs: searchInputs(effective.tool, effective.args),
@@ -843,7 +885,7 @@ export const presentToolDetail = (
     };
   }
 
-  if (normalized === "grep" && resultRecord !== undefined && Array.isArray(resultRecord.matches)) {
+  if (firstParty && normalized === "grep" && resultRecord !== undefined && Array.isArray(resultRecord.matches)) {
     const matches = resultRecord.matches.slice(0, 200).flatMap((value): readonly ToolMatchDetail[] => {
       const row = record(value);
       const path = row === undefined ? undefined : firstString(row, ["path", "file_path"]);
@@ -862,7 +904,7 @@ export const presentToolDetail = (
     };
   }
 
-  if (["glob", "listdir"].includes(normalized) && resultRecord !== undefined) {
+  if (firstParty && ["glob", "listdir"].includes(normalized) && resultRecord !== undefined) {
     const files = Array.isArray(resultRecord.files)
       ? resultRecord.files.filter((value): value is string => typeof value === "string")
       : Array.isArray(resultRecord.entries)
@@ -885,8 +927,11 @@ export const presentToolDetail = (
   }
 
   if (
-    ["shell", "bash", "execute", "commandexecution", "shelloutput", "shellkill"].includes(normalized)
-    || resultRecord !== undefined && (typeof resultRecord.stdout === "string" || typeof resultRecord.stderr === "string")
+    firstParty && (
+      ["shell", "bash", "execute", "commandexecution", "shelloutput", "shellkill"].includes(normalized)
+      || resultRecord !== undefined
+        && (typeof resultRecord.stdout === "string" || typeof resultRecord.stderr === "string")
+    )
   ) {
     const output = resultRecord ?? {};
     return {
@@ -909,7 +954,7 @@ export const presentToolDetail = (
     };
   }
 
-  if (normalized === "webfetch" && resultRecord !== undefined && typeof resultRecord.content === "string") {
+  if (firstParty && normalized === "webfetch" && resultRecord !== undefined && typeof resultRecord.content === "string") {
     const content = resultRecord.content;
     return {
       kind: "document",
@@ -925,7 +970,7 @@ export const presentToolDetail = (
     };
   }
 
-  if (normalized === "gitdiff" && resultRecord !== undefined && typeof resultRecord.diff === "string") {
+  if (firstParty && normalized === "gitdiff" && resultRecord !== undefined && typeof resultRecord.diff === "string") {
     const nextOffset = numberValue(resultRecord.next_offset);
     const totalBytes = numberValue(resultRecord.total_bytes);
     return {
@@ -943,7 +988,7 @@ export const presentToolDetail = (
     };
   }
 
-  if (normalized === "searchtranscript" && resultRecord !== undefined) {
+  if (firstParty && normalized === "searchtranscript" && resultRecord !== undefined) {
     return transcriptPresentation(effective.args, resultRecord);
   }
 
@@ -966,7 +1011,8 @@ export const presentToolCall = (
   const rawArgs = record(argsValue) ?? {};
   const effective = effectiveToolCall(tool, rawArgs);
   const base = baseToolName(effective.tool);
-  if (base === "todo_write" || base === "TodoWrite") {
+  const firstParty = isFirstPartyToolCall(tool, argsValue);
+  if (firstParty && (base === "todo_write" || base === "TodoWrite")) {
     const todos = todoRows(effective.args, resultValue);
     if (todos.length > 0) {
       const done = todos.filter((todo) => todo.status === "completed" || todo.status === "cancelled").length;
@@ -980,9 +1026,10 @@ export const presentToolCall = (
     }
   }
 
-  const edit = editPresentation(effective.tool, effective.args);
+  const edit = firstParty ? editPresentation(effective.tool, effective.args) : undefined;
   if (edit !== undefined) {
     const fullLines = edit.lines;
+    const path = edit.paths.length === 1 ? edit.paths[0] ?? "" : "";
     const additions = fullLines.filter((line) => line.kind === "add").length;
     const deletions = fullLines.filter((line) => line.kind === "delete").length;
     const diff = fullLines.length <= 300
@@ -990,16 +1037,20 @@ export const presentToolCall = (
       : [...fullLines.slice(0, 300), diffLine("separator", 0, 0, `… ${fullLines.length - 300} more lines`)];
     return {
       ...emptyPresentation(edit.verb),
-      subject: edit.path.split(/[\\/]/u).at(-1) ?? "",
-      filePath: edit.path,
+      subject: edit.paths.length > 1
+        ? `${edit.paths.length} files`
+        : path.split(/[\\/]/u).at(-1) ?? "",
+      filePath: path,
       additions,
       deletions,
       diff,
     };
   }
 
-  const isRead = ["Read", "read", "read_file"].includes(effective.tool)
-    || ["Read", "read", "read_file"].includes(base);
+  const isRead = firstParty && (
+    ["Read", "read", "read_file"].includes(effective.tool)
+    || ["Read", "read", "read_file"].includes(base)
+  );
   const path = isRead
     ? firstString(effective.args, ["file_path", "path"]) ?? ""
     : "";

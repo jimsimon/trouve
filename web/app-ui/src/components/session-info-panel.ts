@@ -812,6 +812,33 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
     }
     if (subagentResult.status === "fulfilled") {
       this.#subagents = subagentResult.value;
+      const childSessionIds = [...new Set(
+        subagentResult.value
+          .map((child) => child.session_id)
+          .filter((childSessionId) => childSessionId !== ""),
+      )];
+      const statusResults = await Promise.all(childSessionIds.map(async (childSessionId) => {
+        try {
+          return {
+            childSessionId,
+            statuses: await services.protocol.threadStatuses(childSessionId),
+          };
+        } catch {
+          return { childSessionId, statuses: undefined };
+        }
+      }));
+      if (
+        generation !== this.#generation
+        || sessionId !== this.#effectiveSessionId
+        || threadId !== this.#effectiveThreadId
+      ) return;
+      for (const result of statusResults) {
+        if (result.statuses === undefined) {
+          this.#subagentError = "Some subagent statuses could not be loaded.";
+          continue;
+        }
+        store?.replaceThreadStatusesForSession(result.childSessionId, result.statuses);
+      }
     } else {
       this.#subagentError = "The complete subagent list could not be loaded.";
     }

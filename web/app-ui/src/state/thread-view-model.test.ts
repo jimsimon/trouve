@@ -130,7 +130,7 @@ describe("ThreadViewModel", () => {
     }).toEqual(fixture.expected);
   });
 
-  it("keeps steering as a top-level boundary without splitting active thought output", () => {
+  it("keeps steering as a top-level causal boundary between thought output", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -168,7 +168,7 @@ describe("ThreadViewModel", () => {
       {
         kind: "thinking",
         turn: 3,
-        content: "Following the original direction. Continue with the revised direction.",
+        content: "Following the original direction.",
         complete: true,
       },
       {
@@ -176,6 +176,12 @@ describe("ThreadViewModel", () => {
         turn: 3,
         content: "Prioritize the narrow layout.",
         attachments: [],
+      },
+      {
+        kind: "thinking",
+        turn: 3,
+        content: " Continue with the revised direction.",
+        complete: true,
       },
     ]);
   });
@@ -358,6 +364,68 @@ describe("ThreadViewModel", () => {
       kind: "tool",
       durationMs: 7,
     });
+  });
+
+  it("excludes approval wait from fallback tool duration", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "tool.requested",
+      turn: 1,
+      call_id: "approved",
+      tool: "shell",
+      args: { command: "true" },
+      requires_approval: true,
+    }, "2026-08-01T12:00:00.000Z"));
+    view.apply(envelope(2, {
+      type: "approval.resolved",
+      call_id: "approved",
+      decision: "approve",
+    }, "2026-08-01T12:00:10.000Z"));
+    view.apply(envelope(3, {
+      type: "tool.completed",
+      call_id: "approved",
+      status: "ok",
+      result: {},
+    }, "2026-08-01T12:00:10.250Z"));
+    expect(view.findTool("approved")).toMatchObject({ durationMs: 250 });
+  });
+
+  it("matches canonical cancellation by removing the active turn shell", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "test/model",
+    }));
+    view.apply(envelope(2, { type: "turn.cancelled", turn: 3 }));
+    expect(view.turnRunning).toBe(false);
+    expect(view.items).toEqual([]);
+    expect(view.totalItems).toBe(0);
+  });
+
+  it("closes thinking at tool and steering causal boundaries", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before tool" }));
+    view.apply(envelope(2, {
+      type: "tool.requested",
+      turn: 2,
+      call_id: "read",
+      tool: "read_file",
+      args: {},
+      requires_approval: false,
+    }));
+    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "after tool" }));
+    view.apply(envelope(4, {
+      type: "turn.steered",
+      turn: 2,
+      content: "new direction",
+      attachments: [],
+    }));
+    view.apply(envelope(5, { type: "assistant.thinking", turn: 2, text: "after steer" }));
+    expect(view.items.map((item) => item.kind)).toEqual([
+      "thinking", "tool", "thinking", "steered", "thinking",
+    ]);
   });
 
   it("restores a completed compaction boundary from a folded snapshot", () => {
@@ -570,7 +638,7 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
-  it("keeps one explicitly bounded thought intact across an interleaved tool request", () => {
+  it("uses an interleaved tool request as a thought boundary", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "assistant.thinking",
@@ -598,7 +666,12 @@ describe("ThreadViewModel", () => {
     expect(vm.items.filter((item) => item.kind === "thinking")).toMatchObject([
       {
         kind: "thinking",
-        content: "The final overlap pass is still running.",
+        content: "The final overlap pass is still",
+        complete: true,
+      },
+      {
+        kind: "thinking",
+        content: " running.",
         complete: true,
       },
     ]);
@@ -860,6 +933,36 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("tracks queue projection changes for the lifetime of a pending submission", () => {
+    const vm = new ThreadViewModel();
+    const queueRevision = vm.trackQueueRevision();
+    const queued = {
+      id: "queued-delayed-response",
+      thread_id: "th_1",
+      position: 1,
+      content: "same text as an older prompt",
+      created_at: "2026-08-01T12:00:00Z",
+      attachments: [],
+    };
+
+    vm.apply(envelope(1, { type: "thread.queue_updated", prompts: [queued] }));
+    vm.apply(envelope(2, { type: "thread.queue_updated", prompts: [] }));
+    expect(queueRevision.queueChanged()).toBe(true);
+
+    // The HTTP send response can arrive here. Its stable id remains recorded
+    // until the request owner explicitly closes the tracker.
+    vm.apply(envelope(3, {
+      type: "user.message",
+      turn: 4,
+      content: queued.content,
+      attachments: [],
+    }));
+    expect(vm.queue).toEqual([]);
+    expect(queueRevision.queueChanged()).toBe(true);
+    queueRevision.close();
+    expect(queueRevision.queueChanged()).toBe(false);
+  });
+
   it("marks an unfinished compaction stopped when normal output resumes", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, { type: "thread.compaction_started", turn: 2 }));
@@ -979,11 +1082,10 @@ describe("ThreadViewModel", () => {
     expect(replay.items).toEqual(live.items);
     expect(replay.cursor).toBe(live.cursor);
     expect(replay.turnRunning).toBe(false);
-    expect(replay.items.find((item) => item.kind === "turn-status"))
-      .toMatchObject({ state: { kind: "cancelled" } });
+    expect(replay.items.find((item) => item.kind === "turn-status")).toBeUndefined();
   });
 
-  it("keeps cancellation as an explicit interrupted terminal state", () => {
+  it("removes a cancelled turn shell to match canonical snapshots", () => {
     const vm = new ThreadViewModel();
     vm.apply(
       envelope(
@@ -1000,9 +1102,7 @@ describe("ThreadViewModel", () => {
       ),
     );
 
-    expect(vm.items).toMatchObject([
-      { kind: "turn-status", turn: 9, state: { kind: "cancelled" } },
-    ]);
+    expect(vm.items).toEqual([]);
     expect(vm.turnDurationMs.get(9)).toBe(1_250);
     expect(vm.turnRunning).toBe(false);
   });

@@ -16,6 +16,7 @@ mod web_preview_support;
 
 use std::cell::RefCell;
 use std::fs::File;
+use std::future::Future;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -29,9 +30,9 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use trouve_desktop_host::{
-    FrontendSource, HostLifecycleHandle, HostNativeActions, LocalFileAction,
+    CloseDecision, FrontendSource, HostLifecycleHandle, HostNativeActions, LocalFileAction,
     MAX_NATIVE_ATTACHMENT_BYTES, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS,
     NativeAttachment, NativeNotification, WindowGeometry,
 };
@@ -47,10 +48,129 @@ enum AppEvent {
     PickFiles(FilePickerReply),
     NativePickerClosed,
     RequestAttention,
+    CloseRequestAcknowledged {
+        request_id: u64,
+    },
+    CloseDecisionApplied {
+        request_id: u64,
+        decision: CloseDecision,
+    },
     QuitNow,
 }
 
 const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
+const CLOSE_CONFIRMATION_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct CloseConfirmationWatchdog {
+    request_id: Option<u64>,
+    deadline: Option<Instant>,
+}
+
+impl CloseConfirmationWatchdog {
+    /// Arm the first close request. A request while one is still pending is
+    /// the native escape hatch and must close immediately.
+    fn begin(&mut self, request_id: u64, now: Instant) -> bool {
+        if self.request_id.is_some() {
+            return true;
+        }
+        self.request_id = Some(request_id);
+        self.deadline = Some(now + CLOSE_CONFIRMATION_GRACE);
+        false
+    }
+
+    /// Apply only the decision for the currently pending native request.
+    /// `quit_when_idle` keeps the request active for a later `quit_now` while
+    /// disarming automatic timeout; cancel makes the next native close fresh.
+    fn resolve(&mut self, request_id: u64, decision: CloseDecision) -> bool {
+        if self.request_id != Some(request_id) {
+            return false;
+        }
+        match decision {
+            CloseDecision::Cancel => {
+                self.request_id = None;
+                self.deadline = None;
+                false
+            }
+            CloseDecision::QuitWhenIdle => {
+                self.deadline = None;
+                false
+            }
+            CloseDecision::QuitNow => true,
+        }
+    }
+
+    /// Acknowledgement means the typed frontend owns the confirmation UI. It
+    /// disarms only the matching watchdog without choosing a close decision.
+    fn acknowledge(&mut self, request_id: u64) -> bool {
+        if self.request_id != Some(request_id) {
+            return false;
+        }
+        self.deadline = None;
+        true
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+/// Serialize and coalesce native geometry writes. The worker is drained at
+/// shutdown so no earlier detached write can overwrite the final rectangle.
+async fn run_geometry_persistence_worker<F, Fut, E>(
+    mut receiver: watch::Receiver<Option<WindowGeometry>>,
+    mut persist: F,
+) -> Result<(), E>
+where
+    F: FnMut(WindowGeometry) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut latest_error = None;
+    while receiver.changed().await.is_ok() {
+        let Some(next) = receiver.borrow_and_update().clone() else {
+            continue;
+        };
+        match persist(next).await {
+            Ok(()) => latest_error = None,
+            Err(error) => {
+                tracing::warn!(%error, "persisting desktop window geometry failed");
+                latest_error = Some(error);
+            }
+        }
+    }
+    match latest_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// One event loop can have both a geometry debounce and a close watchdog.
+/// Always wait for the earliest pending deadline: assigning either deadline
+/// directly can postpone the watchdog, while switching to `Wait` after a
+/// geometry flush can lose it entirely.
+fn pending_event_deadline(
+    geometry_save_deadline: Option<Instant>,
+    close_confirmation_deadline: Option<Instant>,
+) -> Option<Instant> {
+    geometry_save_deadline
+        .into_iter()
+        .chain(close_confirmation_deadline)
+        .min()
+}
+
+fn control_flow_for_pending_deadlines(
+    geometry_save_deadline: Option<Instant>,
+    close_confirmation_deadline: Option<Instant>,
+) -> ControlFlow {
+    pending_event_deadline(geometry_save_deadline, close_confirmation_deadline)
+        .map(ControlFlow::WaitUntil)
+        .unwrap_or(ControlFlow::Wait)
+}
 
 #[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
@@ -71,6 +191,8 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let directory_proxy = event_loop.create_proxy();
     let file_proxy = event_loop.create_proxy();
     let quit_proxy = event_loop.create_proxy();
+    let close_acknowledgement_proxy = event_loop.create_proxy();
+    let close_decision_proxy = event_loop.create_proxy();
     let attention_proxy = event_loop.create_proxy();
     let lifecycle = HostLifecycleHandle::default();
     let notification_lifecycle = lifecycle.clone();
@@ -81,6 +203,19 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         // Tao exposes focus and foreground transitions but no desktop
         // occlusion event, so that capability remains explicitly false.
         .with_lifecycle_capabilities(lifecycle.clone(), true, false)
+        .with_close_acknowledgement_observer(move |request_id| {
+            close_acknowledgement_proxy
+                .send_event(AppEvent::CloseRequestAcknowledged { request_id })
+                .map_err(|_| "desktop event loop is unavailable".to_string())
+        })
+        .with_close_decision_observer(move |request_id, decision| {
+            close_decision_proxy
+                .send_event(AppEvent::CloseDecisionApplied {
+                    request_id,
+                    decision,
+                })
+                .map_err(|_| "desktop event loop is unavailable".to_string())
+        })
         .with_quit_handler(move || {
             quit_proxy
                 .send_event(AppEvent::QuitNow)
@@ -218,11 +353,24 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let window_for_events = window.clone();
     let geometry_for_events = geometry.clone();
     let preferences = host.preferences_handle();
+    let geometry_runtime = picker_runtime.clone();
+    let (geometry_updates, geometry_receiver) = watch::channel(None);
+    let geometry_preferences = preferences.clone();
+    let geometry_worker = geometry_runtime.spawn(run_geometry_persistence_worker(
+        geometry_receiver,
+        move |next| {
+            let preferences = geometry_preferences.clone();
+            async move { preferences.update_window_geometry(next).await }
+        },
+    ));
+    let geometry_updates_for_events = geometry_updates.clone();
     let mut geometry_save_deadline: Option<Instant> = None;
+    let mut close_confirmation = CloseConfirmationWatchdog::default();
     let exit_code = event_loop.run_return(move |event, _, control_flow| {
-        *control_flow = geometry_save_deadline
-            .map(ControlFlow::WaitUntil)
-            .unwrap_or(ControlFlow::Wait);
+        *control_flow = control_flow_for_pending_deadlines(
+            geometry_save_deadline,
+            close_confirmation.deadline(),
+        );
         match event {
             Event::UserEvent(AppEvent::PickDirectory(reply)) => {
                 let dialog = AsyncFileDialog::new()
@@ -273,6 +421,21 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 window_for_events.set_focus();
                 window_for_events.request_user_attention(Some(UserAttentionType::Informational));
             }
+            Event::UserEvent(AppEvent::CloseRequestAcknowledged { request_id }) => {
+                close_confirmation.acknowledge(request_id);
+                *control_flow = control_flow_for_pending_deadlines(
+                    geometry_save_deadline,
+                    close_confirmation.deadline(),
+                );
+            }
+            Event::UserEvent(AppEvent::CloseDecisionApplied {
+                request_id,
+                decision,
+            }) => {
+                if close_confirmation.resolve(request_id, decision) {
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
             Event::UserEvent(AppEvent::QuitNow) => *control_flow = ControlFlow::Exit,
             Event::WindowEvent {
                 event: WindowEvent::Focused(focused),
@@ -290,7 +453,16 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                lifecycle.request_close();
+                if close_confirmation.begin(lifecycle.request_close(), Instant::now()) {
+                    // A second close request is an explicit native escape
+                    // hatch when the frontend cannot acknowledge the first.
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    *control_flow = control_flow_for_pending_deadlines(
+                        geometry_save_deadline,
+                        close_confirmation.deadline(),
+                    );
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::Moved(_) | WindowEvent::Resized(_),
@@ -301,21 +473,27 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                     geometry_for_events.borrow().clone(),
                 );
                 *geometry_for_events.borrow_mut() = next;
-                let deadline = Instant::now() + Duration::from_millis(350);
-                geometry_save_deadline = Some(deadline);
-                *control_flow = ControlFlow::WaitUntil(deadline);
+                geometry_save_deadline = Some(Instant::now() + Duration::from_millis(350));
+                *control_flow = control_flow_for_pending_deadlines(
+                    geometry_save_deadline,
+                    close_confirmation.deadline(),
+                );
+            }
+            Event::MainEventsCleared if close_confirmation.expired(Instant::now()) => {
+                *control_flow = ControlFlow::Exit;
             }
             Event::MainEventsCleared
                 if geometry_save_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
             {
                 geometry_save_deadline = None;
                 let next = geometry_for_events.borrow().clone();
-                if let Err(error) =
-                    picker_runtime.block_on(preferences.update_window_geometry(next))
-                {
-                    tracing::warn!(%error, "persisting desktop window geometry failed");
+                if geometry_updates_for_events.send(Some(next)).is_err() {
+                    tracing::warn!("desktop geometry persistence worker is unavailable");
                 }
-                *control_flow = ControlFlow::Wait;
+                *control_flow = control_flow_for_pending_deadlines(
+                    geometry_save_deadline,
+                    close_confirmation.deadline(),
+                );
             }
             Event::WindowEvent {
                 event: WindowEvent::Destroyed,
@@ -325,7 +503,11 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         }
     });
 
-    host.persist_window_geometry(geometry.borrow().clone())?;
+    geometry_updates
+        .send(Some(geometry.borrow().clone()))
+        .map_err(|_| anyhow::anyhow!("desktop geometry persistence worker stopped early"))?;
+    drop(geometry_updates);
+    geometry_runtime.block_on(geometry_worker)??;
     drop(webview);
     drop(window);
     host.shutdown();
@@ -463,4 +645,173 @@ fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String>
     NativeAttachment::new(format!("pasted-{stamp}.png"), "image/png", bytes)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod close_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_disarms_the_deadline_and_makes_the_next_close_fresh() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(1, now));
+        assert!(watchdog.deadline().is_some());
+
+        assert!(!watchdog.resolve(1, CloseDecision::Cancel));
+        assert!(watchdog.deadline().is_none());
+        assert!(!watchdog.begin(2, now));
+    }
+
+    #[test]
+    fn quit_when_idle_disarms_timeout_but_keeps_the_native_escape_hatch() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(7, now));
+
+        assert!(!watchdog.resolve(7, CloseDecision::QuitWhenIdle));
+        assert!(watchdog.deadline().is_none());
+        assert!(watchdog.begin(7, now + CLOSE_CONFIRMATION_GRACE));
+    }
+
+    #[test]
+    fn unresolved_close_exits_only_after_the_grace_period() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(3, now));
+        assert!(!watchdog.expired(now + CLOSE_CONFIRMATION_GRACE - Duration::from_millis(1)));
+        assert!(watchdog.expired(now + CLOSE_CONFIRMATION_GRACE));
+    }
+
+    #[test]
+    fn exact_acknowledgement_keeps_a_healthy_prompt_open_without_deciding() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(3, now));
+
+        assert!(watchdog.acknowledge(3));
+        assert!(!watchdog.expired(now + CLOSE_CONFIRMATION_GRACE * 10));
+        // A second native close remains the explicit escape hatch even after
+        // the frontend has acknowledged the first request.
+        assert!(watchdog.begin(3, now + CLOSE_CONFIRMATION_GRACE * 10));
+    }
+
+    #[test]
+    fn stale_acknowledgement_cannot_disarm_the_current_request() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(4, now));
+        assert!(!watchdog.acknowledge(3));
+        assert!(watchdog.expired(now + CLOSE_CONFIRMATION_GRACE));
+    }
+
+    #[test]
+    fn stale_decision_cannot_disarm_a_newer_close_request() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(4, now));
+        assert!(!watchdog.resolve(3, CloseDecision::Cancel));
+        assert!(watchdog.deadline().is_some());
+        assert!(watchdog.resolve(4, CloseDecision::QuitNow));
+    }
+
+    #[test]
+    fn geometry_and_close_deadlines_always_select_the_earliest_wakeup() {
+        let now = Instant::now();
+        let close = now + Duration::from_secs(2);
+        let earlier_geometry = now + Duration::from_millis(350);
+        let later_geometry = now + Duration::from_secs(3);
+
+        assert_eq!(
+            pending_event_deadline(Some(earlier_geometry), Some(close)),
+            Some(earlier_geometry)
+        );
+        assert_eq!(
+            pending_event_deadline(Some(later_geometry), Some(close)),
+            Some(close)
+        );
+        assert_eq!(pending_event_deadline(None, Some(close)), Some(close));
+    }
+
+    #[test]
+    fn geometry_expiry_does_not_clear_the_close_watchdog() {
+        let now = Instant::now();
+        let mut watchdog = CloseConfirmationWatchdog::default();
+        assert!(!watchdog.begin(11, now));
+        let close = watchdog.deadline().unwrap();
+        let geometry = now + Duration::from_millis(350);
+
+        assert_eq!(
+            pending_event_deadline(Some(geometry), watchdog.deadline()),
+            Some(geometry)
+        );
+        assert!(!watchdog.expired(geometry));
+        assert_eq!(
+            pending_event_deadline(None, watchdog.deadline()),
+            Some(close)
+        );
+        assert!(watchdog.expired(close));
+    }
+
+    #[tokio::test]
+    async fn geometry_worker_coalesces_bursts_and_persists_final_after_inflight_write() {
+        let stale = WindowGeometry {
+            x: 1,
+            y: 2,
+            width: 900,
+            height: 600,
+            maximized: false,
+        };
+        let final_geometry = WindowGeometry {
+            x: 30,
+            y: 40,
+            width: 1_400,
+            height: 900,
+            maximized: true,
+        };
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_worker = observed.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let mut started = Some(started);
+        let mut release_rx = Some(release_rx);
+        let (updates, receiver) = watch::channel(None);
+        updates.send(Some(stale.clone())).unwrap();
+
+        let worker = tokio::spawn(run_geometry_persistence_worker(receiver, move |geometry| {
+            let observed = observed_for_worker.clone();
+            let started = started.take();
+            let release_rx = release_rx.take();
+            async move {
+                observed.lock().unwrap().push(geometry);
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                if let Some(release_rx) = release_rx {
+                    let _ = release_rx.await;
+                }
+                Ok::<(), &'static str>(())
+            }
+        }));
+
+        started_rx.await.unwrap();
+        for offset in 0..1_000 {
+            updates
+                .send(Some(WindowGeometry {
+                    x: offset,
+                    ..stale.clone()
+                }))
+                .unwrap();
+        }
+        updates.send(Some(final_geometry.clone())).unwrap();
+        drop(updates);
+        assert!(!worker.is_finished());
+        release.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[stale, final_geometry]
+        );
+    }
 }

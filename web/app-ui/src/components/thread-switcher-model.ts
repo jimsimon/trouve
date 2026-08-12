@@ -58,40 +58,59 @@ export const threadSwitcherRows = (
       || (filter === "removed" && entry.closed);
     return matchesQuery && matchesFilter;
   };
-  const subtreeMatches = (
-    entry: ThreadSwitcherEntry,
-    visiting = new Set<string>(),
-  ): boolean => {
-    if (matches(entry)) return true;
-    if (visiting.has(entry.id)) return false;
-    const nextVisiting = new Set(visiting);
-    nextVisiting.add(entry.id);
-    return (children.get(entry.id) ?? []).some((child) =>
-      subtreeMatches(child, nextVisiting));
-  };
+  // Each entry has at most one parent. Propagate matches upward once instead
+  // of recursively rescanning every descendant subtree for every row.
+  const visible = new Set(entries.filter(matches).map((entry) => entry.id));
+  const pending = [...visible];
+  for (let index = 0; index < pending.length; index += 1) {
+    const entry = entryById.get(pending[index] ?? "");
+    const parentId = entry?.parentThreadId;
+    if (
+      parentId === undefined
+      || parentId === null
+      || parentId === entry?.id
+      || !entryById.has(parentId)
+      || visible.has(parentId)
+    ) continue;
+    visible.add(parentId);
+    pending.push(parentId);
+  }
 
   const rows: ThreadSwitcherRow[] = [];
   const visited = new Set<string>();
-  const append = (
-    entry: ThreadSwitcherEntry,
-    depth: number,
-    ancestry: ReadonlySet<string>,
-  ): void => {
-    if (visited.has(entry.id) || ancestry.has(entry.id) || !subtreeMatches(entry)) return;
-    visited.add(entry.id);
-    rows.push({ entry, depth });
-    const nextAncestry = new Set(ancestry);
-    nextAncestry.add(entry.id);
-    for (const child of children.get(entry.id) ?? []) {
-      append(child, depth + 1, nextAncestry);
+  const append = (entry: ThreadSwitcherEntry, depth: number): void => {
+    const stack: Array<{ readonly entry: ThreadSwitcherEntry; readonly depth: number }> = [
+      { entry, depth },
+    ];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (
+        current === undefined
+        || visited.has(current.entry.id)
+        || !visible.has(current.entry.id)
+      ) continue;
+      visited.add(current.entry.id);
+      rows.push(current);
+      const descendants = children.get(current.entry.id) ?? [];
+      for (let index = descendants.length - 1; index >= 0; index -= 1) {
+        const child = descendants[index];
+        if (child !== undefined) stack.push({ entry: child, depth: current.depth + 1 });
+      }
     }
   };
-  for (const root of roots) append(root, 0, new Set());
+  for (const root of roots) append(root, 0);
   // A malformed cycle has no root. Keep every thread reachable rather than
   // silently dropping it from the authoritative switcher.
-  for (const entry of entries) append(entry, 0, new Set());
+  for (const entry of entries) append(entry, 0);
   return rows;
 };
+
+/** Number of durable tabs that fit after reserving a slot for provisional
+ * thread setup. A one-tab layout must be allowed to reserve all its space. */
+export const durableThreadTabCapacity = (
+  totalCapacity: number,
+  provisionalOpen: boolean,
+): number => Math.max(0, totalCapacity - (provisionalOpen ? 1 : 0));
 
 /**
  * Selects the bounded desktop working set. Pinned threads lead while the

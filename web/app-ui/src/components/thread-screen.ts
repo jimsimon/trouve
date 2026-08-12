@@ -45,6 +45,7 @@ import {
 import type {
   CompactionState,
   QueuedPrompt,
+  QueueRevisionTracker,
   ThreadChatItem,
   TurnState,
 } from "../state/thread-view-model.js";
@@ -109,6 +110,10 @@ import {
   modelHealthPresentations,
 } from "./model-health.js";
 import {
+  retainedHistoryScrollDelta,
+  type HistoryMeasurementCorrection,
+} from "./history-scroll-correction.js";
+import {
   fontAwesomeIcon,
   type FontAwesomeIconName,
 } from "./font-awesome-icon.js";
@@ -118,6 +123,7 @@ import {
   queueControlState,
   queueFocusAfterDelete,
   queuePreview,
+  shouldMaterializeAcceptedQueuedPrompt,
   type QueueDropPlacement,
 } from "./queue-controls.js";
 import "./turn-metadata.js";
@@ -141,6 +147,7 @@ import {
 } from "./tab-navigation.js";
 import { threadNavigationTitle } from "./thread-title.js";
 import {
+  durableThreadTabCapacity,
   threadSwitcherRows,
   threadWorkingSet,
   type ThreadSwitcherFilter,
@@ -153,6 +160,8 @@ import type {
   NewThreadSetupSubmitEvent,
 } from "./new-thread-setup.js";
 import {
+  CheckpointActionScope,
+  checkpointBoundaryAfterTurn,
   checkpointBoundaryBeforeTurn,
   type TurnCheckpointBoundary,
 } from "./turn-checkpoint-actions.js";
@@ -182,6 +191,7 @@ interface OptimisticPromptSubmission {
   disposition: "turn" | "queue";
   turn?: number;
   durablePrompt?: QueuedPrompt;
+  readonly queueRevision: QueueRevisionTracker;
 }
 
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
@@ -194,7 +204,9 @@ const CHAT_SCROLL_INDICATOR_MIN_HEIGHT_PX = 32;
 const CHAT_HISTORY_PREFETCH_ROOT_MARGIN = "500% 0px 0px 0px";
 const CHAT_HISTORY_STATUS_DELAY_MS = 180;
 const CHAT_HISTORY_RETRY_DELAY_MS = 1_500;
-const THREAD_TITLE_TIMEOUT_MS = 48_000;
+// Title generation is optional metadata and must not make thread creation
+// appear hung when the naming provider is slow or unavailable.
+const THREAD_TITLE_TIMEOUT_MS = 2_000;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -393,6 +405,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #invalidScrollBookmarkThreadId: string | undefined;
   #markdownRequested = false;
   #toolDetailRequested = false;
+  #toolDetailLoadFailed = false;
   #queueEditId = "";
   #queueEditRetainedAttachments: ProtocolAttachment[] = [];
   #queueEditReturnDraft: ComposerDraft | undefined;
@@ -405,7 +418,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #queueDropPlacement: QueueDropPlacement = "before";
   #queueKeyboardDragId = "";
   #queueKeyboardOrder: readonly string[] = [];
-  #checkpointAction = "";
+  readonly #checkpointActions = new CheckpointActionScope();
   #checkpointErrorId = "";
   #checkpointError = "";
   #pendingAttachments: PendingAttachment[] = [];
@@ -538,7 +551,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#queueDropPlacement = "before";
       this.#queueKeyboardDragId = "";
       this.#queueKeyboardOrder = [];
-      this.#checkpointAction = "";
+      this.#checkpointActions.reset();
       this.#checkpointErrorId = "";
       this.#checkpointError = "";
       this.#usageGeneration += 1;
@@ -548,6 +561,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#usagePending = false;
     }
     if (changed.has("threadId")) {
+      this.#checkpointActions.reset();
+      this.#checkpointErrorId = "";
+      this.#checkpointError = "";
       if (this.threadId !== "") {
         this.#services.value?.setThreadTabClosed(this.threadId, false);
         this.#recentThreadIds = [
@@ -628,7 +644,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#pendingStartTurn = undefined;
       this.#cancelRequestedTurn = undefined;
       this.#messageRequest = undefined;
-      this.#optimisticPrompt = undefined;
+      this.#clearOptimisticPrompt();
     }
     if (composerScopeChanged) {
       this.#restoreComposerDraft(this.#draftThreadIdForCurrentScope());
@@ -647,7 +663,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   protected override updated(): void {
-    if (this.threadId !== "") this.#store.value?.markThreadRead(this.threadId);
+    if (
+      this.threadId !== ""
+      && (globalThis.document?.visibilityState ?? "visible") === "visible"
+      && (globalThis.document?.hasFocus() ?? true)
+    ) this.#store.value?.markThreadRead(this.threadId);
     this.#cancelScheduledScrollRender();
     void this.#ensureThreadOptions();
     this.#refreshSubscriptionHealthAfterTurn();
@@ -736,7 +756,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && globalThis.performance.now() < this.#nativeScrollCorrectionBlockedUntil;
       let measured = false;
       let scrollCorrected = false;
-      let historyLayoutChanged = false;
+      const measurementCorrections: HistoryMeasurementCorrection[] = [];
       for (const entry of entries) {
         const element = entry.target as HTMLElement;
         const id = element.dataset["virtualId"];
@@ -747,35 +767,38 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           const correction = this.#virtualizer.measure(id, entry.contentRect.height);
           if (correction.delta !== 0) {
             scrollCorrected = true;
-            // The first observation of a newly mounted history row only
-            // replaces its estimate; compensating for that during wheel
-            // momentum produces a micro-stutter. A later size change is real
-            // visible layout (Markdown, an attachment, disclosure content)
-            // and must retain the reader's anchor.
-            if (id.startsWith("turn:") && previouslyMeasured) {
-              historyLayoutChanged = true;
-            }
+            measurementCorrections.push({
+              id,
+              previouslyMeasured,
+              delta: correction.delta,
+            });
           }
         } catch {
           // A row may have unmounted between delivery and measurement.
         }
       }
+      const retainedHistoryDelta = retainedHistoryScrollDelta(measurementCorrections);
       let expectedScrollTop: number | undefined;
-      if (!followingTail && measured && nativeScrollActive && !historyLayoutChanged) {
+      if (!followingTail && measured && nativeScrollActive) {
         // Native wheel, touch, keyboard, and scrollbar movement is
-        // authoritative while momentum is active. Measurements may update
-        // cached geometry, but never compensate scrollTop during that window:
-        // doing so creates a small reverse jump that the next native scroll
-        // event immediately undoes. Re-anchor the model to the browser and
-        // defer precise DOM-anchor correction until scrolling has settled.
-        this.#virtualizer.setViewport(activeViewport.scrollTop, activeViewport.clientHeight, {
+        // authoritative while momentum is active. Re-anchor the model to the
+        // browser plus only genuine late changes to already measured turn
+        // rows. First-measure estimate calibration in the same observer batch
+        // must not hitchhike into the scroll correction.
+        this.#virtualizer.setViewport(Math.max(
+          0,
+          activeViewport.scrollTop + retainedHistoryDelta,
+        ), activeViewport.clientHeight, {
           userInitiated: true,
           atTail: false,
         });
-      } else if (!followingTail && historyLayoutChanged) {
+        if (retainedHistoryDelta !== 0) {
+          expectedScrollTop = this.#virtualizer.window().scrollTop;
+        }
+      } else if (!followingTail && retainedHistoryDelta !== 0) {
         // Complete turn rows begin with estimates and can lay out again when
-        // Markdown or attachments mount. Once native scrolling has settled,
-        // preserve the current virtual anchor for changes above it.
+        // Markdown or attachments mount. Preserve the current virtual anchor
+        // for changes above it.
         expectedScrollTop = this.#virtualizer.window().scrollTop;
       } else if (!followingTail && layoutAnchor === undefined && scrollCorrected) {
         // If a nested DOM anchor is temporarily unavailable after scrolling
@@ -875,7 +898,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
-    this.#optimisticPrompt = undefined;
+    this.#clearOptimisticPrompt();
     this.#clearMentionPathsRetry();
     this.#clearQueueDragImage();
     this.#markdownContextMenu = undefined;
@@ -891,6 +914,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     newThreadSetupOpen = this.#newThreadSetupOpen,
   ): void {
     if (event.altKey || event.ctrlKey || event.metaKey) return;
+    if (event.key === "Delete" && currentIndex < threads.length) {
+      const thread = threads[currentIndex];
+      if (thread === undefined) return;
+      event.preventDefault();
+      this.#closeThreadTabById(thread.id);
+      return;
+    }
     const tabCount = threads.length + (newThreadSetupOpen ? 1 : 0);
     const nextIndex = nextHorizontalTabIndex(event.key, currentIndex, tabCount);
     const nextThread = nextIndex === undefined ? undefined : threads[nextIndex];
@@ -978,11 +1008,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.threadId,
       resumePreferences.pinnedThreadTabs,
       this.#recentThreadIds,
-      Math.max(1, this.#threadTabCapacity - (newThreadSetupOpen ? 1 : 0)),
+      durableThreadTabCapacity(this.#threadTabCapacity, newThreadSetupOpen),
     );
     const workingThreadIdSet = new Set(workingThreadIds);
+    const sessionThreadById = new Map(sessionThreads.map((candidate) => [candidate.id, candidate]));
     const workingThreads = workingThreadIds
-      .map((id) => threads.find((candidate) => candidate.id === id))
+      .map((id) => sessionThreadById.get(id))
       .filter((candidate): candidate is ProtocolThread => candidate !== undefined);
     const selectedThreadIndex = workingThreads.findIndex(
       (candidate) => candidate.id === this.threadId,
@@ -1108,6 +1139,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             class="thread-tab-main"
             type="button"
             role="tab"
+            aria-keyshortcuts="Delete"
             aria-label=${statusLabel === "" ? label : `${label}, ${statusLabel}`}
             title=${label}
             data-thread-tab-id=${candidate.id}
@@ -1132,14 +1164,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
           </button>
-          <button
+          <span
             class="thread-tab-close"
-            type="button"
-            aria-label=${`Close thread tab ${label}`}
+            aria-hidden="true"
             title="Close thread tab"
             @click=${(event: MouseEvent) =>
               this.#closeThreadTab(event, candidate.id)}
-          >${fontAwesomeIcon("xmark")}</button>
+          >${fontAwesomeIcon("xmark")}</span>
         </span>
       `;
     };
@@ -1147,9 +1178,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       row: ThreadSwitcherRow,
       removed: boolean,
     ) => {
-      const candidate = sessionThreads.find(
-        (threadCandidate) => threadCandidate.id === row.entry.id,
-      );
+      const candidate = sessionThreadById.get(row.entry.id);
       if (candidate === undefined) return nothing;
       const indicator = sessionIndicatorPresentation(
         store.threadIndicatorState(candidate.id),
@@ -1199,6 +1228,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               : nothing}</small>
           </span>
           <span class="thread-switcher-row-actions">
+            ${row.entry.active ? html`<button
+              class="thread-switcher-row-action"
+              type="button"
+              aria-label=${`Cancel active turn in ${row.entry.title}`}
+              title="Cancel active turn"
+              @click=${(event: MouseEvent) => this.#cancelThreadFromSwitcher(event, candidate.id)}
+            >${fontAwesomeIcon("square")}</button>` : nothing}
             ${removed ? nothing : html`<button
               class=${`thread-switcher-row-action${row.entry.pinned ? " active" : ""}`}
               type="button"
@@ -2201,6 +2237,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     presentation,
                     unit.id === nestedActivityUnitId ? activityLabel : undefined,
                     effectiveTurnRunning,
+                    item.unitIndex === layout.units.length - 1,
                   )}</div>`;
               })}</div>`}
           ${!window.followingTail && virtualItems.length > 0
@@ -2227,7 +2264,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     presentation: ChatPresentationIndex,
     activityLabel: string | undefined,
     checkpointRestoreDisabled: boolean,
+    finalUnit: boolean,
   ) {
+    const trailingBoundary = checkpointBoundaryAfterTurn(unit.turn, presentation.turnStates);
     return html`
       ${unit.divider
         ? this.#renderTurnRule(
@@ -2244,6 +2283,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         presentation,
         activityLabel,
       )}
+      ${finalUnit && trailingBoundary !== undefined
+        ? this.#renderCheckpointRule(trailingBoundary, checkpointRestoreDisabled)
+        : nothing}
     `;
   }
 
@@ -2256,9 +2298,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (boundary === undefined) {
       return html`<div class="turn-rule" role="separator"></div>`;
     }
-    const busy = this.#checkpointAction !== "";
-    const restoreBusy = this.#checkpointAction === `restore:${boundary.checkpointId}`;
-    const forkBusy = this.#checkpointAction === `fork:${boundary.checkpointId}`;
+    return this.#renderCheckpointRule(boundary, turnRunning);
+  }
+
+  #renderCheckpointRule(
+    boundary: TurnCheckpointBoundary,
+    turnRunning: boolean,
+  ) {
+    const checkpointAction = this.#checkpointActions.action;
+    const busy = checkpointAction !== "";
+    const restoreBusy = checkpointAction === `restore:${boundary.checkpointId}`;
+    const forkBusy = checkpointAction === `fork:${boundary.checkpointId}`;
     const error = this.#checkpointErrorId === boundary.checkpointId
       ? this.#checkpointError
       : "";
@@ -2266,12 +2316,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? `Restore after turn ${boundary.turn} once the current turn finishes`
       : `Restore files to the checkpoint after turn ${boundary.turn}`;
     return html`
-      <div
-        class="turn-rule with-checkpoint-actions"
-        role="separator"
-        aria-label=${`Turn ${boundary.turn} checkpoint`}
-      >
-        <span class="turn-rule-actions" aria-label=${`Actions after turn ${boundary.turn}`}>
+      <div class="turn-rule with-checkpoint-actions">
+        <span
+          class="turn-rule-separator"
+          role="separator"
+          aria-label=${`Turn ${boundary.turn} checkpoint`}
+        ></span>
+        <span
+          class="turn-rule-actions"
+          role="group"
+          aria-label=${`Actions after turn ${boundary.turn}`}
+        >
           ${error === ""
             ? nothing
             : html`<span class="turn-rule-action-error" role="alert">${error}</span>`}
@@ -2300,35 +2355,55 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   async #restoreTurnCheckpoint(boundary: TurnCheckpointBoundary): Promise<void> {
     const services = this.#services.value;
-    if (services === undefined || this.#checkpointAction !== "") return;
-    this.#checkpointAction = `restore:${boundary.checkpointId}`;
+    if (services === undefined) return;
+    const token = this.#checkpointActions.begin(`restore:${boundary.checkpointId}`);
+    if (token === undefined) return;
+    const sessionId = this.sessionId;
+    const threadId = this.threadId;
     this.#checkpointErrorId = "";
     this.#checkpointError = "";
     this.requestUpdate();
     try {
       await services.protocol.restoreCheckpoint(boundary.checkpointId);
+      if (
+        this.sessionId !== sessionId
+        || this.threadId !== threadId
+        || !this.#checkpointActions.isCurrent(token)
+      ) return;
       globalThis.dispatchEvent(new CustomEvent("trouve-checkpoint-restored", {
-        detail: { sessionId: this.sessionId },
+        detail: { sessionId },
       }));
     } catch {
+      if (
+        this.sessionId !== sessionId
+        || this.threadId !== threadId
+        || !this.#checkpointActions.isCurrent(token)
+      ) return;
       this.#checkpointErrorId = boundary.checkpointId;
       this.#checkpointError = "Could not restore this checkpoint.";
     } finally {
-      this.#checkpointAction = "";
-      this.requestUpdate();
+      if (this.#checkpointActions.finish(token)) this.requestUpdate();
     }
   }
 
   async #forkTurnCheckpoint(boundary: TurnCheckpointBoundary): Promise<void> {
     const services = this.#services.value;
     const store = this.#store.value;
-    if (services === undefined || store === undefined || this.#checkpointAction !== "") return;
-    this.#checkpointAction = `fork:${boundary.checkpointId}`;
+    if (services === undefined || store === undefined) return;
+    const token = this.#checkpointActions.begin(`fork:${boundary.checkpointId}`);
+    if (token === undefined) return;
+    const sessionId = this.sessionId;
+    const threadId = this.threadId;
     this.#checkpointErrorId = "";
     this.#checkpointError = "";
     this.requestUpdate();
     try {
       const fork = await services.protocol.forkCheckpoint(boundary.checkpointId);
+      if (
+        this.sessionId !== sessionId
+        || this.threadId !== threadId
+        || !this.#checkpointActions.isCurrent(token)
+      ) return;
       store.upsertSessionMetadata(fork.session);
       store.upsertThread(fork.thread);
       store.markSessionRead(fork.session.id);
@@ -2343,11 +2418,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : {}),
       });
     } catch {
+      if (
+        this.sessionId !== sessionId
+        || this.threadId !== threadId
+        || !this.#checkpointActions.isCurrent(token)
+      ) return;
       this.#checkpointErrorId = boundary.checkpointId;
       this.#checkpointError = "Could not fork this checkpoint.";
     } finally {
-      this.#checkpointAction = "";
-      this.requestUpdate();
+      if (this.#checkpointActions.finish(token)) this.requestUpdate();
     }
   }
 
@@ -3206,25 +3285,28 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
   }
 
+  #clearOptimisticPrompt(expectedId?: string): void {
+    const optimistic = this.#optimisticPrompt;
+    if (optimistic === undefined || (expectedId !== undefined && optimistic.id !== expectedId)) return;
+    optimistic.queueRevision.close();
+    this.#optimisticPrompt = undefined;
+  }
+
   #reconcileOptimisticPrompt(
     items: readonly ThreadChatItem[],
     queue: readonly QueuedPrompt[],
   ): void {
     const optimistic = this.#optimisticPrompt;
     if (optimistic === undefined || optimistic.threadId !== this.threadId) return;
+    const durablePromptId = optimistic.durablePrompt?.id;
     if (
-      optimistic.durablePrompt !== undefined
-      && queue.some((prompt) => prompt.id === optimistic.durablePrompt?.id)
+      durablePromptId !== undefined
+      && (
+        queue.some((prompt) => prompt.id === durablePromptId)
+        || optimistic.queueRevision.queueChanged()
+      )
     ) {
-      this.#optimisticPrompt = undefined;
-      return;
-    }
-    if (queue.some((prompt) => this.#matchesOptimisticPrompt(
-      prompt.content,
-      prompt.attachments,
-      optimistic,
-    ))) {
-      this.#optimisticPrompt = undefined;
+      this.#clearOptimisticPrompt(optimistic.id);
       return;
     }
     if (items.some((item) =>
@@ -3233,7 +3315,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       && (optimistic.turn === undefined || item.turn === optimistic.turn)
       && this.#matchesOptimisticPrompt(item.content, item.attachments, optimistic)
     )) {
-      this.#optimisticPrompt = undefined;
+      this.#clearOptimisticPrompt(optimistic.id);
     }
   }
 
@@ -3445,6 +3527,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             );
             const chatId = element?.dataset["chatAnchorId"];
             const virtualId = element?.dataset["virtualId"];
+            if (virtualId === CHAT_START_SPACER_ID) continue;
             const id = chatId ?? (virtualId === undefined ? undefined : `virtual:${virtualId}`);
             if (element === null || element === undefined || id === undefined) continue;
             if (!viewport.contains(element)) continue;
@@ -3490,6 +3573,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       | { readonly element: HTMLElement; readonly rect: DOMRect }
       | undefined;
     for (const element of viewport.querySelectorAll<HTMLElement>("[data-virtual-id]")) {
+      if (element.dataset["virtualId"] === CHAT_START_SPACER_ID) continue;
       const rect = element.getBoundingClientRect();
       if (rect.height <= 0 || rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
       const crosses = rect.top <= viewportTop && rect.bottom > viewportTop;
@@ -4265,6 +4349,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                             </ul>`}
                         ${toolPresentation.diff.length > 0 || toolPresentation.todos.length > 0
                           ? nothing
+                          : this.#toolDetailLoadFailed
+                          ? html`<div class="tool-detail-loading" role="alert">
+                              Tool detail viewer could not be loaded.
+                              <button type="button" @click=${this.#retryToolDetailImport}>Retry</button>
+                            </div>`
                           : html`<trouve-tool-detail-view
                               .tool=${item.tool}
                               .args=${item.args}
@@ -4939,10 +5028,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #ensureToolDetail(): void {
-    if (this.#toolDetailRequested) return;
+    if (this.#toolDetailRequested || this.#toolDetailLoadFailed) return;
     this.#toolDetailRequested = true;
-    void import("./tool-detail-view.js");
+    void import("./tool-detail-view.js").catch(() => {
+      this.#toolDetailRequested = false;
+      this.#toolDetailLoadFailed = true;
+      this.requestUpdate();
+    });
   }
+
+  readonly #retryToolDetailImport = (): void => {
+    this.#toolDetailLoadFailed = false;
+    this.#toolDetailRequested = false;
+    this.requestUpdate();
+  };
 
   #currentSessionUsageKey(): string {
     const store = this.#store.value;
@@ -5205,6 +5304,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
       return;
     }
+    const target = event.target;
+    if (
+      target instanceof HTMLInputElement
+      || target instanceof HTMLTextAreaElement
+      || target instanceof HTMLSelectElement
+      || target instanceof HTMLElement && target.isContentEditable
+    ) return;
     const row = (event.target as Element | null)?.closest<HTMLElement>(
       ".thread-switcher-row",
     );
@@ -5281,6 +5387,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #closeThreadTab(event: MouseEvent, threadId: string): void {
     event.preventDefault();
     event.stopPropagation();
+    this.#closeThreadTabById(threadId);
+  }
+
+  #closeThreadTabById(threadId: string): void {
     const store = this.#store.value;
     const services = this.#services.value;
     if (store === undefined || services === undefined) return;
@@ -5310,8 +5420,20 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.openNewThreadSetup();
       }
     } else {
+      this.#pendingThreadTabFocus = this.threadId;
       this.requestUpdate();
     }
+  }
+
+  #cancelThreadFromSwitcher(event: MouseEvent, threadId: string): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const services = this.#services.value;
+    if (services === undefined || this.#connectivityBlocked()) return;
+    void services.protocol.cancelTurn(threadId).catch(() => {
+      this.#requestError = "Turn could not be stopped.";
+      this.requestUpdate();
+    });
   }
 
   #openSubagent(item: Extract<AgentChatItem, { readonly kind: "subagent" }>): void {
@@ -6000,12 +6122,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threadId = this.threadId;
     const generation = this.#threadInteractionGeneration;
     const view = store.threadView(threadId);
-    const runningTurn = view.turnRunning
-      ? (this.#latestRunningTurn(view.items) ?? -1)
+    const activeTurn = view.turnRunning
+      ? (this.#latestActiveTurn(view.items) ?? -1)
       : undefined;
-    const markedCancellation = runningTurn !== undefined
+    const markedCancellation = activeTurn !== undefined
       && this.#cancelRequestedTurn === undefined;
-    if (markedCancellation) this.#cancelRequestedTurn = runningTurn;
+    if (markedCancellation) this.#cancelRequestedTurn = activeTurn;
     this.#queueBusy = promptId;
     this.#queueError = "";
     this.requestUpdate();
@@ -6016,7 +6138,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       dispatched = true;
     } catch {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
-        if (markedCancellation && this.#cancelRequestedTurn === runningTurn) {
+        if (markedCancellation && this.#cancelRequestedTurn === activeTurn) {
           this.#cancelRequestedTurn = undefined;
         }
         this.#queueError = "This prompt could not be sent now. It remains queued.";
@@ -6177,17 +6299,40 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const state = items.find(
         (item) => item.kind === "turn-status" && item.turn === cancelledTurn,
       );
+      const replacementTurnStarted = items.some((item) =>
+        item.kind === "turn-status"
+        && item.turn > cancelledTurn
+        && (
+          item.state.kind === "waiting-for-capacity"
+          || item.state.kind === "running"
+        ));
+      const terminalAcknowledged = state?.kind === "turn-status"
+        && state.state.kind !== "waiting-for-capacity"
+        && state.state.kind !== "running";
+      const noDurableTurnRemains = state === undefined
+        && !durableTurnRunning
+        && this.#pendingStartTurn === undefined;
       if (
-        (state?.kind === "turn-status" && state.state.kind !== "running")
-        || (
-          !durableTurnRunning
-          && this.#pendingStartTurn === undefined
-          && state === undefined
-        )
+        terminalAcknowledged
+        || replacementTurnStarted
+        || noDurableTurnRemains
       ) {
         this.#cancelRequestedTurn = undefined;
       }
     }
+  }
+
+  #latestActiveTurn(items: readonly ThreadChatItem[]): number | undefined {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (
+        item?.kind === "turn-status"
+        && (item.state.kind === "waiting-for-capacity" || item.state.kind === "running")
+      ) {
+        return item.turn;
+      }
+    }
+    return undefined;
   }
 
   #latestRunningTurn(items: readonly ThreadChatItem[]): number | undefined {
@@ -6219,12 +6364,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   async #submitComposer(form: HTMLFormElement, steering: boolean): Promise<void> {
     const services = this.#services.value;
+    const store = this.#store.value;
     const textarea = form.elements.namedItem("message") as HTMLTextAreaElement | null;
     const draftContent = textarea?.value ?? "";
     const content = draftContent.trim();
     const attachments = [...this.#pendingAttachments];
     if (
       services === undefined ||
+      store === undefined ||
       this.threadId === "" ||
       this.#connectivityBlocked() ||
       (content === "" && attachments.length === 0)
@@ -6232,7 +6379,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threadId = this.threadId;
     const requestGeneration = ++this.#turnRequestGeneration;
     const composerCursor = textarea?.selectionStart ?? this.#composerCursor;
-    const view = this.#store.value?.threadView(threadId);
+    const view = store.threadView(threadId);
     const startingTurn = view?.turnRunning === true
       || this.#pendingStartTurn !== undefined
       || this.#cancelRequestedTurn !== undefined;
@@ -6249,6 +6396,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           attachments,
           minimumTurn,
           disposition: startingTurn ? "queue" as const : "turn" as const,
+          queueRevision: view.trackQueueRevision(),
         } satisfies OptimisticPromptSubmission;
     this.#requestPending = true;
     if (!steering) {
@@ -6291,10 +6439,23 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           const queuedPrompt = accepted.queued_prompt;
           if (accepted.queued && queuedPrompt != null) {
             pendingOptimistic.durablePrompt = queuedPrompt;
-            const acceptedQueue = this.#store.value?.threadView(threadId).queue;
+            const acceptedView = this.#store.value?.threadView(threadId);
+            const queueChangedSinceSubmission =
+              pendingOptimistic.queueRevision.queueChanged();
+            this.#reconcileOptimisticPrompt(
+              acceptedView?.items ?? [],
+              acceptedView?.queue ?? [],
+            );
+            const acceptedQueue = acceptedView?.queue;
             if (
               acceptedQueue !== undefined
-              && !acceptedQueue.some((prompt) => prompt.id === queuedPrompt.id)
+              && shouldMaterializeAcceptedQueuedPrompt(
+                optimistic.id,
+                this.#optimisticPrompt?.id,
+                queuedPrompt.id,
+                acceptedQueue,
+                queueChangedSinceSubmission,
+              )
             ) {
               this.#store.value?.replaceThreadQueue(
                 threadId,
@@ -6309,6 +6470,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             this.#store.value?.threadView(threadId)?.items ?? [],
             this.#store.value?.threadView(threadId)?.queue ?? [],
           );
+          pendingOptimistic.queueRevision.close();
         }
         if (accepted.queued !== true && accepted.turn > 0) {
           acceptedTurn = accepted.turn;
@@ -6338,8 +6500,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         requestGeneration === this.#turnRequestGeneration
         && threadId === this.threadId
       ) {
-        if (!steering && this.#optimisticPrompt?.id === optimistic?.id) {
-          this.#optimisticPrompt = undefined;
+        if (
+          !steering
+          && optimistic !== undefined
+          && this.#optimisticPrompt?.id === optimistic.id
+        ) {
+          this.#clearOptimisticPrompt(optimistic.id);
           if (textarea !== null) {
             textarea.value = draftContent;
             textarea.setSelectionRange(composerCursor, composerCursor);
@@ -6802,7 +6968,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (services === undefined || this.threadId === "" || this.#connectivityBlocked()) return;
     const threadId = this.threadId;
     const requestGeneration = ++this.#turnRequestGeneration;
-    const requestedTurn = this.#latestRunningTurn(
+    const requestedTurn = this.#latestActiveTurn(
       this.#store.value?.threadView(this.threadId).items ?? [],
     ) ?? this.#pendingStartTurn ?? -1;
     this.#cancelRequestedTurn = requestedTurn;

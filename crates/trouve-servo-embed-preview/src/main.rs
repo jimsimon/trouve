@@ -108,6 +108,9 @@ fn main() -> Result<()> {
     let sleep_for_action = sleep_inhibitor.clone();
     let native_actions = HostNativeActions::default()
         .with_lifecycle_capabilities(lifecycle.clone(), true, true)
+        // Servo has no first-close watchdog, but the current native bridge
+        // still requires an exact typed acknowledgement path.
+        .with_close_acknowledgement_observer(|_| Ok(()))
         .with_quit_handler(move || {
             quit_proxy
                 .send_event(AppEvent::ExitRequested)

@@ -60,7 +60,9 @@ These are load-bearing. Do not violate them without a new ADR.
    (ADRs 0030 and 0034).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
-   deliberately with a version bump.
+   deliberately with a version bump. Generated clients require an exact
+   protocol-version match because closed wire enums and unions are not
+   automatically forward-compatible (ADR 0036).
 6. **Agent modes are data.** Modes (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a mode must not require new Rust
    control flow.

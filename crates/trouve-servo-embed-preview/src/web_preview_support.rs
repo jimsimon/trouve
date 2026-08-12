@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use trouve_client_core::{
@@ -26,7 +25,6 @@ pub struct WebPreviewHost {
     gateway_origin: String,
     gateway_task: Option<JoinHandle<()>>,
     runtime: Option<Runtime>,
-    _host_storage: TempDir,
 }
 
 impl WebPreviewHost {
@@ -75,9 +73,6 @@ impl WebPreviewHost {
                 }
             });
 
-        let host_storage =
-            tempfile::tempdir().context("creating isolated desktop-host preferences")?;
-        let preference_path = host_storage.path().join("web-preferences.json");
         let (gateway_address, gateway) =
             runtime.block_on(HostGateway::bind_loopback_with_actions(
                 "127.0.0.1:0"
@@ -87,7 +82,7 @@ impl WebPreviewHost {
                 HostCapabilities::desktop(),
                 HostPreferences::default(),
                 Some(&upstream),
-                Some(preference_path),
+                None,
                 native_actions,
             ))?;
         let gateway_task = runtime.spawn(async move {
@@ -100,7 +95,6 @@ impl WebPreviewHost {
             gateway_origin: format!("http://{gateway_address}"),
             gateway_task: Some(gateway_task),
             runtime: Some(runtime),
-            _host_storage: host_storage,
         })
     }
 

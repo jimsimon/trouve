@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "12"
+    "version": "13"
   },
   "paths": {
     "/__trouve/host/v1/capabilities": {
@@ -24,6 +24,39 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/__trouve/host/v1/close-acknowledgement": {
+      "post": {
+        "tags": [],
+        "operationId": "close_acknowledgement",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseAcknowledgementRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
           }
         }
       }
@@ -501,6 +534,19 @@
           "offset": {
             "type": "number",
             "format": "float"
+          }
+        }
+      },
+      "CloseAcknowledgementRequest": {
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

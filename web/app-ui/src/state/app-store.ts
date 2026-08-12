@@ -382,13 +382,9 @@ export class AppStore {
     statuses: readonly ProtocolThreadStatus[],
   ): void {
     const firstSnapshot = !this.#initializedThreadStatusSessions.has(sessionId);
-    const nextIds = new Set(statuses.map((status) => status.thread_id));
-    for (const [threadId, status] of this.#threadStatuses) {
-      if (status.session_id === sessionId && !nextIds.has(threadId)) {
-        this.#threadStatuses.delete(threadId);
-        this.#seenThreadCursors.delete(threadId);
-      }
-    }
+    // A list response has no collection cursor. It cannot prove that a status
+    // received from newer SSE traffic was deleted; thread-list replacement is
+    // the authoritative place that removes status for deleted threads.
     for (const status of statuses) {
       const current = this.#threadStatuses.get(status.thread_id);
       if (current !== undefined && current.latest_cursor > status.latest_cursor) continue;

@@ -27,6 +27,8 @@ const settle = async (): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
+const confirmAutomaticClose = async (): Promise<boolean> => true;
+
 describe("DesktopHostCoordinator", () => {
   it("keeps close UI and protocol-backed idle policy in the frontend", async () => {
     let receive!: (batch: HostLifecycleBatch) => void;
@@ -50,6 +52,7 @@ describe("DesktopHostCoordinator", () => {
     const coordinator = new DesktopHostCoordinator(
       { watchLifecycle, resolveClose, setSleepInhibition },
       {
+        confirmAutomaticClose,
         onCloseRequested: (_request, nextActions) => {
           actions = nextActions;
         },
@@ -58,6 +61,7 @@ describe("DesktopHostCoordinator", () => {
 
     coordinator.start();
     coordinator.updateActivity({
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: true,
@@ -69,6 +73,7 @@ describe("DesktopHostCoordinator", () => {
     expect(resolveClose).not.toHaveBeenCalledWith(7, "quit_now");
 
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
@@ -80,6 +85,269 @@ describe("DesktopHostCoordinator", () => {
       false,
     ]);
     coordinator.stop();
+  });
+
+  it("does not infer idle from the empty store before protocol bootstrap", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    let actions: DesktopCloseActions | undefined;
+    const resolveClose = vi.fn(async () => undefined);
+    const onCloseRequested = vi.fn((_request, nextActions: DesktopCloseActions) => {
+      actions = nextActions;
+    });
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { confirmAutomaticClose, onCloseRequested },
+    );
+    coordinator.start();
+
+    receive(batch(1, { requestId: 17, waitingForIdle: false }));
+    expect(onCloseRequested).toHaveBeenCalledOnce();
+    expect(resolveClose).not.toHaveBeenCalled();
+
+    await actions!.quitWhenIdle();
+    expect(resolveClose).toHaveBeenCalledWith(17, "quit_when_idle");
+    expect(resolveClose).not.toHaveBeenCalledWith(17, "quit_now");
+
+    coordinator.updateActivity({
+      authoritative: false,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    await settle();
+    expect(resolveClose).not.toHaveBeenCalledWith(17, "quit_now");
+
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    await settle();
+    expect(resolveClose).toHaveBeenLastCalledWith(17, "quit_now");
+  });
+
+  it("prompts when bootstrapped idle activity cannot be reconciled after disconnect", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    const disconnected = new Error("stream disconnected");
+    const resolveClose = vi.fn(async () => undefined);
+    const onCloseRequested = vi.fn();
+    const onDiagnostic = vi.fn();
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      {
+        confirmAutomaticClose: vi.fn(async () => Promise.reject(disconnected)),
+        onCloseRequested,
+        onDiagnostic,
+      },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+
+    receive(batch(1, { requestId: 18, waitingForIdle: false }));
+    await settle();
+
+    expect(resolveClose).not.toHaveBeenCalled();
+    expect(onCloseRequested).toHaveBeenCalledOnce();
+    expect(onDiagnostic).toHaveBeenCalledWith(disconnected);
+  });
+
+  it("auto-closes fresh idle activity only after close-time reconciliation", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    const resolveClose = vi.fn(async () => undefined);
+    const onCloseRequested = vi.fn();
+    const reconcileActivity = vi.fn(async () => true);
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { confirmAutomaticClose: reconcileActivity, onCloseRequested },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+
+    receive(batch(1, { requestId: 18, waitingForIdle: false }));
+    receive(batch(2, { requestId: 18, waitingForIdle: false }));
+    await settle();
+    expect(resolveClose).toHaveBeenCalledWith(18, "quit_now");
+    expect(resolveClose).toHaveBeenCalledTimes(1);
+    expect(reconcileActivity).toHaveBeenCalledOnce();
+    expect(onCloseRequested).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges each exact close request without choosing a decision", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    const acknowledgeClose = vi.fn(async () => undefined);
+    const resolveClose = vi.fn(async () => undefined);
+    const onCloseRequested = vi.fn();
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        acknowledgeClose,
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { confirmAutomaticClose, onCloseRequested },
+    );
+    coordinator.start();
+
+    receive(batch(1, { requestId: 41, waitingForIdle: false }));
+    receive(batch(2, { requestId: 41, waitingForIdle: false }));
+    await settle();
+
+    expect(acknowledgeClose).toHaveBeenCalledOnce();
+    expect(acknowledgeClose).toHaveBeenCalledWith(41);
+    expect(resolveClose).not.toHaveBeenCalled();
+    expect(onCloseRequested).toHaveBeenCalledOnce();
+    coordinator.stop();
+  });
+
+  it("does not retry an in-flight acknowledgement after stop", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    let rejectAcknowledgement!: (error: unknown) => void;
+    const acknowledgeClose = vi.fn(
+      () => new Promise<void>((_resolve, reject) => {
+        rejectAcknowledgement = reject;
+      }),
+    );
+    const scheduleRetry = vi.fn((): unknown => "retry");
+    const onDiagnostic = vi.fn();
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        acknowledgeClose,
+        resolveClose: async () => undefined,
+        setSleepInhibition: async () => undefined,
+      },
+      {
+        confirmAutomaticClose,
+        onCloseRequested: vi.fn(),
+        onDiagnostic,
+        closeRetryScheduler: { set: scheduleRetry, clear: vi.fn() },
+      },
+    );
+    coordinator.start();
+    receive(batch(1, { requestId: 43, waitingForIdle: false }));
+    expect(acknowledgeClose).toHaveBeenCalledOnce();
+
+    coordinator.stop();
+    rejectAcknowledgement(new Error("late acknowledgement failure"));
+    await settle();
+
+    expect(scheduleRetry).not.toHaveBeenCalled();
+    expect(onDiagnostic).not.toHaveBeenCalled();
+    expect(acknowledgeClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-presents a fresh close after automatic quit resolution fails", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    let actions: DesktopCloseActions | undefined;
+    const unavailable = new Error("host resolution unavailable");
+    const resolveClose = vi
+      .fn<(requestId: number, decision: "cancel" | "quit_now" | "quit_when_idle") => Promise<void>>()
+      .mockRejectedValueOnce(unavailable)
+      .mockResolvedValue(undefined);
+    const onCloseRequested = vi.fn((_request, nextActions: DesktopCloseActions) => {
+      actions = nextActions;
+    });
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { confirmAutomaticClose, onCloseRequested },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+
+    receive(batch(1, { requestId: 42, waitingForIdle: false }));
+    receive(batch(2, { requestId: 42, waitingForIdle: false }));
+    await settle();
+
+    expect(resolveClose).toHaveBeenCalledTimes(1);
+    expect(onCloseRequested).toHaveBeenCalledOnce();
+    await actions!.quitNow();
+    expect(resolveClose).toHaveBeenCalledTimes(2);
+    expect(resolveClose).toHaveBeenLastCalledWith(42, "quit_now");
+    coordinator.stop();
+  });
+
+  it("rechecks authority before a queued idle close runs", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    const resolveClose = vi.fn(async () => undefined);
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      { confirmAutomaticClose, onCloseRequested: vi.fn() },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+
+    receive(batch(1, { requestId: 19, waitingForIdle: true }));
+    coordinator.updateActivity({
+      authoritative: false,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+    await settle();
+
+    expect(resolveClose).not.toHaveBeenCalled();
   });
 
   it("recovers a retained quit-when-idle request from lifecycle state", async () => {
@@ -97,10 +365,11 @@ describe("DesktopHostCoordinator", () => {
         resolveClose,
         setSleepInhibition: async () => undefined,
       },
-      { onCloseRequested: vi.fn() },
+      { confirmAutomaticClose, onCloseRequested: vi.fn() },
     );
     coordinator.start();
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
@@ -108,6 +377,58 @@ describe("DesktopHostCoordinator", () => {
     receive(batch(9, { requestId: 31, waitingForIdle: true }));
     await settle();
     expect(resolveClose).toHaveBeenCalledWith(31, "quit_now");
+  });
+
+  it("retries a transient quit-when-idle reconciliation failure with backoff", async () => {
+    let receive!: (batch: HostLifecycleBatch) => void;
+    let retry!: () => void;
+    const disconnected = new Error("temporarily disconnected");
+    const confirmClose = vi
+      .fn<() => Promise<boolean>>()
+      .mockRejectedValueOnce(disconnected)
+      .mockResolvedValue(true);
+    const resolveClose = vi.fn(async () => undefined);
+    const scheduleRetry = vi.fn((delayMs: number, callback: () => void): unknown => {
+      expect(delayMs).toBe(1_000);
+      retry = callback;
+      return "retry-1";
+    });
+    const coordinator = new DesktopHostCoordinator(
+      {
+        watchLifecycle: async (callback) => {
+          receive = callback;
+          await new Promise<void>(() => undefined);
+        },
+        resolveClose,
+        setSleepInhibition: async () => undefined,
+      },
+      {
+        confirmAutomaticClose: confirmClose,
+        onCloseRequested: vi.fn(),
+        closeRetryScheduler: {
+          set: scheduleRetry,
+          clear: vi.fn(),
+        },
+      },
+    );
+    coordinator.start();
+    coordinator.updateActivity({
+      authoritative: true,
+      idle: true,
+      workRunning: false,
+      preventSleepWhileRunning: true,
+    });
+
+    receive(batch(1, { requestId: 32, waitingForIdle: true }));
+    await settle();
+    expect(confirmClose).toHaveBeenCalledTimes(1);
+    expect(resolveClose).not.toHaveBeenCalled();
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+
+    retry();
+    await settle();
+    expect(confirmClose).toHaveBeenCalledTimes(2);
+    expect(resolveClose).toHaveBeenCalledWith(32, "quit_now");
   });
 
   it("cancels a close and announces each request only once", async () => {
@@ -126,7 +447,7 @@ describe("DesktopHostCoordinator", () => {
         resolveClose,
         setSleepInhibition: async () => undefined,
       },
-      { onCloseRequested },
+      { confirmAutomaticClose, onCloseRequested },
     );
     coordinator.start();
     receive(batch(1, { requestId: 8, waitingForIdle: false }));
@@ -151,7 +472,7 @@ describe("DesktopHostCoordinator", () => {
         resolveClose: async () => undefined,
         setSleepInhibition: async () => undefined,
       },
-      { onCloseRequested, onDiagnostic },
+      { confirmAutomaticClose, onCloseRequested, onDiagnostic },
     );
     coordinator.start();
     receive(batch(1, { requestId: 9, waitingForIdle: false }));
@@ -174,10 +495,11 @@ describe("DesktopHostCoordinator", () => {
         resolveClose,
         setSleepInhibition: async () => undefined,
       },
-      { onCloseRequested: vi.fn() },
+      { confirmAutomaticClose, onCloseRequested: vi.fn() },
     );
     coordinator.start();
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
@@ -185,6 +507,7 @@ describe("DesktopHostCoordinator", () => {
     receive(batch(1, { requestId: 10, waitingForIdle: true }));
     await settle();
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
@@ -193,17 +516,20 @@ describe("DesktopHostCoordinator", () => {
     expect(resolveClose).toHaveBeenCalledTimes(1);
 
     coordinator.updateActivity({
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: true,
     });
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
     });
     await settle();
     expect(resolveClose).toHaveBeenCalledTimes(2);
+    coordinator.stop();
   });
 
   it("does not inhibit sleep when the general preference is disabled", async () => {
@@ -214,9 +540,10 @@ describe("DesktopHostCoordinator", () => {
         resolveClose: async () => undefined,
         setSleepInhibition,
       },
-      { onCloseRequested: vi.fn() },
+      { confirmAutomaticClose, onCloseRequested: vi.fn() },
     );
     coordinator.updateActivity({
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: false,
@@ -238,10 +565,11 @@ describe("DesktopHostCoordinator", () => {
         resolveClose: async () => undefined,
         setSleepInhibition,
       },
-      { onCloseRequested: vi.fn(), onDiagnostic },
+      { confirmAutomaticClose, onCloseRequested: vi.fn(), onDiagnostic },
     );
 
     const active = {
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: true,
@@ -284,20 +612,23 @@ describe("DesktopHostCoordinator", () => {
         resolveClose: async () => undefined,
         setSleepInhibition,
       },
-      { onCloseRequested: vi.fn() },
+      { confirmAutomaticClose, onCloseRequested: vi.fn() },
     );
 
     coordinator.updateActivity({
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: true,
     });
     coordinator.updateActivity({
+      authoritative: true,
       idle: true,
       workRunning: false,
       preventSleepWhileRunning: true,
     });
     coordinator.updateActivity({
+      authoritative: true,
       idle: false,
       workRunning: true,
       preventSleepWhileRunning: true,

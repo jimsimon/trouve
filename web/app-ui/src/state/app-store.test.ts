@@ -320,6 +320,14 @@ describe("AppStore", () => {
       outcome: "succeeded",
     });
     expect(store.threadIndicatorState("th_2").attention).toBe("question");
+
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_2", { latest_cursor: 5 }),
+    ]);
+    expect(store.threadStatus("th_1")).toMatchObject({
+      outcome: "succeeded",
+      latest_cursor: 8,
+    });
   });
 
   it("folds durable account PR snapshots independently per GitHub host", () => {

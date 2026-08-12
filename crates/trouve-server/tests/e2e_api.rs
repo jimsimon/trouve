@@ -2426,12 +2426,14 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
 /// Records the vendor session id it was resumed with, per turn.
 struct ScriptedBackend {
     sessions_seen: std::sync::Mutex<Vec<Option<String>>>,
+    bridge_urls_seen: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 impl ScriptedBackend {
     fn new() -> Self {
         Self {
             sessions_seen: std::sync::Mutex::new(Vec::new()),
+            bridge_urls_seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -2475,6 +2477,10 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             .lock()
             .unwrap()
             .push(turn.session.clone());
+        self.bridge_urls_seen
+            .lock()
+            .unwrap()
+            .push(turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let fresh = turn.session.is_none();
         let worktree = turn.worktree.clone();
@@ -2565,6 +2571,14 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
             ..Default::default()
         },
     );
+    config.providers.insert(
+        "fake-agent".into(),
+        trouve_core::config::ProviderConfig {
+            kind: "claude-cli".into(),
+            command: Some("/definitely/not/a/fake-agent-test-binary".into()),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(
         Engine::new(store, tmp.path().join("data"), &config)
             .with_config_dir(None)
@@ -2574,6 +2588,7 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    engine.set_base_url(&format!("http://{addr}"));
     let router = trouve_server::build_router(engine);
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
@@ -2646,6 +2661,121 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .unwrap()
         .to_string();
     assert_eq!(call_id, "vendor-call-1");
+
+    // The embedded MCP bridge is scoped to the active vendor turn. While
+    // that turn is waiting for approval, it can advertise and execute trouve
+    // tools through the engine's policy gate.
+    let mcp_url = backend
+        .bridge_urls_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .flatten()
+        .expect("active backend turn receives an engine-issued bridge capability");
+    let mcp = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = mcp_url.clone();
+        async move {
+            let request_id = body["id"].clone();
+            let response = client.post(url).json(&body).send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert!(
+                status.is_success(),
+                "MCP bridge request {request_id} returned {status}: {text}"
+            );
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|error| panic!("MCP bridge returned invalid JSON: {error}: {text}"))
+        }
+    };
+    let init = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"}
+    }))
+    .await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "trouve-bridge");
+
+    let listed = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }))
+    .await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|spec| spec["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"read_file") && names.contains(&"write_file"));
+    assert!(names.contains(&"approval_prompt"));
+
+    let called = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "list_dir", "arguments": {"path": "."}}
+    }))
+    .await;
+    assert_eq!(called["result"]["isError"], false, "{called}");
+
+    // The vendor-side permission shim is also bound to this exact active
+    // ticket. An in-worktree write reaches the ordinary approval flow and
+    // returns allow after the user approves it.
+    let in_worktree_input = serde_json::json!({
+        "file_path": Path::new(&worktree)
+            .join("bridge-approved.txt")
+            .to_string_lossy()
+            .to_string(),
+    });
+    let in_worktree_call = tokio::spawn(mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {
+            "name": "approval_prompt",
+            "arguments": {"tool_name": "Write", "input": in_worktree_input.clone()}
+        }
+    })));
+    let approval_events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "approval.requested" && event["call_id"] != "vendor-call-1"
+    })
+    .await;
+    let bridge_call_id = approval_events
+        .iter()
+        .find(|event| event["type"] == "approval.requested" && event["call_id"] != "vendor-call-1")
+        .unwrap()["call_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = client
+        .post(format!("{base}/approvals"))
+        .json(&serde_json::json!({"call_id": bridge_call_id, "decision": "approve"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let allowed = in_worktree_call.await.unwrap();
+    let allowed_verdict: serde_json::Value =
+        serde_json::from_str(allowed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(allowed_verdict["behavior"], "allow", "{allowed}");
+    assert_eq!(allowed_verdict["updatedInput"], in_worktree_input);
+
+    // The same valid ticket cannot authorize a vendor write outside the
+    // session worktree, even while another backend approval is still live.
+    let outside_input = serde_json::json!({
+        "file_path": tmp
+            .path()
+            .join("outside-agent-write.txt")
+            .to_string_lossy()
+            .to_string(),
+    });
+    let denied = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {
+            "name": "approval_prompt",
+            "arguments": {"tool_name": "Write", "input": outside_input}
+        }
+    }))
+    .await;
+    let denied_verdict: serde_json::Value =
+        serde_json::from_str(denied["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(denied_verdict["behavior"], "deny", "{denied}");
 
     let resp = client
         .post(format!("{base}/approvals"))
@@ -2721,6 +2851,12 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         vec![None, Some("vendor-sess-1".to_string())],
         "turn 2 must resume the vendor session persisted in turn 1"
     );
+    let bridge_urls = backend.bridge_urls_seen.lock().unwrap().clone();
+    assert_eq!(bridge_urls.len(), 2);
+    assert_eq!(
+        bridge_urls[0], bridge_urls[1],
+        "a persistent vendor MCP client must keep one capability URL across resumed turns"
+    );
 
     // Usage from both turns is accounted.
     let usage: serde_json::Value = client
@@ -2734,94 +2870,24 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     assert_eq!(usage["turns"], 2);
     assert_eq!(usage["input_tokens"], 80);
 
-    // Embedded MCP bridge endpoint: a bridged vendor agent can list and
-    // call trouve tools for this thread through the engine's gate.
-    let mcp_url = format!("http://{addr}/internal/threads/{thread_id}/mcp?tools=1&approval=1");
-    let mcp = |body: serde_json::Value| {
-        let client = client.clone();
-        let url = mcp_url.clone();
-        async move {
-            client
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .unwrap()
-                .json::<serde_json::Value>()
-                .await
-                .unwrap()
-        }
-    };
-
-    let init = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-03-26"}
-    }))
-    .await;
-    assert_eq!(init["result"]["serverInfo"]["name"], "trouve-bridge");
-
-    let listed = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
-    }))
-    .await;
-    let names: Vec<&str> = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["name"].as_str().unwrap())
-        .collect();
-    assert!(names.contains(&"read_file") && names.contains(&"write_file"));
-    assert!(names.contains(&"approval_prompt"));
-
-    // Non-mutating call runs without approval (thread is yolo by now anyway).
-    let called = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": "list_dir", "arguments": {"path": "."}}
-    }))
-    .await;
+    // The persistent capability is dormant at terminal state. Even discovery
+    // and the approval shim fail until this same thread starts another turn.
+    let response = client
+        .post(&mcp_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert!(
-        called["result"]["content"][0]["text"]
-            .as_str()
+        response
+            .text()
+            .await
             .unwrap()
-            .contains("agent.txt"),
-        "{called}"
+            .contains("invalid or stale bridge capability ticket")
     );
-
-    // Vendor-executed tool gating (Claude's permission-prompt hook): the
-    // thread is yolo by now, so the gate auto-approves.
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Bash", "input": {"command": "ls"}}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
-
-    // Worktree confinement still applies in yolo mode. Vendor file tools
-    // auto-approve inside the session checkout but an absolute target in
-    // the main repo (or anywhere else) is denied before execution.
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Write", "input": {
-                       "file_path": Path::new(&worktree).join("safe.txt")
-                   }}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
-
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Write", "input": {
-                       "file_path": repo.join("escaped.txt")
-                   }}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"deny\""), "{verdict}");
 
     // CLI-kind provider CRUD: upsert reports auth "cli"; login relays the
     // vendor flow (the configured test binary is absent, so it fails with
@@ -5402,9 +5468,25 @@ async fn spawn_session_child_agent_isolated() {
 #[tokio::test]
 async fn secured_router_enforces_loopback_host_and_internal_token() {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let backend = Arc::new(ScriptedBackend::new());
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let mut config = Config::default();
+    config.providers.insert(
+        "fake-agent".into(),
+        trouve_core::config::ProviderConfig {
+            kind: "claude-cli".into(),
+            command: Some("/definitely/not/a/fake-agent-test-binary".into()),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(
-        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+        Engine::new(store, tmp.path().join("data"), &config)
+            .with_config_dir(None)
+            .with_backend("fake-agent", backend.clone())
+            .with_default_model("fake-agent/agent-model"),
     );
 
     let security = trouve_server::ServerSecurity {
@@ -5413,6 +5495,7 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    engine.set_base_url(&format!("http://{addr}"));
     let router = trouve_server::build_secured_router(engine, security);
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
@@ -5447,16 +5530,64 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
         "method": "initialize",
         "params": {"protocolVersion": "2025-03-26"}
     });
-    let internal = format!("http://{addr}/internal/threads/missing/mcp?tools=0&approval=0");
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Secured bridge"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "hold for approval"}))
+        .send()
+        .await
+        .unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "approval.requested"
+    })
+    .await;
+    let internal = backend
+        .bridge_urls_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .flatten()
+        .expect("active turn receives an exact bridge capability");
+    let unauthenticated = internal.replace("&bridge_token=bridge-secret", "");
+    assert_ne!(unauthenticated, internal);
     let resp = client
-        .post(&internal)
+        .post(&unauthenticated)
         .json(&initialize)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     let resp = client
-        .post(format!("{internal}&bridge_token=bridge-secret"))
+        .post(internal)
         .json(&initialize)
         .send()
         .await

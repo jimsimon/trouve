@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ProtocolModelInfo } from "./protocol-client.js";
 import { ModelCatalogController } from "./model-catalog-controller.js";
@@ -82,5 +82,39 @@ describe("ModelCatalogController", () => {
     liveResult.resolve([model("cursor/default")]);
     await liveResult.promise;
     await Promise.resolve();
+  });
+
+  it("forces fresh static and live snapshots after connectivity recovers", async () => {
+    let staticCalls = 0;
+    let liveCalls = 0;
+    const controller = new ModelCatalogController({
+      models: async () => {
+        staticCalls += 1;
+        return staticCalls === 1
+          ? [model("local/offline")]
+          : [model("codex/gpt-5.6-sol")];
+      },
+      refreshModels: async () => {
+        liveCalls += 1;
+        return liveCalls === 1
+          ? [model("local/offline")]
+          : [model("codex/gpt-5.6-sol"), model("cursor/gpt-5.6")];
+      },
+    });
+
+    await controller.refresh();
+    await vi.waitFor(() => expect(liveCalls).toBe(1));
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "local/offline",
+    ]);
+
+    await controller.refresh("force");
+    await vi.waitFor(() => expect(liveCalls).toBe(2));
+
+    expect(staticCalls).toBe(2);
+    expect(readSignal(controller.current).map(({ id }) => id)).toEqual([
+      "codex/gpt-5.6-sol",
+      "cursor/gpt-5.6",
+    ]);
   });
 });

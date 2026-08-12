@@ -30,6 +30,7 @@ import {
 import { lineRangeOffsets, parentDirectories } from "./file-reveal.js";
 import { languageForPath } from "./file-language.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import { CheckpointActionScope } from "./turn-checkpoint-actions.js";
 import type { TrouveCodeView } from "./code-view.js";
 import "./code-view.js";
 import "./diff-view.js";
@@ -59,6 +60,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
   #refreshing = false;
   #notice = "";
   #noticeIsError = false;
+  readonly #checkpointActions = new CheckpointActionScope();
   #copyFeedback = "";
   #copyFeedbackIsError = false;
   #copiedDiffPath = "";
@@ -168,6 +170,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
       this.#error = "";
     }
     if (this.#sessionScopeChanged) {
+      this.#checkpointActions.reset();
       this.#generation += 1;
       this.#diffFileGeneration += 1;
       this.#fileTreeGeneration += 1;
@@ -223,6 +226,7 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
     this.#fileGeneration += 1;
     this.#fileActionGeneration += 1;
     this.#copySequence += 1;
+    this.#checkpointActions.reset();
     this.#clearCopyFeedbackTimer();
     if (this.#diffRefreshTimer !== undefined) {
       globalThis.clearInterval(this.#diffRefreshTimer);
@@ -282,6 +286,20 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
               >${fontAwesomeIcon("folder-tree")}</button>
               <strong title=${selectedFile.path}>${selectedFile.path}</strong>`}
           <span class="diff-summary-actions" role="group" aria-label="Diff actions">
+            <button
+              type="button"
+              aria-label="Undo to the previous checkpoint"
+              title="Undo to the previous checkpoint"
+              ?disabled=${this.#checkpointActions.action !== ""}
+              @click=${() => void this.#restoreRelativeCheckpoint("undo")}
+            >${fontAwesomeIcon("rotate-left")}</button>
+            <button
+              type="button"
+              aria-label="Redo to the next checkpoint"
+              title="Redo to the next checkpoint"
+              ?disabled=${this.#checkpointActions.action !== ""}
+              @click=${() => void this.#restoreRelativeCheckpoint("redo")}
+            >${fontAwesomeIcon("rotate-right")}</button>
             ${selectedPatch === undefined
               ? nothing
               : html`<button
@@ -366,6 +384,36 @@ export class TrouveInspectionWorkspace extends withSignalTracking(LitElement) {
             `}
       </section>
     `;
+  }
+
+  async #restoreRelativeCheckpoint(direction: "undo" | "redo"): Promise<void> {
+    const services = this.#services.value;
+    const sessionId = this.#effectiveSessionId;
+    if (services === undefined || sessionId === "") return;
+    const token = this.#checkpointActions.begin(direction);
+    if (token === undefined) return;
+    this.#notice = "";
+    this.#noticeIsError = false;
+    this.requestUpdate();
+    try {
+      await services.protocol.restoreSessionCheckpoint(sessionId, direction);
+      if (sessionId !== this.#effectiveSessionId || !this.#checkpointActions.isCurrent(token)) return;
+      this.#notice = direction === "undo"
+        ? "Restored the previous checkpoint."
+        : "Restored the next checkpoint.";
+      globalThis.dispatchEvent(new CustomEvent("trouve-checkpoint-restored", {
+        detail: { sessionId },
+      }));
+      await this.#refreshDiff({ silent: true, force: true });
+    } catch {
+      if (sessionId !== this.#effectiveSessionId || !this.#checkpointActions.isCurrent(token)) return;
+      this.#notice = direction === "undo"
+        ? "The previous checkpoint could not be restored."
+        : "The next checkpoint could not be restored.";
+      this.#noticeIsError = true;
+    } finally {
+      if (this.#checkpointActions.finish(token)) this.requestUpdate();
+    }
   }
 
   #renderSelectedDiff(

@@ -4,10 +4,11 @@ import type {
   RankedComposerCompletion,
 } from "../components/composer-completion.js";
 import type { ParsedDiffFile } from "../components/diff-parser.js";
-import type {
-  ContentWorkerRequest,
+import {
+  type ContentWorkerRequest,
   ContentWorkerResponse,
-  HighlightToken,
+  type HighlightToken,
+  validateContentWorkerRequest,
 } from "../workers/content-worker-protocol.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
@@ -45,14 +46,21 @@ class ContentWorkerClient {
     request: (id: number) => ContentWorkerRequest,
     fallback: () => Promise<T>,
   ): Promise<T> {
+    const id = this.#nextId++;
+    let message: ContentWorkerRequest;
+    try {
+      message = request(id);
+      validateContentWorkerRequest(message);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const worker = this.#ensureWorker();
     if (worker === undefined) return fallback();
     this.#clearIdleTimer();
-    const id = this.#nextId++;
     return new Promise<T>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject, fallback } as PendingRequest);
       try {
-        worker.postMessage(request(id));
+        worker.postMessage(message);
       } catch {
         this.#pending.delete(id);
         void fallback().then(resolve, reject);

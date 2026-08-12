@@ -1,6 +1,11 @@
 # ADR 0023: Lit web frontend and gated webview host
 
-Status: Accepted (2026-08)
+Status: Partially superseded by ADR 0028 (2026-08)
+
+ADR 0028 deliberately retired the Slint rollback and made Wry/Lit the sole
+shipping product frontend. The migration and rollback requirements below are
+retained as the historical decision that governed the transition; ADR 0028 is
+authoritative for the current frontend and rollback policy.
 
 ## Context
 

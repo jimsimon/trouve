@@ -140,15 +140,16 @@ sleep, and window/lifecycle state. The PWA uses browser capability adapters
 and retains explicit fallbacks or explanations where the browser cannot
 provide the equivalent operation.
 
-This functional closure supports the staged default in ADR 0027; it is not a
-claim that desktop qualification is complete. Native and browser notification paths are
+ADR 0028 subsequently made Wry/Lit the sole shipping desktop frontend. This is
+not a claim that every hardening or alternative-engine qualification is
+complete. Native and browser notification paths are
 wired, including preference gating, event-derived summaries, focused-session
 suppression, activation routing, and a user-initiated test; dependable PWA
 background delivery remains a publication gate. Promotion still requires the
 platform, accessibility, security, memory, widget, visual-parity,
-offline-packaging, rollback, and soak gates in
-[ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md). Slint remains the
-explicit rollback while those gates and the Wry rollout are completed.
+offline-packaging, recovery, and soak work tracked from
+[ADR 0023](../adr/0023-lit-web-frontend-and-webview-host.md), while current
+frontend ownership and rollback policy follow ADR 0028.
 
 ## Key workflows
 
@@ -169,8 +170,8 @@ explicit rollback while those gates and the Wry rollout are completed.
 3. **Approval loop**: prompt inline in chat and as a notification; show
    exactly what will run; "always allow" is the ask → allow-list migration
    path; resolving from any client updates all (SSE).
-4. **Diff review & apply**: turn/session ends → review S4 → accept or
-   revert (checkpoint undo/redo backs this).
+4. **Diff review & apply**: turn/session ends → review S4 → accept or restore
+   an exact turn checkpoint from its transcript action.
 5. **PR flow**: session branch → Pull request inspection tab → inspect current
    status and use the lifecycle actions the server reports as available.
 6. **Provider onboarding**: S6 on first run and from settings.

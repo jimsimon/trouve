@@ -83,7 +83,7 @@ describe("buildChatLayout", () => {
     });
   });
 
-  it("suppresses a todo tool card once lifecycle rows represent the update", () => {
+  it("retains a todo tool card when lifecycle rows lack exact call causality", () => {
     const todoTool: ThreadChatItem = {
       id: "todo-tool",
       kind: "tool",
@@ -113,14 +113,105 @@ describe("buildChatLayout", () => {
       todoTool,
       lifecycle,
     ]);
-    expect(projected.units[0]?.items).toEqual([lifecycle]);
-    expect(projected.unitIdForItem.has("todo-tool")).toBe(false);
+    expect(projected.units[0]?.items).toEqual([todoTool, lifecycle]);
+    expect(projected.unitIdForItem.has("todo-tool")).toBe(true);
 
     const legacy = buildChatLayout([
       { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
       todoTool,
     ]);
     expect(legacy.units[0]?.items).toEqual([todoTool]);
+  });
+
+  it("retains parallel, interleaved, multiple, and no-op TODO calls", () => {
+    const todoTool = (id: string): ThreadChatItem => ({
+      id,
+      kind: "tool",
+      callId: id,
+      tool: "todo_write",
+      args: { todos: [] },
+      status: "ok",
+      result: null,
+      output,
+    });
+    const todoLifecycle = (id: string, todoId: string): ThreadChatItem => ({
+      id,
+      kind: "todo",
+      turn: 4,
+      todoId,
+      content: todoId,
+      state: "completed",
+    });
+    const layout = buildChatLayout([
+      { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      todoTool("parallel-one"),
+      {
+        id: "interleaved-shell",
+        kind: "tool",
+        callId: "shell-call",
+        tool: "shell",
+        args: { command: "true" },
+        status: "ok",
+        result: null,
+        output,
+      },
+      todoLifecycle("lifecycle-one", "one"),
+      todoTool("parallel-two"),
+      todoLifecycle("lifecycle-two", "two"),
+      todoTool("no-op"),
+    ]);
+    expect(layout.units[0]?.items.map((item) => item.id)).toEqual([
+      "parallel-one",
+      "interleaved-shell",
+      "lifecycle-one",
+      "parallel-two",
+      "lifecycle-two",
+      "no-op",
+    ]);
+  });
+
+  it("retains failed and third-party TODO calls beside lifecycle rows", () => {
+    const todoTool = (
+      id: string,
+      tool: string,
+      args: unknown,
+      status: "ok" | "error",
+    ): ThreadChatItem => ({
+      id,
+      kind: "tool",
+      callId: id,
+      tool,
+      args,
+      status,
+      result: status === "ok" ? null : { error: "failed" },
+      output,
+    });
+    const lifecycle: ThreadChatItem = {
+      id: "todo-completed",
+      kind: "todo",
+      turn: 4,
+      todoId: "verify",
+      content: "Run checks",
+      state: "completed",
+    };
+    const layout = buildChatLayout([
+      { id: "u4", kind: "user", turn: 4, content: "Continue", attachments: [] },
+      todoTool("failed-native", "todo_write", { todos: [] }, "error"),
+      todoTool("external-direct", "mcp__linear__todo_write", { todos: [] }, "ok"),
+      todoTool("external-wrapped", "mcpToolCall", {
+        serverName: "linear",
+        toolName: "todo_write",
+        arguments: { todos: [] },
+      }, "ok"),
+      lifecycle,
+    ]);
+
+    expect(layout.units[0]?.items.map((item) => item.id)).toEqual([
+      "failed-native",
+      "external-direct",
+      "external-wrapped",
+      "todo-completed",
+    ]);
   });
 
   it("keeps steering in its active turn between the output it redirects", () => {
@@ -210,6 +301,25 @@ describe("buildChatLayout", () => {
     ]);
     expect(layout.units[0]?.items).toEqual([subagent]);
     expect(layout.unitIdForItem.has("spawn-output")).toBe(false);
+  });
+
+  it("retains failed and third-party spawn_output tool calls", () => {
+    const tool = (id: string, name: string, status: "ok" | "error"): ThreadChatItem => ({
+      id,
+      kind: "tool",
+      callId: id,
+      tool: name,
+      args: { thread_id: "th_child" },
+      status,
+      result: status === "error" ? { error: "collection failed" } : {},
+      output,
+    });
+    const layout = buildChatLayout([
+      { id: "u6", kind: "user", turn: 6, content: "Delegate", attachments: [] },
+      tool("failed", "spawn_output", "error"),
+      tool("external", "mcp__example__spawn_output", "ok"),
+    ]);
+    expect(layout.units[0]?.items.map((item) => item.id)).toEqual(["failed", "external"]);
   });
 
   it("associates the event-folded leading status with its turn", () => {
@@ -310,6 +420,41 @@ describe("activityGroupSummary", () => {
     expect(activityGroupSummary(items)).toBe(
       "Ran 2 code searches, ran 1 transcript search, called 1 tool",
     );
+  });
+
+  it("counts third-party MCP basename collisions as generic tool calls", () => {
+    const item: AgentActivityItem = {
+      id: "external-search",
+      kind: "tool",
+      callId: "external-search",
+      tool: "mcp__example__search",
+      args: { query: "record" },
+      status: "ok",
+      result: null,
+      output,
+    };
+    expect(activityGroupSummary([item])).toBe("Called 1 tool");
+  });
+
+  it("keeps wrapped third-party basename collisions in the generic category", () => {
+    const wrapped = (id: string, wrapper: string): AgentActivityItem => ({
+      id,
+      kind: "tool",
+      callId: id,
+      tool: wrapper,
+      args: {
+        serverName: "example",
+        toolName: "search",
+        arguments: { query: "record" },
+      },
+      status: "ok",
+      result: null,
+      output,
+    });
+    expect(activityGroupSummary([
+      wrapped("mcp", "mcpToolCall"),
+      wrapped("dynamic", "dynamicToolCall"),
+    ])).toBe("Called 2 tools");
   });
 
   it("recognizes legacy context-compaction tool names", () => {

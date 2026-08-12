@@ -214,17 +214,6 @@ impl WebPreviewHost {
     }
 
     #[allow(dead_code)]
-    pub fn persist_window_geometry(
-        &self,
-        geometry: trouve_desktop_host::WindowGeometry,
-    ) -> Result<()> {
-        self.runtime
-            .as_ref()
-            .expect("preview runtime remains available until shutdown")
-            .block_on(self.preferences.update_window_geometry(geometry))
-            .context("persisting desktop window geometry")
-    }
-
     /// Stop accepting gateway traffic and tear down its runtime before the
     /// preview process exits.
     pub fn shutdown(mut self) {

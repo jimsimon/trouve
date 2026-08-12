@@ -19,6 +19,12 @@ export type TodoItem = ProtocolComponents["schemas"]["TodoItem"];
 type Usage = ProtocolComponents["schemas"]["Usage"];
 type ThreadViewItem = ProtocolThreadViewSnapshot["items"][number];
 
+/** Constant-space queue revision observation scoped to one pending request. */
+export interface QueueRevisionTracker {
+  readonly queueChanged: () => boolean;
+  readonly close: () => void;
+}
+
 export type ToolCallStatus =
   | "awaiting-approval"
   | "running"
@@ -198,6 +204,7 @@ export class ThreadViewModel {
   readonly turnStartedAt = new Map<number, string>();
   readonly turnDurationMs = new Map<number, number>();
   readonly #capacityAcquiredBeforeStart = new Set<number>();
+  #queueRevision = 0;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -286,7 +293,7 @@ export class ThreadViewModel {
     }
     this.thinking = snapshot.thinking ?? false;
     this.commands = [...(snapshot.commands ?? [])];
-    this.queue = [...(snapshot.queue ?? [])];
+    this.replaceQueue(snapshot.queue ?? []);
     // Protocol 3.1 snapshots predate the todo projection. Preserve any live
     // todo events already folded when an older-compatible snapshot omits it.
     if (snapshot.todos !== undefined) this.replaceTodos(snapshot.todos);
@@ -462,7 +469,19 @@ export class ThreadViewModel {
   }
 
   replaceQueue(prompts: readonly QueuedPrompt[]): void {
-    this.queue = prompts;
+    this.#queueRevision += 1;
+    this.queue = [...prompts];
+  }
+
+  trackQueueRevision(): QueueRevisionTracker {
+    const revision = this.#queueRevision;
+    let closed = false;
+    return {
+      queueChanged: () => !closed && this.#queueRevision !== revision,
+      close: () => {
+        closed = true;
+      },
+    };
   }
 
   replaceTodos(todos: readonly TodoItem[]): void {
@@ -523,7 +542,7 @@ export class ThreadViewModel {
         this.commands = envelope.commands;
         return true;
       case "thread.queue_updated":
-        this.queue = envelope.prompts;
+        this.replaceQueue(envelope.prompts);
         return true;
       case "thread.todos_updated": {
         const turn = this.activeTurn();
@@ -591,6 +610,7 @@ export class ThreadViewModel {
         });
         return true;
       case "turn.steered":
+        this.finishThinking();
         this.appendItem({
           id: `steered:${envelope.turn}:${envelope.cursor}`,
           kind: "steered",
@@ -667,9 +687,7 @@ export class ThreadViewModel {
       }
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
-        // Provider tool lifecycle can interleave with deltas from one
-        // explicitly bounded thinking item. Do not turn that transport
-        // interleaving into a second Thought row.
+        this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",
@@ -680,7 +698,7 @@ export class ThreadViewModel {
           status: envelope.requires_approval ? "awaiting-approval" : "running",
           result: undefined,
           output: emptyToolOutput(),
-          startedAt: envelope.ts,
+          ...(envelope.requires_approval ? {} : { startedAt: envelope.ts }),
         });
         return true;
       case "approval.requested": {
@@ -696,6 +714,9 @@ export class ThreadViewModel {
         const tool = this.findTool(envelope.call_id);
         if (tool !== undefined) {
           tool.status = envelope.decision === "deny" ? "denied" : "running";
+          if (envelope.decision !== "deny" && tool.startedAt === undefined) {
+            tool.startedAt = envelope.ts;
+          }
         }
         return tool !== undefined;
       }
@@ -810,7 +831,12 @@ export class ThreadViewModel {
         this.finishThinking();
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
-        return this.replaceActiveTurn(envelope.turn, { kind: "cancelled" });
+        const index = this.items.findIndex((item) =>
+          item.kind === "turn-status" && item.turn === envelope.turn);
+        if (index < 0) return false;
+        this.items.splice(index, 1);
+        this.totalItems = Math.max(this.itemOffset + this.items.length, this.totalItems - 1);
+        return true;
       }
       default:
         return false;

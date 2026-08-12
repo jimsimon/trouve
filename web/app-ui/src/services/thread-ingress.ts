@@ -179,11 +179,12 @@ export class ThreadIngress {
     try {
       const [threads, statuses] = await Promise.all([
         this.#client.threads(sessionId),
-        this.#client.threadStatuses?.(sessionId) ?? Promise.resolve([]),
+        this.#client.threadStatuses?.(sessionId).catch(() => undefined)
+          ?? Promise.resolve(undefined),
       ]);
       if (generation !== this.#generation) return undefined;
       this.#store.replaceThreadsForSession(sessionId, threads);
-      if (this.#client.threadStatuses !== undefined) {
+      if (statuses !== undefined) {
         this.#store.replaceThreadStatusesForSession(sessionId, statuses);
       }
       const closed = new Set(closedThreadIds);

@@ -27,7 +27,10 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model};
+use crate::tools::{
+    BackgroundMutationLease, LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult,
+    edit_strategy_for_model,
+};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
@@ -114,15 +117,14 @@ const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duratio
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Codex collaborators inherit the root thread's MCP URL. App-server emits a
-/// separate `mcpToolCall` item with the actual owner thread, normally within
-/// the same event-loop tick. Wait briefly for that authoritative ownership
-/// signal before falling back to the URL's root thread.
+/// Codex collaborators inherit the root thread's MCP URL. Stable Codex sends
+/// its vendor thread id in the MCP request metadata, and app-server separately
+/// emits the matching `mcpToolCall` item id. Bound the rendezvous between those
+/// two independently scheduled transports.
 #[cfg(not(test))]
-const BRIDGED_TOOL_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const BRIDGED_TOOL_OWNER_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const BRIDGED_TOOL_OWNER_HINT_TTL: Duration = Duration::from_secs(5);
+const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Bounded recursive delegation. Depth counts spawn edges from the root
 /// conversation thread, so a value of four permits root → child → grandchild
@@ -197,183 +199,257 @@ struct BackendCollaboratorProjection {
     terminal: bool,
 }
 
-struct PendingBridgedToolOwner {
+struct PendingCodexVendorOwner {
     id: u64,
-    tool: String,
-    arguments: serde_json::Value,
     sender: tokio::sync::oneshot::Sender<String>,
-    created_at: Instant,
 }
 
-struct BridgedToolOwnerHint {
-    tool: String,
-    arguments: serde_json::Value,
-    owner_thread_id: String,
-    created_at: Instant,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexCallValidationOutcome {
+    Matched,
+    Mismatched,
 }
 
-struct AbandonedBridgedToolOwner {
-    tool: String,
-    arguments: serde_json::Value,
-    created_at: Instant,
+struct PendingCodexCallValidation {
+    id: u64,
+    vendor_thread_id: String,
+    sender: tokio::sync::oneshot::Sender<CodexCallValidationOutcome>,
+}
+
+#[derive(Default)]
+struct ActiveCodexBridgeRoot {
+    next_id: u64,
+    /// Active-turn vendor thread/session id -> durable trouve thread id.
+    vendor_threads: HashMap<String, String>,
+    pending_vendor_owners: HashMap<String, Vec<PendingCodexVendorOwner>>,
+    /// App-server wrapper item ids that arrived before their HTTP call.
+    wrapper_owners: HashMap<String, String>,
+    /// HTTP calls waiting for their app-server wrapper item.
+    pending_calls: HashMap<String, PendingCodexCallValidation>,
+    /// Successfully matched ids cannot authorize a second execution.
+    consumed_calls: HashSet<String>,
+    /// Timed-out/cancelled ids remain unusable for the rest of the root turn.
+    retired_calls: HashSet<String>,
 }
 
 #[derive(Default)]
 struct BridgedToolOwnerState {
-    next_id: u64,
-    pending: HashMap<String, Vec<PendingBridgedToolOwner>>,
-    hints: HashMap<String, Vec<BridgedToolOwnerHint>>,
-    abandoned: HashMap<String, Vec<AbandonedBridgedToolOwner>>,
+    roots: HashMap<String, ActiveCodexBridgeRoot>,
 }
 
-impl BridgedToolOwnerState {
-    fn prune(&mut self, now: Instant) {
-        self.pending.retain(|_, pending| {
-            pending.retain(|entry| {
-                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
-            });
-            !pending.is_empty()
-        });
-        self.hints.retain(|_, hints| {
-            hints.retain(|entry| {
-                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
-            });
-            !hints.is_empty()
-        });
-        self.abandoned.retain(|_, abandoned| {
-            abandoned.retain(|entry| {
-                now.saturating_duration_since(entry.created_at) <= BRIDGED_TOOL_OWNER_HINT_TTL
-            });
-            !abandoned.is_empty()
-        });
-    }
-}
-
-enum BridgedToolOwnerRegistration {
+enum CodexVendorOwnerRegistration {
     Immediate(String),
     Pending {
         id: u64,
         receiver: tokio::sync::oneshot::Receiver<String>,
     },
+    InactiveRoot,
 }
 
-/// Correlates Codex's inherited MCP request with the app-server item carrying
-/// its real root-or-collaborator owner. Both arrival orders are supported.
+enum CodexCallValidationRegistration {
+    Immediate,
+    Pending {
+        id: u64,
+        receiver: tokio::sync::oneshot::Receiver<CodexCallValidationOutcome>,
+    },
+    InactiveRoot,
+    UnknownOwner,
+    MismatchedOwner,
+    Replayed,
+}
+
+/// Authorizes Codex's inherited MCP requests with explicit vendor identity.
+/// Payload equality is deliberately absent: byte-identical calls from sibling
+/// collaborators must remain independently routable.
 #[derive(Default)]
 struct BridgedToolOwnerRouter {
     state: Mutex<BridgedToolOwnerState>,
 }
 
 impl BridgedToolOwnerRouter {
-    fn register(
-        &self,
-        root_thread_id: &str,
-        tool: &str,
-        arguments: &serde_json::Value,
-    ) -> BridgedToolOwnerRegistration {
-        let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-        state.prune(now);
-        if let Some(hints) = state.hints.get_mut(root_thread_id)
-            && let Some(index) = hints
-                .iter()
-                .position(|hint| hint.tool == tool && hint.arguments == *arguments)
-        {
-            let owner_thread_id = hints.remove(index).owner_thread_id;
-            if hints.is_empty() {
-                state.hints.remove(root_thread_id);
-            }
-            return BridgedToolOwnerRegistration::Immediate(owner_thread_id);
-        }
-        state.next_id = state.next_id.wrapping_add(1);
-        let id = state.next_id;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .entry(root_thread_id.to_string())
-            .or_default()
-            .push(PendingBridgedToolOwner {
-                id,
-                tool: tool.to_string(),
-                arguments: arguments.clone(),
-                sender,
-                created_at: now,
-            });
-        BridgedToolOwnerRegistration::Pending { id, receiver }
+    fn begin_root(&self, root_thread_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .roots
+            .insert(root_thread_id.to_string(), ActiveCodexBridgeRoot::default());
     }
 
-    fn announce(
+    fn bind_vendor_thread(
         &self,
         root_thread_id: &str,
+        vendor_thread_id: &str,
         owner_thread_id: &str,
-        tool: &str,
-        arguments: &serde_json::Value,
-    ) {
+    ) -> std::result::Result<(), String> {
         let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-        state.prune(now);
-        if let Some(abandoned) = state.abandoned.get_mut(root_thread_id)
-            && let Some(index) = abandoned
-                .iter()
-                .position(|entry| entry.tool == tool && entry.arguments == *arguments)
-        {
-            abandoned.remove(index);
-            if abandoned.is_empty() {
-                state.abandoned.remove(root_thread_id);
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return Err(format!(
+                "Codex bridge root turn {root_thread_id} is no longer active"
+            ));
+        };
+        if let Some(existing) = root.vendor_threads.get(vendor_thread_id) {
+            if existing == owner_thread_id {
+                return Ok(());
             }
-            return;
+            return Err(format!(
+                "Codex vendor thread {vendor_thread_id} is already bound to {existing}, not {owner_thread_id}"
+            ));
         }
-        if let Some(pending) = state.pending.get_mut(root_thread_id) {
-            while let Some(index) = pending
-                .iter()
-                .position(|entry| entry.tool == tool && entry.arguments == *arguments)
-            {
-                let entry = pending.remove(index);
-                if entry.sender.send(owner_thread_id.to_string()).is_ok() {
-                    if pending.is_empty() {
-                        state.pending.remove(root_thread_id);
-                    }
-                    return;
-                }
-            }
-            if pending.is_empty() {
-                state.pending.remove(root_thread_id);
+        root.vendor_threads
+            .insert(vendor_thread_id.to_string(), owner_thread_id.to_string());
+        if let Some(waiters) = root.pending_vendor_owners.remove(vendor_thread_id) {
+            for waiter in waiters {
+                let _ = waiter.sender.send(owner_thread_id.to_string());
             }
         }
-        state
-            .hints
-            .entry(root_thread_id.to_string())
-            .or_default()
-            .push(BridgedToolOwnerHint {
-                tool: tool.to_string(),
-                arguments: arguments.clone(),
-                owner_thread_id: owner_thread_id.to_string(),
-                created_at: now,
-            });
+        Ok(())
     }
 
-    fn abandon(&self, root_thread_id: &str, id: u64) {
+    fn register_vendor_owner(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+    ) -> CodexVendorOwnerRegistration {
         let mut state = self.state.lock().unwrap();
-        if let Some(pending) = state.pending.get_mut(root_thread_id) {
-            let abandoned = pending
-                .iter()
-                .position(|entry| entry.id == id)
-                .map(|index| pending.remove(index));
-            if pending.is_empty() {
-                state.pending.remove(root_thread_id);
-            }
-            if let Some(abandoned) = abandoned {
-                state
-                    .abandoned
-                    .entry(root_thread_id.to_string())
-                    .or_default()
-                    .push(AbandonedBridgedToolOwner {
-                        tool: abandoned.tool,
-                        arguments: abandoned.arguments,
-                        created_at: Instant::now(),
-                    });
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return CodexVendorOwnerRegistration::InactiveRoot;
+        };
+        if let Some(owner) = root.vendor_threads.get(vendor_thread_id) {
+            return CodexVendorOwnerRegistration::Immediate(owner.clone());
+        }
+        root.next_id = root.next_id.wrapping_add(1);
+        let id = root.next_id;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        root.pending_vendor_owners
+            .entry(vendor_thread_id.to_string())
+            .or_default()
+            .push(PendingCodexVendorOwner { id, sender });
+        CodexVendorOwnerRegistration::Pending { id, receiver }
+    }
+
+    fn abandon_vendor_owner(&self, root_thread_id: &str, vendor_thread_id: &str, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return;
+        };
+        if let Some(waiters) = root.pending_vendor_owners.get_mut(vendor_thread_id) {
+            waiters.retain(|waiter| waiter.id != id);
+            if waiters.is_empty() {
+                root.pending_vendor_owners.remove(vendor_thread_id);
             }
         }
+    }
+
+    fn register_call_validation(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+        call_id: &str,
+    ) -> CodexCallValidationRegistration {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return CodexCallValidationRegistration::InactiveRoot;
+        };
+        if root
+            .vendor_threads
+            .get(vendor_thread_id)
+            .map(String::as_str)
+            != Some(owner_thread_id)
+        {
+            return CodexCallValidationRegistration::UnknownOwner;
+        }
+        if root.consumed_calls.contains(call_id)
+            || root.retired_calls.contains(call_id)
+            || root.pending_calls.contains_key(call_id)
+        {
+            return CodexCallValidationRegistration::Replayed;
+        }
+        if let Some(wrapper_owner) = root.wrapper_owners.get(call_id) {
+            if wrapper_owner != vendor_thread_id {
+                return CodexCallValidationRegistration::MismatchedOwner;
+            }
+            root.wrapper_owners.remove(call_id);
+            root.consumed_calls.insert(call_id.to_string());
+            return CodexCallValidationRegistration::Immediate;
+        }
+        root.next_id = root.next_id.wrapping_add(1);
+        let id = root.next_id;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        root.pending_calls.insert(
+            call_id.to_string(),
+            PendingCodexCallValidation {
+                id,
+                vendor_thread_id: vendor_thread_id.to_string(),
+                sender,
+            },
+        );
+        CodexCallValidationRegistration::Pending { id, receiver }
+    }
+
+    fn announce_wrapper(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+        call_id: &str,
+    ) -> bool {
+        if call_id.is_empty() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return false;
+        };
+        if root
+            .vendor_threads
+            .get(vendor_thread_id)
+            .map(String::as_str)
+            != Some(owner_thread_id)
+        {
+            return false;
+        }
+        if root.consumed_calls.contains(call_id) || root.retired_calls.contains(call_id) {
+            return false;
+        }
+        if let Some(pending) = root.pending_calls.remove(call_id) {
+            if pending.vendor_thread_id == vendor_thread_id {
+                root.consumed_calls.insert(call_id.to_string());
+                let _ = pending.sender.send(CodexCallValidationOutcome::Matched);
+            } else {
+                let _ = pending.sender.send(CodexCallValidationOutcome::Mismatched);
+                root.wrapper_owners
+                    .insert(call_id.to_string(), vendor_thread_id.to_string());
+            }
+            return true;
+        }
+        match root.wrapper_owners.get(call_id) {
+            Some(existing) => existing == vendor_thread_id,
+            None => {
+                root.wrapper_owners
+                    .insert(call_id.to_string(), vendor_thread_id.to_string());
+                true
+            }
+        }
+    }
+
+    fn abandon_call_validation(&self, root_thread_id: &str, call_id: &str, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return;
+        };
+        if root
+            .pending_calls
+            .get(call_id)
+            .is_some_and(|pending| pending.id == id)
+        {
+            root.pending_calls.remove(call_id);
+            root.retired_calls.insert(call_id.to_string());
+        }
+    }
+
+    fn clear_root(&self, root_thread_id: &str) {
+        self.state.lock().unwrap().roots.remove(root_thread_id);
     }
 }
 
@@ -435,13 +511,42 @@ impl<'a> BackendCollaboratorClaims<'a> {
         }
     }
 
-    fn claim(&mut self, thread_id: &str, session_id: &str) {
-        if self.claimed.insert(thread_id.to_string()) {
-            self.active_threads
-                .lock()
-                .unwrap()
-                .insert(thread_id.to_string(), session_id.to_string());
+    /// Claim an existing collaborator only when no independent dispatcher
+    /// already owns it. Never overwrite another claim: doing so would let our
+    /// later release erase a live replacement turn.
+    fn claim(&mut self, thread_id: &str, session_id: &str) -> bool {
+        if self.claimed.contains(thread_id) {
+            return true;
         }
+        let mut active = self.active_threads.lock().unwrap();
+        if active.contains_key(thread_id) {
+            return false;
+        }
+        active.insert(thread_id.to_string(), session_id.to_string());
+        self.claimed.insert(thread_id.to_string());
+        true
+    }
+
+    /// Create and claim a new collaborator while holding the same registry
+    /// lock used by prompt dispatch. `ThreadCreated` may be published inside
+    /// `create`, but clients cannot claim the visible thread until this method
+    /// has installed the provider's ownership entry.
+    fn create_claimed_thread(
+        &mut self,
+        session_id: &str,
+        create: impl FnOnce() -> Result<Thread, EngineError>,
+    ) -> Result<Thread, EngineError> {
+        let mut active = self.active_threads.lock().unwrap();
+        let thread = create()?;
+        if active.contains_key(&thread.id) {
+            return Err(EngineError::Conflict(format!(
+                "thread {} became active while its collaborator was being created",
+                thread.id
+            )));
+        }
+        active.insert(thread.id.clone(), session_id.to_string());
+        self.claimed.insert(thread.id.clone());
+        Ok(thread)
     }
 
     fn release(&mut self, thread_id: &str) {
@@ -1004,6 +1109,18 @@ impl Drop for ActiveTurnSteererGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeTicketClaims {
+    pub bridge_tools: bool,
+    pub serve_approval: bool,
+    pub correlate_codex_owner: bool,
+}
+
+struct ActiveBridgeTicket {
+    root_thread_id: String,
+    claims: BridgeTicketClaims,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -1128,6 +1245,12 @@ pub struct Engine {
     base_url: RwLock<Option<String>>,
     /// Ephemeral credential appended only to internal MCP bridge URLs.
     bridge_token: RwLock<Option<String>>,
+    /// Per-thread capabilities layered over the process-wide bridge
+    /// credential. Query flags and URL paths are never authorities by
+    /// themselves; the opaque ticket binds their exact claims. Tickets remain
+    /// stable across resumed vendor turns because Codex retains its MCP
+    /// client, but validation also requires the owning thread to be active.
+    bridge_tickets: Mutex<HashMap<String, ActiveBridgeTicket>>,
     /// Routes Codex MCP calls from the inherited root URL to the root or
     /// collaborator thread identified by app-server's item lifecycle.
     bridged_tool_owners: BridgedToolOwnerRouter,
@@ -1482,6 +1605,7 @@ impl Engine {
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             bridge_token: RwLock::new(None),
+            bridge_tickets: Mutex::new(HashMap::new()),
             bridged_tool_owners: BridgedToolOwnerRouter::default(),
             index_hooks: false,
             mcp_logs,
@@ -1588,6 +1712,63 @@ impl Engine {
     /// backwards-compatible.
     pub fn set_bridge_token(&self, token: Option<String>) {
         *self.bridge_token.write().unwrap() = token;
+    }
+
+    /// Validate one engine-issued MCP bridge capability. The process-wide
+    /// bridge token authenticates the caller to the internal route; this
+    /// active-turn ticket additionally binds the durable root path and exact
+    /// tool/approval surface so query-string tampering cannot widen it.
+    pub fn validate_bridge_ticket(
+        &self,
+        ticket: &str,
+        root_thread_id: &str,
+        bridge_tools: bool,
+        serve_approval: bool,
+    ) -> Option<BridgeTicketClaims> {
+        if !self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .contains_key(root_thread_id)
+        {
+            return None;
+        }
+        let tickets = self.bridge_tickets.lock().unwrap();
+        let ticket = tickets.get(ticket)?;
+        (ticket.root_thread_id == root_thread_id
+            && ticket.claims.bridge_tools == bridge_tools
+            && ticket.claims.serve_approval == serve_approval)
+            .then_some(ticket.claims)
+    }
+
+    fn bridge_ticket_for(&self, root_thread_id: &str, claims: BridgeTicketClaims) -> String {
+        let mut tickets = self.bridge_tickets.lock().unwrap();
+        if let Some(ticket) = tickets.iter().find_map(|(ticket, active)| {
+            (active.root_thread_id == root_thread_id && active.claims == claims)
+                .then(|| ticket.clone())
+        }) {
+            return ticket;
+        }
+
+        // A thread can change provider or bridge policy between turns. Never
+        // leave its previous capability surface reusable when that happens.
+        tickets.retain(|_, ticket| ticket.root_thread_id != root_thread_id);
+        let ticket = new_id("bridge");
+        tickets.insert(
+            ticket.clone(),
+            ActiveBridgeTicket {
+                root_thread_id: root_thread_id.to_string(),
+                claims,
+            },
+        );
+        ticket
+    }
+
+    fn revoke_bridge_tickets(&self, root_thread_id: &str) {
+        self.bridge_tickets
+            .lock()
+            .unwrap()
+            .retain(|_, ticket| ticket.root_thread_id != root_thread_id);
     }
 
     /// Swap the tool executor (cloud isolation hook, ADR 0004).
@@ -2677,7 +2858,7 @@ impl Engine {
                         .monitor_automation_turn(
                             automation_id,
                             automation_name,
-                            session_id,
+                            session_id.clone(),
                             thread_id,
                             turn,
                         )
@@ -4417,7 +4598,7 @@ impl Engine {
     }
 
     /// Add or replace an MCP server in the scope's config file.
-    pub fn upsert_mcp_server(
+    pub async fn upsert_mcp_server(
         &self,
         name: &str,
         req: &trouve_protocol::UpsertMcpServerRequest,
@@ -4438,12 +4619,14 @@ impl Engine {
             env: req.env.clone(),
             disabled: !req.enabled.unwrap_or(true),
         };
-        crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)
+        crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)?;
+        self.executor.invalidate_mcp_server(name).await;
+        Ok(())
     }
 
     /// Persistently enable or disable an existing MCP server without
     /// replacing the rest of its configuration.
-    pub fn set_mcp_server_enabled(
+    pub async fn set_mcp_server_enabled(
         &self,
         name: &str,
         req: &trouve_protocol::SetMcpServerEnabledRequest,
@@ -4460,18 +4643,21 @@ impl Engine {
         if !found {
             return Err(EngineError::NotFound(format!("MCP server {name}")));
         }
+        self.executor.invalidate_mcp_server(name).await;
         Ok(())
     }
 
     /// Remove an MCP server from the scope's config file.
-    pub fn delete_mcp_server(
+    pub async fn delete_mcp_server(
         &self,
         name: &str,
         scope: &str,
         workspace_id: Option<&str>,
     ) -> Result<(), EngineError> {
         let path = self.mcp_config_path(scope, workspace_id)?;
-        crate::mcp::remove_server(&path, name).map_err(EngineError::Internal)
+        crate::mcp::remove_server(&path, name).map_err(EngineError::Internal)?;
+        self.executor.invalidate_mcp_server(name).await;
+        Ok(())
     }
 
     /// Recent log lines (stderr + lifecycle) for one MCP server.
@@ -5320,6 +5506,60 @@ impl Engine {
 
     // --- sessions -----------------------------------------------------------
 
+    async fn rollback_failed_session_creation(
+        &self,
+        repo: &Path,
+        session_id: &str,
+        creation: git::WorktreeCreation,
+        checkpoint_oid: Option<String>,
+    ) {
+        match self.store.session(session_id) {
+            Ok(Some(_)) => {
+                if let Err(error) = self.store.delete_session(session_id) {
+                    tracing::error!(
+                        session_id,
+                        %error,
+                        "failed to roll back relational session state after creation error"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                session_id,
+                %error,
+                "failed to inspect relational session state during creation rollback"
+            ),
+        }
+        self.executor.evict_worktree(creation.worktree_path()).await;
+
+        let repo = repo.to_path_buf();
+        let session_id = session_id.to_string();
+        let cleanup_session_id = session_id.clone();
+        let cleanup = tokio::task::spawn_blocking(move || -> Result<()> {
+            git::rollback_worktree_creation(
+                &repo,
+                &creation,
+                checkpoint_oid
+                    .as_deref()
+                    .map(|oid| (cleanup_session_id.as_str(), 0, oid)),
+            )
+        })
+        .await;
+        match cleanup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(
+                session_id,
+                %error,
+                "failed to roll back git artifacts after session creation error"
+            ),
+            Err(error) => tracing::error!(
+                session_id,
+                %error,
+                "session creation rollback task failed"
+            ),
+        }
+    }
+
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
         let ws = self
             .store
@@ -5344,14 +5584,43 @@ impl Engine {
             }
         };
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
-        let base_ref = {
+        if self.store.session(&session_id)?.is_some() {
+            return Err(EngineError::Conflict(format!(
+                "generated session id {session_id} already exists"
+            )));
+        }
+        {
+            let repo = repo.clone();
+            let worktree_path = worktree_path.clone();
+            let branch = branch.clone();
+            let session_id = session_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                if worktree_path.exists() {
+                    bail!(
+                        "generated worktree path already exists: {}",
+                        worktree_path.display()
+                    );
+                }
+                if git::local_branch_exists(&repo, &branch)? {
+                    bail!("generated session branch already exists: {branch}");
+                }
+                if git::checkpoint_ref_exists(&repo, &session_id, 0)? {
+                    bail!("generated session checkpoint ref already exists: {session_id}/0");
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?
+            .map_err(EngineError::Internal)?;
+        }
+        let worktree_result = {
             let repo = repo.clone();
             let worktree_path = worktree_path.clone();
             let branch = branch.clone();
             let selected_base = base_ref.clone();
             let fetch_latest = req.fetch_latest;
             let checkout_ref = req.checkout_ref.clone();
-            tokio::task::spawn_blocking(move || -> Result<String> {
+            tokio::task::spawn_blocking(move || -> Result<(String, git::WorktreeCreation)> {
                 let mut session_base = selected_base.clone();
                 let worktree_base = if fetch_latest {
                     match git::fetch_upstream_base(&repo, &selected_base)? {
@@ -5365,12 +5634,19 @@ impl Engine {
                     selected_base
                 };
                 let checkout_ref = checkout_ref.as_deref().unwrap_or(&worktree_base);
-                git::create_worktree(&repo, &worktree_path, &branch, checkout_ref)?;
-                Ok(session_base)
+                let creation = git::create_worktree(&repo, &worktree_path, &branch, checkout_ref)?;
+                Ok((session_base, creation))
             })
             .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)?
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?
+            .map_err(EngineError::Internal)
+        };
+        let (base_ref, creation) = match worktree_result {
+            Ok(result) => result,
+            // create_worktree performs ownership-safe cleanup for artifacts it
+            // reserved. Without a receipt, generic rollback must not infer
+            // ownership from the earlier absence checks.
+            Err(error) => return Err(error),
         };
 
         let session = Session {
@@ -5386,11 +5662,18 @@ impl Engine {
         };
 
         // Checkpoint 0: pristine state, so the first turn can be undone.
-        let commit = self
+        let commit = match self
             .executor
             .checkpoint_worktree(&worktree_path, &session_id, 0, "trouve: session start")
             .await
-            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.rollback_failed_session_creation(&repo, &session_id, creation, None)
+                    .await;
+                return Err(EngineError::Internal(anyhow!(error)));
+            }
+        };
         let checkpoint_id = new_id("cp");
         let checkpoint = CheckpointRow {
             id: checkpoint_id.clone(),
@@ -5401,7 +5684,7 @@ impl Engine {
             commit_hash: commit.clone(),
         };
 
-        self.store.insert_session_with_lifecycle(
+        let inserted = self.store.insert_session_with_lifecycle(
             &session,
             &checkpoint,
             vec![
@@ -5416,7 +5699,7 @@ impl Engine {
                     Scope::Session(session_id.clone()),
                     Event::WorktreeCreated {
                         path: session.worktree_path.clone(),
-                        branch,
+                        branch: branch.clone(),
                     },
                 ),
                 (
@@ -5425,11 +5708,26 @@ impl Engine {
                         checkpoint_id,
                         thread_id: String::new(),
                         turn: 0,
-                        commit,
+                        commit: commit.clone(),
                     },
                 ),
             ],
-        )?;
+        );
+        if let Err(error) = inserted {
+            self.rollback_failed_session_creation(&repo, &session_id, creation, Some(commit))
+                .await;
+            return Err(error.into());
+        }
+        match tokio::task::spawn_blocking(move || git::finalize_worktree_creation(&creation)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(session_id, %error, "failed to remove session creation marker");
+            }
+            Err(error) => {
+                tracing::warn!(session_id, %error, "session creation marker cleanup task failed");
+            }
+        }
         if self.index_hooks {
             crate::tools::warm_index_in_background(worktree_path);
         }
@@ -5535,6 +5833,12 @@ impl Engine {
         }
 
         let result = async {
+            let bridge_thread_ids = self
+                .store
+                .list_threads(id)?
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>();
             let ws = self
                 .store
                 .workspace(&session.workspace_id)?
@@ -5560,6 +5864,10 @@ impl Engine {
                     self.terminals.reopen_session(id);
                 }
                 return Err(error.into());
+            }
+            for thread_id in bridge_thread_ids {
+                self.revoke_bridge_tickets(&thread_id);
+                self.bridged_tool_owners.clear_root(&thread_id);
             }
             self.executor
                 .evict_worktree(Path::new(&session.worktree_path))
@@ -5593,6 +5901,38 @@ impl Engine {
 
     pub fn create_thread(&self, req: CreateThreadRequest) -> Result<Thread, EngineError> {
         let session = self.get_session(&req.session_id)?;
+        self.create_thread_for_session(session, req)
+    }
+
+    /// Create a thread from already-loaded session metadata. Provider-native
+    /// collaborator creation uses this while holding the active-thread
+    /// registry lock, so it must not call `get_session` (which reads that same
+    /// registry to project `Session.active`).
+    fn create_thread_for_session(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+    ) -> Result<Thread, EngineError> {
+        self.create_thread_for_session_with_parent(session, req, None)
+    }
+
+    fn create_spawned_thread_for_session(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+        parent_thread_id: &str,
+        kind: &str,
+    ) -> Result<Thread, EngineError> {
+        self.create_thread_for_session_with_parent(session, req, Some((parent_thread_id, kind)))
+    }
+
+    fn create_thread_for_session_with_parent(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+        spawn: Option<(&str, &str)>,
+    ) -> Result<Thread, EngineError> {
+        debug_assert_eq!(session.id, req.session_id);
         let ws = self.store.workspace(&session.workspace_id)?.unwrap();
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode_id = req.mode.unwrap_or_else(|| "code".into());
@@ -5620,7 +5960,7 @@ impl Engine {
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
-            parent_thread_id: None,
+            parent_thread_id: spawn.map(|(parent, _)| parent.to_string()),
             title: req
                 .title
                 .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -5636,12 +5976,15 @@ impl Engine {
                 .or(mode.default_permission_mode)
                 .unwrap_or_else(|| *self.default_permission_mode.read().unwrap()),
             created_at: chrono::Utc::now(),
-            // Spawn parentage is recorded by the spawn tools after insert;
-            // reads recompute this flag from the spawned_threads table.
-            spawned: false,
+            spawned: spawn.is_some(),
             todos: Vec::new(),
         };
-        self.store.insert_thread(&thread, &model_options)?;
+        if let Some((parent, kind)) = spawn {
+            self.store
+                .insert_spawned_thread(&thread, &model_options, parent, kind)?;
+        } else {
+            self.store.insert_thread(&thread, &model_options)?;
+        }
         self.store.append_event(
             Scope::Server,
             Event::ThreadCreated {
@@ -5683,17 +6026,32 @@ impl Engine {
         inherited_thread: &Thread,
         access: BackendCollaboratorAccess,
     ) -> Result<String, EngineError> {
-        if access == BackendCollaboratorAccess::Inherit {
-            return Ok(inherited_thread.mode.clone());
-        }
         let workspace = self
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
         let modes =
             modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let read_only = access == BackendCollaboratorAccess::ReadOnly;
         let inherited = modes::find_mode(&modes, &inherited_thread.mode);
+        // Provider metadata may reduce a collaborator's authority, but it is
+        // never an authorization source that can widen the parent's mode.
+        // Unknown parent modes fail closed just like turn execution does.
+        let inherited_read_only = inherited.is_none_or(|mode| mode.read_only);
+        let access = match access {
+            BackendCollaboratorAccess::Interactive if inherited_read_only => {
+                tracing::warn!(
+                    parent_thread_id = %inherited_thread.id,
+                    parent_mode = %inherited_thread.mode,
+                    "provider requested writable collaborator under a read-only parent; clamping access"
+                );
+                BackendCollaboratorAccess::ReadOnly
+            }
+            access => access,
+        };
+        if access == BackendCollaboratorAccess::Inherit {
+            return Ok(inherited_thread.mode.clone());
+        }
+        let read_only = access == BackendCollaboratorAccess::ReadOnly;
         let inherited_matches = inherited.is_some_and(|mode| mode.read_only == read_only);
         if inherited_matches {
             return Ok(inherited_thread.mode.clone());
@@ -5775,24 +6133,7 @@ impl Engine {
     /// cannot remain active while disappearing from the parent's overview.
     pub fn list_thread_descendants(&self, thread_id: &str) -> Result<Vec<Thread>, EngineError> {
         self.get_thread(thread_id)?;
-        let mut pending = self.store.spawned_children(thread_id)?;
-        let mut seen = HashSet::new();
-        let mut descendants = Vec::new();
-        while let Some(child_id) = pending.pop() {
-            if !seen.insert(child_id.clone()) {
-                continue;
-            }
-            pending.extend(self.store.spawned_children(&child_id)?);
-            if let Some(child) = self.store.thread(&child_id)? {
-                descendants.push(child);
-            }
-        }
-        descendants.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(descendants)
+        Ok(self.store.spawned_descendants(thread_id)?)
     }
 
     /// Root thread and number of spawn edges above `thread_id`. Parentage is
@@ -6610,6 +6951,28 @@ impl Engine {
             .collect()
     }
 
+    fn remove_committed_attachment_files(&self, paths: impl IntoIterator<Item = String>) {
+        let attachment_root = self.data_dir.join("attachments");
+        for stored_path in paths {
+            let path = PathBuf::from(&stored_path);
+            if !path.starts_with(&attachment_root) || path == attachment_root {
+                tracing::error!(
+                    path = stored_path,
+                    root = %attachment_root.display(),
+                    "refusing to remove detached attachment outside the attachment store"
+                );
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = stored_path, %error, "failed to remove detached attachment file");
+                }
+            }
+        }
+    }
+
     /// Publish the thread's current queue on its event stream.
     fn emit_queue(&self, thread_id: &str) -> Result<(), EngineError> {
         let prompts = self.store.queued_prompts(thread_id)?;
@@ -6647,10 +7010,11 @@ impl Engine {
             .find(|prompt| prompt.id == prompt_id)
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
 
+        let original_attachments = prompt.attachments;
         let mut attachments = if let Some(retained_ids) = request.retained_attachment_ids {
-            let by_id: std::collections::HashMap<_, _> = prompt
-                .attachments
-                .into_iter()
+            let by_id: std::collections::HashMap<_, _> = original_attachments
+                .iter()
+                .cloned()
                 .map(|attachment| (attachment.id.clone(), attachment))
                 .collect();
             let mut retained = Vec::with_capacity(retained_ids.len());
@@ -6669,27 +7033,49 @@ impl Engine {
             }
             retained
         } else {
-            prompt.attachments
+            original_attachments.clone()
         };
-        attachments.extend(self.save_attachments(&thread_id, request.attachments)?);
-        if !self
-            .store
-            .update_queued_prompt(prompt_id, &request.content, &attachments)?
-        {
+        let retained_ids = attachments
+            .iter()
+            .map(|attachment| attachment.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let removed_ids = original_attachments
+            .iter()
+            .filter(|attachment| !retained_ids.contains(attachment.id.as_str()))
+            .map(|attachment| attachment.id.clone())
+            .collect::<Vec<_>>();
+
+        let prepared = self.prepare_attachments(request.attachments)?;
+        attachments.extend(prepared.iter().map(|(attachment, _)| attachment.clone()));
+        let added_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        let mut added_cleanup =
+            PreparedAttachmentCleanup::new(prepared.iter().map(|(_, path)| path.clone()).collect());
+        let Some(removed_paths) = self.store.update_queued_prompt_attachments(
+            prompt_id,
+            &request.content,
+            &attachments,
+            &added_rows,
+            &removed_ids,
+        )?
+        else {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
-        }
+        };
+        added_cleanup.disarm();
+        self.remove_committed_attachment_files(removed_paths);
         self.emit_queue(&thread_id)
     }
 
     pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
         let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
-        let thread_id = self
-            .store
-            .queued_prompt_thread(prompt_id)?
-            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
-        if !self.store.delete_queued_prompt(prompt_id)? {
+        let Some((thread_id, attachment_paths)) =
+            self.store.delete_queued_prompt_attachments(prompt_id)?
+        else {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
-        }
+        };
+        self.remove_committed_attachment_files(attachment_paths);
         self.emit_queue(&thread_id)
     }
 
@@ -6750,6 +7136,12 @@ impl Engine {
         } else {
             None
         };
+        let original_order = self
+            .store
+            .queued_prompts(&thread_id)?
+            .into_iter()
+            .map(|prompt| prompt.id)
+            .collect::<Vec<_>>();
         let prompt = self
             .store
             .prioritize_queued_prompt(prompt_id, !turn_running)?
@@ -6764,6 +7156,14 @@ impl Engine {
                 .insert(thread_id.clone());
             if let Err(error) = self.emit_queue(&thread_id) {
                 self.resume_after_cancel.lock().unwrap().remove(&thread_id);
+                if !self
+                    .store
+                    .reorder_queued_prompts(&thread_id, &original_order)?
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "queue changed while rolling back failed priority publication for {prompt_id}"
+                    )));
+                }
                 return Err(error);
             }
             drop(active);
@@ -6783,8 +7183,26 @@ impl Engine {
         active.insert(thread_id.clone(), thread.session_id.clone());
         let cancel = self.register_cancel(&thread_id);
         drop(active);
-        let turn =
-            self.launch_claimed_prompt(thread, prompt, session_woke, cancel, activity_publication)?;
+        let turn = match self.launch_claimed_prompt(
+            thread,
+            prompt,
+            session_woke,
+            cancel,
+            activity_publication,
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                if !self
+                    .store
+                    .reorder_queued_prompts(&thread_id, &original_order)?
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "queue changed while rolling back failed priority dispatch for {prompt_id}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         Ok(TurnAccepted {
             thread_id,
             turn,
@@ -7137,6 +7555,7 @@ impl Engine {
 
     /// Register a fresh cancellation token for a turn about to run.
     fn register_cancel(&self, thread_id: &str) -> tokio_util::sync::CancellationToken {
+        self.bridged_tool_owners.begin_root(thread_id);
         let token = tokio_util::sync::CancellationToken::new();
         self.turn_cancels
             .lock()
@@ -7148,6 +7567,7 @@ impl Engine {
     fn clear_cancel(&self, thread_id: &str) {
         self.turn_cancels.lock().unwrap().remove(thread_id);
         self.resume_after_cancel.lock().unwrap().remove(thread_id);
+        self.bridged_tool_owners.clear_root(thread_id);
     }
 
     /// Finish a cancelled or failed turn while coordinating with dispatches
@@ -7170,6 +7590,7 @@ impl Engine {
             };
             (resume, idle_session)
         };
+        self.bridged_tool_owners.clear_root(thread_id);
         self.publish_idle_or_restore(thread_id, idle_session)?;
         Ok(resume)
     }
@@ -7249,6 +7670,7 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
+            background_mutation_lease: None,
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
@@ -7798,13 +8220,20 @@ impl Engine {
         };
         // Codex approvals are native RPCs; serving Claude's permission-gate
         // tool would only tempt the model to call it.
-        let approval = if kind == "codex-app-server" { 0 } else { 1 };
+        let serve_approval = kind != "codex-app-server";
+        let claims = BridgeTicketClaims {
+            bridge_tools,
+            serve_approval,
+            correlate_codex_owner: kind == "codex-app-server",
+        };
+        let ticket = self.bridge_ticket_for(thread_id, claims);
         let mut url = format!(
-            "{}/internal/threads/{}/mcp?tools={}&approval={}",
+            "{}/internal/threads/{}/mcp?tools={}&approval={}&ticket={}",
             base_url.trim_end_matches('/'),
             thread_id,
             bridge_tools as u8,
-            approval,
+            serve_approval as u8,
+            ticket,
         );
         if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
             url.push_str("&bridge_token=");
@@ -7842,17 +8271,32 @@ impl Engine {
 
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
-    pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
+    pub async fn bridged_tool_specs(
+        &self,
+        thread_id: &str,
+        bridge_tools: bool,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
-        let mut specs: Vec<ToolSpec> = self
-            .executor
-            .specs(&ctx)
-            .await
+        let discovered = if bridge_tools {
+            self.executor.specs(&ctx).await
+        } else {
+            // The minimal bridge must not consult external MCP discovery:
+            // listing three native tools is not authority to launch trusted
+            // workspace/user servers.
+            self.executor.native_specs(&ctx).await
+        };
+        let mut specs: Vec<ToolSpec> = discovered
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|spec| {
+                (bridge_tools || matches!(spec.name.as_str(), "search" | "find_related"))
+                    && (mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
+            })
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
+        if !bridge_tools {
+            return Ok(specs);
+        }
         specs.push(search_transcript_spec());
         // Recursive spawn tools use the same mode and depth policy as native
         // provider turns.
@@ -7881,7 +8325,9 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, EngineError> {
-        self.bridged_tool_call_for(thread_id, name, arguments).await
+        let cancel = self.active_bridge_cancel(thread_id)?;
+        self.bridged_tool_call_for(thread_id, name, arguments, cancel)
+            .await
     }
 
     /// Execute a Codex MCP call after correlating app-server's authoritative
@@ -7890,48 +8336,126 @@ impl Engine {
     pub async fn bridged_codex_tool_call(
         self: &Arc<Self>,
         root_thread_id: &str,
+        vendor_thread_id: Option<&str>,
+        vendor_call_id: Option<&str>,
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, EngineError> {
-        let registration = self
+        let vendor_thread_id = vendor_thread_id
+            .filter(|thread_id| !thread_id.is_empty())
+            .ok_or_else(|| {
+                EngineError::BadRequest(
+                    "Codex MCP metadata is missing the required _meta.threadId".into(),
+                )
+            })?;
+        let root_cancel = self.active_bridge_cancel(root_thread_id)?;
+        let owner_registration = self
             .bridged_tool_owners
-            .register(root_thread_id, name, arguments);
-        let root_cancel = self
-            .turn_cancels
-            .lock()
-            .unwrap()
-            .get(root_thread_id)
-            .cloned()
-            .unwrap_or_default();
-        let owner_thread_id = match registration {
-            BridgedToolOwnerRegistration::Immediate(owner) => owner,
-            BridgedToolOwnerRegistration::Pending { id, receiver } => {
+            .register_vendor_owner(root_thread_id, vendor_thread_id);
+        let owner_thread_id = match owner_registration {
+            CodexVendorOwnerRegistration::Immediate(owner) => owner,
+            CodexVendorOwnerRegistration::InactiveRoot => {
+                return Err(EngineError::Conflict(
+                    "Codex MCP request belongs to an inactive root turn".into(),
+                ));
+            }
+            CodexVendorOwnerRegistration::Pending { id, receiver } => {
                 let outcome = tokio::select! {
                     biased;
                     _ = root_cancel.cancelled() => {
-                        self.bridged_tool_owners.abandon(root_thread_id, id);
-                        return Err(EngineError::Internal(anyhow!("tool call cancelled")));
+                        self.bridged_tool_owners.abandon_vendor_owner(
+                            root_thread_id,
+                            vendor_thread_id,
+                            id,
+                        );
+                        return Err(EngineError::Conflict("tool call cancelled".into()));
                     }
                     owner = receiver => owner.ok(),
-                    _ = tokio::time::sleep(BRIDGED_TOOL_OWNER_WAIT_TIMEOUT) => None,
+                    _ = tokio::time::sleep(CODEX_BRIDGE_METADATA_WAIT_TIMEOUT) => None,
                 };
                 match outcome {
                     Some(owner) => owner,
                     None => {
-                        self.bridged_tool_owners.abandon(root_thread_id, id);
-                        tracing::error!(
+                        self.bridged_tool_owners.abandon_vendor_owner(
                             root_thread_id,
-                            tool = name,
-                            "Codex MCP owner notification was not observed; refusing to misroute the call"
+                            vendor_thread_id,
+                            id,
                         );
-                        return Err(EngineError::Internal(anyhow!(
-                            "Codex tool owner could not be identified"
+                        return Err(EngineError::BadRequest(format!(
+                            "Codex MCP _meta.threadId {vendor_thread_id} is unknown, external to this root, or stale"
                         )));
                     }
                 }
             }
         };
-        self.bridged_tool_call_for(&owner_thread_id, name, arguments)
+        if let Some(call_id) = vendor_call_id.filter(|call_id| !call_id.is_empty()) {
+            let validation = self.bridged_tool_owners.register_call_validation(
+                root_thread_id,
+                vendor_thread_id,
+                &owner_thread_id,
+                call_id,
+            );
+            match validation {
+                CodexCallValidationRegistration::Immediate => {}
+                CodexCallValidationRegistration::Pending { id, receiver } => {
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = root_cancel.cancelled() => {
+                            self.bridged_tool_owners.abandon_call_validation(
+                                root_thread_id,
+                                call_id,
+                                id,
+                            );
+                            return Err(EngineError::Conflict("tool call cancelled".into()));
+                        }
+                        outcome = receiver => outcome.ok(),
+                        _ = tokio::time::sleep(CODEX_BRIDGE_METADATA_WAIT_TIMEOUT) => None,
+                    };
+                    match outcome {
+                        Some(CodexCallValidationOutcome::Matched) => {}
+                        Some(CodexCallValidationOutcome::Mismatched) => {
+                            return Err(EngineError::BadRequest(format!(
+                                "Codex MCP _meta.callId {call_id} belongs to another vendor thread"
+                            )));
+                        }
+                        None => {
+                            self.bridged_tool_owners.abandon_call_validation(
+                                root_thread_id,
+                                call_id,
+                                id,
+                            );
+                            return Err(EngineError::BadRequest(format!(
+                                "Codex MCP _meta.callId {call_id} was not observed on the app-server stream"
+                            )));
+                        }
+                    }
+                }
+                CodexCallValidationRegistration::InactiveRoot => {
+                    return Err(EngineError::Conflict(
+                        "Codex MCP request belongs to an inactive root turn".into(),
+                    ));
+                }
+                CodexCallValidationRegistration::UnknownOwner => {
+                    return Err(EngineError::BadRequest(format!(
+                        "Codex MCP _meta.threadId {vendor_thread_id} is not bound to {owner_thread_id}"
+                    )));
+                }
+                CodexCallValidationRegistration::MismatchedOwner => {
+                    return Err(EngineError::BadRequest(format!(
+                        "Codex MCP _meta.callId {call_id} belongs to another vendor thread"
+                    )));
+                }
+                CodexCallValidationRegistration::Replayed => {
+                    return Err(EngineError::Conflict(format!(
+                        "Codex MCP _meta.callId {call_id} was already used or retired"
+                    )));
+                }
+            }
+        }
+        if root_cancel.is_cancelled() {
+            return Err(EngineError::Conflict("tool call cancelled".into()));
+        }
+        self.bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
             .await
     }
 
@@ -7940,8 +8464,10 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, EngineError> {
-        let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
+        let (session, thread, mode, ctx) =
+            self.bridged_context_with_cancel(thread_id, cancel.clone())?;
         let turn = self.store.last_turn(thread_id)?;
         let call = trouve_providers::ToolCallRequest {
             id: new_id("call"),
@@ -7952,15 +8478,6 @@ impl Engine {
         // images, but no bridged vendor consumes them yet); the summary the
         // engine leaves in place of "_images" still tells the model the
         // image was read.
-        // Share the running turn's cancellation token when there is one, so a
-        // cancel also unblocks a bridged tool's approval wait.
-        let cancel = self
-            .turn_cancels
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
         let (content, _images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
@@ -7971,19 +8488,29 @@ impl Engine {
     fn announce_trouve_bridge_wrapper(
         &self,
         root_thread_id: &str,
+        vendor_thread_id: &str,
         owner_thread_id: &str,
+        call_id: &str,
         tool: &str,
         args: &serde_json::Value,
     ) -> bool {
-        let Some((nested_tool, nested_arguments)) = trouve_bridge_wrapper_call(tool, args) else {
+        if trouve_bridge_wrapper_call(tool, args).is_none() {
             return false;
-        };
-        self.bridged_tool_owners.announce(
+        }
+        if !self.bridged_tool_owners.announce_wrapper(
             root_thread_id,
+            vendor_thread_id,
             owner_thread_id,
-            nested_tool,
-            nested_arguments,
-        );
+            call_id,
+        ) {
+            tracing::warn!(
+                root_thread_id,
+                vendor_thread_id,
+                owner_thread_id,
+                call_id,
+                "ignoring unbound, stale, or replayed Codex MCP wrapper identity"
+            );
+        }
         true
     }
 
@@ -7992,6 +8519,7 @@ impl Engine {
     fn suppress_collaborator_bridge_wrapper(
         &self,
         root_thread_id: &str,
+        vendor_thread_id: &str,
         collaborator: &mut BackendCollaboratorProjection,
         event: &BackendCollaboratorEvent,
     ) -> bool {
@@ -8004,7 +8532,9 @@ impl Engine {
                 if collaborator.suppressed_bridge_calls.insert(call_id.clone()) {
                     self.announce_trouve_bridge_wrapper(
                         root_thread_id,
+                        vendor_thread_id,
                         &collaborator.thread.id,
+                        call_id,
                         tool,
                         args,
                     );
@@ -8033,7 +8563,7 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<bool, EngineError> {
-        let (session, thread, mode, _ctx) = self.bridged_context(thread_id)?;
+        let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self
             .store
             .last_turn(thread_id)
@@ -8047,7 +8577,16 @@ impl Engine {
         // that used to force an extra SQLite transaction for every bridged
         // approval.
         let approved = self
-            .gate_backend_approval(&session, &thread, turn, &mode, &call_id, tool, args)
+            .gate_backend_approval(
+                &session,
+                &thread,
+                turn,
+                &mode,
+                &call_id,
+                tool,
+                args,
+                &ctx.cancel,
+            )
             .await
             .map_err(EngineError::Internal)?;
         // A matched card gets its completion from the vendor's own
@@ -8194,8 +8733,13 @@ impl Engine {
         result: &serde_json::Value,
         args: Option<&serde_json::Value>,
     ) -> Result<Option<Vec<trouve_protocol::TodoItem>>> {
-        let base = tool.rsplit("__").next().unwrap_or(tool);
-        if status != ToolStatus::Ok || !matches!(base, "todo_write" | "TodoWrite") {
+        // TODO state is an authoritative first-party thread snapshot. Do not
+        // infer ownership from a tool's basename: an unrelated MCP server can
+        // legitimately expose its own `todo_write`, but its result must remain
+        // an ordinary tool result rather than mutating trouve's thread state.
+        let is_authoritative_todo_tool =
+            matches!(tool, "todo_write" | "TodoWrite" | "mcp__trouve__todo_write");
+        if status != ToolStatus::Ok || !is_authoritative_todo_tool {
             return Ok(None);
         }
         let result_todos = result.get("todos").and_then(Self::parse_todo_snapshot);
@@ -8243,6 +8787,38 @@ impl Engine {
         &self,
         thread_id: &str,
     ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+        let cancel = self.active_bridge_cancel(thread_id)?;
+        self.bridged_context_with_cancel(thread_id, cancel)
+    }
+
+    fn active_bridge_cancel(
+        &self,
+        thread_id: &str,
+    ) -> Result<tokio_util::sync::CancellationToken, EngineError> {
+        let cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Conflict(format!(
+                    "the tool bridge for thread {thread_id} is not attached to an active turn"
+                ))
+            })?;
+        if cancel.is_cancelled() {
+            return Err(EngineError::Conflict(format!(
+                "the active turn for thread {thread_id} is cancelled"
+            )));
+        }
+        Ok(cancel)
+    }
+
+    fn bridged_context_with_cancel(
+        &self,
+        thread_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let ws = self
@@ -8254,13 +8830,6 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
-        let cancel = self
-            .turn_cancels
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
         let worktree = PathBuf::from(&session.worktree_path);
         let canonical_worktree = worktree
             .canonicalize()
@@ -8274,6 +8843,7 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
+            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -8396,7 +8966,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn start_backend_collaborator(
+    async fn start_backend_collaborator_claimed(
         &self,
         session: &Session,
         parent_thread: &Thread,
@@ -8408,11 +8978,18 @@ impl Engine {
         prompt: Option<String>,
         model: Option<String>,
         thinking_level: Option<String>,
+        collaborator_claims: &mut BackendCollaboratorClaims<'_>,
         vendor_threads: &mut HashMap<String, String>,
         collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
     ) -> Result<()> {
         let prompt = prompt.filter(|prompt| !prompt.is_empty());
         if let Some(collaborator) = collaborators.get_mut(&vendor_session_id) {
+            if !collaborator_claims.claim(&collaborator.thread.id, &session.id) {
+                bail!(
+                    "cannot reactivate provider collaborator {} while another turn owns it",
+                    collaborator.thread.id
+                );
+            }
             if let Some(prompt) = prompt {
                 if collaborator.terminal {
                     collaborator.pending_prompt = Some(prompt);
@@ -8444,6 +9021,61 @@ impl Engine {
             .find(|collaborator| collaborator.thread.id == parent_thread_id)
             .map(|collaborator| collaborator.thread.clone())
             .unwrap_or_else(|| parent_thread.clone());
+        let (root_thread_id, depth) = self
+            .subagent_root_and_depth(&inherited_thread.id)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        if depth >= MAX_SUBAGENT_DEPTH {
+            bail!(
+                "provider collaborator nesting is limited to {MAX_SUBAGENT_DEPTH} levels below the root thread"
+            );
+        }
+        let tree_lock = self.subagent_tree_lock(&root_thread_id);
+        let _tree_spawn = tree_lock.lock().await;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
+        let all_modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let inherited_mode = modes::find_mode(&all_modes, &inherited_thread.mode)
+            .cloned()
+            .unwrap_or_else(modes::fallback_mode);
+        if !inherited_mode.allowed_tools.is_empty()
+            && !inherited_mode
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "spawn_thread")
+        {
+            bail!(
+                "provider-native collaborators are not permitted in {} mode",
+                inherited_mode.id
+            );
+        }
+        let children = self.store.spawned_children(&inherited_thread.id)?;
+        let descendants = self
+            .list_thread_descendants(&root_thread_id)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        {
+            let active = self.active_threads.lock().unwrap();
+            let running = children
+                .iter()
+                .filter(|child| active.contains_key(*child))
+                .count();
+            if running >= MAX_CONCURRENT_CHILDREN {
+                bail!(
+                    "provider collaborator parent already has {running} active children; the limit is {MAX_CONCURRENT_CHILDREN}"
+                );
+            }
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            if active_descendants >= MAX_ACTIVE_DESCENDANTS {
+                bail!(
+                    "provider collaborator tree already has {active_descendants} active descendants; the limit is {MAX_ACTIVE_DESCENDANTS}"
+                );
+            }
+        }
         let model = model
             .filter(|model| !model.trim().is_empty())
             .map(|model| {
@@ -8477,28 +9109,23 @@ impl Engine {
             .generate_subagent_title(name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
-        let child = self
-            .create_thread(CreateThreadRequest {
-                session_id: session.id.clone(),
-                title,
-                mode: Some(child_mode),
-                model: Some(model),
-                model_options,
-                permission_mode: Some(inherited_thread.permission_mode),
+        let child = collaborator_claims
+            .create_claimed_thread(&session.id, || {
+                self.create_spawned_thread_for_session(
+                    session.clone(),
+                    CreateThreadRequest {
+                        session_id: session.id.clone(),
+                        title,
+                        mode: Some(child_mode),
+                        model: Some(model),
+                        model_options,
+                        permission_mode: Some(inherited_thread.permission_mode),
+                    },
+                    &parent_thread_id,
+                    "vendor",
+                )
             })
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.store
-            .insert_spawned(&child.id, &parent_thread_id, "vendor")?;
-        // `create_thread` announces before parentage is inserted. Publish the
-        // adjacent update so clients refetch the now-authoritative `spawned`
-        // flag rather than racing the relationship write.
-        self.store.append_event(
-            Scope::Server,
-            Event::ThreadUpdated {
-                thread_id: child.id.clone(),
-                session_id: session.id.clone(),
-            },
-        )?;
         self.store
             .set_backend_session(&child.id, backend_id, &vendor_session_id)?;
         vendor_threads.insert(vendor_session_id.clone(), child.id.clone());
@@ -8523,6 +9150,42 @@ impl Engine {
             .await?;
         collaborators.insert(vendor_session_id, collaborator);
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn start_backend_collaborator(
+        &self,
+        session: &Session,
+        parent_thread: &Thread,
+        backend_id: &str,
+        vendor_session_id: String,
+        parent_vendor_session_id: &str,
+        name: Option<String>,
+        access: BackendCollaboratorAccess,
+        prompt: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+        vendor_threads: &mut HashMap<String, String>,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let mut claims = BackendCollaboratorClaims::new(&self.active_threads);
+        self.start_backend_collaborator_claimed(
+            session,
+            parent_thread,
+            backend_id,
+            vendor_session_id,
+            parent_vendor_session_id,
+            name,
+            access,
+            prompt,
+            model,
+            thinking_level,
+            &mut claims,
+            vendor_threads,
+            collaborators,
+        )
+        .await
     }
 
     async fn publish_backend_collaborator_spawn(
@@ -8690,6 +9353,7 @@ impl Engine {
         backend_id: &str,
         collaborator: &mut BackendCollaboratorProjection,
         event: BackendCollaboratorEvent,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         if collaborator.terminal {
             return Ok(());
@@ -8820,6 +9484,7 @@ impl Engine {
                         &call_id,
                         &tool,
                         &args,
+                        cancel,
                     )
                     .await?;
                 let _ = responder.send(approved);
@@ -8936,6 +9601,11 @@ impl Engine {
         };
         let vendor_session = resume.map(|(id, _)| id);
         let mut active_vendor_session = vendor_session.clone();
+        if let Some(vendor_session_id) = active_vendor_session.as_deref() {
+            self.bridged_tool_owners
+                .bind_vendor_thread(&thread.id, vendor_session_id, &thread.id)
+                .map_err(anyhow::Error::msg)?;
+        }
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
@@ -9217,6 +9887,9 @@ impl Engine {
                 BackendEvent::SessionStarted { session_id } => {
                     active_vendor_session = Some(session_id.clone());
                     vendor_threads.insert(session_id.clone(), thread.id.clone());
+                    self.bridged_tool_owners
+                        .bind_vendor_thread(&thread.id, &session_id, &thread.id)
+                        .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
@@ -9250,9 +9923,22 @@ impl Engine {
                 } => {
                     if trouve_bridge_wrapper_call(&tool, &args).is_some() {
                         if suppressed_bridge_calls.insert(call_id.clone()) {
-                            self.announce_trouve_bridge_wrapper(
-                                &thread.id, &thread.id, &tool, &args,
-                            );
+                            if let Some(vendor_thread_id) = active_vendor_session.as_deref() {
+                                self.announce_trouve_bridge_wrapper(
+                                    &thread.id,
+                                    vendor_thread_id,
+                                    &thread.id,
+                                    &call_id,
+                                    &tool,
+                                    &args,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    root_thread_id = %thread.id,
+                                    call_id,
+                                    "Codex MCP wrapper arrived before its root vendor thread identity"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -9353,7 +10039,7 @@ impl Engine {
                     let vendor_session_id = session_id.clone();
                     let prompt_announced =
                         prompt.as_deref().is_some_and(|prompt| !prompt.is_empty());
-                    self.start_backend_collaborator(
+                    self.start_backend_collaborator_claimed(
                         session,
                         thread,
                         backend_id,
@@ -9364,10 +10050,16 @@ impl Engine {
                         prompt,
                         model,
                         thinking_level,
+                        &mut collaborator_claims,
                         &mut vendor_threads,
                         &mut collaborators,
                     )
                     .await?;
+                    if let Some(owner_thread_id) = vendor_threads.get(&vendor_session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &vendor_session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
                     self.publish_backend_collaborator_spawn(
                         thread,
                         turn,
@@ -9389,15 +10081,6 @@ impl Engine {
                         )
                         .await?;
                     }
-                    if let Some(collaborator) =
-                        collaborators
-                            .get(&vendor_session_id)
-                            .filter(|collaborator| {
-                                !collaborator.terminal || collaborator.pending_prompt.is_some()
-                            })
-                    {
-                        collaborator_claims.claim(&collaborator.thread.id, &session.id);
-                    }
                 }
                 BackendEvent::CollaboratorEvent {
                     session_id,
@@ -9409,7 +10092,7 @@ impl Engine {
                             .as_deref()
                             .unwrap_or_default()
                             .to_string();
-                        self.start_backend_collaborator(
+                        self.start_backend_collaborator_claimed(
                             session,
                             thread,
                             backend_id,
@@ -9420,13 +10103,24 @@ impl Engine {
                             None,
                             None,
                             None,
+                            &mut collaborator_claims,
                             &mut vendor_threads,
                             &mut collaborators,
                         )
                         .await?;
                     }
-                    if let Some(collaborator) = collaborators.get(&session_id) {
-                        collaborator_claims.claim(&collaborator.thread.id, &session.id);
+                    if let Some(owner_thread_id) = vendor_threads.get(&session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    if let Some(collaborator) = collaborators.get(&session_id)
+                        && !collaborator_claims.claim(&collaborator.thread.id, &session.id)
+                    {
+                        bail!(
+                            "cannot route provider collaborator {} while another turn owns it",
+                            collaborator.thread.id
+                        );
                     }
                     let completed_successfully =
                         matches!(&event, BackendCollaboratorEvent::Completed { .. });
@@ -9441,6 +10135,7 @@ impl Engine {
                             .await?;
                             if !self.suppress_collaborator_bridge_wrapper(
                                 &thread.id,
+                                &session_id,
                                 collaborator,
                                 &event,
                             ) {
@@ -9450,6 +10145,7 @@ impl Engine {
                                     backend_id,
                                     collaborator,
                                     event,
+                                    &cancel,
                                 )
                                 .await?;
                             }
@@ -9752,7 +10448,9 @@ impl Engine {
         let engine = self.clone();
         async move {
             let mut approved = engine
-                .gate_backend_approval(&session, &thread, turn, &mode, &call_id, &tool, &args)
+                .gate_backend_approval(
+                    &session, &thread, turn, &mode, &call_id, &tool, &args, &cancel,
+                )
                 .await;
             let mut mutation_permit = None;
             if acquire_mutation_permit
@@ -9792,6 +10490,7 @@ impl Engine {
         call_id: &str,
         tool: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<bool> {
         // A vendor write aimed outside the session worktree is denied
         // without asking: the vendor executes the tool itself, so this is
@@ -9841,13 +10540,6 @@ impl Engine {
                         requires_approval: true,
                     });
                 }
-                let cancel = self
-                    .turn_cancels
-                    .lock()
-                    .unwrap()
-                    .get(&thread.id)
-                    .cloned()
-                    .unwrap_or_default();
                 let rx = self.approvals.request(call_id);
                 approval_events.push(Event::ApprovalRequested {
                     turn,
@@ -10129,7 +10821,7 @@ impl Engine {
             let outcome = if call.name == "search_transcript" {
                 self.handle_search_transcript(session, thread, &call.arguments)
             } else {
-                self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
+                self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments, cancel)
                     .await
             };
             let execution_duration_ms = monotonic_elapsed_ms(execution_started);
@@ -10303,15 +10995,20 @@ impl Engine {
                 _guard: tokio::sync::OwnedRwLockReadGuard<()>,
             },
             Write {
-                _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+                guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
             },
+            /// Background-job control must be able to poll or terminate a
+            /// process while that process retains the write lane.
+            BackgroundControl,
         }
         let execution_lock = self.tool_execution_lock(&session.id);
-        let permit = if mutates {
+        let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
+            Some(ExecutionPermit::BackgroundControl)
+        } else if mutates {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
-                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { _guard: permit }),
+                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { guard: Some(permit) }),
             }
         } else {
             tokio::select! {
@@ -10333,7 +11030,19 @@ impl Engine {
                 )
                 .await?;
             let executor = self.executor.clone();
-            let tool_ctx = ctx.clone();
+            let mut tool_ctx = ctx.clone();
+            if call.name == "shell"
+                && call
+                    .arguments
+                    .get("run_in_background")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
+                && let Some(guard) = guard.take()
+            {
+                tool_ctx.background_mutation_lease =
+                    Some(Arc::new(BackgroundMutationLease::new(guard)));
+            }
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
             let execution_started = std::time::Instant::now();
@@ -10442,6 +11151,7 @@ impl Engine {
         mode: &AgentMode,
         name: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
         if name == "spawn_output" {
             let child_id = args
@@ -10465,7 +11175,11 @@ impl Engine {
                 if !running || std::time::Instant::now() >= deadline {
                     return Ok(status);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("spawn_output wait cancelled"),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                }
             }
         }
 
@@ -10603,22 +11317,32 @@ impl Engine {
             (session.id.clone(), None)
         };
 
-        let child = self
-            .create_thread(CreateThreadRequest {
-                session_id: child_session_id.clone(),
-                title: child_title,
-                mode: Some(child_mode),
-                model: Some(child_model),
-                model_options,
-                permission_mode: Some(thread.permission_mode),
-            })
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let child_session = if child_session_id == session.id {
+            session.clone()
+        } else {
+            self.get_session(&child_session_id)
+                .map_err(|error| anyhow!(error.to_string()))?
+        };
         let kind = if name == "spawn_session" {
             "session"
         } else {
             "thread"
         };
-        self.store.insert_spawned(&child.id, &thread.id, kind)?;
+        let child = self
+            .create_spawned_thread_for_session(
+                child_session,
+                CreateThreadRequest {
+                    session_id: child_session_id.clone(),
+                    title: child_title,
+                    mode: Some(child_mode),
+                    model: Some(child_model),
+                    model_options,
+                    permission_mode: Some(thread.permission_mode),
+                },
+                &thread.id,
+                kind,
+            )
+            .map_err(|e| anyhow!(e.to_string()))?;
         self.send_message_with_tools(&child.id, prompt.to_string(), Vec::new(), true, true)
             .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -10673,6 +11397,12 @@ impl Engine {
                 _ => {}
             }
         }
+        let failed_descendants = self.store.failed_spawned_descendants(thread_id)?;
+        if failure.is_none()
+            && let Some(descendant) = failed_descendants.first()
+        {
+            failure = Some(format!("descendant thread {descendant} failed"));
+        }
         let status = if running {
             "running"
         } else if failure.is_some() {
@@ -10682,17 +11412,7 @@ impl Engine {
         } else {
             "pending"
         };
-        let mut usage = self
-            .store
-            .usage_summary(crate::store::UsageScope::Thread(thread_id))?;
-        for descendant in &descendants {
-            let child_usage = self
-                .store
-                .usage_summary(crate::store::UsageScope::Thread(&descendant.id))?;
-            usage.input_tokens += child_usage.input_tokens;
-            usage.output_tokens += child_usage.output_tokens;
-            usage.cost_usd += child_usage.cost_usd;
-        }
+        let usage = self.store.spawned_subtree_usage(thread_id)?;
         let mut out = serde_json::json!({
             "thread_id": thread_id,
             "status": status,
@@ -10700,6 +11420,7 @@ impl Engine {
             "last_message": last_message,
             "descendants": descendants.len(),
             "active_descendants": active_descendants,
+            "failed_descendants": failed_descendants,
             "usage": {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
@@ -10998,14 +11719,17 @@ fn is_immediate_sqlite_lock(error: &anyhow::Error) -> bool {
 }
 
 fn sqlite_error_code(error: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
-    error.chain().find_map(|cause| {
-        cause
-            .downcast_ref::<rusqlite::Error>()
-            .and_then(|error| match error {
-                rusqlite::Error::SqliteFailure(details, _) => Some(details.code),
-                _ => None,
-            })
-    })
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(|error| match error {
+                    rusqlite::Error::SqliteFailure(details, _) => Some(details.code),
+                    _ => None,
+                })
+        })
+        .or_else(|| crate::store::event_writer_sqlite_error_code(error))
 }
 
 /// Retry one short synchronous checkpoint-store operation without retaining a
@@ -12365,6 +13089,35 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    fn init_engine_test_repo(path: &Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::create_dir_all(path).unwrap();
+        run(&["init", "-b", "main"]);
+        std::fs::write(path.join("README.md"), "test\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&[
+            "-c",
+            "user.name=trouve test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+    }
+
     fn sqlite_busy_error() -> anyhow::Error {
         let data = tempfile::tempdir().unwrap();
         let database = data.path().join("checkpoint-contention.sqlite3");
@@ -12457,63 +13210,207 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridged_tool_owner_router_correlates_both_arrival_orders() {
+    async fn codex_bridge_router_correlates_explicit_vendor_and_call_identity() {
         let router = BridgedToolOwnerRouter::default();
-        let args = serde_json::json!({ "query": "ownership" });
+        router.begin_root("root");
+        router
+            .bind_vendor_thread("root", "vendor-a", "owner-a")
+            .unwrap();
+        router
+            .bind_vendor_thread("root", "vendor-b", "owner-b")
+            .unwrap();
 
-        let BridgedToolOwnerRegistration::Pending { receiver, .. } =
-            router.register("root", "search", &args)
+        assert!(matches!(
+            router.register_vendor_owner("root", "vendor-a"),
+            CodexVendorOwnerRegistration::Immediate(owner) if owner == "owner-a"
+        ));
+
+        // HTTP first: wait for app-server's item identity, independent of
+        // payload equality or any sibling call's ordering.
+        let CodexCallValidationRegistration::Pending { receiver, .. } =
+            router.register_call_validation("root", "vendor-a", "owner-a", "call-a")
         else {
-            panic!("request-first registration should wait for an owner");
+            panic!("request-first identity should wait for its wrapper");
         };
-        router.announce("root", "child-a", "search", &args);
-        assert_eq!(receiver.await.unwrap(), "child-a");
+        assert!(router.announce_wrapper("root", "vendor-a", "owner-a", "call-a"));
+        assert_eq!(receiver.await.unwrap(), CodexCallValidationOutcome::Matched);
 
-        router.announce("root", "child-b", "search", &args);
-        let BridgedToolOwnerRegistration::Immediate(owner) =
-            router.register("root", "search", &args)
-        else {
-            panic!("notification-first registration should consume its hint");
-        };
-        assert_eq!(owner, "child-b");
+        // Wrapper first: the same rendezvous works in the opposite order.
+        assert!(router.announce_wrapper("root", "vendor-b", "owner-b", "call-b"));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-b"),
+            CodexCallValidationRegistration::Immediate
+        ));
 
-        let BridgedToolOwnerRegistration::Pending {
+        // A call id can authorize only its announced vendor owner and only
+        // once, even when sibling calls carry byte-identical tool payloads.
+        assert!(router.announce_wrapper("root", "vendor-a", "owner-a", "call-owner-a"));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-owner-a"),
+            CodexCallValidationRegistration::MismatchedOwner
+        ));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-b"),
+            CodexCallValidationRegistration::Replayed
+        ));
+
+        // A not-yet-announced collaborator may rendezvous briefly, but an
+        // external id is not borrowed from another root.
+        let CodexVendorOwnerRegistration::Pending {
             id,
-            receiver: abandoned,
-        } = router.register("root", "search", &args)
+            receiver: unknown,
+        } = router.register_vendor_owner("root", "external-vendor")
         else {
-            panic!("a fresh request should wait for its owner");
+            panic!("unknown vendor ids should never resolve immediately");
         };
-        router.abandon("root", id);
-        assert!(abandoned.await.is_err());
-        router.announce("root", "late-child", "search", &args);
-        let BridgedToolOwnerRegistration::Pending {
-            id,
-            receiver: replacement,
-        } = router.register("root", "search", &args)
-        else {
-            panic!("a late hint for an abandoned request must not route its replacement");
-        };
-        router.abandon("root", id);
-        assert!(replacement.await.is_err());
-        router.announce("root", "replacement-late", "search", &args);
+        router.abandon_vendor_owner("root", "external-vendor", id);
+        assert!(unknown.await.is_err());
 
-        let BridgedToolOwnerRegistration::Pending {
-            receiver: first, ..
-        } = router.register("root", "search", &args)
-        else {
-            panic!("first parallel request should wait");
+        router.clear_root("root");
+        assert!(matches!(
+            router.register_vendor_owner("root", "vendor-a"),
+            CodexVendorOwnerRegistration::InactiveRoot
+        ));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-a", "owner-a", "stale-call"),
+            CodexCallValidationRegistration::InactiveRoot
+        ));
+    }
+
+    struct DiscoveryProbeExecutor {
+        full_catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn probe_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for DiscoveryProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            self.full_catalog_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![probe_spec("mcp__trusted__external")]
+        }
+
+        async fn native_specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            vec![probe_spec("search"), probe_spec("find_related")]
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn minimal_bridge_listing_never_discovers_external_mcp_tools() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_minimal_bridge".into(),
+            name: "minimal bridge".into(),
+            path: data.path().to_string_lossy().into_owned(),
         };
-        let BridgedToolOwnerRegistration::Pending {
-            receiver: second, ..
-        } = router.register("root", "search", &args)
-        else {
-            panic!("second parallel request should wait");
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_minimal_bridge".into(),
+            workspace_id: workspace.id,
+            title: "Minimal bridge".into(),
+            branch: "trouve/minimal-bridge".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
         };
-        router.announce("root", "child-c", "search", &args);
-        router.announce("root", "child-d", "search", &args);
-        assert_eq!(first.await.unwrap(), "child-c");
-        assert_eq!(second.await.unwrap(), "child-d");
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_minimal_bridge".into(),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "codex/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let full_catalog_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(store, data.path().into(), &Config::default()).with_executor(
+            Arc::new(DiscoveryProbeExecutor {
+                full_catalog_calls: full_catalog_calls.clone(),
+            }),
+        );
+        let _cancel = engine.register_cancel(&thread.id);
+
+        let minimal = engine.bridged_tool_specs(&thread.id, false).await.unwrap();
+        assert_eq!(
+            full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "minimal listing must not enter external MCP discovery"
+        );
+        assert_eq!(
+            minimal
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["search", "find_related", "ask_question"])
+        );
+
+        let full = engine.bridged_tool_specs(&thread.id, true).await.unwrap();
+        assert_eq!(
+            full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            full.iter()
+                .any(|spec| spec.name == "mcp__trusted__external")
+        );
+        engine.clear_cancel(&thread.id);
+    }
+
+    #[test]
+    fn backend_collaborator_claims_never_overwrite_an_active_dispatcher() {
+        let active_threads = Mutex::new(HashMap::from([(
+            "already-running".to_string(),
+            "session-a".to_string(),
+        )]));
+        {
+            let mut claims = BackendCollaboratorClaims::new(&active_threads);
+            assert!(!claims.claim("already-running", "session-b"));
+            assert!(claims.claim("new-collaborator", "session-b"));
+            let active = active_threads.lock().unwrap();
+            assert_eq!(
+                active.get("already-running").map(String::as_str),
+                Some("session-a")
+            );
+            assert_eq!(
+                active.get("new-collaborator").map(String::as_str),
+                Some("session-b")
+            );
+        }
+        let active = active_threads.lock().unwrap();
+        assert_eq!(
+            active.get("already-running").map(String::as_str),
+            Some("session-a")
+        );
+        assert!(!active.contains_key("new-collaborator"));
     }
 
     #[test]
@@ -12595,6 +13492,67 @@ mod tests {
         releases: Arc<tokio::sync::Semaphore>,
     }
 
+    struct McpInvalidationProbeExecutor {
+        started: Arc<tokio::sync::Semaphore>,
+        releases: Arc<tokio::sync::Semaphore>,
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for McpInvalidationProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+
+        async fn invalidate_mcp_server(&self, name: &str) {
+            self.names.lock().unwrap().push(name.to_string());
+            self.started.add_permits(1);
+            self.releases
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap()
+                .forget();
+        }
+    }
+
+    struct SuccessfulTodoExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SuccessfulTodoExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::ok(serde_json::json!({"todos": [
+                {"id": "external", "content": "External", "status": "completed"}
+            ]}))
+        }
+    }
+
     #[async_trait::async_trait]
     impl ToolExecutor for BlockingToolExecutor {
         async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
@@ -12621,6 +13579,38 @@ mod tests {
         started: Arc<tokio::sync::Semaphore>,
         cleanup_started: Arc<tokio::sync::Semaphore>,
         cleanup_release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct FailingCheckpointExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for FailingCheckpointExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+
+        async fn checkpoint_worktree(
+            &self,
+            _worktree: &Path,
+            _session_id: &str,
+            _seq: i64,
+            _message: &str,
+        ) -> Result<String, String> {
+            Err("injected checkpoint failure".into())
+        }
     }
 
     #[async_trait::async_trait]
@@ -12652,6 +13642,143 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mcp_settings_persist_before_waiting_for_cache_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let releases = Arc::new(tokio::sync::Semaphore::new(0));
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(
+                Store::open_in_memory().unwrap(),
+                tmp.path().join("data"),
+                &config,
+            )
+            .with_config_dir(Some(config_dir.clone()))
+            .with_executor(Arc::new(McpInvalidationProbeExecutor {
+                started: started.clone(),
+                releases: releases.clone(),
+                names: names.clone(),
+            })),
+        );
+        let config_path = crate::mcp::user_config_path(&config_dir);
+
+        let request = trouve_protocol::UpsertMcpServerRequest {
+            scope: "user".into(),
+            workspace_id: None,
+            command: "first".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            enabled: Some(true),
+        };
+        assert!(engine.upsert_mcp_server("", &request).await.is_err());
+        assert!(started.try_acquire().is_err());
+
+        let task_engine = engine.clone();
+        let task =
+            tokio::spawn(async move { task_engine.upsert_mcp_server("docs", &request).await });
+        started.clone().acquire_owned().await.unwrap().forget();
+        let servers = crate::mcp::read_servers(&config_path);
+        assert_eq!(servers["docs"].command, "first");
+        assert!(!servers["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let task = tokio::spawn(async move {
+            task_engine
+                .set_mcp_server_enabled(
+                    "docs",
+                    &trouve_protocol::SetMcpServerEnabledRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        enabled: false,
+                    },
+                )
+                .await
+        });
+        started.clone().acquire_owned().await.unwrap().forget();
+        assert!(crate::mcp::read_servers(&config_path)["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let task = tokio::spawn(async move {
+            task_engine
+                .set_mcp_server_enabled(
+                    "docs",
+                    &trouve_protocol::SetMcpServerEnabledRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        enabled: true,
+                    },
+                )
+                .await
+        });
+        started.clone().acquire_owned().await.unwrap().forget();
+        assert!(!crate::mcp::read_servers(&config_path)["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let task = tokio::spawn(async move {
+            task_engine
+                .upsert_mcp_server(
+                    "docs",
+                    &trouve_protocol::UpsertMcpServerRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        command: "replacement".into(),
+                        args: vec!["--new".into()],
+                        env: std::collections::BTreeMap::new(),
+                        enabled: Some(true),
+                    },
+                )
+                .await
+        });
+        started.clone().acquire_owned().await.unwrap().forget();
+        let servers = crate::mcp::read_servers(&config_path);
+        assert_eq!(servers["docs"].command, "replacement");
+        assert_eq!(servers["docs"].args, ["--new"]);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let task =
+            tokio::spawn(async move { task_engine.delete_mcp_server("docs", "user", None).await });
+        started.clone().acquire_owned().await.unwrap().forget();
+        assert!(!crate::mcp::read_servers(&config_path).contains_key("docs"));
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let missing = engine
+            .set_mcp_server_enabled(
+                "missing",
+                &trouve_protocol::SetMcpServerEnabledRequest {
+                    scope: "user".into(),
+                    workspace_id: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(matches!(missing, Err(EngineError::NotFound(_))));
+        assert!(started.try_acquire().is_err());
+        assert_eq!(
+            names.lock().unwrap().as_slice(),
+            ["docs", "docs", "docs", "docs", "docs"]
+        );
+    }
+
     #[test]
     fn session_branches_default_to_short_ids_and_can_include_title_slugs() {
         assert_eq!(
@@ -12662,6 +13789,235 @@ mod tests {
             session_branch_name("Fix the Login Bug", "se_abc123def456", true),
             "trouve/fix-the-login-bug-abc123"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_session_creation_rolls_back_worktree_branch_and_database_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repo);
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_session_rollback".into(),
+            name: "rollback".into(),
+            path: repo.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Engine::new(store.clone(), data_dir.clone(), &Config::default())
+            .with_executor(Arc::new(FailingCheckpointExecutor));
+
+        let error = engine
+            .create_session(CreateSessionRequest {
+                workspace_id: workspace.id.clone(),
+                title: Some("Must roll back".into()),
+                base_ref: Some("main".into()),
+                checkout_ref: None,
+                fetch_latest: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected checkpoint failure"));
+        assert!(store.list_sessions(Some(&workspace.id)).unwrap().is_empty());
+        assert_eq!(git::list_branches(&repo).unwrap(), ["main"]);
+        let worktree_root = data_dir.join("worktrees");
+        assert!(
+            !worktree_root.exists() || std::fs::read_dir(worktree_root).unwrap().next().is_none(),
+            "failed creation left a worktree directory"
+        );
+        let refs = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/trouve/checkpoints/",
+            ])
+            .output()
+            .unwrap();
+        assert!(refs.status.success());
+        assert!(
+            refs.stdout.is_empty(),
+            "failed creation left a checkpoint ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_output_wait_is_immediately_cancellation_aware() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_spawn_cancel".into(),
+            name: "spawn cancel".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: "se_spawn_cancel".into(),
+            workspace_id: workspace.id.clone(),
+            title: "spawn cancel".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let parent = Thread {
+            id: "th_spawn_cancel_parent".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let child = Thread {
+            id: "th_spawn_cancel_child".into(),
+            parent_thread_id: Some(parent.id.clone()),
+            spawned: true,
+            ..parent.clone()
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&parent, &serde_json::Map::new())
+            .unwrap();
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), &parent.id, "thread")
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            store,
+            temp.path().join("data"),
+            &Config::default(),
+        ));
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), session.id.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            engine.handle_spawn_tool(
+                &session,
+                &parent,
+                &modes::fallback_mode(),
+                "spawn_output",
+                &serde_json::json!({"thread_id": child.id, "wait_ms": 180_000}),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("spawn_output did not wake promptly on cancellation")
+        .unwrap_err();
+        assert!(result.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn queued_attachment_removal_cleans_index_rows_and_owned_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let attachment_dir = data_dir.join("attachments");
+        std::fs::create_dir_all(&attachment_dir).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_attachment_cleanup".into(),
+            name: "attachments".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: "se_attachment_cleanup".into(),
+            workspace_id: workspace.id.clone(),
+            title: "attachments".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let thread = Thread {
+            id: "th_attachment_cleanup".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        let engine = Engine::new(store.clone(), data_dir, &Config::default());
+
+        let removed = trouve_protocol::Attachment {
+            id: "at_removed".into(),
+            name: "removed.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 7,
+        };
+        let removed_path = attachment_dir.join("at_removed.txt");
+        std::fs::write(&removed_path, "removed").unwrap();
+        store
+            .add_attachment(
+                &thread.id,
+                &removed,
+                removed_path.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        let updated = store
+            .enqueue_prompt(&thread.id, "before", std::slice::from_ref(&removed))
+            .unwrap();
+        engine
+            .update_queued_prompt(
+                &updated.id,
+                trouve_protocol::UpdateQueuedPromptRequest {
+                    content: "after".into(),
+                    retained_attachment_ids: Some(Vec::new()),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(!removed_path.exists());
+        assert!(store.attachment(&removed.id).unwrap().is_none());
+
+        let deleted = trouve_protocol::Attachment {
+            id: "at_deleted".into(),
+            name: "deleted.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 7,
+        };
+        let deleted_path = attachment_dir.join("at_deleted.txt");
+        std::fs::write(&deleted_path, "deleted").unwrap();
+        store
+            .add_attachment(
+                &thread.id,
+                &deleted,
+                deleted_path.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        let deleted_prompt = store
+            .enqueue_prompt(&thread.id, "delete", std::slice::from_ref(&deleted))
+            .unwrap();
+        engine.delete_queued_prompt(&deleted_prompt.id).unwrap();
+        assert!(!deleted_path.exists());
+        assert!(store.attachment(&deleted.id).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -12985,6 +14341,27 @@ mod tests {
                 permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
             })
             .unwrap();
+        let read_only_parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: Some("Read-only parent".into()),
+                mode: Some("review".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+            })
+            .unwrap();
+        assert_eq!(
+            engine
+                .backend_collaborator_mode(
+                    &session,
+                    &read_only_parent,
+                    BackendCollaboratorAccess::Interactive,
+                )
+                .unwrap(),
+            "review",
+            "provider metadata must not widen a read-only parent"
+        );
         store
             .set_backend_session(&parent.id, "codex", "vendor-root")
             .unwrap();
@@ -13151,6 +14528,39 @@ default_permission_mode = "ask"
 "#,
         )
         .unwrap();
+        let restricted_parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: Some("Restricted provider parent".into()),
+                mode: Some("plan".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Ask),
+            })
+            .unwrap();
+        let blocked = engine
+            .start_backend_collaborator(
+                &session,
+                &restricted_parent,
+                "codex",
+                "vendor-blocked".into(),
+                "vendor-plan-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                Some("This collaborator must not start".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("provider-native collaborators are not permitted")
+        );
+        assert!(!vendor_threads.contains_key("vendor-blocked"));
         engine
             .start_backend_collaborator(
                 &session,
@@ -13190,10 +14600,51 @@ default_permission_mode = "ask"
             "tool": "read_file",
             "arguments": bridge_arguments.clone()
         });
+        let root_cancel = engine.register_cancel(&parent.id);
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-root", &parent.id)
+            .unwrap();
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-child", &child.id)
+            .unwrap();
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-audit", &audit_child.id)
+            .unwrap();
+        let missing_owner = engine
+            .bridged_codex_tool_call(&parent.id, None, None, "read_file", &bridge_arguments)
+            .await
+            .unwrap_err();
+        assert!(missing_owner.to_string().contains("_meta.threadId"));
+        let unknown_owner = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-external"),
+                None,
+                "read_file",
+                &bridge_arguments,
+            )
+            .await
+            .unwrap_err();
+        assert!(unknown_owner.to_string().contains("unknown, external"));
+        let thread_only_output = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-audit"),
+                None,
+                "read_file",
+                &bridge_arguments,
+            )
+            .await
+            .unwrap();
+        assert!(thread_only_output.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
                 &parent.id,
+                "vendor-child",
                 projection,
                 &BackendCollaboratorEvent::ToolStarted {
                     call_id: "codex-wrapper".into(),
@@ -13203,7 +14654,13 @@ default_permission_mode = "ask"
             ));
         }
         let bridge_output = engine
-            .bridged_codex_tool_call(&parent.id, "read_file", &bridge_arguments)
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-child"),
+                Some("codex-wrapper"),
+                "read_file",
+                &bridge_arguments,
+            )
             .await
             .unwrap();
         assert!(bridge_output.contains("owned by the child"));
@@ -13211,6 +14668,7 @@ default_permission_mode = "ask"
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
                 &parent.id,
+                "vendor-child",
                 projection,
                 &BackendCollaboratorEvent::ToolCompleted {
                     call_id: "codex-wrapper".into(),
@@ -13247,6 +14705,98 @@ default_permission_mode = "ask"
                 ))
         );
 
+        // Two collaborators submit byte-identical mutations while the HTTP
+        // and wrapper transports arrive in opposite orders. Explicit vendor
+        // metadata sends each call through its own mode policy: the code
+        // child writes, while the review child is denied.
+        let identical_write_args = serde_json::json!({
+            "path": "metadata-owner.txt",
+            "content": "written by interactive child"
+        });
+        let write_wrapper = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "write_file",
+            "arguments": identical_write_args.clone()
+        });
+        let request_first = tokio::spawn({
+            let engine = engine.clone();
+            let parent_id = parent.id.clone();
+            let arguments = identical_write_args.clone();
+            async move {
+                engine
+                    .bridged_codex_tool_call(
+                        &parent_id,
+                        Some("vendor-child"),
+                        Some("request-first-write"),
+                        "write_file",
+                        &arguments,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = engine
+                    .bridged_tool_owners
+                    .state
+                    .lock()
+                    .unwrap()
+                    .roots
+                    .get(&parent.id)
+                    .is_some_and(|root| root.pending_calls.contains_key("request-first-write"));
+                if pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP-first call should enter identity rendezvous");
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "request-first-write".into(),
+                    tool: "mcpToolCall".into(),
+                    args: write_wrapper.clone(),
+                },
+            ));
+        }
+        request_first.await.unwrap().unwrap();
+
+        {
+            let projection = collaborators.get_mut("vendor-audit").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-audit",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "wrapper-first-write".into(),
+                    tool: "mcpToolCall".into(),
+                    args: write_wrapper,
+                },
+            ));
+        }
+        let review_result = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-audit"),
+                Some("wrapper-first-write"),
+                "write_file",
+                &identical_write_args,
+            )
+            .await
+            .unwrap();
+        assert!(review_result.contains("not permitted in this mode"));
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("metadata-owner.txt")).unwrap(),
+            "written by interactive child"
+        );
+
         let projection = collaborators.get_mut("vendor-child").unwrap();
         engine
             .persist_backend_collaborator_event(
@@ -13255,6 +14805,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::ThinkingDelta("Checking the suite.".into()),
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13265,6 +14816,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::ThinkingCompleted,
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13279,6 +14831,7 @@ default_permission_mode = "ask"
                     tool: "shell".into(),
                     args: serde_json::json!({ "command": "cargo test" }),
                 },
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13292,6 +14845,7 @@ default_permission_mode = "ask"
                     call_id: "call-1".into(),
                     chunk: "all green".into(),
                 },
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13306,6 +14860,7 @@ default_permission_mode = "ask"
                     ok: true,
                     result: serde_json::json!({ "exit_code": 0 }),
                 },
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13316,6 +14871,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::TextDelta("The suite passes.".into()),
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13333,6 +14889,7 @@ default_permission_mode = "ask"
                         ..Usage::default()
                     },
                 },
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13414,6 +14971,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::TurnStarted,
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13442,6 +15000,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::UserMessage("Also inspect the current protocol".into()),
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13452,6 +15011,7 @@ default_permission_mode = "ask"
                 "codex",
                 projection,
                 BackendCollaboratorEvent::TextDelta("The follow-up passes.".into()),
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13464,6 +15024,7 @@ default_permission_mode = "ask"
                 BackendCollaboratorEvent::Completed {
                     usage: Usage::default(),
                 },
+                &root_cancel,
             )
             .await
             .unwrap();
@@ -13601,6 +15162,49 @@ default_permission_mode = "ask"
             (parent.id.clone(), MAX_SUBAGENT_DEPTH)
         );
         assert!(!engine.thread_can_spawn_subagents(&deepest.id).unwrap());
+
+        let cancelled_call = tokio::spawn({
+            let engine = engine.clone();
+            let parent_id = parent.id.clone();
+            async move {
+                engine
+                    .bridged_codex_tool_call(
+                        &parent_id,
+                        Some("vendor-child"),
+                        Some("cancelled-metadata-call"),
+                        "read_file",
+                        &serde_json::json!({ "path": "bridge-owner.txt" }),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = engine
+                    .bridged_tool_owners
+                    .state
+                    .lock()
+                    .unwrap()
+                    .roots
+                    .get(&parent.id)
+                    .is_some_and(|root| root.pending_calls.contains_key("cancelled-metadata-call"));
+                if pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("call should wait for its wrapper before root cancellation");
+        root_cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), cancelled_call)
+                .await
+                .expect("root cancellation should stop metadata rendezvous")
+                .unwrap(),
+            Err(EngineError::Conflict(message)) if message.contains("cancelled")
+        ));
+        engine.clear_cancel(&parent.id);
     }
 
     fn projection_pr(number: u64, workspace_id: &str, head: &str) -> trouve_protocol::PrInfo {
@@ -14374,6 +15978,95 @@ default_permission_mode = "ask"
             store.thread(&thread.id).unwrap().unwrap().todos,
             vendor_todos
         );
+
+        // An external MCP server may use the same basename, or a provider may
+        // report a generic wrapper whose nested tool is named `todo_write`.
+        // Neither is allowed to replace trouve's authoritative thread TODOs
+        // or synthesize a TodosUpdated event.
+        let todos_updated_before = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .iter()
+            .filter(|env| matches!(env.event, Event::TodosUpdated { .. }))
+            .count();
+        let external_engine = Arc::new(
+            Engine::new(store.clone(), tmp.path().into(), &config)
+                .with_executor(Arc::new(SuccessfulTodoExecutor)),
+        );
+        let mut external_thread = thread.clone();
+        external_thread.permission_mode = trouve_protocol::PermissionMode::Yolo;
+        let external_ctx = ToolCtx {
+            worktree: tmp.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let mode = modes::fallback_mode();
+        for (turn, call) in [
+            (
+                2,
+                trouve_providers::ToolCallRequest {
+                    id: "call_external_todo".into(),
+                    name: "mcp__external__todo_write".into(),
+                    arguments: serde_json::json!({"todos": [
+                        {"id": "external", "content": "External", "status": "completed"}
+                    ]}),
+                },
+            ),
+            (
+                3,
+                trouve_providers::ToolCallRequest {
+                    id: "call_external_todo_wrapper".into(),
+                    name: "mcpToolCall".into(),
+                    arguments: serde_json::json!({
+                        "server": "external",
+                        "tool": "todo_write",
+                        "arguments": {"todos": [
+                            {"id": "external", "content": "External", "status": "completed"}
+                        ]}
+                    }),
+                },
+            ),
+        ] {
+            external_engine
+                .handle_tool_call(
+                    &session,
+                    &external_thread,
+                    turn,
+                    &mode,
+                    &external_ctx,
+                    &call,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.thread(&thread.id).unwrap().unwrap().todos,
+            vendor_todos
+        );
+        let todos_updated_after = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .iter()
+            .filter(|env| matches!(env.event, Event::TodosUpdated { .. }))
+            .count();
+        assert_eq!(todos_updated_after, todos_updated_before);
+
+        // The reserved first-party bridge namespace is still authoritative if
+        // a supported provider exposes the native tool under that identifier.
+        let bridged = external_engine
+            .persist_todos_from_result(
+                &thread.id,
+                "mcp__trouve__todo_write",
+                ToolStatus::Ok,
+                &serde_json::json!({"todos": [
+                    {"id": "bridged", "content": "Bridged", "status": "pending"}
+                ]}),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bridged[0].id, "bridged");
     }
 
     #[test]
@@ -14797,21 +16490,75 @@ default_permission_mode = "ask"
             &config,
         );
         engine.set_base_url("http://127.0.0.1:4000");
+        let _cancel = engine.register_cancel("th_1");
 
         let codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
         assert!(codex.bridge_tools);
         assert!(codex.url.contains("tools=1"));
         assert!(codex.disallowed_tools.is_empty());
+        let codex_ticket = codex
+            .url
+            .split('?')
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("ticket="))
+            .unwrap();
+        let claims = engine
+            .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+            .unwrap();
+        assert!(claims.correlate_codex_owner);
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_tampered", true, false)
+                .is_none()
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", false, false)
+                .is_none()
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, true)
+                .is_none()
+        );
+
+        engine.clear_cancel("th_1");
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_none(),
+            "a retained capability must remain dormant between turns"
+        );
+        let _resumed_cancel = engine.register_cancel("th_1");
+        let resumed_codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
+        assert_eq!(
+            resumed_codex.url, codex.url,
+            "a resumed vendor runtime must receive the URL its persistent MCP client already uses"
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_some()
+        );
 
         let claude = engine.mcp_bridge_for("claude/model", "th_1").unwrap();
         assert!(claude.bridge_tools);
         assert!(claude.disallowed_tools.iter().any(|tool| tool == "Edit"));
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_none(),
+            "changing the bridge capability surface must rotate the old ticket"
+        );
 
         let native = engine
             .mcp_bridge_for("claude-native/model", "th_1")
             .unwrap();
         assert!(!native.bridge_tools);
         assert!(native.url.contains("tools=0"));
+        engine.clear_cancel("th_1");
     }
 
     #[tokio::test]

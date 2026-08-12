@@ -34,6 +34,22 @@ export type ContentWorkerRequest =
       readonly language: string;
     };
 
+export const CONTENT_WORKER_MAX_SOURCE_UNITS = 4 * 1024 * 1024;
+export const CONTENT_WORKER_MAX_FUZZY_ITEMS = 10_000;
+
+/** Apply the same resource bounds before posting and inside the worker. This
+ * keeps worker rejection from turning into an unbounded main-thread fallback. */
+export const validateContentWorkerRequest = (request: ContentWorkerRequest): void => {
+  if (
+    (request.type === "markdown" || request.type === "diff" || request.type === "highlight")
+    && request.source.length > CONTENT_WORKER_MAX_SOURCE_UNITS
+  ) throw new Error("content exceeds worker bounds");
+  if (
+    (request.type === "composer-fuzzy" && request.candidates.length > CONTENT_WORKER_MAX_FUZZY_ITEMS)
+    || (request.type === "palette-fuzzy" && request.items.length > CONTENT_WORKER_MAX_FUZZY_ITEMS)
+  ) throw new Error("too many fuzzy candidates");
+};
+
 export type ContentWorkerResult =
   | string
   | readonly ParsedDiffFile[]

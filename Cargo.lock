@@ -7267,6 +7267,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "libc",
  "portable-pty",
  "reqwest",
  "serde",
@@ -7280,6 +7281,7 @@ dependencies = [
  "tracing",
  "trouve-protocol",
  "trouve-providers",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7346,6 +7348,7 @@ dependencies = [
  "reqwest",
  "rsa",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7361,6 +7364,8 @@ dependencies = [
  "trouve-search",
  "trouve-thread-view",
  "uuid",
+ "windows-sys 0.61.2",
+ "xattr",
 ]
 
 [[package]]
@@ -7380,6 +7385,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 
 
-STRATEGIES = {"apply_patch", "edit_file", "hashline"}
+STRATEGIES = {"apply_patch", "hashline"}
 ORIGINS = {"local", "external"}
 
 
@@ -68,8 +68,8 @@ def load(path: pathlib.Path) -> list[Run]:
         strategy = require(entry, "strategy", str, location)
         task = require(entry, "task", str, location)
         run = require(entry, "run", int, location)
-        origin = entry.get("origin", "local")
-        if not isinstance(origin, str) or origin not in ORIGINS:
+        origin = require(entry, "origin", str, location)
+        if origin not in ORIGINS:
             raise DataError(f"{location}: origin must be local or external")
         if not model or not task or run < 1:
             raise DataError(f"{location}: model/task must be non-empty and run must be positive")
@@ -122,17 +122,32 @@ def percentile(values: list[float], fraction: float) -> float:
 def paired_runs(
     runs: list[Run], model: str, baseline: str, candidate: str, origin: str
 ) -> list[tuple[Run, Run]]:
-    selected = [run for run in runs if run.model == model and run.origin == origin]
+    selected = [
+        run
+        for run in runs
+        if run.model == model
+        and run.origin == origin
+        and run.strategy in {baseline, candidate}
+    ]
     indexed = {(run.strategy, run.task, run.run): run for run in selected}
-    keys = {
-        (run.task, run.run)
-        for run in selected
-        if run.strategy == baseline
-        and (candidate, run.task, run.run) in indexed
+    baseline_keys = {
+        (run.task, run.run) for run in selected if run.strategy == baseline
     }
+    candidate_keys = {
+        (run.task, run.run) for run in selected if run.strategy == candidate
+    }
+    if baseline_keys != candidate_keys:
+        missing_candidate = sorted(baseline_keys - candidate_keys)
+        missing_baseline = sorted(candidate_keys - baseline_keys)
+        details = []
+        if missing_candidate:
+            details.append(f"missing {candidate} rows for {missing_candidate}")
+        if missing_baseline:
+            details.append(f"missing {baseline} rows for {missing_baseline}")
+        raise DataError(f"{model} {origin} evidence is not fully paired: {'; '.join(details)}")
     return [
         (indexed[(baseline, task, number)], indexed[(candidate, task, number)])
-        for task, number in sorted(keys)
+        for task, number in sorted(baseline_keys)
     ]
 
 
@@ -147,12 +162,35 @@ def summarize(pairs: list[tuple[Run, Run]]) -> dict[str, object]:
         "candidate_tokens_median": statistics.median(run.output_tokens for run in candidate),
         "baseline_retries_mean": statistics.fmean(run.edit_retries for run in baseline),
         "candidate_retries_mean": statistics.fmean(run.edit_retries for run in candidate),
+        "baseline_stale_retries_mean": statistics.fmean(run.stale_retries for run in baseline),
         "candidate_stale_retries_mean": statistics.fmean(run.stale_retries for run in candidate),
         "baseline_executor_ms_median": statistics.median(run.executor_ms for run in baseline),
         "candidate_executor_ms_median": statistics.median(run.executor_ms for run in candidate),
         "baseline_executor_ms_p95": percentile([run.executor_ms for run in baseline], 0.95),
         "candidate_executor_ms_p95": percentile([run.executor_ms for run in candidate], 0.95),
     }
+
+
+def corpus_shape_error(
+    pairs: list[tuple[Run, Run]], minimum_tasks: int, minimum_runs_per_task: int
+) -> str | None:
+    task_runs: dict[str, set[int]] = {}
+    for baseline, _ in pairs:
+        task_runs.setdefault(baseline.task, set()).add(baseline.run)
+    if len(task_runs) < minimum_tasks:
+        return f"requires at least {minimum_tasks} distinct tasks; found {len(task_runs)}"
+    short = sorted(
+        (task, len(runs))
+        for task, runs in task_runs.items()
+        if len(runs) < minimum_runs_per_task
+    )
+    if short:
+        details = ", ".join(f"{task} ({count})" for task, count in short)
+        return (
+            f"requires at least {minimum_runs_per_task} independent runs per task; "
+            f"under-represented: {details}"
+        )
+    return None
 
 
 def decision(summary: dict[str, object], minimum_pairs: int, token_improvement: float) -> tuple[str, str]:
@@ -169,8 +207,19 @@ def decision(summary: dict[str, object], minimum_pairs: int, token_improvement: 
     return "reject", "candidate did not provide the required token/retry benefit"
 
 
-def report(model: str, baseline: str, candidate: str, local: dict[str, object] | None,
-           external: dict[str, object] | None, outcome: str, reason: str) -> str:
+def report(
+    model: str,
+    baseline: str,
+    candidate: str,
+    local: dict[str, object] | None,
+    external: dict[str, object] | None,
+    outcome: str,
+    reason: str,
+    minimum_pairs: int,
+    minimum_tasks: int,
+    minimum_runs_per_task: int,
+    minimum_token_improvement: float,
+) -> str:
     lines = [f"# Edit strategy benchmark: {model}", ""]
     for label, summary in (("Local", local), ("External", external)):
         if summary is None:
@@ -187,6 +236,7 @@ def report(model: str, baseline: str, candidate: str, local: dict[str, object] |
                 f"| Safe/correct | {summary['baseline_correct']:.1%} | {summary['candidate_correct']:.1%} |",
                 f"| Median output tokens | {summary['baseline_tokens_median']:.0f} | {summary['candidate_tokens_median']:.0f} |",
                 f"| Mean edit retries | {summary['baseline_retries_mean']:.2f} | {summary['candidate_retries_mean']:.2f} |",
+                f"| Mean stale retries | {summary['baseline_stale_retries_mean']:.2f} | {summary['candidate_stale_retries_mean']:.2f} |",
                 f"| Median executor time | {summary['baseline_executor_ms_median']:.1f} ms | {summary['candidate_executor_ms_median']:.1f} ms |",
                 f"| p95 executor time | {summary['baseline_executor_ms_p95']:.1f} ms | {summary['candidate_executor_ms_p95']:.1f} ms |",
                 "",
@@ -194,6 +244,14 @@ def report(model: str, baseline: str, candidate: str, local: dict[str, object] |
         )
     lines.extend(
         [
+            "## Gate configuration",
+            "",
+            f"- Minimum paired local runs: {minimum_pairs}",
+            f"- Minimum distinct local tasks: {minimum_tasks}",
+            f"- Minimum independent runs per task: {minimum_runs_per_task}",
+            f"- Minimum median token improvement: {minimum_token_improvement:.1%}",
+            "- Required candidate safe/correct rate: 100%",
+            "",
             "## Profile decision",
             "",
             f"**{outcome.upper()}** — {reason}.",
@@ -218,12 +276,18 @@ def main() -> int:
     parser.add_argument("--baseline", choices=sorted(STRATEGIES), default="apply_patch")
     parser.add_argument("--candidate", choices=sorted(STRATEGIES), default="hashline")
     parser.add_argument("--minimum-pairs", type=int, default=20)
+    parser.add_argument("--minimum-tasks", type=int, default=10)
+    parser.add_argument("--minimum-runs-per-task", type=int, default=2)
     parser.add_argument("--minimum-token-improvement", type=float, default=0.05)
     args = parser.parse_args()
     if args.baseline == args.candidate:
         parser.error("baseline and candidate must differ")
     if args.minimum_pairs < 1:
         parser.error("--minimum-pairs must be positive")
+    if args.minimum_tasks < 1:
+        parser.error("--minimum-tasks must be positive")
+    if args.minimum_runs_per_task < 1:
+        parser.error("--minimum-runs-per-task must be positive")
     if not 0 <= args.minimum_token_improvement < 1:
         parser.error("--minimum-token-improvement must be in [0, 1)")
     try:
@@ -234,9 +298,28 @@ def main() -> int:
         external = summarize(external_pairs) if external_pairs else None
         if local is None:
             outcome, reason = "insufficient", "no paired local runs"
+        elif shape_error := corpus_shape_error(
+            local_pairs, args.minimum_tasks, args.minimum_runs_per_task
+        ):
+            outcome, reason = "insufficient", shape_error
         else:
             outcome, reason = decision(local, args.minimum_pairs, args.minimum_token_improvement)
-        print(report(args.model, args.baseline, args.candidate, local, external, outcome, reason), end="")
+        print(
+            report(
+                args.model,
+                args.baseline,
+                args.candidate,
+                local,
+                external,
+                outcome,
+                reason,
+                args.minimum_pairs,
+                args.minimum_tasks,
+                args.minimum_runs_per_task,
+                args.minimum_token_improvement,
+            ),
+            end="",
+        )
         return {"pass": 0, "reject": 1, "insufficient": 2}[outcome]
     except DataError as error:
         print(f"benchmark data error: {error}", file=sys.stderr)

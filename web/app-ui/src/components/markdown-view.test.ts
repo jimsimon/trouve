@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { renderMarkdown } from "./markdown-view.js";
+import { CONTENT_WORKER_MAX_SOURCE_UNITS } from "../workers/content-worker-protocol.js";
+import { renderMarkdown, renderMarkdownSafely } from "./markdown-view.js";
 import { stableMarkdownPrefixLength } from "./streaming-markdown.js";
 
 describe("renderMarkdown", () => {
@@ -57,5 +58,13 @@ describe("renderMarkdown", () => {
     expect(rendered).not.toContain("tok-");
     expect(rendered).not.toContain("<tag>");
     expect(rendered).toContain("&#x3C;tag>&#x26; value");
+  });
+});
+
+describe("renderMarkdownSafely", () => {
+  it("resolves an oversized render to a bounded failure state", async () => {
+    await expect(
+      renderMarkdownSafely("x".repeat(CONTENT_WORKER_MAX_SOURCE_UNITS + 1)),
+    ).resolves.toBeUndefined();
   });
 });

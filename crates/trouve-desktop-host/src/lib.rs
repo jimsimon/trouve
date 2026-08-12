@@ -8,10 +8,11 @@
 mod gateway;
 
 pub use gateway::{
-    AttachmentPayload, CSRF_HEADER, CloseDecisionRequest, HOST_API_PREFIX, HostBootstrap,
-    HostGateway, HostGatewayBindError, HostGatewayError, HostLifecycleBatch, HostPreferencesHandle,
-    LocalFileActionRequest, NativeNotificationRequest, OpenHttpsUrlRequest, PickDirectoryResponse,
-    PickFilesResponse, ReadClipboardImageResponse, SleepInhibitionRequest, host_openapi_json,
+    AttachmentPayload, CSRF_HEADER, CloseAcknowledgementRequest, CloseDecisionRequest,
+    HOST_API_PREFIX, HostBootstrap, HostGateway, HostGatewayBindError, HostGatewayError,
+    HostLifecycleBatch, HostPreferencesHandle, LocalFileActionRequest, NativeNotificationRequest,
+    OpenHttpsUrlRequest, PickDirectoryResponse, PickFilesResponse, ReadClipboardImageResponse,
+    SleepInhibitionRequest, host_openapi_json,
 };
 
 use std::collections::{BTreeMap, VecDeque};
@@ -29,7 +30,7 @@ use utoipa::ToSchema;
 ///
 /// This is not the Trouve HTTP protocol version. Increment it only when the
 /// native capability request/response schema changes.
-pub const DESKTOP_BRIDGE_VERSION: u16 = 12;
+pub const DESKTOP_BRIDGE_VERSION: u16 = 13;
 
 /// Runtime desktop build selected by development and qualification hosts.
 pub const APP_UI_DIST_ENV: &str = "TROUVE_APP_UI_DIST";
@@ -551,6 +552,24 @@ impl HostLifecycleHandle {
         Ok(decision == CloseDecision::QuitNow)
     }
 
+    pub(crate) fn acknowledge_close_request(
+        &self,
+        request_id: u64,
+    ) -> Result<(), HostValidationError> {
+        let feed = self.0.feed.lock().unwrap();
+        let Some(pending) = feed.state.pending_close.as_ref() else {
+            return Err(HostValidationError::InvalidLifecycle(
+                "there is no pending close request".into(),
+            ));
+        };
+        if pending.request_id != request_id {
+            return Err(HostValidationError::InvalidLifecycle(
+                "close request id is stale".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.0.cursor.subscribe()
     }
@@ -669,6 +688,9 @@ type FilePicker = dyn Fn() -> FilePickerFuture + Send + Sync + 'static;
 type ClipboardImageFuture =
     Pin<Box<dyn Future<Output = Result<Option<NativeAttachment>, String>> + Send + 'static>>;
 type ClipboardImageReader = dyn Fn() -> ClipboardImageFuture + Send + Sync + 'static;
+type CloseDecisionObserver =
+    dyn Fn(u64, CloseDecision) -> Result<(), String> + Send + Sync + 'static;
+type CloseAcknowledgementObserver = dyn Fn(u64) -> Result<(), String> + Send + Sync + 'static;
 type QuitHandler = dyn Fn() -> Result<(), String> + Send + Sync + 'static;
 type SleepInhibitor = dyn Fn(bool) -> Result<(), String> + Send + Sync + 'static;
 type NativeNotificationSender =
@@ -933,6 +955,8 @@ pub struct HostNativeActions {
     file_picker: Option<Arc<FilePicker>>,
     clipboard_image_reader: Option<Arc<ClipboardImageReader>>,
     external_https_opener: Option<Arc<ExternalHttpsOpener>>,
+    close_acknowledgement_observer: Option<Arc<CloseAcknowledgementObserver>>,
+    close_decision_observer: Option<Arc<CloseDecisionObserver>>,
     quit_handler: Option<Arc<QuitHandler>>,
     sleep_inhibitor: Option<Arc<SleepInhibitor>>,
     native_notification_sender: Option<Arc<NativeNotificationSender>>,
@@ -998,6 +1022,27 @@ impl HostNativeActions {
         F: Fn() -> Result<(), String> + Send + Sync + 'static,
     {
         self.quit_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Notify the embedding event loop after the frontend resolves a native
+    /// close request. This lets the host cancel or disarm any native watchdog
+    /// without exposing another web-facing capability.
+    pub fn with_close_decision_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(u64, CloseDecision) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.close_decision_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Notify the embedding event loop when the frontend has received an
+    /// exact close request and taken ownership of its confirmation UI.
+    pub fn with_close_acknowledgement_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(u64) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.close_acknowledgement_observer = Some(Arc::new(observer));
         self
     }
 
@@ -1088,7 +1133,9 @@ impl HostNativeActions {
     }
 
     pub fn can_confirm_close(&self) -> bool {
-        self.lifecycle.is_some() && self.quit_handler.is_some()
+        self.lifecycle.is_some()
+            && self.quit_handler.is_some()
+            && self.close_acknowledgement_observer.is_some()
     }
 
     pub fn can_inhibit_sleep(&self) -> bool {
@@ -1148,6 +1195,23 @@ impl HostNativeActions {
         self.quit_handler
             .as_ref()
             .ok_or_else(|| "quit handler is unavailable".to_string())?()
+    }
+
+    pub(crate) fn close_decision_applied(
+        &self,
+        request_id: u64,
+        decision: CloseDecision,
+    ) -> Result<(), String> {
+        match self.close_decision_observer.as_ref() {
+            Some(observer) => observer(request_id, decision),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn close_request_acknowledged(&self, request_id: u64) -> Result<(), String> {
+        self.close_acknowledgement_observer
+            .as_ref()
+            .ok_or_else(|| "close acknowledgement is unavailable".to_string())?(request_id)
     }
 
     pub(crate) fn set_sleep_inhibition(&self, active: bool) -> Result<(), String> {

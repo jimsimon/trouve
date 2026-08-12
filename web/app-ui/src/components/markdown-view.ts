@@ -6,6 +6,7 @@ import {
   renderMarkdownOffThread,
 } from "../services/content-worker-client.js";
 import { safeMarkdownHref } from "../services/markdown-renderer.js";
+import { CONTENT_WORKER_MAX_SOURCE_UNITS } from "../workers/content-worker-protocol.js";
 import {
   parseChatFileTarget,
 } from "./chat-file-link.js";
@@ -13,6 +14,19 @@ import { stableMarkdownPrefixLength } from "./streaming-markdown.js";
 
 export const renderMarkdown = async (source: string): Promise<string> =>
   renderMarkdownOffThread(source);
+
+const MARKDOWN_RENDER_FAILURE_NOTICE = "This content is too large to render safely.";
+
+/** Resolve worker rejection into a render-state result so component updates
+ * never leak an unhandled promise rejection. */
+export const renderMarkdownSafely = async (source: string): Promise<string | undefined> => {
+  if (source.length > CONTENT_WORKER_MAX_SOURCE_UNITS) return undefined;
+  try {
+    return await renderMarkdown(source);
+  } catch {
+    return undefined;
+  }
+};
 
 export class TrouveMarkdownView extends LitElement {
   static override properties = {
@@ -25,6 +39,7 @@ export class TrouveMarkdownView extends LitElement {
       :host { min-width: 0; max-width: 100%; display: block; color: var(--trouve-text); overflow-wrap: anywhere; }
       :host > div { min-width: 0; max-width: 100%; }
       .pending-content { visibility: hidden; white-space: pre-wrap; }
+      .render-notice { margin: 0; color: var(--trouve-text-dim); }
       :host([streaming])::after { content: ""; display: inline-block; width: .55em; height: 1em; margin-left: .18em; vertical-align: -.14em; background: var(--trouve-accent); animation: var(--trouve-chat-streaming-animation, pulse 1s steps(2, end) infinite); }
       :where(p, ul, ol, blockquote, pre, table) { margin: 0 0 .75em; }
       :where(p, ul, ol, blockquote, pre, table):last-child { margin-bottom: 0; }
@@ -57,6 +72,7 @@ export class TrouveMarkdownView extends LitElement {
   #processedContent = "";
   #stableSourceLength = 0;
   #stableRendered = "";
+  #renderFailure = false;
 
   protected override willUpdate(changed: PropertyValues<this>): void {
     if (changed.has("content") || changed.has("streaming")) {
@@ -71,12 +87,17 @@ export class TrouveMarkdownView extends LitElement {
 
   async #process(content: string, streaming: boolean): Promise<void> {
     const generation = ++this.#generation;
+    if (content.length > CONTENT_WORKER_MAX_SOURCE_UNITS) {
+      this.#showRenderFailure(generation);
+      return;
+    }
     const cached = streaming ? undefined : cachedMarkdownOffThread(content);
     if (cached !== undefined) {
       this.#processedContent = content;
       this.#stableSourceLength = content.length;
       this.#stableRendered = cached;
       this.#rendered = cached;
+      this.#renderFailure = false;
       return;
     }
     const stableLength = streaming ? stableMarkdownPrefixLength(content) : content.length;
@@ -88,14 +109,29 @@ export class TrouveMarkdownView extends LitElement {
     const newlyStable = content.slice(committedStableLength, stableLength);
     const tail = content.slice(stableLength);
     const [newlyStableRendered, tailRendered] = await Promise.all([
-      newlyStable === "" ? Promise.resolve("") : renderMarkdown(newlyStable),
-      tail === "" ? Promise.resolve("") : renderMarkdown(tail),
+      newlyStable === "" ? Promise.resolve("") : renderMarkdownSafely(newlyStable),
+      tail === "" ? Promise.resolve("") : renderMarkdownSafely(tail),
     ]);
+    if (newlyStableRendered === undefined || tailRendered === undefined) {
+      this.#showRenderFailure(generation);
+      return;
+    }
     if (generation !== this.#generation || !this.isConnected) return;
     this.#processedContent = content;
     this.#stableSourceLength = stableLength;
     this.#stableRendered = committedStableRendered + newlyStableRendered;
     this.#rendered = this.#stableRendered + tailRendered;
+    this.#renderFailure = false;
+    this.requestUpdate();
+  }
+
+  #showRenderFailure(generation: number): void {
+    if (generation !== this.#generation || !this.isConnected) return;
+    this.#processedContent = "";
+    this.#stableSourceLength = 0;
+    this.#stableRendered = "";
+    this.#rendered = "";
+    this.#renderFailure = true;
     this.requestUpdate();
   }
 
@@ -139,7 +175,9 @@ export class TrouveMarkdownView extends LitElement {
   };
 
   override render() {
-    return html`<div @click=${this.#activateLink}>${this.#rendered === "" && this.content !== ""
+    return html`<div @click=${this.#activateLink}>${this.#renderFailure
+      ? html`<p class="render-notice" role="status">${MARKDOWN_RENDER_FAILURE_NOTICE}</p>`
+      : this.#rendered === "" && this.content !== ""
       ? html`<div class="pending-content" aria-hidden="true">${this.content}</div>`
       : unsafeHTML(this.#rendered)}</div>`;
   }

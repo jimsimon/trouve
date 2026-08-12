@@ -21,12 +21,11 @@ pub enum EditStrategy {
     /// preferred existing-file editor.
     PreferHashline,
     /// Require the model's trained apply-patch format for existing files.
-    /// Used only by isolated benchmark processes; creation and deletion remain
-    /// available, while alternative overwrite paths are hidden and denied.
+    /// Used only by isolated benchmark processes; every mutation path except
+    /// the selected editor is hidden and denied.
     EnforceApplyPatch,
-    /// Require hashline for existing-file edits. File creation and deletion
-    /// remain available; a separately named patch fallback is gated until
-    /// repeated hashline failures.
+    /// Require hashline in an isolated benchmark process. Every mutation path
+    /// except hashline is hidden and denied.
     EnforceHashline,
 }
 
@@ -46,11 +45,18 @@ const TRAINED_FORMAT_PROFILES: &[ModelEditProfile] = &[ModelEditProfile {
 const BENCHMARKED_HASHLINE_PROFILES: &[ModelEditProfile] = &[];
 
 pub fn for_model(model: &str) -> EditStrategy {
-    if let Some(strategy) = std::env::var("TROUVE_EDIT_BENCHMARK_STRATEGY")
-        .ok()
-        .and_then(|value| benchmark_override(&value))
-    {
-        return strategy;
+    match std::env::var("TROUVE_EDIT_BENCHMARK_STRATEGY") {
+        Ok(value) => {
+            return benchmark_override(&value).unwrap_or_else(|| {
+                panic!(
+                    "invalid TROUVE_EDIT_BENCHMARK_STRATEGY={value:?}; expected apply_patch or hashline"
+                )
+            });
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("TROUVE_EDIT_BENCHMARK_STRATEGY must be valid UTF-8")
+        }
     }
     BENCHMARKED_HASHLINE_PROFILES
         .iter()
@@ -67,8 +73,31 @@ fn benchmark_override(value: &str) -> Option<EditStrategy> {
     }
 }
 
+pub(super) fn is_enforced_benchmark(strategy: EditStrategy) -> bool {
+    matches!(
+        strategy,
+        EditStrategy::EnforceApplyPatch | EditStrategy::EnforceHashline
+    )
+}
+
+pub(super) fn benchmark_tool_allowed(strategy: EditStrategy, name: &str) -> bool {
+    let selected_editor = match strategy {
+        EditStrategy::EnforceApplyPatch => "apply_patch",
+        EditStrategy::EnforceHashline => "hashline_edit",
+        _ => return true,
+    };
+    name == selected_editor
+        || matches!(
+            name,
+            "read_file" | "list_dir" | "git_diff" | "glob" | "grep" | "search" | "find_related"
+        )
+}
+
 pub(super) fn advertise(strategy: EditStrategy, mut spec: ToolSpec) -> Option<ToolSpec> {
     let name = spec.name.as_str();
+    if !benchmark_tool_allowed(strategy, name) {
+        return None;
+    }
     match strategy {
         EditStrategy::Auto => {
             if name == "apply_patch_fallback" {
@@ -108,9 +137,6 @@ pub(super) fn advertise(strategy: EditStrategy, mut spec: ToolSpec) -> Option<To
             }
         }
         EditStrategy::EnforceApplyPatch => {
-            if matches!(name, "edit_file" | "hashline_edit" | "apply_patch_fallback") {
-                return None;
-            }
             if name == "apply_patch" {
                 spec.description = format!(
                     "Required existing-file edit strategy for this benchmark run. {}",
@@ -119,9 +145,6 @@ pub(super) fn advertise(strategy: EditStrategy, mut spec: ToolSpec) -> Option<To
             }
         }
         EditStrategy::EnforceHashline => {
-            if matches!(name, "edit_file" | "apply_patch") {
-                return None;
-            }
             if name == "read_file" {
                 spec.description = format!(
                     "For existing-file edits, read with format=\"hashline\" before calling hashline_edit. {}",
@@ -162,5 +185,30 @@ mod tests {
             Some(EditStrategy::EnforceHashline)
         );
         assert_eq!(benchmark_override("automatic"), None);
+    }
+
+    #[test]
+    fn benchmark_catalog_allows_only_read_tools_and_selected_editor() {
+        assert!(benchmark_tool_allowed(
+            EditStrategy::EnforceApplyPatch,
+            "apply_patch"
+        ));
+        assert!(benchmark_tool_allowed(
+            EditStrategy::EnforceHashline,
+            "hashline_edit"
+        ));
+        for name in [
+            "write_file",
+            "delete_file",
+            "shell",
+            "web_fetch",
+            "mcp__x__edit",
+        ] {
+            assert!(!benchmark_tool_allowed(
+                EditStrategy::EnforceApplyPatch,
+                name
+            ));
+            assert!(!benchmark_tool_allowed(EditStrategy::EnforceHashline, name));
+        }
     }
 }

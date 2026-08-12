@@ -38,6 +38,10 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "search".into(),
                 "find_related".into(),
                 "git_diff".into(),
+                // Codex full-bridge turns disable native network access.
+                // Keep legitimate read-only research available through the
+                // permission-gated ToolExecutor path.
+                "web_fetch".into(),
                 "todo_write".into(),
                 // Delegation is orchestration rather than a worktree
                 // mutation. Read-only children may fan out only into the
@@ -69,6 +73,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "search".into(),
                 "find_related".into(),
                 "git_diff".into(),
+                "web_fetch".into(),
                 "todo_write".into(),
                 "spawn_thread".into(),
                 "spawn_output".into(),
@@ -108,6 +113,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "grep".into(),
                 "search".into(),
                 "find_related".into(),
+                "web_fetch".into(),
                 "todo_write".into(),
                 "spawn_thread".into(),
                 "spawn_output".into(),
@@ -139,6 +145,7 @@ pub fn fallback_mode() -> AgentMode {
             "grep".into(),
             "search".into(),
             "find_related".into(),
+            "web_fetch".into(),
             "todo_write".into(),
         ],
         read_only: true,
@@ -325,6 +332,7 @@ mod tests {
         for id in ["plan", "review", "question"] {
             let mode = find_mode(&modes, id).unwrap();
             assert!(mode.read_only);
+            assert!(mode.allowed_tools.iter().any(|tool| tool == "web_fetch"));
             assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_thread"));
             assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_output"));
             assert!(

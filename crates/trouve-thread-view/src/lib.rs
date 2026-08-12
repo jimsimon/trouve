@@ -19,6 +19,11 @@ pub struct ThreadProjection {
     /// suffix after this absolute offset.
     #[serde(default)]
     materialized_items: u64,
+    /// One hidden turn-boundary bit for each item in the live suffix. A
+    /// cancelled turn deliberately has no visible status row, so the boundary
+    /// must survive independently for bounded, turn-aligned pagination.
+    #[serde(default)]
+    turn_starts: Vec<bool>,
     /// Execution anchors are projection state rather than protocol state.
     /// They are serialized with the cache so a command that spans a cache
     /// refresh still receives an accurate duration when it completes.
@@ -43,6 +48,12 @@ struct ProjectionIndexes {
     open_compactions: HashMap<u64, usize>,
     questions: HashMap<String, usize>,
     latest_thinking: Option<usize>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct MaterializedThreadItem {
+    pub item: ThreadViewItem,
+    pub turn_start: bool,
 }
 
 impl ThreadProjection {
@@ -91,7 +102,7 @@ impl ThreadProjection {
                 } else {
                     ThreadTurnState::WaitingForCapacity
                 };
-                let idx = self.push(ThreadViewItem::TurnStatus { turn: *turn, state });
+                let idx = self.push_turn_start(ThreadViewItem::TurnStatus { turn: *turn, state });
                 self.indexes.turns.insert(*turn, idx);
             }
             Event::CompactionStarted { turn } => {
@@ -159,6 +170,7 @@ impl ThreadProjection {
                 content,
                 attachments,
             } => {
+                self.finish_thinking();
                 self.push(ThreadViewItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -248,11 +260,7 @@ impl ThreadProjection {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
-                // Tool lifecycle events can interleave with deltas from the
-                // same provider-owned thinking item. Only the explicit
-                // AssistantThinkingCompleted edge closes that item; otherwise
-                // a sentence split around a tool request renders as two
-                // separate thoughts.
+                self.finish_thinking();
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -425,6 +433,13 @@ impl ThreadProjection {
                 self.finish_turn(*turn, envelope.ts);
                 if let Some(idx) = self.indexes.turns.remove(turn) {
                     self.snapshot.items.remove(idx);
+                    self.turn_starts.remove(idx);
+                    // Cancellation hides the status row but not the turn's
+                    // transcript. Move its boundary to the first remaining
+                    // item so pagination cannot merge it with older turns.
+                    if let Some(turn_start) = self.turn_starts.get_mut(idx) {
+                        *turn_start = true;
+                    }
                     self.indexes = ProjectionIndexes::default();
                 }
             }
@@ -435,6 +450,13 @@ impl ThreadProjection {
     fn push(&mut self, item: ThreadViewItem) -> usize {
         let idx = self.snapshot.items.len();
         self.snapshot.items.push(item);
+        self.turn_starts.push(false);
+        idx
+    }
+
+    fn push_turn_start(&mut self, item: ThreadViewItem) -> usize {
+        let idx = self.push(item);
+        self.turn_starts[idx] = true;
         idx
     }
 
@@ -462,11 +484,18 @@ impl ThreadProjection {
         self.materialized_items + self.snapshot.items.len() as u64
     }
 
+    /// Hidden boundaries corresponding one-for-one with the live item suffix.
+    pub fn live_turn_starts(&self) -> &[bool] {
+        debug_assert_eq!(self.turn_starts.len(), self.snapshot.items.len());
+        &self.turn_starts
+    }
+
     /// Remove the completed prefix that can be persisted independently. An
     /// active turn remains in the live projection because subsequent stream
     /// events can still mutate its thinking, assistant, approval, question,
     /// and tool rows in place.
-    pub fn take_materializable_prefix(&mut self) -> (u64, Vec<ThreadViewItem>) {
+    pub fn take_materializable_prefix(&mut self) -> (u64, Vec<MaterializedThreadItem>) {
+        self.ensure_indexes();
         let keep_from = if self.snapshot.turn_running {
             self.snapshot
                 .items
@@ -490,6 +519,12 @@ impl ThreadProjection {
         }
         let start = self.materialized_items;
         let items = self.snapshot.items.drain(..keep_from).collect::<Vec<_>>();
+        let turn_starts = self.turn_starts.drain(..keep_from).collect::<Vec<_>>();
+        let items = items
+            .into_iter()
+            .zip(turn_starts)
+            .map(|(item, turn_start)| MaterializedThreadItem { item, turn_start })
+            .collect::<Vec<_>>();
         self.materialized_items += items.len() as u64;
         self.indexes = ProjectionIndexes::default();
         (start, items)
@@ -537,6 +572,9 @@ impl ThreadProjection {
         if self.indexes.ready {
             return;
         }
+        if self.turn_starts.len() != self.snapshot.items.len() {
+            self.turn_starts.resize(self.snapshot.items.len(), false);
+        }
         self.indexes.ready = true;
         for (idx, item) in self.snapshot.items.iter().enumerate() {
             match item {
@@ -563,6 +601,7 @@ impl ThreadProjection {
                     self.indexes.tools.insert(call_id.clone(), idx);
                 }
                 ThreadViewItem::TurnStatus { turn, .. } => {
+                    self.turn_starts[idx] = true;
                     self.indexes.turns.insert(*turn, idx);
                 }
                 ThreadViewItem::Questions { request_id, .. } => {
@@ -1057,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_is_durable_without_splitting_explicitly_bounded_thinking() {
+    fn steering_is_a_causal_boundary_between_thinking_items() {
         let mut projection = ThreadProjection::default();
         for (cursor, event) in [
             Event::TurnStarted {
@@ -1101,14 +1140,20 @@ mod tests {
                 ThreadViewItem::TurnStatus { .. },
                 ThreadViewItem::User { content: prompt, .. },
                 ThreadViewItem::Thinking {
-                    content: thought,
+                    content: before,
                     complete: true,
                     ..
                 },
                 ThreadViewItem::Steered { content: steering, .. },
+                ThreadViewItem::Thinking {
+                    content: after,
+                    complete: true,
+                    ..
+                },
             ] if prompt == "Start here."
-                && thought == "Before steering.After steering."
+                && before == "Before steering."
                 && steering == "Prioritize the regression."
+                && after == "After steering."
         ));
         assert!(!projection.snapshot.thinking);
     }
@@ -1147,6 +1192,47 @@ mod tests {
                 },
             }) if checkpoint_id == "cp_after_2"
         ));
+    }
+
+    #[test]
+    fn cancelled_turn_moves_hidden_boundary_to_first_visible_item() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "keep this prompt".into(),
+                attachments: Vec::new(),
+            },
+            Event::AssistantMessage {
+                turn: 1,
+                content: "partial response".into(),
+            },
+            Event::TurnCancelled { turn: 1 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        assert_eq!(projection.live_turn_starts(), &[true, false]);
+        assert!(
+            !projection
+                .snapshot
+                .items
+                .iter()
+                .any(|item| matches!(item, ThreadViewItem::TurnStatus { .. }))
+        );
+        let (_, materialized) = projection.take_materializable_prefix();
+        assert!(materialized[0].turn_start);
+        assert!(!materialized[1].turn_start);
     }
 
     #[test]
@@ -1261,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_does_not_split_one_explicitly_bounded_thinking_item() {
+    fn tool_request_is_a_causal_boundary_between_thinking_items() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -1302,14 +1388,22 @@ mod tests {
             .iter()
             .filter(|item| matches!(item, ThreadViewItem::Thinking { .. }))
             .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
             thoughts[0],
             ThreadViewItem::Thinking {
                 content,
                 complete: true,
                 ..
-            } if content == "The final overlap pass is still running."
+            } if content == "The final overlap pass is still"
+        ));
+        assert!(matches!(
+            thoughts[1],
+            ThreadViewItem::Thinking {
+                content,
+                complete: true,
+                ..
+            } if content == " running."
         ));
         assert!(!projection.snapshot.thinking);
     }

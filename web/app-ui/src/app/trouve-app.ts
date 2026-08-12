@@ -225,6 +225,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #desktopCoordinator = this.#hostClient === undefined
     ? undefined
     : new DesktopHostCoordinator(this.#hostClient, {
+        confirmAutomaticClose: () => this.#confirmAutomaticDesktopClose(),
         onCloseRequested: (request, actions) =>
           this.#desktopCloseRequested(request, actions),
         onDiagnostic: () => {
@@ -637,6 +638,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     if (event.type !== "server.connectivity_changed") return;
     const wasOffline = readSignal(this.#store.serverInfo)?.online === false;
+    if (event.online && wasOffline) {
+      // The catalog may contain only local models when bootstrap overlaps a
+      // transient offline probe. Recovery makes the remote roster usable
+      // again, so invalidate both the static and live snapshots immediately.
+      void this.#modelCatalog.refresh("force").catch(() => undefined);
+    }
     if (this.#connectivityNoticeTimer !== undefined) {
       clearTimeout(this.#connectivityNoticeTimer);
       this.#connectivityNoticeTimer = undefined;
@@ -919,6 +926,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       readSignal(this.#generalPreferences.current).preventSleepWhileRunning;
     const shouldPreventSleep = workRunning && preventSleepWhileRunning;
     this.#desktopCoordinator?.updateActivity({
+      authoritative: this.#protocolReady,
       idle: !workRunning,
       workRunning,
       preventSleepWhileRunning,
@@ -957,16 +965,25 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     request: HostPendingCloseRequest,
     actions: DesktopCloseActions,
   ): void {
-    if (!readSignal(this.#store.sessions).some((session) => session.active)) {
-      void actions.quitNow().catch(() => {
-        this.#shellNotice = "Trouve could not close the desktop window.";
-        this.requestUpdate();
-      });
-      return;
-    }
     this.#desktopClosePrompt = { request, actions, armed: request.waitingForIdle };
     this.#desktopClosePending = "";
     this.requestUpdate();
+  }
+
+  async #confirmAutomaticDesktopClose(): Promise<boolean> {
+    if (!this.#protocolReady || !this.isConnected) {
+      throw new Error("protocol activity is not authoritative");
+    }
+    const reconciled = await this.#protocolIngress.reconcileSessionActivity();
+    if (!reconciled) {
+      throw new Error("protocol activity could not be reconciled");
+    }
+    if (!this.#protocolReady || !this.isConnected) {
+      throw new Error("protocol activity became unavailable");
+    }
+    const workRunning = readSignal(this.#store.sessions).some((session) => session.active);
+    this.#syncDesktopActivity();
+    return !workRunning;
   }
 
   async #resolveDesktopClose(

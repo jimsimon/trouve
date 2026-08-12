@@ -37,9 +37,10 @@ database.
 
 Servo embedding can be tested at the accepted revision without perturbing the
 product database dependency. Root workspace commands do not build or test the
-harness, so CI and local qualification must invoke its manifest explicitly with
-`--locked`. Its independent lockfile requires separate dependency, license, and
-security review.
+harness, so CI and local qualification invoke its manifest explicitly with
+`--locked`. The dedicated qualification workflow runs nested formatting,
+clippy, tests, a reviewed license inventory/SBOM, and a RustSec audit against
+the independent lockfile.
 
 This isolation is not evidence of engine promotion. Visual parity,
 accessibility actions, native capabilities, memory and performance, recovery,

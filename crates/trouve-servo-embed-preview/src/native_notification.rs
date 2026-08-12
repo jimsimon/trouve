@@ -53,6 +53,13 @@ fn budget() -> &'static ActionListenerBudget {
     BUDGET.get_or_init(|| ActionListenerBudget::new(MAX_PENDING_ACTION_LISTENERS))
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+fn escape_freedesktop_markup(body: &str) -> String {
+    body.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn request(
     summary: &str,
     body: &str,
@@ -60,11 +67,12 @@ fn request(
     track_activation: bool,
 ) -> notify_rust::Notification {
     let mut request = notify_rust::Notification::new();
-    request
-        .appname("Trouve")
-        .summary(summary)
-        .body(body)
-        .icon("trouve");
+    request.appname("Trouve").summary(summary);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    request.body(&escape_freedesktop_markup(body));
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    request.body(body);
+    request.icon("trouve");
     if sound {
         #[cfg(all(unix, not(target_os = "macos")))]
         request.sound_name("message-new-instant");

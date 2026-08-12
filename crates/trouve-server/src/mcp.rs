@@ -3,7 +3,7 @@
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
-//! `/internal/threads/{id}/mcp?tools=0|1&approval=0|1` as an HTTP MCP
+//! `/internal/threads/{id}/mcp?tools=0|1&approval=0|1&ticket=...` as an HTTP MCP
 //! server. It always serves trouve's read-only semantic search tools and
 //! the interactive question tool; with `approval=1` it serves
 //! `approval_prompt` (Claude's `--permission-prompt-tool` target: permission
@@ -35,16 +35,22 @@ const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
 #[derive(serde::Deserialize)]
 pub(crate) struct McpQuery {
     /// Serve the full ToolExecutor tool set (vendor built-ins stand down).
-    #[serde(default)]
-    tools: u8,
+    tools: Option<u8>,
     /// Serve the `approval_prompt` permission gate (Claude needs it; agents
     /// with native approval flows like Codex turn it off).
-    #[serde(default = "default_approval")]
-    approval: u8,
+    approval: Option<u8>,
+    /// Opaque active-turn capability issued by the engine. It binds this
+    /// route path and both flags; the reusable process bridge token alone is
+    /// intentionally insufficient authorization.
+    ticket: Option<String>,
 }
 
-fn default_approval() -> u8 {
-    1
+fn tool_call_is_available(name: &str, bridge_tools: bool, serve_approval: bool) -> bool {
+    if name == "approval_prompt" {
+        serve_approval
+    } else {
+        bridge_tools || ALWAYS_BRIDGED.contains(&name)
+    }
 }
 
 pub(crate) async fn mcp_endpoint(
@@ -53,6 +59,36 @@ pub(crate) async fn mcp_endpoint(
     Query(q): Query<McpQuery>,
     Json(msg): Json<Value>,
 ) -> Response {
+    let Some(bridge_tools) = q.tools.filter(|value| *value <= 1).map(|value| value == 1) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bridge tools claim",
+        )
+            .into_response();
+    };
+    let Some(serve_approval) = q
+        .approval
+        .filter(|value| *value <= 1)
+        .map(|value| value == 1)
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bridge approval claim",
+        )
+            .into_response();
+    };
+    let Some(ticket) = q.ticket.as_deref() else {
+        return (StatusCode::UNAUTHORIZED, "missing bridge capability ticket").into_response();
+    };
+    let Some(claims) =
+        engine.validate_bridge_ticket(ticket, &thread_id, bridge_tools, serve_approval)
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "invalid or stale bridge capability ticket",
+        )
+            .into_response();
+    };
     let method = msg["method"].as_str().unwrap_or("");
     let id = msg["id"].clone();
     if id.is_null() {
@@ -75,16 +111,30 @@ pub(crate) async fn mcp_endpoint(
                 result's file_path and line to discover similar code.",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => tools_list(&engine, &thread_id, q.tools == 1, q.approval != 0).await,
-        "tools/call" if msg["params"]["name"] == "approval_prompt" => {
-            approval_prompt(&engine, &thread_id, &msg["params"]).await
+        "tools/list" => tools_list(&engine, &thread_id, bridge_tools, serve_approval).await,
+        "tools/call"
+            if tool_call_is_available(
+                msg["params"]["name"].as_str().unwrap_or_default(),
+                bridge_tools,
+                serve_approval,
+            ) =>
+        {
+            if msg["params"]["name"] == "approval_prompt" {
+                approval_prompt(&engine, &thread_id, &msg["params"]).await
+            } else {
+                tools_call(
+                    &engine,
+                    &thread_id,
+                    &msg["params"],
+                    claims.correlate_codex_owner,
+                )
+                .await
+            }
         }
-        "tools/call" => {
-            // `approval=0` is the existing Codex-specific bridge mode.
-            // Codex collaborators inherit this root-scoped URL, so correlate
-            // the call with app-server's owner notification before executing.
-            tools_call(&engine, &thread_id, &msg["params"], q.approval == 0).await
-        }
+        "tools/call" => Err(format!(
+            "tool is not available on this MCP bridge: {}",
+            msg["params"]["name"].as_str().unwrap_or_default()
+        )),
         _ => Err(format!("method not supported: {method}")),
     };
     let response = match result {
@@ -125,7 +175,7 @@ async fn tools_list(
     }
     // Best-effort: the approval gate must exist even when the thread lookup
     // fails, so a failed spec fetch just serves fewer tools.
-    match engine.bridged_tool_specs(thread_id).await {
+    match engine.bridged_tool_specs(thread_id, bridge_tools).await {
         Ok(specs) => tools.extend(
             specs
                 .iter()
@@ -178,8 +228,15 @@ async fn tools_call(
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let result = if correlate_codex_owner {
+        let (vendor_thread_id, vendor_call_id) = codex_tool_call_metadata(params)?;
         engine
-            .bridged_codex_tool_call(thread_id, name, &arguments)
+            .bridged_codex_tool_call(
+                thread_id,
+                Some(vendor_thread_id),
+                vendor_call_id,
+                name,
+                &arguments,
+            )
             .await
     } else {
         engine.bridged_tool_call(thread_id, name, &arguments).await
@@ -195,5 +252,77 @@ async fn tools_call(
             "content": [ { "type": "text", "text": format!("tool call failed: {e}") } ],
             "isError": true,
         })),
+    }
+}
+
+fn codex_tool_call_metadata(params: &Value) -> Result<(&str, Option<&str>), String> {
+    let metadata = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Codex MCP request is missing object _meta metadata".to_string())?;
+    let thread_id = metadata
+        .get("threadId")
+        .and_then(Value::as_str)
+        .filter(|thread_id| !thread_id.is_empty())
+        .ok_or_else(|| "Codex MCP request is missing string _meta.threadId".to_string())?;
+    let call_id = match metadata.get("callId") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|call_id| !call_id.is_empty())
+                .ok_or_else(|| {
+                    "Codex MCP _meta.callId must be a non-empty string when present".to_string()
+                })?,
+        ),
+    };
+    Ok((thread_id, call_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{codex_tool_call_metadata, tool_call_is_available};
+
+    #[test]
+    fn query_flags_gate_tool_execution_as_well_as_discovery() {
+        assert!(tool_call_is_available("search", false, false));
+        assert!(tool_call_is_available("find_related", false, false));
+        assert!(tool_call_is_available("ask_question", false, false));
+        assert!(!tool_call_is_available("write_file", false, false));
+        assert!(!tool_call_is_available("approval_prompt", false, false));
+
+        assert!(tool_call_is_available("write_file", true, false));
+        assert!(!tool_call_is_available("approval_prompt", true, false));
+        assert!(tool_call_is_available("approval_prompt", false, true));
+    }
+
+    #[test]
+    fn codex_metadata_uses_only_explicit_thread_and_app_server_call_identity() {
+        let params = serde_json::json!({
+            "name": "search",
+            "arguments": { "query": "same" },
+            "_meta": { "threadId": "vendor-child", "callId": "item-42" },
+            "id": "not-the-call-id",
+            "toolCallId": "not-the-call-id-either"
+        });
+        assert_eq!(
+            codex_tool_call_metadata(&params).unwrap(),
+            ("vendor-child", Some("item-42"))
+        );
+        assert_eq!(
+            codex_tool_call_metadata(&serde_json::json!({
+                "_meta": { "threadId": "vendor-root" }
+            }))
+            .unwrap(),
+            ("vendor-root", None)
+        );
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({ "_meta": {} }),
+            serde_json::json!({ "_meta": { "threadId": "" } }),
+            serde_json::json!({ "_meta": { "threadId": "vendor", "callId": 42 } }),
+        ] {
+            assert!(codex_tool_call_metadata(&malformed).is_err());
+        }
     }
 }

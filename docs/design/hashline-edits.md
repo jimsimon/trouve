@@ -65,12 +65,17 @@ section header, not to lines shifted by an earlier operation in the same call.
 A single call may contain multiple file sections.
 
 Named registers are scoped to one thread and persist across edit calls for the
-life of the process. Anonymous registers exist only during one call. Register
-storage is bounded by count, size, and least-recently-used thread scope so a
-long-running desktop process cannot accumulate unbounded captured source.
+life of the process. Anonymous registers exist only during one call. A register
+is at most 1 MiB; each thread retains at most 16 named registers and 4 MiB;
+the process retains at most 64 thread scopes and 32 MiB, evicting least-recently
+used scopes as necessary.
 
 Syntactic block targets use trouve-search's bundled tree-sitter grammars.
 Markdown headings resolve through the next heading of equal or higher level.
+Fenced-code content is excluded from Markdown heading detection. All block
+targets in one file share one parse, and block targeting is limited to 1 MiB
+files so the non-interruptible portion of a tree-sitter parse stays bounded;
+larger files remain editable with explicit ranges.
 If a language or opening line cannot be resolved unambiguously, the tool
 rejects the operation and requests an explicit `N.=M` range.
 
@@ -92,6 +97,12 @@ then:
 4. stages every result beside its destination;
 5. revalidates the exact preimages to catch external-editor races;
 6. promotes the staged files only after all preflight work succeeds.
+
+The call is limited to 64 sections and 128 MiB of aggregate source and output.
+Each resulting file remains limited to 32 MiB, including register expansion.
+`REM` removes the requested final path rather than a symlink target. `MV`
+uses no-clobber destination promotion; final-component symlinks are rejected
+instead of being followed, and case-only renames are handled as direct renames.
 
 A stale tag changes no files. Its error has `code: "stale_snapshot"` and
 returns the current tag plus a bounded numbered excerpt around the first
@@ -128,14 +139,11 @@ applies it to both raw-provider tool schemas and the vendor MCP bridge:
   as preferred. `codex/*` uses this profile because V4A is in distribution.
 - `prefer_hashline` keeps alternatives available but marks hashline as
   preferred for existing files.
-- `enforce_apply_patch` is a benchmark-only profile that hides and denies
-  alternate existing-file editors, so an apply-patch baseline cannot silently
-  use hashline or exact replacement.
-- `enforce_hashline` removes `edit_file` and ordinary `apply_patch` from the
-  catalog. `write_file` can create but cannot overwrite, and `delete_file`
-  retains explicit deletion. A separately named patch fallback is advertised
-  but remains locked until two non-cancellation hashline failures in the
-  thread, after which it can recover from repeated stale or malformed edits.
+- `enforce_apply_patch` and `enforce_hashline` are benchmark-only profiles.
+  Each advertises read-only inspection tools plus its selected editor, and
+  denies every other mutation path before dispatch. Shell, MCP, direct
+  write/delete, network, and fallback tools are unavailable, so one benchmark
+  arm cannot silently mutate through an unmeasured editor.
 
 Execution applies the same policy, so a model cannot bypass it by emitting a
 hidden tool name. No production model is assigned a hashline-enforced profile

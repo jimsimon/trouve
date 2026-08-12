@@ -54,7 +54,7 @@ license review deliberately change that policy.
 | @playwright/test | 1.62.1 | Apache-2.0 | development |
 | @redocly/ajv | 8.11.2 | MIT | development |
 | @redocly/config | 0.22.0 | MIT | development |
-| @redocly/openapi-core | 1.34.18 | MIT | development |
+| @redocly/openapi-core | 1.34.19 | MIT | development |
 | @rolldown/binding-android-arm64 | 1.2.1 | MIT | development |
 | @rolldown/binding-darwin-arm64 | 1.2.1 | MIT | development |
 | @rolldown/binding-darwin-x64 | 1.2.1 | MIT | development |
@@ -150,7 +150,7 @@ license review deliberately change that policy.
 | is-plain-obj | 4.1.0 | MIT | runtime/transitive |
 | js-levenshtein | 1.1.6 | MIT | development |
 | js-tokens | 4.0.0 | MIT | development |
-| js-yaml | 4.3.0 | MIT | development |
+| js-yaml | 4.3.1 | MIT | development |
 | json-schema-traverse | 1.0.0 | MIT | development |
 | lightningcss | 1.33.0 | MPL-2.0 | development |
 | lightningcss-android-arm64 | 1.33.0 | MPL-2.0 | development |
@@ -213,7 +213,7 @@ license review deliberately change that policy.
 | micromark-util-types | 2.0.2 | MIT | runtime/transitive |
 | minimatch | 5.1.9 | ISC | development |
 | ms | 2.1.3 | MIT | runtime/transitive |
-| nanoid | 3.3.16 | MIT | development |
+| nanoid | 3.3.18 | MIT | development |
 | nanoid | 5.1.16 | MIT | runtime/transitive |
 | node-domexception | 1.0.0 | MIT | runtime/transitive |
 | node-fetch | 3.3.2 | MIT | runtime/transitive |

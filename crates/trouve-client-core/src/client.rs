@@ -282,6 +282,8 @@ impl ProtocolClient {
         thread_id: &str,
         call_id: &str,
     ) -> Result<ThreadToolDetails> {
+        let thread_id = urlencode_path_segment(thread_id);
+        let call_id = urlencode_path_segment(call_id);
         self.get_json(&format!("/threads/{thread_id}/tools/{call_id}"))
             .await
     }
@@ -928,6 +930,7 @@ impl ProtocolClient {
     }
 
     pub async fn upsert_mcp_server(&self, name: &str, req: &UpsertMcpServerRequest) -> Result<()> {
+        let name = urlencode_path_segment(name);
         let resp = self
             .http
             .put(format!("{}/mcp-servers/{name}", self.base))
@@ -951,6 +954,7 @@ impl ProtocolClient {
         name: &str,
         req: &SetMcpServerEnabledRequest,
     ) -> Result<()> {
+        let name = urlencode_path_segment(name);
         let resp = self
             .http
             .put(format!("{}/mcp-servers/{name}/enabled", self.base))
@@ -975,6 +979,7 @@ impl ProtocolClient {
         scope: &str,
         workspace_id: Option<&str>,
     ) -> Result<()> {
+        let name = urlencode_path_segment(name);
         let mut path = format!("/mcp-servers/{name}?scope={scope}");
         if let Some(id) = workspace_id {
             path.push_str(&format!("&workspace_id={id}"));
@@ -983,6 +988,7 @@ impl ProtocolClient {
     }
 
     pub async fn mcp_server_logs(&self, name: &str) -> Result<McpLogs> {
+        let name = urlencode_path_segment(name);
         self.get_json(&format!("/mcp-servers/{name}/logs")).await
     }
 
@@ -1351,6 +1357,10 @@ fn urlencode(s: &str) -> String {
     encoded
 }
 
+fn urlencode_path_segment(s: &str) -> String {
+    urlencode(s).replace('/', "%2F")
+}
+
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &str) -> Result<T> {
     let status = resp.status();
     let bytes = resp.bytes().await?;
@@ -1418,13 +1428,27 @@ fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolClient, ProtocolResponseError, response_error, urlencode};
+    use super::{
+        ProtocolClient, ProtocolResponseError, response_error, urlencode, urlencode_path_segment,
+    };
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
         assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
         assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
         assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
+
+    #[test]
+    fn path_segment_encoding_does_not_allow_opaque_ids_to_add_url_segments() {
+        assert_eq!(
+            urlencode_path_segment("call/with?parts"),
+            "call%2Fwith%3Fparts"
+        );
+        assert_eq!(
+            urlencode_path_segment("MCP server?#name"),
+            "MCP%20server%3F%23name"
+        );
     }
 
     #[test]

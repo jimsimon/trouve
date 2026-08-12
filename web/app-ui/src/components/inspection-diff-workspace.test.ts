@@ -34,15 +34,18 @@ describe("inspection diff workspace contract", () => {
     expect(source).not.toContain("Copy complete diff");
   });
 
-  it("does not expose checkpoint restore controls in the diff pane", () => {
+  it("exposes both relative checkpoint directions in the diff pane", () => {
     const source = readFileSync(
       new URL("./inspection-workspace.ts", import.meta.url),
       "utf8",
     );
 
-    expect(source).not.toContain("#restoreCheckpoint");
-    expect(source).not.toContain("restoreSessionCheckpoint");
-    expect(source).not.toContain("Undo turn");
-    expect(source).not.toContain("Redoing…");
+    expect(source).toContain('aria-label="Undo to the previous checkpoint"');
+    expect(source).toContain('aria-label="Redo to the next checkpoint"');
+    expect(source).toContain("restoreSessionCheckpoint(sessionId, direction)");
+    expect(source).toContain('this.#restoreRelativeCheckpoint("undo")');
+    expect(source).toContain('this.#restoreRelativeCheckpoint("redo")');
+    expect(source).toContain("this.#checkpointActions.reset()");
+    expect(source).toContain("this.#checkpointActions.isCurrent(token)");
   });
 });

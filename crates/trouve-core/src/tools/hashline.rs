@@ -32,7 +32,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use trouve_protocol::ToolStatus;
-use trouve_search::chunk::syntactic_block_range;
+use trouve_search::chunk::syntactic_block_ranges;
 use trouve_search::languages::detect_language;
 
 use super::{Tool, ToolCtx, ToolResult};
@@ -40,10 +40,15 @@ use super::{Tool, ToolCtx, ToolResult};
 const SNAPSHOT_HEX_LEN: usize = 12;
 const MAX_HASHLINE_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HASHLINE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_HASHLINE_BLOCK_FILE_BYTES: usize = 1024 * 1024;
+const MAX_HASHLINE_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_HASHLINE_SECTIONS: usize = 64;
 const STALE_CONTEXT_LINES: usize = 7;
 const MAX_REGISTER_BYTES: usize = 1024 * 1024;
-const MAX_NAMED_REGISTERS_PER_SCOPE: usize = 64;
-const MAX_REGISTER_SCOPES: usize = 256;
+const MAX_REGISTER_SCOPE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REGISTER_STORE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_NAMED_REGISTERS_PER_SCOPE: usize = 16;
+const MAX_REGISTER_SCOPES: usize = 64;
 
 /// Render a text-file page in hashline form. The tag covers the complete file,
 /// while only the requested lines count against the response-size limit.
@@ -101,8 +106,10 @@ impl Tool for HashlineEdit {
     fn description(&self) -> &'static str {
         "Apply compact, line-numbered edits using snapshot tags returned by \
          read_file with format=\"hashline\". Supports multi-file [path#TAG] \
-         sections with range and syntactic-block PUT/CUT, register paste, \
-         whole-file REM, and MV. \
+         sections. Syntax: PUT N.=M: followed by '+' payload rows replaces \
+         lines; PUT <N:, >N:, or >$: inserts; N* selects a syntactic block; \
+         CUT N.=M [@name] captures and deletes; bodyless PUT <N [@name] \
+         pastes a register; REM removes the requested path; MV \"dest\" moves it. \
          Every section is preflighted before any file is changed; stale tags \
          return refreshed compact context. Never invent or reuse a tag after \
          the target file changes."
@@ -114,7 +121,7 @@ impl Tool for HashlineEdit {
             "properties": {
                 "input": {
                     "type": "string",
-                    "description": "Hashline sections and operations. Payload rows begin with '+'."
+                    "description": "One or more [path#TAG] sections. Use PUT N.=M: plus '+' rows to replace, PUT <N:/ >N:/ >$: to insert, N* for blocks, CUT ... [@name] to capture/delete, bodyless PUT ... [@name] to paste, REM to remove, or MV \"dest\" to move."
                 }
             },
             "required": ["input"]
@@ -229,6 +236,7 @@ enum Gap {
 #[derive(Debug)]
 struct PreparedFile {
     path: String,
+    source_path: PathBuf,
     full_path: PathBuf,
     original: String,
     updated: String,
@@ -238,13 +246,22 @@ struct PreparedFile {
     new_snapshot: Option<String>,
     action: PreparedAction,
     permissions: std::fs::Permissions,
+    symlink: Option<SymlinkInfo>,
 }
 
 #[derive(Debug)]
 struct LoadedFile {
+    source_path: PathBuf,
     full_path: PathBuf,
     original: String,
     permissions: std::fs::Permissions,
+    symlink: Option<SymlinkInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct SymlinkInfo {
+    target: PathBuf,
+    target_is_dir: bool,
 }
 
 #[derive(Debug)]
@@ -254,7 +271,44 @@ enum PreparedAction {
     Move {
         destination: String,
         destination_full_path: PathBuf,
+        case_only: bool,
     },
+}
+
+/// A case-only rename is the narrow exception to the normal no-clobber rule.
+/// Restrict it to two spellings of the same final directory entry: allowing a
+/// different parent spelling would also accept symlinked-directory aliases,
+/// while comparing only canonical paths would accept destination symlinks.
+fn case_only_destination_matches_source(
+    source_path: &Path,
+    source_full_path: &Path,
+    destination_path: &Path,
+) -> bool {
+    let (Some(source_parent), Some(destination_parent)) =
+        (source_path.parent(), destination_path.parent())
+    else {
+        return false;
+    };
+    let (Some(source_name), Some(destination_name)) =
+        (source_path.file_name(), destination_path.file_name())
+    else {
+        return false;
+    };
+    if source_parent != destination_parent || source_name == destination_name {
+        return false;
+    }
+    if source_name.to_string_lossy().to_lowercase()
+        != destination_name.to_string_lossy().to_lowercase()
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(destination_path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    std::fs::canonicalize(destination_path).is_ok_and(|path| path == source_full_path)
 }
 
 #[derive(Debug)]
@@ -296,11 +350,18 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         Ok(sections) => sections,
         Err(error) => return ToolResult::error(error),
     };
+    if sections.len() > MAX_HASHLINE_SECTIONS {
+        return ToolResult::error(format!(
+            "hashline input has {} file sections; the limit is {MAX_HASHLINE_SECTIONS}",
+            sections.len()
+        ));
+    }
 
     let mut canonical_paths = HashSet::new();
     let mut resolved_sources = HashSet::new();
     let mut loaded = Vec::with_capacity(sections.len());
     let mut stale = Vec::new();
+    let mut total_source_bytes = 0usize;
 
     // The engine acquires the per-session mutation lane before invoking this
     // mutating tool. Read and validate every snapshot only after that point.
@@ -311,6 +372,28 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         let resolved = match ctx.resolve(&section.path) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
+        };
+        let symlink = match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = match std::fs::read_link(&resolved) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "cannot inspect symlink {}: {error}",
+                            section.path
+                        ));
+                    }
+                };
+                Some(SymlinkInfo {
+                    target,
+                    target_is_dir: std::fs::metadata(&resolved)
+                        .is_ok_and(|metadata| metadata.is_dir()),
+                })
+            }
+            Ok(_) => None,
+            Err(error) => {
+                return ToolResult::error(format!("cannot inspect {}: {error}", section.path));
+            }
         };
         if !resolved_sources.insert(resolved.clone()) {
             return ToolResult::error(format!(
@@ -350,6 +433,14 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 return ToolResult::error(format!("cannot read {}: {error}", section.path));
             }
         };
+        total_source_bytes = match total_source_bytes.checked_add(original.len()) {
+            Some(total) if total <= MAX_HASHLINE_TOTAL_BYTES => total,
+            _ => {
+                return ToolResult::error(format!(
+                    "hashline source files exceed the {MAX_HASHLINE_TOTAL_BYTES}-byte per-call limit"
+                ));
+            }
+        };
         let current = snapshot_tag(&original);
         if current != section.expected_snapshot {
             stale.push(stale_file(section, &original, current));
@@ -365,9 +456,11 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             }
         };
         loaded.push(LoadedFile {
+            source_path: resolved,
             full_path,
             original,
             permissions,
+            symlink,
         });
     }
 
@@ -379,7 +472,8 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
     }
 
     let mut destinations = HashSet::new();
-    for section in &sections {
+    let mut case_only_moves = HashSet::new();
+    for (section_index, section) in sections.iter().enumerate() {
         let FileAction::Move { destination } = &section.action else {
             continue;
         };
@@ -398,11 +492,25 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 "more than one hashline section moves to {destination}"
             ));
         }
-        if destination_path.symlink_metadata().is_ok() {
+        if destination_path == loaded[section_index].source_path {
             return ToolResult::error(format!(
-                "cannot move {} to {destination}: destination already exists",
+                "cannot move {} to {destination}: source and destination are identical",
                 section.path
             ));
+        }
+        if destination_path.symlink_metadata().is_ok() {
+            if case_only_destination_matches_source(
+                &loaded[section_index].source_path,
+                &loaded[section_index].full_path,
+                &destination_path,
+            ) {
+                case_only_moves.insert(section_index);
+            } else {
+                return ToolResult::error(format!(
+                    "cannot move {} to {destination}: destination already exists",
+                    section.path
+                ));
+            }
         }
         if !destination_path.parent().is_some_and(Path::is_dir) {
             return ToolResult::error(format!(
@@ -417,11 +525,31 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         named: load_named_registers(ctx),
     };
     let mut prepared = Vec::with_capacity(sections.len());
+    let mut total_output_bytes = 0usize;
     for (section, loaded) in sections.iter().zip(&loaded) {
+        if matches!(section.action, FileAction::Move { .. }) && loaded.symlink.is_some() {
+            return ToolResult::error(format!(
+                "{}: moving a symlink is not supported; move the link explicitly with a filesystem tool",
+                section.path
+            ));
+        }
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("hashline edit cancelled");
+        }
         let operations = match materialize_operations(section, &loaded.original, &mut registers) {
             Ok(operations) => operations,
             Err(error) => return ToolResult::error(format!("{}: {error}", section.path)),
         };
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("hashline edit cancelled");
+        }
+        let section_index = prepared.len();
+        if case_only_moves.contains(&section_index) && !operations.is_empty() {
+            return ToolResult::error(format!(
+                "{}: a case-only move cannot be combined with content edits",
+                section.path
+            ));
+        }
         let (updated, adds, deletes) = match &section.action {
             FileAction::Remove => (
                 String::new(),
@@ -441,6 +569,21 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
                 }
             }
         };
+        if updated.len() > MAX_HASHLINE_FILE_BYTES as usize {
+            return ToolResult::error(format!(
+                "{} would become {} bytes; the limit is {MAX_HASHLINE_FILE_BYTES}",
+                section.path,
+                updated.len()
+            ));
+        }
+        total_output_bytes = match total_output_bytes.checked_add(updated.len()) {
+            Some(total) if total <= MAX_HASHLINE_TOTAL_BYTES => total,
+            _ => {
+                return ToolResult::error(format!(
+                    "hashline output files exceed the {MAX_HASHLINE_TOTAL_BYTES}-byte per-call limit"
+                ));
+            }
+        };
         if matches!(section.action, FileAction::Update) && updated == loaded.original {
             return ToolResult::error(format!(
                 "{}: hashline operations produce no changes",
@@ -453,12 +596,14 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             FileAction::Move { destination } => PreparedAction::Move {
                 destination: destination.clone(),
                 destination_full_path: ctx.resolve(destination).expect("destination was validated"),
+                case_only: case_only_moves.contains(&section_index),
             },
         };
         let new_snapshot =
             (!matches!(section.action, FileAction::Remove)).then(|| snapshot_tag(&updated));
         prepared.push(PreparedFile {
             path: section.path.clone(),
+            source_path: loaded.source_path.clone(),
             full_path: loaded.full_path.clone(),
             original: loaded.original.clone(),
             updated,
@@ -468,6 +613,7 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             new_snapshot,
             action,
             permissions: loaded.permissions.clone(),
+            symlink: loaded.symlink.clone(),
         });
     }
 
@@ -482,8 +628,9 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
             PreparedAction::Remove => None,
             PreparedAction::Move {
                 destination_full_path,
+                case_only,
                 ..
-            } => Some(destination_full_path),
+            } => (!case_only).then_some(destination_full_path),
         };
         let Some(target) = target else {
             staged.push(None);
@@ -536,13 +683,22 @@ fn apply_hashline(ctx: &ToolCtx, input: &str) -> ToolResult {
         if let PreparedAction::Move {
             destination,
             destination_full_path,
+            case_only,
         } = &file.action
-            && destination_full_path.symlink_metadata().is_ok()
         {
-            return ToolResult::error(format!(
-                "cannot move {} to {destination}: destination appeared during preflight",
-                file.path
-            ));
+            let destination_exists = destination_full_path.symlink_metadata().is_ok();
+            let still_same_source = *case_only
+                && case_only_destination_matches_source(
+                    &file.source_path,
+                    &file.full_path,
+                    destination_full_path,
+                );
+            if destination_exists != *case_only || (*case_only && !still_same_source) {
+                return ToolResult::error(format!(
+                    "cannot move {} to {destination}: destination changed during preflight",
+                    file.path
+                ));
+            }
         }
     }
     if !raced.is_empty() {
@@ -591,16 +747,34 @@ fn commit_prepared(
             .persist(&file.full_path)
             .map(|_| ())
             .map_err(|error| error.error.to_string()),
-        PreparedAction::Remove => std::fs::remove_file(&file.full_path).map_err(|e| e.to_string()),
+        PreparedAction::Remove => {
+            std::fs::remove_file(&file.source_path).map_err(|error| error.to_string())
+        }
         PreparedAction::Move {
             destination_full_path,
+            case_only,
             ..
         } => {
+            if *case_only {
+                // Revalidate at the commit boundary. On a case-insensitive
+                // directory the source entry itself occupies both spellings,
+                // so another entry cannot claim the destination while the
+                // verified source remains in place.
+                if !case_only_destination_matches_source(
+                    &file.source_path,
+                    &file.full_path,
+                    destination_full_path,
+                ) {
+                    return Err("case-only move destination changed before commit".into());
+                }
+                return std::fs::rename(&file.source_path, destination_full_path)
+                    .map_err(|error| error.to_string());
+            }
             staged
                 .expect("moved file has a staged payload")
-                .persist(destination_full_path)
+                .persist_noclobber(destination_full_path)
                 .map_err(|error| error.error.to_string())?;
-            if let Err(error) = std::fs::remove_file(&file.full_path) {
+            if let Err(error) = std::fs::remove_file(&file.source_path) {
                 let cleanup = std::fs::remove_file(destination_full_path);
                 return Err(match cleanup {
                     Ok(()) => format!("cannot remove move source: {error}"),
@@ -617,16 +791,43 @@ fn commit_prepared(
 fn rollback_prepared(file: &PreparedFile) -> Result<(), String> {
     if let PreparedAction::Move {
         destination_full_path,
+        case_only,
         ..
     } = &file.action
-        && let Err(error) = std::fs::remove_file(destination_full_path)
-        && error.kind() != std::io::ErrorKind::NotFound
     {
-        return Err(format!("cannot remove moved destination: {error}"));
+        if *case_only {
+            return std::fs::rename(destination_full_path, &file.source_path)
+                .map_err(|error| format!("cannot restore case-only move: {error}"));
+        }
+        if let Err(error) = std::fs::remove_file(destination_full_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("cannot remove moved destination: {error}"));
+        }
+    }
+    if matches!(file.action, PreparedAction::Remove)
+        && let Some(symlink) = &file.symlink
+    {
+        return create_symlink(&symlink.target, &file.source_path, symlink.target_is_dir)
+            .map_err(|error| format!("cannot restore symlink: {error}"));
     }
     std::fs::write(&file.full_path, file.original.as_bytes()).map_err(|error| error.to_string())?;
     std::fs::set_permissions(&file.full_path, file.permissions.clone())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path, _target_is_dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path, target_is_dir: bool) -> std::io::Result<()> {
+    if target_is_dir {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 fn prepared_result(file: &PreparedFile) -> Value {
@@ -900,11 +1101,14 @@ fn materialize_operations(
     registers: &mut CallRegisters,
 ) -> Result<Vec<Operation>, String> {
     let lines = logical_lines(original);
+    let block_ranges = resolve_block_ranges(section, original)?;
     let mut operations = Vec::with_capacity(section.operations.len());
+    let mut materialized_body_bytes = 0usize;
     for operation in &section.operations {
         match operation {
             ParsedOperation::Replace { target, body } => {
-                let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                reserve_materialized_body(body, &mut materialized_body_bytes)?;
+                let (start, end) = resolve_span_target(&section.path, *target, &block_ranges)?;
                 operations.push(Operation::Replace {
                     start,
                     end,
@@ -912,13 +1116,14 @@ fn materialize_operations(
                 });
             }
             ParsedOperation::Insert { gap, body } => {
+                reserve_materialized_body(body, &mut materialized_body_bytes)?;
                 operations.push(Operation::Insert {
-                    gap: resolve_parsed_gap(&section.path, original, *gap)?,
+                    gap: resolve_parsed_gap(&section.path, *gap, &block_ranges)?,
                     body: body.clone(),
                 });
             }
             ParsedOperation::Cut { target, register } => {
-                let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                let (start, end) = resolve_span_target(&section.path, *target, &block_ranges)?;
                 validate_range(start, end, lines.len())?;
                 store_register(
                     register.as_deref(),
@@ -929,13 +1134,16 @@ fn materialize_operations(
             }
             ParsedOperation::Paste { target, register } => {
                 let body = read_register(register.as_deref(), registers)?;
+                reserve_materialized_body(body, &mut materialized_body_bytes)?;
+                let body = body.clone();
                 match target {
                     PasteTarget::Span(target) => {
-                        let (start, end) = resolve_span_target(&section.path, original, *target)?;
+                        let (start, end) =
+                            resolve_span_target(&section.path, *target, &block_ranges)?;
                         operations.push(Operation::Replace { start, end, body });
                     }
                     PasteTarget::Gap(gap) => operations.push(Operation::Insert {
-                        gap: resolve_parsed_gap(&section.path, original, *gap)?,
+                        gap: resolve_parsed_gap(&section.path, *gap, &block_ranges)?,
                         body,
                     }),
                 }
@@ -945,10 +1153,81 @@ fn materialize_operations(
     Ok(operations)
 }
 
+fn reserve_materialized_body(body: &[String], total: &mut usize) -> Result<(), String> {
+    let bytes = register_content_bytes(body);
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| "materialized hashline payload size overflowed".to_owned())?;
+    if *total > MAX_HASHLINE_FILE_BYTES as usize {
+        return Err(format!(
+            "materialized edit payload is {} bytes; the per-file limit is {MAX_HASHLINE_FILE_BYTES}",
+            *total
+        ));
+    }
+    Ok(())
+}
+
+fn requested_block_starts(section: &Section) -> HashSet<usize> {
+    let mut starts = HashSet::new();
+    for operation in &section.operations {
+        match operation {
+            ParsedOperation::Replace { target, .. } | ParsedOperation::Cut { target, .. } => {
+                insert_span_start(&mut starts, *target);
+            }
+            ParsedOperation::Insert { gap: target, .. } => {
+                insert_gap_start(&mut starts, *target);
+            }
+            ParsedOperation::Paste { target, .. } => match target {
+                PasteTarget::Span(target) => insert_span_start(&mut starts, *target),
+                PasteTarget::Gap(target) => insert_gap_start(&mut starts, *target),
+            },
+        }
+    }
+    starts
+}
+
+fn insert_span_start(starts: &mut HashSet<usize>, target: SpanTarget) {
+    if let SpanTarget::Block { start } = target {
+        starts.insert(start);
+    }
+}
+
+fn insert_gap_start(starts: &mut HashSet<usize>, target: ParsedGap) {
+    if let ParsedGap::AfterBlock(start) = target {
+        starts.insert(start);
+    }
+}
+
+fn resolve_block_ranges(
+    section: &Section,
+    original: &str,
+) -> Result<HashMap<usize, (usize, usize)>, String> {
+    let starts = requested_block_starts(section);
+    if starts.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if original.len() > MAX_HASHLINE_BLOCK_FILE_BYTES {
+        return Err(format!(
+            "syntactic block edits are limited to {MAX_HASHLINE_BLOCK_FILE_BYTES}-byte files; use explicit N.=M ranges"
+        ));
+    }
+    let language = detect_language(Path::new(&section.path)).ok_or_else(|| {
+        format!(
+            "cannot resolve syntactic blocks: unknown language for {}",
+            section.path
+        )
+    })?;
+    Ok(if language == "markdown" {
+        markdown_section_ranges(original, &starts)
+    } else {
+        syntactic_block_ranges(original, language, &starts)
+    })
+}
+
 fn resolve_span_target(
     path: &str,
-    original: &str,
     target: SpanTarget,
+    block_ranges: &HashMap<usize, (usize, usize)>,
 ) -> Result<(usize, usize), String> {
     match target {
         SpanTarget::Range { start, end } => Ok((start, end)),
@@ -956,12 +1235,7 @@ fn resolve_span_target(
             let language = detect_language(Path::new(path)).ok_or_else(|| {
                 format!("cannot resolve block {start}*: unknown language for {path}")
             })?;
-            let range = if language == "markdown" {
-                markdown_section_range(original, start)
-            } else {
-                syntactic_block_range(original, language, start)
-            };
-            range.ok_or_else(|| {
+            block_ranges.get(&start).copied().ok_or_else(|| {
                 format!(
                     "cannot resolve a multi-line {language} block beginning on line {start}; use an explicit N.=M range"
                 )
@@ -970,35 +1244,92 @@ fn resolve_span_target(
     }
 }
 
-fn resolve_parsed_gap(path: &str, original: &str, gap: ParsedGap) -> Result<Gap, String> {
+fn resolve_parsed_gap(
+    path: &str,
+    gap: ParsedGap,
+    block_ranges: &HashMap<usize, (usize, usize)>,
+) -> Result<Gap, String> {
     match gap {
         ParsedGap::Before(line) => Ok(Gap::Before(line)),
         ParsedGap::After(line) => Ok(Gap::After(line)),
         ParsedGap::End => Ok(Gap::End),
         ParsedGap::AfterBlock(start) => {
-            let (_, end) = resolve_span_target(path, original, SpanTarget::Block { start })?;
+            let (_, end) = resolve_span_target(path, SpanTarget::Block { start }, block_ranges)?;
             Ok(Gap::After(end))
         }
     }
 }
 
+#[cfg(test)]
 fn markdown_section_range(source: &str, start: usize) -> Option<(usize, usize)> {
+    markdown_section_ranges(source, &HashSet::from([start])).remove(&start)
+}
+
+fn markdown_section_ranges(
+    source: &str,
+    starts: &HashSet<usize>,
+) -> HashMap<usize, (usize, usize)> {
     let lines = logical_lines(source);
-    let heading = lines.get(start.checked_sub(1)?)?.trim_start();
-    let level = heading.bytes().take_while(|byte| *byte == b'#').count();
-    if level == 0 || level > 6 || heading.as_bytes().get(level) != Some(&b' ') {
-        return None;
-    }
-    let mut end = lines.len();
-    for (offset, line) in lines.iter().enumerate().skip(start) {
-        let line = line.trim_start();
-        let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
-        if (1..=level).contains(&next_level) && line.as_bytes().get(next_level) == Some(&b' ') {
-            end = offset;
-            break;
+    let mut headings = Vec::<(usize, usize)>::new();
+    let mut fence: Option<(u8, usize)> = None;
+    for (offset, line) in lines.iter().enumerate() {
+        if let Some((open, length)) = fence {
+            if markdown_fence(line).is_some_and(|(next, count, suffix)| {
+                next == open
+                    && count >= length
+                    && suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+            }) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((marker, length, info)) = markdown_fence(line)
+            && !(marker == b'`' && info.contains('`'))
+        {
+            fence = Some((marker, length));
+            continue;
+        }
+        let Some(trimmed) = markdown_line_after_allowed_indent(line) else {
+            continue;
+        };
+        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if (1..=6).contains(&level) && trimmed.as_bytes().get(level) == Some(&b' ') {
+            headings.push((offset + 1, level));
         }
     }
-    (end > start).then_some((start, end))
+    let mut ranges = HashMap::new();
+    for (index, &(start, level)) in headings.iter().enumerate() {
+        if !starts.contains(&start) {
+            continue;
+        }
+        let end = headings[index + 1..]
+            .iter()
+            .find(|(_, next_level)| *next_level <= level)
+            .map_or(lines.len(), |(next_start, _)| next_start - 1);
+        if end > start {
+            ranges.insert(start, (start, end));
+        }
+    }
+    ranges
+}
+
+/// Return a CommonMark fenced-code marker and the remainder of its line.
+/// Fences may be indented by at most three spaces and contain at least three
+/// matching backticks or tildes. Opener info-string and closer restrictions
+/// are applied by the caller because they differ.
+fn markdown_fence(line: &str) -> Option<(u8, usize, &str)> {
+    let trimmed = markdown_line_after_allowed_indent(line)?;
+    let marker = trimmed.as_bytes().first().copied()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then(|| (marker, length, &trimmed[length..]))
+}
+
+fn markdown_line_after_allowed_indent(line: &str) -> Option<&str> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    (indent <= 3).then(|| &line[indent..])
 }
 
 fn store_register(
@@ -1006,7 +1337,7 @@ fn store_register(
     content: Vec<String>,
     registers: &mut CallRegisters,
 ) -> Result<(), String> {
-    let bytes = content.iter().map(String::len).sum::<usize>() + content.len();
+    let bytes = register_content_bytes(&content);
     if bytes > MAX_REGISTER_BYTES {
         return Err(format!(
             "captured register is {bytes} bytes; the limit is {MAX_REGISTER_BYTES}"
@@ -1020,6 +1351,18 @@ fn store_register(
                 "named register limit ({MAX_NAMED_REGISTERS_PER_SCOPE}) reached"
             ));
         }
+        let existing = registers
+            .named
+            .get(name)
+            .map_or(0, |value| register_content_bytes(value));
+        let total = named_register_bytes(&registers.named)
+            .saturating_sub(existing)
+            .saturating_add(bytes);
+        if total > MAX_REGISTER_SCOPE_BYTES {
+            return Err(format!(
+                "named registers would use {total} bytes; the per-thread limit is {MAX_REGISTER_SCOPE_BYTES}"
+            ));
+        }
         registers.named.insert(name.to_owned(), content);
     } else {
         registers.anonymous = Some(content);
@@ -1027,18 +1370,34 @@ fn store_register(
     Ok(())
 }
 
-fn read_register(name: Option<&str>, registers: &CallRegisters) -> Result<Vec<String>, String> {
+fn read_register<'a>(
+    name: Option<&str>,
+    registers: &'a CallRegisters,
+) -> Result<&'a Vec<String>, String> {
     match name {
         Some(name) => registers
             .named
             .get(name)
-            .cloned()
             .ok_or_else(|| format!("named register @{name} is empty")),
         None => registers
             .anonymous
-            .clone()
+            .as_ref()
             .ok_or_else(|| "anonymous register is empty; CUT content first".to_owned()),
     }
+}
+
+fn register_content_bytes(content: &[String]) -> usize {
+    content
+        .iter()
+        .map(|line| line.len().saturating_add(1))
+        .sum()
+}
+
+fn named_register_bytes(values: &HashMap<String, Vec<String>>) -> usize {
+    values
+        .values()
+        .map(|content| register_content_bytes(content))
+        .sum()
 }
 
 fn register_scope(ctx: &ToolCtx) -> String {
@@ -1077,7 +1436,14 @@ fn persist_named_registers(ctx: &ToolCtx, values: HashMap<String, Vec<String>>) 
             last_used: sequence,
         },
     );
-    while store.scopes.len() > MAX_REGISTER_SCOPES {
+    while store.scopes.len() > MAX_REGISTER_SCOPES
+        || store
+            .scopes
+            .values()
+            .map(|bank| named_register_bytes(&bank.values))
+            .sum::<usize>()
+            > MAX_REGISTER_STORE_BYTES
+    {
         let Some(oldest) = store
             .scopes
             .iter()
@@ -1484,6 +1850,174 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_a_symlink_removes_only_the_requested_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let input = tagged("link.txt", "keep\n", "REM\n");
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert!(!link.exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moving_a_symlink_is_rejected_without_touching_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let input = tagged("link.txt", "keep\n", "MV moved.txt\n");
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep\n");
+        assert!(!tmp.path().join("moved.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_rejects_a_destination_symlink_to_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        let destination = tmp.path().join("source-link.txt");
+        std::fs::write(&source, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        let input = tagged("source.txt", "keep\n", "MV source-link.txt\n");
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+
+        assert_eq!(result.status, ToolStatus::Error);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "keep\n");
+        assert!(
+            destination
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_rejects_a_hardlink_alias_to_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        let destination = tmp.path().join("source-alias.txt");
+        std::fs::write(&source, "keep\n").unwrap();
+        std::fs::hard_link(&source, &destination).unwrap();
+        let input = tagged("source.txt", "keep\n", "MV source-alias.txt\n");
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+
+        assert_eq!(result.status, ToolStatus::Error);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_only_move_commit_rejects_a_destination_replaced_by_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        let destination = tmp.path().join("source-link.txt");
+        std::fs::write(&source, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        let prepared = PreparedFile {
+            path: "source.txt".into(),
+            source_path: source.clone(),
+            full_path: source.clone(),
+            original: "keep\n".into(),
+            updated: "keep\n".into(),
+            adds: 0,
+            deletes: 0,
+            old_snapshot: snapshot_tag("keep\n"),
+            new_snapshot: Some(snapshot_tag("keep\n")),
+            action: PreparedAction::Move {
+                destination: "source-link.txt".into(),
+                destination_full_path: destination.clone(),
+                case_only: true,
+            },
+            permissions: std::fs::metadata(&source).unwrap().permissions(),
+            symlink: None,
+        };
+
+        assert!(commit_prepared(&prepared, None).is_err());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "keep\n");
+        assert!(
+            destination
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_case_only_move_is_preserved_when_the_filesystem_supports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("lower.txt");
+        let destination = tmp.path().join("Lower.txt");
+        std::fs::write(&source, "keep\n").unwrap();
+        let full_path = std::fs::canonicalize(&source).unwrap();
+        if !case_only_destination_matches_source(&source, &full_path, &destination) {
+            return;
+        }
+        let input = tagged("lower.txt", "keep\n", "MV Lower.txt\n");
+
+        let result = HashlineEdit.run(&ctx(&tmp), &json!({"input": input})).await;
+
+        assert_eq!(result.status, ToolStatus::Ok, "{:?}", result.result);
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "keep\n");
+        assert!(
+            tmp.path()
+                .read_dir()
+                .unwrap()
+                .any(|entry| { entry.unwrap().file_name() == std::ffi::OsStr::new("Lower.txt") })
+        );
+    }
+
+    #[test]
+    fn move_commit_never_clobbers_a_destination_created_after_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        let destination = tmp.path().join("destination.txt");
+        std::fs::write(&source, "old\n").unwrap();
+        std::fs::write(&destination, "occupied\n").unwrap();
+        let mut staged = tempfile::NamedTempFile::new_in(tmp.path()).unwrap();
+        staged.write_all(b"new\n").unwrap();
+        let prepared = PreparedFile {
+            path: "source.txt".into(),
+            source_path: source.clone(),
+            full_path: source.clone(),
+            original: "old\n".into(),
+            updated: "new\n".into(),
+            adds: 1,
+            deletes: 1,
+            old_snapshot: snapshot_tag("old\n"),
+            new_snapshot: Some(snapshot_tag("new\n")),
+            action: PreparedAction::Move {
+                destination: "destination.txt".into(),
+                destination_full_path: destination.clone(),
+                case_only: false,
+            },
+            permissions: std::fs::metadata(&source).unwrap().permissions(),
+            symlink: None,
+        };
+
+        assert!(commit_prepared(&prepared, Some(staged)).is_err());
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "occupied\n");
+    }
+
     #[tokio::test]
     async fn cut_register_can_capture_content_before_removing_its_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1537,6 +2071,65 @@ mod tests {
         let source = "# Top\nintro\n## Child\nbody\n# Next\nend\n";
         assert_eq!(markdown_section_range(source, 1), Some((1, 4)));
         assert_eq!(markdown_section_range(source, 3), Some((3, 4)));
+    }
+
+    #[test]
+    fn markdown_blocks_ignore_headings_inside_fenced_code() {
+        let source = "# Top\n\n```sh\n# not a heading\n```\nbody\n# Next\nend\n";
+        assert_eq!(markdown_section_range(source, 1), Some((1, 6)));
+        assert_eq!(markdown_section_range(source, 4), None);
+    }
+
+    #[test]
+    fn markdown_fences_reject_indented_openers_and_invalid_backtick_info() {
+        let indented = "# Top\n    ```\n# Next\nend\n";
+        assert_eq!(markdown_section_range(indented, 1), Some((1, 2)));
+        assert_eq!(markdown_section_range(indented, 3), Some((3, 4)));
+
+        let invalid_info = "# Top\n```bad`info\n# Next\n```\n";
+        assert_eq!(markdown_section_range(invalid_info, 1), Some((1, 2)));
+        assert_eq!(markdown_section_range(invalid_info, 3), Some((3, 4)));
+    }
+
+    #[test]
+    fn markdown_fences_close_only_with_whitespace_after_a_matching_marker() {
+        let marker_text = "# Top\n```sh\n```not-a-close\n# hidden\n```\n# Next\nend\n";
+        assert_eq!(markdown_section_range(marker_text, 1), Some((1, 5)));
+        assert_eq!(markdown_section_range(marker_text, 4), None);
+        assert_eq!(markdown_section_range(marker_text, 6), Some((6, 7)));
+
+        let indented_close = "# Top\n~~~text\n    ~~~\n# hidden\n~~~   \t\n# Next\nend\n";
+        assert_eq!(markdown_section_range(indented_close, 1), Some((1, 5)));
+        assert_eq!(markdown_section_range(indented_close, 4), None);
+        assert_eq!(markdown_section_range(indented_close, 6), Some((6, 7)));
+    }
+
+    #[test]
+    fn materialized_register_pastes_have_a_per_file_budget() {
+        let body = vec!["x".repeat(MAX_REGISTER_BYTES - 1)];
+        let mut total = 0;
+        for _ in 0..(MAX_HASHLINE_FILE_BYTES as usize / MAX_REGISTER_BYTES) {
+            reserve_materialized_body(&body, &mut total).unwrap();
+        }
+        assert!(reserve_materialized_body(&body, &mut total).is_err());
+    }
+
+    #[test]
+    fn named_registers_have_an_aggregate_scope_budget() {
+        let mut registers = CallRegisters::default();
+        let body = vec!["x".repeat(MAX_REGISTER_BYTES - 1)];
+        for index in 0..(MAX_REGISTER_SCOPE_BYTES / MAX_REGISTER_BYTES) {
+            store_register(Some(&format!("r{index}")), body.clone(), &mut registers).unwrap();
+        }
+        assert!(store_register(Some("overflow"), body, &mut registers).is_err());
+    }
+
+    #[test]
+    fn runtime_schema_documents_the_operation_grammar() {
+        let description = HashlineEdit.description();
+        assert!(description.contains("PUT N.=M:"));
+        assert!(description.contains("CUT N.=M"));
+        assert!(description.contains("MV \"dest\""));
     }
 
     #[tokio::test]

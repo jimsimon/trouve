@@ -4,6 +4,8 @@
 //! called via `spawn_blocking` from async code.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -16,6 +18,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
 const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
+const WORKTREE_RESERVATION_SUFFIX: &str = ".trouve-creation-owner";
 // The legacy aggregate endpoint still needs a strict whole-session budget.
 // New clients load a bounded metadata manifest and one bounded patch at a time.
 const MAX_SESSION_DIFF_FILES: usize = 250;
@@ -476,29 +479,248 @@ fn fetch_upstream_base_with_timeout(
     }))
 }
 
+/// Proof that this process atomically reserved and created one session
+/// worktree. Failed-session cleanup requires this receipt; a preflight absence
+/// check alone is never treated as ownership.
+pub struct WorktreeCreation {
+    worktree_path: PathBuf,
+    branch_ref: String,
+    branch_oid: String,
+    reservation_path: PathBuf,
+    reservation_token: String,
+    directory_identity: same_file::Handle,
+}
+
+impl WorktreeCreation {
+    pub fn worktree_path(&self) -> &Path {
+        &self.worktree_path
+    }
+}
+
+fn reservation_path(worktree_path: &Path) -> Result<PathBuf> {
+    let parent = worktree_path
+        .parent()
+        .context("worktree path has no parent directory")?;
+    let mut name = worktree_path
+        .file_name()
+        .context("worktree path has no final component")?
+        .to_os_string();
+    name.push(WORKTREE_RESERVATION_SUFFIX);
+    Ok(parent.join(name))
+}
+
+fn write_creation_reservation(path: &Path, token: &str) -> Result<()> {
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("reserving session creation marker {}", path.display()))?;
+    marker.write_all(token.as_bytes())?;
+    marker.sync_all()?;
+    Ok(())
+}
+
+fn reservation_matches(creation: &WorktreeCreation) -> bool {
+    std::fs::read_to_string(&creation.reservation_path)
+        .is_ok_and(|token| token == creation.reservation_token)
+}
+
+fn directory_identity_matches(creation: &WorktreeCreation) -> bool {
+    same_file::Handle::from_path(&creation.worktree_path)
+        .is_ok_and(|current| current == creation.directory_identity)
+}
+
+fn remove_creation_reservation(creation: &WorktreeCreation) -> Result<()> {
+    if !reservation_matches(creation) {
+        bail!(
+            "session creation marker no longer belongs to this attempt: {}",
+            creation.reservation_path.display()
+        );
+    }
+    std::fs::remove_file(&creation.reservation_path).with_context(|| {
+        format!(
+            "removing session creation marker {}",
+            creation.reservation_path.display()
+        )
+    })
+}
+
+fn delete_ref_if_matches(repo: &Path, reference: &str, expected_oid: &str) -> Result<()> {
+    ensure_safe_ref(reference)?;
+    git(repo, &["update-ref", "-d", reference, expected_oid])?;
+    Ok(())
+}
+
 /// Create the session worktree on a new branch from `base_ref`.
 pub fn create_worktree(
     repo: &Path,
     worktree_path: &Path,
     branch: &str,
     base_ref: &str,
-) -> Result<()> {
+) -> Result<WorktreeCreation> {
     ensure_safe_ref(base_ref)?;
+    let branch_ref = format!("refs/heads/{branch}");
+    ensure_safe_ref(&branch_ref)?;
+    let branch_oid = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )?;
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    git(
+
+    let reservation_path = reservation_path(worktree_path)?;
+    let reservation_token = uuid::Uuid::new_v4().to_string();
+    write_creation_reservation(&reservation_path, &reservation_token)?;
+    if let Err(error) = std::fs::create_dir(worktree_path) {
+        let _ = std::fs::remove_file(&reservation_path);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            bail!(
+                "refusing to replace pre-existing worktree path {}",
+                worktree_path.display()
+            );
+        }
+        return Err(error)
+            .with_context(|| format!("reserving worktree path {}", worktree_path.display()));
+    }
+    let directory_identity = match same_file::Handle::from_path(worktree_path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = std::fs::remove_dir(worktree_path);
+            let _ = std::fs::remove_file(&reservation_path);
+            return Err(error)
+                .with_context(|| format!("recording identity for {}", worktree_path.display()));
+        }
+    };
+
+    // Empty expected OID is Git's atomic "must not exist" compare-and-swap.
+    if let Err(error) = git(repo, &["update-ref", &branch_ref, &branch_oid, ""]) {
+        if same_file::Handle::from_path(worktree_path)
+            .is_ok_and(|current| current == directory_identity)
+        {
+            let _ = std::fs::remove_dir(worktree_path);
+        }
+        let _ = std::fs::remove_file(&reservation_path);
+        return Err(error).context("atomically reserving session branch");
+    }
+
+    let creation = WorktreeCreation {
+        worktree_path: worktree_path.to_path_buf(),
+        branch_ref,
+        branch_oid,
+        reservation_path,
+        reservation_token,
+        directory_identity,
+    };
+    if let Err(error) = git(
         repo,
         &[
             "worktree",
             "add",
-            "-b",
-            branch,
             worktree_path.to_str().context("non-utf8 worktree path")?,
             "--end-of-options",
-            base_ref,
+            branch,
         ],
-    )?;
+    ) {
+        if let Err(rollback) = rollback_worktree_creation(repo, &creation, None) {
+            return Err(error).context(format!(
+                "worktree creation failed; ownership-safe rollback also failed: {rollback:#}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(creation)
+}
+
+/// Remove only the artifacts proven to belong to one failed creation attempt.
+pub fn rollback_worktree_creation(
+    repo: &Path,
+    creation: &WorktreeCreation,
+    checkpoint: Option<(&str, i64, &str)>,
+) -> Result<()> {
+    if let Some((session_id, seq, expected_oid)) = checkpoint {
+        let reference = format!("refs/trouve/checkpoints/{session_id}/{seq}");
+        delete_ref_if_matches(repo, &reference, expected_oid)
+            .context("deleting owned checkpoint ref")?;
+    }
+
+    if !reservation_matches(creation) || !directory_identity_matches(creation) {
+        bail!(
+            "refusing to remove ambiguous worktree path {}",
+            creation.worktree_path.display()
+        );
+    }
+    // Claim cleanup atomically before touching the checkout. If the branch
+    // advanced or was rebound, CAS fails and the path remains untouched. A
+    // branch recreated after this point is a new identity and is never
+    // considered by this receipt again.
+    delete_ref_if_matches(repo, &creation.branch_ref, &creation.branch_oid)
+        .context("claiming owned session branch for cleanup")?;
+
+    if let Err(remove_error) = remove_worktree(repo, &creation.worktree_path) {
+        if !reservation_matches(creation) || !directory_identity_matches(creation) {
+            return Err(remove_error)
+                .context("git worktree removal failed and path ownership changed before fallback");
+        }
+        std::fs::remove_dir_all(&creation.worktree_path).with_context(|| {
+            format!(
+                "removing owned failed-session worktree {} after git cleanup failed",
+                creation.worktree_path.display()
+            )
+        })?;
+    }
+    prune_worktrees(repo)?;
+    remove_creation_reservation(creation)?;
+    Ok(())
+}
+
+/// Release the short-lived ownership marker after session state is durable.
+pub fn finalize_worktree_creation(creation: &WorktreeCreation) -> Result<()> {
+    remove_creation_reservation(creation)
+}
+
+fn ref_exists(repo: &Path, reference: &str) -> Result<bool> {
+    ensure_safe_ref(reference)?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", reference])
+        .status()
+        .with_context(|| format!("checking git ref {reference} in {}", repo.display()))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git show-ref --verify failed in {} with {status}",
+            repo.display()
+        ),
+    }
+}
+
+pub fn local_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    ref_exists(repo, &format!("refs/heads/{branch}"))
+}
+
+pub fn checkpoint_ref_exists(repo: &Path, session_id: &str, seq: i64) -> Result<bool> {
+    ref_exists(repo, &format!("refs/trouve/checkpoints/{session_id}/{seq}"))
+}
+
+pub fn delete_local_branch(repo: &Path, branch: &str) -> Result<()> {
+    let reference = format!("refs/heads/{branch}");
+    ensure_safe_ref(&reference)?;
+    git(repo, &["update-ref", "-d", &reference])?;
+    Ok(())
+}
+
+pub fn delete_checkpoint_ref(repo: &Path, session_id: &str, seq: i64) -> Result<()> {
+    let reference = format!("refs/trouve/checkpoints/{session_id}/{seq}");
+    ensure_safe_ref(&reference)?;
+    git(repo, &["update-ref", "-d", &reference])?;
+    Ok(())
+}
+
+pub fn prune_worktrees(repo: &Path) -> Result<()> {
+    git(repo, &["worktree", "prune"])?;
     Ok(())
 }
 
@@ -540,6 +762,7 @@ pub fn checkpoint(worktree: &Path, session_id: &str, seq: i64, message: &str) ->
             "update-ref",
             &format!("refs/trouve/checkpoints/{session_id}/{seq}"),
             &commit,
+            "",
         ],
     )?;
     Ok(commit)
@@ -726,6 +949,163 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn worktree_creation_preserves_an_independently_created_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join("independent.txt"), "keep").unwrap();
+
+        assert!(create_worktree(&repo, &worktree, "trouve/collision", "main").is_err());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("independent.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!local_branch_exists(&repo, "trouve/collision").unwrap());
+    }
+
+    #[test]
+    fn worktree_creation_preserves_an_independently_created_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        run(&repo, &["branch", "trouve/collision"]);
+        let expected = run(&repo, &["rev-parse", "trouve/collision"]);
+        let worktree = tmp.path().join("worktree");
+
+        assert!(create_worktree(&repo, &worktree, "trouve/collision", "main").is_err());
+        assert_eq!(run(&repo, &["rev-parse", "trouve/collision"]), expected);
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn finalizing_worktree_creation_removes_only_its_reservation_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = tmp.path().join("worktree");
+        let creation = create_worktree(&repo, &worktree, "trouve/finalize", "main").unwrap();
+        assert!(creation.reservation_path.exists());
+
+        finalize_worktree_creation(&creation).unwrap();
+
+        assert!(!creation.reservation_path.exists());
+        assert!(worktree.join("a.txt").exists());
+    }
+
+    #[test]
+    fn checkpoint_creation_does_not_replace_an_independent_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let expected = run(tmp.path(), &["rev-parse", "HEAD"]);
+        run(
+            tmp.path(),
+            &[
+                "update-ref",
+                "refs/trouve/checkpoints/se_collision/0",
+                &expected,
+            ],
+        );
+
+        assert!(checkpoint(tmp.path(), "se_collision", 0, "collision").is_err());
+        assert_eq!(
+            run(
+                tmp.path(),
+                &["rev-parse", "refs/trouve/checkpoints/se_collision/0"]
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn creation_rollback_preserves_a_replaced_worktree_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = tmp.path().join("worktree");
+        let displaced = tmp.path().join("displaced");
+        let creation = create_worktree(&repo, &worktree, "trouve/replaced", "main").unwrap();
+        run(
+            &repo,
+            &[
+                "worktree",
+                "move",
+                worktree.to_str().unwrap(),
+                displaced.to_str().unwrap(),
+            ],
+        );
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join("independent.txt"), "keep").unwrap();
+
+        assert!(rollback_worktree_creation(&repo, &creation, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("independent.txt")).unwrap(),
+            "keep"
+        );
+        assert!(local_branch_exists(&repo, "trouve/replaced").unwrap());
+    }
+
+    #[test]
+    fn creation_rollback_preserves_a_branch_that_changed_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = tmp.path().join("worktree");
+        let creation = create_worktree(&repo, &worktree, "trouve/advanced", "main").unwrap();
+        std::fs::write(worktree.join("a.txt"), "advanced\n").unwrap();
+        run(&worktree, &["add", "a.txt"]);
+        run(&worktree, &["commit", "-m", "advance"]);
+        let advanced = run(&repo, &["rev-parse", "trouve/advanced"]);
+
+        assert!(rollback_worktree_creation(&repo, &creation, None).is_err());
+        assert_eq!(run(&repo, &["rev-parse", "trouve/advanced"]), advanced);
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn creation_rollback_preserves_a_checkpoint_ref_that_changed_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let worktree = tmp.path().join("worktree");
+        let creation = create_worktree(&repo, &worktree, "trouve/checkpoint-race", "main").unwrap();
+        let checkpoint_oid = checkpoint(&worktree, "se_checkpoint_race", 0, "checkpoint").unwrap();
+        let independent = run(&repo, &["rev-parse", "main"]);
+        run(
+            &repo,
+            &[
+                "update-ref",
+                "refs/trouve/checkpoints/se_checkpoint_race/0",
+                &independent,
+            ],
+        );
+
+        assert!(
+            rollback_worktree_creation(
+                &repo,
+                &creation,
+                Some(("se_checkpoint_race", 0, &checkpoint_oid)),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            run(
+                &repo,
+                &["rev-parse", "refs/trouve/checkpoints/se_checkpoint_race/0",],
+            ),
+            independent
+        );
+        assert!(worktree.exists());
     }
 
     #[test]

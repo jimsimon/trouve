@@ -117,6 +117,42 @@ describe("HostClient", () => {
     expect(requests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("b".repeat(64));
   });
 
+  it("gates close acknowledgement on the independently versioned bridge", async () => {
+    const legacyRequests: Request[] = [];
+    const legacyFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      legacyRequests.push(request);
+      return Response.json({
+        capabilities: { ...validCapabilities, bridge_version: 12 },
+        csrf_token: "l".repeat(64),
+      });
+    });
+    const legacy = new HostClient("http://127.0.0.1:43127", legacyFetch);
+    await legacy.bootstrap();
+    await expect(legacy.acknowledgeClose(7)).resolves.toBeUndefined();
+    expect(legacyRequests).toHaveLength(1);
+
+    const currentRequests: Request[] = [];
+    const currentFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      currentRequests.push(request);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({
+          capabilities: { ...validCapabilities, bridge_version: 13 },
+          csrf_token: "n".repeat(64),
+        });
+      }
+      return new Response(null, { status: 204 });
+    });
+    const current = new HostClient("http://127.0.0.1:43127", currentFetch);
+    await current.bootstrap();
+    await current.acknowledgeClose(8);
+
+    expect(currentRequests.at(-1)?.url).toContain("/close-acknowledgement");
+    await expect(currentRequests.at(-1)?.clone().json()).resolves.toEqual({ request_id: 8 });
+    expect(currentRequests.at(-1)?.headers.get("x-trouve-host-csrf")).toBe("n".repeat(64));
+  });
+
   it("serializes active preference writes and coalesces queued values", async () => {
     let releaseFirst!: () => void;
     const firstBlocked = new Promise<void>((resolve) => {

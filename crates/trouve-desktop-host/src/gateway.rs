@@ -39,6 +39,7 @@ const PICK_DIRECTORY_PATH: &str = "/__trouve/host/v1/pick-directory";
 const PICK_FILES_PATH: &str = "/__trouve/host/v1/pick-files";
 const READ_CLIPBOARD_IMAGE_PATH: &str = "/__trouve/host/v1/read-clipboard-image";
 const LIFECYCLE_PATH: &str = "/__trouve/host/v1/lifecycle";
+const CLOSE_ACKNOWLEDGEMENT_PATH: &str = "/__trouve/host/v1/close-acknowledgement";
 const CLOSE_DECISION_PATH: &str = "/__trouve/host/v1/close-decision";
 const SLEEP_INHIBITION_PATH: &str = "/__trouve/host/v1/sleep-inhibition";
 const NATIVE_NOTIFICATION_PATH: &str = "/__trouve/host/v1/native-notification";
@@ -105,6 +106,11 @@ pub struct CloseDecisionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CloseAcknowledgementRequest {
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SleepInhibitionRequest {
     pub active: bool,
 }
@@ -161,6 +167,7 @@ struct LifecycleQuery {
         pick_files,
         read_clipboard_image,
         get_lifecycle,
+        close_acknowledgement,
         close_decision,
         set_sleep_inhibition,
         send_native_notification,
@@ -181,6 +188,7 @@ struct LifecycleQuery {
         HostLifecycleEnvelope,
         crate::HostLifecycleEvent,
         crate::PendingCloseRequest,
+        CloseAcknowledgementRequest,
         CloseDecisionRequest,
         crate::CloseDecision,
         SleepInhibitionRequest,
@@ -422,6 +430,7 @@ impl HostGateway {
             .route(PICK_FILES_PATH, post(pick_files))
             .route(READ_CLIPBOARD_IMAGE_PATH, post(read_clipboard_image))
             .route(LIFECYCLE_PATH, get(get_lifecycle))
+            .route(CLOSE_ACKNOWLEDGEMENT_PATH, post(close_acknowledgement))
             .route(CLOSE_DECISION_PATH, post(close_decision))
             .route(SLEEP_INHIBITION_PATH, post(set_sleep_inhibition))
             .route(NATIVE_NOTIFICATION_PATH, post(send_native_notification))
@@ -652,13 +661,17 @@ async fn put_preferences(
     let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
         .await
         .map_err(|_| GatewayRejection::InvalidPreferences)?;
-    let preferences: HostPreferences =
+    let mut preferences: HostPreferences =
         serde_json::from_slice(&bytes).map_err(|_| GatewayRejection::InvalidPreferences)?;
-    validate_preferences(&preferences).map_err(|_| GatewayRejection::InvalidPreferences)?;
     // Serialize persistence and the in-memory replacement as one ordered
     // operation. Concurrent resize/theme writes can no longer complete out
     // of order or leave disk and memory on different versions.
     let mut current = state.preferences.lock().await;
+    // Geometry is owned by the native window adapter. A web-client PUT is a
+    // snapshot replacement for web-owned fields, so preserve a resize that
+    // happened after the client read that snapshot.
+    preferences.geometry = current.geometry.clone();
+    validate_preferences(&preferences).map_err(|_| GatewayRejection::InvalidPreferences)?;
     if let Some(path) = state.preference_path.clone() {
         let persisted = preferences.clone();
         tokio::task::spawn_blocking(move || persist_preferences(&path, &persisted))
@@ -854,6 +867,40 @@ async fn get_lifecycle(
 
 #[utoipa::path(
     post,
+    path = "/__trouve/host/v1/close-acknowledgement",
+    request_body = CloseAcknowledgementRequest,
+    responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500))
+)]
+async fn close_acknowledgement(
+    State(state): State<GatewayState>,
+    request: Request<Body>,
+) -> Result<Response, GatewayRejection> {
+    validate_mutation(&state, request.headers())?;
+    if state.capabilities.kind != HostKind::Desktop
+        || !state.capabilities.close_confirmation
+        || !state.native_actions.can_confirm_close()
+    {
+        return Err(GatewayRejection::Missing);
+    }
+    let request: CloseAcknowledgementRequest = read_json_action(request, 1024).await?;
+    if request.request_id == 0 {
+        return Err(GatewayRejection::InvalidAction);
+    }
+    state
+        .native_actions
+        .lifecycle()
+        .ok_or(GatewayRejection::Missing)?
+        .acknowledge_close_request(request.request_id)
+        .map_err(|_| GatewayRejection::InvalidAction)?;
+    state
+        .native_actions
+        .close_request_acknowledged(request.request_id)
+        .map_err(|_| GatewayRejection::Internal)?;
+    no_content()
+}
+
+#[utoipa::path(
+    post,
     path = "/__trouve/host/v1/close-decision",
     request_body = CloseDecisionRequest,
     responses((status = 204), (status = 400), (status = 403), (status = 404), (status = 500))
@@ -880,6 +927,10 @@ async fn close_decision(
     let quit = lifecycle
         .apply_close_decision(request.request_id, request.decision)
         .map_err(|_| GatewayRejection::InvalidAction)?;
+    state
+        .native_actions
+        .close_decision_applied(request.request_id, request.decision)
+        .map_err(|_| GatewayRejection::Internal)?;
     if quit {
         state
             .native_actions
@@ -1182,13 +1233,49 @@ fn persist_preferences(path: &Path, preferences: &HostPreferences) -> std::io::R
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+        replace_file(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 async fn serve_frontend(
@@ -2605,10 +2692,25 @@ mod tests {
         let lifecycle = crate::HostLifecycleHandle::default();
         let quit_count = Arc::new(AtomicUsize::new(0));
         let quit_for_action = quit_count.clone();
+        let close_decisions = Arc::new(Mutex::new(Vec::new()));
+        let decisions_for_action = close_decisions.clone();
+        let close_acknowledgements = Arc::new(Mutex::new(Vec::new()));
+        let acknowledgements_for_action = close_acknowledgements.clone();
         let app = gateway()
             .with_native_actions(
                 HostNativeActions::default()
                     .with_lifecycle_capabilities(lifecycle.clone(), true, true)
+                    .with_close_acknowledgement_observer(move |request_id| {
+                        acknowledgements_for_action.lock().unwrap().push(request_id);
+                        Ok(())
+                    })
+                    .with_close_decision_observer(move |request_id, decision| {
+                        decisions_for_action
+                            .lock()
+                            .unwrap()
+                            .push((request_id, decision));
+                        Ok(())
+                    })
                     .with_quit_handler(move || {
                         quit_for_action.fetch_add(1, Ordering::SeqCst);
                         Ok(())
@@ -2658,6 +2760,23 @@ mod tests {
             })
         );
 
+        let acknowledged = app
+            .clone()
+            .oneshot(json_action_request(
+                CLOSE_ACKNOWLEDGEMENT_PATH,
+                &bootstrap.csrf_token,
+                CloseAcknowledgementRequest { request_id },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.status(), StatusCode::NO_CONTENT);
+        assert_eq!(quit_count.load(Ordering::SeqCst), 0);
+        assert!(close_decisions.lock().unwrap().is_empty());
+        assert_eq!(
+            close_acknowledgements.lock().unwrap().as_slice(),
+            &[request_id]
+        );
+
         let deferred = app
             .clone()
             .oneshot(json_action_request(
@@ -2672,6 +2791,10 @@ mod tests {
             .unwrap();
         assert_eq!(deferred.status(), StatusCode::NO_CONTENT);
         assert_eq!(quit_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            close_decisions.lock().unwrap().as_slice(),
+            &[(request_id, CloseDecision::QuitWhenIdle)]
+        );
 
         let state_response = app
             .clone()
@@ -2702,8 +2825,16 @@ mod tests {
             .unwrap();
         assert_eq!(quit.status(), StatusCode::NO_CONTENT);
         assert_eq!(quit_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            close_decisions.lock().unwrap().as_slice(),
+            &[
+                (request_id, CloseDecision::QuitWhenIdle),
+                (request_id, CloseDecision::QuitNow),
+            ]
+        );
 
         let stale = app
+            .clone()
             .oneshot(json_action_request(
                 CLOSE_DECISION_PATH,
                 &bootstrap.csrf_token,
@@ -2715,6 +2846,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+        let stale_acknowledgement = app
+            .clone()
+            .oneshot(json_action_request(
+                CLOSE_ACKNOWLEDGEMENT_PATH,
+                &bootstrap.csrf_token,
+                CloseAcknowledgementRequest { request_id },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_acknowledgement.status(), StatusCode::BAD_REQUEST);
+
+        let cancelled_request_id = lifecycle.request_close();
+        let cancelled = app
+            .oneshot(json_action_request(
+                CLOSE_DECISION_PATH,
+                &bootstrap.csrf_token,
+                CloseDecisionRequest {
+                    request_id: cancelled_request_id,
+                    decision: CloseDecision::Cancel,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+        assert_eq!(quit_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            close_decisions.lock().unwrap().as_slice(),
+            &[
+                (request_id, CloseDecision::QuitWhenIdle),
+                (request_id, CloseDecision::QuitNow),
+                (cancelled_request_id, CloseDecision::Cancel),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3247,6 +3411,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(parent);
     }
 
+    #[test]
+    fn preference_persistence_replaces_an_existing_file() {
+        let path = temporary_preference_path("replace-existing");
+        let mut first = HostPreferences::default();
+        first.appearance.theme = "light".into();
+        persist_preferences(&path, &first).unwrap();
+
+        let mut second = HostPreferences::default();
+        second.appearance.theme = "system".into();
+        second.navigation_width = 312.0;
+        persist_preferences(&path, &second).unwrap();
+
+        assert_eq!(
+            load_preferences(&path, HostPreferences::default()).unwrap(),
+            second
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[tokio::test]
     async fn native_geometry_updates_preserve_concurrent_frontend_preferences() {
         let path = temporary_preference_path("geometry-handle");
@@ -3283,16 +3466,6 @@ mod tests {
         let mut frontend_update = preferences.snapshot().await;
         frontend_update.appearance.theme = "light".into();
         frontend_update.navigation_width = 318.0;
-        let response = client
-            .put(format!("{origin}{PREFERENCES_PATH}"))
-            .header(ORIGIN, &origin)
-            .header(CSRF_HEADER, bootstrap.csrf_token)
-            .json(&frontend_update)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
         let geometry = crate::WindowGeometry {
             x: -120,
             y: 80,
@@ -3304,6 +3477,20 @@ mod tests {
             .update_window_geometry(geometry.clone())
             .await
             .unwrap();
+
+        // The web request was constructed before the native resize completed.
+        // Its stale `geometry: null` must not overwrite the native-owned value.
+        let response = client
+            .put(format!("{origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &origin)
+            .header(CSRF_HEADER, bootstrap.csrf_token)
+            .json(&frontend_update)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let returned: HostPreferences = response.json().await.unwrap();
+        assert_eq!(returned.geometry, Some(geometry.clone()));
         let stored = load_preferences(&path, HostPreferences::default()).unwrap();
         assert_eq!(stored.geometry, Some(geometry));
         assert_eq!(stored.appearance.theme, "light");
