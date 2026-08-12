@@ -37,8 +37,8 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a file from the workspace. Text returns at most 64KB (use offset to page through \
-         larger files); images (png/jpeg/gif/webp) are returned as vision content. Set \
+        "Read a workspace file or a host-registered read-only resource. Text returns at most \
+         64KB (use offset to page through larger files); images (png/jpeg/gif/webp) are returned as vision content. Set \
          format=\"hashline\" to receive a whole-file snapshot tag and numbered lines for \
          compact hashline_edit calls."
     }
@@ -46,7 +46,7 @@ impl Tool for ReadFile {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Workspace-relative file path"},
+                "path": {"type": "string", "description": "Workspace-relative file path, or an absolute path under a host-registered read-only root"},
                 "offset": {"type": "integer", "description": "Line to start from (1-based)", "minimum": 1},
                 "limit": {"type": "integer", "description": "Maximum number of lines", "minimum": 1},
                 "format": {
@@ -67,7 +67,7 @@ impl Tool for ReadFile {
         let Some(path) = args.get("path").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: path");
         };
-        let full = match ctx.resolve(path) {
+        let full = match ctx.resolve_read(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
@@ -438,13 +438,13 @@ impl Tool for ListDir {
         "list_dir"
     }
     fn description(&self) -> &'static str {
-        "List the entries of a workspace directory (non-recursive)."
+        "List a workspace or host-registered read-only directory (non-recursive)."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Workspace-relative directory (default: workspace root)"}
+                "path": {"type": "string", "description": "Workspace-relative directory (default: workspace root), or an absolute directory under a host-registered read-only root"}
             }
         })
     }
@@ -454,7 +454,7 @@ impl Tool for ListDir {
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let full = match ctx.resolve(rel) {
+        let full = match ctx.resolve_read(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
@@ -543,6 +543,37 @@ mod tests {
         assert_eq!(res.result["content"], "first\n");
         assert_eq!(res.result["truncated"], true);
         assert_eq!(res.result["next_offset"], 2);
+    }
+
+    #[tokio::test]
+    async fn registered_host_resources_are_readable_but_never_writable() {
+        let worktree = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        let skill = package.path().join("SKILL.md");
+        std::fs::write(&skill, "host instructions\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: worktree.path().to_path_buf(),
+            read_only_roots: vec![package.path().canonicalize().unwrap()].into(),
+            ..Default::default()
+        };
+        let absolute = skill.to_str().unwrap();
+
+        let read = ReadFile.run(&ctx, &json!({"path": absolute})).await;
+        assert_eq!(read.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(read.result["content"], "host instructions\n");
+
+        let listed = ListDir.run(&ctx, &json!({"path": package.path()})).await;
+        assert_eq!(listed.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(listed.result["entries"][0]["name"], "SKILL.md");
+
+        let write = WriteFile
+            .run(&ctx, &json!({"path": absolute, "content": "changed\n"}))
+            .await;
+        assert_eq!(write.status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(skill).unwrap(),
+            "host instructions\n"
+        );
     }
 
     #[tokio::test]

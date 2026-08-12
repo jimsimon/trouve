@@ -13,6 +13,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Host-controlled path-list of additional resources that file-reading tools
+/// may inspect without granting mutation access outside the session worktree.
+pub const READ_ONLY_ROOTS_ENV: &str = "TROUVE_READ_ONLY_ROOTS";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     /// Directory name unless front matter overrides it.
@@ -91,6 +95,67 @@ pub fn discover(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec
     skills.into_values().collect()
 }
 
+fn configured_home(variable: &str, fallback: &Path) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn canonical_existing_roots(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut roots = candidates
+        .into_iter()
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        // A root filesystem is never a reasonable resource capability. This
+        // also turns an accidentally empty path-list entry into a fail-closed
+        // no-op instead of broad host access.
+        .filter(|root| root.parent().is_some())
+        .filter(|root| {
+            std::fs::metadata(root).is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Canonical host resources visible to read-only filesystem tools.
+///
+/// These are deliberately narrower than the user's home/config directories:
+/// only directories whose contents are intended to be agent instructions or
+/// installed plugin packages are automatic. Embedders may add explicit roots
+/// through [`READ_ONLY_ROOTS_ENV`]. Missing roots are ignored, and callers
+/// still validate every requested path after resolving symlinks.
+pub fn trusted_read_roots(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(config_dir) = config_dir {
+        candidates.push(config_dir.join("skills"));
+    }
+    if let Some(workspace_root) = workspace_root {
+        candidates.push(workspace_root.join(".agents").join("skills"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let codex = configured_home("CODEX_HOME", &home.join(".codex"));
+        candidates.push(codex.join("skills"));
+        candidates.push(codex.join("plugins").join("cache"));
+
+        let claude = configured_home("CLAUDE_CONFIG_DIR", &home.join(".claude"));
+        candidates.push(claude.join("skills"));
+        candidates.push(claude.join("plugins").join("cache"));
+
+        candidates.push(home.join(".cursor").join("skills"));
+    }
+
+    if let Some(raw) = std::env::var_os(READ_ONLY_ROOTS_ENV) {
+        candidates.extend(std::env::split_paths(&raw).filter(|path| path.is_absolute()));
+    }
+    canonical_existing_roots(candidates)
+}
+
 /// Render the "available skills" section of the system prompt, or None when
 /// there are no skills.
 pub fn prompt_section(skills: &[Skill]) -> Option<String> {
@@ -163,5 +228,25 @@ mod tests {
         assert!(section.contains("write-adr"));
         assert!(section.contains("/x/SKILL.md"));
         assert!(prompt_section(&[]).is_none());
+    }
+
+    #[test]
+    fn canonical_read_roots_ignore_missing_duplicates_and_filesystem_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resource = tmp.path().join("resource");
+        std::fs::create_dir(&resource).unwrap();
+        let alias = tmp.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&resource, &alias).unwrap();
+
+        let mut candidates = vec![
+            resource.clone(),
+            resource.clone(),
+            tmp.path().join("missing"),
+        ];
+        #[cfg(unix)]
+        candidates.extend([alias, PathBuf::from("/")]);
+
+        assert_eq!(canonical_existing_roots(candidates), vec![resource]);
     }
 }

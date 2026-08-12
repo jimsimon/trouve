@@ -23,14 +23,14 @@ impl Tool for Grep {
         "grep"
     }
     fn description(&self) -> &'static str {
-        "Search workspace files with a regular expression. Respects .gitignore. Returns up to 200 matches as path:line pairs."
+        "Search workspace files or a host-registered read-only root with a regular expression. Respects .gitignore. Returns up to 200 matches as path:line pairs."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Rust-flavoured regular expression"},
-                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root)"},
+                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root), or an absolute directory under a host-registered read-only root"},
                 "case_insensitive": {"type": "boolean"}
             },
             "required": ["pattern"]
@@ -48,7 +48,7 @@ impl Tool for Grep {
             return ToolResult::error("missing required argument: pattern");
         };
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = match ctx.resolve(rel) {
+        let root = match ctx.resolve_read(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };

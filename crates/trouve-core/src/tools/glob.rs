@@ -16,7 +16,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &'static str {
-        "Find workspace files whose path matches a glob pattern (e.g. \"*.rs\", \
+        "Find files under the workspace or a host-registered read-only root whose path matches a glob pattern (e.g. \"*.rs\", \
          \"src/**/*.slint\"). Bare patterns match at any depth. Respects .gitignore; \
          results are sorted by modification time, newest first."
     }
@@ -25,7 +25,7 @@ impl Tool for Glob {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob pattern; \"*.rs\" matches at any depth, use \"/\" for structure (\"src/**/*.ts\")"},
-                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root)"}
+                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root), or an absolute directory under a host-registered read-only root"}
             },
             "required": ["pattern"]
         })
@@ -42,7 +42,7 @@ impl Tool for Glob {
             return ToolResult::error("missing required argument: pattern");
         };
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = match ctx.resolve(rel) {
+        let root = match ctx.resolve_read(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };

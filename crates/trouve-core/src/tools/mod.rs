@@ -67,8 +67,9 @@ impl BackgroundMutationLease {
     }
 }
 
-/// Execution context: everything a tool may touch. All paths resolve inside
-/// the session worktree.
+/// Execution context: everything a tool may touch. Mutation paths resolve
+/// inside the session worktree; explicitly registered host resources are
+/// additionally available to read-only filesystem tools.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCtx {
     /// Cancellation for the turn that owns this call. Long-running tools
@@ -78,6 +79,9 @@ pub struct ToolCtx {
     /// Canonicalized once when the engine builds the turn context. Isolated
     /// tool tests may omit it and pay the one-off fallback canonicalization.
     pub canonical_worktree: Option<PathBuf>,
+    /// Canonical files/directories exposed as read-only capabilities by the
+    /// host. They never participate in mutation path resolution.
+    pub read_only_roots: Arc<[PathBuf]>,
     /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
     /// tool tests that do not exercise thread state.
     pub thread_id: String,
@@ -142,6 +146,42 @@ impl ToolCtx {
             bail!("path escapes the worktree: {path}");
         }
         Ok(joined)
+    }
+
+    /// Resolve a path for a read-only filesystem operation.
+    ///
+    /// Relative paths retain ordinary worktree semantics. Absolute paths are
+    /// accepted only when the existing canonical target is contained by a
+    /// canonical root the host registered for this turn. Resolving the full
+    /// target prevents symlinks inside an allowed package from escaping to a
+    /// credential or unrelated checkout elsewhere on the host.
+    pub fn resolve_read(&self, path: &str) -> Result<PathBuf> {
+        let requested = Path::new(path);
+        if !requested.is_absolute() {
+            return self.resolve(path);
+        }
+        if requested
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            bail!("read path contains parent traversal: {path}");
+        }
+        let canonical = requested
+            .canonicalize()
+            .with_context(|| format!("cannot resolve read-only path {path}"))?;
+        let supported = std::fs::metadata(&canonical)
+            .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir());
+        if !supported {
+            bail!("read-only path is not a regular file or directory: {path}");
+        }
+        if !self
+            .read_only_roots
+            .iter()
+            .any(|root| canonical == *root || canonical.starts_with(root))
+        {
+            bail!("absolute path is not under a registered read-only root: {path}");
+        }
+        Ok(canonical)
     }
 }
 
@@ -775,6 +815,32 @@ mod tests {
         assert!(ctx.resolve("a/../../outside").is_err());
     }
 
+    #[test]
+    fn read_resolution_allows_only_registered_canonical_roots() {
+        let worktree = tempfile::tempdir().unwrap();
+        let readable = tempfile::tempdir().unwrap();
+        let hidden = tempfile::tempdir().unwrap();
+        let allowed = readable.path().join("skill");
+        std::fs::create_dir(&allowed).unwrap();
+        let instruction = allowed.join("SKILL.md");
+        std::fs::write(&instruction, "instructions").unwrap();
+        let secret = hidden.path().join("secret");
+        std::fs::write(&secret, "secret").unwrap();
+        let ctx = ToolCtx {
+            worktree: worktree.path().to_path_buf(),
+            read_only_roots: vec![allowed.canonicalize().unwrap()].into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ctx.resolve_read(instruction.to_str().unwrap()).unwrap(),
+            instruction.canonicalize().unwrap()
+        );
+        assert!(ctx.resolve_read(secret.to_str().unwrap()).is_err());
+        // Registration never widens the mutation resolver.
+        assert!(ctx.resolve(instruction.to_str().unwrap()).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_resolution_rejects_symlink_escapes() {
@@ -806,6 +872,20 @@ mod tests {
         std::fs::write(dir.path().join("real/f"), "x").unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
         assert!(ctx.resolve("alias/f").is_ok());
+
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        std::os::unix::fs::symlink(outside.path(), allowed.join("escape")).unwrap();
+        let read_ctx = ToolCtx {
+            worktree: dir.path().to_path_buf(),
+            read_only_roots: vec![allowed.canonicalize().unwrap()].into(),
+            ..Default::default()
+        };
+        assert!(
+            read_ctx
+                .resolve_read(allowed.join("escape/secret").to_str().unwrap())
+                .is_err()
+        );
     }
 
     #[tokio::test]

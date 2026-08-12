@@ -53,11 +53,13 @@ These are load-bearing. Do not violate them without a new ADR.
    loop directly. Vendor harnesses use the full tool bridge by default;
    unavoidable vendor-native tools are disabled or confined read-only, and
    approval-only fallbacks hold an engine mutation lease (ADR 0030).
-4. **Sessions own worktrees.** Agent file operations happen in the session's
-   git worktree, never in the user's checkout. Threads share the session
-   worktree and their turns may run concurrently; read-only tools may overlap,
-   but mutation-capable tool calls and checkpoints are exclusive per session
-   (ADRs 0030 and 0034).
+4. **Sessions own worktrees.** Agent mutations happen in the session's git
+   worktree, never in the user's checkout. Read-only filesystem tools may also
+   inspect canonical host-registered instruction/package roots, but those
+   capabilities never widen mutation paths (ADR 0037). Threads share the
+   session worktree and their turns may run concurrently; read-only tools may
+   overlap, but mutation-capable tool calls and checkpoints are exclusive per
+   session (ADRs 0030 and 0034).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
    deliberately with a version bump. Generated clients require an exact

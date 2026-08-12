@@ -7665,6 +7665,11 @@ impl Engine {
             cancel: cancel.clone(),
             worktree: worktree.clone(),
             canonical_worktree: Some(canonical_worktree),
+            read_only_roots: crate::skills::trusted_read_roots(
+                self.config_dir.as_deref(),
+                Some(Path::new(&ws.path)),
+            )
+            .into(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
@@ -8838,6 +8843,11 @@ impl Engine {
             cancel,
             worktree,
             canonical_worktree: Some(canonical_worktree),
+            read_only_roots: crate::skills::trusted_read_roots(
+                self.config_dir.as_deref(),
+                Some(Path::new(&ws.path)),
+            )
+            .into(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),

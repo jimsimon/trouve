@@ -46,3 +46,4 @@ sequentially.
 | [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Accepted |
 | [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |
 | [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |
+| [0037](0037-capability-scoped-external-read-roots.md) | Capability-scoped external read roots | Accepted |
