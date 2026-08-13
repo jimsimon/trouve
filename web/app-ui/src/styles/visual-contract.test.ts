@@ -681,7 +681,10 @@ describe("Trouve visual contract", () => {
       /\.session-indicator\.error \{[^}]*color:\s*var\(--trouve-err\)[^}]*font-size:\s*18px/s,
     );
     expect(app).toMatch(
-      /\.session-indicator\.unread \{[^}]*color:\s*var\(--trouve-accent\)[^}]*font-size:\s*11px/s,
+      /\.session-indicator\.unread \{[^}]*color:\s*var\(--trouve-warn\)[^}]*font-size:\s*11px/s,
+    );
+    expect(app).toMatch(
+      /\.session-indicator\.unread:hover \{[^}]*color:\s*var\(--trouve-warn\)/s,
     );
     expect(app).toMatch(
       /\.session-indicator\.busy::before \{[^}]*width:\s*10px[^}]*height:\s*10px[^}]*background:\s*var\(--trouve-accent\)[^}]*animation:\s*trouve-session-busy-pulse 1\.6s linear infinite/s,
