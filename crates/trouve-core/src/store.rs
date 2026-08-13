@@ -704,6 +704,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_tasks ADD COLUMN last_progress_at TEXT",
     "ALTER TABLE code_review_findings ADD COLUMN github_publication_status TEXT NOT NULL DEFAULT 'pending'",
     "ALTER TABLE code_review_findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE code_review_findings ADD COLUMN outside_diff INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE code_review_findings ADD COLUMN origin TEXT NOT NULL DEFAULT 'new_change'",
     "ALTER TABLE code_review_findings ADD COLUMN resolved_head TEXT NOT NULL DEFAULT ''",
@@ -3600,6 +3601,7 @@ pub struct NewCodeReviewFindingDetails {
     pub evidence: trouve_protocol::CodeReviewFindingEvidence,
     pub origin: trouve_protocol::CodeReviewFindingOrigin,
     pub theme_ids: Vec<String>,
+    pub outside_diff: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -9870,8 +9872,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO code_review_findings
                         (id, job_id, path, line, side, severity, confidence, title, body,
-                         evidence, origin, prompt_for_agents, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', ?13)",
+                         evidence, origin, prompt_for_agents, outside_diff, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14)",
                 params![
                     finding_id,
                     job_id,
@@ -9885,6 +9887,7 @@ impl Store {
                     serde_json::to_string(&details.evidence)?,
                     code_review_finding_origin_str(details.origin),
                     finding.prompt_for_agents,
+                    details.outside_diff,
                     now,
                 ],
             )?;
@@ -9999,6 +10002,21 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records the containing review URL for a finding rendered in the review
+    /// body without changing whether its inline publication succeeded.
+    pub fn update_code_review_finding_review_url(
+        &self,
+        id: &str,
+        review_url: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET github_comment_url = ?2
+             WHERE id = ?1",
+            params![id, review_url],
+        )? > 0)
     }
 
     /// Records a finding's published comment coordinates. A comment landing
@@ -10280,7 +10298,8 @@ impl Store {
                     f.evidence, f.origin, f.prompt_for_agents, f.status, f.github_comment_id,
                     f.github_comment_url, f.github_publication_status,
                     f.github_thread_id, f.resolved_at,
-                    j.head_sha, f.resolved_head, f.resolved_by_job_id
+                    j.head_sha, f.resolved_head, f.resolved_by_job_id,
+                    f.outside_diff
              FROM code_review_findings f
              JOIN code_review_jobs j ON j.id = f.job_id
              WHERE f.collapse_pending = 1
@@ -10331,6 +10350,7 @@ impl Store {
                         observed_head: row.get(21)?,
                         resolved_head: row.get(22)?,
                         resolved_by_job_id: row.get(23)?,
+                        outside_diff: row.get(24)?,
                     },
                 ))
             })?
@@ -10363,7 +10383,7 @@ impl Store {
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at,
                         (SELECT head_sha FROM code_review_jobs WHERE id = code_review_findings.job_id),
-                        resolved_head, resolved_by_job_id
+                        resolved_head, resolved_by_job_id, outside_diff
                  FROM code_review_findings
                  WHERE job_id = ?1{status_filter} ORDER BY path, line, id"
             ))?;
@@ -10398,6 +10418,7 @@ impl Store {
                     observed_head: row.get(18)?,
                     resolved_head: row.get(19)?,
                     resolved_by_job_id: row.get(20)?,
+                    outside_diff: row.get(21)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -10548,7 +10569,7 @@ impl Store {
                         f.prompt_for_agents, f.status, f.github_comment_id,
                         f.github_comment_url, f.github_publication_status,
                         f.github_thread_id, f.resolved_at, j.head_sha,
-                        f.resolved_head, f.resolved_by_job_id
+                        f.resolved_head, f.resolved_by_job_id, f.outside_diff
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -10582,6 +10603,7 @@ impl Store {
                     observed_head: row.get(18)?,
                     resolved_head: row.get(19)?,
                     resolved_by_job_id: row.get(20)?,
+                    outside_diff: row.get(21)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -10665,7 +10687,8 @@ impl Store {
                         f.github_thread_id, f.resolved_at,
                         f.github_thread_resolved, f.github_thread_generation,
                         f.github_thread_recheck_pending, f.evidence, f.origin,
-                        j.head_sha, f.resolved_head, f.resolved_by_job_id
+                        j.head_sha, f.resolved_head, f.resolved_by_job_id,
+                        f.outside_diff
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -10702,6 +10725,7 @@ impl Store {
                         observed_head: row.get(21)?,
                         resolved_head: row.get(22)?,
                         resolved_by_job_id: row.get(23)?,
+                        outside_diff: row.get(24)?,
                     },
                     is_resolved: row.get(16)?,
                     generation: row.get::<_, i64>(17)? as u64,
@@ -11964,20 +11988,20 @@ impl Store {
         if !prepared {
             return Ok(false);
         }
-        let existing: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM code_review_publication_manifest WHERE job_id = ?1",
+        // A rejected request can be retried with a different representation
+        // (for example, inline comments moved into the review body). Persist
+        // the exact next request before crossing the dispatch boundary.
+        tx.execute(
+            "DELETE FROM code_review_publication_manifest WHERE job_id = ?1",
             params![job_id],
-            |row| row.get(0),
         )?;
-        if existing == 0 {
-            for (finding_id, primary_finding_id, publication_status) in entries {
-                tx.execute(
-                    "INSERT INTO code_review_publication_manifest
-                            (job_id, finding_id, primary_finding_id, publication_status)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![job_id, finding_id, primary_finding_id, publication_status],
-                )?;
-            }
+        for (finding_id, primary_finding_id, publication_status) in entries {
+            tx.execute(
+                "INSERT INTO code_review_publication_manifest
+                        (job_id, finding_id, primary_finding_id, publication_status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![job_id, finding_id, primary_finding_id, publication_status],
+            )?;
         }
         tx.commit()?;
         Ok(true)
@@ -21114,6 +21138,7 @@ mod tests {
                     },
                     origin: trouve_protocol::CodeReviewFindingOrigin::NewChange,
                     theme_ids: vec!["rvth-test".into()],
+                    outside_diff: true,
                 }],
                 &[NewCodeReviewTheme {
                     id: "rvth-test".into(),
@@ -21154,6 +21179,7 @@ mod tests {
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.findings[0].confidence, "high");
+        assert!(detail.findings[0].outside_diff);
         assert_eq!(
             detail.findings[0].evidence.consequence,
             "the failure is silently ignored"

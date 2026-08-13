@@ -1971,8 +1971,9 @@ export interface components {
             samples: number;
         };
         /**
-         * @description A confirmed issue produced by the coordinator and, when possible,
-         *     published as an inline GitHub review comment.
+         * @description A confirmed issue produced by the coordinator. Findings on commentable
+         *     diff lines are published as inline GitHub review comments; findings whose
+         *     strongest valid anchor is unchanged code are published in the review body.
          */
         CodeReviewFinding: {
             body: string;
@@ -1994,6 +1995,11 @@ export interface components {
             /** @description Immutable PR head on which this finding was first observed. */
             observed_head?: string;
             origin?: components["schemas"]["CodeReviewFindingOrigin"];
+            /**
+             * @description The finding is anchored to a head-revision line that GitHub cannot
+             *     represent as an inline pull-request diff comment.
+             */
+            outside_diff?: boolean;
             path: string;
             prompt_for_agents?: string;
             /** Format: date-time */

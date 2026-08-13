@@ -161,6 +161,7 @@ describe("pull request dashboard model", () => {
                 path: "src/main.ts",
                 line: 17,
                 side: "RIGHT",
+                outside_diff: true,
                 title: "Failure path is ignored",
                 severity: "high",
                 confidence: "high",
@@ -236,6 +237,7 @@ describe("pull request dashboard model", () => {
       reviewPrompt: "Fix every confirmed issue.",
       reviewFindings: [
         {
+          outsideDiff: true,
           location: "src/main.ts:17",
           title: "Failure path is ignored",
           severity: "high",
@@ -244,6 +246,7 @@ describe("pull request dashboard model", () => {
           publicationStatus: "published",
         },
         {
+          outsideDiff: false,
           location: "src/legacy.ts:9",
           title: "Legacy finding",
           severity: "medium",

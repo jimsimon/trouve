@@ -3,7 +3,7 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -49,6 +49,14 @@ pub struct SessionDiffStat {
     pub additions: u64,
     pub deletions: u64,
     pub binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewAnchorValidationLimits {
+    pub tree_bytes: usize,
+    pub distinct_blobs: usize,
+    pub blob_bytes: usize,
+    pub total_blob_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -2978,6 +2986,118 @@ fn session_diff_path_with_cancel(
     })
 }
 
+/// Keep only anchors that identify an existing line in a tracked regular
+/// file at the immutable review head. The caller reaches this through
+/// `ToolExecutor`; keeping git and object reads here centralizes the exact
+/// repository semantics. Anchors whose blobs exceed the per-blob, distinct,
+/// or aggregate content budgets are invalid; repository and executor failures
+/// still fail validation.
+pub fn valid_review_anchors(
+    worktree: &Path,
+    head_sha: &str,
+    anchors: &[crate::tools::ReviewAnchor],
+    limits: ReviewAnchorValidationLimits,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<crate::tools::ReviewAnchor>> {
+    ensure_safe_ref(head_sha)?;
+    let operation =
+        GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review anchor validation");
+    let tree = run_git_bounded(
+        worktree,
+        None,
+        &["ls-tree", "-r", "-l", "-z", "--full-tree", head_sha],
+        None,
+        limits.tree_bytes,
+        &operation,
+    )
+    .context("reading bounded review tree metadata")?;
+    if tree.truncated {
+        bail!(
+            "review tree metadata exceeds the {}-byte limit",
+            limits.tree_bytes
+        );
+    }
+    let regular_blobs = review_tree_regular_blobs(&tree.bytes);
+
+    let mut line_counts = HashMap::new();
+    let mut invalid_blobs = HashSet::new();
+    let mut total_blob_bytes = 0_usize;
+    let mut valid = Vec::new();
+    for anchor in anchors {
+        operation.check()?;
+        let Some((object_id, object_size)) = regular_blobs.get(&anchor.path) else {
+            continue;
+        };
+        if anchor.line == 0 || invalid_blobs.contains(object_id) {
+            continue;
+        }
+        let line_count = if let Some(count) = line_counts.get(object_id) {
+            *count
+        } else {
+            if line_counts.len() >= limits.distinct_blobs {
+                invalid_blobs.insert(object_id.clone());
+                continue;
+            }
+            let remaining = limits.total_blob_bytes.saturating_sub(total_blob_bytes);
+            if remaining == 0 {
+                invalid_blobs.insert(object_id.clone());
+                continue;
+            }
+            let output_limit = limits.blob_bytes.min(remaining);
+            if *object_size > output_limit {
+                invalid_blobs.insert(object_id.clone());
+                continue;
+            }
+            let contents = run_git_bounded(
+                worktree,
+                None,
+                &["cat-file", "blob", object_id],
+                None,
+                output_limit,
+                &operation,
+            )
+            .with_context(|| format!("reading bounded review anchor blob for {:?}", anchor.path))?;
+            if contents.truncated {
+                invalid_blobs.insert(object_id.clone());
+                continue;
+            }
+            total_blob_bytes = total_blob_bytes
+                .checked_add(contents.bytes.len())
+                .context("review anchor blob byte count overflow")?;
+            let contents = contents.bytes;
+            let count = if contents.is_empty() {
+                0
+            } else {
+                contents.iter().filter(|byte| **byte == b'\n').count()
+                    + usize::from(!contents.ends_with(b"\n"))
+            };
+            line_counts.insert(object_id.clone(), count);
+            count
+        };
+        if usize::try_from(anchor.line).is_ok_and(|line| line <= line_count) {
+            valid.push(anchor.clone());
+        }
+    }
+    Ok(valid)
+}
+
+fn review_tree_regular_blobs(tree: &[u8]) -> HashMap<String, (String, usize)> {
+    tree.split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            let metadata = std::str::from_utf8(&entry[..tab]).ok()?;
+            let path = std::str::from_utf8(&entry[tab + 1..]).ok()?;
+            let mut fields = metadata.split_whitespace();
+            let mode = fields.next()?;
+            let kind = fields.next()?;
+            let object_id = fields.next()?;
+            let object_size = fields.next()?.parse::<usize>().ok()?;
+            (kind == "blob" && matches!(mode, "100644" | "100755"))
+                .then(|| (path.to_string(), (object_id.to_string(), object_size)))
+        })
+        .collect()
+}
+
 /// Common ancestor used by a pull-request comparison.
 pub fn merge_base(repo: &Path, base_ref: &str, head_ref: &str) -> Result<String> {
     merge_base_cancellable(
@@ -3848,6 +3968,138 @@ mod tests {
         assert!(first.contains("+two"));
         assert!(second.contains("+added"));
         assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
+    }
+
+    #[test]
+    fn review_anchors_resolve_regular_file_lines_at_the_immutable_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(tmp.path().join("deleted.txt"), "old\n").unwrap();
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "add source"]);
+        std::fs::remove_file(tmp.path().join("deleted.txt")).unwrap();
+        run(tmp.path(), &["add", "-A"]);
+        run(tmp.path(), &["commit", "-m", "delete old file"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // Mutable worktree content must not affect anchors for the review commit.
+        std::fs::write(tmp.path().join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        let anchors = vec![
+            crate::tools::ReviewAnchor {
+                path: "a.txt".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "src/lib.rs".into(),
+                line: 2,
+            },
+            crate::tools::ReviewAnchor {
+                path: "src/lib.rs".into(),
+                line: 3,
+            },
+            crate::tools::ReviewAnchor {
+                path: "missing.rs".into(),
+                line: 1,
+            },
+            crate::tools::ReviewAnchor {
+                path: "deleted.txt".into(),
+                line: 1,
+            },
+        ];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let limits = ReviewAnchorValidationLimits {
+            tree_bytes: 1024 * 1024,
+            distinct_blobs: 16,
+            blob_bytes: 1024 * 1024,
+            total_blob_bytes: 4 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            valid_review_anchors(tmp.path(), &head, &anchors, limits, &cancel).unwrap(),
+            anchors[..2]
+        );
+
+        let tree_error = format!(
+            "{:#}",
+            valid_review_anchors(
+                tmp.path(),
+                &head,
+                &anchors,
+                ReviewAnchorValidationLimits {
+                    tree_bytes: 1,
+                    ..limits
+                },
+                &cancel,
+            )
+            .unwrap_err()
+        );
+        assert!(tree_error.contains("tree metadata"), "{tree_error}");
+
+        assert!(
+            valid_review_anchors(
+                tmp.path(),
+                &head,
+                &anchors[1..2],
+                ReviewAnchorValidationLimits {
+                    blob_bytes: 1,
+                    ..limits
+                },
+                &cancel,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            valid_review_anchors(
+                tmp.path(),
+                &head,
+                &anchors[..2],
+                ReviewAnchorValidationLimits {
+                    distinct_blobs: 1,
+                    ..limits
+                },
+                &cancel,
+            )
+            .unwrap(),
+            anchors[..1]
+        );
+        assert_eq!(
+            valid_review_anchors(
+                tmp.path(),
+                &head,
+                &anchors[..2],
+                ReviewAnchorValidationLimits {
+                    total_blob_bytes: 4,
+                    ..limits
+                },
+                &cancel,
+            )
+            .unwrap(),
+            anchors[..1]
+        );
+
+        cancel.cancel();
+        let cancelled = format!(
+            "{:#}",
+            valid_review_anchors(tmp.path(), &head, &anchors, limits, &cancel).unwrap_err()
+        );
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+    }
+
+    #[test]
+    fn review_tree_paths_are_never_matched_through_lossy_utf8() {
+        let tree = b"100644 blob invalid 1\tbad-\xff.rs\0\
+                     100644 blob valid 1\tbad-\xef\xbf\xbd.rs\0";
+
+        let blobs = review_tree_regular_blobs(tree);
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(
+            blobs.get("bad-\u{fffd}.rs"),
+            Some(&("valid".to_string(), 1))
+        );
     }
 
     #[test]

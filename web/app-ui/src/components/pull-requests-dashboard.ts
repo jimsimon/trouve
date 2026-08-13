@@ -698,7 +698,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                       @click=${() => this.#fix(row, finding.prompt)}
                     >Fix</button>
                   </div>
-                  <small>Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}${finding.origin === "new_change" ? nothing : ` · ${finding.origin.replaceAll("_", " ")}`}</small>
+                  <small>${finding.outsideDiff ? "Outside diff · " : ""}Identified at ${finding.location} · Severity: ${finding.severity} · Confidence: ${finding.confidence}${finding.origin === "new_change" ? nothing : ` · ${finding.origin.replaceAll("_", " ")}`}</small>
                   <p>${finding.body}</p>
                   ${finding.themes.map((theme) => html`
                     <p><strong>Shared root cause:</strong> ${theme.rootCause}</p>

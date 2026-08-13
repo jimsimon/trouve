@@ -292,7 +292,9 @@ pub use requests::*;
 // background upgrades (additive).
 // 7.9: session creation accepts an additive idempotency key so clients can
 // safely retry when a committed response is lost.
-pub const PROTOCOL_VERSION: &str = "7.9";
+// 7.10: code-review findings identify verified RIGHT-side anchors outside the
+// pull-request diff so clients can distinguish review-level comments.
+pub const PROTOCOL_VERSION: &str = "7.10";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

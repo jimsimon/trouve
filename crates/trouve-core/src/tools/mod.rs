@@ -946,6 +946,15 @@ pub trait ToolExecutor: Send + Sync {
                 .collect()
         })
     }
+    /// Resolve proposed outside-diff anchors against the immutable review
+    /// head. Only tracked regular files and existing RIGHT-side lines are
+    /// returned.
+    async fn review_repository_valid_anchors(
+        &self,
+        _request: &ReviewRepositoryAnchors,
+    ) -> Result<Vec<ReviewAnchor>, String> {
+        Err("review repository anchor validation is unavailable in this executor".into())
+    }
     /// Resolve one review merge base through the audited executor chokepoint.
     async fn review_repository_merge_base(
         &self,
@@ -1042,6 +1051,24 @@ pub struct ReviewRepositoryDiff {
     pub max_files: usize,
     pub max_changed_lines: u64,
     pub max_bytes: usize,
+}
+
+pub struct ReviewRepositoryAnchors {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub anchors: Vec<ReviewAnchor>,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub max_tree_bytes: usize,
+    pub max_distinct_blobs: usize,
+    pub max_blob_bytes: usize,
+    pub max_total_blob_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewAnchor {
+    pub path: String,
+    pub line: u64,
 }
 
 pub struct ReviewRepositoryMergeBase {
@@ -3297,6 +3324,38 @@ impl ToolExecutor for LocalToolExecutor {
         })
         .await
         .map_err(|error| format!("review diff manifest task failed: {error}"))?
+    }
+
+    async fn review_repository_valid_anchors(
+        &self,
+        request: &ReviewRepositoryAnchors,
+    ) -> Result<Vec<ReviewAnchor>, String> {
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let head_sha = request.head_sha.clone();
+        let anchors = request.anchors.clone();
+        let cancel = request.cancel.clone();
+        let max_tree_bytes = request.max_tree_bytes;
+        let max_distinct_blobs = request.max_distinct_blobs;
+        let max_blob_bytes = request.max_blob_bytes;
+        let max_total_blob_bytes = request.max_total_blob_bytes;
+        tokio::task::spawn_blocking(move || {
+            crate::git::valid_review_anchors(
+                &worktree,
+                &head_sha,
+                &anchors,
+                crate::git::ReviewAnchorValidationLimits {
+                    tree_bytes: max_tree_bytes,
+                    distinct_blobs: max_distinct_blobs,
+                    blob_bytes: max_blob_bytes,
+                    total_blob_bytes: max_total_blob_bytes,
+                },
+                &cancel,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review anchor validation task failed: {error}"))?
     }
 
     async fn review_repository_merge_base(
