@@ -232,7 +232,6 @@ The Lit frontend's npm inventory is generated separately in
 | fnv | 1.0.7 | Apache-2.0 / MIT | registry+https://github.com/rust-lang/crates.io-index |
 | foldhash | 0.1.5 | Zlib | registry+https://github.com/rust-lang/crates.io-index |
 | foldhash | 0.2.0 | Zlib | registry+https://github.com/rust-lang/crates.io-index |
-| font-types | 0.11.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | font-types | 0.12.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | fontconfig-parser | 0.5.8 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | fontdb | 0.23.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -268,16 +267,15 @@ The Lit frontend's npm inventory is generated separately in
 | gimli | 0.32.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | gl_generator | 0.14.0 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | gleam | 0.15.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| glifo | 0.1.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| glifo | 0.3.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | glob | 0.3.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
 | glslopt | 0.1.14 | MIT | registry+https://github.com/rust-lang/crates.io-index |
-| grid | 1.0.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | group | 0.14.0 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | guillotiere | 0.7.0 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | h2 | 0.4.15 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | half | 2.7.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| harfbuzz-sys | 0.7.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| harfbuzz-sys | 0.8.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | harfrust | 0.12.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | hash2curve | 0.14.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | hashbrown | 0.15.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -421,8 +419,8 @@ The Lit frontend's npm inventory is generated separately in
 | module-lattice | 0.2.3 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | mozangle | 0.6.0 | BSD-3-Clause | registry+https://github.com/rust-lang/crates.io-index |
-| mozjs | 0.21.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| mozjs_sys | 140.13.0-0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| mozjs | 0.21.3 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| mozjs_sys | 140.13.0-3 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | ndk | 0.9.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | ndk-context | 0.1.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | ndk-sys | 0.6.0+11769913 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -567,7 +565,6 @@ The Lit frontend's npm inventory is generated separately in
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
 | rayon | 1.12.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| read-fonts | 0.39.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | read-fonts | 0.41.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | reborrow | 0.5.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | redox_syscall | 0.4.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
@@ -583,7 +580,6 @@ The Lit frontend's npm inventory is generated separately in
 | rfd | 0.17.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | rgb | 0.8.53 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | ring | 0.17.14 | Apache-2.0 AND ISC | registry+https://github.com/rust-lang/crates.io-index |
-| ron | 0.12.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | roxmltree | 0.21.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | rsa | 0.10.0-rc.18 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -613,9 +609,8 @@ The Lit frontend's npm inventory is generated separately in
 | sec1 | 0.8.1 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| selectors | 0.39.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
+| selectors | 0.40.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
 | semver | 1.0.28 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| seq-macro | 0.3.6 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_bytes | 0.11.19 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -626,63 +621,63 @@ The Lit frontend's npm inventory is generated separately in
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | serdect | 0.4.3 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
-| servo | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-allocator | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-background-hang-monitor | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-background-hang-monitor-api | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-base | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-canvas | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-canvas-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-config | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-config-macro | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-constellation | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-constellation-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-default-resources | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-deny-public-fields | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-devtools | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-devtools-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-dom-struct | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-embedder-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-fonts | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-fonts-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-geometry | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-hyper-serde | 0.4.0 | MIT OR Apache-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-jstraceable-derive | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-layout | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-layout-api | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-malloc-size-of | 0.4.0 | MIT OR Apache-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-audio | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-derive | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-dummy | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-ohos | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-player | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-streams | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-thread | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-media-webrtc | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-metrics | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-net | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-net-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-paint | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-paint-api | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-pixels | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-profile | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-profile-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-script | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-script-bindings | 0.4.0 | MPL-2.0 AND BSD-3-Clause | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-script-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-storage | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-storage-traits | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-timers | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-tracing | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-url | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-wakelock | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-webgl | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-webvtt | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-webxr-api | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo-xpath | 0.4.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=35672cc3d4beb768489f5218e73bee7aff0ddb01#35672cc3d4beb768489f5218e73bee7aff0ddb01 |
-| servo_arc | 0.4.3 | MIT OR Apache-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
+| servo | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-allocator | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-background-hang-monitor | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-background-hang-monitor-api | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-base | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-canvas | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-canvas-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-config | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-config-macro | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-constellation | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-constellation-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-default-resources | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-deny-public-fields | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-devtools | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-devtools-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-dom-struct | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-embedder-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-fonts | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-fonts-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-geometry | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-hyper-serde | 0.5.0 | MIT OR Apache-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-jstraceable-derive | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-layout | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-layout-api | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-malloc-size-of | 0.5.0 | MIT OR Apache-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-audio | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-derive | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-dummy | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-ohos | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-player | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-streams | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-thread | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-media-webrtc | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-metrics | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-net | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-net-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-paint | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-paint-api | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-pixels | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-profile | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-profile-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-script | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-script-bindings | 0.5.0 | MPL-2.0 AND BSD-3-Clause | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-script-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-storage | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-storage-traits | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-timers | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-tracing | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-url | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-wakelock | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-webgl | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-webvtt | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-webxr-api | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo-xpath | 0.5.0 | MPL-2.0 | git+https://github.com/servo/servo.git?rev=42892b088a2ea622cd07786416545f7cd20f76ae#42892b088a2ea622cd07786416545f7cd20f76ae |
+| servo_arc | 0.4.3 | MIT OR Apache-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
 | sha1 | 0.10.7 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sha1 | 0.11.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | sha1_smol | 1.0.1 | BSD-3-Clause | registry+https://github.com/rust-lang/crates.io-index |
@@ -702,7 +697,6 @@ The Lit frontend's npm inventory is generated separately in
 | simdutf8 | 0.1.5 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | simplecss | 0.2.2 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | siphasher | 1.0.3 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| skrifa | 0.42.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | skrifa | 0.44.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | slab | 0.4.12 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | slotmap | 1.1.1 | Zlib | registry+https://github.com/rust-lang/crates.io-index |
@@ -725,13 +719,13 @@ The Lit frontend's npm inventory is generated separately in
 | strsim | 0.11.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | strum | 0.28.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | strum_macros | 0.28.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
-| stylo | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_atoms | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_derive | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_dom | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_malloc_size_of | 0.19.0 | MIT OR Apache-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_static_prefs | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| stylo_traits | 0.19.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
+| stylo | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_atoms | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_derive | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_dom | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_malloc_size_of | 0.20.0 | MIT OR Apache-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_static_prefs | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| stylo_traits | 0.20.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
 | subtle | 2.6.1 | BSD-3-Clause | registry+https://github.com/rust-lang/crates.io-index |
 | surfman | 0.13.0 | MIT OR Apache-2.0 OR MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | svg_fmt | 0.4.5 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -742,7 +736,7 @@ The Lit frontend's npm inventory is generated separately in
 | sync_wrapper | 1.0.2 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | synstructure | 0.13.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | sys-locale | 0.3.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| taffy | 0.12.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
+| taffy | 0.13.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tar | 0.4.46 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tauri-winrt-notification | 0.7.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -754,8 +748,6 @@ The Lit frontend's npm inventory is generated separately in
 | thiserror-impl | 2.0.19 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | thread_local | 1.1.10 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tiff | 0.11.3 | MIT | registry+https://github.com/rust-lang/crates.io-index |
-| tikv-jemalloc-sys | 0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| tikv-jemallocator | 0.6.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | time | 0.3.54 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | time-core | 0.1.9 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | time-macros | 0.2.32 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -767,8 +759,8 @@ The Lit frontend's npm inventory is generated separately in
 | tinystr | 0.8.3 | Unicode-3.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tinyvec | 1.12.0 | Zlib OR Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib | registry+https://github.com/rust-lang/crates.io-index |
-| to_shmem | 0.5.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
-| to_shmem_derive | 0.1.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=2d289c14fdf46952d52cabce63b1f0dc55b2ccde#2d289c14fdf46952d52cabce63b1f0dc55b2ccde |
+| to_shmem | 0.5.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
+| to_shmem_derive | 0.1.0 | MPL-2.0 | git+https://github.com/servo/stylo?rev=f6d1d525db9a7fb1aa0842926458e63faa4f44c7#f6d1d525db9a7fb1aa0842926458e63faa4f44c7 |
 | tokio | 1.53.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tokio-macros | 2.7.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -794,8 +786,6 @@ The Lit frontend's npm inventory is generated separately in
 | try-lock | 0.2.5 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | tungstenite | 0.30.0 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| turboshake | 0.7.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| typeid | 1.0.3 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | uds_windows | 1.2.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | uluru | 3.1.0 | MPL-2.0 | registry+https://github.com/rust-lang/crates.io-index |
@@ -826,8 +816,8 @@ The Lit frontend's npm inventory is generated separately in
 | v_frame | 0.3.9 | BSD-2-Clause | registry+https://github.com/rust-lang/crates.io-index |
 | valuable | 0.1.1 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
-| vello_common | 0.0.9 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
-| vello_cpu | 0.0.9 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| vello_common | 0.2.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
+| vello_cpu | 0.2.0 | Apache-2.0 OR MIT | registry+https://github.com/rust-lang/crates.io-index |
 | version_check | 0.9.5 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | void | 1.0.2 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | walkdir | 2.5.0 | Unlicense/MIT | registry+https://github.com/rust-lang/crates.io-index |
