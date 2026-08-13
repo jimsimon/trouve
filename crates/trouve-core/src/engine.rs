@@ -10007,9 +10007,13 @@ impl Engine {
         };
 
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
-        let mode = personas::find_persona(&all_modes, &thread.mode)
+        let mut mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(personas::fallback_persona);
+        let background = self.store.is_code_review_thread(&thread.id)?;
+        if background {
+            mode = personas::secure_automated_review_persona(mode);
+        }
         // A turn owns only a shared session lifecycle lease. Sibling turns in
         // the same worktree may reason and invoke tools concurrently; the
         // narrower tool-execution lane is the authority that serializes
@@ -10021,7 +10025,6 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let background = self.store.is_code_review_thread(&thread.id)?;
         let turn_capacity = self
             .turn_scheduler
             .acquire(&thread.model, background, &cancel)
@@ -10147,7 +10150,14 @@ impl Engine {
             }
         }
 
-        let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        let mut system =
+            context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        if background {
+            // Context assembly intentionally layers trusted workspace
+            // instructions after the persona. Repeat the immutable review
+            // guard last so no configurable layer can weaken it.
+            personas::append_automated_review_security_prompt(&mut system);
+        }
         let live_models = tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -11170,9 +11180,12 @@ impl Engine {
             .map_err(EngineError::Internal)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
-        let mode = personas::find_persona(&all_modes, &thread.mode)
+        let mut mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(personas::fallback_persona);
+        if self.store.is_code_review_thread(&thread.id)? {
+            mode = personas::secure_automated_review_persona(mode);
+        }
         let worktree = PathBuf::from(&session.worktree_path);
         let canonical_worktree = worktree
             .canonicalize()
