@@ -4525,6 +4525,14 @@ fn update_thread_row(
     let updated = conn.execute(
         "UPDATE threads
          SET mode = COALESCE(?2, mode),
+             route_provider_id = CASE
+                 WHEN ?3 IS NOT NULL AND ?3 <> model THEN NULL
+                 ELSE route_provider_id
+             END,
+             route_provider_model = CASE
+                 WHEN ?3 IS NOT NULL AND ?3 <> model THEN NULL
+                 ELSE route_provider_model
+             END,
              model = COALESCE(?3, model),
              model_options = COALESCE(?4, model_options),
              permission_mode = COALESCE(?5, permission_mode)

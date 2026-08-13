@@ -6,6 +6,7 @@ import type {
 } from "../services/protocol-client.js";
 import {
   ProviderLoginPoller,
+  movedProviderOrder,
   providerSubmission,
   validatedHttpsUrl,
   type LoginPollScheduler,
@@ -56,6 +57,13 @@ const preset: ProtocolKnownProvider = {
 };
 
 describe("provider settings security boundaries", () => {
+  it("moves providers within a normalized complete preference order", () => {
+    expect(movedProviderOrder(["codex", "stale"], ["openai", "codex", "cursor"], "cursor", -1))
+      .toEqual(["codex", "cursor", "openai"]);
+    expect(movedProviderOrder(["codex", "openai"], ["openai", "codex"], "codex", -1))
+      .toEqual(["codex", "openai"]);
+  });
+
   it("accepts only HTTPS authorization URLs", () => {
     expect(validatedHttpsUrl("https://auth.example.test/device?flow=1")).toBe(
       "https://auth.example.test/device?flow=1",

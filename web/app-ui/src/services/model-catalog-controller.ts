@@ -1,12 +1,14 @@
-import type {
-  ProtocolClient,
-  ProtocolModelInfo,
-} from "./protocol-client.js";
+import type { ProtocolModelInfo } from "./protocol-client.js";
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 
 export type ModelCatalogFreshness = "if-stale" | "force";
 
 const DEFAULT_LIVE_TTL_MS = 300_000;
+
+interface ModelCatalogProtocol {
+  models(): Promise<readonly ProtocolModelInfo[]>;
+  modelRoutes(): Promise<readonly ProtocolModelInfo[]>;
+}
 
 /** App-wide stale-while-revalidate model catalog.
  *
@@ -16,7 +18,7 @@ const DEFAULT_LIVE_TTL_MS = 300_000;
  * any setup or composer control behind ACP startup.
  */
 export class ModelCatalogController {
-  readonly #protocol: Pick<ProtocolClient, "models" | "refreshModels">;
+  readonly #protocol: ModelCatalogProtocol;
   readonly #now: () => number;
   readonly #liveTtlMs: number;
   readonly #current = createSignal<readonly ProtocolModelInfo[]>(
@@ -47,7 +49,7 @@ export class ModelCatalogController {
   #generation = 0;
 
   constructor(
-    protocol: Pick<ProtocolClient, "models" | "refreshModels">,
+    protocol: ModelCatalogProtocol,
     options: { readonly now?: () => number; readonly liveTtlMs?: number } = {},
   ) {
     this.#protocol = protocol;
@@ -172,7 +174,7 @@ export class ModelCatalogController {
     this.#refreshing.set(true);
     let request: Promise<readonly ProtocolModelInfo[]>;
     try {
-      request = this.#protocol.refreshModels();
+      request = this.#protocol.modelRoutes();
     } catch (error: unknown) {
       request = Promise.reject(error);
     }

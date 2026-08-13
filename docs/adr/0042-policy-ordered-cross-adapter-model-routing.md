@@ -1,6 +1,6 @@
-# 0021 — Policy-ordered cross-adapter model routing
+# 0042 — Policy-ordered cross-adapter model routing
 
-Status: Accepted (2026-07).
+Status: Accepted (2026-08).
 
 ## Context
 
@@ -68,9 +68,10 @@ extend grouping without changing the picker or turn protocol.
 
 ## Consequences
 
-- A picker normally shows a bare hosted model id such as `gpt-5.6-sol`, while
-  local and transport-owned entries remain visibly qualified, such as
-  `local/qwen2.5-coder:7b` or `cursor/default`.
+- The original picker policy showed a bare hosted model id such as
+  `gpt-5.6-sol`, while local and transport-owned entries remained visibly
+  qualified. ADR 0043 supersedes that identifier and concrete-choice policy by
+  emitting `auto/<model>` alongside concrete `provider/<model>` choices.
 - API routes and vendor-agent backends can replace one another within a turn
   without weakening permission or tool policy.
 - A cold configuration may need more than one turn to discover a working

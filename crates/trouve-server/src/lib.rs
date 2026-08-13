@@ -41,16 +41,16 @@ use trouve_protocol::{
     PROTOCOL_VERSION, PersonaInfo, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo,
     ProviderInfo, ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
-    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
-    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
-    SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, Workspace,
+    ReviewerProfile, RoutedModelInfo, Scope, SendMessageRequest, ServerInfo, ServerProjection,
+    Session, SessionDiff, SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff,
+    SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest,
+    SetLocalEnabledRequest, SetMcpServerEnabledRequest, SetProviderOrderRequest, SteerAccepted,
+    SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalReplayStart,
+    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -143,6 +143,7 @@ impl IntoResponse for ApiError {
         resolve_approval,
         resolve_question,
         list_models,
+        list_model_routes,
         refresh_models,
         list_personas,
         list_persona_infos,
@@ -615,6 +616,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
+        .route("/v1/model-routes", get(list_model_routes))
         .route("/v1/models/refresh", get(refresh_models))
         .route("/v1/personas", get(list_personas))
         .route("/v1/persona-infos", get(list_persona_infos))
@@ -1762,6 +1764,11 @@ async fn resolve_question(
 #[utoipa::path(get, path = "/v1/models", responses((status = 200, body = [ModelInfo])))]
 async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
     Json(engine.list_models().await)
+}
+
+#[utoipa::path(get, path = "/v1/model-routes", responses((status = 200, body = [RoutedModelInfo])))]
+async fn list_model_routes(State(engine): State<Arc<Engine>>) -> Json<Vec<RoutedModelInfo>> {
+    Json(engine.list_model_routes().await)
 }
 
 #[utoipa::path(get, path = "/v1/models/refresh", responses((status = 200, body = [ModelInfo])))]

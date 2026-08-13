@@ -1,17 +1,19 @@
-# 0022 — Explicit and sticky model route selection
+# 0043 — Explicit and sticky model route selection
 
-Status: Accepted (2026-07).
+Status: Accepted (2026-08).
 
 ## Context
 
-ADR 0021 introduced provider-neutral model selection and bounded failover, but
+ADR 0042 introduced provider-neutral model selection and bounded failover, but
 its picker catalog replaced hosted provider-qualified choices with a bare model
 id. That hid the existing hard-pin behavior and made provider-specific usage
 details inaccessible from the model picker. Re-ranking every new turn could
 also move a conversation between healthy providers merely because reported
 headroom changed, forcing vendor backends to replay or digest history.
 
-This decision extends ADR 0021. It does not supersede it.
+This decision partially supersedes ADR 0042's picker-identifier and
+concrete-choice policy. Its route eligibility, handoff safety, and bounded
+failover rules remain in force.
 
 ## Decision
 
@@ -22,7 +24,7 @@ This decision extends ADR 0021. It does not supersede it.
   longer emitted by the picker catalog.
 - A concrete selection is a hard pin and never crosses providers. Automatic
   selections may cross API-provider and vendor-agent adapter boundaries under
-  ADR 0021's safe-handoff rules.
+  ADR 0042's safe-handoff rules.
 - The first successful route for an automatic selection becomes that thread's
   durable affinity. Later turns keep it ahead of provider preference, capacity
   headroom, and global learned-success ordering. An open circuit or explicitly

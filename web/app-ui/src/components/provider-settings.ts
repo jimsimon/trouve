@@ -56,6 +56,28 @@ export interface ProviderSubmission {
   readonly request: ProtocolUpsertProviderRequest;
 }
 
+export const movedProviderOrder = (
+  order: readonly string[],
+  configuredIds: readonly string[],
+  providerId: string,
+  direction: -1 | 1,
+): readonly string[] => {
+  const configured = new Set(configuredIds);
+  const normalized = [
+    ...order.filter((id, index) => configured.has(id) && order.indexOf(id) === index),
+    ...configuredIds.filter((id) => !order.includes(id)),
+  ];
+  const index = normalized.indexOf(providerId);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= normalized.length) return normalized;
+  const current = normalized[index];
+  const replacement = normalized[target];
+  if (current === undefined || replacement === undefined) return normalized;
+  normalized[index] = replacement;
+  normalized[target] = current;
+  return normalized;
+};
+
 /** Build the write request without ever putting write-only values in element
  * properties or rendered attributes. Callers should discard the result as
  * soon as the request settles. */
@@ -290,6 +312,12 @@ export class TrouveProviderSettings extends LitElement {
     .provider-picker > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
     .provider-save-row { display: flex; align-items: end; justify-content: flex-end; gap: 8px; }
     .provider-save-row input { min-width: 0; flex: 1; }
+    .routing-priority { display: grid; gap: 8px; }
+    .routing-priority > p { font-size: 11px; }
+    .priority-list { display: grid; gap: 4px; }
+    .priority-row { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+    .priority-rank { color: var(--trouve-text-dim); font-size: 11px; text-align: right; }
+    .priority-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .subscription-health { display: grid; gap: 12px; }
     .subscription-health > h3 { font-size: 16px; }
     .subscription-health > p { font-size: 11px; }
@@ -467,6 +495,8 @@ export class TrouveProviderSettings extends LitElement {
 
         <p class="provider-description">${description}</p>
 
+        ${allConfigured.length < 2 ? nothing : this.#renderRoutingPriority(allConfigured)}
+
         ${this.#notice === "" ? nothing : html`
           <p class=${`notice${this.#noticeIsError ? " error" : ""}`} role=${this.#noticeIsError ? "alert" : "status"} aria-live="polite">
             ${this.#notice}
@@ -603,6 +633,46 @@ export class TrouveProviderSettings extends LitElement {
               `}
         </div>
       </article>
+    `;
+  }
+
+  #renderRoutingPriority(configured: readonly ProtocolProviderInfo[]) {
+    const ids = configured.map((provider) => provider.id);
+    const order = movedProviderOrder(
+      this.#providers?.provider_order ?? [],
+      ids,
+      "",
+      1,
+    );
+    return html`
+      <section class="settings-card routing-priority" aria-labelledby="routing-priority-title">
+        <h3 id="routing-priority-title">Automatic routing priority</h3>
+        <p>The first healthy route is preferred for a new automatic model selection. Successful threads stay on their current provider until it fails or reports exhausted capacity.</p>
+        <div class="priority-list">
+          ${order.map((providerId, index) => html`
+            <div class="priority-row">
+              <span class="priority-rank">${index + 1}</span>
+              <strong>${providerId}</strong>
+              <div class="actions">
+                <button
+                  type="button"
+                  aria-label=${`Move ${providerId} earlier`}
+                  title="Prefer earlier"
+                  ?disabled=${index === 0 || this.#busy !== ""}
+                  @click=${() => void this.#moveProvider(providerId, -1)}
+                >${fontAwesomeIcon("arrow-up")}</button>
+                <button
+                  type="button"
+                  aria-label=${`Move ${providerId} later`}
+                  title="Prefer later"
+                  ?disabled=${index + 1 === order.length || this.#busy !== ""}
+                  @click=${() => void this.#moveProvider(providerId, 1)}
+                >${fontAwesomeIcon("arrow-down")}</button>
+              </div>
+            </div>
+          `)}
+        </div>
+      </section>
     `;
   }
 
@@ -916,6 +986,32 @@ export class TrouveProviderSettings extends LitElement {
       await this.#load();
     } catch {
       this.#setNotice("Provider could not be removed. Try again.", true);
+    } finally {
+      this.#busy = "";
+      this.requestUpdate();
+    }
+  }
+
+  async #moveProvider(providerId: string, direction: -1 | 1): Promise<void> {
+    const services = this.#services.value;
+    const providers = this.#providers;
+    if (services === undefined || providers === undefined || this.#busy !== "") return;
+    const configuredIds = providers.providers.map((provider) => provider.id);
+    const providerIds = movedProviderOrder(
+      providers.provider_order ?? [],
+      configuredIds,
+      providerId,
+      direction,
+    );
+    this.#busy = "provider-order";
+    this.#setNotice("Saving automatic routing priority…", false);
+    this.requestUpdate();
+    try {
+      await services.protocol.setProviderOrder({ provider_ids: [...providerIds] });
+      this.#providers = { ...providers, provider_order: [...providerIds] };
+      this.#setNotice("Automatic routing priority was updated.", false);
+    } catch {
+      this.#setNotice("Automatic routing priority could not be saved.", true);
     } finally {
       this.#busy = "";
       this.requestUpdate();

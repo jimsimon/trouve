@@ -92,6 +92,11 @@ These are load-bearing. Do not violate them without a new ADR.
     `trouve-process`. Process-tree creation holds that shared macOS boundary
     from sentinel setup through spawn; ordinary callers release it immediately
     after creating the child and wait outside it (ADR 0038).
+11. **Model identity is separate from execution route.** A concrete
+    `provider/model` selection is a hard pin. An `auto/model` selection may use
+    only catalog-compatible routes, preserves thread affinity while healthy,
+    and crosses adapters solely through the durable transcript/worktree
+    boundary under bounded failover (ADRs 0042 and 0043).
 
 ## Conventions
 

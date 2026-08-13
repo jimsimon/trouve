@@ -13,6 +13,7 @@ impl Engine {
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
+        prompt_persisted: &AtomicBool,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -27,12 +28,22 @@ impl Engine {
             .context("workspace vanished")?;
         let scope = Scope::Thread(thread.id.clone());
         let worktree = PathBuf::from(&session.worktree_path);
+        let canonical_worktree = worktree.canonicalize()?;
         let tool_ctx = ToolCtx {
+            cancel: cancel.clone(),
             worktree: worktree.clone(),
+            canonical_worktree: Some(canonical_worktree),
+            read_only_roots: crate::skills::trusted_read_roots(
+                self.config_dir.as_deref(),
+                Some(Path::new(&workspace.path)),
+            )
+            .into(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&workspace.path)),
+            edit_strategy: edit_strategy_for_model(&thread.model),
+            background_mutation_lease: None,
         };
 
         let modes =
@@ -51,10 +62,13 @@ impl Engine {
         let capacity_model = format!("{}/{}", first_route.provider_id, first_route.provider_model);
         let background = self.store.is_code_review_thread(&thread.id)?;
         let capacity_started = Instant::now();
-        let turn_capacity = self.turn_scheduler.acquire_global(background).await?;
+        let turn_capacity = self
+            .turn_scheduler
+            .acquire_global(background, &cancel)
+            .await?;
         let first_route_capacity = self
             .turn_scheduler
-            .acquire_provider(&capacity_model, background)
+            .acquire_provider(&capacity_model, background, &cancel)
             .await?;
         let capacity_wait_ms = capacity_started
             .elapsed()
@@ -75,19 +89,12 @@ impl Engine {
         )?;
 
         let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
-        let lock = self.session_lock(&session.id);
-        let _read_guard;
-        let _write_guard;
-        if concurrent_child {
-            _read_guard = None;
-            _write_guard = None;
-        } else if mode.read_only {
-            _read_guard = Some(lock.read().await);
-            _write_guard = None;
-        } else {
-            _read_guard = None;
-            _write_guard = Some(lock.write().await);
-        }
+        let session_lifecycle = self.session_lock(&session.id);
+        let _session_lifecycle_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = session_lifecycle.read() => guard,
+        };
         let _turn_capacity = turn_capacity;
 
         let has_native = candidates
@@ -101,14 +108,35 @@ impl Engine {
             .unwrap_or(first_route.info.context_window);
         let history_before = self.store.messages(&thread.id)?;
 
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-            },
-        )?;
+        if !prompt_persisted.load(Ordering::Acquire) {
+            let mut shell_options = self.store.thread_model_options(&thread.id)?;
+            normalize_thinking_option(&mut shell_options, Some(&first_route.info));
+            let thinking_level = resolved_thinking_level(&shell_options, Some(&first_route.info));
+            let supports_steering = matches!(
+                &first_route.executor,
+                ModelExecutor::Backend(backend) if tools_enabled && backend.supports_steering()
+            );
+            self.store
+                .append_events_async(
+                    scope.clone(),
+                    vec![
+                        Event::TurnStarted {
+                            turn,
+                            mode: thread.mode.clone(),
+                            model: thread.model.clone(),
+                            thinking_level,
+                            supports_steering,
+                        },
+                        Event::UserMessage {
+                            turn,
+                            content: prompt.content.clone(),
+                            attachments: prompt.attachments.clone(),
+                        },
+                    ],
+                )
+                .await?;
+            prompt_persisted.store(true, Ordering::Release);
+        }
         self.store.append_event(
             scope.clone(),
             Event::ModelRouteSelected {
@@ -119,15 +147,6 @@ impl Engine {
                 reason: "initial".into(),
             },
         )?;
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
-
         // Compaction must run before this turn's user message joins the
         // provider transcript. If a backend is selected first and later
         // hands off to native execution, the native route uses the full
@@ -143,33 +162,39 @@ impl Engine {
                     provider,
                     &native_route.provider_model,
                     failover_context_window,
+                    &cancel,
                 )
                 .await
         {
             tracing::warn!("compaction failed for {}: {error}", thread.id);
         }
 
-        let resolved = self.resolve_attachments(&attachments);
-        let routed_attachments = if has_native {
-            // Native tools only accept worktree-relative paths. Materialize
-            // up front so a backend -> native handoff can see every original
-            // attachment without mutating the transcript mid-turn.
-            materialize_attachments(&worktree, &resolved)
-        } else {
-            resolved
-        };
-        let (images, files): (Vec<_>, Vec<_>) = routed_attachments
+        // Materialization stays behind ToolExecutor and happens once before
+        // any cross-adapter handoff, so every route sees the same safe paths.
+        let materialized = self
+            .materialize_attachments_for_turn(&session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let stored_files = materialized
             .iter()
-            .cloned()
-            .partition(|(attachment, _)| attachment.mime.starts_with("image/"));
-        let stored_content = annotate_attachments(content.clone(), &routed_attachments);
-        let backend_content = annotate_attachments(content, &files);
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let stored_content = annotate_attachments(content.clone(), &stored_files);
+        let (images, files): (Vec<_>, Vec<_>) = materialized
+            .into_iter()
+            .partition(|file| file.attachment.mime.starts_with("image/"));
+        let backend_files = files
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let backend_content = annotate_attachments(content, &backend_files);
         let backend_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
-            .map(|(attachment, path)| trouve_agents::TurnAttachment {
-                name: attachment.name,
-                mime: attachment.mime,
-                path,
+            .map(|file| trouve_agents::TurnAttachment {
+                name: file.attachment.name,
+                mime: file.attachment.mime,
+                bytes: file.bytes,
+                local_path: Some(file.absolute_path),
             })
             .collect();
         self.store.append_message(
@@ -183,21 +208,20 @@ impl Engine {
 
         let mut specs = Vec::new();
         if has_native && tools_enabled {
-            specs = self
-                .executor
-                .specs(&tool_ctx)
-                .await
-                .into_iter()
-                .filter(|spec| {
-                    mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name)
-                })
-                .collect();
+            specs = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                specs = self.executor.specs(&tool_ctx) => specs,
+            }
+            .into_iter()
+            .filter(|spec| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
+            .collect();
             specs.push(ask_question_spec());
             specs.push(search_transcript_spec());
             let spawn_allowed = |name: &str| {
                 mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
             };
-            if self.store.spawn_parent(&thread.id)?.is_none() {
+            if self.thread_can_spawn_subagents(&thread.id)? {
                 if spawn_allowed("spawn_thread") {
                     specs.push(spawn_thread_spec());
                 }
@@ -239,7 +263,7 @@ impl Engine {
                 let capacity_model = format!("{}/{}", route.provider_id, route.provider_model);
                 route_capacity = Some(
                     self.turn_scheduler
-                        .acquire_provider(&capacity_model, background)
+                        .acquire_provider(&capacity_model, background, &cancel)
                         .await?,
                 );
             }
@@ -310,7 +334,8 @@ impl Engine {
                     let checkpoint_id = if concurrent_child {
                         None
                     } else {
-                        self.maybe_checkpoint(&session, thread, turn).await?
+                        self.maybe_checkpoint(&session, thread, turn, &cancel)
+                            .await?
                     };
                     self.store.append_event(
                         scope,
@@ -589,14 +614,20 @@ impl Engine {
             if tool_calls.is_empty() {
                 return Ok(RouteAttemptResult::Completed);
             }
-            for call in tool_calls {
-                let (result_content, images) = self
-                    .handle_tool_call(session, thread, turn, mode, tool_ctx, &call, cancel)
-                    .await?;
+            // Keep the same read-only concurrency and mutation barriers used
+            // by concrete-model turns. Route failover must not change tool
+            // scheduling semantics merely because the model was automatic.
+            let results = self
+                .handle_tool_calls_parallel(
+                    session, thread, turn, mode, tool_ctx, tool_calls, cancel,
+                )
+                .await;
+            for (call_id, result) in results {
+                let (result_content, images) = result?;
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::ToolResult {
-                        call_id: call.id,
+                        call_id,
                         content: result_content,
                         images,
                     })?,
@@ -809,6 +840,7 @@ impl Engine {
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         normalize_thinking_option(&mut model_options, Some(&route.info));
         let backend_turn = BackendTurn {
+            cancel: cancel.clone(),
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
@@ -890,6 +922,9 @@ impl Engine {
                     }
                     persisted.push(Event::AssistantThinking { turn, text: delta });
                 }
+                BackendEvent::ThinkingCompleted => {
+                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                }
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
@@ -930,6 +965,50 @@ impl Engine {
                 }
                 BackendEvent::CommandsUpdated { commands } => {
                     persisted.push(Event::CommandsUpdated { commands });
+                }
+                BackendEvent::TodosUpdated { todos } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    self.store.update_thread_todos(&thread.id, &todos)?;
+                    persisted.push(Event::TodosUpdated { todos });
+                }
+                BackendEvent::UsageUpdated { usage } => {
+                    persisted.push(Event::TurnUsageUpdated { turn, usage });
+                }
+                BackendEvent::CompactionStarted => {
+                    if !segment.is_empty() {
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
+                    }
+                    persisted.push(Event::CompactionStarted { turn });
+                }
+                BackendEvent::CompactionCompleted => {
+                    persisted.push(Event::CompactionCompleted {
+                        turn,
+                        messages_compacted: 0,
+                    });
+                }
+                BackendEvent::CompactionFailed => {
+                    persisted.push(Event::CompactionFailed { turn });
+                }
+                BackendEvent::CollaboratorStarted { session_id, .. } => {
+                    tracing::warn!(
+                        %session_id,
+                        "automatic route does not project vendor collaborators yet"
+                    );
+                }
+                BackendEvent::CollaboratorEvent {
+                    session_id, event, ..
+                } => {
+                    if let BackendCollaboratorEvent::ApprovalNeeded { responder, .. } = event {
+                        let _ = responder.send(false);
+                    } else {
+                        tracing::debug!(
+                            %session_id,
+                            "ignored vendor collaborator event on automatic route"
+                        );
+                    }
                 }
                 BackendEvent::ToolCompleted {
                     call_id,
@@ -977,6 +1056,7 @@ impl Engine {
                         call_id,
                         status,
                         result,
+                        execution_duration_ms: None,
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
@@ -999,7 +1079,9 @@ impl Engine {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
                     let approved = self
-                        .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
+                        .gate_backend_approval(
+                            session, thread, turn, mode, &call_id, &tool, &args, cancel,
+                        )
                         .await?;
                     let _ = responder.send(approved);
                 }
@@ -1018,7 +1100,7 @@ impl Engine {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
                     let answers = self
-                        .ask_user_questions(&thread.id, turn, &request_id, title, questions)
+                        .ask_user_questions(&thread.id, turn, &request_id, title, questions, cancel)
                         .await?;
                     let _ = responder.send(answers);
                 }
@@ -1034,11 +1116,11 @@ impl Engine {
                     }
                 }
             }
-            if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
+            if persisted.len() >= STREAM_EVENT_BATCH_MAX {
                 flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                 persist_deadline = None;
             } else if !persisted.is_empty() && persist_deadline.is_none() {
-                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
+                persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
             }
         }
         drop(stream);
@@ -1068,6 +1150,7 @@ impl Engine {
                     result: serde_json::json!({
                         "error": "provider route ended during tool execution"
                     }),
+                    execution_duration_ms: None,
                 });
             }
             flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
@@ -1095,6 +1178,7 @@ impl Engine {
                     result: serde_json::json!({
                         "error": "turn cancelled during tool execution"
                     }),
+                    execution_duration_ms: None,
                 });
             }
             flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;

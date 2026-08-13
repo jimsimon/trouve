@@ -32,7 +32,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         return [model("cursor/default")];
       },
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         return live.promise;
       },
@@ -240,7 +240,7 @@ describe("ModelCatalogController", () => {
         staticCalls += 1;
         return staticResult.promise;
       },
-      refreshModels: () => {
+      modelRoutes: () => {
         liveCalls += 1;
         return liveResult.promise;
       },
@@ -270,7 +270,7 @@ describe("ModelCatalogController", () => {
           ? Promise.resolve([model("local/offline")])
           : forcedStatic.promise;
       },
-      refreshModels: () => {
+      modelRoutes: async () => {
         liveCalls += 1;
         return liveCalls === 1
           ? Promise.resolve([model("local/offline")])

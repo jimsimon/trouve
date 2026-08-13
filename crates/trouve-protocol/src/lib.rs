@@ -294,7 +294,9 @@ pub use requests::*;
 // safely retry when a committed response is lost.
 // 7.10: code-review findings identify verified RIGHT-side anchors outside the
 // pull-request diff so clients can distinguish review-level comments.
-pub const PROTOCOL_VERSION: &str = "7.10";
+// 7.11: provider-neutral `auto/<model>` selections expose their concrete routes,
+// persist sticky thread affinity, and emit route-selection events (additive).
+pub const PROTOCOL_VERSION: &str = "7.11";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -158,6 +158,7 @@ const protocolValidators = {
   personas: componentArray(protocolSchemaId, "AgentPersona"),
   personaInfos: componentArray(protocolSchemaId, "PersonaInfo"),
   models: componentArray(protocolSchemaId, "ModelInfo"),
+  modelRoutes: componentArray(protocolSchemaId, "RoutedModelInfo"),
   thread: componentRef(protocolSchemaId, "Thread"),
   threads: componentArray(protocolSchemaId, "Thread"),
   threadStatuses: componentArray(protocolSchemaId, "ThreadStatus"),
