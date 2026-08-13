@@ -59,6 +59,41 @@ describe("renderMarkdown", () => {
     expect(rendered).not.toContain("<tag>");
     expect(rendered).toContain("&#x3C;tag>&#x26; value");
   });
+
+  it("recovers unambiguous same-length fences inside Markdown examples", async () => {
+    const source = [
+      "before",
+      "",
+      "```markdown",
+      "### Finding",
+      "",
+      "```text",
+      "Agent-ready prompt...",
+      "```",
+      "",
+      "</details>",
+      "```",
+      "",
+      "after",
+    ].join("\n");
+    const rendered = await renderMarkdown(source);
+    const visibleText = rendered.replace(/<[^>]+>/gu, "");
+
+    expect(rendered.match(/<pre>/gu)).toHaveLength(1);
+    expect(rendered).toContain('<code class="language-markdown">');
+    expect(visibleText).toContain("```text");
+    expect(visibleText).toContain("Agent-ready prompt...");
+    expect(rendered).toContain("&#x3C;/details>");
+    expect(rendered).toContain("<p>after</p>");
+  });
+
+  it("keeps CommonMark meaning when no later outer closer exists", async () => {
+    const rendered = await renderMarkdown("```markdown\n```text\n```\nafter");
+
+    expect(rendered.match(/<pre>/gu)).toHaveLength(1);
+    expect(rendered.replace(/<[^>]+>/gu, "")).toContain("```text");
+    expect(rendered).toContain("<p>after</p>");
+  });
 });
 
 describe("renderMarkdownSafely", () => {

@@ -19,6 +19,102 @@ interface HastNode {
   children?: HastNode[];
 }
 
+interface MarkdownFence {
+  readonly indent: string;
+  readonly marker: "`" | "~";
+  readonly length: number;
+  readonly info: string;
+}
+
+const markdownFence = (line: string): MarkdownFence | undefined => {
+  const match = /^( {0,3})(`{3,}|~{3,})([^\r\n]*)\r?$/u.exec(line);
+  const run = match?.[2];
+  const info = match?.[3] ?? "";
+  if (run === undefined || (run[0] === "`" && info.includes("`"))) return undefined;
+  return {
+    indent: match?.[1] ?? "",
+    marker: run[0] as "`" | "~",
+    length: run.length,
+    info,
+  };
+};
+
+const markdownFenceLanguage = (info: string): string =>
+  info.trim().split(/\s+/u)[0]?.toLowerCase() ?? "";
+
+const isMarkdownExampleFence = (fence: MarkdownFence): boolean =>
+  ["markdown", "md"].includes(markdownFenceLanguage(fence.info));
+
+const isClosingFence = (fence: MarkdownFence, outer: MarkdownFence): boolean =>
+  fence.marker === outer.marker
+  && fence.length >= outer.length
+  && fence.info.trim() === "";
+
+/**
+ * Models occasionally put a same-length fenced block inside a
+ * ```markdown example and then emit a second closer for the outer block.
+ * CommonMark closes at the first fence, but the later closer makes the
+ * intended nesting unambiguous. Lengthen only that outer pair before remark
+ * parses it; a single closer keeps ordinary CommonMark meaning.
+ */
+export const recoverNestedMarkdownFences = (source: string): string => {
+  const lines = source.match(/[^\n]*(?:\n|$)/gu)?.filter(Boolean) ?? [];
+  const endings = lines.map((raw) =>
+    raw.endsWith("\r\n") ? "\r\n" : raw.endsWith("\n") ? "\n" : ""
+  );
+  const bodies = lines.map((raw, index) =>
+    raw.slice(0, raw.length - (endings[index]?.length ?? 0))
+  );
+  let changed = false;
+
+  for (let openerIndex = 0; openerIndex < bodies.length; openerIndex += 1) {
+    const outer = markdownFence(bodies[openerIndex] ?? "");
+    if (outer === undefined || !isMarkdownExampleFence(outer)) continue;
+
+    let nestedOpen = false;
+    let recoveredInner = false;
+    let outerCloserIndex: number | undefined;
+    for (let index = openerIndex + 1; index < bodies.length; index += 1) {
+      const candidate = markdownFence(bodies[index] ?? "");
+      if (candidate === undefined || candidate.marker !== outer.marker) continue;
+      if (candidate.length === outer.length && candidate.info.trim() !== "") {
+        nestedOpen = true;
+        continue;
+      }
+      if (!isClosingFence(candidate, outer)) continue;
+      if (nestedOpen) {
+        const laterCloser = bodies.slice(index + 1).some((line) => {
+          const later = markdownFence(line);
+          return later !== undefined && isClosingFence(later, outer);
+        });
+        if (!laterCloser) break;
+        nestedOpen = false;
+        recoveredInner = true;
+        continue;
+      }
+      if (recoveredInner) outerCloserIndex = index;
+      break;
+    }
+    if (outerCloserIndex === undefined) continue;
+
+    let replacementLength = outer.length + 1;
+    for (const body of bodies.slice(openerIndex + 1, outerCloserIndex)) {
+      const candidate = markdownFence(body);
+      if (candidate?.marker === outer.marker) {
+        replacementLength = Math.max(replacementLength, candidate.length + 1);
+      }
+    }
+    const replacement = outer.marker.repeat(replacementLength);
+    bodies[openerIndex] = `${outer.indent}${replacement}${outer.info}`;
+    const closer = markdownFence(bodies[outerCloserIndex] ?? "");
+    bodies[outerCloserIndex] = `${closer?.indent ?? ""}${replacement}`;
+    openerIndex = outerCloserIndex;
+    changed = true;
+  }
+  if (!changed) return source;
+  return bodies.map((body, index) => `${body}${endings[index] ?? ""}`).join("");
+};
+
 export const safeMarkdownHref = (
   href: string,
 ): "internal" | "external" | undefined => {
@@ -177,4 +273,4 @@ const markdownProcessor = unified()
   .use(rehypeStringify);
 
 export const renderMarkdownDirect = async (source: string): Promise<string> =>
-  String(await markdownProcessor.process(source));
+  String(await markdownProcessor.process(recoverNestedMarkdownFences(source)));

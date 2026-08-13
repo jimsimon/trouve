@@ -36,4 +36,25 @@ describe("streaming Markdown stable prefix", () => {
       "intro\n\n~~~text\ninside\n~~~~~\n\n",
     );
   });
+
+  it("does not freeze an ambiguous nested Markdown fence before its outer closer", () => {
+    const partial = [
+      "before",
+      "",
+      "```markdown",
+      "```text",
+      "prompt",
+      "```",
+      "",
+      "still potentially inside the example",
+      "",
+    ].join("\n");
+    expect(partial.slice(0, stableMarkdownPrefixLength(partial))).toBe("before\n\n");
+
+    const outerCloser = "```\n\n";
+    const complete = partial + outerCloser + "after";
+    expect(complete.slice(0, stableMarkdownPrefixLength(complete))).toBe(
+      partial + outerCloser,
+    );
+  });
 });
