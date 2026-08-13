@@ -217,7 +217,11 @@ impl<'a> GitOperation<'a> {
             bail!("{} cancelled", self.label);
         }
         if Instant::now() >= self.deadline {
-            bail!("{} timed out after {}s", self.label, self.timeout.as_secs_f32());
+            bail!(
+                "{} timed out after {}s",
+                self.label,
+                self.timeout.as_secs_f32()
+            );
         }
         Ok(())
     }
