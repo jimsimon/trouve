@@ -28,7 +28,9 @@ use crate::config::{Config, ProviderConfig};
 use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
-use crate::store::{ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, Store};
+use crate::store::{
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance, Store,
+};
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
     DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
@@ -2238,7 +2240,7 @@ impl Engine {
         let attachment_root = self.data_dir.join("attachments");
         let managed_worktree_root = self.data_dir.join("worktrees");
         let index_hooks = self.index_hooks;
-        tokio::spawn(async move {
+        let cleanup = async move {
             match store.claim_artifact_cleanup_job(&job.id) {
                 Ok(Some(job)) => {
                     execute_artifact_cleanup_job(
@@ -2258,7 +2260,30 @@ impl Engine {
                     "failed to claim immediate artifact cleanup"
                 ),
             }
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(cleanup);
+            }
+            Err(no_runtime) => {
+                // Core's synchronous APIs are also exercised by embedders and
+                // tests outside Tokio. Complete the immediate best-effort
+                // cleanup there instead of panicking; the durable job remains
+                // available to the startup worker if runtime construction
+                // itself fails.
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(cleanup),
+                    Err(error) => tracing::warn!(
+                        %no_runtime,
+                        %error,
+                        "could not start a runtime for immediate artifact cleanup"
+                    ),
+                }
+            }
+        }
     }
 
     /// Enable internet-reachability monitoring with the given probe (the
@@ -5770,6 +5795,26 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> Result<(Session, std::sync::MutexGuard<'_, HashSet<String>>), EngineError> {
+        let (session, deleting) = self.ensure_terminal_session_exists(session_id)?;
+        if session.archived {
+            return Err(EngineError::Conflict(format!(
+                "session {} is archived",
+                session.id
+            )));
+        }
+        if self.store.open_workspace(&session.workspace_id)?.is_none() {
+            return Err(EngineError::Conflict(format!(
+                "workspace {} is closed",
+                session.workspace_id
+            )));
+        }
+        Ok((session, deleting))
+    }
+
+    fn ensure_terminal_session_exists(
+        &self,
+        session_id: &str,
+    ) -> Result<(Session, std::sync::MutexGuard<'_, HashSet<String>>), EngineError> {
         let deleting = self.deleting_sessions.lock().unwrap();
         if deleting.contains(session_id) {
             return Err(EngineError::Conflict(format!(
@@ -5783,18 +5828,6 @@ impl Engine {
             .store
             .session(session_id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
-        if session.archived {
-            return Err(EngineError::Conflict(format!(
-                "session {} is archived",
-                session.id
-            )));
-        }
-        if self.store.open_workspace(&session.workspace_id)?.is_none() {
-            return Err(EngineError::Conflict(format!(
-                "workspace {} is closed",
-                session.workspace_id
-            )));
-        }
         Ok((session, deleting))
     }
 
@@ -5821,7 +5854,10 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> Result<Vec<trouve_protocol::TerminalInfo>, EngineError> {
-        let (_session, deleting) = self.ensure_terminal_session_available(session_id)?;
+        // Listing is observational: archive/workspace close tears terminals
+        // down, so callers should see an empty list while creation remains
+        // rejected until the owner is reopened.
+        let (_session, deleting) = self.ensure_terminal_session_exists(session_id)?;
         let terminals = self
             .terminals
             .list_session(session_id)
@@ -6529,7 +6565,7 @@ impl Engine {
         let lifecycle = self.session_lock(id);
         let _lifecycle_guard = lifecycle.write().await;
 
-        let result = async {
+        async {
             let session = self
                 .store
                 .session(id)?
@@ -6578,8 +6614,7 @@ impl Engine {
             self.schedule_artifact_cleanup(cleanup_job);
             Ok(())
         }
-        .await;
-        result
+        .await
     }
 
     // --- threads ------------------------------------------------------------
@@ -7493,12 +7528,14 @@ impl Engine {
             }
             let queued_prompt = prompt.clone();
             let result = self.store.accept_prompt_with_events(
-                prompt,
-                tools_enabled,
-                attachment_rows,
-                None,
-                None,
-                attachment_cleanup.claim(),
+                PromptAcceptance {
+                    prompt,
+                    tools_enabled,
+                    attachments: attachment_rows,
+                    claim_prompt_id: None,
+                    expected_previous_turn: None,
+                    staging_cleanup_claim: attachment_cleanup.claim(),
+                },
                 vec![(
                     Scope::Thread(thread_id.to_string()),
                     Event::QueueUpdated {
@@ -7562,12 +7599,14 @@ impl Engine {
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
         let accepted = self.store.accept_prompt_with_events(
-            prompt,
-            tools_enabled,
-            attachment_rows,
-            Some(started_prompt.id.clone()),
-            Some(previous_turn),
-            attachment_cleanup.claim(),
+            PromptAcceptance {
+                prompt,
+                tools_enabled,
+                attachments: attachment_rows,
+                claim_prompt_id: Some(started_prompt.id.clone()),
+                expected_previous_turn: Some(previous_turn),
+                staging_cleanup_claim: attachment_cleanup.claim(),
+            },
             events,
         );
         if let Err(error) = accepted {

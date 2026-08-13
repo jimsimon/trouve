@@ -2485,6 +2485,15 @@ pub(crate) struct ArtifactCleanupClaim {
     pub token: String,
 }
 
+pub(crate) struct PromptAcceptance {
+    pub prompt: trouve_protocol::QueuedPrompt,
+    pub tools_enabled: bool,
+    pub attachments: Vec<(trouve_protocol::Attachment, String)>,
+    pub claim_prompt_id: Option<String>,
+    pub expected_previous_turn: Option<u64>,
+    pub staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+}
+
 impl ArtifactCleanupJob {
     pub(crate) fn claim(&self) -> Option<ArtifactCleanupClaim> {
         self.claim_token.as_ref().map(|token| ArtifactCleanupClaim {
@@ -3021,30 +3030,46 @@ fn apply_store_mutation(
         } => {
             // Validate the owner in this transaction so a stale engine
             // snapshot cannot surface an FK error after session deletion.
-            let session_exists = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-                params![thread.session_id],
-                |row| row.get::<_, bool>(0),
-            )?;
+            let child_workspace = conn
+                .query_row(
+                    "SELECT workspace_id FROM sessions WHERE id = ?1",
+                    params![thread.session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
             anyhow::ensure!(
-                session_exists,
+                child_workspace.is_some(),
                 "session {} no longer exists",
                 thread.session_id
             );
             insert_thread_row(conn, thread, model_options)?;
             if let Some((parent, kind)) = spawn {
-                let parent_session = conn
+                let parent_owner = conn
                     .query_row(
-                        "SELECT session_id FROM threads WHERE id = ?1",
+                        "SELECT threads.session_id, sessions.workspace_id
+                         FROM threads
+                         JOIN sessions ON sessions.id = threads.session_id
+                         WHERE threads.id = ?1",
                         params![parent],
-                        |row| row.get::<_, String>(0),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()?;
-                anyhow::ensure!(
-                    parent_session.as_deref() == Some(thread.session_id.as_str()),
-                    "spawn parent {parent} does not belong to session {}",
-                    thread.session_id
-                );
+                let Some((parent_session, parent_workspace)) = parent_owner else {
+                    anyhow::bail!("spawn parent {parent} no longer exists");
+                };
+                if *kind == "session" {
+                    anyhow::ensure!(
+                        child_workspace.as_deref() == Some(parent_workspace.as_str()),
+                        "spawn parent {parent} does not belong to workspace of session {}",
+                        thread.session_id
+                    );
+                } else {
+                    anyhow::ensure!(
+                        parent_session == thread.session_id,
+                        "spawn parent {parent} does not belong to session {}",
+                        thread.session_id
+                    );
+                }
                 conn.execute(
                     "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
                      VALUES (?1, ?2, ?3)",
@@ -4953,14 +4978,17 @@ impl Store {
     /// queue and turn shell while holding the engine's queue/activity locks.
     pub(crate) fn accept_prompt_with_events(
         &self,
-        prompt: trouve_protocol::QueuedPrompt,
-        tools_enabled: bool,
-        attachments: Vec<(trouve_protocol::Attachment, String)>,
-        claim_prompt_id: Option<String>,
-        expected_previous_turn: Option<u64>,
-        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+        acceptance: PromptAcceptance,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
+        let PromptAcceptance {
+            prompt,
+            tools_enabled,
+            attachments,
+            claim_prompt_id,
+            expected_previous_turn,
+            staging_cleanup_claim,
+        } = acceptance;
         let pending = serialize_lifecycle_events(
             events,
             StoreMutation::AcceptPrompt {
@@ -11061,12 +11089,14 @@ mod tests {
 
         store
             .accept_prompt_with_events(
-                prompt.clone(),
-                false,
-                vec![(attachment.clone(), "/tmp/at_accept.png".into())],
-                Some(prompt.id.clone()),
-                Some(0),
-                None,
+                PromptAcceptance {
+                    prompt: prompt.clone(),
+                    tools_enabled: false,
+                    attachments: vec![(attachment.clone(), "/tmp/at_accept.png".into())],
+                    claim_prompt_id: Some(prompt.id.clone()),
+                    expected_previous_turn: Some(0),
+                    staging_cleanup_claim: None,
+                },
                 events,
             )
             .unwrap();
@@ -11114,12 +11144,14 @@ mod tests {
         };
 
         let result = store.accept_prompt_with_events(
-            prompt,
-            true,
-            vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
-            Some("qp_accept_rollback".into()),
-            Some(99),
-            None,
+            PromptAcceptance {
+                prompt,
+                tools_enabled: true,
+                attachments: vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
+                claim_prompt_id: Some("qp_accept_rollback".into()),
+                expected_previous_turn: Some(99),
+                staging_cleanup_claim: None,
+            },
             vec![(
                 Scope::Thread("th_accept_rollback".into()),
                 Event::QueueUpdated {

@@ -6563,7 +6563,7 @@ cat > /dev/null
             r#"#!/bin/sh
 IFS= read -r line
 echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{}}}'
-sleep 10
+while IFS= read -r _; do :; done
 "#,
         )
         .unwrap();
@@ -6605,7 +6605,7 @@ IFS= read -r line
 : > "$0.started"
 sleep 0.05
 echo '{"jsonrpc":"2.0","id":1,"result":{"turn":{}}}'
-sleep 10
+while IFS= read -r _; do :; done
 "#,
         )
         .unwrap();
@@ -7400,9 +7400,12 @@ import json, os, sys, time
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("method") == "initialize":
-        with open(sys.argv[0] + ".pid", "w") as marker:
+        marker_path = sys.argv[0] + ".pid"
+        pending_path = marker_path + ".pending"
+        with open(pending_path, "w") as marker:
             marker.write(str(os.getpid()))
             marker.flush()
+        os.replace(pending_path, marker_path)
         time.sleep(60)
 "#,
         )
@@ -7453,9 +7456,12 @@ for line in sys.stdin:
 import json, os, sys, time
 for line in sys.stdin:
     if json.loads(line).get("method") == "initialize":
-        with open(sys.argv[0] + ".pid", "w") as marker:
+        marker_path = sys.argv[0] + ".pid"
+        pending_path = marker_path + ".pending"
+        with open(pending_path, "w") as marker:
             marker.write(str(os.getpid()))
             marker.flush()
+        os.replace(pending_path, marker_path)
         time.sleep(60)
 "#,
         )

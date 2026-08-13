@@ -2480,18 +2480,18 @@ impl ToolExecutor for LocalToolExecutor {
         )
         .await
         .map_err(|error| format!("MCP config mutation worker failed: {error}"))??;
-        if outcome == McpConfigMutationOutcome::Applied {
-            if let Err(error) = self.mcp.evict_server(&request.name).await {
-                // The manager made the old definition non-reusable before it
-                // attempted cleanup. The config commit therefore succeeded;
-                // retain that quarantine and report cleanup as an operational
-                // warning instead of inviting a retry of the committed RMW.
-                tracing::warn!(
-                    server = %request.name,
-                    error = format!("{error:#}"),
-                    "MCP config mutation committed; quarantined process cleanup was not acknowledged"
-                );
-            }
+        if outcome == McpConfigMutationOutcome::Applied
+            && let Err(error) = self.mcp.evict_server(&request.name).await
+        {
+            // The manager made the old definition non-reusable before it
+            // attempted cleanup. The config commit therefore succeeded;
+            // retain that quarantine and report cleanup as an operational
+            // warning instead of inviting a retry of the committed RMW.
+            tracing::warn!(
+                server = %request.name,
+                error = format!("{error:#}"),
+                "MCP config mutation committed; quarantined process cleanup was not acknowledged"
+            );
         }
         Ok(outcome)
     }

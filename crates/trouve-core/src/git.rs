@@ -695,7 +695,7 @@ fn parse_index_stat(block: &[u8]) -> Result<SnapshotIndexStat> {
         .strip_prefix("flags: ")
         .context("invalid git index flags line")?
         .trim();
-    let flags = u32::from_str_radix(&flags_text, 16)
+    let flags = u32::from_str_radix(flags_text, 16)
         .with_context(|| format!("invalid git index flags: {flags_text:?}"))?;
     Ok(SnapshotIndexStat {
         ctime_seconds,
@@ -1408,14 +1408,14 @@ fn build_session_snapshot_index(
     for path in overlay {
         operation.check()?;
         let prior = entries.get(&path).cloned();
-        if let Ok(metadata) = std::fs::symlink_metadata(worktree.join(&path)) {
-            if metadata.is_file() {
-                hashed_bytes = hashed_bytes.saturating_add(metadata.len());
-                if hashed_bytes > MAX_SESSION_SNAPSHOT_HASH_BYTES {
-                    return Err(session_diff_too_large(format!(
-                        "session changes contain more than {MAX_SESSION_SNAPSHOT_HASH_BYTES} bytes"
-                    )));
-                }
+        if let Ok(metadata) = std::fs::symlink_metadata(worktree.join(&path))
+            && metadata.is_file()
+        {
+            hashed_bytes = hashed_bytes.saturating_add(metadata.len());
+            if hashed_bytes > MAX_SESSION_SNAPSHOT_HASH_BYTES {
+                return Err(session_diff_too_large(format!(
+                    "session changes contain more than {MAX_SESSION_SNAPSHOT_HASH_BYTES} bytes"
+                )));
             }
         }
         match snapshot_entry_for_path(worktree, &path, prior.as_ref(), filemode, operation)? {

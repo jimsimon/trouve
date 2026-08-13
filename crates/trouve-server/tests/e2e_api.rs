@@ -623,7 +623,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     // Approve; the turn then finishes with a checkpoint.
     let resp = client
         .post(format!("{base}/approvals"))
-        .json(&serde_json::json!({"call_id": call_id, "decision": "approve"}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": call_id,
+            "decision": "approve",
+        }))
         .send()
         .await
         .unwrap();
@@ -868,7 +872,13 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert!(!Path::new(&worktree).exists());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while Path::new(&worktree).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deleted session worktree was not cleaned up");
     let resp = client
         .get(format!("{base}/sessions/{session_id}"))
         .send()
@@ -1741,7 +1751,11 @@ async fn ask_question_tool_round_trips_answers() {
     // Unknown request ids are a 404.
     let resp = client
         .post(format!("{base}/questions"))
-        .json(&serde_json::json!({"request_id": "bogus", "answers": []}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "request_id": "bogus",
+            "answers": [],
+        }))
         .send()
         .await
         .unwrap();
@@ -1751,6 +1765,7 @@ async fn ask_question_tool_round_trips_answers() {
     let resp = client
         .post(format!("{base}/questions"))
         .json(&serde_json::json!({
+            "thread_id": thread_id,
             "request_id": request_id,
             "answers": [
                 {"question_id": "q1", "selected_option_ids": ["opt1"]},
@@ -2751,7 +2766,11 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .to_string();
     let response = client
         .post(format!("{base}/approvals"))
-        .json(&serde_json::json!({"call_id": bridge_call_id, "decision": "approve"}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": bridge_call_id,
+            "decision": "approve",
+        }))
         .send()
         .await
         .unwrap();
@@ -2785,7 +2804,11 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
 
     let resp = client
         .post(format!("{base}/approvals"))
-        .json(&serde_json::json!({"call_id": call_id, "decision": "approve"}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": call_id,
+            "decision": "approve",
+        }))
         .send()
         .await
         .unwrap();
@@ -5482,9 +5505,17 @@ async fn spawn_session_child_agent_isolated() {
     .await;
 
     let results = tool_results(&events);
-    let spawn = results.iter().find(|(id, _)| *id == "p1").unwrap().1;
-    let child_thread_id = spawn["thread_id"].as_str().unwrap();
-    let child_session_id = spawn["session_id"].as_str().unwrap();
+    let spawn = results
+        .iter()
+        .find(|(id, _)| *id == "p1")
+        .unwrap_or_else(|| panic!("missing spawn_session result in events: {events:#?}"))
+        .1;
+    let child_thread_id = spawn["thread_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("spawn_session did not return a thread: {spawn}"));
+    let child_session_id = spawn["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("spawn_session did not return a session: {spawn}"));
     assert_ne!(child_session_id, session["id"].as_str().unwrap());
     // The child is based on the parent's latest checkpoint commit (its
     // actual work), not the session branch — checkpoints never move the

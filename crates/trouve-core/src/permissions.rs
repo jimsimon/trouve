@@ -333,9 +333,12 @@ impl ApprovalHub {
 /// Pending agent questions, mirroring [`ApprovalHub`]: one oneshot per
 /// outstanding `question.requested`, resolved by the answers endpoint
 /// (`None` = the user skipped).
+type QuestionKey = (String, String);
+type QuestionResponder = oneshot::Sender<Option<Vec<QuestionAnswer>>>;
+
 #[derive(Default)]
 pub struct QuestionHub {
-    pending: Mutex<HashMap<(String, String), oneshot::Sender<Option<Vec<QuestionAnswer>>>>>,
+    pending: Mutex<HashMap<QuestionKey, QuestionResponder>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
