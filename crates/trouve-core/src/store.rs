@@ -269,6 +269,7 @@ CREATE TABLE IF NOT EXISTS automations (
   mode TEXT,
   model TEXT,
   thinking_level TEXT,
+  model_options TEXT NOT NULL DEFAULT '{}', -- JSON object
   permission_mode TEXT NOT NULL DEFAULT 'ask',
   schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -759,6 +760,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE persona_cleanup_intents ADD COLUMN claim_token TEXT",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
+    "ALTER TABLE automations ADD COLUMN model_options TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE threads ADD COLUMN title TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
@@ -3122,8 +3124,9 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
 
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
-    let permission_mode: String = r.get(7)?;
-    let schedule_json: String = r.get(8)?;
+    let model_options_json: String = r.get(7)?;
+    let permission_mode: String = r.get(8)?;
+    let schedule_json: String = r.get(9)?;
     Ok(trouve_protocol::Automation {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -3132,6 +3135,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         mode: r.get(4)?,
         model: r.get(5)?,
         thinking_level: r.get(6)?,
+        model_options: serde_json::from_str(&model_options_json).unwrap_or_default(),
         permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
@@ -3141,12 +3145,12 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
                 days: vec![],
             },
         ),
-        enabled: r.get(9)?,
-        next_run_at: r.get(10)?,
-        last_run_at: r.get(11)?,
-        last_session_id: r.get(12)?,
-        last_error: r.get(13)?,
-        created_at: r.get(14)?,
+        enabled: r.get(10)?,
+        next_run_at: r.get(11)?,
+        last_run_at: r.get(12)?,
+        last_session_id: r.get(13)?,
+        last_error: r.get(14)?,
+        created_at: r.get(15)?,
     })
 }
 
@@ -8727,9 +8731,10 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations (id, name, prompt, workspace_id, mode, model,
-                                      thinking_level, permission_mode, schedule, enabled,
-                                      next_run_at, last_run_at, last_session_id, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                      thinking_level, model_options, permission_mode, schedule,
+                                      enabled, next_run_at, last_run_at, last_session_id, last_error,
+                                      created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 a.id,
                 a.name,
@@ -8738,6 +8743,7 @@ impl Store {
                 a.mode,
                 a.model,
                 a.thinking_level,
+                serde_json::to_string(&a.model_options)?,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -8757,8 +8763,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
-                    model = ?6, thinking_level = ?7, permission_mode = ?8, schedule = ?9,
-                    enabled = ?10, next_run_at = ?11
+                    model = ?6, thinking_level = ?7, model_options = ?8,
+                    permission_mode = ?9, schedule = ?10, enabled = ?11, next_run_at = ?12
              WHERE id = ?1",
             params![
                 a.id,
@@ -8768,6 +8774,7 @@ impl Store {
                 a.mode,
                 a.model,
                 a.thinking_level,
+                serde_json::to_string(&a.model_options)?,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -8821,8 +8828,9 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
-                    schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
+            "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, model_options,
+                    permission_mode, schedule, enabled, next_run_at, last_run_at, last_session_id,
+                    last_error, created_at
              FROM automations ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_automation)?;
@@ -8837,8 +8845,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
-                        schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
+                "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, model_options,
+                        permission_mode, schedule, enabled, next_run_at, last_run_at, last_session_id,
+                        last_error, created_at
                  FROM automations WHERE id = ?1",
                 params![id],
                 row_to_automation,
@@ -20543,6 +20552,10 @@ mod tests {
             mode: Some("code".into()),
             model: None,
             thinking_level: Some("high".into()),
+            model_options: serde_json::json!({"fast": true, "temperature": 0.4})
+                .as_object()
+                .unwrap()
+                .clone(),
             permission_mode: PermissionMode::Yolo,
             schedule: trouve_protocol::AutomationSchedule {
                 kind: "weekly".into(),
@@ -20564,6 +20577,7 @@ mod tests {
         assert_eq!(listed[0].schedule, auto.schedule);
         assert_eq!(listed[0].mode.as_deref(), Some("code"));
         assert_eq!(listed[0].thinking_level.as_deref(), Some("high"));
+        assert_eq!(listed[0].model_options, auto.model_options);
         assert_eq!(listed[0].permission_mode, PermissionMode::Yolo);
 
         // Edit: rename + disable clears the next fire time.
@@ -20579,6 +20593,7 @@ mod tests {
         assert!(!got.enabled);
         assert!(got.next_run_at.is_none());
         assert_eq!(got.thinking_level.as_deref(), Some("max"));
+        assert_eq!(got.model_options, auto.model_options);
         assert_eq!(got.permission_mode, PermissionMode::AllowList);
 
         // A run records its outcome without touching the definition.

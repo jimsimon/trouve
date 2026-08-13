@@ -205,4 +205,14 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(agentActivitySource).toContain('aria-atomic="true"');
     expect(agentActivitySource).toContain('aria-hidden="true"');
   });
+
+  it("applies a mode's default model and clears incompatible options atomically", () => {
+    const composer = section(
+      '<label class="composer-option mode-option">',
+      '<div class="composer-option model-option">',
+    );
+    expect(composer).toContain("mode?.default_model");
+    expect(composer).toContain("{ model: mode.default_model }");
+    expect(composer).toContain("model_options: {}");
+  });
 });

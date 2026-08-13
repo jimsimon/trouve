@@ -3142,6 +3142,11 @@ pub struct Automation {
     /// advertised option key when the turn starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    /// `thinking_level` remains as a compatibility shorthand; values in this
+    /// object take precedence when both select the same model capability.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy applied only to sessions created by this automation.
     /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
     #[serde(default)]
@@ -3178,6 +3183,9 @@ pub struct UpsertAutomationRequest {
     /// clients preserves normal model/mode/global inheritance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy for each fresh automation session. Omitted by older
     /// clients means Ask.
     #[serde(default)]

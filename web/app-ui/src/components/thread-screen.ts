@@ -114,12 +114,15 @@ import {
   formatSessionUsage,
 } from "./composer-usage.js";
 import {
+  changeModelOption,
   modelOptionControls,
   modelOptionLabel,
+  type ModelOptionChangeDetail,
 } from "./model-option-controls.js";
 import {
   modelHealthPresentations,
 } from "./model-health.js";
+import "./model-options-editor.js";
 import {
   retainedHistoryScrollDelta,
   type HistoryMeasurementCorrection,
@@ -2065,10 +2068,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     aria-label="Persona"
                     .value=${thread.mode}
                     ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
-                    @change=${(event: Event) => this.#updateThreadSetting(
-                      { mode: (event.currentTarget as HTMLSelectElement).value },
-                      "Persona could not be changed.",
-                    )}
+                    @change=${(event: Event) => {
+                      const modeId = (event.currentTarget as HTMLSelectElement).value;
+                      const mode = this.#modes.find((candidate) => candidate.id === modeId);
+                      const nextModel = mode?.default_model ?? thread.model;
+                      return this.#updateThreadSetting(
+                        {
+                          mode: modeId,
+                          ...(mode?.default_model == null
+                            ? {}
+                            : { model: mode.default_model }),
+                          ...(nextModel === thread.model ? {} : { model_options: {} }),
+                        },
+                        "Mode could not be changed.",
+                      );
+                    }}
                   >
                     ${this.#modes.some((mode) => mode.id === thread.mode)
                       ? nothing
@@ -2095,31 +2109,41 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     )}
                   ></trouve-model-picker>
                 </div>
-                <label class="composer-option thinking-option">
-                  <span>Thinking</span>
-                  <select
-                    aria-label="Thinking level"
-                    .value=${modelControls.thinking?.selected ?? ""}
-                    ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
-                    @change=${(event: Event) => {
-                      const thinking = modelControls.thinking;
-                      if (thinking === undefined) return;
-                      void this.#updateThreadModelOption(
-                        thinking.key,
-                        (event.currentTarget as HTMLSelectElement).value,
-                        "Thinking level could not be changed.",
-                      );
-                    }}
-                  >
-                    <option value="">Model default</option>
-                    ${(modelControls.thinking?.values ?? []).map(
-                      (value) => html`<option
-                        value=${value}
-                        .selected=${value === modelControls.thinking?.selected}
-                      >${modelOptionLabel(value)}</option>`,
-                    )}
-                  </select>
-                </label>
+                <div class="composer-option subscription-option">
+                  <span>Subscription</span>
+                  ${selectedModelHealth === undefined
+                    ? html`<div
+                        class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}
+                        role="status"
+                        aria-busy=${subscriptionLoading ? "true" : "false"}
+                        aria-label=${subscriptionLoading
+                          ? "Loading subscription status"
+                          : "Subscription status is unavailable"}
+                      >
+                        <span class="model-health-placeholder-dot" aria-hidden="true"></span>
+                        <span>${subscriptionLoading ? "Loading…" : "Not available"}</span>
+                      </div>`
+                    : html`
+                      <div
+                        class=${`model-health-pill tone-${selectedModelHealth.tone}`}
+                        tabindex="0"
+                        title=${selectedModelHealth.detail}
+                        aria-label=${`Subscription status: ${selectedModelHealth.summary}. ${selectedModelHealth.detail}`}
+                      >
+                        <span class=${`model-health-dot tone-${selectedModelHealth.tone}`} aria-hidden="true"></span>
+                        <span>${selectedModelHealth.summary}</span>
+                      </div>`}
+                </div>
+                ${modelControls.length === 0
+                  ? nothing
+                  : html`<trouve-model-options-editor
+                      compact
+                      .controls=${modelControls}
+                      .disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
+                      @trouve-model-option-changed=${(
+                        event: CustomEvent<ModelOptionChangeDetail>,
+                      ) => void this.#updateThreadModelOption(event.detail)}
+                    ></trouve-model-options-editor>`}
                 <label class="composer-option permission-option">
                   <span class=${thread.permission_mode === "yolo" ? "permission-yolo" : ""}>Permissions</span>
                   <span class="permission-control-row">
@@ -2147,50 +2171,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       : nothing}
                   </span>
                 </label>
-                ${modelControls.context === undefined
-                  ? nothing
-                  : html`
-                      <label class="composer-option context-option">
-                        <span>Context</span>
-                        <select
-                          aria-label="Context size"
-                          .value=${modelControls.context.selected}
-                          ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
-                          @change=${(event: Event) => this.#updateThreadModelOption(
-                            "context",
-                            (event.currentTarget as HTMLSelectElement).value,
-                            "Context size could not be changed.",
-                          )}
-                        >
-                          ${modelControls.context.selected === ""
-                            ? html`<option value="" disabled .selected=${true}>Select…</option>`
-                            : nothing}
-                          ${modelControls.context.values.map(
-                            (value) => html`<option
-                              value=${value}
-                              .selected=${value === modelControls.context!.selected}
-                            >${value.toUpperCase()}</option>`,
-                          )}
-                        </select>
-                      </label>
-                    `}
-                ${modelControls.fast === undefined
-                  ? nothing
-                  : html`
-                      <div class="composer-option composer-fast-option">
-                        <span>Fast</span>
-                        <button
-                          type="button"
-                          aria-pressed=${modelControls.fast.selected ? "true" : "false"}
-                          ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
-                          @click=${() => this.#updateThreadModelOption(
-                            "fast",
-                            !modelControls.fast!.selected,
-                            "Fast mode could not be changed.",
-                          )}
-                        >${modelControls.fast.selected ? "On" : "Off"}</button>
-                      </div>
-                    `}
               `}
           <span class="composer-controls-spacer" aria-hidden="true"></span>
           <label
@@ -5766,18 +5746,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   async #updateThreadModelOption(
-    key: string,
-    value: string | boolean,
-    errorMessage: string,
+    change: ModelOptionChangeDetail,
   ): Promise<void> {
     const thread = this.#store.value?.thread(this.threadId);
     if (thread === undefined) return;
     await this.#updateThreadSetting({
-      model_options: {
-        ...(thread.model_options ?? {}),
-        [key]: value,
-      },
-    }, errorMessage);
+      model_options: changeModelOption(thread.model_options ?? {}, change),
+    }, "Model option could not be changed.");
   }
 
   /** Open the provisional setup tab without creating durable server state. */

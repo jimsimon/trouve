@@ -181,7 +181,13 @@ import {
 } from "../components/chat-file-link.js";
 import { pickAndRegisterWorkspace } from "../components/workspace-settings-model.js";
 import { modelHealthPresentations } from "../components/model-health.js";
-import { modelOptionLabel } from "../components/model-option-controls.js";
+import {
+  changeModelOption,
+  isThinkingModelOption,
+  modelOptionControls,
+  sanitizeModelOptions,
+  type ModelOptionChangeDetail,
+} from "../components/model-option-controls.js";
 import {
   WORKSPACE_PULL_REQUEST_FILTERS,
   WORKSPACE_STATUS_FILTERS,
@@ -197,6 +203,7 @@ import "../components/session-list.js";
 import "../components/session-usage-panel.js";
 import "../components/thread-screen.js";
 import "../components/model-picker.js";
+import "../components/model-options-editor.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
 const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -450,6 +457,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionInheritedThinking: string | undefined;
   #newSessionOptionsLifecycle = createNewSessionOptionsLifecycle();
   #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
+  #newSessionModelOptions: Readonly<Record<string, unknown>> = {};
   #newSessionOptionsError = "";
   #newSessionOptionsStatus = "";
   #newSessionOptionsGeneration = 0;
@@ -2000,6 +2008,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   #resetNewSessionOptionsForWorkspace(workspaceId: string): void {
     this.#newSessionOptionEdits = createNewThreadOptionEdits();
+    this.#newSessionModelOptions = {};
     if (!newSessionOptionsAreAuthoritative(
       this.#newSessionOptionsLifecycle,
       workspaceId,
@@ -2029,6 +2038,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #reconcileNewSessionDefaults(models: readonly ProtocolModelInfo[]): void {
+    const previousMode = this.#newSessionModes.find(
+      (mode) => mode.id === this.#newSessionModeId,
+    );
+    const previousModelId = resolveNewSessionModel(
+      this.#newSessionModelId,
+      previousMode,
+      this.#newSessionProviders,
+    );
     const defaults = reconcileNewThreadDefaults(
       {
         modeId: this.#newSessionModeId,
@@ -2053,6 +2070,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionInheritedThinking = inheritance.inheritedThinking;
     this.#newSessionInheritedPermissionMode = inheritance.inheritedPermissionMode;
+    const nextMode = this.#newSessionModes.find((mode) => mode.id === defaults.modeId);
+    const nextModelId = resolveNewSessionModel(
+      defaults.modelId,
+      nextMode,
+      this.#newSessionProviders,
+    );
+    const nextModel = this.#availableNewSessionModels().find(
+      (model) => model.id === nextModelId,
+    );
+    this.#newSessionModelOptions = previousModelId === nextModelId
+      ? sanitizeModelOptions(nextModel, this.#newSessionModelOptions)
+      : {};
   }
 
   /** Match the retained controller's bounded title-model request. Session
@@ -2099,6 +2128,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionWorkspaceId = workspaceId;
     this.#resetNewSessionOptionsForWorkspace(workspaceId);
     this.#newSessionPreferredBaseRef = "";
+    // Catalog loads are asynchronous. Drop every workspace-specific selection
+    // before starting them so a fast submit cannot combine the new workspace
+    // with the previous workspace's mode, model, or model options.
+    this.#newSessionModeId = "";
+    this.#newSessionModelId = "";
+    this.#newSessionModelOptions = {};
+    this.#newSessionModes = [];
+    this.#newSessionModels = [];
+    this.#newSessionProviders = undefined;
     void this.#loadNewSessionBranches(workspaceId);
     void this.#loadNewSessionOptions(workspaceId);
   };
@@ -2159,6 +2197,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPrompt = "";
     this.#newSessionPromptComposing = false;
     this.#newSessionPermissionMode = "";
+    this.#newSessionModelOptions = {};
     this.#newSessionPreferredBaseRef = "";
   }
 
@@ -2381,6 +2420,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         thinking: this.#newSessionThinking,
         permissionMode: this.#newSessionPermissionMode,
       },
+      modelOptions: this.#newSessionModelOptions,
       edits: this.#newSessionOptionEdits,
       modes: this.#newSessionModes,
       providers: this.#newSessionProviders,
@@ -2486,6 +2526,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
+    this.#newSessionAttachmentGeneration += 1;
+    this.#newSessionModelOptions = {};
     this.#newSessionAttachmentGeneration += 1;
     this.#newSessionAttachmentPending = false;
     this.#newSessionPreferredBaseRef = "";
@@ -3025,8 +3067,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       newSessionModels,
       this.#newSessionSubscriptionHealth,
     );
-    const newSessionThinkingOption = thinkingOption(
-      newSessionModels.find((model) => model.id === effectiveNewSessionModel),
+    const effectiveNewSessionModelInfo = newSessionModels.find(
+      (model) => model.id === effectiveNewSessionModel,
+    );
+    const newSessionThinkingOption = thinkingOption(effectiveNewSessionModelInfo);
+    const newSessionModelOptions = modelOptionControls(
+      effectiveNewSessionModelInfo,
+      {
+        ...(newSessionThinkingOption === undefined || this.#newSessionThinking === ""
+          ? {}
+          : { [newSessionThinkingOption.key]: this.#newSessionThinking }),
+        ...this.#newSessionModelOptions,
+      },
     );
     const newSessionOptionsLoading = newSessionOptionsAreLoading(
       this.#newSessionOptionsLifecycle,
@@ -3668,7 +3720,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.#newSessionOptionEdits = {
                       mode: true,
                       model: false,
-                      thinking: false,
+                      thinking: this.#newSessionOptionEdits.thinking,
                       permission: false,
                     };
                     this.#newSessionModeId =
@@ -3706,6 +3758,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       model: true,
                       thinking: false,
                     };
+                    const previousModel = resolveNewSessionModel(
+                      this.#newSessionModelId,
+                      selectedNewSessionMode,
+                      this.#newSessionProviders,
+                    );
                     const defaults = resolveNewThreadDefaults(
                       this.#newSessionModes,
                       newSessionModels,
@@ -3722,6 +3779,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       newSessionOptionsCatalogWorkspaceId(this.#newSessionOptionsLifecycle),
                       this.#newSessionWorkspaceId,
                     ).inheritedThinking;
+                    const nextModel = resolveNewSessionModel(
+                      defaults.modelId,
+                      selectedNewSessionMode,
+                      this.#newSessionProviders,
+                    );
+                    if (nextModel !== previousModel) this.#newSessionModelOptions = {};
                     this.requestUpdate();
                   }}
                 ></trouve-model-picker>
@@ -3758,62 +3821,40 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   <option value="yolo" .selected=${live(this.#newSessionPermissionMode === "yolo")}>Yolo</option>
                 </select>
               </label>
-              <label class="new-session-thinking">
-                <span>${newSessionThinkingOption?.budget === undefined
-                  ? "Thinking level"
-                  : "Thinking budget (tokens)"}</span>
-                ${newSessionThinkingOption?.budget === undefined
-                  ? html`<select
-                      name="thinking"
-                      .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
-                      ?disabled=${this.#newSessionPending || newSessionThinkingOption === undefined}
-                      @change=${(event: Event) => {
-                        this.#newSessionOptionEdits = {
-                          ...this.#newSessionOptionEdits,
-                          thinking: true,
-                        };
-                        const value = (event.currentTarget as HTMLSelectElement).value;
-                        this.#newSessionThinking = value || resolveNewThreadDefaults(
-                          this.#newSessionModes,
-                          newSessionModels,
-                          this.#newSessionProviders,
-                          { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
-                        ).thinking;
+              ${newSessionModelOptions.length === 0
+                ? nothing
+                : html`<trouve-model-options-editor
+                    class="new-session-model-options"
+                    .controls=${newSessionModelOptions}
+                    .disabled=${this.#newSessionPending}
+                    @trouve-model-option-changed=${(
+                      event: CustomEvent<ModelOptionChangeDetail>,
+                    ) => {
+                      this.#newSessionModelOptions = changeModelOption(
+                        this.#newSessionModelOptions,
+                        event.detail,
+                      );
+                      this.#newSessionOptionEdits = {
+                        ...this.#newSessionOptionEdits,
+                        thinking: true,
+                      };
+                      if (isThinkingModelOption(event.detail.key)) {
+                        this.#newSessionThinking = event.detail.value === undefined
+                          ? resolveNewThreadDefaults(
+                              this.#newSessionModes,
+                              newSessionModels,
+                              this.#newSessionProviders,
+                              {
+                                modeId: this.#newSessionModeId,
+                                modelId: this.#newSessionModelId,
+                              },
+                            ).thinking
+                          : String(event.detail.value);
                         this.#newSessionInheritedThinking = undefined;
-                        this.requestUpdate();
-                      }}
-                    >
-                      ${newSessionThinkingOption === undefined
-                        ? html`<option value="">Not supported</option>`
-                        : newSessionThinkingOption.values.map(
-                            (value) => html`<option
-                              value=${value}
-                              .selected=${live(value === this.#newSessionThinking)}
-                            >${modelOptionLabel(value)}</option>`,
-                          )}
-                    </select>`
-                  : html`<input
-                      name="thinking"
-                      type="number"
-                      required
-                      step="1"
-                      min=${newSessionThinkingOption.budget.minimum}
-                      max=${newSessionThinkingOption.budget.maximum ?? nothing}
-                      .value=${this.#newSessionThinking}
-                      ?disabled=${this.#newSessionPending}
-                      @input=${(event: Event) => {
-                        const value = (event.currentTarget as HTMLInputElement).value;
-                        if (value === "") return;
-                        this.#newSessionOptionEdits = {
-                          ...this.#newSessionOptionEdits,
-                          thinking: true,
-                        };
-                        this.#newSessionThinking = value;
-                        this.#newSessionInheritedThinking = undefined;
-                        this.requestUpdate();
-                      }}
-                    />`}
-              </label>
+                      }
+                      this.requestUpdate();
+                    }}
+                  ></trouve-model-options-editor>`}
             </div>
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`

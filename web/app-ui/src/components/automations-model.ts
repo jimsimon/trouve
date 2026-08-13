@@ -2,8 +2,13 @@ import type {
   ProtocolAutomation,
   ProtocolAutomationSchedule,
   ProtocolAutomationTemplate,
+  ProtocolModelInfo,
   ProtocolUpsertAutomationRequest,
 } from "../services/protocol-client.js";
+import {
+  isThinkingModelOption,
+  sanitizeModelOptions,
+} from "./model-option-controls.js";
 
 export type AutomationScheduleKind = "hourly" | "daily" | "weekly";
 export type AutomationPermissionMode = NonNullable<
@@ -16,7 +21,7 @@ export interface AutomationDraft {
   readonly workspaceId: string;
   readonly mode: string;
   readonly model: string;
-  readonly thinkingLevel: string;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly permissionMode: AutomationPermissionMode;
   readonly scheduleKind: AutomationScheduleKind;
   readonly minute: string;
@@ -91,7 +96,7 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
   workspaceId,
   mode: "",
   model: "",
-  thinkingLevel: "",
+  modelOptions: {},
   permissionMode: "ask",
   scheduleKind: "daily",
   minute: "0",
@@ -102,17 +107,28 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
 
 export const automationDraftFrom = (
   automation: ProtocolAutomation,
-): AutomationDraft => ({
-  name: automation.name,
-  prompt: automation.prompt,
-  workspaceId: automation.workspace_id,
-  mode: automation.mode ?? "",
-  model: automation.model ?? "",
-  thinkingLevel: automation.thinking_level ?? "",
-  permissionMode: permissionMode(automation.permission_mode),
-  ...draftForSchedule(automation.schedule),
-  enabled: automation.enabled,
-});
+): AutomationDraft => {
+  const modelOptions: Record<string, unknown> = {
+    ...(automation.model_options ?? {}),
+  };
+  if (
+    automation.thinking_level != null
+    && !Object.keys(modelOptions).some(isThinkingModelOption)
+  ) {
+    modelOptions["thinking_level"] = automation.thinking_level;
+  }
+  return {
+    name: automation.name,
+    prompt: automation.prompt,
+    workspaceId: automation.workspace_id,
+    mode: automation.mode ?? "",
+    model: automation.model ?? "",
+    modelOptions,
+    permissionMode: permissionMode(automation.permission_mode),
+    ...draftForSchedule(automation.schedule),
+    enabled: automation.enabled,
+  };
+};
 
 export const automationDraftFromTemplate = (
   template: ProtocolAutomationTemplate,
@@ -181,6 +197,7 @@ const scheduleFromDraft = (draft: AutomationDraft): ProtocolAutomationSchedule =
 
 export const automationRequestFromDraft = (
   draft: AutomationDraft,
+  model: ProtocolModelInfo | null | undefined,
 ): ProtocolUpsertAutomationRequest => {
   const errors = validateAutomationDraft(draft);
   if (hasAutomationDraftErrors(errors)) {
@@ -192,7 +209,8 @@ export const automationRequestFromDraft = (
     workspace_id: draft.workspaceId,
     mode: draft.mode === "" ? null : draft.mode,
     model: draft.model === "" ? null : draft.model,
-    thinking_level: draft.thinkingLevel === "" ? null : draft.thinkingLevel,
+    thinking_level: null,
+    model_options: { ...sanitizeModelOptions(model, draft.modelOptions) },
     permission_mode: draft.permissionMode,
     schedule: scheduleFromDraft(draft),
     enabled: draft.enabled,
