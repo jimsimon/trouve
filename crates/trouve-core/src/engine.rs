@@ -906,6 +906,20 @@ fn trouve_bridge_wrapper_call<'a>(
     Some((nested_tool, arguments))
 }
 
+/// Return the canonical trouve tool represented by a provider's presentation
+/// item. Claude exposes MCP tools as namespaced tool names while Codex wraps
+/// them in an `mcpToolCall` item. In either case ToolExecutor owns the durable
+/// lifecycle, so the provider's presentation-only lifecycle is suppressed.
+fn trouve_bridge_presentation_call<'a>(
+    tool: &'a str,
+    args: &'a serde_json::Value,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    if let Some(nested_tool) = tool.strip_prefix("mcp__trouve__") {
+        return (!nested_tool.is_empty()).then_some((nested_tool, args));
+    }
+    trouve_bridge_wrapper_call(tool, args)
+}
+
 struct BackendApprovalOutcome {
     owner_thread_id: Option<String>,
     call_id: String,
@@ -10857,8 +10871,9 @@ impl Engine {
         true
     }
 
-    /// Consume Codex's MCP presentation lifecycle. The matching ToolExecutor
-    /// call writes the sole durable card in the collaborator thread.
+    /// Consume the provider's MCP presentation lifecycle. The matching
+    /// ToolExecutor call writes the sole durable card in the collaborator
+    /// thread.
     fn suppress_collaborator_bridge_wrapper(
         &self,
         root_thread_id: &str,
@@ -10871,8 +10886,10 @@ impl Engine {
                 call_id,
                 tool,
                 args,
-            } if trouve_bridge_wrapper_call(tool, args).is_some() => {
-                if collaborator.suppressed_bridge_calls.insert(call_id.clone()) {
+            } if trouve_bridge_presentation_call(tool, args).is_some() => {
+                if collaborator.suppressed_bridge_calls.insert(call_id.clone())
+                    && trouve_bridge_wrapper_call(tool, args).is_some()
+                {
                     self.announce_trouve_bridge_wrapper(
                         root_thread_id,
                         vendor_thread_id,
@@ -12628,8 +12645,10 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
-                    if trouve_bridge_wrapper_call(&tool, &args).is_some() {
-                        if suppressed_bridge_calls.insert(call_id.clone()) {
+                    if trouve_bridge_presentation_call(&tool, &args).is_some() {
+                        if suppressed_bridge_calls.insert(call_id.clone())
+                            && trouve_bridge_wrapper_call(&tool, &args).is_some()
+                        {
                             if let Some(vendor_thread_id) = active_vendor_session.as_deref() {
                                 self.announce_trouve_bridge_wrapper(
                                     &thread.id,
@@ -17741,7 +17760,7 @@ mod tests {
     }
 
     #[test]
-    fn only_first_party_codex_mcp_items_are_bridge_wrappers() {
+    fn only_first_party_mcp_items_are_bridge_presentations() {
         let args = serde_json::json!({
             "type": "mcpToolCall",
             "server": "trouve",
@@ -17763,6 +17782,14 @@ mod tests {
             .is_none()
         );
         assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
+
+        let claude_args = serde_json::json!({ "path": "README.md" });
+        let (tool, nested) =
+            trouve_bridge_presentation_call("mcp__trouve__read_file", &claude_args).unwrap();
+        assert_eq!(tool, "read_file");
+        assert_eq!(nested, &claude_args);
+        assert!(trouve_bridge_presentation_call("mcp__github__get_issue", &claude_args).is_none());
+        assert!(trouve_bridge_presentation_call("mcp__trouve__", &claude_args).is_none());
     }
 
     struct CatalogTestProvider {
@@ -19557,6 +19584,41 @@ default_permission_mode = "ask"
                 projection,
                 &BackendCollaboratorEvent::ToolCompleted {
                     call_id: "codex-wrapper".into(),
+                    ok: true,
+                    result: serde_json::json!({ "status": "completed" }),
+                },
+            ));
+        }
+        // Claude announces the same first-party MCP call with a namespaced
+        // tool name rather than Codex's structured wrapper. Its presentation
+        // lifecycle must also disappear in favor of ToolExecutor's card.
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "claude-wrapper".into(),
+                    tool: "mcp__trouve__read_file".into(),
+                    args: bridge_arguments.clone(),
+                },
+            ));
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolOutput {
+                    call_id: "claude-wrapper".into(),
+                    chunk: "owned by the child".into(),
+                },
+            ));
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolCompleted {
+                    call_id: "claude-wrapper".into(),
                     ok: true,
                     result: serde_json::json!({ "status": "completed" }),
                 },
