@@ -688,12 +688,23 @@ fn reject_macos_extended_acl(path: &Path) -> std::io::Result<()> {
     let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
     let _ = unsafe { acl_free(acl) };
     match result {
-        0 => Ok(()),
-        1 => Err(std::io::Error::new(
+        // Darwin differs from the POSIX-style contract used by several
+        // other ACL implementations: zero means that an entry was returned,
+        // while an empty ACL reports EINVAL for ACL_FIRST_ENTRY.  Reversing
+        // those meanings rejects ordinary files and permits the extended ACL
+        // that this atomic replacement cannot preserve.
+        0 => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "MCP config has an extended ACL that cannot be preserved atomically",
         )),
-        _ => Err(std::io::Error::last_os_error()),
+        _ => {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -3489,6 +3500,16 @@ for line in sys.stdin:
             xattr::get(&path, "user.trouve-mcp-test").unwrap(),
             Some(b"retained".to_vec())
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plain_config_is_not_mistaken_for_an_extended_acl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        reject_macos_extended_acl(&path).unwrap();
     }
 
     #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "hurd"))]

@@ -247,6 +247,9 @@ mod tests {
         #[cfg(unix)]
         candidates.extend([alias, PathBuf::from("/")]);
 
-        assert_eq!(canonical_existing_roots(candidates), vec![resource]);
+        assert_eq!(
+            canonical_existing_roots(candidates),
+            vec![resource.canonicalize().unwrap()]
+        );
     }
 }

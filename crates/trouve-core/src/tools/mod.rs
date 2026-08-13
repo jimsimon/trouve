@@ -1126,7 +1126,26 @@ fn open_directory_nofollow(
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
 
-    let start = if path.is_absolute() { "/" } else { "." };
+    // Resolve aliases in trusted ancestors (notably macOS `/var` ->
+    // `/private/var`) while retaining the final component for the
+    // descriptor-relative O_NOFOLLOW check below. Canonicalizing the entire
+    // path would silently accept a symlink in the protected root itself.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("attachment root has no final component: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "resolving attachment root parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    let walk_path = canonical_parent.join(file_name);
+
+    let start = if walk_path.is_absolute() { "/" } else { "." };
     let start = std::ffi::CString::new(start).expect("static path has no NUL");
     // SAFETY: `start` is NUL-terminated and the returned descriptor is
     // immediately transferred to OwnedFd.
@@ -1144,7 +1163,7 @@ fn open_directory_nofollow(
     }
     // SAFETY: `start_fd` is a newly owned successful open result.
     let mut current = unsafe { OwnedFd::from_raw_fd(start_fd) };
-    let components = path.components().collect::<Vec<_>>();
+    let components = walk_path.components().collect::<Vec<_>>();
     let mut normal_index = 0usize;
     let normal_count = components
         .iter()
@@ -2621,6 +2640,30 @@ mod tests {
 
         assert!(!attachment.exists());
         assert!(!untouched_repository.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_cleanup_allows_a_symlinked_ancestor_but_not_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let real_root = real.path().join("attachments");
+        std::fs::create_dir(&real_root).unwrap();
+        let alias = aliases.path().join("data");
+        symlink(real.path(), &alias).unwrap();
+        let alias_root = alias.join("attachments");
+        let attachment = alias_root.join("at_test");
+        std::fs::write(&attachment, b"payload").unwrap();
+
+        cleanup_attachments_secure(&alias_root, std::slice::from_ref(&attachment)).unwrap();
+        assert!(!attachment.exists());
+
+        let linked_root = aliases.path().join("linked-attachments");
+        symlink(&real_root, &linked_root).unwrap();
+        let error = cleanup_attachments_secure(&linked_root, &[]).unwrap_err();
+        assert!(error.contains("opening attachment directory"), "{error}");
     }
 
     #[tokio::test]

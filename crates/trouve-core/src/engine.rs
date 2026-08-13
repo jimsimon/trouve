@@ -14811,6 +14811,23 @@ mod tests {
         }
     }
 
+    async fn await_mcp_invalidation_start(
+        started: &Arc<tokio::sync::Semaphore>,
+        task: &mut tokio::task::JoinHandle<Result<(), EngineError>>,
+    ) {
+        tokio::select! {
+            permit = started.clone().acquire_owned() => {
+                permit.expect("MCP invalidation probe semaphore closed").forget();
+            }
+            result = task => {
+                panic!("MCP settings mutation exited before cache invalidation started: {result:?}");
+            }
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("MCP settings mutation did not reach cache invalidation within five seconds");
+            }
+        }
+    }
+
     struct SuccessfulTodoExecutor;
 
     #[async_trait::async_trait]
@@ -15085,9 +15102,9 @@ mod tests {
         assert!(started.try_acquire().is_err());
 
         let task_engine = engine.clone();
-        let task =
+        let mut task =
             tokio::spawn(async move { task_engine.upsert_mcp_server("docs", &request).await });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut task).await;
         let servers = crate::mcp::read_servers(&config_path);
         assert_eq!(servers["docs"].command, "first");
         assert!(!servers["docs"].disabled);
@@ -15097,7 +15114,7 @@ mod tests {
 
         fail_after_commit.store(true, Ordering::SeqCst);
         let task_engine = engine.clone();
-        let committed = tokio::spawn(async move {
+        let mut committed = tokio::spawn(async move {
             task_engine
                 .upsert_mcp_server(
                     "committed",
@@ -15112,7 +15129,7 @@ mod tests {
                 )
                 .await
         });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut committed).await;
         assert_eq!(
             crate::mcp::read_servers(&config_path)["committed"].command,
             "committed-mcp"
@@ -15126,7 +15143,7 @@ mod tests {
         );
 
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             task_engine
                 .set_mcp_server_enabled(
                     "docs",
@@ -15138,14 +15155,14 @@ mod tests {
                 )
                 .await
         });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut task).await;
         assert!(crate::mcp::read_servers(&config_path)["docs"].disabled);
         assert!(!task.is_finished());
         releases.add_permits(1);
         task.await.unwrap().unwrap();
 
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             task_engine
                 .set_mcp_server_enabled(
                     "docs",
@@ -15157,14 +15174,14 @@ mod tests {
                 )
                 .await
         });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut task).await;
         assert!(!crate::mcp::read_servers(&config_path)["docs"].disabled);
         assert!(!task.is_finished());
         releases.add_permits(1);
         task.await.unwrap().unwrap();
 
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             task_engine
                 .upsert_mcp_server(
                     "docs",
@@ -15179,7 +15196,7 @@ mod tests {
                 )
                 .await
         });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut task).await;
         let servers = crate::mcp::read_servers(&config_path);
         assert_eq!(servers["docs"].command, "replacement");
         assert_eq!(servers["docs"].args, ["--new"]);
@@ -15188,9 +15205,9 @@ mod tests {
         task.await.unwrap().unwrap();
 
         let task_engine = engine.clone();
-        let task =
+        let mut task =
             tokio::spawn(async move { task_engine.delete_mcp_server("docs", "user", None).await });
-        started.clone().acquire_owned().await.unwrap().forget();
+        await_mcp_invalidation_start(&started, &mut task).await;
         assert!(!crate::mcp::read_servers(&config_path).contains_key("docs"));
         assert!(!task.is_finished());
         releases.add_permits(1);
