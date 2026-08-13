@@ -21,6 +21,34 @@ use trouve_protocol::PROTOCOL_VERSION;
 
 const SERVER_URL_ENV: &str = "TROUVE_SERVER_URL";
 
+#[cfg(any(target_os = "linux", test))]
+const BACKGROUND_NICE_INCREMENT: i32 = 5;
+
+#[cfg(any(target_os = "linux", test))]
+fn background_nice_value(current: i32) -> i32 {
+    current.saturating_add(BACKGROUND_NICE_INCREMENT).min(19)
+}
+
+/// Lower only the runtime thread that invokes this hook. Linux inherits a
+/// thread's niceness when it spawns child processes, so agent subprocesses
+/// yield to the unchanged Tao/Wry event-loop thread under CPU contention.
+#[cfg(target_os = "linux")]
+fn deprioritize_background_thread() {
+    // SAFETY: these calls operate on the current Linux thread when `who` is
+    // zero and retain no Rust pointers.
+    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let target = background_nice_value(current);
+    if target == current {
+        return;
+    }
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not lower desktop runtime CPU priority"
+        );
+    }
+}
+
 /// Hardened loopback gateway and the runtime that owns it.
 ///
 /// Keep this value alive for the webview's full lifetime. Calling
@@ -64,10 +92,13 @@ impl WebPreviewHost {
         allow_embedded_server: bool,
     ) -> Result<Self> {
         trouve_server::install_crypto_provider();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            // The gateway, embedded server, and notification dispatcher are
-            // I/O-bound; four workers avoid per-core allocator arena growth.
-            .worker_threads(4)
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        // The gateway, embedded server, and notification dispatcher are
+        // I/O-bound; four workers avoid per-core allocator arena growth.
+        runtime_builder.worker_threads(4);
+        #[cfg(target_os = "linux")]
+        runtime_builder.on_thread_start(deprioritize_background_thread);
+        let runtime = runtime_builder
             .enable_all()
             .build()
             .context("creating the desktop host runtime")?;
@@ -275,6 +306,14 @@ mod tests {
         let error = configured_server_url(None, false).unwrap_err().to_string();
         assert!(error.contains(SERVER_URL_ENV));
         assert!(error.contains("never open the default database"));
+    }
+
+    #[test]
+    fn background_niceness_yields_without_exceeding_linux_limit() {
+        assert_eq!(background_nice_value(0), 5);
+        assert_eq!(background_nice_value(10), 15);
+        assert_eq!(background_nice_value(18), 19);
+        assert_eq!(background_nice_value(19), 19);
     }
 
     #[test]
