@@ -640,7 +640,7 @@ fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std:
         return Ok(());
     }
     let group = signal_unix_process_group(child.process_group);
-    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel);
+    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel, child.process_group);
     group.and(escaped)
 }
 
@@ -752,7 +752,7 @@ fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Res
         return Ok(());
     }
     let group = signal_unix_process_group(child.process_group);
-    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel);
+    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel, child.process_group);
     group.and(escaped)
 }
 
@@ -825,7 +825,14 @@ fn signal_unix_process_group(process_group: i32) -> std::io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn terminate_unix_sentinel_holders(sentinel: &OwnedFd) -> std::io::Result<()> {
+fn linux_process_parent_id(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, tail) = stat.rsplit_once(") ")?;
+    tail.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_unix_sentinel_holders(sentinel: &OwnedFd, tree_leader: i32) -> std::io::Result<()> {
     let sentinel_target = std::fs::read_link(format!("/proc/self/fd/{}", sentinel.as_raw_fd()))?;
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut first_error = None;
@@ -850,6 +857,18 @@ fn terminate_unix_sentinel_holders(sentinel: &OwnedFd) -> std::io::Result<()> {
         if !holds_sentinel {
             continue;
         }
+        // Every sentinel writer is close-on-exec in the owner. A different
+        // process-tree spawn can nevertheless fork while this writer is still
+        // present in the shared parent, briefly inheriting it before exec
+        // closes it. Such a process is another direct child of trouve, not a
+        // descendant of this tree. Killing it here made unrelated short-lived
+        // commands fail nondeterministically under concurrent test/turn load.
+        // The actual tree leader remains eligible even though it is also a
+        // direct child; its descendants either name that leader as their
+        // parent or have already been reparented after escaping the group.
+        if pid != tree_leader && linux_process_parent_id(pid) == Some(own_pid) {
+            continue;
+        }
         if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
@@ -864,7 +883,7 @@ fn terminate_unix_sentinel_holders(sentinel: &OwnedFd) -> std::io::Result<()> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn terminate_unix_sentinel_holders(_sentinel: &OwnedFd) -> std::io::Result<()> {
+fn terminate_unix_sentinel_holders(_sentinel: &OwnedFd, _tree_leader: i32) -> std::io::Result<()> {
     // The inherited sentinel still prevents a false cleanup acknowledgement
     // on these platforms. Without a portable process-holder query, an escaped
     // descendant remains quarantined until it exits rather than racing a new
@@ -1375,6 +1394,52 @@ mod tests {
         stdout.read_to_end(&mut bytes).unwrap();
         stderr.read_to_end(&mut bytes).unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sentinel_cleanup_preserves_an_unrelated_direct_child_during_exec() {
+        use std::os::unix::process::CommandExt as _;
+
+        // Model the narrow overlap between two concurrent spawns: the second
+        // child forks while the first spawn's sentinel writer still exists in
+        // the shared parent. The inherited descriptor is normally closed by
+        // exec; retaining it here makes the race deterministic.
+        let mut owner = std::process::Command::new("/bin/true");
+        let (sentinel, writer) = install_unix_descendant_sentinel(&mut owner).unwrap();
+        let writer_fd = writer.as_raw_fd();
+        let mut unrelated = std::process::Command::new("/bin/sh");
+        unrelated
+            .args(["-c", "sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        // SAFETY: only async-signal-safe fcntl calls run between fork and exec.
+        unsafe {
+            unrelated.pre_exec(move || {
+                let flags = libc::fcntl(writer_fd, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(writer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut unrelated = unrelated.spawn().unwrap();
+        drop(writer);
+        assert!(unix_descendant_sentinel_active(&sentinel).unwrap());
+
+        terminate_unix_sentinel_holders(&sentinel, i32::MAX).unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "cleanup for one process tree killed an unrelated direct child"
+        );
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
     }
 
     #[cfg(target_os = "linux")]
