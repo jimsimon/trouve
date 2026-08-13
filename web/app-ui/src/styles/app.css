@@ -886,6 +886,21 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .settings-subsection h2 { margin: 0; color: var(--trouve-text-hi); font-size: 16px; line-height: 1.35; }
 .settings-note, .settings-field p, .settings-tagline, .legal-copy { color: var(--trouve-text-soft); font-size: var(--trouve-settings-info-font-size, 11px); }
 .settings-tagline { color: var(--trouve-text-dim); font-size: 12px; }
+.settings-about-card { display: grid; grid-template-columns: 58px minmax(0, 1fr) auto; align-items: center; gap: 14px; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 16px; background: var(--trouve-panel-bg); }
+.settings-about-card > img { inline-size: 58px; block-size: 58px; border-radius: 13px; padding: 8px; background: var(--trouve-accent-bg); object-fit: contain; }
+.settings-about-copy { min-width: 0; display: grid; gap: 3px; }
+.settings-about-copy strong { color: var(--trouve-text-hi); font-size: 21px; line-height: 1.2; }
+.settings-about-copy span { color: var(--trouve-text-soft); font-size: 12px; }
+.settings-about-card dl, .settings-about-card dl div { margin: 0; }
+.settings-about-card dl div { display: grid; justify-items: end; gap: 3px; }
+.settings-about-card dt { color: var(--trouve-text-mid); font-size: 11px; font-weight: 700; }
+.settings-about-card dd { margin: 0; border: 1px solid var(--trouve-border); border-radius: 6px; padding: 5px 10px; color: var(--trouve-text-hi); background: var(--trouve-control-bg); font-size: 12px; font-weight: 700; }
+@media (max-width: 560px) {
+  .settings-about-card { grid-template-columns: 48px minmax(0, 1fr); }
+  .settings-about-card > img { inline-size: 48px; block-size: 48px; }
+  .settings-about-card dl { grid-column: 1 / -1; justify-self: stretch; }
+  .settings-about-card dl div { grid-template-columns: auto 1fr; align-items: center; justify-items: start; }
+}
 .capability-note { border-left: 2px solid var(--trouve-warn-border); padding-left: 8px; color: var(--trouve-text-dim); }
 .settings-check { display: flex; align-items: center; gap: 8px; color: var(--trouve-text); }
 .settings-check.compact { margin: 0; font-weight: 400; }

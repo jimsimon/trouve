@@ -526,9 +526,22 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                           </div>
                         `
                       : html`
-                          <div class="settings-section">
+                          <div class="settings-section settings-about">
                             <h1 id="settings-title">About</h1>
-                            <p class="settings-tagline">trouve — a protocol-first AI coding harness.</p>
+                            <p class="settings-note">Application details for this Trouve build.</p>
+                            <section class="settings-about-card" aria-label="Trouve application details">
+                              <img src="icons/trouve-512.png" alt="" />
+                              <div class="settings-about-copy">
+                                <strong>trouve</strong>
+                                <span>A protocol-first AI coding harness</span>
+                              </div>
+                              <dl>
+                                <div>
+                                  <dt>Version</dt>
+                                  <dd>v${__TROUVE_FRONTEND_VERSION__}</dd>
+                                </div>
+                              </dl>
+                            </section>
                           </div>
                         `}
                   `}
