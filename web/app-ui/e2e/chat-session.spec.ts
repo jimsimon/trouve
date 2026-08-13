@@ -2,6 +2,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 
 import { parseUnifiedDiff } from "../src/components/diff-parser.js";
+import { SUPPORTED_PROTOCOL_VERSION } from "../src/services/protocol-client.js";
 
 interface FixtureEvent extends Record<string, unknown> {
   readonly cursor: number;
@@ -482,7 +483,7 @@ const installProtocolFixtures = async (
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "4.1",
+        protocol_version: SUPPORTED_PROTOCOL_VERSION,
         online: true,
       },
       "GET /v1/session-summaries": {

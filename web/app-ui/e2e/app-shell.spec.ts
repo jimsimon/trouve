@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+import { SUPPORTED_PROTOCOL_VERSION } from "../src/services/protocol-client.js";
 import { stabilizeVisualFonts } from "./visual-fonts";
 
 const pr = {
@@ -90,7 +91,7 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       "GET /v1/info": {
         name: "trouve-server",
         version: "3.7.0",
-        protocol_version: "4.1",
+        protocol_version: SUPPORTED_PROTOCOL_VERSION,
         online: true,
       },
       "GET /v1/session-summaries": {
