@@ -1298,12 +1298,9 @@ IFS= read -r line # first turn/start
 printf '%s\n' "$line" > "$0.turn-start-1"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
-IFS= read -r line # second thread/resume
-printf '%s\n' "$line" > "$0.thread-resume-2"
-echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # second turn/start
 printf '%s\n' "$line" > "$0.turn-start-2"
-echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
 cat > /dev/null
 "#,
@@ -1817,11 +1814,8 @@ IFS= read -r line # first turn/interrupt
 printf '%s\n' "$line" > "$0.interrupt.tmp"
 mv "$0.interrupt.tmp" "$0.interrupt"
 echo '{"jsonrpc":"2.0","id":4,"result":{}}'
-IFS= read -r line # thread/resume
-printf '%s\n' "$line" > "$0.thread-resume"
-echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # replacement turn/start
-echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","id":5,"result":{"turn":{"id":"turn-2"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-1","delta":"stale"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-2","delta":"replacement"}}'
@@ -1865,14 +1859,9 @@ cat > /dev/null
 
     assert_eq!(text, "replacement");
     assert_eq!(completed, 1);
-    let resumed: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.thread-resume")).unwrap())
-            .unwrap();
-    assert_eq!(resumed["method"], "thread/resume");
-    assert_eq!(resumed["params"]["threadId"], "thr-1");
-    assert_eq!(
-        resumed["params"]["developerInstructions"], "mode prompt",
-        "resumed Codex threads must recover current mode and bridge guidance"
+    assert!(
+        !std::path::Path::new(&format!("{stub}.thread-resume")).exists(),
+        "a thread already loaded with matching MCP configuration must be reused"
     );
 }
 
@@ -1890,11 +1879,9 @@ IFS= read -r line # thread/start
 echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # first turn/start
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
-IFS= read -r line # replacement thread/resume
-echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # predecessor turn/interrupt
 printf '%s\n' "$line" > "$0.interrupt"
-echo '{"jsonrpc":"2.0","id":5,"error":{"message":"cannot interrupt predecessor"}}'
+echo '{"jsonrpc":"2.0","id":4,"error":{"message":"cannot interrupt predecessor"}}'
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
 cat > /dev/null
 "#,
