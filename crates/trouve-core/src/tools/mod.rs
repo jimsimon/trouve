@@ -4205,7 +4205,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(synced, repository);
+        assert_eq!(synced, std::fs::canonicalize(repository).unwrap());
     }
 
     #[tokio::test]
