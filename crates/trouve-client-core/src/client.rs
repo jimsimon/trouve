@@ -1191,6 +1191,8 @@ impl ProtocolClient {
         .await
     }
 
+    /// Validate a failed persona and start a whole-job replacement using the
+    /// current repository review settings.
     pub async fn retry_code_review_persona(
         &self,
         id: &str,

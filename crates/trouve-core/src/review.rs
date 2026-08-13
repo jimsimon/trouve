@@ -161,7 +161,11 @@ the best supported JSON result.";
 const COORDINATOR_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish validation in about one minute. Use no more than 4 tool calls \
 total, only to resolve a concrete ambiguity that the supplied candidate and diff context cannot \
-settle. Do not inventory the repository, recreate the diff, make a todo list, or run builds/tests.";
+settle. Do not inventory the repository, recreate the diff, make a todo list, or run builds/tests. \
+Treat checked-in code and the supplied revision as authoritative. Do not inspect this review \
+service's runtime, deployment, model/provider configuration, context window, queues, environment, \
+or hardware; those are unrelated to whether the change is correct. When a candidate concerns a \
+configured limit, inspect the checked-in definition and call sites, not the local running service.";
 const FINDING_LEVEL_GUIDANCE: &str = "\
 Finding level rubric (apply these same thresholds in every review domain):
 - Severity measures the realistic consequence and blast radius if a reachable issue manifests, \
@@ -1016,6 +1020,29 @@ fn manual_request_can_satisfy_automatic_review(
 fn review_id_from_url(url: &str) -> Option<u64> {
     url.split_once("#pullrequestreview-")
         .and_then(|(_, id)| id.parse().ok())
+}
+
+fn should_skip_automatic_review(trigger: &str, revision_job_exists: bool) -> bool {
+    // The store query matches both the current base and head. The pull-state
+    // watermark is intentionally not used here because it also tracks manual
+    // reviews (including draft reviews) for incremental diff selection.
+    should_terminate_duplicate_review_job(trigger, revision_job_exists)
+}
+
+fn should_terminate_duplicate_review_job(trigger: &str, prior_revision_job_exists: bool) -> bool {
+    trigger == "automatic" && prior_revision_job_exists
+}
+
+fn incremental_review_base_sha(
+    base_sha: &str,
+    head_sha: &str,
+    last_reviewed_head_sha: &str,
+) -> String {
+    if last_reviewed_head_sha.is_empty() || last_reviewed_head_sha == head_sha {
+        base_sha.into()
+    } else {
+        last_reviewed_head_sha.into()
+    }
 }
 
 #[derive(Deserialize)]
@@ -2330,21 +2357,31 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
-        let existing = self
+        let old = self
             .store
             .code_review_job(id)?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
-        if existing.publication_claimed {
-            self.sync_code_review_projection(&existing.job).await;
+        if old.publication_claimed {
+            self.sync_code_review_projection(&old.job).await;
             return self
                 .store
                 .code_review_job(id)?
                 .map(|record| record.job)
                 .ok_or_else(|| EngineError::NotFound(format!("review job {id}")));
         }
+        let new_job = self
+            .new_code_review_job_with_current_settings(
+                old.job.installation_id,
+                &old.job.repository,
+                old.job.pull_number,
+                old.job.scope,
+                "retry",
+                Some(&old.job),
+            )
+            .await?;
         let replacement = self
             .store
-            .retry_code_review_job(id)
+            .retry_code_review_job(id, &new_job)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
         self.code_review.cancel_job(id);
@@ -2361,33 +2398,75 @@ impl Engine {
         id: &str,
         reviewer_id: &str,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
-        // A terminal job normally has already cleaned up its disposable
-        // session. Retry cleanup once more here so a transient cleanup delay
-        // does not unnecessarily block a persona retry.
-        self.retry_code_review_cleanup().await;
-        let job = self
+        let detail = self
             .store
-            .retry_code_review_persona(id, reviewer_id)
-            .map_err(|error| EngineError::BadRequest(error.to_string()))?
+            .code_review_job_overview(id)?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
-        self.emit_code_review_job_updated(id)?;
-        self.emit_code_review_updated(Some(id.to_owned()))?;
-        self.sync_code_review_projection(&job).await;
-        self.code_review.job_wake.notify_one();
-        Ok(job)
+        if detail.job.status != "failed" {
+            return Err(EngineError::BadRequest(
+                "reviewer personas can only be retried after the review job fails".into(),
+            ));
+        }
+        let persona = detail
+            .personas
+            .iter()
+            .find(|persona| persona.reviewer_id == reviewer_id)
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!(
+                    "reviewer persona {reviewer_id} was not part of review job {id}"
+                ))
+            })?;
+        if !matches!(persona.status.as_str(), "failed" | "cancelled") {
+            return Err(EngineError::BadRequest(format!(
+                "reviewer persona {reviewer_id} has no failed or cancelled batches to retry"
+            )));
+        }
+        // A new job is required to apply the current repository-wide models,
+        // prompts, reviewer catalog, and routing policy consistently. Reusing
+        // successful tasks from the old job would mix configuration snapshots.
+        self.retry_review_job(id).await
     }
 
     pub async fn request_code_review(
         self: &Arc<Self>,
         request: trouve_protocol::RequestCodeReviewRequest,
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
+        let new_job = self
+            .new_code_review_job_with_current_settings(
+                request.installation_id,
+                &request.repository,
+                request.pull_number,
+                request.scope,
+                "manual",
+                None,
+            )
+            .await?;
+        let job = self
+            .store
+            .enqueue_code_review_job(&new_job)?
+            .ok_or_else(|| EngineError::Internal(anyhow!("manual review dedupe collision")))?;
+        self.emit_code_review_updated(Some(job.id.clone()))?;
+        self.sync_code_review_projection(&job).await;
+        self.code_review.job_wake.notify_one();
+        Ok(job)
+    }
+
+    async fn new_code_review_job_with_current_settings(
+        &self,
+        installation_id: u64,
+        repository_name: &str,
+        pull_number: u64,
+        scope: trouve_protocol::CodeReviewJobScope,
+        trigger: &str,
+        predecessor: Option<&trouve_protocol::CodeReviewJob>,
+    ) -> Result<NewCodeReviewJob, EngineError> {
         let repository = self
             .store
             .list_code_review_repositories()?
             .into_iter()
             .find(|repository| {
-                repository.repository == request.repository
-                    && repository.installation_id == request.installation_id
+                repository.repository == repository_name
+                    && repository.installation_id == installation_id
             })
             .ok_or_else(|| {
                 EngineError::BadRequest(
@@ -2408,7 +2487,7 @@ impl Engine {
         let (pull, rate): (GithubPullRequest, _) = api
             .get(&format!(
                 "/repos/{}/pulls/{}",
-                repository.repository, request.pull_number
+                repository.repository, pull_number
             ))
             .await
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
@@ -2420,55 +2499,65 @@ impl Engine {
         }
         let reviewers = self.reviewers_for_repository_policy(&repository)?;
         let config_hash = Self::code_review_config_hash(&repository, &reviewers)?;
-        let pull_state = self
-            .store
-            .code_review_pull_state(&repository.repository, pull.number)?;
-        let review_base_sha = match request.scope {
-            trouve_protocol::CodeReviewJobScope::Full => pull.base.sha.clone(),
-            trouve_protocol::CodeReviewJobScope::Incremental
-                if !pull_state.last_reviewed_head_sha.is_empty() =>
-            {
-                pull_state.last_reviewed_head_sha
+        let (base_ref, head_sha, head_ref, review_base_sha) = match predecessor {
+            Some(predecessor) => (
+                predecessor.base_ref.clone(),
+                predecessor.head_sha.clone(),
+                predecessor.head_ref.clone(),
+                predecessor.review_base_sha.clone(),
+            ),
+            None => {
+                let pull_state = self
+                    .store
+                    .code_review_pull_state(&repository.repository, pull.number)?;
+                let review_base_sha = match scope {
+                    trouve_protocol::CodeReviewJobScope::Full => pull.base.sha.clone(),
+                    trouve_protocol::CodeReviewJobScope::Incremental => {
+                        incremental_review_base_sha(
+                            &pull.base.sha,
+                            &pull.head.sha,
+                            &pull_state.last_reviewed_head_sha,
+                        )
+                    }
+                };
+                (
+                    pull.base.sha.clone(),
+                    pull.head.sha.clone(),
+                    pull.head.name.clone(),
+                    review_base_sha,
+                )
             }
-            trouve_protocol::CodeReviewJobScope::Incremental => pull.base.sha.clone(),
         };
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let job = self
-            .store
-            .enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key: format!(
-                    "{}#{}:{}:{}:manual-api:{nonce}:{config_hash}",
-                    repository.repository, pull.number, pull.base.sha, pull.head.sha
-                ),
-                installation_id: repository.installation_id,
-                repository: repository.repository.clone(),
-                pull_number: pull.number,
-                pull_title: pull.title,
-                pull_url: pull.html_url,
-                head_sha: pull.head.sha,
-                review_base_sha,
-                base_ref: pull.base.sha,
-                head_ref: pull.head.name,
-                scope: request.scope,
-                trigger: "manual".into(),
-                retry_of: None,
-                model: repository.model,
-                coordinator_thinking_level: repository.coordinator_thinking_level,
-                router_model: repository.router_model,
-                router_thinking_level: repository.router_thinking_level,
-                prompt: repository.prompt,
-                reviewers,
-                routing_mode: repository.routing_mode,
-                semantic_routing: repository.semantic_routing,
-                included_reviewer_ids: repository.included_reviewer_ids,
-                excluded_reviewer_ids: repository.excluded_reviewer_ids,
-                config_hash,
-            })?
-            .ok_or_else(|| EngineError::Internal(anyhow!("manual review dedupe collision")))?;
-        self.emit_code_review_updated(Some(job.id.clone()))?;
-        self.sync_code_review_projection(&job).await;
-        self.code_review.job_wake.notify_one();
-        Ok(job)
+        Ok(NewCodeReviewJob {
+            dedupe_key: format!(
+                "{}#{}:{}:{}:{trigger}:{nonce}:{config_hash}",
+                repository.repository, pull.number, base_ref, head_sha
+            ),
+            installation_id: repository.installation_id,
+            repository: repository.repository.clone(),
+            pull_number: pull.number,
+            pull_title: pull.title,
+            pull_url: pull.html_url,
+            head_sha,
+            review_base_sha,
+            base_ref,
+            head_ref,
+            scope,
+            trigger: trigger.into(),
+            retry_of: predecessor.map(|job| job.id.clone()),
+            model: repository.model,
+            coordinator_thinking_level: repository.coordinator_thinking_level,
+            router_model: repository.router_model,
+            router_thinking_level: repository.router_thinking_level,
+            prompt: repository.prompt,
+            reviewers,
+            routing_mode: repository.routing_mode,
+            semantic_routing: repository.semantic_routing,
+            included_reviewer_ids: repository.included_reviewer_ids,
+            excluded_reviewer_ids: repository.excluded_reviewer_ids,
+            config_hash,
+        })
     }
 
     pub(crate) fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
@@ -3342,7 +3431,6 @@ impl Engine {
                     pull.number,
                     &pull.base.sha,
                     &pull.head.sha,
-                    &config_hash,
                 )?;
                 let review_superseded = !superseded.is_empty();
                 if review_superseded {
@@ -3361,7 +3449,7 @@ impl Engine {
                     manual_requested,
                 )?;
                 // If a manually requested review is superseded while the bot is
-                // still selected, replace it for the new revision/configuration
+                // still selected, replace it for the new revision
                 // without requiring the user to toggle the request off and on.
                 let replace_manual_review = should_replace_manual_review(
                     repository.mode,
@@ -3373,6 +3461,15 @@ impl Engine {
                     "{}#{}:{}:{}:automatic:{config_hash}",
                     repository.repository, pull.number, pull.base.sha, pull.head.sha
                 );
+                let pull_state = self
+                    .store
+                    .code_review_pull_state(&repository.repository, pull.number)?;
+                let revision_job_exists = self.store.code_review_job_exists_for_revision(
+                    &repository.repository,
+                    pull.number,
+                    &pull.base.sha,
+                    &pull.head.sha,
+                )?;
                 let triggers = requested_review_triggers(
                     repository.mode,
                     pull.draft,
@@ -3385,6 +3482,13 @@ impl Engine {
                 }
 
                 for requested in triggers {
+                    // Polling must not start a second automatic pass for a
+                    // revision already attempted or published. Explicit
+                    // reviewer requests and trusted comment commands remain
+                    // eligible and have their own durable dedupe keys.
+                    if should_skip_automatic_review(requested.trigger, revision_job_exists) {
+                        continue;
+                    }
                     // The first manual request for an unseen automatic head
                     // satisfies its automatic review. Later requests retain
                     // their own stable keys and intentionally run again.
@@ -3398,18 +3502,24 @@ impl Engine {
                     } else {
                         requested.requested_key
                     };
-                    let dedupe_key = format!(
+                    let mut dedupe_key = format!(
                         "{}#{}:{}:{}:{trigger_key}:{config_hash}",
                         repository.repository, pull.number, pull.base.sha, pull.head.sha
                     );
-                    let pull_state = self
-                        .store
-                        .code_review_pull_state(&repository.repository, pull.number)?;
-                    let review_base_sha = if pull_state.last_reviewed_head_sha.is_empty() {
-                        pull.base.sha.clone()
-                    } else {
-                        pull_state.last_reviewed_head_sha
-                    };
+                    // A stale or cancelled automatic attempt must not block a
+                    // later return to the same base/head revision, but its
+                    // durable dedupe key still occupies the unique index.
+                    if trigger_key == "automatic"
+                        && self.store.code_review_job_exists(&dedupe_key)?
+                    {
+                        dedupe_key.push(':');
+                        dedupe_key.push_str(&uuid::Uuid::new_v4().simple().to_string());
+                    }
+                    let review_base_sha = incremental_review_base_sha(
+                        &pull.base.sha,
+                        &pull.head.sha,
+                        &pull_state.last_reviewed_head_sha,
+                    );
                     let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
                         dedupe_key,
                         installation_id: repository.installation_id,
@@ -4181,6 +4291,16 @@ impl Engine {
     ) -> Result<String> {
         let preparation_started = Instant::now();
         let mut job = record.job.clone();
+        let prior_revision_job_exists = self.store.code_review_job_has_prior_revision(
+            &job.id,
+            &job.repository,
+            job.pull_number,
+            &job.base_ref,
+            &job.head_sha,
+        )?;
+        if should_terminate_duplicate_review_job(&job.trigger, prior_revision_job_exists) {
+            bail!("stale: pull request revision already has a review");
+        }
         let coordinator_model = review_model(&job)?;
         ensure_review_current(superseded)?;
         validate_repository(&job.repository)?;
@@ -4923,7 +5043,9 @@ impl Engine {
                     return Err(error);
                 }
             };
-            let (turn, validated) = turn;
+            let (mut turn, mut validated) = turn;
+            normalize_coordinator_output(&mut validated, &candidates, &previous_findings);
+            turn.output = serde_json::to_string(&validated)?;
             let old_ids = previous_findings
                 .iter()
                 .map(|finding| finding.id.as_str())
@@ -10532,6 +10654,63 @@ fn finding_origin_with_history(
     }
 }
 
+fn normalize_coordinator_output(
+    output: &mut ReviewOutput,
+    candidates: &[CandidateFinding],
+    previous_findings: &[trouve_protocol::CodeReviewFinding],
+) {
+    let candidate_ids = candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.as_str())
+        .collect::<HashSet<_>>();
+    for finding in &mut output.findings {
+        let mut seen = HashSet::new();
+        finding.source_candidate_ids.retain(|candidate_id| {
+            candidate_ids.contains(candidate_id.as_str()) && seen.insert(candidate_id.clone())
+        });
+    }
+    let accepted = output
+        .findings
+        .iter()
+        .flat_map(|finding| finding.source_candidate_ids.iter())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let supplied_reasons = output
+        .rejected_candidates
+        .iter()
+        .filter_map(|rejection| {
+            let reason = rejection.reason.trim();
+            (candidate_ids.contains(rejection.candidate_id.as_str())
+                && !accepted.contains(rejection.candidate_id.as_str())
+                && !reason.is_empty())
+            .then_some((rejection.candidate_id.clone(), reason.to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
+    output.rejected_candidates = candidates
+        .iter()
+        .filter(|candidate| !accepted.contains(candidate.candidate_id.as_str()))
+        .map(|candidate| ReviewCandidateRejection {
+            candidate_id: candidate.candidate_id.clone(),
+            reason: supplied_reasons
+                .get(candidate.candidate_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    "The final review editor did not retain this candidate and did not provide a specific reason."
+                        .into()
+                }),
+        })
+        .collect();
+
+    let previous_ids = previous_findings
+        .iter()
+        .map(|finding| finding.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    output
+        .resolved_finding_ids
+        .retain(|id| previous_ids.contains(id.as_str()) && seen.insert(id.clone()));
+}
+
 /// Keeps only themes that genuinely span multiple findings: a non-empty root
 /// cause covering at least one retained finding via its candidate ids and at
 /// least two distinct findings overall, counting previously published finding
@@ -12272,6 +12451,43 @@ mod tests {
         }
     }
 
+    fn test_retry_job_request(
+        job: &trouve_protocol::CodeReviewJob,
+        dedupe_key: &str,
+    ) -> NewCodeReviewJob {
+        let mut request = test_review_job_request(dedupe_key);
+        request.installation_id = job.installation_id;
+        request.repository.clone_from(&job.repository);
+        request.pull_number = job.pull_number;
+        request.pull_title.clone_from(&job.pull_title);
+        request.pull_url.clone_from(&job.pull_url);
+        request.head_sha.clone_from(&job.head_sha);
+        request.review_base_sha.clone_from(&job.review_base_sha);
+        request.base_ref.clone_from(&job.base_ref);
+        request.head_ref.clone_from(&job.head_ref);
+        request.scope = job.scope;
+        request.trigger = "retry".into();
+        request.retry_of = Some(job.id.clone());
+        request.model.clone_from(&job.model);
+        request
+            .coordinator_thinking_level
+            .clone_from(&job.coordinator_thinking_level);
+        request.router_model.clone_from(&job.router_model);
+        request
+            .router_thinking_level
+            .clone_from(&job.router_thinking_level);
+        request.routing_mode = job.routing_mode;
+        request.semantic_routing = job.semantic_routing;
+        request
+            .included_reviewer_ids
+            .clone_from(&job.included_reviewer_ids);
+        request
+            .excluded_reviewer_ids
+            .clone_from(&job.excluded_reviewer_ids);
+        request.config_hash = "retry-config".into();
+        request
+    }
+
     fn review_app_test_config() -> crate::config::Config {
         crate::config::Config {
             github_review_app: Some(GithubReviewAppConfig {
@@ -13892,7 +14108,13 @@ mod tests {
         assert!(record.publication_claimed);
         assert!(record.publication_dispatched);
         assert!(!record.publication_accepted);
-        assert!(engine.store.retry_code_review_job(&job.id).is_err());
+        let retry_request = test_retry_job_request(&job, "retry:dispatched-publication");
+        assert!(
+            engine
+                .store
+                .retry_code_review_job(&job.id, &retry_request)
+                .is_err()
+        );
         engine
             .store
             .set_code_review_finding_publication_status(
@@ -17168,7 +17390,7 @@ mod tests {
             candidate("explained"),
             candidate("missing-reason"),
         ];
-        let review = ReviewOutput {
+        let mut review = ReviewOutput {
             summary: String::new(),
             findings: vec![ReviewFinding {
                 path: "src/lib.rs".into(),
@@ -17180,15 +17402,32 @@ mod tests {
                 body: "accepted".into(),
                 evidence: Default::default(),
                 origin: Default::default(),
-                source_candidate_ids: vec!["accepted".into()],
+                source_candidate_ids: vec!["accepted".into(), "invented".into(), "accepted".into()],
             }],
-            rejected_candidates: vec![ReviewCandidateRejection {
-                candidate_id: "explained".into(),
-                reason: "Duplicate of the accepted finding.".into(),
-            }],
-            resolved_finding_ids: Vec::new(),
+            rejected_candidates: vec![
+                ReviewCandidateRejection {
+                    candidate_id: "explained".into(),
+                    reason: "Duplicate of the accepted finding.".into(),
+                },
+                ReviewCandidateRejection {
+                    candidate_id: "invented".into(),
+                    reason: "Invalid candidate id was not supplied.".into(),
+                },
+            ],
+            resolved_finding_ids: vec!["invented-finding".into()],
             themes: Vec::new(),
         };
+        normalize_coordinator_output(&mut review, &candidates, &[]);
+        assert_eq!(review.findings[0].source_candidate_ids, ["accepted"]);
+        assert_eq!(
+            review
+                .rejected_candidates
+                .iter()
+                .map(|rejection| rejection.candidate_id.as_str())
+                .collect::<Vec<_>>(),
+            ["explained", "missing-reason"]
+        );
+        assert!(review.resolved_finding_ids.is_empty());
 
         let rejected = candidate_rejections(&review, &candidates);
         assert_eq!(rejected.len(), 2);
@@ -17356,6 +17595,7 @@ mod tests {
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 12 tool calls"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
+        assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("checked-in code"));
         assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 24);
     }
 
@@ -17566,6 +17806,29 @@ mod tests {
             false,
             "manual"
         ));
+    }
+
+    #[test]
+    fn existing_revision_only_suppresses_automatic_reviews() {
+        assert!(should_skip_automatic_review("automatic", true));
+        assert!(!should_skip_automatic_review("automatic", false));
+        assert!(!should_skip_automatic_review("manual", true));
+        assert!(should_terminate_duplicate_review_job("automatic", true));
+        assert!(!should_terminate_duplicate_review_job("manual", true));
+        assert!(!should_terminate_duplicate_review_job("retry", true));
+    }
+
+    #[test]
+    fn same_revision_manual_review_uses_the_pull_request_base() {
+        assert_eq!(incremental_review_base_sha("base", "head-2", ""), "base");
+        assert_eq!(
+            incremental_review_base_sha("base", "head-2", "head-1"),
+            "head-1"
+        );
+        assert_eq!(
+            incremental_review_base_sha("base", "head-2", "head-2"),
+            "base"
+        );
     }
 
     #[test]
