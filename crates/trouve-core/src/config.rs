@@ -56,6 +56,11 @@ pub struct Config {
     /// Unset preserves the historical CPU-only behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
+    /// Whether trouve's compiled-in skills are exposed to agents and slash
+    /// command completion. Unset means enabled. User and workspace skills
+    /// remain available when this is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_skills_enabled: Option<bool>,
     /// Whether new session branches include a slug derived from the session
     /// title. Unset means compact `trouve/<short-id>` branches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,12 +160,6 @@ pub struct ProviderConfig {
     /// stub binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code and Codex: bridge trouve's ToolExecutor in over MCP for
-    /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
-    /// built-ins are confined to a read-only sandbox. Defaults to true for
-    /// those backends; explicit false retains the vendor-native fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_bridge: Option<bool>,
 }
 
 impl Default for ProviderConfig {

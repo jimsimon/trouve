@@ -894,7 +894,7 @@ impl ClaudeBackend {
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
         }
-        let fp = config_fingerprint(turn);
+        let fp = config_fingerprint(turn)?;
         let mut procs = self.pool.procs.lock().await;
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);

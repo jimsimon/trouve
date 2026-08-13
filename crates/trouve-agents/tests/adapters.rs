@@ -178,6 +178,8 @@ async fn claude_adapter_reaps_persistent_process_before_cancelled_stream_closes(
         tmp.path(),
         "claude-cancel",
         r#"#!/bin/bash
+if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 echo $$ > "$0.pid"
 IFS= read -r prompt
 : > "$0.prompt"
@@ -196,6 +198,10 @@ IFS= read -r keepalive
             BackendPermission::ReadOnly,
         );
         turn.cancel = cancel.clone();
+        turn.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_cancel/mcp?approval=1".into(),
+            headers: Vec::new(),
+        });
         turn
     })
     .await;
@@ -2148,7 +2154,7 @@ cat > /dev/null
 }
 
 #[tokio::test]
-async fn claude_adapter_wires_mcp_tool_bridge() {
+async fn claude_adapter_wires_supplemental_mcp_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),

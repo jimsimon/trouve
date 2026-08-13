@@ -75,9 +75,8 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
                 "search".into(),
                 "find_related".into(),
                 "git_diff".into(),
-                // Codex full-bridge turns disable native network access.
                 // Keep legitimate read-only research available through the
-                // permission-gated ToolExecutor path.
+                // permission-gated supplemental ToolExecutor path.
                 "web_fetch".into(),
                 "todo_write".into(),
                 // Delegation is orchestration rather than a worktree

@@ -1,6 +1,7 @@
 # ADR 0030: Parallel tool execution with per-session mutation confinement
 
-Status: Accepted (2026-08); whole-turn locking superseded by ADR 0034
+Status: Accepted (2026-08); whole-turn locking superseded by ADR 0034;
+vendor full-tool replacement superseded by ADR 0043
 
 ## Context
 
@@ -31,21 +32,17 @@ event type or protocol version is therefore unnecessary.
 - Missing or duplicate provider call ids are normalized before the assistant
   message is persisted or execution starts, so events and results retain a
   unique identity under parallel execution.
-- Claude Code and Codex use trouve's full MCP tool bridge by default. User MCP
-  servers are exposed through `ToolExecutor`, not mounted directly alongside
-  the full bridge.
-  - Claude's native tools stand down.
-  - Codex does not currently provide a supported switch to remove all native
-    tools, so its native tools run in a read-only sandbox with loopback/network
-    access; every mutation is directed to the trouve bridge.
-- Vendor protocols that expose approval hooks but cannot use the full bridge
-  acquire an exclusive per-session mutation permit after approval and retain
+- Subscription CLI adapters retain certified model-optimized native core
+  tools under ADR 0043. Trouve-only and user-configured MCP capabilities are
+  exposed through the supplemental `ToolExecutor` bridge.
+- Vendor protocols acquire an exclusive per-session mutation permit after
+  approval and retain
   it until the matching completion event. Approval waits run concurrently
   with stream consumption so multiple vendor requests cannot deadlock the
   event loop.
-- An explicit `tool_bridge = false` remains a compatibility escape hatch. It
-  opts the affected Claude/Codex backend out of full mutation confinement and
-  should not be used when concurrent mutation safety is required.
+- There is no strict/full-replacement bridge mode or provider configuration
+  switch. Native execution is normalized into Trouve's canonical operation
+  taxonomy and presentation.
 
 ## Consequences
 
@@ -60,9 +57,9 @@ event type or protocol version is therefore unnecessary.
 - Event consumers need no migration. They may observe several calls in the
   started state and completions in an order different from provider transcript
   order, which the existing call ids already support.
-- Full bridging changes the default tool surface for Claude and Codex, but it
-  removes duplicate direct MCP mounts and centralizes permissions, audit, and
-  worktree serialization in `ToolExecutor`.
+- Supplemental bridging avoids duplicate direct MCP mounts while keeping
+  Trouve-owned capabilities inside `ToolExecutor`; certified vendor-native
+  operations are normalized and audited by their adapters under ADR 0043.
 
 ## Alternatives considered
 

@@ -17,6 +17,7 @@
 //!   answered with `{ decision: "accept" | "decline" }`
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -44,10 +45,36 @@ const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_
 #[cfg(test)]
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// A shared credential operation is normally only a read or atomic rename.
+/// If an interactive login owns the lock, callers yield instead of occupying
+/// Tokio's blocking pool until the user finishes the browser flow.
+const AUTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Product-level capabilities Trouve suppresses when the running Codex
+/// app-server advertises them. The dynamic feature catalog is the schema
+/// authority: older CLIs never receive config keys they do not understand.
+const PRODUCT_SURFACE_FEATURES: &[&str] = &[
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "current_time_reminder",
+    "goals",
+    "hooks",
+    "image_generation",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "workspace_dependencies",
+];
+
 pub struct CodexBackend {
     id: String,
     command: String,
-    server: Mutex<Option<Arc<AppServer>>>,
+    server: Arc<Mutex<Option<Arc<AppServer>>>>,
     catalog: Arc<ModelsDevCatalog>,
 }
 
@@ -74,47 +101,12 @@ fn permission_settings(
     }
 }
 
-fn sandbox_settings(
-    permission: BackendPermission,
-    full_tool_bridge: bool,
-) -> (&'static str, Value) {
-    let (_, permission_sandbox, permission_policy_type) = permission_settings(permission);
-    let (sandbox, policy_type) = if full_tool_bridge {
-        ("read-only", "readOnly")
-    } else {
-        (permission_sandbox, permission_policy_type)
-    };
-    let policy = if full_tool_bridge {
-        // A read-only filesystem sandbox does not make outbound requests
-        // read-only: native commands can still push Git refs, call mutating
-        // APIs, or exfiltrate workspace content. Full-bridge turns route
-        // network reads through ToolExecutor's gated `web_fetch` tool instead.
-        json!({ "type": policy_type, "networkAccess": false })
-    } else if matches!(permission, BackendPermission::ReadOnly) {
-        // Read-only is an authorization boundary even when the bridge is
-        // temporarily unavailable. Fail closed instead of silently restoring
-        // an unaudited outbound side channel.
-        json!({ "type": policy_type, "networkAccess": false })
-    } else {
-        json!({ "type": policy_type })
-    };
-    (sandbox, policy)
-}
-
-fn approval_policy(permission: BackendPermission, full_tool_bridge: bool) -> &'static str {
-    if full_tool_bridge {
-        "never"
-    } else {
-        permission_settings(permission).0
-    }
-}
-
 impl CodexBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
-            server: Mutex::new(None),
+            server: Arc::new(Mutex::new(None)),
             catalog: Arc::new(ModelsDevCatalog::embedded()),
         }
     }
@@ -334,6 +326,12 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if turn.mcp_bridge.is_some() && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "optimized Codex turns mount user MCP only through Trouve's capability bridge"
+                    .into(),
+            ));
+        }
         let trouve_thread_id = turn.thread_id.clone();
         let cancel = turn.cancel.clone();
         let mut server = self.server_cancellable(&cancel).await?;
@@ -346,20 +344,16 @@ impl AgentBackend for CodexBackend {
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .or(id_effort);
-        let full_tool_bridge = turn
-            .mcp_bridge
-            .as_ref()
-            .is_some_and(|bridge| bridge.bridge_tools);
-        // Full-bridge mutations are approved by trouve inside the MCP call.
-        // Asking Codex to approve them as well would duplicate prompts and
-        // could hold a vendor request open ahead of the engine's execution
-        // lane. Native Codex tools are read-only in this posture.
-        let approval_policy = approval_policy(turn.permission, full_tool_bridge);
-        // Codex currently has no app-server switch that removes all built-in
-        // tools. With the full bridge mounted, confine those built-ins to a
-        // read-only sandbox and route every mutation through trouve's MCP
-        // ToolExecutor instead.
-        let (sandbox, sandbox_policy) = sandbox_settings(turn.permission, full_tool_bridge);
+        let (approval_policy, sandbox, sandbox_policy_type) = permission_settings(turn.permission);
+        let sandbox_policy = if matches!(turn.permission, BackendPermission::ReadOnly) {
+            // Sandboxed read-only turns still need outbound access for
+            // fetches, remote inspection, and Trouve's loopback MCP bridge.
+            json!({ "type": sandbox_policy_type, "networkAccess": true })
+        } else {
+            // dangerFullAccess has no networkAccess field: with no OS
+            // sandbox, network access is already unrestricted.
+            json!({ "type": sandbox_policy_type })
+        };
 
         // Per-thread config overrides: request raw reasoning from models that
         // expose it and mount trouve/user MCP servers. Both thread/start and
@@ -368,7 +362,12 @@ impl AgentBackend for CodexBackend {
         // requests so a resumed thread retains its current mode and, most
         // importantly, the ToolExecutor bridge guidance after an app restart
         // or vendor-side compaction.
-        let config_override = codex_config_override(&turn);
+        let supported_features = if turn.mcp_bridge.is_some() {
+            server.supported_features().await
+        } else {
+            HashSet::new()
+        };
+        let config_override = codex_config_override_with_features(&turn, &supported_features);
         let mcp_config = thread_mcp_config(&config_override);
         let with_thread_settings = |mut params: Value| {
             params["config"] = config_override.clone();
@@ -594,8 +593,15 @@ impl AgentBackend for CodexBackend {
 
 /// Codex config overrides enabling raw reasoning when available.
 fn codex_config_override(turn: &crate::BackendTurn) -> Value {
+    codex_config_override_with_features(turn, &HashSet::new())
+}
+
+fn codex_config_override_with_features(
+    turn: &crate::BackendTurn,
+    supported_features: &HashSet<String>,
+) -> Value {
     let mut config = json!({ "show_raw_agent_reasoning": true });
-    if let Some(mcp_config) = mcp_config_override(turn, &HashSet::new())
+    if let Some(mcp_config) = mcp_config_override(turn, supported_features)
         && let (Some(config), Some(mcp)) = (config.as_object_mut(), mcp_config.as_object())
     {
         config.extend(mcp.clone());
@@ -3552,6 +3558,205 @@ impl LoadedThreadCache {
         }
     }
 }
+
+/// Keeps Codex's refreshed subscription credentials while the rest of its
+/// home remains isolated. A baseline comparison prevents an old app-server
+/// from overwriting a newer login performed by another process.
+///
+/// The adjacent lock file is stable across atomic auth.json replacements, so
+/// every Trouve app-server and Trouve-initiated login shares one writer lock.
+/// A direct vendor CLI does not participate in that lock; the second source
+/// read immediately before publication detects and preserves such a write
+/// whenever it overlaps staging.
+struct AuthSync {
+    source: PathBuf,
+    isolated: PathBuf,
+    baseline: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+struct AuthFileLock {
+    _file: std::fs::File,
+}
+
+impl AuthFileLock {
+    fn open(source: &Path) -> std::io::Result<std::fs::File> {
+        let parent = source.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex auth path has no parent directory",
+            )
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut name = source
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no file name",
+                )
+            })?
+            .to_os_string();
+        name.push(".trouve.lock");
+        let path = source.with_file_name(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    fn acquire(source: &Path) -> std::io::Result<Self> {
+        let file = Self::open(source)?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+
+    fn try_acquire_for(source: &Path, wait: std::time::Duration) -> std::io::Result<Option<Self>> {
+        let file = Self::open(source)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+async fn acquire_auth_lock(source: PathBuf) -> Result<AuthFileLock, BackendError> {
+    tokio::task::spawn_blocking(move || AuthFileLock::acquire(&source))
+        .await
+        .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+        .map_err(BackendError::Io)
+}
+
+fn read_auth_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn stage_auth_snapshot(isolated_home: &Path) -> std::io::Result<Option<AuthSync>> {
+    let Some(source) = codex_auth_path() else {
+        return Ok(None);
+    };
+    stage_auth_snapshot_from(source, isolated_home)
+}
+
+fn stage_auth_snapshot_from(
+    source: PathBuf,
+    isolated_home: &Path,
+) -> std::io::Result<Option<AuthSync>> {
+    let Some(_lock) = AuthFileLock::try_acquire_for(&source, AUTH_LOCK_WAIT)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Codex credentials are being updated (usually by an interactive login); retry shortly",
+        ));
+    };
+    let baseline = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let isolated = isolated_home.join("auth.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    {
+        use std::io::Write as _;
+        let mut file = options.open(&isolated)?;
+        file.write_all(&baseline)?;
+        file.sync_all()?;
+    }
+    Ok(Some(AuthSync::new(source, isolated, baseline)))
+}
+
+impl AuthSync {
+    fn new(source: PathBuf, isolated: PathBuf, baseline: Vec<u8>) -> Self {
+        Self {
+            source,
+            isolated,
+            baseline: std::sync::Mutex::new(Some(baseline)),
+        }
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.sync_with_publish_hook(|| {})
+    }
+
+    fn sync_with_publish_hook(&self, before_publish: impl FnOnce()) -> std::io::Result<()> {
+        let mut baseline = self.baseline.lock().unwrap();
+        let Some(previous) = baseline.clone() else {
+            return Ok(());
+        };
+        let isolated = std::fs::read(&self.isolated)?;
+        if isolated == previous {
+            return Ok(());
+        }
+        let Some(_lock) = AuthFileLock::try_acquire_for(&self.source, AUTH_LOCK_WAIT)? else {
+            tracing::debug!(
+                "Codex auth is busy; deferring this isolated credential refresh until a later sync"
+            );
+            return Ok(());
+        };
+        let source = read_auth_or_empty(&self.source)?;
+        if source != previous && source != isolated {
+            tracing::warn!(
+                "Codex auth changed outside the isolated app-server; preserving the newer source"
+            );
+            *baseline = None;
+            return Ok(());
+        }
+        if source != isolated {
+            let parent = self.source.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no parent directory",
+                )
+            })?;
+            let mut staged = tempfile::Builder::new()
+                .prefix(".trouve-auth-")
+                .tempfile_in(parent)?;
+            {
+                use std::io::Write as _;
+                staged.write_all(&isolated)?;
+                staged.as_file().sync_all()?;
+            }
+
+            before_publish();
+            let current = read_auth_or_empty(&self.source)?;
+            if current != source {
+                if current != isolated {
+                    tracing::warn!(
+                        "Codex auth changed while a refresh was staged; preserving the newer source"
+                    );
+                    *baseline = None;
+                    return Ok(());
+                }
+            } else {
+                staged.persist(&self.source).map_err(|error| error.error)?;
+            }
+        }
+        // Publication (or another writer's identical publication) succeeded.
+        // Keep the old baseline on every error so the next sync retries.
+        *baseline = Some(isolated);
+        Ok(())
+    }
+}
+
 struct AppServer {
     stdin: SharedStdin,
     next_id: AtomicI64,
@@ -3574,6 +3779,16 @@ struct AppServer {
     /// app-server process. This is intentionally process-local: an empty map
     /// after restart is what activates the cold-resume prompt fallback.
     thread_instructions: std::sync::Mutex<HashMap<String, String>>,
+    /// A clean Codex home containing credentials only. Keeping the TempDir
+    /// alive prevents ambient config, skills, plugins, hooks, and MCP servers
+    /// from becoming a second capability source.
+    _isolated_home: tempfile::TempDir,
+    /// The app-server schema, discovered through its version-specific
+    /// experimental feature catalog on the first optimized turn.
+    supported_features: tokio::sync::OnceCell<HashSet<String>>,
+    /// Syncs token rotations from the isolated home back to Codex's real
+    /// credential file without exposing any other ambient configuration.
+    auth_sync: Option<Arc<AuthSync>>,
     /// Held so the complete owned process tree lives as long as the server
     /// handle and can be synchronously signalled during Drop-time cleanup.
     child: Arc<std::sync::Mutex<ProcessTreeChild>>,
@@ -3584,6 +3799,11 @@ struct AppServer {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
+        if let Some(auth_sync) = &self.auth_sync
+            && let Err(error) = auth_sync.sync()
+        {
+            tracing::warn!("Codex credential sync failed during shutdown: {error}");
+        }
         // Startup may be cancelled while the handshake future owns the last
         // server handle. Keep process-tree cleanup independent of that
         // future's completion and of the Tokio runtime's lifetime.
@@ -3609,6 +3829,16 @@ impl Drop for TransportWriteGuard<'_> {
 
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
+        let isolated_home = tempfile::Builder::new()
+            .prefix("trouve-codex-home-")
+            .tempdir()
+            .map_err(BackendError::Io)?;
+        let isolated_path = isolated_home.path().to_path_buf();
+        let auth_sync = tokio::task::spawn_blocking(move || stage_auth_snapshot(&isolated_path))
+            .await
+            .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+            .map_err(BackendError::Io)?
+            .map(Arc::new);
         let mut command_process = crate::process_env::tokio_command(command);
         command_process
             .arg("app-server")
@@ -3635,6 +3865,9 @@ impl AppServer {
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             loaded_threads: Mutex::new(LoadedThreadCache::default()),
             thread_instructions: std::sync::Mutex::new(HashMap::new()),
+            _isolated_home: isolated_home,
+            supported_features: tokio::sync::OnceCell::new(),
+            auth_sync,
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3853,6 +4086,16 @@ impl AppServer {
             }
         }
         Ok(())
+    }
+
+    async fn sync_auth(&self) {
+        if let Some(auth_sync) = self.auth_sync.clone() {
+            match tokio::task::spawn_blocking(move || auth_sync.sync()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("Codex credential sync failed: {error}"),
+                Err(error) => tracing::warn!("Codex credential sync task failed: {error}"),
+            }
+        }
     }
 
     async fn supported_features(&self) -> HashSet<String> {
@@ -4505,16 +4748,6 @@ async fn remove_route(routing: &Routing, thread_id: &str, expected: &RouteSender
         .lock()
         .await
         .remove_route_if_same(thread_id, expected, false);
-}
-
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        if let Some(auth_sync) = &self.auth_sync
-            && let Err(error) = auth_sync.sync()
-        {
-            tracing::warn!("Codex credential sync failed during shutdown: {error}");
-        }
-    }
 }
 
 fn codex_auth_path() -> Option<std::path::PathBuf> {
@@ -7566,38 +7799,6 @@ cat > /dev/null
             permission_settings(crate::BackendPermission::Yolo),
             ("untrusted", "danger-full-access", "dangerFullAccess")
         );
-
-        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, true);
-        assert_eq!(
-            approval_policy(crate::BackendPermission::Ask, true),
-            "never"
-        );
-        assert_eq!(sandbox, "read-only");
-        assert_eq!(policy["type"], "readOnly");
-        assert_eq!(policy["networkAccess"], false);
-
-        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Yolo, false);
-        assert_eq!(
-            approval_policy(crate::BackendPermission::Yolo, false),
-            "untrusted",
-            "Yolo must retain callbacks so trouve can validate and serialize native mutations"
-        );
-        assert_eq!(sandbox, "danger-full-access");
-        assert_eq!(policy["type"], "dangerFullAccess");
-
-        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, false);
-        assert_eq!(
-            approval_policy(crate::BackendPermission::Ask, false),
-            "untrusted"
-        );
-        assert_eq!(sandbox, "danger-full-access");
-        assert_eq!(policy["type"], "dangerFullAccess");
-        assert!(policy["networkAccess"].is_null());
-
-        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::ReadOnly, false);
-        assert_eq!(sandbox, "read-only");
-        assert_eq!(policy["type"], "readOnly");
-        assert_eq!(policy["networkAccess"], false);
     }
 
     #[test]
@@ -7642,7 +7843,8 @@ cat > /dev/null
     #[test]
     fn loaded_threads_are_reused_until_their_thread_settings_change() {
         let first = json!({ "trouve": { "url": "http://127.0.0.1/thread-1" } });
-        let changed = json!({ "trouve": { "url": "http://127.0.0.1/thread-1?tools=1" } });
+        let changed =
+            json!({ "trouve": { "url": "http://127.0.0.1/thread-1?catalog_revision=2" } });
         let loaded = HashMap::from([(
             "thread-1".to_string(),
             LoadedThreadSettings {

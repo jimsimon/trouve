@@ -14,6 +14,63 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail};
+use trouve_protocol::{CommandInfo, CommandKind};
+
+const MAX_SKILL_BYTES: u64 = 1024 * 1024;
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 512;
+
+struct BuiltInSkill {
+    directory: &'static str,
+    text: &'static str,
+}
+
+const BUILTIN_SKILLS: &[BuiltInSkill] = &[
+    BuiltInSkill {
+        directory: "code-review",
+        text: include_str!("../skills/code-review/SKILL.md"),
+    },
+    BuiltInSkill {
+        directory: "security-review",
+        text: include_str!("../skills/security-review/SKILL.md"),
+    },
+    BuiltInSkill {
+        directory: "debug",
+        text: include_str!("../skills/debug/SKILL.md"),
+    },
+    BuiltInSkill {
+        directory: "simplify",
+        text: include_str!("../skills/simplify/SKILL.md"),
+    },
+    BuiltInSkill {
+        directory: "verify",
+        text: include_str!("../skills/verify/SKILL.md"),
+    },
+    BuiltInSkill {
+        directory: "skill-creator",
+        text: include_str!("../skills/skill-creator/SKILL.md"),
+    },
+];
+
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+fn canonical_skill_roots(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<PathBuf> {
+    [
+        config_dir.map(|dir| dir.join("skills")),
+        workspace_root.map(|root| root.join(".agents").join("skills")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|root| root.canonicalize().ok())
+    .collect()
+}
+
 /// Host-controlled path-list of additional resources that file-reading tools
 /// may inspect without granting mutation access outside the session worktree.
 pub const READ_ONLY_ROOTS_ENV: &str = "TROUVE_READ_ONLY_ROOTS";
@@ -204,6 +261,129 @@ pub fn discover(
         );
     }
     skills.into_values().collect()
+}
+
+/// Load one discovered skill by its stable catalog name. Callers never
+/// supply a path, so models cannot escape the configured skill roots.
+pub fn load(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    name: &str,
+    include_builtins: bool,
+) -> Result<(Skill, String)> {
+    if name.trim().is_empty() {
+        bail!("skill name must not be empty");
+    }
+    let skill = discover(config_dir, workspace_root, include_builtins)
+        .into_iter()
+        .find(|skill| skill.name == name)
+        .ok_or_else(|| anyhow::anyhow!("unknown skill: {name}"))?;
+    match &skill.source {
+        SkillSource::BuiltIn(text) => Ok((skill.clone(), (*text).to_string())),
+        SkillSource::File(path) => {
+            let canonical_path = path
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("cannot resolve skill {name}: {error}"))?;
+            if !canonical_skill_roots(config_dir, workspace_root)
+                .iter()
+                .any(|root| canonical_path.starts_with(root))
+            {
+                bail!("skill {name} escaped its declared root");
+            }
+            if std::fs::metadata(&canonical_path).is_ok_and(|m| m.len() > MAX_SKILL_BYTES) {
+                bail!("skill {name} exceeds the {MAX_SKILL_BYTES} byte limit");
+            }
+            let text = std::fs::read_to_string(&canonical_path)
+                .map_err(|error| anyhow::anyhow!("cannot load skill {name}: {error}"))?;
+            if text.len() as u64 > MAX_SKILL_BYTES {
+                bail!("skill {name} exceeds the {MAX_SKILL_BYTES} byte limit");
+            }
+            Ok((
+                Skill {
+                    source: SkillSource::File(canonical_path),
+                    ..skill
+                },
+                text,
+            ))
+        }
+    }
+}
+
+/// Build the provider-neutral prompt completion catalog.
+pub fn command_catalog(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    include_builtins: bool,
+) -> Vec<CommandInfo> {
+    discover(config_dir, workspace_root, include_builtins)
+        .into_iter()
+        .filter(|skill| skill.user_invocable)
+        .map(|skill| CommandInfo {
+            usage: if skill.argument_hint.is_empty() {
+                format!("/{}", skill.name)
+            } else {
+                format!("/{} {}", skill.name, skill.argument_hint)
+            },
+            name: skill.name,
+            description: skill.description,
+            kind: CommandKind::Prompt,
+        })
+        .collect()
+}
+
+/// Expand an explicit skill invocation into the exact instructions sent to
+/// the model while preserving the original text in the user-visible event.
+pub fn expand_invocation(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    input: &str,
+    include_builtins: bool,
+) -> Result<Option<String>> {
+    let Some(after_slash) = input.trim().strip_prefix('/') else {
+        return Ok(None);
+    };
+    let command_end = after_slash
+        .find(char::is_whitespace)
+        .unwrap_or(after_slash.len());
+    let command = &after_slash[..command_end];
+    if command.is_empty() {
+        return Ok(None);
+    }
+    let remainder = after_slash[command_end..].trim();
+    let (name, request, generic) = if command == "skill" {
+        let name_end = remainder
+            .find(char::is_whitespace)
+            .unwrap_or(remainder.len());
+        let name = &remainder[..name_end];
+        if name.is_empty() {
+            bail!("usage: /skill <name> [request]");
+        }
+        (name, remainder[name_end..].trim(), true)
+    } else {
+        (command, remainder, false)
+    };
+    let Some(skill) = discover(config_dir, workspace_root, include_builtins)
+        .into_iter()
+        .find(|skill| skill.name == name)
+    else {
+        if generic {
+            bail!("unknown skill: {name}");
+        }
+        return Ok(None);
+    };
+    if !skill.user_invocable {
+        bail!("skill {name} is not user-invocable");
+    }
+    let (skill, instructions) = load(config_dir, workspace_root, name, include_builtins)?;
+    let request = if request.is_empty() {
+        "Apply the explicitly invoked skill to the current task."
+    } else {
+        request
+    };
+    Ok(Some(format!(
+        "<trouve-skill name=\"{}\">\n{}\n</trouve-skill>\n\n<skill-request>\n{}\n</skill-request>",
+        skill.name, instructions, request
+    )))
 }
 
 fn configured_home(variable: &str, fallback: &Path) -> PathBuf {

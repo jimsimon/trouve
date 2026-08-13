@@ -1,6 +1,6 @@
-# 0018 — Trouve owns the agent capability surface
+# ADR 0042: Trouve owns the agent capability surface
 
-Status: Superseded by 0019.
+Status: Superseded by 0043.
 
 ## Context
 

@@ -18,10 +18,12 @@ use trouve_agents::{
     BackendPermission, BackendStartupActivity, BackendSteer, BackendTurn,
 };
 use trouve_protocol::{
-    AgentPersona, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
-    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
-    TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    AgentPersona, ApprovalDecision, BranchList, CommandAction, CommandInfo, CommandResult,
+    CreateSessionRequest, CreateThreadRequest, Event, ExecuteCommandRequest,
+    ForkCheckpointResponse, PermissionMode, ProviderInfo, ProvidersResponse, RestoreDirection,
+    Scope, Session, SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread,
+    ToolStatus, TurnAccepted, TurnPhase, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -1738,6 +1740,62 @@ fn resolved_thinking_level(
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
 
+fn require_no_command_arguments(
+    spec: &crate::commands::CommandSpec,
+    arguments: &str,
+) -> Result<(), EngineError> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::BadRequest(format!("usage: {}", spec.usage)))
+    }
+}
+
+fn single_command_argument<'a>(
+    spec: &crate::commands::CommandSpec,
+    arguments: &'a str,
+) -> Result<&'a str, EngineError> {
+    let mut parts = arguments.split_whitespace();
+    let Some(value) = parts.next() else {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    };
+    if parts.next().is_some() {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    }
+    Ok(value)
+}
+
+fn permission_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::AllowList => "allow-list",
+        PermissionMode::Yolo => "yolo",
+    }
+}
+
+fn command_preview(text: &str, max_chars: usize) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = flattened.chars().take(max_chars).collect();
+    if flattened.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
+
+fn truncate_command_output(mut output: String) -> String {
+    const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+    if output.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return output;
+    }
+    let mut end = MAX_COMMAND_OUTPUT_BYTES;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str("\n\n_Output truncated by Trouve._");
+    output
+}
+
 const GITHUB_PR_DETAIL_CACHE_CAPACITY: usize = 48;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1980,7 +2038,6 @@ impl Drop for ActiveTurnSteererGuard<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeTicketClaims {
-    pub bridge_tools: bool,
     pub serve_approval: bool,
     pub correlate_codex_owner: bool,
 }
@@ -2292,7 +2349,7 @@ fn is_backend_kind(kind: &str) -> bool {
 /// user a question or searching the transcript. A mode may restrict
 /// executable workspace tools, but must not advertise skills the model is
 /// then unable to load.
-fn mode_allows_tool(mode: &AgentMode, name: &str) -> bool {
+fn mode_allows_tool(mode: &AgentPersona, name: &str) -> bool {
     name == "load_skill"
         || mode.allowed_tools.is_empty()
         || mode.allowed_tools.iter().any(|allowed| allowed == name)
@@ -2871,12 +2928,11 @@ impl Engine {
     /// Validate one engine-issued MCP bridge capability. The process-wide
     /// bridge token authenticates the caller to the internal route; this
     /// active-turn ticket additionally binds the durable root path and exact
-    /// tool/approval surface so query-string tampering cannot widen it.
+    /// approval surface so query-string tampering cannot widen it.
     pub fn validate_bridge_ticket(
         &self,
         ticket: &str,
         root_thread_id: &str,
-        bridge_tools: bool,
         serve_approval: bool,
     ) -> Option<BridgeTicketClaims> {
         if !self
@@ -2889,9 +2945,7 @@ impl Engine {
         }
         let tickets = self.bridge_tickets.lock().unwrap();
         let ticket = tickets.get(ticket)?;
-        (ticket.root_thread_id == root_thread_id
-            && ticket.claims.bridge_tools == bridge_tools
-            && ticket.claims.serve_approval == serve_approval)
+        (ticket.root_thread_id == root_thread_id && ticket.claims.serve_approval == serve_approval)
             .then_some(ticket.claims)
     }
 
@@ -4864,6 +4918,77 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Current global skill settings. Built-in skills default to enabled;
+    /// user and workspace skills are not governed by this switch.
+    pub fn skills_settings(&self) -> trouve_protocol::SkillsSettings {
+        trouve_protocol::SkillsSettings {
+            builtin_skills_enabled: self.builtin_skills_enabled(),
+        }
+    }
+
+    /// Enable or disable Trouve's compiled-in skills and refresh completion
+    /// catalogs for existing threads. Running turns keep their initial
+    /// instruction snapshot.
+    pub fn set_builtin_skills_enabled(self: &Arc<Self>, enabled: bool) -> Result<(), EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            if config.builtin_skills_enabled() == enabled {
+                return Ok(());
+            }
+            config.builtin_skills_enabled = Some(enabled);
+            self.persist_config(&config);
+        }
+
+        let engine = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _task = runtime.spawn_blocking(move || engine.republish_command_catalogs());
+        } else if let Err(error) = std::thread::Builder::new()
+            .name("trouve-skill-catalogs".into())
+            .spawn(move || engine.republish_command_catalogs())
+        {
+            tracing::warn!("failed to start skill catalog refresh: {error}");
+        }
+        Ok(())
+    }
+
+    fn republish_command_catalogs(&self) {
+        let sessions = match self.store.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!("failed to list sessions for skill catalog refresh: {error}");
+                return;
+            }
+        };
+        for session in sessions {
+            let workspace = match self.store.workspace(&session.workspace_id) {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "failed to load workspace for skill catalog refresh: {error}");
+                    continue;
+                }
+            };
+            let threads = match self.store.list_threads(&session.id) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "failed to list threads for skill catalog refresh: {error}");
+                    continue;
+                }
+            };
+            for thread in threads {
+                if let Err(error) =
+                    self.emit_command_catalog(&thread.id, Path::new(&workspace.path))
+                {
+                    tracing::warn!(thread_id = %thread.id, "failed to refresh skill command catalog: {error}");
+                }
+            }
+        }
+    }
+
+    fn builtin_skills_enabled(&self) -> bool {
+        self.config.lock().unwrap().builtin_skills_enabled()
     }
 
     async fn generate_subagent_title(
@@ -8257,6 +8382,7 @@ impl Engine {
             // Only kill ephemeral terminals after the durable deletion has
             // committed. A database error therefore leaves live PTYs intact.
             self.terminals.remove_session(id);
+            self.evict_thread_catalogs(&bridge_thread_ids);
             for thread_id in bridge_thread_ids {
                 self.revoke_bridge_tickets(&thread_id);
                 self.bridged_tool_owners.clear_root(&thread_id);
@@ -8388,6 +8514,7 @@ impl Engine {
                 session_id: live_session.id,
             },
         )?;
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
         drop(deleting);
         Ok(thread)
     }
@@ -8575,7 +8702,7 @@ impl Engine {
                 }
             }
             "mode" => {
-                let modes = self.list_modes(Some(&session.workspace_id))?;
+                let modes = self.list_personas(Some(&session.workspace_id))?;
                 if arguments.is_empty() {
                     let mut output = format!("## Modes\n\nCurrent: `{}`\n", thread.mode);
                     for mode in modes {
@@ -8696,6 +8823,7 @@ impl Engine {
                 require_no_command_arguments(spec, &arguments)?;
                 let created = self.create_thread(CreateThreadRequest {
                     session_id: session.id.clone(),
+                    title: None,
                     mode: Some(thread.mode.clone()),
                     model: Some(thread.model.clone()),
                     model_options: thread.model_options.clone(),
@@ -8802,11 +8930,11 @@ impl Engine {
             }
             "instructions" => {
                 require_no_command_arguments(spec, &arguments)?;
-                let all_modes =
-                    modes::resolve_modes(self.config_dir.as_deref(), Some(workspace_root));
-                let mode = modes::find_mode(&all_modes, &thread.mode)
+                let all_personas =
+                    personas::resolve_personas(self.config_dir.as_deref(), Some(workspace_root));
+                let mode = personas::find_persona(&all_personas, &thread.mode)
                     .cloned()
-                    .unwrap_or_else(modes::fallback_mode);
+                    .unwrap_or_else(personas::fallback_persona);
                 let instructions = context::system_prompt(
                     &mode,
                     self.config_dir.as_deref(),
@@ -8829,6 +8957,7 @@ impl Engine {
                     &session.id,
                     &UpdateSessionRequest {
                         title: Some(arguments.clone()),
+                        expected_title: None,
                         archived: None,
                     },
                 )?;
@@ -9642,6 +9771,7 @@ impl Engine {
         allow_spawned: bool,
     ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        self.validate_prompt_content(&thread, &content)?;
         if !allow_spawned && self.subagent_is_read_only(&thread)? {
             return Err(EngineError::Conflict(
                 "this subagent uses a read-only exploration, audit, or review mode".into(),
@@ -10522,6 +10652,34 @@ impl Engine {
         }
     }
 
+    fn validate_prompt_content(&self, thread: &Thread, content: &str) -> Result<(), EngineError> {
+        let Some(after_slash) = content.trim().strip_prefix('/') else {
+            return Ok(());
+        };
+        let name_end = after_slash
+            .find(char::is_whitespace)
+            .unwrap_or(after_slash.len());
+        let name = &after_slash[..name_end];
+        if crate::commands::action_spec(name).is_some() {
+            return Err(EngineError::BadRequest(format!(
+                "/{name} is a Trouve action command; use the thread command endpoint"
+            )));
+        }
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
+        crate::skills::expand_invocation(
+            self.config_dir.as_deref(),
+            Some(Path::new(&workspace.path)),
+            content,
+            self.builtin_skills_enabled(),
+        )
+        .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+        Ok(())
+    }
+
     /// Drop a thread's dispatcher claim; when it was the session's last
     /// active thread, announce the session going idle.
     fn release_thread(&self, thread_id: &str) -> Result<(), EngineError> {
@@ -10669,6 +10827,17 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .context("workspace vanished")?;
+        // Skills may be installed or edited while a thread is idle. Refresh
+        // completions at turn start and expand only the model-facing copy;
+        // the durable user event remains exactly what the user submitted.
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
+        let model_content = crate::skills::expand_invocation(
+            self.config_dir.as_deref(),
+            Some(Path::new(&ws.path)),
+            &content,
+            self.builtin_skills_enabled(),
+        )?
+        .unwrap_or_else(|| content.clone());
         let scope = Scope::Thread(thread.id.clone());
         let worktree = PathBuf::from(&session.worktree_path);
         let canonical_worktree = worktree.canonicalize()?;
@@ -10685,6 +10854,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
             edit_strategy: edit_strategy_for_model(&thread.model),
             background_mutation_lease: None,
         };
@@ -10788,7 +10958,7 @@ impl Engine {
             .iter()
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
-        let content = annotate_attachments(content, &prompt_files);
+        let content = annotate_attachments(model_content, &prompt_files);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
@@ -10832,7 +11002,12 @@ impl Engine {
             }
         }
 
-        let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        let system = context::system_prompt(
+            &mode,
+            self.config_dir.as_deref(),
+            Path::new(&ws.path),
+            self.builtin_skills_enabled(),
+        );
         let live_models = tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("turn cancelled"),
@@ -11221,11 +11396,10 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
-    /// the full bridge by default so mutation-capable work crosses the same
-    /// ToolExecutor and per-session execution lane as native provider calls.
-    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
-    fn mcp_bridge_for(
+    /// MCP config for provider-independent capabilities that supplement a
+    /// subscription CLI's optimized native tools. User MCP servers also flow
+    /// through this endpoint so their execution stays inside ToolExecutor.
+    async fn mcp_bridge_for(
         &self,
         model: &str,
         thread_id: &str,
@@ -11235,8 +11409,10 @@ impl Engine {
         };
         let kind = {
             let config = self.config.lock().unwrap();
-            let pc = config.providers.get(backend_id)?;
-            (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
+            let Some(pc) = config.providers.get(backend_id) else {
+                return Ok(None);
+            };
+            pc.kind.clone()
         };
         if !matches!(
             kind.as_str(),
@@ -11244,98 +11420,104 @@ impl Engine {
         ) {
             return Ok(None);
         }
-        let Some(base_url) = self.base_url.read().unwrap().clone() else {
-            tracing::warn!(
-                "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
-                 running without it (approvals will fail in ask mode)"
-            );
-            return None;
-        };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let serve_approval = kind != "codex-app-server";
+        let base_url = self.base_url.read().unwrap().clone().ok_or_else(|| {
+            anyhow!(
+                "Trouve's capability bridge is required for {backend_id}, but the server base URL \
+                 is unavailable; refusing to start a CLI turn without the shared control plane"
+            )
+        })?;
+        // Codex and Cursor own their approval protocols. Claude uses the
+        // bridge as its headless permission-prompt target.
+        let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
-            bridge_tools,
             serve_approval,
             correlate_codex_owner: kind == "codex-app-server",
         };
         let ticket = self.bridge_ticket_for(thread_id, claims);
-        let mut url = format!(
-            "{}/internal/threads/{}/mcp?tools={}&approval={}&ticket={}",
+        let (revision, _) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        let url = format!(
+            "{}/internal/threads/{}/mcp?approval={}&ticket={}&catalog_revision={revision:016x}",
             base_url.trim_end_matches('/'),
             thread_id,
-            bridge_tools as u8,
             serve_approval as u8,
             ticket,
         );
-        if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
-            url.push_str("&bridge_token=");
-            url.push_str(token);
-        }
-        Some(trouve_agents::McpBridgeConfig {
-            url,
-            bridge_tools,
-            // Claude built-ins stand down; Codex uses the same bridge while
-            // its remaining built-ins are confined by a read-only sandbox.
-            disallowed_tools: if bridge_tools && kind == "claude-cli" {
-                [
-                    "Bash",
-                    "Edit",
-                    "Write",
-                    "MultiEdit",
-                    "NotebookEdit",
-                    "WebFetch",
-                    "WebSearch",
-                    "Read",
-                    "Glob",
-                    "Grep",
-                    "Task",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-            } else {
-                Vec::new()
-            },
-        })
+        let headers = self
+            .bridge_token
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|token| ("Authorization".into(), format!("Bearer {token}")))
+            .into_iter()
+            .collect();
+        Ok(Some(trouve_agents::McpBridgeConfig { url, headers }))
     }
 
     // --- bridged tools (MCP tool bridge, Phase 6) -----------------------------
 
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
-    pub async fn bridged_tool_specs(
+    pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
+        self.build_bridged_tool_specs(thread_id).await
+    }
+
+    /// Reuse the catalog prepared for the bridge URL when its revision
+    /// matches. A missing/stale entry is rebuilt so direct callers and
+    /// restarted servers remain self-healing.
+    pub async fn bridged_tool_specs_for_revision(
         &self,
         thread_id: &str,
-        bridge_tools: bool,
+        revision: Option<u64>,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
+        if let Some(revision) = revision
+            && let Some(catalog) = self
+                .bridged_tool_catalogs
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .filter(|catalog| catalog.revision == revision)
+                .cloned()
+        {
+            return Ok(catalog.specs);
+        }
+        let (_, specs) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        Ok(specs)
+    }
+
+    async fn refresh_bridged_tool_catalog(
+        &self,
+        thread_id: &str,
+    ) -> Result<(u64, Vec<ToolSpec>), EngineError> {
+        let specs = self.build_bridged_tool_specs(thread_id).await?;
+        let revision = tool_catalog_revision(&specs);
+        self.bridged_tool_catalogs.lock().unwrap().insert(
+            thread_id.to_string(),
+            BridgedToolCatalog {
+                revision,
+                specs: specs.clone(),
+            },
+        );
+        Ok((revision, specs))
+    }
+
+    async fn build_bridged_tool_specs(
+        &self,
+        thread_id: &str,
     ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
-        let discovered = if bridge_tools {
-            self.executor.specs(&ctx).await
-        } else {
-            // The minimal bridge must not consult external MCP discovery:
-            // listing three native tools is not authority to launch trusted
-            // workspace/user servers.
-            self.executor.native_specs(&ctx).await
-        };
-        let mut specs: Vec<ToolSpec> = discovered
+        let mut specs: Vec<ToolSpec> = self
+            .executor
+            .specs(&ctx)
+            .await
             .into_iter()
-            .filter(|spec| {
-                (bridge_tools || matches!(spec.name.as_str(), "search" | "find_related"))
-                    && (mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
-            })
+            .filter(|spec| mode_allows_tool(&mode, &spec.name))
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
-        if !bridge_tools {
-            return Ok(specs);
-        }
         specs.push(search_transcript_spec());
         // Recursive spawn tools use the same mode and depth policy as native
         // provider turns.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
-        };
+        let spawn_allowed = |name: &str| mode_allows_tool(&mode, name);
         if self.thread_can_spawn_subagents(thread_id)? {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
@@ -11507,6 +11689,10 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
+        // Register before execution can block on approval. Only this trusted
+        // MCP path can make a later vendor lifecycle echo suppressible.
+        self.bridge_echoes
+            .register(thread_id, turn, &call.id, name, arguments);
         // Bridged responses are text-only (MCP content blocks could carry
         // images, but no bridged vendor consumes them yet); the summary the
         // engine leaves in place of "_images" still tells the model the
@@ -11515,7 +11701,7 @@ impl Engine {
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok((content, images))
+        Ok(content)
     }
 
     fn announce_trouve_bridge_wrapper(
@@ -11893,46 +12079,11 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
             edit_strategy: edit_strategy_for_model(&thread.model),
             background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
-    }
-
-    /// User-configured MCP servers for a session's worktree, flattened for
-    /// a vendor agent CLI: scopes merged (user < workspace < worktree),
-    /// disabled entries dropped, env `${VAR}` references expanded. The name
-    /// "trouve" is reserved for the bridge and skipped.
-    fn mcp_servers_for(
-        &self,
-        session: &Session,
-    ) -> Result<Vec<trouve_agents::McpServerLaunch>, EngineError> {
-        let workspace_root = self
-            .store
-            .workspace(&session.workspace_id)?
-            .map(|ws| PathBuf::from(ws.path));
-        // Only trusted (user-config) servers are handed to the vendor CLI:
-        // it would otherwise spawn a cloned repo's command with the expanded
-        // environment, same RCE/exfiltration risk as the native path.
-        let configs = crate::mcp::trusted_configs(
-            self.config_dir.as_deref(),
-            workspace_root.as_deref(),
-            Path::new(&session.worktree_path),
-        );
-        Ok(configs
-            .into_iter()
-            .filter(|(name, _)| name != "trouve")
-            .map(|(name, config)| trouve_agents::McpServerLaunch {
-                name,
-                command: config.command,
-                args: config.args,
-                env: config
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), crate::mcp::expand_env(v)))
-                    .collect(),
-            })
-            .collect())
     }
 
     fn record_backend_collaborator_input(
@@ -12672,11 +12823,11 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         mode: &AgentPersona,
-        ctx: &ToolCtx,
+        _ctx: &ToolCtx,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
-        display_content: String,
+        _display_content: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
         cancel: tokio_util::sync::CancellationToken,
@@ -12685,6 +12836,10 @@ impl Engine {
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .context("workspace vanished")?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog_started = Instant::now();
         let model_catalog = tokio::select! {
@@ -12707,6 +12862,10 @@ impl Engine {
         // read-only permission), but reserve strict tool-use rejection for
         // backends that can actually guarantee a tool-free surface.
         let strict_tool_free = !tools_enabled && backend.supports_tool_free_turns();
+        // Keep contexts from the retired full-replacement mode out of this
+        // optimized-native contract. Bump the namespace whenever provider
+        // surface isolation changes enough to require a fresh vendor context.
+        let backend_session_key = format!("{backend_id}#trouve-native-v1");
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -12717,7 +12876,9 @@ impl Engine {
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
         let (resume, handoff) = if tools_enabled {
-            let resume = self.store.backend_session(&thread.id, backend_id)?;
+            let resume = self
+                .store
+                .backend_session_exact(&thread.id, &backend_session_key)?;
             let payloads = self.store.messages(&thread.id)?;
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
@@ -12783,6 +12944,11 @@ impl Engine {
             BackendPermission::Ask
         };
 
+        let mcp_bridge = if tools_enabled {
+            self.mcp_bridge_for(&thread.model, &thread.id).await?
+        } else {
+            None
+        };
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
@@ -12798,23 +12964,9 @@ impl Engine {
             }
             instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
         }
-        let full_tool_bridge = mcp_bridge
-            .as_ref()
-            .is_some_and(|bridge| bridge.bridge_tools);
-        if full_tool_bridge {
-            if !instructions.is_empty() {
-                instructions.push_str("\n\n");
-            }
-            instructions.push_str(crate::tools::VENDOR_TOOL_BRIDGE_GUIDANCE);
-        }
-        // A full bridge already exposes user MCP servers through the local
-        // ToolExecutor. Mounting them directly as well would bypass trouve's
-        // permission and per-session concurrency gates.
-        let mcp_servers = if tools_enabled && !full_tool_bridge {
-            self.mcp_servers_for(session)?
-        } else {
-            Vec::new()
-        };
+        // User MCP is resolved and executed through Trouve's supplemental
+        // bridge. Never mount it directly into a subscription harness.
+        let mcp_servers = Vec::new();
         // The digest decorates only the prompt sent to the vendor; the
         // stored transcript keeps the user's words alone.
         let prompt = match &handoff {
@@ -12853,6 +13005,7 @@ impl Engine {
                 .await?;
         }
         let backend_turn_started = Instant::now();
+        let _bridge_echo_turn = self.bridge_echoes.begin_turn(&thread.id, turn);
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
@@ -12941,6 +13094,10 @@ impl Engine {
         let mut persist_deadline = None;
         let mut seen_tool_cards = HashSet::new();
         let mut suppressed_bridge_calls = HashSet::new();
+        // Supplemental MCP calls already emitted their canonical card from
+        // ToolExecutor. Some harnesses echo that lifecycle with a different
+        // call id; suppress only echoes correlated to trusted MCP execution.
+        let mut ignored_bridge_call_ids = HashSet::new();
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
@@ -13405,7 +13562,6 @@ impl Engine {
                         ignored_bridge_call_ids.insert(call_id);
                         continue;
                     }
-                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
@@ -13425,7 +13581,9 @@ impl Engine {
                     persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
-                    if suppressed_bridge_calls.contains(&call_id) {
+                    if suppressed_bridge_calls.contains(&call_id)
+                        || ignored_bridge_call_ids.contains(&call_id)
+                    {
                         continue;
                     }
                     if github_repository.is_some()
@@ -13439,9 +13597,9 @@ impl Engine {
                     }
                     persisted.push(Event::ToolOutput { call_id, chunk });
                 }
-                BackendEvent::CommandsUpdated { commands } => {
-                    persisted.push(Event::CommandsUpdated { commands });
-                }
+                // Vendor command catalogs are intentionally non-authoritative.
+                // Only Trouve's CommandCatalogUpdated reaches clients.
+                BackendEvent::CommandsUpdated { .. } => {}
                 BackendEvent::TodosUpdated { todos } => {
                     // Vendor-native plans are authoritative replacements just
                     // like todo_write results, but they are not transcript
@@ -13612,10 +13770,10 @@ impl Engine {
                                     approval.args,
                                     approval.responder,
                                     approval_cancel,
-                                    // Full-bridge calls acquire the lane in
-                                    // handle_tool_call; vendor-native child
-                                    // mutations need it here.
-                                    !full_tool_bridge,
+                                    // Supplemental bridged calls are
+                                    // suppressed above; vendor-native child
+                                    // mutations acquire the lane here.
+                                    true,
                                     Some(owner_thread_id),
                                 ));
                             }
@@ -13645,7 +13803,9 @@ impl Engine {
                     ok,
                     result,
                 } => {
-                    if suppressed_bridge_calls.remove(&call_id) {
+                    if suppressed_bridge_calls.remove(&call_id)
+                        || ignored_bridge_call_ids.remove(&call_id)
+                    {
                         // The bridged execution path owns persistence and PR
                         // evidence for this duplicate vendor lifecycle card.
                         backend_mutation_permits.remove(&call_id);
@@ -13799,11 +13959,9 @@ impl Engine {
                         args,
                         responder,
                         approval_cancel,
-                        // Full-bridge calls acquire the same lane inside
-                        // handle_tool_call; pre-acquiring here would make the
-                        // vendor wait on its own permit. Native Codex tools
-                        // are read-only under the full-bridge sandbox.
-                        !full_tool_bridge,
+                        // Supplemental bridged calls are suppressed above;
+                        // vendor-native mutations acquire the lane here.
+                        true,
                         None,
                     ));
                     continue;
@@ -14113,7 +14271,7 @@ impl Engine {
                     approval_events.push(Event::ToolRequested {
                         turn,
                         call_id: call_id.to_string(),
-                        tool: tool.to_string(),
+                        tool: display_tool,
                         args: display_args,
                         requires_approval: true,
                     });
@@ -18642,10 +18800,6 @@ mod tests {
             vec![probe_spec("mcp__trusted__external")]
         }
 
-        async fn native_specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
-            vec![probe_spec("search"), probe_spec("find_related")]
-        }
-
         fn tool_mutates(&self, _name: &str) -> Option<bool> {
             Some(false)
         }
@@ -18661,7 +18815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn minimal_bridge_listing_never_discovers_external_mcp_tools() {
+    async fn supplemental_bridge_catalog_includes_user_mcp_tools() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
         let workspace = Workspace {
@@ -18704,29 +18858,19 @@ mod tests {
         );
         let _cancel = engine.register_cancel(&thread.id);
 
-        let minimal = engine.bridged_tool_specs(&thread.id, false).await.unwrap();
+        let specs = engine.bridged_tool_specs(&thread.id).await.unwrap();
         assert_eq!(
             full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "minimal listing must not enter external MCP discovery"
-        );
-        assert_eq!(
-            minimal
-                .iter()
-                .map(|spec| spec.name.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["search", "find_related", "ask_question"])
-        );
-
-        let full = engine.bridged_tool_specs(&thread.id, true).await.unwrap();
-        assert_eq!(
-            full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
+            1,
+            "supplemental listing must discover user MCP through ToolExecutor"
         );
         assert!(
-            full.iter()
+            specs
+                .iter()
                 .any(|spec| spec.name == "mcp__trusted__external")
         );
+        assert!(specs.iter().any(|spec| spec.name == "ask_question"));
+        assert!(specs.iter().any(|spec| spec.name == "search_transcript"));
         engine.clear_cancel(&thread.id);
     }
 
@@ -23437,8 +23581,8 @@ default_permission_mode = "ask"
         assert!(lock.try_write().is_ok());
     }
 
-    #[test]
-    fn codex_and_claude_default_to_the_full_tool_bridge() {
+    #[tokio::test]
+    async fn subscription_backends_use_the_supplemental_bridge() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -23455,26 +23599,59 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        config.providers.insert(
-            "claude-native".into(),
-            ProviderConfig {
-                kind: "claude-cli".into(),
-                tool_bridge: Some(false),
-                ..Default::default()
-            },
-        );
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().to_path_buf(),
-            &config,
-        );
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_bridge".into(),
+            name: "bridge".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_bridge".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Bridge".into(),
+            branch: "trouve/bridge".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_1".into(),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "codex/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &config);
         engine.set_base_url("http://127.0.0.1:4000");
+        engine.set_bridge_token(Some("bridge-secret".into()));
         let _cancel = engine.register_cancel("th_1");
 
-        let codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
-        assert!(codex.bridge_tools);
-        assert!(codex.url.contains("tools=1"));
-        assert!(codex.disallowed_tools.is_empty());
+        let codex = engine
+            .mcp_bridge_for("codex/model", "th_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!codex.url.contains("tools="));
+        assert!(codex.url.contains("approval=0"));
+        assert!(!codex.url.contains("bridge-secret"));
+        assert_eq!(
+            codex.headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer bridge-secret".to_string()
+            )]
+        );
         let codex_ticket = codex
             .url
             .split('?')
@@ -23484,59 +23661,64 @@ default_permission_mode = "ask"
             .find_map(|pair| pair.strip_prefix("ticket="))
             .unwrap();
         let claims = engine
-            .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+            .validate_bridge_ticket(codex_ticket, "th_1", false)
             .unwrap();
         assert!(claims.correlate_codex_owner);
         assert!(
             engine
-                .validate_bridge_ticket(codex_ticket, "th_tampered", true, false)
+                .validate_bridge_ticket(codex_ticket, "th_tampered", false)
                 .is_none()
         );
         assert!(
             engine
-                .validate_bridge_ticket(codex_ticket, "th_1", false, false)
-                .is_none()
-        );
-        assert!(
-            engine
-                .validate_bridge_ticket(codex_ticket, "th_1", true, true)
+                .validate_bridge_ticket(codex_ticket, "th_1", true)
                 .is_none()
         );
 
         engine.clear_cancel("th_1");
         assert!(
             engine
-                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .validate_bridge_ticket(codex_ticket, "th_1", false)
                 .is_none(),
             "a retained capability must remain dormant between turns"
         );
         let _resumed_cancel = engine.register_cancel("th_1");
-        let resumed_codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
+        let resumed_codex = engine
+            .mcp_bridge_for("codex/model", "th_1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             resumed_codex.url, codex.url,
             "a resumed vendor runtime must receive the URL its persistent MCP client already uses"
         );
         assert!(
             engine
-                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .validate_bridge_ticket(codex_ticket, "th_1", false)
                 .is_some()
         );
 
-        let claude = engine.mcp_bridge_for("claude/model", "th_1").unwrap();
-        assert!(claude.bridge_tools);
-        assert!(claude.disallowed_tools.iter().any(|tool| tool == "Edit"));
+        let claude = engine
+            .mcp_bridge_for("claude/model", "th_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!claude.url.contains("tools="));
+        assert!(claude.url.contains("approval=1"));
         assert!(
             engine
-                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .validate_bridge_ticket(codex_ticket, "th_1", false)
                 .is_none(),
             "changing the bridge capability surface must rotate the old ticket"
         );
 
-        let native = engine
-            .mcp_bridge_for("claude-native/model", "th_1")
-            .unwrap();
-        assert!(!native.bridge_tools);
-        assert!(native.url.contains("tools=0"));
+        assert!(
+            engine
+                .mcp_bridge_for("missing/model", "th_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
         engine.clear_cancel("th_1");
     }
 

@@ -384,6 +384,14 @@ pub enum ThreadViewItem {
         content: String,
         attachments: Vec<Attachment>,
     },
+    /// Output of a deterministic Trouve slash command. Commands are not model
+    /// turns, so they intentionally have no turn number.
+    Command {
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arguments: String,
+        output: String,
+    },
     /// A separately navigable child agent transcript spawned from this parent
     /// turn. Children in read-only modes are transcript-only; other child
     /// threads can accept follow-up prompts after their initial turn.

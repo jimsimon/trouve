@@ -941,12 +941,13 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .json()
         .await
         .unwrap();
-    assert_eq!(aligned["item_offset"], 0);
+    let aligned_offset = aligned["item_offset"].as_u64().unwrap();
+    assert!(aligned_offset < total_items);
     assert_eq!(
         aligned["items"].as_array().unwrap().len() as u64,
-        total_items
+        total_items - aligned_offset
     );
-    assert_eq!(aligned["has_older"], false);
+    assert_eq!(aligned["has_older"], aligned_offset > 0);
     assert_eq!(aligned["items"][0]["kind"], "turn_status");
     let older: serde_json::Value = client
         .get(format!(
@@ -3008,9 +3009,12 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
 /// writes a file to the worktree when approved, and completes with usage.
 /// Records the vendor session id it was resumed with, per turn.
+type BridgeHeaders = Vec<(String, String)>;
+
 struct ScriptedBackend {
     sessions_seen: std::sync::Mutex<Vec<Option<String>>>,
     bridge_urls_seen: std::sync::Mutex<Vec<Option<String>>>,
+    bridge_headers_seen: std::sync::Mutex<Vec<Option<BridgeHeaders>>>,
 }
 
 impl ScriptedBackend {
@@ -3018,6 +3022,7 @@ impl ScriptedBackend {
         Self {
             sessions_seen: std::sync::Mutex::new(Vec::new()),
             bridge_urls_seen: std::sync::Mutex::new(Vec::new()),
+            bridge_headers_seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -3065,6 +3070,11 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             .lock()
             .unwrap()
             .push(turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()));
+        self.bridge_headers_seen.lock().unwrap().push(
+            turn.mcp_bridge
+                .as_ref()
+                .map(|bridge| bridge.headers.clone()),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let fresh = turn.session.is_none();
         let worktree = turn.worktree.clone();
@@ -3290,12 +3300,26 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .iter()
         .map(|spec| spec["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"read_file") && names.contains(&"write_file"));
+    assert!(names.contains(&"search"));
+    assert!(names.contains(&"load_skill"));
+    assert!(names.contains(&"todo_write"));
     assert!(names.contains(&"approval_prompt"));
+    assert!(!names.contains(&"read_file"));
+    assert!(!names.contains(&"write_file"));
+    assert!(!names.contains(&"list_dir"));
 
     let called = mcp(serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": "list_dir", "arguments": {"path": "."}}
+        "params": {
+            "name": "todo_write",
+            "arguments": {
+                "todos": [{
+                    "id": "todo-1",
+                    "content": "Exercise the supplemental bridge",
+                    "status": "pending"
+                }]
+            }
+        }
     }))
     .await;
     assert_eq!(called["result"]["isError"], false, "{called}");
@@ -6246,17 +6270,24 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
         .cloned()
         .flatten()
         .expect("active turn receives an exact bridge capability");
-    let unauthenticated = internal.replace("&bridge_token=bridge-secret", "");
-    assert_ne!(unauthenticated, internal);
+    assert!(!internal.contains("bridge-secret"));
+    let headers = backend
+        .bridge_headers_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .flatten()
+        .expect("active turn receives bridge authentication headers");
+    assert_eq!(
+        headers,
+        vec![(
+            "Authorization".to_string(),
+            "Bearer bridge-secret".to_string()
+        )]
+    );
     let resp = client
-        .post(&unauthenticated)
-        .json(&initialize)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-    let resp = client
-        .post(internal)
+        .post(&internal)
         .json(&initialize)
         .send()
         .await

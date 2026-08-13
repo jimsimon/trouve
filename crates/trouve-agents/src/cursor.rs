@@ -434,7 +434,13 @@ impl AgentBackend for CursorBackend {
         let session_id = match &turn.session {
             Some(sid) if known_session => sid.clone(),
             Some(sid) => match server
-                .load_session(sid, &turn.worktree, &turn.mcp_servers, &cancel)
+                .load_session(
+                    sid,
+                    &turn.worktree,
+                    &turn.mcp_servers,
+                    turn.mcp_bridge.as_ref(),
+                    &cancel,
+                )
                 .await
             {
                 Ok(()) => sid.clone(),
@@ -443,14 +449,24 @@ impl AgentBackend for CursorBackend {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
                     server
-                        .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
+                        .new_session(
+                            &turn.worktree,
+                            &turn.mcp_servers,
+                            turn.mcp_bridge.as_ref(),
+                            &cancel,
+                        )
                         .await?
                 }
             },
             None => {
                 fresh_session = true;
                 server
-                    .new_session(&turn.worktree, &turn.mcp_servers, &cancel)
+                    .new_session(
+                        &turn.worktree,
+                        &turn.mcp_servers,
+                        turn.mcp_bridge.as_ref(),
+                        &cancel,
+                    )
                     .await?
             }
         };
@@ -1495,6 +1511,9 @@ struct AcpServer {
     /// `cursor/ask_question` find their route here, and permission requests
     /// recover rawInput when cursor omits it.
     calls: Arc<Mutex<HashMap<String, (String, Value)>>>,
+    /// Negotiated during initialize; an HTTP bridge is mandatory whenever a
+    /// BackendTurn includes one.
+    mcp_http: AtomicBool,
     /// Held so the complete process tree lives as long as the server handle;
     /// mutable ownership also lets a blocked transport be terminated and
     /// reaped. The reader holds only a `Weak`, so it cannot keep the child
@@ -1635,6 +1654,7 @@ impl AcpServer {
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
+            mcp_http: AtomicBool::new(false),
             child: Arc::new(Mutex::new(child)),
             closed: Arc::new(AtomicBool::new(false)),
             transport_cleanup_started: AtomicBool::new(false),
@@ -1847,6 +1867,7 @@ impl AcpServer {
         &self,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        bridge: Option<&crate::McpBridgeConfig>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String, BackendError> {
         let mcp_servers =
@@ -1854,7 +1875,7 @@ impl AcpServer {
         let result = self
             .request_cancellable(
                 "session/new",
-                json!({ "cwd": worktree, "mcpServers": acp_mcp_servers(mcp_servers) }),
+                json!({ "cwd": worktree, "mcpServers": mcp_servers }),
                 cancel,
             )
             .await
@@ -1882,8 +1903,11 @@ impl AcpServer {
         session_id: &str,
         worktree: &std::path::Path,
         mcp_servers: &[crate::McpServerLaunch],
+        bridge: Option<&crate::McpBridgeConfig>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), BackendError> {
+        let mcp_servers =
+            acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
         self.request_cancellable(
             "session/load",
             json!({
@@ -2623,12 +2647,12 @@ for line in sys.stdin:
                 async move {
                     match method {
                         "session/new" => server
-                            .new_session(&worktree, &[], &cancel)
+                            .new_session(&worktree, &[], None, &cancel)
                             .await
                             .map(|_| ()),
                         "session/load" => {
                             server
-                                .load_session("session-1", &worktree, &[], &cancel)
+                                .load_session("session-1", &worktree, &[], None, &cancel)
                                 .await
                         }
                         "session/set_config_option" => server
@@ -3024,6 +3048,7 @@ for line in sys.stdin:
                     .new_session(
                         directory.path(),
                         &[],
+                        None,
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await,

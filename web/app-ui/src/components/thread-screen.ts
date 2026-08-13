@@ -2875,6 +2875,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     activityPresentation: AgentActivityPresentation | undefined,
     activityInput: RunningAgentActivityInput | undefined,
   ) {
+    const command = unit.items.length === 1 && unit.items[0]?.kind === "command"
+      ? unit.items[0]
+      : undefined;
+    if (command !== undefined) return this.#renderCommandCard(command);
     this.#ensureMarkdown();
     const assistantItems = unit.items.filter(
       (item): item is Extract<AgentChatItem, { readonly kind: "assistant" }> =>
@@ -2971,6 +2975,44 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 : this.#renderTerminalTurnState(unit.status)}
             </div>`
           : nothing}
+      </article>
+    `;
+  }
+
+  #renderCommandCard(
+    item: Extract<AgentChatItem, { readonly kind: "command" }>,
+  ) {
+    this.#ensureMarkdown();
+    const invocation = `/${item.name}${item.arguments === "" ? "" : ` ${item.arguments}`}`;
+    return html`
+      <article class="message turn-card assistant-message agent-turn-card command-result-card">
+        <header class="message-header agent-header turn-header">
+          <div class="message-disclosure command-result-header">
+            ${fontAwesomeIcon("terminal", { className: "disclosure-icon" })}
+            <strong>Trouve</strong>
+            <small class="agent-model-label">${invocation}</small>
+            <span class="agent-header-spacer"></span>
+            <span class="agent-copy-action">
+              ${this.#renderCopyButton(
+                `command:${item.id}`,
+                assistantCopyText(item.output),
+                "Copy command output",
+              )}
+            </span>
+          </div>
+        </header>
+        <div class="message-body turn-body-stream agent-body-stream">
+          <section
+            class="turn-rail-node turn-response-node agent-text-block complete"
+            data-chat-anchor-id=${`command:${item.id}`}
+            aria-label=${`${invocation} output`}
+          >
+            <span class="turn-rail-marker response complete" aria-hidden="true">
+              ${fontAwesomeIcon("check")}
+            </span>
+            <trouve-markdown-view .content=${item.output}></trouve-markdown-view>
+          </section>
+        </div>
       </article>
     `;
   }
@@ -3262,6 +3304,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     while (index < unit.items.length) {
       const item = unit.items[index];
       if (item === undefined) break;
+      // Command items are isolated into their own card by `buildChatLayout`.
+      // The card is rendered before this method, but keep the narrowing here
+      // explicit for defensive compatibility with retained snapshots.
+      if (item.kind === "command") {
+        flushActivityRows();
+        index += 1;
+        continue;
+      }
       if (item.kind === "steered") {
         flushActivityRows();
         rows.push(this.#renderUserNode(item));
@@ -6976,6 +7026,17 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const requestGeneration = ++this.#turnRequestGeneration;
     const composerCursor = textarea?.selectionStart ?? this.#composerCursor;
     const view = store.threadView(threadId);
+    const commandMatch = /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(content);
+    const actionCommand = !steering && commandMatch !== null
+      ? view.commands.find((command) =>
+          command.name === commandMatch[1]
+          && command.kind === "action")
+      : undefined;
+    if (actionCommand !== undefined && attachments.length > 0) {
+      this.#requestError = "Trouve action commands do not accept attachments.";
+      this.requestUpdate();
+      return;
+    }
     const startingTurn = view?.turnRunning === true
       || this.#pendingStartTurn !== undefined
       || this.#cancelRequestedTurn !== undefined;
@@ -6983,7 +7044,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       (maximum, item) => "turn" in item ? Math.max(maximum, item.turn + 1) : maximum,
       1,
     );
-    const optimistic = steering
+    const optimistic = steering || actionCommand !== undefined
       ? undefined
       : {
           id: `optimistic:${threadId}:${requestGeneration}`,
@@ -7025,7 +7086,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : { attachments: attachments.map(({ upload }) => upload) }),
       };
       let acceptedTurn: number | undefined;
-      if (steering) {
+      if (actionCommand !== undefined) {
+        const result = await services.protocol.executeCommand(threadId, {
+          name: actionCommand.name,
+          arguments: commandMatch?.[2]?.trim() ?? "",
+        });
+        if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
+        const action = result.action ?? { type: "none" as const };
+        if (action.type === "switch_thread") {
+          const threads = await services.protocol.threads(sessionId);
+          if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
+          for (const thread of threads) store.upsertThread(thread);
+          services.setThreadTabClosed(action.thread_id, false);
+          services.router.navigate({
+            kind: "session",
+            workspaceId: this.workspaceId,
+            sessionId,
+            threadId: action.thread_id,
+          });
+        } else if (action.type === "open_terminal") {
+          services.router.navigate({
+            kind: "session",
+            workspaceId: this.workspaceId,
+            sessionId,
+            threadId,
+            inspection: "terminal",
+          });
+        }
+      } else if (steering) {
         await services.protocol.steerTurn(threadId, request);
         if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
       } else {
@@ -7095,12 +7183,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       }
     } catch {
       if (this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
-        if (
-          !steering
-          && optimistic !== undefined
-          && this.#optimisticPrompt?.id === optimistic.id
-        ) {
-          this.#clearOptimisticPrompt(optimistic.id);
+        if (!steering) {
+          if (optimistic !== undefined && this.#optimisticPrompt?.id === optimistic.id) {
+            this.#clearOptimisticPrompt(optimistic.id);
+          }
           if (textarea !== null) {
             textarea.value = draftContent;
             textarea.setSelectionRange(composerCursor, composerCursor);
@@ -7117,7 +7203,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         this.#requestError = steering
           ? "The active turn could not be steered."
-          : "Message could not be sent.";
+          : actionCommand === undefined
+            ? "Message could not be sent."
+            : "Command could not be executed.";
       }
     } finally {
       if (this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {

@@ -1,10 +1,10 @@
-# 0019 — Trouve control plane with native CLI tools
+# ADR 0043: Trouve control plane with native CLI tools
 
 Status: Accepted (2026-07).
 
 ## Context
 
-ADR 0018 made Trouve the only executable capability source by disabling
+ADR 0042 made Trouve the only executable capability source by disabling
 vendor tools and replacing them through MCP. That gives one execution
 chokepoint, but subscription CLIs expose an agent seam rather than raw model
 inference. Their models are optimized for the harness's native tool names,

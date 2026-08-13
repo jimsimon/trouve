@@ -148,7 +148,21 @@ impl ThreadProjection {
                 });
                 self.indexes.open_compactions.insert(*turn, idx);
             }
-            Event::CommandsUpdated { commands } => self.snapshot.commands = commands.clone(),
+            Event::CommandsUpdated { commands } | Event::CommandCatalogUpdated { commands } => {
+                self.snapshot.commands = commands.clone();
+            }
+            Event::CommandExecuted {
+                name,
+                arguments,
+                output,
+            } => {
+                self.finish_thinking();
+                self.push(ThreadViewItem::Command {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    output: output.clone(),
+                });
+            }
             Event::QueueUpdated { prompts } => self.snapshot.queue = prompts.clone(),
             Event::TodosUpdated { todos } => {
                 let turn = self.active_turn();
@@ -727,6 +741,7 @@ impl ThreadProjection {
                 }
                 ThreadViewItem::User { .. }
                 | ThreadViewItem::Steered { .. }
+                | ThreadViewItem::Command { .. }
                 | ThreadViewItem::Subagent { .. }
                 | ThreadViewItem::Assistant { .. }
                 | ThreadViewItem::TodoUpdate { .. }

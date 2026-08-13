@@ -136,19 +136,17 @@ pub struct McpServerLaunch {
 
 /// Streamable-HTTP MCP server the vendor agent connects to in order to
 /// reach trouve (the engine's internal per-thread MCP endpoint). Always
-/// used for approval prompting in Ask mode; normally also supplies every
-/// mutation-capable tool so the engine can enforce worktree serialization.
-#[derive(Debug, Clone)]
+/// used for approval prompting in Ask mode and to expose Trouve-owned
+/// supplemental capabilities alongside each vendor's optimized native tools.
+#[derive(Clone)]
 pub struct McpBridgeConfig {
     /// Thread-scoped endpoint URL, with non-secret capability selectors in
     /// its query parameters.
     pub url: String,
-    /// When true the bridge serves trouve's ToolExecutor tools and vendor
-    /// mutations are disabled or sandbox-confined; when false it only serves
-    /// the approval-prompt gate.
-    pub bridge_tools: bool,
-    /// Vendor built-in tools to disable while the bridge supplies tools.
-    pub disallowed_tools: Vec<String>,
+    /// Static headers sent with every bridge request. Credentials belong
+    /// here rather than in the URL so they are not exposed through process
+    /// listings, logs, or vendor session metadata.
+    pub headers: Vec<(String, String)>,
 }
 
 impl fmt::Debug for McpBridgeConfig {

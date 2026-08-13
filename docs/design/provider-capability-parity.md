@@ -1,6 +1,6 @@
 # Provider capability consistency
 
-ADR 0019 makes provider choice an inference and transport choice, not a
+ADR 0043 makes provider choice an inference and transport choice, not a
 choice of agent product. This document is the implementation contract for
 that decision: execution dialects may differ, but the visible harness does
 not.

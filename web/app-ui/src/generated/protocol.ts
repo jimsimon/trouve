@@ -511,6 +511,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/config/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_skills_settings"];
+        put: operations["set_skills_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/github/prs/refresh": {
         parameters: {
             query?: never;
@@ -1524,6 +1540,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["cancel_turn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/threads/{id}/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["execute_command"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2559,13 +2591,47 @@ export interface components {
          */
         CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
         /**
-         * @description One slash command / skill the vendor harness accepts in prompts (e.g.
-         *     "/simplify"), surfaced by clients as prompt-box completions.
+         * @description Client-side action that follows a completed command. Persistent state is
+         *     still reported through the event log; these are navigation hints only.
+         */
+        CommandAction: {
+            /** @enum {string} */
+            type: "none";
+        } | {
+            thread_id: components["schemas"]["String"];
+            /** @enum {string} */
+            type: "switch_thread";
+        } | {
+            /** @enum {string} */
+            type: "open_terminal";
+        };
+        /**
+         * @description One slash command or skill accepted by Trouve, surfaced by clients as a
+         *     prompt-box completion.
          */
         CommandInfo: {
             description?: string;
+            /**
+             * @description Whether submitting this command starts a model turn or executes a
+             *     deterministic Trouve action.
+             */
+            kind?: components["schemas"]["CommandKind"];
             /** @description Name without the leading slash. */
             name: string;
+            /** @description User-facing invocation syntax, including the leading slash. */
+            usage?: string;
+        };
+        /**
+         * @description How a slash command is dispatched by clients.
+         * @enum {string}
+         */
+        CommandKind: "prompt" | "action";
+        /** @description Result of a deterministic slash command. */
+        CommandResult: {
+            /** @description Optional client navigation requested by the command. */
+            action?: components["schemas"]["CommandAction"];
+            name: string;
+            output: string;
         };
         /** @description Browser callback URL/code pasted into a CLI login running on another host. */
         CompleteLoginRequest: {
@@ -2821,6 +2887,16 @@ export interface components {
         } | {
             commands: components["schemas"]["CommandInfo"][];
             /** @enum {string} */
+            type: "thread.command_catalog_updated";
+        } | {
+            arguments?: string;
+            name: string;
+            output: string;
+            /** @enum {string} */
+            type: "thread.command_executed";
+        } | {
+            commands: components["schemas"]["CommandInfo"][];
+            /** @enum {string} */
             type: "thread.commands_updated";
         } | {
             prompts: components["schemas"]["QueuedPrompt"][];
@@ -3017,6 +3093,16 @@ export interface components {
              * @description RFC 3339 timestamp assigned at append time.
              */
             ts: string;
+        };
+        /**
+         * @description Execute one deterministic Trouve slash command. Prompt commands from the
+         *     catalog continue to use `SendMessageRequest` so they start a model turn.
+         */
+        ExecuteCommandRequest: {
+            /** @description Everything following the command name, without leading whitespace. */
+            arguments?: string;
+            /** @description Catalog name without the leading slash. */
+            name: string;
         };
         FileContent: {
             content: string;
@@ -4295,6 +4381,17 @@ export interface components {
             /** @description Required for workspace scope: whose `.agents/.mcp.json` to edit. */
             workspace_id?: string | null;
         };
+        /** @description Update the global skill settings persisted in `config.toml`. */
+        SetSkillsSettingsRequest: {
+            builtin_skills_enabled: boolean;
+        };
+        /**
+         * @description Global skill settings. Built-in skills are enabled by default; user and
+         *     workspace skills are independent of this switch.
+         */
+        SkillsSettings: {
+            builtin_skills_enabled?: boolean;
+        };
         /**
          * @description A steering message accepted by the active vendor turn. Durable display
          *     state follows as `turn.steered` on the thread event stream.
@@ -4494,6 +4591,12 @@ export interface components {
             kind: "steered";
             /** Format: int64 */
             turn: number;
+        } | {
+            arguments?: string;
+            /** @enum {string} */
+            kind: "command";
+            name: string;
+            output: string;
         } | {
             call_id?: null | components["schemas"]["String"];
             /** @enum {string} */
@@ -6073,6 +6176,54 @@ export interface operations {
                 };
             };
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_skills_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillsSettings"];
+                };
+            };
+        };
+    };
+    set_skills_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSkillsSettingsRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8307,6 +8458,55 @@ export interface operations {
                 content?: never;
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    execute_command: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecuteCommandRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandResult"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

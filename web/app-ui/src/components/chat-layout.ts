@@ -7,7 +7,7 @@ import {
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
+  { readonly kind: "assistant" | "steered" | "command" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -46,6 +46,7 @@ export interface ChatLayout {
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
   || item.kind === "steered"
+  || item.kind === "command"
   || item.kind === "subagent"
   || item.kind === "progress"
   || item.kind === "thinking"
@@ -75,7 +76,9 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     if (current === undefined) return;
     const active = current;
     const turn = active.turn ?? lastExplicitTurn ?? 0;
-    const id = turn === 0 ? `turn:0:${active.firstId}` : `turn:${turn}`;
+    const id = active.turn === undefined
+      ? `standalone:${active.firstId}`
+      : `turn:${turn}`;
     const linkedSpawnCalls = new Set(
       active.items.flatMap((item) =>
         item.kind === "subagent" && item.callId !== undefined ? [item.callId] : []),
@@ -128,6 +131,12 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
   for (const item of items) {
     if (item.kind === "user") {
       claim(item.turn, item.id).prompt = item;
+      continue;
+    }
+    if (item.kind === "command") {
+      flush();
+      claim(undefined, item.id).items.push(item);
+      flush();
       continue;
     }
     if (isAgentItem(item)) {

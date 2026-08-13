@@ -31,10 +31,10 @@ use trouve_protocol::{
     AddLocalModelRequest, AgentPersona, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
-    CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry,
+    CodeReviewTask, CommandResult, CompleteLoginRequest, ConfigureGithubAppRequest,
+    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry,
     ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
-    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
+    EVENT_CURSOR_HEADER, ErrorBody, ExecuteCommandRequest, FileContent, ForkCheckpointResponse,
     GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
     GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
     LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo, OpenTerminalRequest,
@@ -45,12 +45,12 @@ use trouve_protocol::{
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
     SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
-    SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, Workspace,
+    SetMcpServerEnabledRequest, SetSkillsSettingsRequest, SkillsSettings, SteerAccepted,
+    SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalReplayStart,
+    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -750,6 +750,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/threads/{id}/tools/{call_id}",
             get(get_thread_tool_details),
         )
+        .route("/v1/threads/{id}/commands", post(execute_command))
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/threads/{id}/steer", post(steer_turn))
         .route("/v1/attachments/{id}", get(get_attachment))

@@ -73,6 +73,10 @@ export type ProtocolUpdateQueuedPromptRequest =
   ProtocolComponents["schemas"]["UpdateQueuedPromptRequest"];
 export type ProtocolSendMessageRequest =
   ProtocolComponents["schemas"]["SendMessageRequest"];
+export type ProtocolExecuteCommandRequest =
+  ProtocolComponents["schemas"]["ExecuteCommandRequest"];
+export type ProtocolCommandResult =
+  ProtocolComponents["schemas"]["CommandResult"];
 export type ProtocolSteerTurnRequest =
   ProtocolComponents["schemas"]["SteerTurnRequest"];
 export type ProtocolTurnAccepted = ProtocolComponents["schemas"]["TurnAccepted"];
@@ -147,6 +151,10 @@ export type ProtocolGitWorktreeSettings =
   ProtocolComponents["schemas"]["GitWorktreeSettings"];
 export type ProtocolSetGitWorktreeSettingsRequest =
   ProtocolComponents["schemas"]["SetGitWorktreeSettingsRequest"];
+export type ProtocolSkillsSettings =
+  ProtocolComponents["schemas"]["SkillsSettings"];
+export type ProtocolSetSkillsSettingsRequest =
+  ProtocolComponents["schemas"]["SetSkillsSettingsRequest"];
 
 export interface ProtocolCursorSnapshot<T> {
   readonly cursor: number;
@@ -203,6 +211,8 @@ interface ProtocolValidators {
   readonly threadStatuses: ValidateFunction;
   readonly queuedPrompts: ValidateFunction;
   readonly turnAccepted: ValidateFunction;
+  readonly commandResult: ValidateFunction;
+  readonly skillsSettings: ValidateFunction;
   readonly usageSummary: ValidateFunction;
   readonly dirEntries: ValidateFunction;
   readonly paths: ValidateFunction;
@@ -333,6 +343,8 @@ const validateResponse = async <T>(
     | "ThreadViewSnapshot"
     | "QueuedPrompt[]"
     | "TurnAccepted"
+    | "CommandResult"
+    | "SkillsSettings"
     | "UsageSummary"
     | "DirEntry[]"
     | "Path[]"
@@ -424,7 +436,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.12";
+export const SUPPORTED_PROTOCOL_VERSION = "7.13";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -1312,6 +1324,19 @@ export class ProtocolClient {
     );
   }
 
+  skillsSettings(): Promise<ProtocolSkillsSettings> {
+    return this.#validatedJson(
+      "/v1/config/skills",
+      "skill settings",
+      "SkillsSettings",
+      (loaded) => loaded.skillsSettings,
+    );
+  }
+
+  setSkillsSettings(request: ProtocolSetSkillsSettingsRequest): Promise<void> {
+    return this.#mutation("/v1/config/skills", "save skill settings", "PUT", request);
+  }
+
   gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
     return this.#validatedJson(
       "/v1/config/git-worktrees",
@@ -1828,6 +1853,20 @@ export class ProtocolClient {
       "TurnAccepted",
       result.data,
       (loaded) => loaded.turnAccepted,
+    );
+  }
+
+  async executeCommand(
+    threadId: string,
+    request: ProtocolExecuteCommandRequest,
+  ): Promise<ProtocolCommandResult> {
+    return this.#validatedMutation(
+      `/v1/threads/${encodeURIComponent(threadId)}/commands`,
+      "execute command",
+      "POST",
+      "CommandResult",
+      (loaded) => loaded.commandResult,
+      request,
     );
   }
 

@@ -151,6 +151,12 @@ pub enum ChatItem {
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
     },
+    /// Output of a deterministic trouve slash command.
+    Command {
+        name: String,
+        arguments: String,
+        output: String,
+    },
     /// A child-agent transcript linked from its parent turn.
     Subagent {
         turn: u64,
@@ -360,6 +366,15 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 attachments,
+            },
+            ThreadViewItem::Command {
+                name,
+                arguments,
+                output,
+            } => Self::Command {
+                name,
+                arguments,
+                output,
             },
             ThreadViewItem::Subagent {
                 turn,
@@ -1209,6 +1224,7 @@ mod tests {
                 ChatItem::ToolCall { .. } => "tool",
                 ChatItem::TurnStatus { .. } => "turn-status",
                 ChatItem::Questions { .. } => "questions",
+                ChatItem::Command { .. } => "command",
             })
             .collect::<Vec<_>>();
         let turn_state = vm.items.iter().find_map(|item| match item {
