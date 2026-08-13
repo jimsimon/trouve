@@ -3,7 +3,6 @@
 # Members:
 #   crates/trouve-search   — code search/indexing library + CLI (published)
 #   crates/trouve-*        — harness crates (protocol, core, providers, server, cli, ...)
-#   crates/trouve-slint-*  — reusable Slint widget crates
 #
 # Every first-party artifact shares one release version and repository tag.
 # See docs/adr/0012-single-version-monorepo-release-train.md.
@@ -11,13 +10,18 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The pinned Servo nightly and trouve-server use incompatible libsqlite3-sys
+# link versions.
+# Keep the disposable embedding qualification harness in a nested workspace
+# with its own lockfile so the exact pinned engine can be tested without
+# changing the product server's database dependency.
+exclude = ["crates/trouve-servo-embed-preview"]
 
 [workspace.package]
 version = "3.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
-# Slint 1.17 and its compiler crates require Rust 1.92.
 rust-version = "1.92"
 
 [workspace.dependencies]
@@ -29,6 +33,8 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
 futures = "0.3"
+fontdb = "0.23.0"
+fs4 = "0.13"
 hmac = "0.12"
 hex = "0.4"
 jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
@@ -37,7 +43,6 @@ reqwest = { version = "0.13", default-features = false, features = ["form", "jso
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
-slint = "1.17"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
@@ -48,7 +53,10 @@ toml = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["chrono"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+xattr = "1.6.1"
 
 # Internal crates
 trouve-protocol = { path = "crates/trouve-protocol", version = "3.7.0" }
@@ -59,10 +67,7 @@ trouve-providers = { path = "crates/trouve-providers", version = "3.7.0" }
 trouve-server = { path = "crates/trouve-server", version = "3.7.0" }
 trouve-client-core = { path = "crates/trouve-client-core", version = "3.7.0" }
 trouve-thread-view = { path = "crates/trouve-thread-view", version = "3.7.0" }
-trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.7.0" }
-trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.7.0" }
-trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.7.0" }
-trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.7.0" }
+trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "3.7.0" }
 
 [profile.release]
 lto = "thin"

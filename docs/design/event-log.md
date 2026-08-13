@@ -45,13 +45,83 @@ session stream.
 - Resumption: clients send `Last-Event-ID: <cursor>` (or `?after=<cursor>`);
   the server replays every persisted event after that cursor, then continues
   live. Replay and live delivery are indistinguishable to the client.
-- The server never skips cursors within a scope; a gap means data loss and
-  is a bug.
+- The store allocates one globally monotonic cursor across all scopes. Scopes
+  only filter which events are delivered, so cursors are ordered but not dense:
+  clients must drop duplicates and older events but must never require
+  `next_cursor == previous_cursor + 1`.
 - A client may seed itself from a server-derived snapshot carrying
   `x-trouve-event-cursor`, then subscribe after that cursor. Large folded
   transcripts are transferred as bounded newest-first pages. Snapshots are
   rebuildable projections of this log; they do not replace it as the durable
   source of truth.
+
+Completed folded transcript rows are materialized in the indexed
+`thread_view_items` projection, while `thread_view_cache` retains only the
+currently mutable turn suffix and its fold indexes. A page request therefore
+deserializes at most the live suffix and the requested rows; it never loads a
+thread's complete folded history merely to slice one page. Completed tool rows
+carry bounded presentation arguments and a `details_deferred` marker. Their
+full arguments and terminal result live in the rebuildable
+`thread_tool_details` projection and are fetched only when the user expands
+that call. Both tables are disposable cache state: invalidating their schema
+version rebuilds them from the authoritative thread event stream.
+
+### Session-list bootstrap and resume
+
+Clients must not retain every background thread merely to render the session
+inbox. The server therefore maintains a durable `SessionSummary` projection
+containing session/workspace ids, archive and activity state, aggregate
+approval/question attention, the latest terminal outcome, latest thread id,
+source-event cursor, and timestamp.
+
+`GET /v1/session-summaries` returns `{summaries, cursor}` from one SQLite read
+transaction. A client replaces its normalized summary map with that snapshot,
+then opens the existing server stream at `GET /v1/events?after=<cursor>` and
+applies `session.summary_updated` replacements or tombstones. Because each
+projection mutation and its derived server event are committed in the same
+writer transaction, an update is either already represented by the snapshot
+or appears after its cursor; there is no snapshot/stream race window.
+
+`GET /v1/server-projection` supplies the durable replacement state not carried
+by `SessionSummary`: the newest cached account PR list per configured GitHub
+host, the branch- and `session.pr_opened`-derived PR associations for every
+session, and session-naming settings. Each host slice retains its source event
+cursor and timestamp, and the response carries the current server cursor in
+`x-trouve-event-cursor`. Clients fetch it after the session-summary boundary,
+apply it before opening SSE, and still resume at the earlier session-summary
+cursor. Any replacement event that raced the projection request is therefore
+replayed and ordered by its own cursor, while cold startup no longer scans the
+complete retained server log merely to find the latest replacement events.
+
+Completion, failure, approval, and question source events also derive a
+compact `session.notification` edge after their replacement summary in that
+same transaction. The edge carries the exact category and source thread plus
+an optional bounded failure excerpt or question subtitle. It lets inactive
+thread notifications retain the native behavior without one SSE follower per
+thread. Notifications remain client policy: snapshot-covered history is not
+shown, replay is freshness-gated, focused visible threads are suppressed, and
+preference/sound/activation handling stays with each client.
+
+The projection's `latest_cursor` is the source event cursor, while the
+snapshot `cursor` is the latest server-scope cursor used for SSE resumption.
+They serve different purposes and clients must not interchange them. Because
+turn responders cannot survive their owning process, restart appends a durable
+`session.recovered` source event and replacement summary for each interrupted
+session. Recovery clears stale activity and approval/question attention and
+marks the interrupted outcome failed; snapshot and resumed-stream clients
+therefore converge on the same cursor-addressed transition.
+
+Conversation tab status uses the same projection pattern at thread scope.
+`GET /v1/thread-statuses?session_id=…` returns compact `ThreadStatus` rows for
+the selected session, and source turn/approval/question events transactionally
+append `thread.status_updated` replacements on the server stream. Clients can
+therefore keep open and closed thread tabs current without retaining each
+thread transcript or opening one SSE connection per tab. Each row's
+`latest_cursor` is the source-event cursor and also drives client-local
+seen/unseen terminal indicators. `started_at` records the current or most
+recent turn start, while `completed_at` records its terminal event; clients use
+that pair for live and completed child-agent elapsed time without replaying the
+thread.
 
 ## Event envelope
 
@@ -75,16 +145,34 @@ Thread scope:
 - `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
   capacity was acquired; background review work uses a lane that reserves
   capacity for interactive desktop turns
-- `turn.started` `{turn, mode, model}` / `turn.completed` `{turn, usage,
-  checkpoint_id?}` / `turn.failed` `{turn, error}`
+- `turn.started` `{turn, mode, model, thinking_level?}` (the effective
+  provider-native thinking selection for that turn) / `turn.usage_updated`
+  `{turn, usage}`
+  (live current-context replacement without ending the turn) /
+  `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
+  `{turn, error}`
 - `user.message` `{turn, content}`
+- `subagent.spawned` `{turn, thread_id, session_id, prompt, model, call_id?}` —
+  a separately navigable child-agent transcript was attached to the parent
+  turn; the optional call id identifies a redundant trouve spawn tool row
 - `assistant.delta` `{turn, text}` — streamed model output
+- `assistant.thinking` `{turn, text}` — streamed display-only model reasoning /
+  `assistant.thinking_completed` `{turn}` — the provider explicitly closed
+  the current thinking item, even when no visible output follows immediately
 - `assistant.message` `{turn, content}` — folded final text for the turn
 - `tool.requested` `{turn, call_id, tool, args, requires_approval}`
 - `approval.requested` `{turn, call_id}` / `approval.resolved` `{call_id,
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
-  `tool.completed` `{call_id, status, result}`
+  `tool.completed` `{call_id, status, result, execution_duration_ms?}`. The
+  optional duration covers only `ToolExecutor::execute`, measured with a
+  monotonic clock; clients fall back to durable timestamps for older or
+  provider-owned calls.
+  Multiple call ids may be live concurrently. Cursor order reflects actual
+  request/start/output/completion timing and is not required to match the
+  provider transcript's tool-call order; `call_id` is the correlation key.
+- `question.requested` `{turn, request_id, title?, questions}` /
+  `question.resolved` `{request_id, answers?}`
 - `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts
   changed (enqueue/edit/reorder/delete/dispatch); carries the full remaining
   queue in run order, so replaying to the tail reproduces the current queue
@@ -95,15 +183,29 @@ Thread scope:
 Session scope:
 
 - `checkpoint.created` `{checkpoint_id, turn, thread_id, ref}`
-- `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo)
+- `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo/exact)
 - `worktree.created` / `worktree.removed` `{path, branch}`
 
 Server scope:
 
 - `workspace.registered` `{workspace_id, path}`
-- `workspace.pull_requests_updated` `{workspace_id, pull_requests}` — full
-  dashboard snapshot for one workspace, emitted after a requested refresh
+- `thread.status_updated` `{status}` — compact replacement activity,
+  attention, outcome, and source cursor for one thread
+- `github.pull_requests_updated` `{pull_requests}` — full account-centric
+  dashboard snapshot for one configured GitHub host
 - `session.created` / `session.deleted` `{session_id, workspace_id}`
+- `session.updated` `{session_id, workspace_id}` — session metadata changed
+- `thread.created` / `thread.updated` `{thread_id, session_id}`
+- `session.activity` `{session_id, workspace_id, active}` — one or more
+  threads in the session started work, or the final active thread stopped
+- `session.recovered` `{session_id, workspace_id}` — restart reconciled
+  process-owned activity and unresolved attention that cannot be resumed
+- `session.summary_updated` `{session_id, summary}` — full replacement of
+  the transactionally materialized session projection; explicit `null`
+  `summary` is the durable deletion tombstone
+- `session.notification` `{session_id, thread_id, kind, detail?}` — compact
+  notification edge for a completed/failed turn or a newly requested
+  approval/question; `detail` is a bounded failure excerpt or question title
 - `server.connectivity_changed` `{online}` — the server's internet
   reachability flipped; while offline `/v1/models` lists only models that
   run without internet, and clients gate prompt entry on that list
@@ -145,14 +247,20 @@ guarantees per-scope monotonicity; per-scope density is *not* guaranteed and
 clients must not assume consecutive cursors.
 
 Writes go through a single event-writer chokepoint. Callers may submit one
-event or an ordered same-scope batch. The writer assigns cursors, commits the
-transaction, and only then publishes envelopes to in-process subscribers and
-acknowledges the caller. A subscriber can therefore never observe an event
-that would not survive a crash. Per-turn coalescing buffers are bounded by
-count and approximate bytes and apply backpressure. Routes on a multiplexed
-vendor transport have a bounded event budget and report overload to only the
-affected turn, keeping the shared reader available to unrelated turns and
-JSON-RPC responses.
+event or an ordered same-scope batch. Session create/update/delete relational
+changes also execute in that writer transaction. For session-relevant source
+events, the same transaction updates the `session_summaries` and
+unresolved-attention projection tables and appends the derived server-scope
+`session.summary_updated` event immediately after its source. Notification-
+worthy source events append `session.notification` immediately after that
+replacement. The writer then commits and publishes every source and derived
+envelope in exact cursor order before acknowledging callers. A subscriber can
+therefore never observe an event that would not survive a crash, and summary
+state cannot diverge from its notification edge. Per-turn coalescing buffers
+are bounded by count and approximate bytes and apply backpressure. Routes on a
+multiplexed vendor transport have a bounded event budget and report overload
+to only the affected turn, keeping the shared reader available to unrelated
+turns and JSON-RPC responses.
 
 ## Retention & privacy
 
@@ -164,8 +272,12 @@ here is uploaded except the deliberately published review result.
 
 ## Relationship to checkpoints and audit
 
-- `turn.completed` references the checkpoint created for that turn; undo
-  emits `checkpoint.restored` rather than deleting events — the log records
-  what happened, the worktree reflects the restore.
+- `turn.completed` references the checkpoint created for that turn, and the
+  folded `ThreadTurnState::Completed` retains that id so clients can offer
+  turn-boundary restore/fork actions after replay. Relative undo/redo and
+  checkpoint-targeted restore emit `checkpoint.restored` rather than deleting
+  events — the log records what happened, while the worktree reflects the
+  restore. Forking creates a normal new session/thread lifecycle at the named
+  checkpoint and does not copy the source transcript.
 - The audit view is a filter over the log (`tool.*`, `approval.*`), not a
   separate store.

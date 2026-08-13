@@ -19,7 +19,12 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
 
+const MAX_PATCH_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PATCH_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 pub struct ApplyPatch;
+
+pub struct ApplyPatchFallback;
 
 #[async_trait::async_trait]
 impl Tool for ApplyPatch {
@@ -53,124 +58,187 @@ impl Tool for ApplyPatch {
         else {
             return ToolResult::error("missing required argument: input");
         };
-        let ops = match parse(input) {
-            Ok(ops) => ops,
-            Err(e) => return ToolResult::error(e),
-        };
-        if ops.is_empty() {
-            return ToolResult::error("patch contains no file operations");
+        if input.len() > MAX_PATCH_INPUT_BYTES {
+            return ToolResult::error(format!(
+                "patch is {} bytes; the limit is {MAX_PATCH_INPUT_BYTES}",
+                input.len()
+            ));
         }
-
-        // Stage everything first; only write when the whole patch applies.
-        let mut writes: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
-        let mut report = Vec::new();
-        for op in &ops {
-            match op {
-                Op::Add { path, content } => {
-                    let full = match ctx.resolve(path) {
-                        Ok(p) => p,
-                        Err(e) => return ToolResult::error(e),
-                    };
-                    if full.exists() {
-                        return ToolResult::error(format!(
-                            "cannot add {path}: file already exists (use Update File)"
-                        ));
-                    }
-                    report.push(json!({
-                        "path": path, "action": "add",
-                        "adds": content.lines().count(), "dels": 0,
-                    }));
-                    writes.push((full, Some(content.clone())));
-                }
-                Op::Delete { path } => {
-                    let full = match ctx.resolve(path) {
-                        Ok(p) => p,
-                        Err(e) => return ToolResult::error(e),
-                    };
-                    if !full.is_file() {
-                        return ToolResult::error(format!("cannot delete {path}: not a file"));
-                    }
-                    let dels = std::fs::read_to_string(&full)
-                        .map(|t| t.lines().count())
-                        .unwrap_or(0);
-                    report.push(json!({
-                        "path": path, "action": "delete", "adds": 0, "dels": dels,
-                    }));
-                    writes.push((full, None));
-                }
-                Op::Update {
-                    path,
-                    move_to,
-                    hunks,
-                } => {
-                    let full = match ctx.resolve(path) {
-                        Ok(p) => p,
-                        Err(e) => return ToolResult::error(e),
-                    };
-                    let content = match std::fs::read_to_string(&full) {
-                        Ok(t) => t,
-                        Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
-                    };
-                    let updated = match apply_hunks(&content, hunks) {
-                        Ok(u) => u,
-                        Err(e) => return ToolResult::error(format!("{path}: {e}")),
-                    };
-                    let (adds, dels) = hunks.iter().fold((0, 0), |(a, d), h| {
-                        (a + h.new.len() - h.keep, d + h.old.len() - h.keep)
-                    });
-                    match move_to {
-                        Some(dest) => {
-                            let dest_full = match ctx.resolve(dest) {
-                                Ok(p) => p,
-                                Err(e) => return ToolResult::error(e),
-                            };
-                            // Don't silently clobber an existing destination
-                            // (which would also delete the source) — matches
-                            // the Add guard.
-                            if dest != path && dest_full.exists() {
-                                return ToolResult::error(format!(
-                                    "cannot move {path} to {dest}: destination already exists"
-                                ));
-                            }
-                            report.push(json!({
-                                "path": dest, "action": "move",
-                                "from": path, "adds": adds, "dels": dels,
-                            }));
-                            writes.push((full, None));
-                            writes.push((dest_full, Some(updated)));
-                        }
-                        None => {
-                            report.push(json!({
-                                "path": path, "action": "update", "adds": adds, "dels": dels,
-                            }));
-                            writes.push((full, Some(updated)));
-                        }
-                    }
-                }
-            }
+        let input = input.to_owned();
+        let ctx = ctx.clone();
+        match tokio::task::spawn_blocking(move || apply_patch(&ctx, &input)).await {
+            Ok(result) => result,
+            Err(error) => ToolResult::error(format!("patch worker failed: {error}")),
         }
-
-        for (full, content) in writes {
-            match content {
-                Some(text) => {
-                    if let Some(parent) = full.parent()
-                        && let Err(e) = std::fs::create_dir_all(parent)
-                    {
-                        return ToolResult::error(format!("cannot create parent dirs: {e}"));
-                    }
-                    if let Err(e) = std::fs::write(&full, text) {
-                        return ToolResult::error(format!("cannot write {}: {e}", full.display()));
-                    }
-                }
-                None => {
-                    if let Err(e) = std::fs::remove_file(&full) {
-                        return ToolResult::error(format!("cannot delete {}: {e}", full.display()));
-                    }
-                }
-            }
-        }
-        ToolResult::ok(json!({"files": report}))
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for ApplyPatchFallback {
+    fn name(&self) -> &'static str {
+        "apply_patch_fallback"
+    }
+
+    fn description(&self) -> &'static str {
+        "Controlled fallback for a hashline-enforced model. This tool remains locked until two \
+         hashline_edit attempts fail, then accepts the same V4A envelope as apply_patch. Use it \
+         only to recover from repeated stale or malformed hashline edits."
+    }
+
+    fn parameters(&self) -> Value {
+        ApplyPatch.parameters()
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        ApplyPatch.run(ctx, args).await
+    }
+}
+
+fn apply_patch(ctx: &ToolCtx, input: &str) -> ToolResult {
+    if ctx.cancel.is_cancelled() {
+        return ToolResult::error("patch cancelled");
+    }
+    let ops = match parse(input) {
+        Ok(ops) => ops,
+        Err(e) => return ToolResult::error(e),
+    };
+    if ops.is_empty() {
+        return ToolResult::error("patch contains no file operations");
+    }
+
+    // Stage everything first; only write when the whole patch applies.
+    let mut writes: Vec<(std::path::PathBuf, Option<String>)> = Vec::new();
+    let mut report = Vec::new();
+    for op in ops {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("patch cancelled");
+        }
+        match op {
+            Op::Add { path, content } => {
+                let full = match ctx.resolve(&path) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error(e),
+                };
+                if full.exists() {
+                    return ToolResult::error(format!(
+                        "cannot add {path}: file already exists (use Update File)"
+                    ));
+                }
+                report.push(json!({
+                    "path": path, "action": "add",
+                    "adds": content.lines().count(), "dels": 0,
+                }));
+                writes.push((full, Some(content)));
+            }
+            Op::Delete { path } => {
+                let full = match ctx.resolve(&path) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error(e),
+                };
+                if !full.is_file() {
+                    return ToolResult::error(format!("cannot delete {path}: not a file"));
+                }
+                if std::fs::metadata(&full)
+                    .is_ok_and(|metadata| metadata.len() > MAX_PATCH_FILE_BYTES)
+                {
+                    return ToolResult::error(format!(
+                        "cannot delete {path}: file exceeds the {MAX_PATCH_FILE_BYTES}-byte patch limit"
+                    ));
+                }
+                let dels = std::fs::read_to_string(&full)
+                    .map(|t| t.lines().count())
+                    .unwrap_or(0);
+                report.push(json!({
+                    "path": path, "action": "delete", "adds": 0, "dels": dels,
+                }));
+                writes.push((full, None));
+            }
+            Op::Update {
+                path,
+                move_to,
+                hunks,
+            } => {
+                let full = match ctx.resolve(&path) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error(e),
+                };
+                if std::fs::metadata(&full)
+                    .is_ok_and(|metadata| metadata.len() > MAX_PATCH_FILE_BYTES)
+                {
+                    return ToolResult::error(format!(
+                        "cannot update {path}: file exceeds the {MAX_PATCH_FILE_BYTES}-byte patch limit"
+                    ));
+                }
+                let content = match std::fs::read_to_string(&full) {
+                    Ok(t) => t,
+                    Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+                };
+                let updated = match apply_hunks(&content, &hunks) {
+                    Ok(u) => u,
+                    Err(e) => return ToolResult::error(format!("{path}: {e}")),
+                };
+                let (adds, dels) = hunks.iter().fold((0, 0), |(a, d), h| {
+                    (a + h.new.len() - h.keep, d + h.old.len() - h.keep)
+                });
+                match move_to {
+                    Some(dest) => {
+                        let dest_full = match ctx.resolve(&dest) {
+                            Ok(p) => p,
+                            Err(e) => return ToolResult::error(e),
+                        };
+                        // Don't silently clobber an existing destination
+                        // (which would also delete the source) — matches
+                        // the Add guard.
+                        if dest != path && dest_full.exists() {
+                            return ToolResult::error(format!(
+                                "cannot move {path} to {dest}: destination already exists"
+                            ));
+                        }
+                        report.push(json!({
+                            "path": dest, "action": "move",
+                            "from": path, "adds": adds, "dels": dels,
+                        }));
+                        writes.push((full, None));
+                        writes.push((dest_full, Some(updated)));
+                    }
+                    None => {
+                        report.push(json!({
+                            "path": path, "action": "update", "adds": adds, "dels": dels,
+                        }));
+                        writes.push((full, Some(updated)));
+                    }
+                }
+            }
+        }
+    }
+
+    if ctx.cancel.is_cancelled() {
+        return ToolResult::error("patch cancelled");
+    }
+    for (full, content) in writes {
+        match content {
+            Some(text) => {
+                if let Some(parent) = full.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    return ToolResult::error(format!("cannot create parent dirs: {e}"));
+                }
+                if let Err(e) = std::fs::write(&full, text) {
+                    return ToolResult::error(format!("cannot write {}: {e}", full.display()));
+                }
+            }
+            None => {
+                if let Err(e) = std::fs::remove_file(&full) {
+                    return ToolResult::error(format!("cannot delete {}: {e}", full.display()));
+                }
+            }
+        }
+    }
+    ToolResult::ok(json!({"files": report}))
 }
 
 enum Op {

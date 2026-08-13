@@ -1,0 +1,29 @@
+[package]
+name = "trouve-desktop-host"
+version.workspace = true
+edition.workspace = true
+description = "Typed desktop webview host and native capability boundary for trouve."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+base64 = "0.22"
+fontdb.workspace = true
+fs4.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+utoipa.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

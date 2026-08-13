@@ -1,0 +1,120 @@
+name: Web frontend qualification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * 2"
+  push:
+    branches: [main]
+    paths:
+      - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-client-core/**"
+      - "crates/trouve-desktop-host/**"
+      - "crates/trouve-protocol/**"
+      - "Cargo.toml"
+      - "scripts/generate_rust_third_party_notices.py"
+      - "scripts/sync_versions.py"
+      - "web/app-ui/**"
+      - ".github/workflows/web-frontend-qualification.yml"
+  pull_request:
+    paths:
+      - "crates/trouve-servo-embed-preview/**"
+      - "crates/trouve-client-core/**"
+      - "crates/trouve-desktop-host/**"
+      - "crates/trouve-protocol/**"
+      - "Cargo.toml"
+      - "scripts/generate_rust_third_party_notices.py"
+      - "scripts/sync_versions.py"
+      - "web/app-ui/**"
+      - ".github/workflows/web-frontend-qualification.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-frontend-qualification-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  servo-nested-workspace:
+    name: Servo nested-workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Keep this list aligned with the Debian-like dependencies published in
+      # the Servo Book. The qualification harness links Servo directly even
+      # though these CI tests do not open a native window.
+      - name: Install Servo build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          build-essential ca-certificates ccache clang cmake curl g++ git gperf
+          gstreamer1.0-libav gstreamer1.0-plugins-bad
+          gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+          gstreamer1.0-plugins-ugly gstreamer1.0-tools libclang-dev
+          libdbus-1-dev libegl1-mesa-dev libfreetype6-dev libges-1.0-dev
+          libgl1-mesa-dri libgles2-mesa-dev libglib2.0-dev
+          libgstreamer-plugins-bad1.0-dev
+          libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev
+          libgstrtspserver-1.0-dev libharfbuzz-dev liblzma-dev libudev-dev
+          libunwind-dev libvulkan1 libx11-dev libxcb-render0-dev
+          libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          libxkbcommon-x11-0 libxkbcommon-x11-dev libxkbcommon0 libxmu-dev
+          libxmu6 llvm-dev m4 pkg-config xorg-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: crates/trouve-servo-embed-preview -> target
+          cache-on-failure: true
+      - name: Verify isolated dependency graph
+        run: >-
+          cargo metadata
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --format-version 1 > /dev/null
+      - name: Verify Servo dependency licenses and notices
+        run: >-
+          python3 scripts/generate_rust_third_party_notices.py
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --notice crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md
+          --check --sbom target/servo-rust-sbom.cdx.json
+      - name: Install dependency security auditor
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
+        with:
+          tool: cargo-audit
+      - name: Audit isolated Servo lockfile
+        # This disposable qualification harness follows Servo's pinned source
+        # graph. These advisories are currently unavoidable in that upstream
+        # graph; keep each exception explicit so every new advisory still
+        # fails the build and Servo upgrades can remove waivers deliberately.
+        run: >-
+          cargo audit
+          --file crates/trouve-servo-embed-preview/Cargo.lock
+          --deny warnings
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2025-0075
+          --ignore RUSTSEC-2025-0080
+          --ignore RUSTSEC-2025-0081
+          --ignore RUSTSEC-2025-0098
+          --ignore RUSTSEC-2025-0100
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2026-0173
+          --ignore RUSTSEC-2026-0192
+      - name: Format isolated Servo workspace
+        run: >-
+          cargo fmt --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --all -- --check
+      - name: Lint isolated Servo workspace
+        run: >-
+          cargo clippy
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --all-targets -- -D warnings
+      - name: Compile and run Servo harness tests
+        run: >-
+          cargo test
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked

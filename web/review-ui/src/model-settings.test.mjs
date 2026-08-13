@@ -65,5 +65,6 @@ test("fixed thinking budgets follow advertised numeric bounds", () => {
 
 test("thinking labels make provider tokens readable", () => {
   assert.equal(thinkingLevelLabel("xhigh"), "Extra High");
+  assert.equal(thinkingLevelLabel("ultra"), "Ultra");
   assert.equal(thinkingLevelLabel("vendor-special"), "vendor-special");
 });

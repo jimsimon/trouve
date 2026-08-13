@@ -25,7 +25,6 @@ import {
   loginStatus,
   openJobEvents,
   openServerEvents,
-  refreshReviews,
   requestReview,
   resetMode,
   retryJob,
@@ -101,6 +100,9 @@ Chart.register(...registerables);
 type Section = "overview" | "jobs" | "repositories" | "reviewers" | "stats" | "settings";
 
 const SERVER_EVENT_REFRESH_DEBOUNCE_MS = 100;
+const AUTOMATIC_RETRY_MS = 5_000;
+const DASHBOARD_FALLBACK_REFRESH_MS = 30_000;
+const CLI_IDLE_REFRESH_MS = 5 * 60_000;
 
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: "overview", label: "Overview", icon: "◫" },
@@ -252,10 +254,10 @@ function useClock(active: boolean): number {
 
 function useFlash(): [string, (message: string) => void] {
   const [message, setMessage] = useState("");
-  const flash = (next: string): void => {
+  const flash = useCallback((next: string): void => {
     setMessage(next);
     window.setTimeout(() => setMessage(""), 2_500);
-  };
+  }, []);
   return [message, flash];
 }
 
@@ -330,6 +332,7 @@ function App() {
     promise: Promise<void> | null;
     reloadRequested: boolean;
   }>({ promise: null, reloadRequested: false });
+  const configurationLoadRef = useRef<Promise<void> | null>(null);
 
   const loadDashboard = useCallback((quiet = false): Promise<void> => {
     const state = dashboardLoadRef.current;
@@ -366,18 +369,26 @@ function App() {
     return request;
   }, []);
 
-  const loadConfiguration = async (): Promise<void> => {
-    const results = await Promise.allSettled([
-      getProviders().then(setProviders),
-      getReviewSettings().then(setReviewSettings),
-      getModels().then(setModels),
-      getModeInfos().then(setModeInfos),
-    ]);
-    const errors = results
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map(({ reason }) => (reason instanceof Error ? reason.message : String(reason)));
-    setConfigurationError(errors.join("; "));
-  };
+  const loadConfiguration = useCallback((): Promise<void> => {
+    if (configurationLoadRef.current) return configurationLoadRef.current;
+    const request = (async (): Promise<void> => {
+      const results = await Promise.allSettled([
+        getProviders().then(setProviders),
+        getReviewSettings().then(setReviewSettings),
+        getModels().then(setModels),
+        getModeInfos().then(setModeInfos),
+      ]);
+      const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map(({ reason }) => (reason instanceof Error ? reason.message : String(reason)));
+      setConfigurationError(errors.join("; "));
+    })();
+    configurationLoadRef.current = request;
+    void request.finally(() => {
+      if (configurationLoadRef.current === request) configurationLoadRef.current = null;
+    });
+    return request;
+  }, []);
 
   useEffect(() => {
     const onHash = (): void => setRoute(routeFromHash());
@@ -393,7 +404,30 @@ function App() {
     route.section === "settings";
   useEffect(() => {
     if (needsConfiguration) void loadConfiguration();
-  }, [needsConfiguration]);
+  }, [needsConfiguration, loadConfiguration]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadDashboard(true);
+    }, DASHBOARD_FALLBACK_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!dashboardError) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadDashboard(true);
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [dashboardError, loadDashboard]);
+
+  useEffect(() => {
+    if (!needsConfiguration || !configurationError) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadConfiguration();
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [configurationError, loadConfiguration, needsConfiguration]);
 
   useEffect(() => {
     if (serverEventAfter === null) return;
@@ -416,9 +450,7 @@ function App() {
   const error = dashboardError || (needsConfiguration ? configurationError : "");
   const content = dashboard ? (
     <>
-      {route.section === "overview" && (
-        <Overview dashboard={dashboard} onRefresh={() => void loadDashboard(true)} />
-      )}
+      {route.section === "overview" && <Overview dashboard={dashboard} />}
       {route.section === "jobs" && (
         <JobsPage
           dashboard={dashboard}
@@ -497,15 +529,7 @@ function App() {
         {error && (
           <div class="banner error" role="alert">
             {error}
-            <button
-              type="button"
-              onClick={() => {
-                void loadDashboard();
-                if (needsConfiguration) void loadConfiguration();
-              }}
-            >
-              Retry
-            </button>
+            <span>Retrying automatically.</span>
           </div>
         )}
         {loading && !dashboard ? <div class="loading">Loading review operations…</div> : content}
@@ -514,13 +538,7 @@ function App() {
   );
 }
 
-function Overview({
-  dashboard,
-  onRefresh,
-}: {
-  dashboard: Dashboard;
-  onRefresh: () => void;
-}) {
+function Overview({ dashboard }: { dashboard: Dashboard }) {
   const counts = dashboard.jobs.reduce<Record<string, number>>((result, job) => {
     result[job.status] = (result[job.status] ?? 0) + 1;
     return result;
@@ -536,18 +554,6 @@ function Overview({
         eyebrow="Operations"
         title="Review overview"
         description="Live review activity, queue health, and recent outcomes."
-        action={
-          <button
-            class="ghost"
-            type="button"
-            onClick={async () => {
-              await refreshReviews();
-              onRefresh();
-            }}
-          >
-            Reconcile now
-          </button>
-        }
       />
       <div class="metric-grid">
         {[
@@ -1077,6 +1083,15 @@ function JobDetailPane({
     if (!selectedTaskId || taskDetails[selectedTaskId] || taskErrors[selectedTaskId]) return;
     void loadTask(selectedTaskId);
   }, [selectedTaskId, taskDetails, taskErrors, loadTask]);
+
+  const selectedTaskError = selectedTaskId ? taskErrors[selectedTaskId] : undefined;
+  useEffect(() => {
+    if (!selectedTaskId || !selectedTaskError) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadTask(selectedTaskId);
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [loadTask, selectedTaskError, selectedTaskId]);
 
   useEffect(() => {
     setTaskDetails((current) => {
@@ -1680,9 +1695,7 @@ function JobDetailPane({
                 {taskErrors[selectedTask.id] && (
                   <div class="banner error">
                     {taskErrors[selectedTask.id]}
-                    <button type="button" onClick={() => void loadTask(selectedTask.id)}>
-                      Retry
-                    </button>
+                    <span>Retrying automatically.</span>
                   </div>
                 )}
                 <OutputBlock
@@ -3187,7 +3200,7 @@ function ProviderSettings({
     () => setDefaultThinking(providers?.default_thinking_level ?? ""),
     [providers?.default_thinking_level],
   );
-  const loadCliData = async (): Promise<void> => {
+  const loadCliData = useCallback(async (): Promise<boolean> => {
     try {
       const [nextKnown, nextClis] = await Promise.all([getKnownProviders(), getClis()]);
       setKnownProviders(nextKnown);
@@ -3202,13 +3215,35 @@ function ProviderSettings({
         }),
       );
       setCliStatuses(Object.fromEntries(statusEntries));
+      return true;
     } catch (cause) {
-      flash(cause instanceof Error ? cause.message : String(cause));
+      const message = cause instanceof Error ? cause.message : String(cause);
+      flash(`${message} Retrying automatically.`);
+      return false;
     }
-  };
+  }, [flash]);
   useEffect(() => {
-    void loadCliData();
-  }, []);
+    let disposed = false;
+    let timer: number | undefined;
+    const refresh = async (): Promise<void> => {
+      if (document.visibilityState !== "visible") {
+        timer = window.setTimeout(() => void refresh(), AUTOMATIC_RETRY_MS);
+        return;
+      }
+      const loaded = await loadCliData();
+      if (!disposed) {
+        timer = window.setTimeout(
+          () => void refresh(),
+          loaded ? CLI_IDLE_REFRESH_MS : AUTOMATIC_RETRY_MS,
+        );
+      }
+    };
+    void refresh();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loadCliData]);
   const cliInstalling = Object.values(cliStatuses).some(
     (status) => status.status === "pending",
   );
@@ -3569,11 +3604,8 @@ function ProviderSettings({
         <header>
           <div>
             <h3>Subscription CLI binaries</h3>
-            <p class="muted">Managed versions take precedence over system copies on PATH.</p>
+            <p class="muted">Managed versions take precedence over system copies on PATH. Status updates automatically.</p>
           </div>
-          <button class="ghost compact" type="button" onClick={() => void loadCliData()}>
-            Refresh
-          </button>
         </header>
         <div class="cli-list">
           {clis.map((cli) => {

@@ -94,7 +94,7 @@ pub struct ServerInfo {
     pub online: bool,
 }
 
-// --- Git & Worktrees settings -------------------------------------------
+// --- session naming settings --------------------------------------------
 
 /// When the dedicated session-title model should occupy memory.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -149,24 +149,31 @@ pub struct TitleModelStatus {
     pub install_total: u64,
 }
 
-/// Global settings shown under Settings → Git & Worktrees.
+/// Global session-naming settings shown under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GitWorktreeSettings {
+    /// Whether new session branches include a slug derived from the session
+    /// title. False uses the compact `trouve/<short-id>` form.
+    #[serde(default)]
+    pub derive_branch_name_from_session_title: bool,
     pub title_model_load_behavior: TitleModelLoadBehavior,
     #[serde(default)]
     pub title_model_resource_policy: TitleModelResourcePolicy,
     pub title_model: TitleModelStatus,
 }
 
-/// Update Settings → Git & Worktrees.
+/// Update the Session Naming section under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetGitWorktreeSettingsRequest {
+    /// Omitted by older clients to preserve the current branch-naming mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive_branch_name_from_session_title: Option<bool>,
     pub title_model_load_behavior: TitleModelLoadBehavior,
     #[serde(default)]
     pub title_model_resource_policy: TitleModelResourcePolicy,
 }
 
-/// Ask the server to derive the title used to create a session and branch.
+/// Ask the server to derive a concise title for a new session.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GenerateSessionTitleRequest {
     pub prompt: String,
@@ -201,7 +208,8 @@ pub struct Workspace {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
     pub workspace_id: WorkspaceId,
-    /// Human-readable title; also used to derive the branch slug.
+    /// Human-readable title. When title-derived branch naming is enabled,
+    /// this is also used to derive the branch slug.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Base ref the session branch is created from (default: workspace HEAD).
@@ -223,7 +231,8 @@ pub struct Session {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
-    /// Branch dedicated to this session (`trouve/<slug>`).
+    /// Branch dedicated to this session. New sessions default to
+    /// `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
     pub branch: String,
     /// Absolute path of the session worktree.
     pub worktree_path: String,
@@ -237,6 +246,14 @@ pub struct Session {
     #[serde(default)]
     pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A new session and its initial thread, both created from an existing
+/// turn checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ForkCheckpointResponse {
+    pub session: Session,
+    pub thread: Thread,
 }
 
 /// Partial session update (rename / archive). Omitted fields are unchanged.
@@ -253,6 +270,9 @@ pub struct UpdateSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateThreadRequest {
     pub session_id: SessionId,
+    /// Concise user-visible title for navigation surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Agent mode id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -276,6 +296,18 @@ pub enum TodoStatus {
     Cancelled,
 }
 
+/// One user-visible transition in a todo's lifecycle. `Skipped` is derived
+/// when an unfinished todo disappears from a replacement snapshot; it is not
+/// a current-list status because skipped items are no longer in that list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadTodoState {
+    Started,
+    Completed,
+    Cancelled,
+    Skipped,
+}
+
 /// One stable item in a thread's current todo list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TodoItem {
@@ -288,6 +320,15 @@ pub struct TodoItem {
 pub struct Thread {
     pub id: ThreadId,
     pub session_id: SessionId,
+    /// Direct parent when this thread was spawned by another thread. The
+    /// relation is optional so user-created threads and older servers remain
+    /// compatible; clients can use it to render nested collaborator trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<ThreadId>,
+    /// Concise user-visible title. Older threads may not have one; clients
+    /// fall back to the session title or mode/model metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub mode: String,
     pub model: String,
     /// Current values for the model's options (thinking level, etc.);
@@ -316,6 +357,23 @@ pub enum ThreadViewItem {
         content: String,
         attachments: Vec<Attachment>,
     },
+    Steered {
+        turn: u64,
+        content: String,
+        attachments: Vec<Attachment>,
+    },
+    /// A separately navigable child agent transcript spawned from this parent
+    /// turn. Children in read-only modes are transcript-only; other child
+    /// threads can accept follow-up prompts after their initial turn.
+    Subagent {
+        turn: u64,
+        thread_id: ThreadId,
+        session_id: SessionId,
+        prompt: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
+    },
     Assistant {
         turn: u64,
         content: String,
@@ -326,13 +384,38 @@ pub enum ThreadViewItem {
         content: String,
         complete: bool,
     },
+    /// A context-window compaction boundary in the transcript. Unlike a
+    /// tool call, this is engine lifecycle state and remains visible after
+    /// completion so clients can show where earlier context was summarized.
+    Compaction {
+        turn: u64,
+        state: ThreadCompactionState,
+    },
+    /// A durable todo lifecycle boundary derived from successive
+    /// `thread.todos_updated` snapshots while a turn is running.
+    TodoUpdate {
+        turn: u64,
+        todo_id: String,
+        content: String,
+        state: ThreadTodoState,
+    },
     ToolCall {
         call_id: String,
         tool: String,
         args: serde_json::Value,
+        /// Completed historical rows may contain only bounded presentation
+        /// arguments. Fetch `/v1/threads/{thread}/tools/{call_id}` before
+        /// rendering expanded/raw detail when this flag is true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        details_deferred: bool,
         status: ThreadToolStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<serde_json::Value>,
+        /// Executor-only duration when the completion event carries a
+        /// monotonic measurement; otherwise the compatible fallback derived
+        /// from durable tool event timestamps.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnStatus {
         turn: u64,
@@ -352,6 +435,16 @@ pub enum ThreadViewItem {
     },
 }
 
+/// Full arguments and terminal result for one materialized historical tool
+/// call. Live-tail tool calls continue to carry these fields inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ThreadToolDetails {
+    pub call_id: String,
+    pub args: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadToolStatus {
@@ -366,9 +459,32 @@ pub enum ThreadToolStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ThreadTurnState {
+    /// The durable turn shell exists, but shared/provider scheduler capacity
+    /// has not yet been acquired.
+    WaitingForCapacity,
     Running,
-    Completed { usage: crate::Usage },
-    Failed { error: String },
+    Completed {
+        usage: crate::Usage,
+        /// Checkpoint created after this turn. Older retained snapshots may
+        /// omit it, in which case checkpoint actions are unavailable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<crate::CheckpointId>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadCompactionState {
+    Running,
+    Completed {
+        messages_compacted: u64,
+    },
+    /// A started compaction did not report completion before normal turn
+    /// output or a terminal turn event arrived.
+    Failed,
 }
 
 /// Folded current thread state and one transcript item page at the cursor
@@ -401,6 +517,12 @@ pub struct ThreadViewSnapshot {
     #[serde(default)]
     pub turn_models: std::collections::BTreeMap<u64, String>,
     #[serde(default)]
+    pub turn_thinking_levels: std::collections::BTreeMap<u64, String>,
+    /// Per-turn native steering capability. False/absent is authoritative;
+    /// clients must not infer capability from provider or model names.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub turn_steerable: std::collections::BTreeMap<u64, bool>,
+    #[serde(default)]
     pub turn_started_at: std::collections::BTreeMap<u64, chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub turn_duration_ms: std::collections::BTreeMap<u64, u64>,
@@ -418,9 +540,14 @@ pub struct ThreadViewQuery {
     /// newest page.
     #[serde(default)]
     pub before: Option<u64>,
-    /// Requested item count; the server applies a safe upper bound.
+    /// Maximum item count; the server applies a safe upper bound.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Expand the page backward to the beginning of its oldest turn. This can
+    /// return more than `limit` items, but prevents a paged turn from changing
+    /// shape when its preceding history is loaded.
+    #[serde(default)]
+    pub turn_aligned: Option<bool>,
 }
 
 /// Partial thread update between turns (mode/model switching). Rejected with
@@ -448,6 +575,24 @@ pub struct SendMessageRequest {
     /// then on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentUpload>,
+}
+
+/// Add user guidance to the turn currently running on a thread. The backend
+/// must advertise steering support for that exact turn.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SteerTurnRequest {
+    pub content: String,
+    /// Steering accepts the same attachment inputs as an ordinary prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
+}
+
+/// A steering message accepted by the active vendor turn. Durable display
+/// state follows as `turn.steered` on the thread event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SteerAccepted {
+    pub thread_id: ThreadId,
+    pub turn: u64,
 }
 
 /// One file uploaded with a prompt.
@@ -483,6 +628,11 @@ pub struct TurnAccepted {
     pub turn: u64,
     #[serde(default)]
     pub queued: bool,
+    /// The newly accepted durable queue row when this prompt remains queued.
+    /// Clients can use its stable id immediately instead of waiting for the
+    /// matching `thread.queue_updated` event before enabling queue mutations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_prompt: Option<QueuedPrompt>,
 }
 
 // --- queued prompts --------------------------------------------------------
@@ -504,6 +654,14 @@ pub struct QueuedPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateQueuedPromptRequest {
     pub content: String,
+    /// Existing queued attachment ids to keep, in display order. Omit this
+    /// field to preserve every existing attachment (the behavior of clients
+    /// predating protocol 2.14); send an empty list to remove all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_attachment_ids: Option<Vec<String>>,
+    /// New files to append after the retained attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
 }
 
 /// Full desired order for a thread's queue (every queued prompt id, first
@@ -517,6 +675,8 @@ pub struct ReorderQueueRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveApprovalRequest {
+    /// Owning thread for this vendor-local call id.
+    pub thread_id: ThreadId,
     pub call_id: CallId,
     pub decision: ApprovalDecision,
 }
@@ -527,6 +687,8 @@ pub struct ResolveApprovalRequest {
 /// questions (the agent is told the user declined to answer).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveQuestionRequest {
+    /// Owning thread for this vendor-local request id.
+    pub thread_id: ThreadId,
     pub request_id: CallId,
     #[serde(default)]
     pub answers: Option<Vec<crate::QuestionAnswer>>,
@@ -537,6 +699,31 @@ pub struct ResolveQuestionRequest {
 /// The session's unified diff against its base ref.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionDiff {
+    pub diff: String,
+}
+
+/// Bounded metadata for one path changed against a session's base ref.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionDiffFileSummary {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
+}
+
+/// Lightweight changed-file manifest for a session. File patch content is
+/// intentionally excluded and loaded only after the user selects a path.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionDiffSummary {
+    pub files: Vec<SessionDiffFileSummary>,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// A bounded unified patch for exactly one selected session-relative path.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionFileDiff {
+    pub path: String,
     pub diff: String,
 }
 
@@ -576,6 +763,15 @@ pub struct TerminalInfo {
     pub exited: bool,
 }
 
+/// Absolute byte offset at which a terminal output subscription begins.
+///
+/// Sent as JSON in the named, id-less `replay-start` SSE event before any
+/// replayed or live base64 output chunks.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TerminalReplayStart {
+    pub offset: u64,
+}
+
 /// Keyboard/paste bytes for the PTY, base64-encoded.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TerminalInputRequest {
@@ -598,6 +794,13 @@ pub struct CheckRun {
     /// success / failure / … (None while running)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
+    /// GitHub page for the check run, when the provider exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -689,6 +892,45 @@ pub struct GithubPrList {
     pub prs: Vec<PrInfo>,
 }
 
+/// Controls an account-level GitHub pull-request refresh.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct RefreshGithubPrsQuery {
+    /// Bypass the server freshness window for an explicit user action. A
+    /// concurrent refresh that completed after this request began is still
+    /// reused rather than immediately repeated.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Latest persisted account-level PR replacement for one GitHub host.
+/// The event cursor and timestamp let clients order this bootstrap state
+/// against newer SSE events without replaying the retained server history.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GithubPrHostProjection {
+    pub cursor: u64,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    pub pull_requests: GithubPrList,
+}
+
+/// Pull requests already associated with one session using durable branch or
+/// `session.pr_opened` evidence. This is a local projection of the persisted
+/// account snapshots and never performs a GitHub request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionPrProjection {
+    pub session_id: SessionId,
+    pub prs: Vec<PrInfo>,
+}
+
+/// Durable server-owned state that is not part of the session-summary
+/// snapshot. Clients fetch this once during bootstrap and can then resume the
+/// server event stream at the session-summary cursor instead of cursor zero.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ServerProjection {
+    pub github_pull_requests: Vec<GithubPrHostProjection>,
+    pub session_pull_requests: Vec<SessionPrProjection>,
+    pub git_worktree_settings: GitWorktreeSettings,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreatePrRequest {
     pub title: String,
@@ -706,6 +948,500 @@ pub struct MergePrRequest {
     /// merge / squash / rebase (default: merge)
     #[serde(default)]
     pub method: Option<String>,
+}
+
+/// A GitHub account, bot, or team shown in pull-request collaboration UI.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrActor {
+    /// GraphQL node id. It is opaque to clients and only sent back in typed
+    /// pull-request actions.
+    pub id: String,
+    /// User/bot login or team slug.
+    pub login: String,
+    /// Human-readable name when GitHub exposes one.
+    #[serde(default)]
+    pub name: String,
+    /// user / bot / team / mannequin / unknown
+    pub kind: String,
+    #[serde(default)]
+    pub avatar_url: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrLabel {
+    pub id: String,
+    pub name: String,
+    /// Six-digit GitHub label color without a leading `#`.
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMilestone {
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReactionSummary {
+    /// GitHub reaction content (`THUMBS_UP`, `HEART`, ...).
+    pub content: String,
+    pub count: u64,
+    #[serde(default)]
+    pub viewer_has_reacted: bool,
+}
+
+/// A top-level PR conversation comment or one comment in a review thread.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrComment {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<u64>,
+    pub body: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_can_delete: bool,
+    #[serde(default)]
+    pub viewer_did_author: bool,
+    #[serde(default)]
+    pub reactions: Vec<PrReactionSummary>,
+    /// Review-comment-only context.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub diff_hunk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReviewDetail {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub state: String,
+    #[serde(default)]
+    pub body: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub commit_oid: String,
+    #[serde(default)]
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_can_delete: bool,
+    #[serde(default)]
+    pub viewer_did_author: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrReviewThread {
+    pub id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default)]
+    pub diff_side: String,
+    #[serde(default)]
+    pub is_outdated: bool,
+    #[serde(default)]
+    pub is_resolved: bool,
+    #[serde(default)]
+    pub viewer_can_reply: bool,
+    #[serde(default)]
+    pub viewer_can_resolve: bool,
+    #[serde(default)]
+    pub viewer_can_unresolve: bool,
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrCommit {
+    pub oid: String,
+    pub abbreviated_oid: String,
+    pub message_headline: String,
+    #[serde(default)]
+    pub message_body: String,
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PrActor>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub change_type: String,
+    #[serde(default)]
+    pub viewer_viewed_state: String,
+}
+
+/// Lazily fetched before/after content for one file in a selected pull
+/// request. Large and binary blobs retain their metadata without crossing the
+/// protocol as unbounded text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrFileDiff {
+    pub path: String,
+    pub change_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_bytes: Option<u64>,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMergeQueueEntry {
+    pub id: String,
+    pub position: u64,
+    pub state: String,
+    pub enqueued_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_time_to_merge: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrMergeQueueStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<PrMergeQueueEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrAutoMerge {
+    pub method: String,
+    pub enabled_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_by: Option<PrActor>,
+    #[serde(default)]
+    pub commit_title: String,
+    #[serde(default)]
+    pub commit_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrStackEntry {
+    pub position: u64,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub base: String,
+    pub head: String,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub merge_state_status: String,
+}
+
+/// GitHub's native pull-request stack, when the host supports the current
+/// GraphQL stack fields and this PR belongs to one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrStack {
+    pub id: String,
+    pub number: u64,
+    pub size: u64,
+    pub base: String,
+    #[serde(default)]
+    pub entries: Vec<PrStackEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrCapabilities {
+    #[serde(default)]
+    pub can_update: bool,
+    #[serde(default)]
+    pub can_close: bool,
+    #[serde(default)]
+    pub can_reopen: bool,
+    #[serde(default)]
+    pub can_assign: bool,
+    #[serde(default)]
+    pub can_label: bool,
+    #[serde(default)]
+    pub can_merge_as_admin: bool,
+    #[serde(default)]
+    pub can_update_branch: bool,
+    #[serde(default)]
+    pub can_enable_auto_merge: bool,
+    #[serde(default)]
+    pub can_disable_auto_merge: bool,
+    #[serde(default)]
+    pub did_author: bool,
+}
+
+/// Full collaboration state for one selected PR. Account/session summary
+/// projections remain compact; this is fetched lazily by the PR pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrDetailSection {
+    /// PR metadata, capabilities, checks, and sidebar choices.
+    Overview,
+    /// Description, issue comments, reviews, and review threads.
+    Conversation,
+    /// Commit history.
+    Commits,
+    /// Changed-file metadata. Individual file content remains separately lazy.
+    Files,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrDetail {
+    pub info: PrInfo,
+    /// Immutable base commit used with `info.head_sha` to load known files
+    /// without re-listing the pull request's changed-file connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// Pull-request GraphQL node id used by typed server-side mutations.
+    pub id: String,
+    pub viewer: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub reactions: Vec<PrReactionSummary>,
+    /// subscribed / unsubscribed / ignored
+    #[serde(default)]
+    pub viewer_subscription: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    pub commit_count: u64,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub active_lock_reason: String,
+    #[serde(default)]
+    pub maintainer_can_modify: bool,
+    pub capabilities: PrCapabilities,
+    /// Merge methods enabled by repository settings (`merge`, `squash`,
+    /// `rebase`).
+    #[serde(default)]
+    pub merge_methods: Vec<String>,
+    #[serde(default)]
+    pub default_merge_method: String,
+    #[serde(default)]
+    pub auto_merge_allowed: bool,
+    #[serde(default)]
+    pub labels: Vec<PrLabel>,
+    #[serde(default)]
+    pub available_labels: Vec<PrLabel>,
+    #[serde(default)]
+    pub assignees: Vec<PrActor>,
+    #[serde(default)]
+    pub assignable_users: Vec<PrActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<PrMilestone>,
+    #[serde(default)]
+    pub available_milestones: Vec<PrMilestone>,
+    #[serde(default)]
+    pub review_requests: Vec<PrActor>,
+    #[serde(default)]
+    pub reviews: Vec<PrReviewDetail>,
+    #[serde(default)]
+    pub comments: Vec<PrComment>,
+    #[serde(default)]
+    pub review_threads: Vec<PrReviewThread>,
+    #[serde(default)]
+    pub commits: Vec<PrCommit>,
+    #[serde(default)]
+    pub files: Vec<PrFile>,
+    pub merge_queue: PrMergeQueueStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<PrAutoMerge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<PrStack>,
+    /// True only when a safety cap prevented an unbounded GitHub connection
+    /// from being returned in full.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCommentKind {
+    Issue,
+    Review,
+}
+
+/// Typed PR-page actions. The server resolves every opaque target against the
+/// selected session PR before contacting GitHub; OAuth tokens and arbitrary
+/// GitHub API access never cross into the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PrActionRequest {
+    Update {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maintainer_can_modify: Option<bool>,
+    },
+    SetState {
+        /// draft / ready / close / reopen
+        state: String,
+    },
+    RequestReviewers {
+        #[serde(default)]
+        users: Vec<String>,
+        #[serde(default)]
+        bots: Vec<String>,
+        #[serde(default)]
+        teams: Vec<String>,
+        /// Replace the current request set instead of adding to it.
+        #[serde(default)]
+        replace: bool,
+    },
+    SubmitReview {
+        /// approve / request_changes / comment
+        event: String,
+        #[serde(default)]
+        body: String,
+    },
+    UpdateReview {
+        id: String,
+        body: String,
+    },
+    DeleteReview {
+        id: String,
+    },
+    DismissReview {
+        id: String,
+        message: String,
+    },
+    AddComment {
+        body: String,
+    },
+    UpdateComment {
+        id: String,
+        kind: PrCommentKind,
+        body: String,
+    },
+    DeleteComment {
+        id: String,
+        kind: PrCommentKind,
+    },
+    ReplyReviewThread {
+        thread_id: String,
+        body: String,
+    },
+    ResolveReviewThread {
+        thread_id: String,
+        resolved: bool,
+    },
+    AddReviewThread {
+        body: String,
+        path: String,
+        line: u64,
+        /// left / right
+        side: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_side: Option<String>,
+    },
+    SetFileViewed {
+        path: String,
+        viewed: bool,
+    },
+    UpdateBranch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    Merge {
+        /// merge / squash / rebase
+        method: String,
+        #[serde(default)]
+        commit_title: String,
+        #[serde(default)]
+        commit_message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    SetAutoMerge {
+        enabled: bool,
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        commit_title: String,
+        #[serde(default)]
+        commit_message: String,
+    },
+    SetMergeQueue {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_head_sha: Option<String>,
+    },
+    SetLabels {
+        #[serde(default)]
+        label_ids: Vec<String>,
+    },
+    SetAssignees {
+        #[serde(default)]
+        assignee_ids: Vec<String>,
+    },
+    SetMilestone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        milestone_id: Option<String>,
+    },
+    SetLock {
+        locked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SetSubscription {
+        /// subscribed / unsubscribed / ignored
+        state: String,
+    },
+    AddReaction {
+        subject_id: String,
+        content: String,
+    },
+    RemoveReaction {
+        subject_id: String,
+        content: String,
+    },
 }
 
 // --- subscription health -----------------------------------------------------
@@ -759,8 +1495,13 @@ pub struct McpServerInfo {
     /// Values may be `${VAR}` references resolved at spawn time.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Whether this definition participates in the effective MCP config.
+    /// Older servers omit the field, which clients interpret as enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// "ok" / "error" / "unknown" (unknown when listing skipped the probe) /
-    /// "untrusted" (a repo-scoped server that is never auto-run).
+    /// "untrusted" (a repo-scoped server that is never auto-run) /
+    /// "disabled" (this definition is persistently disabled).
     pub health: String,
     /// "5 tools" when healthy, the failure reason when not, "" for unknown.
     pub detail: String,
@@ -778,6 +1519,21 @@ pub struct UpsertMcpServerRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Preserve a disabled definition while editing or importing it. Omitted
+    /// requests retain the historical behavior of creating an enabled server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Persistently enable or disable an existing user-managed MCP definition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetMcpServerEnabledRequest {
+    /// "user" or "workspace".
+    pub scope: String,
+    /// Required for workspace scope: whose `.agents/.mcp.json` to edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub enabled: bool,
 }
 
 /// Recent stderr and lifecycle lines for one MCP server.
@@ -2038,6 +2794,11 @@ pub struct Automation {
     /// Model for the runs (None = the mode's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Thinking level for the runs (None = the selected model/mode/global
+    /// default). The engine maps this canonical value to the model's
+    /// advertised option key when the turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// Permission policy applied only to sessions created by this automation.
     /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
     #[serde(default)]
@@ -2070,6 +2831,10 @@ pub struct UpsertAutomationRequest {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Thinking level for each fresh automation thread. Omitted by older
+    /// clients preserves normal model/mode/global inheritance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     /// Permission policy for each fresh automation session. Omitted by older
     /// clients means Ask.
     #[serde(default)]
@@ -2175,6 +2940,18 @@ mod tests {
             request.title_model_resource_policy,
             TitleModelResourcePolicy::CpuRamOnly
         );
+        assert_eq!(request.derive_branch_name_from_session_title, None);
+
+        let historical: GitWorktreeSettings = serde_json::from_value(serde_json::json!({
+            "title_model_load_behavior": "auto",
+            "title_model": {
+                "state": "not_installed",
+                "runtime_installed": false,
+                "model_downloaded": false
+            }
+        }))
+        .unwrap();
+        assert!(!historical.derive_branch_name_from_session_title);
     }
 
     #[test]

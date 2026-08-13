@@ -1,6 +1,6 @@
 # Bounded thread-view pages
 
-Status: Accepted (2026-08)
+Status: Superseded by 0033
 
 ## Context
 

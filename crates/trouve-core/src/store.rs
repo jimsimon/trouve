@@ -15,14 +15,34 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{
-    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, ThreadViewSnapshot,
-    Workspace,
+    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
+    SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
+    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
 };
-use trouve_thread_view::ThreadProjection;
+use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Version 2 retains server-measured per-tool execution durations. Treat the
+// projection as a rebuildable cache so existing databases are upgraded by
+// folding their durable event history again, without a storage migration.
+// v3 retains the checkpoint id on completed folded turns so cached histories
+// expose exact restore/fork actions after an upgrade.
+// v4 stores completed folded rows independently and keeps only the live tail
+// in the serialized projection cache.
+// v5 adds durable TODO lifecycle rows. v6 keeps explicitly bounded provider
+// thinking intact when tool lifecycle events interleave with its deltas. v7
+// applies the same explicit-boundary rule when steering interleaves with them.
+// v8 retains hidden turn boundaries after cancellation removes the visible
+// status row, keeping turn-aligned pages bounded across cancelled histories.
+// v9 terminalizes unmatched provider control-plane tool rows when their turn
+// ends, so interrupted collaboration waits cannot replay as active forever.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 9;
+// A snapshot folds events without holding the SQLite connection. A terminal
+// event can therefore advance the materialized cache before the snapshot
+// reacquires the connection. Rebuild from that newer cache instead of mixing
+// the stale in-memory projection with newer materialized rows.
+const THREAD_VIEW_CACHE_RACE_RETRIES: usize = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -45,6 +65,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id),
+  title TEXT,
   mode TEXT NOT NULL,
   model TEXT NOT NULL,
   permission_mode TEXT NOT NULL,
@@ -109,6 +130,24 @@ CREATE TABLE IF NOT EXISTS attachments (
   path TEXT NOT NULL,         -- stored file, absolute
   created_at TEXT NOT NULL
 );
+-- Durable intents for artifact deletion. These rows deliberately have no
+-- foreign keys: session/attachment metadata is removed in the same
+-- transaction, while the cleanup intent must survive until the executor
+-- confirms the filesystem work.
+CREATE TABLE IF NOT EXISTS artifact_cleanup_jobs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  session_id TEXT,
+  worktree_path TEXT,
+  repository_path TEXT,
+  attachment_paths TEXT NOT NULL DEFAULT '[]',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  next_attempt_at TEXT,
+  claim_until TEXT,
+  claim_token TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
   scope_kind TEXT NOT NULL,
@@ -123,6 +162,52 @@ CREATE TABLE IF NOT EXISTS thread_view_cache (
   schema_version INTEGER NOT NULL,
   state TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS thread_view_items (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  item_index INTEGER NOT NULL,
+  item TEXT NOT NULL,
+  turn_start INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (thread_id, item_index)
+);
+CREATE TABLE IF NOT EXISTS thread_tool_details (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  call_id TEXT NOT NULL,
+  args TEXT NOT NULL,
+  result TEXT,
+  PRIMARY KEY (thread_id, call_id)
+);
+CREATE TABLE IF NOT EXISTS thread_statuses (
+  thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  active INTEGER NOT NULL DEFAULT 0,
+  attention TEXT NOT NULL DEFAULT 'none',
+  last_outcome TEXT NOT NULL DEFAULT 'idle',
+  latest_cursor INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS thread_statuses_session ON thread_statuses (session_id);
+CREATE TABLE IF NOT EXISTS session_summaries (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 0,
+  last_outcome TEXT NOT NULL DEFAULT 'idle',
+  latest_thread_id TEXT,
+  latest_cursor INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS session_summaries_workspace
+  ON session_summaries (workspace_id, archived, updated_at, session_id);
+CREATE TABLE IF NOT EXISTS session_summary_attention (
+  kind TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  thread_id TEXT NOT NULL,
+  PRIMARY KEY (kind, item_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS session_summary_attention_session
+  ON session_summary_attention (session_id, kind);
 CREATE TABLE IF NOT EXISTS spawned_threads (
   child_thread_id TEXT PRIMARY KEY REFERENCES threads(id),
   parent_thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -135,6 +220,7 @@ CREATE TABLE IF NOT EXISTS automations (
   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
   mode TEXT,
   model TEXT,
+  thinking_level TEXT,
   permission_mode TEXT NOT NULL DEFAULT 'ask',
   schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -376,8 +462,18 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
+    "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE threads ADD COLUMN title TEXT",
+    "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
+    "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
+    "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS thread_view_items_turn_start
+       ON thread_view_items (thread_id, turn_start, item_index)",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
     "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
     "ALTER TABLE code_review_repositories ADD COLUMN semantic_routing INTEGER NOT NULL DEFAULT 0",
@@ -463,6 +559,9 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     backfill_code_review_collapse_pending(conn)?;
     migrate_backend_sessions(conn)?;
     migrate_automatic_code_review_routing(conn)?;
+    migrate_session_summary_projection(conn)?;
+    migrate_thread_status_projection(conn)?;
+    recover_interrupted_session_summaries(conn)?;
     Ok(())
 }
 
@@ -590,6 +689,794 @@ fn migrate_code_review_finding_publication_status(conn: &mut Connection) -> Resu
     Ok(())
 }
 
+struct SessionSummaryChange {
+    session_id: String,
+    summary: Option<SessionSummary>,
+    notification: Option<Event>,
+}
+
+struct ThreadStatusChange {
+    statuses: Vec<ThreadStatus>,
+}
+
+/// Build the compact per-thread projection once for existing databases. New
+/// writes update it in the same transaction as their source event.
+fn migrate_thread_status_projection(conn: &Connection) -> Result<()> {
+    // v2 rebuilds the projection once so databases created before timing was
+    // retained gain accurate latest-turn timestamps from the durable log.
+    const MIGRATION_ID: &str = "thread-status-projection-v2";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM thread_statuses", [])?;
+    let threads_have_session_id = {
+        let mut stmt = tx.prepare("PRAGMA table_info(threads)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "session_id")
+    };
+    if threads_have_session_id {
+        tx.execute(
+            "INSERT INTO thread_statuses
+               (thread_id, session_id, active, attention, last_outcome, latest_cursor)
+             SELECT id, session_id, 0, 'none', 'idle', 0 FROM threads",
+            [],
+        )?;
+    }
+    let mut after = 0u64;
+    loop {
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT cursor, scope_kind, scope_id, ts, payload
+                 FROM events WHERE cursor > ?1 ORDER BY cursor LIMIT 512",
+            )?;
+            let mapped = stmt.query_map([after as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for (cursor, kind, id, timestamp, payload) in &rows {
+            after = *cursor;
+            let Ok(event) = serde_json::from_str::<Event>(payload) else {
+                continue;
+            };
+            let scope = scope_from_cols(kind, id.clone());
+            let _ = project_thread_status(&tx, &scope, &event, *cursor, timestamp)?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Build the projection once for existing databases. Afterwards the sole
+/// event-writer transaction updates it and appends its durable replacement.
+fn migrate_session_summary_projection(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "session-summary-projection-v1";
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM session_summary_attention", [])?;
+        tx.execute("DELETE FROM session_summaries", [])?;
+        tx.execute(
+            "INSERT INTO session_summaries
+               (session_id, workspace_id, archived, active, last_outcome,
+                latest_thread_id, latest_cursor, updated_at)
+             SELECT id, workspace_id, archived, 0, 'idle', NULL, 0, created_at
+             FROM sessions",
+            [],
+        )?;
+
+        let mut after = 0u64;
+        loop {
+            let rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT cursor, scope_kind, scope_id, ts, payload
+                     FROM events WHERE cursor > ?1 ORDER BY cursor LIMIT 512",
+                )?;
+                let mapped = stmt.query_map([after as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (cursor, kind, id, timestamp, payload) in &rows {
+                after = *cursor;
+                let Ok(event) = serde_json::from_str::<Event>(payload) else {
+                    continue;
+                };
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+                    continue;
+                };
+                let scope = scope_from_cols(kind, id.clone());
+                let _ = project_session_summary(
+                    &tx,
+                    &scope,
+                    &event,
+                    *cursor,
+                    ts.with_timezone(&chrono::Utc),
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+            params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Process-owned turns and response channels do not survive restart. Record
+/// recovery as durable source + replacement events so a resumed stream sees
+/// the same cleared state as a fresh projection snapshot.
+fn recover_interrupted_session_summaries(conn: &Connection) -> Result<()> {
+    let interrupted = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, workspace_id FROM session_summaries AS summary
+             WHERE active != 0 OR EXISTS (
+               SELECT 1 FROM session_summary_attention AS attention
+               WHERE attention.session_id = summary.session_id
+             )
+             ORDER BY session_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now();
+    let events = interrupted
+        .into_iter()
+        .map(|(session_id, workspace_id)| {
+            let event = Event::SessionRecovered {
+                session_id,
+                workspace_id,
+            };
+            Ok(PendingEvent {
+                scope: Scope::Server,
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = insert_event_batch(conn, events.iter(), events.len())?;
+    Ok(())
+}
+
+fn ensure_session_summary(
+    conn: &Connection,
+    session_id: &str,
+    cursor: u64,
+    ts: &chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_summaries
+           (session_id, workspace_id, archived, active, last_outcome,
+            latest_thread_id, latest_cursor, updated_at)
+         SELECT id, workspace_id, archived, 0, 'idle', NULL, ?2, ?3
+         FROM sessions WHERE id = ?1",
+        params![session_id, cursor as i64, ts.to_rfc3339()],
+    )?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_summaries WHERE session_id = ?1)",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn session_for_thread(conn: &Connection, thread_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT session_id FROM threads WHERE id = ?1",
+        [thread_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn clear_thread_attention(conn: &Connection, thread_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_summary_attention WHERE thread_id = ?1",
+        [thread_id],
+    )?;
+    Ok(())
+}
+
+fn touch_session_summary(
+    conn: &Connection,
+    session_id: &str,
+    thread_id: Option<&str>,
+    cursor: u64,
+    ts: &chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE session_summaries
+         SET latest_thread_id = COALESCE(?2, latest_thread_id),
+             latest_cursor = ?3,
+             updated_at = ?4
+         WHERE session_id = ?1",
+        params![session_id, thread_id, cursor as i64, ts.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn project_session_summary(
+    conn: &Connection,
+    scope: &Scope,
+    event: &Event,
+    cursor: u64,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<SessionSummaryChange>> {
+    let (session_id, thread_id) = match event {
+        Event::SessionSummaryUpdated { .. } => return Ok(None),
+        Event::SessionDeleted { session_id, .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention WHERE session_id = ?1",
+                [session_id],
+            )?;
+            conn.execute(
+                "DELETE FROM session_summaries WHERE session_id = ?1",
+                [session_id],
+            )?;
+            return Ok(Some(SessionSummaryChange {
+                session_id: session_id.clone(),
+                summary: None,
+                notification: None,
+            }));
+        }
+        Event::SessionCreated { session_id, .. }
+        | Event::SessionUpdated { session_id, .. }
+        | Event::SessionActivity { session_id, .. }
+        | Event::SessionRecovered { session_id, .. } => (session_id.clone(), None),
+        Event::ThreadCreated {
+            session_id,
+            thread_id,
+        }
+        | Event::ThreadUpdated {
+            session_id,
+            thread_id,
+        } => (session_id.clone(), Some(thread_id.clone())),
+        Event::TurnStarted { .. }
+        | Event::TurnCompleted { .. }
+        | Event::TurnFailed { .. }
+        | Event::TurnCancelled { .. }
+        | Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ToolCompleted { .. }
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. } => {
+            let Scope::Thread(thread_id) = scope else {
+                return Ok(None);
+            };
+            let Some(session_id) = session_for_thread(conn, thread_id)? else {
+                return Ok(None);
+            };
+            (session_id, Some(thread_id.clone()))
+        }
+        _ => return Ok(None),
+    };
+
+    if !ensure_session_summary(conn, &session_id, cursor, &ts)? {
+        return Ok(None);
+    }
+
+    match event {
+        Event::SessionUpdated { .. } => {
+            conn.execute(
+                "UPDATE session_summaries
+                 SET archived = COALESCE(
+                     (SELECT archived FROM sessions WHERE id = ?1), archived)
+                 WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::SessionActivity { active, .. } => {
+            conn.execute(
+                "UPDATE session_summaries SET active = ?2 WHERE session_id = ?1",
+                params![session_id, i64::from(*active)],
+            )?;
+        }
+        Event::SessionRecovered { .. } => {
+            conn.execute(
+                "DELETE FROM session_summary_attention WHERE session_id = ?1",
+                [&session_id],
+            )?;
+            conn.execute(
+                "UPDATE session_summaries
+                 SET active = 0, last_outcome = 'failed'
+                 WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::ThreadCreated { .. } => {
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnStarted { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnCompleted { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'succeeded' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnFailed { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'failed' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::TurnCancelled { .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                clear_thread_attention(conn, thread_id)?;
+            }
+            conn.execute(
+                "UPDATE session_summaries SET last_outcome = 'idle' WHERE session_id = ?1",
+                [&session_id],
+            )?;
+        }
+        Event::ApprovalRequested { call_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, call_id);
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_summary_attention
+                       (kind, item_id, session_id, thread_id)
+                     VALUES ('approval', ?1, ?2, ?3)",
+                    params![item_id, session_id, thread_id],
+                )?;
+            }
+        }
+        Event::ApprovalResolved { call_id, .. } | Event::ToolCompleted { call_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, call_id);
+                conn.execute(
+                    "DELETE FROM session_summary_attention
+                     WHERE kind = 'approval' AND item_id = ?1 AND session_id = ?2",
+                    params![item_id, session_id],
+                )?;
+            }
+        }
+        Event::QuestionRequested { request_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, request_id);
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_summary_attention
+                       (kind, item_id, session_id, thread_id)
+                     VALUES ('question', ?1, ?2, ?3)",
+                    params![item_id, session_id, thread_id],
+                )?;
+            }
+        }
+        Event::QuestionResolved { request_id, .. } => {
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, request_id);
+                conn.execute(
+                    "DELETE FROM session_summary_attention
+                     WHERE kind = 'question' AND item_id = ?1 AND session_id = ?2",
+                    params![item_id, session_id],
+                )?;
+            }
+        }
+        _ => {}
+    }
+
+    let notification = session_notification_event(event, &session_id, thread_id.as_deref());
+    touch_session_summary(conn, &session_id, thread_id.as_deref(), cursor, &ts)?;
+    Ok(
+        session_summary(conn, &session_id)?.map(|summary| SessionSummaryChange {
+            session_id,
+            summary: Some(summary),
+            notification,
+        }),
+    )
+}
+
+fn scoped_attention_item_id(thread_id: &str, vendor_id: &str) -> String {
+    // JSON string escaping makes the tuple unambiguous even if either vendor
+    // identifier contains a delimiter chosen by a backend.
+    serde_json::to_string(&(thread_id, vendor_id)).expect("string tuple serializes")
+}
+
+fn ensure_thread_status(conn: &Connection, thread_id: &str) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO thread_statuses
+           (thread_id, session_id, active, attention, last_outcome, latest_cursor)
+         SELECT id, session_id, 0, 'none', 'idle', 0
+         FROM threads WHERE id = ?1",
+        [thread_id],
+    )?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thread_statuses WHERE thread_id = ?1)",
+        [thread_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn thread_attention(conn: &Connection, thread_id: &str) -> Result<SessionAttention> {
+    let (approval, question) = conn.query_row(
+        "SELECT
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE thread_id = ?1 AND kind = 'approval'),
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE thread_id = ?1 AND kind = 'question')",
+        [thread_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )?;
+    Ok(match (approval, question) {
+        (false, false) => SessionAttention::None,
+        (true, false) => SessionAttention::Approval,
+        (false, true) => SessionAttention::Question,
+        (true, true) => SessionAttention::Both,
+    })
+}
+
+fn thread_status(conn: &Connection, thread_id: &str) -> Result<Option<ThreadStatus>> {
+    conn.query_row(
+        "SELECT session_id, active, attention, last_outcome, latest_cursor,
+                started_at, completed_at
+         FROM thread_statuses WHERE thread_id = ?1",
+        [thread_id],
+        |row| {
+            let active = row.get::<_, i64>(1)? != 0;
+            let attention = match row.get::<_, String>(2)?.as_str() {
+                "approval" => SessionAttention::Approval,
+                "question" => SessionAttention::Question,
+                "both" => SessionAttention::Both,
+                _ => SessionAttention::None,
+            };
+            let outcome = if active {
+                SessionOutcome::Running
+            } else {
+                match row.get::<_, String>(3)?.as_str() {
+                    "succeeded" => SessionOutcome::Succeeded,
+                    "failed" => SessionOutcome::Failed,
+                    _ => SessionOutcome::Idle,
+                }
+            };
+            Ok(ThreadStatus {
+                thread_id: thread_id.to_owned(),
+                session_id: row.get(0)?,
+                active,
+                attention,
+                outcome,
+                latest_cursor: row.get::<_, i64>(4)? as u64,
+                started_at: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|value| value.parse().ok()),
+                completed_at: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|value| value.parse().ok()),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn thread_statuses(conn: &Connection, session_id: &str) -> Result<Vec<ThreadStatus>> {
+    let mut stmt = conn.prepare(
+        "SELECT thread_id FROM thread_statuses
+         WHERE session_id = ?1 ORDER BY thread_id",
+    )?;
+    let ids = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statuses = Vec::with_capacity(ids.len());
+    for thread_id in ids {
+        if let Some(status) = thread_status(conn, &thread_id)? {
+            statuses.push(status);
+        }
+    }
+    Ok(statuses)
+}
+
+fn project_thread_status(
+    conn: &Connection,
+    scope: &Scope,
+    event: &Event,
+    cursor: u64,
+    timestamp: &str,
+) -> Result<Option<ThreadStatusChange>> {
+    if matches!(event, Event::ThreadStatusUpdated { .. }) {
+        return Ok(None);
+    }
+    if let Event::SessionRecovered { session_id, .. } = event {
+        let interrupted_thread_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT thread_id FROM thread_statuses
+                 WHERE session_id = ?1 AND (active != 0 OR attention != 'none')
+                 ORDER BY thread_id",
+            )?;
+            stmt.query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if interrupted_thread_ids.is_empty() {
+            return Ok(None);
+        }
+        conn.execute(
+            "UPDATE thread_statuses
+             SET completed_at = ?3, active = 0, attention = 'none',
+                 last_outcome = 'failed', latest_cursor = ?2
+             WHERE session_id = ?1 AND (active != 0 OR attention != 'none')",
+            params![session_id, cursor as i64, timestamp],
+        )?;
+        let statuses = interrupted_thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                thread_status(conn, &thread_id)?.context("recovered thread status disappeared")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(ThreadStatusChange { statuses }));
+    }
+
+    let thread_id = match event {
+        Event::ThreadCreated { thread_id, .. } => thread_id.clone(),
+        Event::TurnStarted { .. }
+        | Event::TurnCompleted { .. }
+        | Event::TurnFailed { .. }
+        | Event::TurnCancelled { .. }
+        | Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ToolCompleted { .. }
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. } => {
+            let Scope::Thread(thread_id) = scope else {
+                return Ok(None);
+            };
+            thread_id.clone()
+        }
+        _ => return Ok(None),
+    };
+    if !ensure_thread_status(conn, &thread_id)? {
+        return Ok(None);
+    }
+
+    match event {
+        Event::ThreadCreated { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, attention = 'none', last_outcome = 'idle',
+                     started_at = NULL, completed_at = NULL
+                 WHERE thread_id = ?1",
+                [&thread_id],
+            )?;
+        }
+        Event::TurnStarted { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 1, last_outcome = 'running', started_at = ?2,
+                     completed_at = NULL
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnCompleted { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'succeeded', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnFailed { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'failed', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        Event::TurnCancelled { .. } => {
+            conn.execute(
+                "UPDATE thread_statuses
+                 SET active = 0, last_outcome = 'idle', completed_at = ?2
+                 WHERE thread_id = ?1",
+                params![thread_id, timestamp],
+            )?;
+        }
+        _ => {}
+    }
+    let attention = match thread_attention(conn, &thread_id)? {
+        SessionAttention::None => "none",
+        SessionAttention::Approval => "approval",
+        SessionAttention::Question => "question",
+        SessionAttention::Both => "both",
+    };
+    conn.execute(
+        "UPDATE thread_statuses SET attention = ?2, latest_cursor = ?3
+         WHERE thread_id = ?1",
+        params![thread_id, attention, cursor as i64],
+    )?;
+    Ok(
+        thread_status(conn, &thread_id)?.map(|status| ThreadStatusChange {
+            statuses: vec![status],
+        }),
+    )
+}
+
+const SESSION_NOTIFICATION_DETAIL_CHARS: usize = 120;
+
+fn compact_session_notification_detail(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut chars = value.chars();
+    let mut compact = chars
+        .by_ref()
+        .take(SESSION_NOTIFICATION_DETAIL_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        compact.push('…');
+    }
+    Some(compact)
+}
+
+fn session_notification_event(
+    source: &Event,
+    session_id: &str,
+    thread_id: Option<&str>,
+) -> Option<Event> {
+    let thread_id = thread_id?;
+    let (kind, detail) = match source {
+        Event::TurnCompleted { .. } => (
+            trouve_protocol::SessionNotificationKind::TurnCompleted,
+            None,
+        ),
+        Event::TurnFailed { error, .. } => (
+            trouve_protocol::SessionNotificationKind::TurnFailed,
+            compact_session_notification_detail(error),
+        ),
+        Event::ApprovalRequested { .. } => (
+            trouve_protocol::SessionNotificationKind::ApprovalRequested,
+            None,
+        ),
+        Event::QuestionRequested { title, .. } => (
+            trouve_protocol::SessionNotificationKind::QuestionRequested,
+            title
+                .as_deref()
+                .and_then(compact_session_notification_detail),
+        ),
+        _ => return None,
+    };
+    Some(Event::SessionNotification {
+        session_id: session_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        kind,
+        detail,
+    })
+}
+
+fn session_summary(conn: &Connection, session_id: &str) -> Result<Option<SessionSummary>> {
+    let row = conn
+        .query_row(
+            "SELECT workspace_id, archived, active, last_outcome,
+                    latest_thread_id, latest_cursor, updated_at
+             FROM session_summaries WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((workspace_id, archived, active, last_outcome, latest_thread_id, cursor, ts)) = row
+    else {
+        return Ok(None);
+    };
+    let (approval, question) = conn.query_row(
+        "SELECT
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE session_id = ?1 AND kind = 'approval'),
+           EXISTS(SELECT 1 FROM session_summary_attention
+                  WHERE session_id = ?1 AND kind = 'question')",
+        [session_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )?;
+    let attention = match (approval, question) {
+        (false, false) => SessionAttention::None,
+        (true, false) => SessionAttention::Approval,
+        (false, true) => SessionAttention::Question,
+        (true, true) => SessionAttention::Both,
+    };
+    let active = active != 0;
+    let outcome = if active {
+        SessionOutcome::Running
+    } else {
+        match last_outcome.as_str() {
+            "idle" => SessionOutcome::Idle,
+            "succeeded" => SessionOutcome::Succeeded,
+            "failed" => SessionOutcome::Failed,
+            // A downgrade may encounter a newer additive outcome literal.
+            // Keep the writer transaction available and expose the neutral
+            // state until a known event replaces the projection value.
+            _ => SessionOutcome::Idle,
+        }
+    };
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&ts)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    Ok(Some(SessionSummary {
+        session_id: session_id.to_string(),
+        workspace_id,
+        archived: archived != 0,
+        active,
+        attention,
+        outcome,
+        latest_thread_id,
+        latest_cursor: cursor as u64,
+        updated_at,
+    }))
+}
+
 /// Upgrade untouched default policies to automatic routing while preserving
 /// customized persona selections as Core policies. Record the migration so a
 /// later user choice to return to Core remains respected.
@@ -687,8 +1574,8 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
 
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
-    let permission_mode: String = r.get(6)?;
-    let schedule_json: String = r.get(7)?;
+    let permission_mode: String = r.get(7)?;
+    let schedule_json: String = r.get(8)?;
     Ok(trouve_protocol::Automation {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -696,6 +1583,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         workspace_id: r.get(3)?,
         mode: r.get(4)?,
         model: r.get(5)?,
+        thinking_level: r.get(6)?,
         permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
@@ -705,12 +1593,12 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
                 days: vec![],
             },
         ),
-        enabled: r.get(8)?,
-        next_run_at: r.get(9)?,
-        last_run_at: r.get(10)?,
-        last_session_id: r.get(11)?,
-        last_error: r.get(12)?,
-        created_at: r.get(13)?,
+        enabled: r.get(9)?,
+        next_run_at: r.get(10)?,
+        last_run_at: r.get(11)?,
+        last_session_id: r.get(12)?,
+        last_error: r.get(13)?,
+        created_at: r.get(14)?,
     })
 }
 
@@ -1472,6 +2360,154 @@ pub struct Store {
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCleanupJob {
+    pub id: String,
+    pub claim_token: Option<String>,
+    pub session_id: Option<String>,
+    pub worktree_path: Option<String>,
+    pub repository_path: Option<String>,
+    pub attachment_paths: Vec<String>,
+}
+
+impl ArtifactCleanupJob {
+    pub(crate) fn deleted_session(
+        session_id: String,
+        worktree_path: String,
+        repository_path: String,
+        attachment_paths: Vec<String>,
+    ) -> Self {
+        Self {
+            id: format!("acj_{}", uuid::Uuid::new_v4().simple()),
+            claim_token: None,
+            session_id: Some(session_id),
+            worktree_path: Some(worktree_path),
+            repository_path: Some(repository_path),
+            attachment_paths,
+        }
+    }
+
+    fn attachments(attachment_paths: Vec<String>) -> Self {
+        Self {
+            id: format!("acj_{}", uuid::Uuid::new_v4().simple()),
+            claim_token: None,
+            session_id: None,
+            worktree_path: None,
+            repository_path: None,
+            attachment_paths,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.session_id.is_some() {
+            "deleted_session"
+        } else {
+            "attachments"
+        }
+    }
+}
+
+const ARTIFACT_CLEANUP_CLAIM_MINUTES: i64 = 5;
+const MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM: usize = 64;
+const MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES: usize = 1024 * 1024;
+const MAX_ARTIFACT_CLEANUP_PATHS: usize = 4096;
+const MAX_ARTIFACT_CLEANUP_PATH_BYTES: usize = 32 * 1024;
+const MAX_ARTIFACT_CLEANUP_METADATA_BYTES: usize = 32 * 1024;
+const MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES: usize = 64;
+
+type RawArtifactCleanupJob = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+fn raw_artifact_cleanup_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifactCleanupJob> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get::<_, i64>(7)? != 0,
+    ))
+}
+
+fn decode_artifact_cleanup_job(
+    id: String,
+    kind: String,
+    session_id: Option<String>,
+    worktree_path: Option<String>,
+    repository_path: Option<String>,
+    paths_json: String,
+) -> Result<ArtifactCleanupJob> {
+    anyhow::ensure!(
+        paths_json.len() <= MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES,
+        "artifact cleanup job {id} attachment paths exceed the decode limit"
+    );
+    let attachment_paths: Vec<String> = serde_json::from_str(&paths_json)
+        .with_context(|| format!("artifact cleanup job {id} has invalid attachment paths"))?;
+    anyhow::ensure!(
+        attachment_paths.len() <= MAX_ARTIFACT_CLEANUP_PATHS,
+        "artifact cleanup job {id} has too many attachment paths"
+    );
+    anyhow::ensure!(
+        attachment_paths
+            .iter()
+            .all(|path| !path.is_empty() && path.len() <= MAX_ARTIFACT_CLEANUP_PATH_BYTES),
+        "artifact cleanup job {id} contains an invalid attachment path length"
+    );
+    match kind.as_str() {
+        "attachments" => anyhow::ensure!(
+            session_id.is_none() && worktree_path.is_none() && repository_path.is_none(),
+            "attachment cleanup job {id} has unexpected session fields"
+        ),
+        "deleted_session" => anyhow::ensure!(
+            session_id.is_some() && worktree_path.is_some() && repository_path.is_some(),
+            "deleted-session cleanup job {id} is missing required fields"
+        ),
+        _ => anyhow::bail!("artifact cleanup job {id} has unknown kind {kind:?}"),
+    }
+    Ok(ArtifactCleanupJob {
+        id,
+        claim_token: None,
+        session_id,
+        worktree_path,
+        repository_path,
+        attachment_paths,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactCleanupClaim {
+    pub id: String,
+    pub token: String,
+}
+
+pub(crate) struct PromptAcceptance {
+    pub prompt: trouve_protocol::QueuedPrompt,
+    pub tools_enabled: bool,
+    pub attachments: Vec<(trouve_protocol::Attachment, String)>,
+    pub claim_prompt_id: Option<String>,
+    pub expected_previous_turn: Option<u64>,
+    pub staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+}
+
+impl ArtifactCleanupJob {
+    pub(crate) fn claim(&self) -> Option<ArtifactCleanupClaim> {
+        self.claim_token.as_ref().map(|token| ArtifactCleanupClaim {
+            id: self.id.clone(),
+            token: token.clone(),
+        })
+    }
+}
+
 /// One serialized event, in flight to the writer thread.
 struct PendingEvent {
     scope: Scope,
@@ -1480,12 +2516,70 @@ struct PendingEvent {
     /// there instead of poisoning a whole batch.
     payload: String,
     event: Event,
+    /// Optional relational mutation that must commit immediately before this
+    /// source event and its derived projection update.
+    mutation: Option<StoreMutation>,
+}
+
+enum StoreMutation {
+    Insert {
+        session: Box<Session>,
+        initial_checkpoint: Box<CheckpointRow>,
+    },
+    Update {
+        id: String,
+        title: Option<String>,
+        archived: Option<bool>,
+    },
+    UpdateThread {
+        id: String,
+        mode: Option<String>,
+        model: Option<String>,
+        model_options: Option<serde_json::Map<String, serde_json::Value>>,
+        permission_mode: Option<PermissionMode>,
+    },
+    InsertThread {
+        thread: Box<Thread>,
+        model_options: serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(String, String)>,
+    },
+    Delete {
+        id: String,
+        cleanup: Box<ArtifactCleanupJob>,
+    },
+    AcceptPrompt {
+        prompt: Box<trouve_protocol::QueuedPrompt>,
+        tools_enabled: bool,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        claim_prompt_id: Option<String>,
+        expected_previous_turn: Option<u64>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
+    AppendCheckpoint {
+        checkpoint: Box<CheckpointRow>,
+    },
+    AppendMessage {
+        thread_id: String,
+        payload: String,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
 struct AppendRequest {
     events: Vec<PendingEvent>,
     reply: AppendReply,
+    queued_at: std::time::Instant,
+}
+
+/// The on-disk event writer owns a dedicated SQLite connection so read-side
+/// queries cannot hold it behind the store's process-local connection mutex.
+/// In-memory stores must share their sole connection because independent
+/// `:memory:` connections are independent databases.
+enum EventWriterConnection {
+    Dedicated(Connection),
+    Shared(Arc<Mutex<Connection>>),
 }
 
 enum AppendReply {
@@ -1553,7 +2647,7 @@ fn scope_from_cols(kind: &str, id: String) -> Scope {
 /// The thread exits when every `Store` clone (each holding a request sender)
 /// has been dropped.
 fn spawn_event_writer(
-    conn: Arc<Mutex<Connection>>,
+    conn: EventWriterConnection,
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
 ) -> std::sync::mpsc::Sender<AppendRequest> {
@@ -1571,6 +2665,7 @@ fn spawn_event_writer(
                     },
                 };
                 let mut event_count = first.events.len();
+                let queued_at = first.queued_at;
                 let mut requests = vec![first];
                 while event_count < APPEND_BATCH_MAX {
                     let Ok(request) = rx.try_recv() else {
@@ -1583,50 +2678,73 @@ fn spawn_event_writer(
                     event_count += request.events.len();
                     requests.push(request);
                 }
-                let wait_started = std::time::Instant::now();
-                let (inserted, wait, elapsed) = {
-                    let mut conn = conn.lock().unwrap();
-                    let wait = wait_started.elapsed();
-                    let started = std::time::Instant::now();
-                    let inserted = insert_event_batch(
-                        &mut conn,
-                        requests.iter().flat_map(|request| request.events.iter()),
-                        event_count,
-                    );
-                    (inserted, wait, started.elapsed())
+                let queue_wait = queued_at.elapsed();
+                let (inserted, connection_wait, commit_elapsed) = match &conn {
+                    EventWriterConnection::Dedicated(conn) => {
+                        let started = std::time::Instant::now();
+                        let inserted = insert_event_batch(
+                            conn,
+                            requests.iter().flat_map(|request| request.events.iter()),
+                            event_count,
+                        );
+                        (inserted, std::time::Duration::ZERO, started.elapsed())
+                    }
+                    EventWriterConnection::Shared(conn) => {
+                        let wait_started = std::time::Instant::now();
+                        let conn = conn.lock().unwrap();
+                        let connection_wait = wait_started.elapsed();
+                        let started = std::time::Instant::now();
+                        let inserted = insert_event_batch(
+                            &conn,
+                            requests.iter().flat_map(|request| request.events.iter()),
+                            event_count,
+                        );
+                        (inserted, connection_wait, started.elapsed())
+                    }
                 };
-                if elapsed >= std::time::Duration::from_millis(20) {
+                let total_elapsed = queue_wait
+                    .saturating_add(connection_wait)
+                    .saturating_add(commit_elapsed);
+                if total_elapsed >= std::time::Duration::from_millis(20) {
                     tracing::warn!(
                         event_count,
                         request_count = requests.len(),
-                        wait_ms = wait.as_millis(),
-                        elapsed_ms = elapsed.as_millis(),
+                        queue_wait_ms = queue_wait.as_millis(),
+                        connection_wait_ms = connection_wait.as_millis(),
+                        commit_ms = commit_elapsed.as_millis(),
+                        total_ms = total_elapsed.as_millis(),
                         "slow event-log batch commit"
                     );
                 } else {
                     tracing::trace!(
                         event_count,
                         request_count = requests.len(),
-                        wait_us = wait.as_micros(),
-                        elapsed_us = elapsed.as_micros(),
+                        queue_wait_us = queue_wait.as_micros(),
+                        connection_wait_us = connection_wait.as_micros(),
+                        commit_us = commit_elapsed.as_micros(),
                         "event-log batch committed"
                     );
                 }
                 match inserted {
-                    Ok(cursors) => {
-                        let mut cursors = cursors.into_iter();
+                    Ok(inserted) => {
+                        // Publish every committed source and derived event in
+                        // exact cursor order before resolving append callers.
+                        for envelope in inserted.published {
+                            let _ = events_tx.send(envelope.clone());
+                            let (kind, id) = scope_cols(&envelope.scope);
+                            let scoped_sender = scoped_events
+                                .lock()
+                                .unwrap()
+                                .get(&(kind.to_owned(), id))
+                                .cloned();
+                            if let Some(sender) = scoped_sender {
+                                let _ = sender.send(envelope);
+                            }
+                        }
+
+                        let mut cursors = inserted.source_cursors.into_iter();
                         for request in requests {
                             let mut envelopes = Vec::with_capacity(request.events.len());
-                            // One caller batch has one scope, so resolve its
-                            // live sender without re-locking for every event.
-                            let scoped_sender = request.events.first().and_then(|event| {
-                                let (kind, id) = scope_cols(&event.scope);
-                                scoped_events
-                                    .lock()
-                                    .unwrap()
-                                    .get(&(kind.to_owned(), id))
-                                    .cloned()
-                            });
                             for event in request.events {
                                 let envelope = EventEnvelope {
                                     cursor: cursors.next().expect("one cursor per inserted event"),
@@ -1634,12 +2752,6 @@ fn spawn_event_writer(
                                     ts: event.ts,
                                     event: event.event,
                                 };
-                                // Nobody listening is fine; a caller that gave
-                                // up waiting is too.
-                                let _ = events_tx.send(envelope.clone());
-                                if let Some(sender) = &scoped_sender {
-                                    let _ = sender.send(envelope.clone());
-                                }
                                 envelopes.push(envelope);
                             }
                             request.reply.send(Ok(envelopes));
@@ -1649,8 +2761,21 @@ fn spawn_event_writer(
                         // The transaction rolled back: every waiter's event
                         // was equally not persisted.
                         let message = format!("appending event batch: {e}");
+                        let sqlite_code = e.chain().find_map(|cause| {
+                            cause
+                                .downcast_ref::<rusqlite::Error>()
+                                .and_then(|error| match error {
+                                    rusqlite::Error::SqliteFailure(details, _) => {
+                                        Some(details.code)
+                                    }
+                                    _ => None,
+                                })
+                        });
                         for request in requests {
-                            request.reply.send(Err(anyhow::anyhow!(message.clone())));
+                            request.reply.send(Err(anyhow::Error::new(EventWriterError {
+                                message: message.clone(),
+                                sqlite_code,
+                            })));
                         }
                     }
                 }
@@ -1660,41 +2785,708 @@ fn spawn_event_writer(
     tx
 }
 
+#[derive(Debug, Clone)]
+struct EventWriterError {
+    message: String,
+    sqlite_code: Option<rusqlite::ErrorCode>,
+}
+
+impl std::fmt::Display for EventWriterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EventWriterError {}
+
+/// Recover the SQLite classification retained when the event-writer thread
+/// transported a transaction error back across its reply channel.
+pub(crate) fn event_writer_sqlite_error_code(error: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<EventWriterError>())
+        .and_then(|error| error.sqlite_code)
+}
+
 /// Insert a batch in queue order under one transaction, returning the
 /// assigned cursors. All-or-nothing: on error the transaction rolls back.
+struct InsertedEventBatch {
+    source_cursors: Vec<u64>,
+    published: Vec<EventEnvelope>,
+}
+
+fn insert_session_row(conn: &Connection, session: &Session) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions
+           (id, workspace_id, title, branch, worktree_path, base_ref, archived, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            session.id,
+            session.workspace_id,
+            session.title,
+            session.branch,
+            session.worktree_path,
+            session.base_ref,
+            session.archived,
+            session.created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_initial_checkpoint_row(
+    conn: &Connection,
+    checkpoint: &CheckpointRow,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO checkpoints
+           (id, session_id, thread_id, turn, seq, commit_hash, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            checkpoint.id,
+            checkpoint.session_id,
+            checkpoint.thread_id,
+            checkpoint.turn as i64,
+            checkpoint.seq,
+            checkpoint.commit_hash,
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_checkpoint_row(
+    conn: &Connection,
+    row: &CheckpointRow,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let undo_pos: Option<i64> = conn.query_row(
+        "SELECT undo_pos FROM sessions WHERE id = ?1",
+        params![row.session_id],
+        |r| r.get(0),
+    )?;
+    if let Some(pos) = undo_pos {
+        conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
+            params![row.session_id, pos],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
+            params![row.session_id],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
+         VALUES (?1, ?2, ?3, ?4,
+                 (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
+                 ?5, ?6)",
+        params![
+            row.id,
+            row.session_id,
+            row.thread_id,
+            row.turn as i64,
+            row.commit_hash,
+            created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_session_row(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    archived: Option<bool>,
+) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE sessions
+         SET title = COALESCE(?2, title), archived = COALESCE(?3, archived)
+         WHERE id = ?1",
+        params![id, title, archived],
+    )?;
+    anyhow::ensure!(updated == 1, "session {id} no longer exists");
+    Ok(())
+}
+
+fn update_thread_row(
+    conn: &Connection,
+    id: &str,
+    mode: Option<&str>,
+    model: Option<&str>,
+    model_options: Option<&serde_json::Map<String, serde_json::Value>>,
+    permission_mode: Option<PermissionMode>,
+) -> Result<()> {
+    let model_options = model_options.map(serde_json::to_string).transpose()?;
+    let permission_mode = permission_mode.map(permission_mode_str);
+    let updated = conn.execute(
+        "UPDATE threads
+         SET mode = COALESCE(?2, mode),
+             model = COALESCE(?3, model),
+             model_options = COALESCE(?4, model_options),
+             permission_mode = COALESCE(?5, permission_mode)
+         WHERE id = ?1",
+        params![id, mode, model, model_options, permission_mode],
+    )?;
+    anyhow::ensure!(updated == 1, "thread {id} no longer exists");
+    Ok(())
+}
+
+fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
+         OR (scope_kind = 'thread' AND scope_id IN
+             (SELECT id FROM threads WHERE session_id = ?1))",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM messages WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM backend_sessions WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM queued_prompts WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
+    conn.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM attachments WHERE thread_id IN
+         (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM spawned_threads
+         WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
+            OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+        params![id],
+    )?;
+    conn.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
+    let deleted = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    anyhow::ensure!(deleted == 1, "session {id} no longer exists");
+    Ok(())
+}
+
+fn insert_artifact_cleanup_job(
+    conn: &Connection,
+    job: &ArtifactCleanupJob,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO artifact_cleanup_jobs
+           (id, kind, session_id, worktree_path, repository_path,
+            attachment_paths, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            job.id,
+            job.kind(),
+            job.session_id,
+            job.worktree_path,
+            job.repository_path,
+            serde_json::to_string(&job.attachment_paths)?,
+            timestamp.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn apply_store_mutation(
+    conn: &Connection,
+    mutation: &StoreMutation,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    match mutation {
+        StoreMutation::Insert {
+            session,
+            initial_checkpoint,
+        } => {
+            insert_session_row(conn, session)?;
+            insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
+        }
+        StoreMutation::Update {
+            id,
+            title,
+            archived,
+        } => update_session_row(conn, id, title.as_deref(), *archived)?,
+        StoreMutation::UpdateThread {
+            id,
+            mode,
+            model,
+            model_options,
+            permission_mode,
+        } => update_thread_row(
+            conn,
+            id,
+            mode.as_deref(),
+            model.as_deref(),
+            model_options.as_ref(),
+            *permission_mode,
+        )?,
+        StoreMutation::InsertThread {
+            thread,
+            model_options,
+            spawn,
+        } => {
+            // Validate the owner in this transaction so a stale engine
+            // snapshot cannot surface an FK error after session deletion.
+            let child_workspace = conn
+                .query_row(
+                    "SELECT workspace_id FROM sessions WHERE id = ?1",
+                    params![thread.session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                child_workspace.is_some(),
+                "session {} no longer exists",
+                thread.session_id
+            );
+            insert_thread_row(conn, thread, model_options)?;
+            if let Some((parent, kind)) = spawn {
+                let parent_owner = conn
+                    .query_row(
+                        "SELECT threads.session_id, sessions.workspace_id
+                         FROM threads
+                         JOIN sessions ON sessions.id = threads.session_id
+                         WHERE threads.id = ?1",
+                        params![parent],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let Some((parent_session, parent_workspace)) = parent_owner else {
+                    anyhow::bail!("spawn parent {parent} no longer exists");
+                };
+                if *kind == "session" {
+                    anyhow::ensure!(
+                        child_workspace.as_deref() == Some(parent_workspace.as_str()),
+                        "spawn parent {parent} does not belong to workspace of session {}",
+                        thread.session_id
+                    );
+                } else {
+                    anyhow::ensure!(
+                        parent_session == thread.session_id,
+                        "spawn parent {parent} does not belong to session {}",
+                        thread.session_id
+                    );
+                }
+                conn.execute(
+                    "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
+                     VALUES (?1, ?2, ?3)",
+                    params![thread.id, parent, kind],
+                )?;
+            }
+        }
+        StoreMutation::Delete { id, cleanup } => {
+            insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
+            delete_session_rows(conn, id)?;
+        }
+        StoreMutation::AcceptPrompt {
+            prompt,
+            tools_enabled,
+            attachments,
+            claim_prompt_id,
+            expected_previous_turn,
+            staging_cleanup_claim,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        prompt.thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO queued_prompts
+                   (id, thread_id, position, content, attachments, tools_enabled, claimed, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![
+                    prompt.id,
+                    prompt.thread_id,
+                    prompt.position as i64,
+                    prompt.content,
+                    serde_json::to_string(&prompt.attachments)?,
+                    tools_enabled,
+                    prompt.created_at,
+                ],
+            )?;
+            if let Some(claim_prompt_id) = claim_prompt_id {
+                let claimed = conn.execute(
+                    "UPDATE queued_prompts SET claimed = 1
+                     WHERE id = ?1 AND thread_id = ?2 AND claimed = 0",
+                    params![claim_prompt_id, prompt.thread_id],
+                )?;
+                anyhow::ensure!(
+                    claimed == 1,
+                    "queued prompt changed while accepting message"
+                );
+            }
+            if let Some(expected_previous_turn) = expected_previous_turn {
+                let updated = conn.execute(
+                    "UPDATE threads SET last_turn = last_turn + 1
+                     WHERE id = ?1 AND last_turn = ?2",
+                    params![prompt.thread_id, *expected_previous_turn as i64],
+                )?;
+                anyhow::ensure!(updated == 1, "turn changed while accepting message");
+            }
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
+        }
+        StoreMutation::AppendCheckpoint { checkpoint } => {
+            append_checkpoint_row(conn, checkpoint, timestamp)?;
+        }
+        StoreMutation::AppendMessage {
+            thread_id,
+            payload,
+            attachments,
+            staging_cleanup_claim,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, payload],
+            )?;
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn insert_event_batch<'a>(
-    conn: &mut Connection,
+    conn: &Connection,
     batch: impl IntoIterator<Item = &'a PendingEvent>,
     event_count: usize,
-) -> Result<Vec<u64>> {
-    let tx = conn.transaction()?;
-    let mut cursors = Vec::with_capacity(event_count);
+) -> Result<InsertedEventBatch> {
+    let tx = conn.unchecked_transaction()?;
+    let mut source_cursors = Vec::with_capacity(event_count);
+    let mut published = Vec::with_capacity(event_count.saturating_mul(2));
     let mut thread_events = Vec::new();
-    {
-        let mut stmt = tx.prepare_cached(
+    for event in batch {
+        if let Some(mutation) = event.mutation.as_ref() {
+            apply_store_mutation(&tx, mutation, event.ts)?;
+        }
+        let (kind, id) = scope_cols(&event.scope);
+        tx.execute(
             "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, id, event.ts.to_rfc3339(), event.payload],
         )?;
-        for event in batch {
-            let (kind, id) = scope_cols(&event.scope);
-            stmt.execute(params![kind, id, event.ts.to_rfc3339(), event.payload])?;
-            let cursor = tx.last_insert_rowid() as u64;
-            cursors.push(cursor);
-            if let Scope::Thread(thread_id) = &event.scope {
-                thread_events.push((
-                    thread_id.clone(),
-                    EventEnvelope {
-                        cursor,
-                        scope: event.scope.clone(),
-                        ts: event.ts,
-                        event: event.event.clone(),
-                    },
-                ));
+        let source_cursor = tx.last_insert_rowid() as u64;
+        source_cursors.push(source_cursor);
+        let source = EventEnvelope {
+            cursor: source_cursor,
+            scope: event.scope.clone(),
+            ts: event.ts,
+            event: event.event.clone(),
+        };
+        if let Scope::Thread(thread_id) = &event.scope {
+            thread_events.push((thread_id.clone(), source.clone()));
+        }
+        published.push(source);
+
+        if let Some(change) =
+            project_session_summary(&tx, &event.scope, &event.event, source_cursor, event.ts)?
+        {
+            let derived = Event::SessionSummaryUpdated {
+                session_id: change.session_id,
+                summary: change.summary,
+            };
+            let payload = serde_json::to_string(&derived)?;
+            tx.execute(
+                "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                 VALUES ('server', '', ?1, ?2)",
+                params![event.ts.to_rfc3339(), payload],
+            )?;
+            published.push(EventEnvelope {
+                cursor: tx.last_insert_rowid() as u64,
+                scope: Scope::Server,
+                ts: event.ts,
+                event: derived,
+            });
+            if let Some(notification) = change.notification {
+                let payload = serde_json::to_string(&notification)?;
+                tx.execute(
+                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                     VALUES ('server', '', ?1, ?2)",
+                    params![event.ts.to_rfc3339(), payload],
+                )?;
+                published.push(EventEnvelope {
+                    cursor: tx.last_insert_rowid() as u64,
+                    scope: Scope::Server,
+                    ts: event.ts,
+                    event: notification,
+                });
+            }
+        }
+        if let Some(change) = project_thread_status(
+            &tx,
+            &event.scope,
+            &event.event,
+            source_cursor,
+            &event.ts.to_rfc3339(),
+        )? {
+            for status in change.statuses {
+                let derived = Event::ThreadStatusUpdated { status };
+                let payload = serde_json::to_string(&derived)?;
+                tx.execute(
+                    "INSERT INTO events (scope_kind, scope_id, ts, payload)
+                     VALUES ('server', '', ?1, ?2)",
+                    params![event.ts.to_rfc3339(), payload],
+                )?;
+                published.push(EventEnvelope {
+                    cursor: tx.last_insert_rowid() as u64,
+                    scope: Scope::Server,
+                    ts: event.ts,
+                    event: derived,
+                });
             }
         }
     }
     update_thread_view_caches(&tx, &thread_events)?;
     tx.commit()?;
-    Ok(cursors)
+    Ok(InsertedEventBatch {
+        source_cursors,
+        published,
+    })
+}
+
+fn compact_tool_argument(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    const SUMMARY_KEYS: &[&str] = &[
+        "tool",
+        "toolName",
+        "name",
+        "arguments",
+        "command",
+        "cmd",
+        "cwd",
+        "query",
+        "pattern",
+        "url",
+        "path",
+        "file_path",
+        "title",
+        "repo",
+        "offset",
+        "limit",
+        "line",
+        "start_line",
+        "end_line",
+    ];
+    if depth > 3 {
+        return serde_json::Value::Null;
+    }
+    match value {
+        serde_json::Value::String(value) => {
+            let mut chars = value.chars();
+            let mut summary = chars.by_ref().take(320).collect::<String>();
+            if chars.next().is_some() {
+                summary.push('…');
+            }
+            serde_json::Value::String(summary)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .take(4)
+                .map(|value| compact_tool_argument(value, depth + 1))
+                .collect(),
+        ),
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| SUMMARY_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), compact_tool_argument(value, depth + 1)))
+                .collect(),
+        ),
+        value => value.clone(),
+    }
+}
+
+fn persist_materialized_thread_items(
+    conn: &Connection,
+    thread_id: &str,
+    start: u64,
+    items: Vec<MaterializedThreadItem>,
+) -> Result<()> {
+    for (offset, materialized) in items.into_iter().enumerate() {
+        let item_index = start
+            .checked_add(offset as u64)
+            .context("thread-view item index overflow")?;
+        let persisted = match materialized.item {
+            ThreadViewItem::ToolCall {
+                call_id,
+                tool,
+                args,
+                status,
+                result,
+                duration_ms,
+                ..
+            } => {
+                let encoded_args = serde_json::to_string(&args)?;
+                let encoded_result = result.as_ref().map(serde_json::to_string).transpose()?;
+                conn.execute(
+                    "INSERT INTO thread_tool_details (thread_id, call_id, args, result)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(thread_id, call_id) DO UPDATE SET
+                       args = excluded.args,
+                       result = excluded.result",
+                    params![thread_id, &call_id, encoded_args, encoded_result],
+                )?;
+                ThreadViewItem::ToolCall {
+                    call_id,
+                    tool,
+                    args: compact_tool_argument(&args, 0),
+                    details_deferred: true,
+                    status,
+                    result: None,
+                    duration_ms,
+                }
+            }
+            item => item,
+        };
+        conn.execute(
+            "INSERT INTO thread_view_items (thread_id, item_index, item, turn_start)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, item_index) DO UPDATE SET
+               item = excluded.item,
+               turn_start = excluded.turn_start",
+            params![
+                thread_id,
+                i64::try_from(item_index).context("thread-view item index exceeds SQLite")?,
+                serde_json::to_string(&persisted)?,
+                i64::from(materialized.turn_start),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_materialized_thread_items(
+    conn: &Connection,
+    thread_id: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<ThreadViewItem>> {
+    if start >= end {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT item FROM thread_view_items
+         WHERE thread_id = ?1 AND item_index >= ?2 AND item_index < ?3
+         ORDER BY item_index",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            thread_id,
+            i64::try_from(start).context("thread-view start exceeds SQLite")?,
+            i64::try_from(end).context("thread-view end exceeds SQLite")?
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn materialized_thread_turn_boundary(
+    conn: &Connection,
+    thread_id: &str,
+    at_or_before: u64,
+) -> Result<Option<u64>> {
+    conn.query_row(
+        "SELECT item_index FROM thread_view_items
+         WHERE thread_id = ?1 AND turn_start = 1 AND item_index <= ?2
+         ORDER BY item_index DESC LIMIT 1",
+        params![
+            thread_id,
+            i64::try_from(at_or_before).context("thread-view boundary exceeds SQLite")?
+        ],
+        |row| Ok(row.get::<_, i64>(0)? as u64),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Expand a requested backward page to the beginning of its oldest turn.
+/// The web renderer virtualizes complete turns; splitting one across pages
+/// would mutate the visible row when the preceding page is prepended.
+fn thread_view_page_start(
+    conn: &Connection,
+    thread_id: &str,
+    requested_start: u64,
+    materialized: u64,
+    live_turn_starts: &[bool],
+) -> Result<u64> {
+    if requested_start == 0 {
+        return Ok(0);
+    }
+    if requested_start >= materialized {
+        let relative = usize::try_from(requested_start - materialized)
+            .context("live thread-view boundary exceeds memory")?;
+        if let Some(boundary) = live_turn_starts
+            .get(..=relative.min(live_turn_starts.len().saturating_sub(1)))
+            .and_then(|items| items.iter().rposition(|turn_start| *turn_start))
+        {
+            return Ok(materialized + boundary as u64);
+        }
+        if materialized == 0 {
+            return Ok(0);
+        }
+        return Ok(
+            materialized_thread_turn_boundary(conn, thread_id, materialized - 1)?.unwrap_or(0),
+        );
+    }
+    Ok(materialized_thread_turn_boundary(conn, thread_id, requested_start)?.unwrap_or(0))
 }
 
 fn update_thread_view_caches(
@@ -1768,6 +3560,8 @@ fn update_thread_view_caches(
                 event,
             });
         }
+        let (item_start, completed_items) = projection.take_materializable_prefix();
+        persist_materialized_thread_items(tx, &thread_id, item_start, completed_items)?;
         tx.execute(
             "UPDATE thread_view_cache
              SET cursor = ?2, schema_version = ?3, state = ?4
@@ -1793,9 +3587,34 @@ fn serialize_events(scope: Scope, events: Vec<Event>) -> Result<Vec<PendingEvent
                 ts: now,
                 payload: serde_json::to_string(&event)?,
                 event,
+                mutation: None,
             })
         })
         .collect()
+}
+
+fn serialize_lifecycle_events(
+    events: Vec<(Scope, Event)>,
+    mutation: StoreMutation,
+) -> Result<Vec<PendingEvent>> {
+    let now = chrono::Utc::now();
+    let mut pending = events
+        .into_iter()
+        .map(|(scope, event)| {
+            Ok(PendingEvent {
+                scope,
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = pending
+        .first_mut()
+        .context("a lifecycle mutation requires at least one source event")?;
+    first.mutation = Some(mutation);
+    Ok(pending)
 }
 
 impl Store {
@@ -1817,7 +3636,11 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
-        Ok(Self::from_conn(conn))
+        let writer_conn = Connection::open(path)
+            .with_context(|| format!("opening event-writer database {}", path.display()))?;
+        writer_conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        writer_conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self::from_connections(conn, Some(writer_conn)))
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -1831,15 +3654,18 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
-        Ok(Self::from_conn(conn))
+        Ok(Self::from_connections(conn, None))
     }
 
-    fn from_conn(conn: Connection) -> Self {
+    fn from_connections(conn: Connection, writer_conn: Option<Connection>) -> Self {
         let conn = Arc::new(Mutex::new(conn));
         let (events_tx, _) = broadcast::channel(4096);
         let scoped_events = Arc::new(Mutex::new(HashMap::new()));
         let append_tx = spawn_event_writer(
-            Arc::clone(&conn),
+            writer_conn.map_or_else(
+                || EventWriterConnection::Shared(Arc::clone(&conn)),
+                EventWriterConnection::Dedicated,
+            ),
             events_tx.clone(),
             Arc::clone(&scoped_events),
         );
@@ -1862,17 +3688,32 @@ impl Store {
     /// other on the connection mutex. This call still waits for durability:
     /// it returns once the batch containing this event has committed.
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
+        let mut envelopes = self.append_pending_events(serialize_events(scope, vec![event])?)?;
+        Ok(envelopes.pop().expect("single append returns one event"))
+    }
+
+    /// Persist a same-scope batch synchronously. Use this for cancellation
+    /// guards whose lifecycle must not be split after enqueue by dropping an
+    /// async future.
+    pub fn append_events(&self, scope: Scope, events: Vec<Event>) -> Result<Vec<EventEnvelope>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.append_pending_events(serialize_events(scope, events)?)
+    }
+
+    fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
-                events: serialize_events(scope, vec![event])?,
+                events,
                 reply: AppendReply::Sync(reply),
+                queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
-        let mut envelopes = reply_rx
+        reply_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))??;
-        Ok(envelopes.pop().expect("single append returns one event"))
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
     }
 
     /// Persist a same-scope batch without blocking a Tokio worker thread.
@@ -1892,11 +3733,19 @@ impl Store {
             .send(AppendRequest {
                 events: serialize_events(scope, events)?,
                 reply: AppendReply::Async(reply),
+                queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+    }
+
+    /// Persist one event without blocking a Tokio worker thread, while
+    /// retaining the same commit-before-return guarantee as `append_event`.
+    pub async fn append_event_async(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
+        let mut envelopes = self.append_events_async(scope, vec![event]).await?;
+        Ok(envelopes.pop().expect("single append returns one event"))
     }
 
     /// Newest persisted cursor for `scope`, or zero when the scope is empty.
@@ -1921,19 +3770,47 @@ impl Store {
         thread_id: &str,
         before: Option<u64>,
         limit: usize,
+        turn_aligned: bool,
     ) -> Result<(u64, ThreadViewSnapshot)> {
-        let (mut projection, cache_valid, rows) = {
+        self.thread_view_snapshot_with_retries(
+            thread_id,
+            before,
+            limit,
+            turn_aligned,
+            THREAD_VIEW_CACHE_RACE_RETRIES,
+        )
+    }
+
+    fn thread_view_snapshot_with_retries(
+        &self,
+        thread_id: &str,
+        before: Option<u64>,
+        limit: usize,
+        turn_aligned: bool,
+        retries_remaining: usize,
+    ) -> Result<(u64, ThreadViewSnapshot)> {
+        let (mut projection, cache_valid, observed_cache, rows) = {
             let conn = self.conn.lock().unwrap();
             let cached = conn
                 .query_row(
-                    "SELECT schema_version, state FROM thread_view_cache WHERE thread_id = ?1",
+                    "SELECT cursor, schema_version, state FROM thread_view_cache
+                     WHERE thread_id = ?1",
                     params![thread_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .optional()?;
+            let observed_cache = cached
+                .as_ref()
+                .map(|(cursor, version, _)| (*cursor, *version));
             let mut cache_valid = false;
             let projection: ThreadProjection = cached
-                .and_then(|(version, state)| {
+                .and_then(|(_, version, state)| {
                     (version == THREAD_VIEW_SCHEMA_VERSION)
                         .then(|| serde_json::from_str(&state).ok())
                         .flatten()
@@ -1965,6 +3842,7 @@ impl Store {
             (
                 projection,
                 cache_valid,
+                observed_cache,
                 rows.collect::<rusqlite::Result<Vec<_>>>()?,
             )
         };
@@ -1991,12 +3869,53 @@ impl Store {
                 event,
             });
         }
+        let (item_start, completed_items) = projection.take_materializable_prefix();
         if needs_write {
             projection.snapshot.item_offset = 0;
             projection.snapshot.total_items = 0;
             projection.snapshot.has_older = false;
             let state = serde_json::to_string(&projection)?;
-            self.conn.lock().unwrap().execute(
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            let current_cache = tx
+                .query_row(
+                    "SELECT cursor, schema_version FROM thread_view_cache WHERE thread_id = ?1",
+                    params![thread_id],
+                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let cache_advanced = current_cache != observed_cache
+                && current_cache.is_some_and(|(cursor, version)| {
+                    cursor > projection.cursor
+                        || (cursor == projection.cursor && version == THREAD_VIEW_SCHEMA_VERSION)
+                });
+            if cache_advanced {
+                tx.commit()?;
+                drop(conn);
+                anyhow::ensure!(
+                    retries_remaining > 0,
+                    "thread-view cache kept advancing while building snapshot"
+                );
+                return self.thread_view_snapshot_with_retries(
+                    thread_id,
+                    before,
+                    limit,
+                    turn_aligned,
+                    retries_remaining - 1,
+                );
+            }
+            if !cache_valid {
+                tx.execute(
+                    "DELETE FROM thread_view_items WHERE thread_id = ?1",
+                    params![thread_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM thread_tool_details WHERE thread_id = ?1",
+                    params![thread_id],
+                )?;
+            }
+            persist_materialized_thread_items(&tx, thread_id, item_start, completed_items)?;
+            tx.execute(
                 "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(thread_id) DO UPDATE SET
@@ -2011,20 +3930,111 @@ impl Store {
                     state
                 ],
             )?;
+            tx.commit()?;
         }
+        let cursor = projection.cursor;
+        let materialized = projection.materialized_items();
+        let total = projection.total_items();
+        let end = before.unwrap_or(total).min(total);
+        let requested_start = end.saturating_sub(u64::try_from(limit.max(1)).unwrap_or(u64::MAX));
+        let (start, mut items) = {
+            let conn = self.conn.lock().unwrap();
+            let start = if turn_aligned {
+                thread_view_page_start(
+                    &conn,
+                    thread_id,
+                    requested_start,
+                    materialized,
+                    projection.live_turn_starts(),
+                )?
+            } else {
+                requested_start
+            };
+            let items = load_materialized_thread_items(
+                &conn,
+                thread_id,
+                start.min(materialized),
+                end.min(materialized),
+            )?;
+            (start, items)
+        };
+        if end > materialized {
+            let tail_start = start.saturating_sub(materialized) as usize;
+            let tail_end = end.saturating_sub(materialized) as usize;
+            items.extend_from_slice(&projection.snapshot.items[tail_start..tail_end]);
+        }
+        anyhow::ensure!(
+            items.len() as u64 == end.saturating_sub(start),
+            "materialized thread-view page is not contiguous"
+        );
         let mut snapshot = projection.snapshot;
-        let total = snapshot.items.len();
-        let end = before
-            .and_then(|offset| usize::try_from(offset).ok())
-            .unwrap_or(total)
-            .min(total);
-        let start = end.saturating_sub(limit.max(1));
-        let items = snapshot.items.drain(start..end).collect();
         snapshot.items = items;
-        snapshot.item_offset = start as u64;
-        snapshot.total_items = total as u64;
+        snapshot.item_offset = start;
+        snapshot.total_items = total;
         snapshot.has_older = start > 0;
-        Ok((projection.cursor, snapshot))
+        Ok((cursor, snapshot))
+    }
+
+    /// Load the full payload for one completed historical tool call. The
+    /// thread event log remains authoritative; this row is a rebuildable
+    /// projection used only to avoid embedding large payloads in every page.
+    pub fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<Option<ThreadToolDetails>> {
+        let conn = self.conn.lock().unwrap();
+        let encoded = conn
+            .query_row(
+                "SELECT args, result FROM thread_tool_details
+                 WHERE thread_id = ?1 AND call_id = ?2",
+                params![thread_id, call_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        encoded
+            .map(|(args, result)| {
+                Ok(ThreadToolDetails {
+                    call_id: call_id.to_string(),
+                    args: serde_json::from_str(&args)?,
+                    result: result
+                        .map(|result| serde_json::from_str(&result))
+                        .transpose()?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Atomic session-summary snapshot. The cursor and rows share one SQLite
+    /// read transaction, so an update is either present in both or replayed
+    /// from `/v1/events` after this cursor—never missed between two reads.
+    pub fn session_summaries_snapshot(&self) -> Result<SessionSummariesSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let cursor = tx
+            .query_row(
+                "SELECT MAX(cursor) FROM events
+                 WHERE scope_kind = 'server' AND scope_id = ''",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(0) as u64;
+        let session_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id FROM session_summaries
+                 ORDER BY archived, updated_at DESC, session_id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut summaries = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if let Some(summary) = session_summary(&tx, &session_id)? {
+                summaries.push(summary);
+            }
+        }
+        tx.commit()?;
+        Ok(SessionSummariesSnapshot { summaries, cursor })
     }
 
     /// Read at most `limit` persisted rows in `(after, through]`.
@@ -2123,13 +4133,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Most recently persisted account PR snapshot for `host`.
+    /// Most recently persisted account PR snapshot event for `host`.
     ///
     /// The scan runs newest-first in bounded pages and stops at the first
     /// matching host. Payloads are decoded after releasing the SQLite
     /// connection mutex so a cold or missing host cannot block unrelated
     /// store operations for the full server history.
-    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+    pub fn latest_github_pr_snapshot_event(&self, host: &str) -> Result<Option<EventEnvelope>> {
         const PAGE_SIZE: usize = 64;
 
         let mut before = i64::MAX;
@@ -2137,12 +4147,16 @@ impl Store {
             let page = {
                 let conn = self.conn.lock().unwrap();
                 let mut stmt = conn.prepare(
-                    "SELECT cursor, payload FROM events
+                    "SELECT cursor, ts, payload FROM events
                      WHERE scope_kind = 'server' AND scope_id = '' AND cursor < ?1
                      ORDER BY cursor DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![before, PAGE_SIZE as i64], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 let mut page = Vec::new();
                 for row in rows {
@@ -2150,25 +4164,41 @@ impl Store {
                 }
                 page
             };
-            let Some((oldest, _)) = page.last() else {
+            let Some((oldest, _, _)) = page.last() else {
                 return Ok(None);
             };
             before = *oldest;
             let exhausted = page.len() < PAGE_SIZE;
-            for (_, payload) in page {
-                let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
-                    serde_json::from_str::<Event>(&payload)
-                else {
+            for (cursor, ts, payload) in page {
+                let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                    continue;
+                };
+                let Event::GithubPullRequestsUpdated { pull_requests } = &event else {
                     continue;
                 };
                 if pull_requests.host.eq_ignore_ascii_case(host) {
-                    return Ok(Some(pull_requests));
+                    return Ok(Some(EventEnvelope {
+                        cursor: cursor as u64,
+                        scope: Scope::Server,
+                        ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                        event,
+                    }));
                 }
             }
             if exhausted {
                 return Ok(None);
             }
         }
+    }
+
+    /// Most recently persisted account PR replacement payload for `host`.
+    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+        Ok(self
+            .latest_github_pr_snapshot_event(host)?
+            .and_then(|envelope| match envelope.event {
+                Event::GithubPullRequestsUpdated { pull_requests } => Some(pull_requests),
+                _ => None,
+            }))
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -2280,13 +4310,24 @@ impl Store {
     // --- sessions -----------------------------------------------------------
 
     pub fn insert_session(&self, s: &Session) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO sessions (id, workspace_id, title, branch, worktree_path, base_ref, archived, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![s.id, s.workspace_id, s.title, s.branch, s.worktree_path, s.base_ref,
-                    s.archived, s.created_at.to_rfc3339()],
-        )?;
-        Ok(())
+        insert_session_row(&self.conn.lock().unwrap(), s)
+    }
+
+    /// Persist a newly created session, its pristine checkpoint, and every
+    /// initial lifecycle event in the event writer's one transaction.
+    pub(crate) fn insert_session_with_lifecycle(
+        &self,
+        session: &Session,
+        initial_checkpoint: &CheckpointRow,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events(serialize_lifecycle_events(
+            events,
+            StoreMutation::Insert {
+                session: Box::new(session.clone()),
+                initial_checkpoint: Box::new(initial_checkpoint.clone()),
+            },
+        )?)
     }
 
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
@@ -2336,62 +4377,353 @@ impl Store {
         title: Option<&str>,
         archived: Option<bool>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(title) = title {
-            conn.execute(
-                "UPDATE sessions SET title = ?2 WHERE id = ?1",
-                params![id, title],
-            )?;
-        }
-        if let Some(archived) = archived {
-            conn.execute(
-                "UPDATE sessions SET archived = ?2 WHERE id = ?1",
-                params![id, archived],
-            )?;
-        }
-        Ok(())
+        update_session_row(&self.conn.lock().unwrap(), id, title, archived)
+    }
+
+    /// Rename/archive and append the lifecycle source event atomically.
+    pub(crate) fn update_session_with_event(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        archived: Option<bool>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::Update {
+                id: id.to_string(),
+                title: title.map(str::to_owned),
+                archived,
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         // One transaction so a failure can't leave a half-deleted session.
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
-             OR (scope_kind = 'thread' AND scope_id IN (SELECT id FROM threads WHERE session_id = ?1))",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM backend_sessions WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM queued_prompts WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
-        tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
-        // attachments and spawned_threads both FK to threads(id); with
-        // foreign_keys=ON, deleting threads while these rows exist fails the
-        // whole transaction. Any session that ever took an attachment or used
-        // spawn_thread/spawn_session hit this, leaving a session the engine
-        // had already removed from disk still present in the DB.
-        tx.execute(
-            "DELETE FROM attachments WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM spawned_threads WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
-             OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        delete_session_rows(&tx, id)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete relational/session-scoped state and append the server tombstone
+    /// source event atomically before any filesystem cleanup begins.
+    pub(crate) fn delete_session_with_event(
+        &self,
+        id: &str,
+        cleanup: ArtifactCleanupJob,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::Delete {
+                id: id.to_string(),
+                cleanup: Box::new(cleanup),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
+    }
+
+    pub(crate) fn stage_attachment_cleanup(
+        &self,
+        attachment_paths: Vec<String>,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        if attachment_paths.is_empty() {
+            return Ok(None);
+        }
+        let mut job = ArtifactCleanupJob::attachments(attachment_paths);
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+        // The preparing request owns this job. A crashed request releases it
+        // automatically when the bounded lease expires.
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES))
+        .to_rfc3339();
+        let claim_token = uuid::Uuid::new_v4().simple().to_string();
+        tx.execute(
+            "UPDATE artifact_cleanup_jobs
+             SET claim_until = ?2, claim_token = ?3 WHERE id = ?1",
+            params![job.id, claim_until, claim_token],
+        )?;
+        tx.commit()?;
+        job.claim_token = Some(claim_token);
+        Ok(Some(job))
+    }
+
+    pub(crate) fn claim_artifact_cleanup_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        self.claim_artifact_cleanup_job_where(Some(id))
+    }
+
+    pub(crate) fn claim_next_artifact_cleanup_job(&self) -> Result<Option<ArtifactCleanupJob>> {
+        self.claim_artifact_cleanup_job_where(None)
+    }
+
+    fn claim_artifact_cleanup_job_where(
+        &self,
+        requested_id: Option<&str>,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
+        for _ in 0..MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM {
+            let raw: Option<RawArtifactCleanupJob> = if let Some(id) = requested_id {
+                tx.query_row(
+                    "SELECT rowid,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128 THEN id END,
+                            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3 THEN kind END,
+                            CASE WHEN session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?3) THEN session_id END,
+                            CASE WHEN worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?3) THEN worktree_path END,
+                            CASE WHEN repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?3) THEN repository_path END,
+                            CASE WHEN typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?4 THEN attachment_paths END,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128
+                                   AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3
+                                   AND (session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?3))
+                                   AND (worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?3))
+                                   AND (repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?3))
+                                   AND typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?4
+                                   AND typeof(attempts) = 'integer' AND attempts >= 0
+                                   AND (claim_until IS NULL OR (typeof(claim_until) = 'text'
+                                        AND length(CAST(claim_until AS BLOB)) <= ?5
+                                        AND instr(claim_until, 'T') = 11
+                                        AND julianday(claim_until) IS NOT NULL))
+                                   AND (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'
+                                        AND length(CAST(next_attempt_at AS BLOB)) <= ?5
+                                        AND instr(next_attempt_at, 'T') = 11
+                                        AND julianday(next_attempt_at) IS NOT NULL))
+                                 THEN 1 ELSE 0 END
+                     FROM artifact_cleanup_jobs
+                     WHERE id = ?1
+                       AND (claim_until IS NULL
+                            OR typeof(claim_until) != 'text'
+                            OR length(CAST(claim_until AS BLOB)) > ?5
+                            OR instr(claim_until, 'T') != 11
+                            OR julianday(claim_until) IS NULL
+                            OR julianday(claim_until) <= julianday(?2))
+                       AND (next_attempt_at IS NULL
+                            OR typeof(next_attempt_at) != 'text'
+                            OR length(CAST(next_attempt_at AS BLOB)) > ?5
+                            OR instr(next_attempt_at, 'T') != 11
+                            OR julianday(next_attempt_at) IS NULL
+                            OR julianday(next_attempt_at) <= julianday(?2))",
+                    params![id, now, MAX_ARTIFACT_CLEANUP_METADATA_BYTES as i64, MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES as i64, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+                    raw_artifact_cleanup_job,
+                )
+                .optional()?
+            } else {
+                tx.query_row(
+                    "SELECT rowid,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128 THEN id END,
+                            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?2 THEN kind END,
+                            CASE WHEN session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?2) THEN session_id END,
+                            CASE WHEN worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?2) THEN worktree_path END,
+                            CASE WHEN repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?2) THEN repository_path END,
+                            CASE WHEN typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?3 THEN attachment_paths END,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128
+                                   AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?2
+                                   AND (session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?2))
+                                   AND (worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?2))
+                                   AND (repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?2))
+                                   AND typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?3
+                                   AND typeof(attempts) = 'integer' AND attempts >= 0
+                                   AND (claim_until IS NULL OR (typeof(claim_until) = 'text'
+                                        AND length(CAST(claim_until AS BLOB)) <= ?4
+                                        AND instr(claim_until, 'T') = 11
+                                        AND julianday(claim_until) IS NOT NULL))
+                                   AND (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'
+                                        AND length(CAST(next_attempt_at AS BLOB)) <= ?4
+                                        AND instr(next_attempt_at, 'T') = 11
+                                        AND julianday(next_attempt_at) IS NOT NULL))
+                                 THEN 1 ELSE 0 END
+                     FROM artifact_cleanup_jobs
+                     WHERE (claim_until IS NULL
+                            OR typeof(claim_until) != 'text'
+                            OR length(CAST(claim_until AS BLOB)) > ?4
+                            OR instr(claim_until, 'T') != 11
+                            OR julianday(claim_until) IS NULL
+                            OR julianday(claim_until) <= julianday(?1))
+                       AND (next_attempt_at IS NULL
+                            OR typeof(next_attempt_at) != 'text'
+                            OR length(CAST(next_attempt_at AS BLOB)) > ?4
+                            OR instr(next_attempt_at, 'T') != 11
+                            OR julianday(next_attempt_at) IS NULL
+                            OR julianday(next_attempt_at) <= julianday(?1))
+                     ORDER BY created_at, id LIMIT 1",
+                    params![now, MAX_ARTIFACT_CLEANUP_METADATA_BYTES as i64, MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES as i64, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+                    raw_artifact_cleanup_job,
+                )
+                .optional()?
+            };
+            let Some((
+                rowid,
+                id,
+                kind,
+                session_id,
+                worktree_path,
+                repository_path,
+                paths_json,
+                metadata_is_valid,
+            )) = raw
+            else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let decoded = if metadata_is_valid {
+                id.zip(kind)
+                    .zip(paths_json)
+                    .ok_or_else(|| anyhow::anyhow!("cleanup metadata exceeds its decode limit"))
+                    .and_then(|((id, kind), paths_json)| {
+                        decode_artifact_cleanup_job(
+                            id,
+                            kind,
+                            session_id,
+                            worktree_path,
+                            repository_path,
+                            paths_json,
+                        )
+                    })
+            } else {
+                Err(anyhow::anyhow!(
+                    "cleanup metadata has an invalid SQLite type or exceeds its decode limit"
+                ))
+            };
+            let mut job = match decoded {
+                Ok(job) => job,
+                Err(error) => {
+                    let error = format!("malformed durable cleanup intent: {error:#}");
+                    let next_attempt_at = (now_at + chrono::Duration::minutes(10)).to_rfc3339();
+                    tx.execute(
+                        "UPDATE artifact_cleanup_jobs
+                         SET attempts = CASE
+                               WHEN typeof(attempts) = 'integer'
+                                    AND attempts >= 0
+                                    AND attempts < 9223372036854775807
+                                 THEN attempts + 1 ELSE 1 END,
+                             last_error = ?2,
+                             next_attempt_at = ?3, claim_until = NULL, claim_token = NULL
+                         WHERE rowid = ?1",
+                        params![rowid, error, next_attempt_at],
+                    )?;
+                    tracing::warn!(cleanup_rowid = rowid, %error, "quarantined malformed artifact cleanup job");
+                    if requested_id.is_some() {
+                        tx.commit()?;
+                        return Ok(None);
+                    }
+                    continue;
+                }
+            };
+            let claim_until =
+                (now_at + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES)).to_rfc3339();
+            let claim_token = uuid::Uuid::new_v4().simple().to_string();
+            let claimed = tx.execute(
+                "UPDATE artifact_cleanup_jobs
+                 SET claim_until = ?2, claim_token = ?3
+                 WHERE id = ?1
+                   AND (claim_until IS NULL OR julianday(claim_until) <= julianday(?4))
+                   AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))",
+                params![&job.id, claim_until, claim_token, now],
+            )?;
+            if claimed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            job.claim_token = Some(claim_token);
+            tx.commit()?;
+            return Ok(Some(job));
+        }
+        tx.commit()?;
+        Ok(None)
+    }
+
+    pub(crate) fn renew_artifact_cleanup_claim(
+        &self,
+        claim: &ArtifactCleanupClaim,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES))
+        .to_rfc3339();
+        Ok(conn.execute(
+            "UPDATE artifact_cleanup_jobs SET claim_until = ?3
+             WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, claim_until],
+        )? == 1)
+    }
+
+    pub(crate) fn complete_claimed_artifact_cleanup_job(
+        &self,
+        claim: &ArtifactCleanupClaim,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "artifact cleanup claim {} is no longer owned",
+            claim.id
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fail_claimed_artifact_cleanup_job(
+        &self,
+        claim: &ArtifactCleanupClaim,
+        error: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let attempts = conn
+            .query_row(
+                "SELECT CASE
+                          WHEN typeof(attempts) = 'integer' AND attempts >= 0
+                            THEN attempts END
+                   FROM artifact_cleanup_jobs
+                 WHERE id = ?1 AND claim_token = ?2",
+                params![claim.id, claim.token],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .context("artifact cleanup claim is no longer owned")?
+            .unwrap_or(0);
+        let delay_seconds = match attempts {
+            0 => 1,
+            1 => 5,
+            2 => 30,
+            3 => 120,
+            _ => 600,
+        };
+        let next_attempt_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
+        let updated = conn.execute(
+            "UPDATE artifact_cleanup_jobs
+             SET attempts = CASE
+                   WHEN typeof(attempts) = 'integer'
+                        AND attempts >= 0
+                        AND attempts < 9223372036854775807
+                     THEN attempts + 1 ELSE 1 END,
+                 last_error = ?3,
+                 next_attempt_at = ?4, claim_until = NULL, claim_token = NULL
+             WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, error, next_attempt_at],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "artifact cleanup claim {} is no longer owned",
+            claim.id
+        );
         Ok(())
     }
 
@@ -2402,21 +4734,51 @@ impl Store {
         t: &Thread,
         model_options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO threads
-                (id, session_id, mode, model, permission_mode, model_options, todos, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                t.id,
-                t.session_id,
-                t.mode,
-                t.model,
-                permission_mode_str(t.permission_mode),
-                serde_json::to_string(model_options)?,
-                serde_json::to_string(&t.todos)?,
-                t.created_at.to_rfc3339()
-            ],
+        insert_thread_row(&self.conn.lock().unwrap(), t, model_options)
+    }
+
+    /// Insert a thread (and optional spawn edge) together with its durable
+    /// creation edge. Parent ownership is validated in the same transaction.
+    pub(crate) fn insert_thread_with_event(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::InsertThread {
+                thread: Box::new(thread.clone()),
+                model_options: model_options.clone(),
+                spawn: spawn.map(|(parent, kind)| (parent.to_string(), kind.to_string())),
+            },
         )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
+    }
+
+    /// Insert a spawned thread and its parent edge in one transaction. A
+    /// concurrent reader can therefore never cache the child as an ordinary
+    /// root thread between the two writes.
+    pub fn insert_spawned_thread(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        parent: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        insert_thread_row(&tx, thread, model_options)?;
+        tx.execute(
+            "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
+             VALUES (?1, ?2, ?3)",
+            params![thread.id, parent, kind],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2453,6 +4815,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn list_thread_statuses(&self, session_id: &str) -> Result<Vec<ThreadStatus>> {
+        let conn = self.conn.lock().unwrap();
+        thread_statuses(&conn, session_id)
+    }
+
     /// Update thread settings between turns. `None` fields are unchanged.
     pub fn update_thread(
         &self,
@@ -2462,32 +4829,39 @@ impl Store {
         model_options: Option<&serde_json::Map<String, serde_json::Value>>,
         permission_mode: Option<PermissionMode>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(mode) = mode {
-            conn.execute(
-                "UPDATE threads SET mode = ?2 WHERE id = ?1",
-                params![id, mode],
-            )?;
-        }
-        if let Some(model) = model {
-            conn.execute(
-                "UPDATE threads SET model = ?2 WHERE id = ?1",
-                params![id, model],
-            )?;
-        }
-        if let Some(options) = model_options {
-            conn.execute(
-                "UPDATE threads SET model_options = ?2 WHERE id = ?1",
-                params![id, serde_json::to_string(options)?],
-            )?;
-        }
-        if let Some(pm) = permission_mode {
-            conn.execute(
-                "UPDATE threads SET permission_mode = ?2 WHERE id = ?1",
-                params![id, permission_mode_str(pm)],
-            )?;
-        }
-        Ok(())
+        update_thread_row(
+            &self.conn.lock().unwrap(),
+            id,
+            mode,
+            model,
+            model_options,
+            permission_mode,
+        )
+    }
+
+    pub(crate) fn update_thread_with_event(
+        &self,
+        id: &str,
+        mode: Option<&str>,
+        model: Option<&str>,
+        model_options: Option<&serde_json::Map<String, serde_json::Value>>,
+        permission_mode: Option<PermissionMode>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::UpdateThread {
+                id: id.to_string(),
+                mode: mode.map(str::to_owned),
+                model: model.map(str::to_owned),
+                model_options: model_options.cloned(),
+                permission_mode,
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     /// Replace the current todo snapshot for exactly one thread.
@@ -2501,8 +4875,8 @@ impl Store {
 
     // --- spawned threads --------------------------------------------------
     // Parentage of agent-spawned children (spawn_thread / spawn_session
-    // tools): drives the depth guard (children don't spawn grandchildren)
-    // and the concurrency cap.
+    // tools): drives bounded recursive delegation, hierarchy projections,
+    // and per-parent/per-tree concurrency caps.
 
     pub fn insert_spawned(&self, child: &str, parent: &str, kind: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -2532,6 +4906,82 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every descendant below `parent`, loaded in one recursive query. `UNION`
+    /// bounds corrupt cycles and deduplicates children with malformed legacy
+    /// parentage instead of turning hierarchy reads into unbounded N+1 walks.
+    pub fn spawned_descendants(&self, parent: &str) -> Result<Vec<Thread>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "WITH RECURSIVE descendant_ids(id) AS (
+                 SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN descendant_ids parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT {THREAD_COLUMNS} FROM threads
+             WHERE id IN (SELECT id FROM descendant_ids)
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map(params![parent], row_to_thread)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Aggregate usage for a spawned subtree (the root plus all descendants)
+    /// without one usage query per historical child.
+    pub fn spawned_subtree_usage(&self, root: &str) -> Result<trouve_protocol::UsageSummary> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "WITH RECURSIVE subtree(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN subtree parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM usage WHERE thread_id IN (SELECT id FROM subtree)",
+            params![root],
+            |row| {
+                Ok(trouve_protocol::UsageSummary {
+                    turns: row.get::<_, i64>(0)? as u64,
+                    input_tokens: row.get::<_, i64>(1)? as u64,
+                    output_tokens: row.get::<_, i64>(2)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(3)? as u64,
+                    cost_usd: row.get(4)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    /// Failed descendants in one subtree. The root's own detailed error is
+    /// folded from its event log by the caller; descendant status is enough to
+    /// prevent a failed nested worker from being reported as overall success.
+    pub fn failed_spawned_descendants(&self, root: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendant_ids(id) AS (
+                 SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1
+                 UNION
+                 SELECT spawned.child_thread_id
+                 FROM spawned_threads spawned
+                 JOIN descendant_ids parent ON spawned.parent_thread_id = parent.id
+             )
+             SELECT statuses.thread_id
+             FROM thread_statuses statuses
+             WHERE statuses.thread_id IN (SELECT id FROM descendant_ids)
+               AND statuses.last_outcome = 'failed'
+             ORDER BY statuses.thread_id",
+        )?;
+        let rows = stmt.query_map(params![root], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Atomically claim the next turn number for a thread.
     pub fn last_turn(&self, thread_id: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
@@ -2555,6 +5005,37 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(turn as u64)
+    }
+
+    /// Persist prompt acceptance, its attachment index rows, the optional
+    /// dispatcher claim/turn allocation, and every resulting durable event in
+    /// the event writer's single transaction. Callers construct the visible
+    /// queue and turn shell while holding the engine's queue/activity locks.
+    pub(crate) fn accept_prompt_with_events(
+        &self,
+        acceptance: PromptAcceptance,
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let PromptAcceptance {
+            prompt,
+            tools_enabled,
+            attachments,
+            claim_prompt_id,
+            expected_previous_turn,
+            staging_cleanup_claim,
+        } = acceptance;
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::AcceptPrompt {
+                prompt: Box::new(prompt),
+                tools_enabled,
+                attachments,
+                claim_prompt_id,
+                expected_previous_turn,
+                staging_cleanup_claim,
+            },
+        )?;
+        self.append_pending_events(pending)
     }
 
     // --- queued prompts -------------------------------------------------------
@@ -2620,6 +5101,16 @@ impl Store {
         )?)
     }
 
+    pub(crate) fn next_queued_prompt_position(&self, thread_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let position: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        Ok(position as u64)
+    }
+
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -2652,13 +5143,106 @@ impl Store {
     }
 
     /// Returns false when the prompt no longer exists (already dispatched).
-    pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
+    pub fn update_queued_prompt(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        let attachments_json = serde_json::to_string(attachments)?;
         let n = conn.execute(
-            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1 AND claimed = 0",
-            params![id, content],
+            "UPDATE queued_prompts
+             SET content = ?2, attachments = ?3
+             WHERE id = ?1 AND claimed = 0",
+            params![id, content, attachments_json],
         )?;
         Ok(n > 0)
+    }
+
+    /// Update a visible queued prompt while atomically indexing newly staged
+    /// attachments and removing rows for attachments no longer retained.
+    /// The returned paths are safe for filesystem cleanup only after commit.
+    pub(crate) fn update_queued_prompt_attachments(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+        added: &[(trouve_protocol::Attachment, String)],
+        removed_ids: &[String],
+        staging_cleanup_claim: Option<&ArtifactCleanupClaim>,
+    ) -> Result<Option<Option<ArtifactCleanupJob>>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some(thread_id) = tx
+            .query_row(
+                "SELECT thread_id FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        for (attachment, path) in added {
+            tx.execute(
+                "INSERT INTO attachments
+                   (id, thread_id, name, mime, size_bytes, path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    attachment.id,
+                    thread_id,
+                    attachment.name,
+                    attachment.mime,
+                    attachment.size_bytes as i64,
+                    path,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE queued_prompts SET content = ?2, attachments = ?3 WHERE id = ?1",
+            params![id, content, serde_json::to_string(attachments)?],
+        )?;
+
+        let mut removed_paths = Vec::with_capacity(removed_ids.len());
+        for attachment_id in removed_ids {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                )?;
+                removed_paths.push(path);
+            }
+        }
+        if let Some(claim) = staging_cleanup_claim {
+            let deleted = tx.execute(
+                "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                params![claim.id, claim.token],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "attachment staging claim {} is no longer owned",
+                claim.id
+            );
+        }
+        let cleanup = if removed_paths.is_empty() {
+            None
+        } else {
+            let job = ArtifactCleanupJob::attachments(removed_paths);
+            insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+            Some(job)
+        };
+        tx.commit()?;
+        Ok(Some(cleanup))
     }
 
     pub fn delete_queued_prompt(&self, id: &str) -> Result<bool> {
@@ -2668,6 +5252,59 @@ impl Store {
             params![id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Delete a visible queued prompt and every attachment-index row it owns
+    /// in one transaction. Returns the thread id and committed file paths for
+    /// post-transaction filesystem cleanup.
+    pub(crate) fn delete_queued_prompt_attachments(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Option<ArtifactCleanupJob>)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some((thread_id, attachments_json)) = tx
+            .query_row(
+                "SELECT thread_id, attachments FROM queued_prompts
+                 WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let attachments = parse_attachments(&attachments_json);
+        let mut paths = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment.id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment.id, thread_id],
+                )?;
+                paths.push(path);
+            }
+        }
+        tx.execute(
+            "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+            params![id],
+        )?;
+        let cleanup = if paths.is_empty() {
+            None
+        } else {
+            let job = ArtifactCleanupJob::attachments(paths);
+            insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+            Some(job)
+        };
+        tx.commit()?;
+        Ok(Some((thread_id, cleanup)))
     }
 
     /// Apply a full new order. `ids` must be exactly the thread's current
@@ -2698,6 +5335,64 @@ impl Store {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Move one visible prompt to the front in a single transaction and,
+    /// when requested, claim it for an idle dispatcher. Returns `None` when
+    /// the prompt no longer exists or another dispatcher already claimed it.
+    pub fn prioritize_queued_prompt(
+        &self,
+        id: &str,
+        claim: bool,
+    ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some(mut prompt) = tx
+            .query_row(
+                "SELECT thread_id, content, attachments, created_at
+                 FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |row| {
+                    Ok(trouve_protocol::QueuedPrompt {
+                        id: id.to_string(),
+                        thread_id: row.get(0)?,
+                        position: 0,
+                        content: row.get(1)?,
+                        attachments: parse_attachments(&row.get::<_, String>(2)?),
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM queued_prompts
+                 WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
+            )?;
+            let rows = stmt.query_map(params![prompt.thread_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ordered = std::iter::once(id.to_string())
+            .chain(ids.into_iter().filter(|candidate| candidate != id));
+        for (index, candidate) in ordered.enumerate() {
+            tx.execute(
+                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1 AND claimed = 0",
+                params![candidate, index as i64],
+            )?;
+        }
+        if claim {
+            tx.execute(
+                "UPDATE queued_prompts SET claimed = 1 WHERE id = ?1 AND claimed = 0",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        prompt.position = 0;
+        Ok(Some(prompt))
     }
 
     /// Hide and return the front prompt while a dispatcher prepares its
@@ -2785,6 +5480,37 @@ impl Store {
         Ok(())
     }
 
+    /// Remove steering attachments that were indexed before the backend
+    /// accepted the steering command. Restrict every id to the owning thread
+    /// so a malformed rollback cannot detach another prompt's upload.
+    pub fn remove_attachments(
+        &self,
+        thread_id: &str,
+        attachment_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let mut paths = Vec::with_capacity(attachment_ids.len());
+        for attachment_id in attachment_ids {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                )?;
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(paths)
+    }
+
     /// On-disk paths of every attachment belonging to a session's threads
     /// (for cleaning up the files when the session is deleted).
     pub fn session_attachment_paths(&self, session_id: &str) -> Result<Vec<String>> {
@@ -2825,9 +5551,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations (id, name, prompt, workspace_id, mode, model,
-                                      permission_mode, schedule, enabled, next_run_at,
-                                      last_run_at, last_session_id, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      thinking_level, permission_mode, schedule, enabled,
+                                      next_run_at, last_run_at, last_session_id, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 a.id,
                 a.name,
@@ -2835,6 +5561,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -2854,8 +5581,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
-                    model = ?6, permission_mode = ?7, schedule = ?8, enabled = ?9,
-                    next_run_at = ?10
+                    model = ?6, thinking_level = ?7, permission_mode = ?8, schedule = ?9,
+                    enabled = ?10, next_run_at = ?11
              WHERE id = ?1",
             params![
                 a.id,
@@ -2864,6 +5591,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                a.thinking_level,
                 permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
@@ -2917,8 +5645,8 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                    next_run_at, last_run_at, last_session_id, last_error, created_at
+            "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                    schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
              FROM automations ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], row_to_automation)?;
@@ -2933,8 +5661,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
-                        next_run_at, last_run_at, last_session_id, last_error, created_at
+                "SELECT id, name, prompt, workspace_id, mode, model, thinking_level, permission_mode,
+                        schedule, enabled, next_run_at, last_run_at, last_session_id, last_error, created_at
                  FROM automations WHERE id = ?1",
                 params![id],
                 row_to_automation,
@@ -5797,11 +8525,10 @@ impl Store {
     // --- usage accounting -------------------------------------------------------
 
     /// Record a turn's usage. `usage` totals are summed across the turn's
-    /// requests (correct for billing); `context_input_tokens` is the input
-    /// size of the turn's *last* request — the only meaningful proxy for the
-    /// current context size, since summing per-iteration inputs over a
-    /// multi-tool turn inflates the figure many-fold and spuriously trips
-    /// compaction.
+    /// requests (correct for billing); `context_input_tokens` is the
+    /// provider-authoritative context size for the turn's *last* request.
+    /// Summing per-iteration inputs over a multi-tool turn inflates the figure
+    /// many-fold and spuriously trips compaction.
     pub fn record_usage(
         &self,
         session_id: &str,
@@ -5829,9 +8556,10 @@ impl Store {
     }
 
     /// Context size (in tokens) of the thread's most recent turn: the last
-    /// request's input, used by the compaction trigger and the UI usage
-    /// indicator. Older rows recorded before this column existed report 0
-    /// (the caller falls back to a character estimate).
+    /// request's provider-authoritative measurement, used by the compaction
+    /// trigger and the UI usage indicator. Older rows recorded before this
+    /// column existed report 0 (the caller falls back to a character
+    /// estimate).
     pub fn last_input_tokens(&self, thread_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -5880,36 +8608,51 @@ impl Store {
         // inserting the checkpoint must be all-or-nothing, or a crash between
         // them loses the redo tail without recording the new checkpoint.
         let tx = conn.unchecked_transaction()?;
-        let undo_pos: Option<i64> = tx.query_row(
-            "SELECT undo_pos FROM sessions WHERE id = ?1",
-            params![row.session_id],
-            |r| r.get(0),
-        )?;
-        if let Some(pos) = undo_pos {
-            tx.execute(
-                "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
-                params![row.session_id, pos],
-            )?;
-            tx.execute(
-                "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
-                params![row.session_id],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4,
-                     (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
-                     ?5, ?6)",
-            params![
-                row.id,
-                row.session_id,
-                row.thread_id,
-                row.turn as i64,
-                row.commit_hash,
-                chrono::Utc::now().to_rfc3339()
-            ],
-        )?;
+        append_checkpoint_row(&tx, row, chrono::Utc::now())?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a checkpoint and its lifecycle event in the event writer's one
+    /// transaction. This keeps the relational undo stack and durable event
+    /// log in sync while concurrent threads are streaming events.
+    pub(crate) fn append_checkpoint_with_event(
+        &self,
+        row: &CheckpointRow,
+        scope: Scope,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::AppendCheckpoint {
+                checkpoint: Box::new(row.clone()),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one checkpoint event returns one envelope"))
+    }
+
+    pub(crate) fn append_event_with_message(
+        &self,
+        scope: Scope,
+        event: Event,
+        thread_id: &str,
+        payload: &serde_json::Value,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    ) -> Result<()> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::AppendMessage {
+                thread_id: thread_id.to_string(),
+                payload: payload.to_string(),
+                attachments,
+                staging_cleanup_claim,
+            },
+        )?;
+        self.append_pending_events(pending)?;
         Ok(())
     }
 
@@ -5925,6 +8668,27 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn checkpoint(&self, checkpoint_id: &str) -> Result<Option<CheckpointRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, session_id, thread_id, turn, seq, commit_hash FROM checkpoints
+             WHERE id = ?1",
+            params![checkpoint_id],
+            row_to_checkpoint,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn checkpoint_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement =
+            conn.prepare("SELECT id FROM checkpoints WHERE session_id = ?1 ORDER BY seq")?;
+        let rows = statement.query_map(params![session_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn latest_checkpoint_seq(&self, session_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
@@ -5932,6 +8696,20 @@ impl Store {
             params![session_id],
             |r| r.get::<_, Option<i64>>(0),
         )?)
+    }
+
+    /// Sequence the next checkpoint at the tip of the currently selected
+    /// undo branch. After an undo this deliberately reuses the first redo
+    /// sequence; the append transaction truncates that stale redo tail.
+    pub fn next_checkpoint_seq(&self, session_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let (latest, undo_pos) = conn.query_row(
+            "SELECT (SELECT MAX(seq) FROM checkpoints WHERE session_id = ?1), undo_pos
+             FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        Ok(undo_pos.unwrap_or(latest.unwrap_or(-1)) + 1)
     }
 
     pub fn undo_pos(&self, session_id: &str) -> Result<Option<i64>> {
@@ -5986,15 +8764,42 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-/// Columns matching `row_to_thread`, including the agent-spawned flag.
+/// Columns matching `row_to_thread`, including durable spawn parentage.
+fn insert_thread_row(
+    conn: &Connection,
+    thread: &Thread,
+    model_options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO threads
+            (id, session_id, title, mode, model, permission_mode, model_options, todos, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            thread.id,
+            thread.session_id,
+            thread.title,
+            thread.mode,
+            thread.model,
+            permission_mode_str(thread.permission_mode),
+            serde_json::to_string(model_options)?,
+            serde_json::to_string(&thread.todos)?,
+            thread.created_at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
      created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
-     todos";
+     todos, title, (SELECT st.parent_thread_id FROM spawned_threads st \
+       WHERE st.child_thread_id = threads.id LIMIT 1)";
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
         session_id: r.get(1)?,
+        parent_thread_id: r.get(10)?,
+        title: r.get(9)?,
         mode: r.get(2)?,
         model: r.get(3)?,
         permission_mode: permission_mode_from(&r.get::<_, String>(4)?),
@@ -6022,7 +8827,278 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trouve_protocol::Event;
+    use trouve_protocol::{Event, ToolStatus};
+
+    #[test]
+    fn event_writer_errors_preserve_sqlite_classification() {
+        let error = anyhow::Error::new(EventWriterError {
+            message: "database is locked".into(),
+            sqlite_code: Some(rusqlite::ErrorCode::DatabaseLocked),
+        });
+        assert_eq!(
+            event_writer_sqlite_error_code(&error),
+            Some(rusqlite::ErrorCode::DatabaseLocked)
+        );
+    }
+
+    #[test]
+    fn artifact_cleanup_claim_tokens_fence_stale_workers() {
+        let store = Store::open_in_memory().unwrap();
+        let staged = store
+            .stage_attachment_cleanup(vec!["/tmp/attachment".into()])
+            .unwrap()
+            .unwrap();
+        let staging_claim = staged.claim().unwrap();
+        assert!(store.renew_artifact_cleanup_claim(&staging_claim).unwrap());
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE artifact_cleanup_jobs SET claim_until = ?2 WHERE id = ?1",
+                params![staged.id, "1970-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        let reclaimed = store
+            .claim_artifact_cleanup_job(&staged.id)
+            .unwrap()
+            .unwrap();
+        let current_claim = reclaimed.claim().unwrap();
+        assert_ne!(current_claim.token, staging_claim.token);
+        assert!(!store.renew_artifact_cleanup_claim(&staging_claim).unwrap());
+        assert!(
+            store
+                .complete_claimed_artifact_cleanup_job(&staging_claim)
+                .is_err()
+        );
+        assert!(
+            store
+                .fail_claimed_artifact_cleanup_job(&staging_claim, "stale")
+                .is_err()
+        );
+        store
+            .complete_claimed_artifact_cleanup_job(&current_claim)
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_cleanup_row_does_not_starve_later_valid_job() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_json', 'attachments', '{not-json', '2000-01-01T00:00:00Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_blob', CAST(X'80' AS BLOB), '[]', '2000-01-01T00:00:01Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_integer', 42, 7, '2000-01-01T00:00:02Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, claim_until, created_at)
+             VALUES ('acj_poison_claim', 'attachments', '[]', CAST(X'80' AS BLOB),
+                     '2000-01-01T00:00:03Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, next_attempt_at, created_at)
+             VALUES ('acj_poison_backoff', 'attachments', '[]', 'not-a-timestamp',
+                     '2000-01-01T00:00:04Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, attempts, created_at)
+             VALUES ('acj_poison_attempts', 'attachments', '[]', CAST(X'80' AS BLOB),
+                     '2000-01-01T00:00:05Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, claim_until, created_at)
+             VALUES ('acj_future_claim', 'attachments', '[]', '2999-01-01T00:00:00Z',
+                     '2000-01-01T00:00:06Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, next_attempt_at, created_at)
+             VALUES ('acj_future_backoff', 'attachments', '[]', '2999-01-01T00:00:00Z',
+                     '2000-01-01T00:00:07Z');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT typeof(kind) FROM artifact_cleanup_jobs WHERE id = 'acj_poison_blob'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "blob"
+        );
+        drop(conn);
+        let valid = ArtifactCleanupJob::attachments(vec!["/tmp/valid".into()]);
+        insert_artifact_cleanup_job(&store.conn.lock().unwrap(), &valid, chrono::Utc::now())
+            .unwrap();
+
+        let claimed = store.claim_next_artifact_cleanup_job().unwrap().unwrap();
+        assert_eq!(claimed.id, valid.id);
+        assert!(claimed.claim_token.is_some());
+        for id in [
+            "acj_poison_json",
+            "acj_poison_blob",
+            "acj_poison_integer",
+            "acj_poison_claim",
+            "acj_poison_backoff",
+            "acj_poison_attempts",
+        ] {
+            let (attempts, last_error, next_attempt_at): (i64, Option<String>, Option<String>) =
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT attempts, last_error, next_attempt_at
+                     FROM artifact_cleanup_jobs WHERE id = ?1",
+                        params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(attempts, 1, "poisoned cleanup row {id} was not quarantined");
+            assert!(
+                last_error
+                    .unwrap()
+                    .contains("malformed durable cleanup intent")
+            );
+            assert!(next_attempt_at.is_some());
+        }
+        for id in ["acj_future_claim", "acj_future_backoff"] {
+            let (attempts, last_error): (i64, Option<String>) = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attempts, last_error FROM artifact_cleanup_jobs WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(attempts, 0, "valid future cleanup job {id} was modified");
+            assert!(last_error.is_none());
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_repairs_malformed_attempt_count() {
+        let store = Store::open_in_memory().unwrap();
+        let job = ArtifactCleanupJob::attachments(vec!["/tmp/retry".into()]);
+        insert_artifact_cleanup_job(&store.conn.lock().unwrap(), &job, chrono::Utc::now()).unwrap();
+        let claimed = store.claim_artifact_cleanup_job(&job.id).unwrap().unwrap();
+        let claim = claimed.claim().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE artifact_cleanup_jobs SET attempts = CAST(X'80' AS BLOB) WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        store
+            .fail_claimed_artifact_cleanup_job(&claim, "retry cleanup")
+            .unwrap();
+
+        let (attempt_type, attempts, claim_until, claim_token, next_attempt_at): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT typeof(attempts), attempts, claim_until, claim_token, next_attempt_at
+                   FROM artifact_cleanup_jobs WHERE id = ?1",
+                params![job.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(attempt_type, "integer");
+        assert_eq!(attempts, 1);
+        assert!(claim_until.is_none());
+        assert!(claim_token.is_none());
+        assert!(next_attempt_at.is_some());
+    }
+
+    #[test]
+    fn spawned_subtree_queries_include_nested_usage_and_failures() {
+        let store = Store::open_in_memory().unwrap();
+        for thread_id in ["root", "child", "grandchild"] {
+            seed_thread(&store, thread_id);
+        }
+        store.insert_spawned("child", "root", "thread").unwrap();
+        store
+            .insert_spawned("grandchild", "child", "thread")
+            .unwrap();
+        for (turn, thread_id, input_tokens) in
+            [(1, "root", 2), (1, "child", 3), (1, "grandchild", 5)]
+        {
+            store
+                .record_usage(
+                    "se_q",
+                    thread_id,
+                    turn,
+                    &trouve_protocol::Usage {
+                        input_tokens,
+                        output_tokens: 1,
+                        cached_input_tokens: 1,
+                        ..Default::default()
+                    },
+                    input_tokens + 1,
+                )
+                .unwrap();
+        }
+        store
+            .append_event(
+                Scope::Thread("grandchild".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "nested failure".into(),
+                },
+            )
+            .unwrap();
+
+        let descendant_ids = store
+            .spawned_descendants("root")
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            descendant_ids,
+            HashSet::from(["child".to_string(), "grandchild".to_string()])
+        );
+        let usage = store.spawned_subtree_usage("root").unwrap();
+        assert_eq!(usage.turns, 3);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(
+            store.failed_spawned_descendants("root").unwrap(),
+            vec!["grandchild".to_string()]
+        );
+    }
+
+    #[test]
+    fn compact_tool_argument_bounds_utf8_summary() {
+        let compact = compact_tool_argument(&serde_json::json!("🦀".repeat(400)), 0);
+        let text = compact.as_str().unwrap();
+        assert_eq!(text.chars().count(), 321);
+        assert!(text.ends_with('…'));
+        assert_eq!(text.trim_end_matches('…'), "🦀".repeat(320));
+    }
 
     #[test]
     fn thread_view_snapshot_rebuilds_and_advances_with_event_appends() {
@@ -6034,6 +9110,8 @@ mod tests {
                 turn: 1,
                 mode: "code".into(),
                 model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
             },
             Event::UserMessage {
                 turn: 1,
@@ -6056,25 +9134,32 @@ mod tests {
             store.append_event(scope.clone(), event).unwrap();
         }
 
-        let (first_cursor, first) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (first_cursor, first) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert_eq!(first.items.len(), 3);
         assert_eq!(first.item_offset, 0);
         assert_eq!(first.total_items, 3);
         assert!(!first.has_older);
         assert!(first.turn_running);
 
-        let (_, tail) = store.thread_view_snapshot("th_view", None, 2).unwrap();
-        assert_eq!(tail.item_offset, 1);
-        assert_eq!(tail.total_items, 3);
-        assert!(tail.has_older);
-        assert_eq!(tail.items, first.items[1..]);
-        let (_, older) = store
-            .thread_view_snapshot("th_view", Some(tail.item_offset), 2)
+        let (_, legacy_tail) = store
+            .thread_view_snapshot("th_view", None, 2, false)
             .unwrap();
-        assert_eq!(older.item_offset, 0);
-        assert_eq!(older.total_items, 3);
-        assert!(!older.has_older);
-        assert_eq!(older.items, first.items[..1]);
+        assert_eq!(legacy_tail.item_offset, 1);
+        assert_eq!(legacy_tail.items.len(), 2);
+        assert!(legacy_tail.has_older);
+
+        let (_, tail) = store
+            .thread_view_snapshot("th_view", None, 2, true)
+            .unwrap();
+        // Pages expand to the beginning of the oldest included turn. Even a
+        // tiny target cannot split the live turn that the client renders as
+        // one stable virtual row.
+        assert_eq!(tail.item_offset, 0);
+        assert_eq!(tail.total_items, 3);
+        assert!(!tail.has_older);
+        assert_eq!(tail.items, first.items);
 
         store
             .append_event(
@@ -6097,13 +9182,16 @@ mod tests {
             )
             .unwrap() as u64;
         assert!(cached_cursor > first_cursor);
-        let (second_cursor, second) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (second_cursor, second) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert!(second_cursor > first_cursor);
         assert!(!second.turn_running);
         assert_eq!(second.items.len(), 3);
         let changes_before = store.conn.lock().unwrap().total_changes();
-        let (unchanged_cursor, unchanged) =
-            store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (unchanged_cursor, unchanged) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         let changes_after = store.conn.lock().unwrap().total_changes();
         assert_eq!(unchanged_cursor, second_cursor);
         assert_eq!(unchanged.items, second.items);
@@ -6118,27 +9206,219 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (rebuilt_cursor, rebuilt) = store.thread_view_snapshot("th_view", None, 256).unwrap();
+        let (rebuilt_cursor, rebuilt) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
         assert_eq!(rebuilt_cursor, second_cursor);
         assert_eq!(rebuilt.items, second.items);
 
-        for index in 0..300 {
-            store
-                .append_event(
-                    scope.clone(),
-                    Event::UserMessage {
-                        turn: 2,
-                        content: format!("historical message {index}"),
-                        attachments: Vec::new(),
-                    },
-                )
-                .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE thread_view_cache SET state = '{' WHERE thread_id = 'th_view'",
+                [],
+            )
+            .unwrap();
+        let (repaired_cursor, repaired) = store
+            .thread_view_snapshot("th_view", None, 256, false)
+            .unwrap();
+        assert_eq!(repaired_cursor, second_cursor);
+        assert_eq!(repaired.items, second.items);
+
+        for turn in 2..=101 {
+            for event in [
+                Event::TurnStarted {
+                    turn,
+                    mode: "code".into(),
+                    model: "test/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+                Event::UserMessage {
+                    turn,
+                    content: format!("historical prompt {turn}"),
+                    attachments: Vec::new(),
+                },
+                Event::AssistantMessage {
+                    turn,
+                    content: format!("historical response {turn}"),
+                },
+                Event::TurnCompleted {
+                    turn,
+                    usage: Default::default(),
+                    checkpoint_id: None,
+                },
+            ] {
+                store.append_event(scope.clone(), event).unwrap();
+            }
         }
-        let (_, bounded) = store.thread_view_snapshot("th_view", None, 256).unwrap();
-        assert_eq!(bounded.items.len(), 256);
+        let (_, bounded) = store
+            .thread_view_snapshot("th_view", None, 256, true)
+            .unwrap();
+        assert_eq!(bounded.items.len(), 258);
         assert_eq!(bounded.total_items, 303);
-        assert_eq!(bounded.item_offset, 47);
+        assert_eq!(bounded.item_offset, 45);
         assert!(bounded.has_older);
+        assert!(matches!(
+            bounded.items.first(),
+            Some(ThreadViewItem::TurnStatus { .. })
+        ));
+        let (_, older) = store
+            .thread_view_snapshot("th_view", Some(bounded.item_offset), 256, true)
+            .unwrap();
+        assert_eq!(older.item_offset, 0);
+        assert_eq!(older.items.len(), 45);
+        assert!(!older.has_older);
+    }
+
+    #[test]
+    fn turn_aligned_pages_do_not_backfill_across_cancelled_turns() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_cancelled_pages");
+        let scope = Scope::Thread("th_cancelled_pages".into());
+        for turn in 1..=200 {
+            for event in [
+                Event::TurnStarted {
+                    turn,
+                    mode: "code".into(),
+                    model: "test/model".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+                Event::UserMessage {
+                    turn,
+                    content: format!("cancelled prompt {turn}"),
+                    attachments: Vec::new(),
+                },
+                Event::AssistantMessage {
+                    turn,
+                    content: format!("partial response {turn}"),
+                },
+                Event::TurnCancelled { turn },
+            ] {
+                store.append_event(scope.clone(), event).unwrap();
+            }
+        }
+
+        let (_, newest) = store
+            .thread_view_snapshot("th_cancelled_pages", None, 1, true)
+            .unwrap();
+        assert_eq!(newest.total_items, 400);
+        assert_eq!(newest.item_offset, 398);
+        assert_eq!(newest.items.len(), 2);
+        assert!(matches!(
+            newest.items.as_slice(),
+            [
+                ThreadViewItem::User { turn: 200, .. },
+                ThreadViewItem::Assistant { turn: 200, .. },
+            ]
+        ));
+
+        let (_, previous) = store
+            .thread_view_snapshot("th_cancelled_pages", Some(newest.item_offset), 1, true)
+            .unwrap();
+        assert_eq!(previous.item_offset, 396);
+        assert_eq!(previous.items.len(), 2);
+        assert!(matches!(
+            previous.items.as_slice(),
+            [
+                ThreadViewItem::User { turn: 199, .. },
+                ThreadViewItem::Assistant { turn: 199, .. },
+            ]
+        ));
+    }
+
+    #[test]
+    fn completed_tool_payloads_are_materialized_separately_from_history_pages() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_tool_details");
+        let scope = Scope::Thread("th_tool_details".into());
+        let large_argument = format!("argument-marker-{}", "a".repeat(32_768));
+        let large_result = format!("result-marker-{}", "r".repeat(32_768));
+        for event in [
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "test/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+            Event::UserMessage {
+                turn: 1,
+                content: "inspect the repository".into(),
+                attachments: Vec::new(),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "large-read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "command": large_argument,
+                }),
+                requires_approval: false,
+            },
+            Event::ToolCompleted {
+                call_id: "large-read".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::json!({"content": large_result}),
+                execution_duration_ms: Some(12),
+            },
+            Event::AssistantMessage {
+                turn: 1,
+                content: "done".into(),
+            },
+            Event::TurnCompleted {
+                turn: 1,
+                usage: Default::default(),
+                checkpoint_id: None,
+            },
+        ] {
+            store.append_event(scope.clone(), event).unwrap();
+        }
+
+        let (_, snapshot) = store
+            .thread_view_snapshot("th_tool_details", None, 256, false)
+            .unwrap();
+        let compact_tool = snapshot
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ThreadViewItem::ToolCall {
+                    call_id,
+                    args,
+                    details_deferred,
+                    result,
+                    ..
+                } if call_id == "large-read" => Some((args, *details_deferred, result.as_ref())),
+                _ => None,
+            })
+            .expect("materialized tool call");
+        assert!(compact_tool.1);
+        assert!(compact_tool.2.is_none());
+        assert!(serde_json::to_string(compact_tool.0).unwrap().len() < 1_024);
+
+        let details = store
+            .thread_tool_details("th_tool_details", "large-read")
+            .unwrap()
+            .expect("lazy tool details");
+        assert_eq!(details.args["command"], large_argument);
+        assert_eq!(details.result.unwrap()["content"], large_result);
+
+        let cached_state = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM thread_view_cache WHERE thread_id = 'th_tool_details'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(!cached_state.contains("argument-marker"));
+        assert!(!cached_state.contains("result-marker"));
     }
 
     #[test]
@@ -6473,6 +9753,601 @@ mod tests {
     }
 
     #[test]
+    fn session_summary_projection_is_transactional_resumable_and_tombstoned() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_summary");
+
+        let created = store
+            .append_event(
+                Scope::Server,
+                Event::SessionCreated {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let initial = store.session_summaries_snapshot().unwrap();
+        assert_eq!(initial.summaries.len(), 1);
+        assert_eq!(initial.summaries[0].latest_cursor, created.cursor);
+        assert!(
+            initial.cursor > created.cursor,
+            "the derived update follows its source"
+        );
+        assert_eq!(initial.summaries[0].outcome, SessionOutcome::Idle);
+
+        store
+            .append_event(
+                Scope::Server,
+                Event::ThreadCreated {
+                    thread_id: "th_summary".into(),
+                    session_id: "se_q".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::TurnStarted {
+                    turn: 1,
+                    mode: "code".into(),
+                    model: "p/m".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                    active: true,
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::ApprovalRequested {
+                    turn: 1,
+                    call_id: "call_1".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::QuestionRequested {
+                    turn: 1,
+                    request_id: "question_1".into(),
+                    title: Some("Choose".into()),
+                    questions: vec![trouve_protocol::Question {
+                        id: "choice".into(),
+                        prompt: "Continue?".into(),
+                        options: Vec::new(),
+                        allow_multiple: false,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let waiting = store.session_summaries_snapshot().unwrap();
+        assert_eq!(waiting.summaries[0].attention, SessionAttention::Both);
+        assert_eq!(waiting.summaries[0].outcome, SessionOutcome::Running);
+        assert!(waiting.summaries[0].active);
+        assert_eq!(
+            waiting.summaries[0].latest_thread_id.as_deref(),
+            Some("th_summary")
+        );
+
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::ApprovalResolved {
+                    call_id: "call_1".into(),
+                    decision: trouve_protocol::ApprovalDecision::Approve,
+                },
+            )
+            .unwrap();
+        let question_only = store.session_summaries_snapshot().unwrap();
+        assert_eq!(
+            question_only.summaries[0].attention,
+            SessionAttention::Question
+        );
+
+        store
+            .append_event(
+                Scope::Thread("th_summary".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "expected test failure".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                    active: false,
+                },
+            )
+            .unwrap();
+        let failed = store.session_summaries_snapshot().unwrap();
+        assert_eq!(failed.summaries[0].attention, SessionAttention::None);
+        assert_eq!(failed.summaries[0].outcome, SessionOutcome::Failed);
+        assert!(!failed.summaries[0].active);
+
+        // A client that starts replay after the snapshot cursor observes the
+        // complete replacement summary and cannot lose this concurrent edit.
+        store
+            .update_session_with_event(
+                "se_q",
+                None,
+                Some(true),
+                Event::SessionUpdated {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let resumed = store.events_after(&Scope::Server, failed.cursor).unwrap();
+        assert!(resumed.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::SessionSummaryUpdated {
+                summary: Some(summary),
+                ..
+            } if summary.archived
+        )));
+
+        store
+            .delete_session_with_event(
+                "se_q",
+                ArtifactCleanupJob::deleted_session(
+                    "se_q".into(),
+                    "/tmp/se_q".into(),
+                    "/tmp/repo".into(),
+                    Vec::new(),
+                ),
+                Event::SessionDeleted {
+                    session_id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                },
+            )
+            .unwrap();
+        let deleted = store.session_summaries_snapshot().unwrap();
+        assert!(deleted.summaries.is_empty());
+        assert!(
+            store
+                .events_after(&Scope::Server, failed.cursor)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(
+                    &envelope.event,
+                    Event::SessionSummaryUpdated {
+                        session_id,
+                        summary: None,
+                    } if session_id == "se_q"
+                ))
+        );
+    }
+
+    #[test]
+    fn thread_status_projection_tracks_concurrent_threads_independently() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_waiting");
+        seed_thread(&store, "th_finished");
+
+        for thread_id in ["th_waiting", "th_finished"] {
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::ThreadCreated {
+                        thread_id: thread_id.into(),
+                        session_id: "se_q".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread(thread_id.into()),
+                    Event::TurnStarted {
+                        turn: 1,
+                        mode: "code".into(),
+                        model: "p/m".into(),
+                        thinking_level: None,
+                        supports_steering: false,
+                    },
+                )
+                .unwrap();
+        }
+        let approval = store
+            .append_event(
+                Scope::Thread("th_waiting".into()),
+                Event::ApprovalRequested {
+                    turn: 1,
+                    call_id: "call_waiting".into(),
+                },
+            )
+            .unwrap();
+        let completed = store
+            .append_event(
+                Scope::Thread("th_finished".into()),
+                Event::TurnCompleted {
+                    turn: 1,
+                    usage: Default::default(),
+                    checkpoint_id: None,
+                },
+            )
+            .unwrap();
+
+        let statuses = store.list_thread_statuses("se_q").unwrap();
+        let waiting = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_waiting")
+            .unwrap();
+        assert!(waiting.active);
+        assert_eq!(waiting.attention, SessionAttention::Approval);
+        assert_eq!(waiting.outcome, SessionOutcome::Running);
+        assert_eq!(waiting.latest_cursor, approval.cursor);
+        assert!(waiting.started_at.is_some());
+        assert!(waiting.completed_at.is_none());
+        let finished = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_finished")
+            .unwrap();
+        assert!(!finished.active);
+        assert_eq!(finished.attention, SessionAttention::None);
+        assert_eq!(finished.outcome, SessionOutcome::Succeeded);
+        assert_eq!(finished.latest_cursor, completed.cursor);
+        assert!(finished.started_at.is_some());
+        assert!(finished.completed_at.is_some());
+        assert!(finished.completed_at >= finished.started_at);
+
+        let replacements = store.events_after(&Scope::Server, 0).unwrap();
+        assert!(replacements.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_waiting"
+                    && status.attention == SessionAttention::Approval
+        )));
+        assert!(replacements.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_finished"
+                    && status.outcome == SessionOutcome::Succeeded
+        )));
+
+        store
+            .append_event(
+                Scope::Thread("th_waiting".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: "approval no longer actionable".into(),
+                },
+            )
+            .unwrap();
+        let waiting = store
+            .list_thread_statuses("se_q")
+            .unwrap()
+            .into_iter()
+            .find(|status| status.thread_id == "th_waiting")
+            .unwrap();
+        assert!(!waiting.active);
+        assert_eq!(waiting.attention, SessionAttention::None);
+        assert_eq!(waiting.outcome, SessionOutcome::Failed);
+        assert!(waiting.completed_at.is_some());
+    }
+
+    #[test]
+    fn session_notification_edges_preserve_native_category_detail_and_order() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_notice");
+
+        store
+            .append_event(
+                Scope::Thread("th_notice".into()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: format!("  {}tail  ", "界".repeat(120)),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread("th_notice".into()),
+                Event::QuestionRequested {
+                    turn: 2,
+                    request_id: "question_notice".into(),
+                    title: Some("  Choose a deployment target  ".into()),
+                    questions: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let events = store.events_after(&Scope::Server, 0).unwrap();
+        let notifications = events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                Event::SessionNotification {
+                    session_id,
+                    thread_id,
+                    kind,
+                    detail,
+                } => Some((
+                    envelope.cursor,
+                    session_id.as_str(),
+                    thread_id.as_str(),
+                    *kind,
+                    detail.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].1, "se_q");
+        assert_eq!(notifications[0].2, "th_notice");
+        assert_eq!(
+            notifications[0].3,
+            trouve_protocol::SessionNotificationKind::TurnFailed
+        );
+        assert_eq!(
+            notifications[0].4,
+            Some(format!("{}…", "界".repeat(120)).as_str())
+        );
+        assert_eq!(
+            notifications[1].3,
+            trouve_protocol::SessionNotificationKind::QuestionRequested
+        );
+        assert_eq!(notifications[1].4, Some("Choose a deployment target"));
+
+        for (notification_cursor, ..) in notifications {
+            let summary_cursor = events
+                .iter()
+                .rev()
+                .find(|envelope| {
+                    envelope.cursor < notification_cursor
+                        && matches!(envelope.event, Event::SessionSummaryUpdated { .. })
+                })
+                .map(|envelope| envelope.cursor)
+                .expect("notification follows a replacement summary");
+            assert_eq!(notification_cursor, summary_cursor + 1);
+        }
+    }
+
+    #[test]
+    fn reopening_persists_recovery_and_clears_process_owned_attention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("recovery.db");
+        let before_restart = {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_recovery");
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionActivity {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                        active: true,
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread("th_recovery".into()),
+                    Event::ApprovalRequested {
+                        turn: 1,
+                        call_id: "call_crashed".into(),
+                    },
+                )
+                .unwrap();
+            let snapshot = store.session_summaries_snapshot().unwrap();
+            assert!(snapshot.summaries[0].active);
+            assert_eq!(snapshot.summaries[0].attention, SessionAttention::Approval);
+            snapshot.cursor
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let recovered = reopened.session_summaries_snapshot().unwrap();
+        assert!(recovered.cursor > before_restart);
+        assert_eq!(recovered.summaries.len(), 1);
+        assert!(!recovered.summaries[0].active);
+        assert_eq!(recovered.summaries[0].attention, SessionAttention::None);
+        assert_eq!(recovered.summaries[0].outcome, SessionOutcome::Failed);
+
+        let replay = reopened
+            .events_after(&Scope::Server, before_restart)
+            .unwrap();
+        assert!(matches!(
+            replay.first().map(|envelope| &envelope.event),
+            Some(Event::SessionRecovered { session_id, .. }) if session_id == "se_q"
+        ));
+        assert!(matches!(
+            replay.get(1).map(|envelope| &envelope.event),
+            Some(Event::SessionSummaryUpdated {
+                summary: Some(summary),
+                ..
+            }) if !summary.active
+                && summary.attention == SessionAttention::None
+                && summary.outcome == SessionOutcome::Failed
+        ));
+        assert!(replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_recovery"
+                    && !status.active
+                    && status.attention == SessionAttention::None
+                    && status.outcome == SessionOutcome::Failed
+        )));
+    }
+
+    #[test]
+    fn reopening_marks_only_interrupted_thread_statuses_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sibling-recovery.db");
+        let (before_restart, finished_cursor, finished_completed_at) = {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_interrupted");
+            seed_thread(&store, "th_succeeded");
+            for thread_id in ["th_interrupted", "th_succeeded"] {
+                store
+                    .append_event(
+                        Scope::Thread(thread_id.into()),
+                        Event::TurnStarted {
+                            turn: 1,
+                            mode: "code".into(),
+                            model: "test/model".into(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .append_event(
+                    Scope::Thread("th_interrupted".into()),
+                    Event::ApprovalRequested {
+                        turn: 1,
+                        call_id: "call_interrupted".into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Thread("th_succeeded".into()),
+                    Event::TurnCompleted {
+                        turn: 1,
+                        usage: Default::default(),
+                        checkpoint_id: None,
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::SessionActivity {
+                        session_id: "se_q".into(),
+                        workspace_id: "ws_q".into(),
+                        active: true,
+                    },
+                )
+                .unwrap();
+            let finished = store
+                .list_thread_statuses("se_q")
+                .unwrap()
+                .into_iter()
+                .find(|status| status.thread_id == "th_succeeded")
+                .unwrap();
+            (
+                store.latest_event_cursor(&Scope::Server).unwrap(),
+                finished.latest_cursor,
+                finished.completed_at,
+            )
+        };
+
+        let reopened = Store::open(&path).unwrap();
+        let statuses = reopened.list_thread_statuses("se_q").unwrap();
+        let interrupted = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_interrupted")
+            .unwrap();
+        assert!(!interrupted.active);
+        assert_eq!(interrupted.attention, SessionAttention::None);
+        assert_eq!(interrupted.outcome, SessionOutcome::Failed);
+        assert!(interrupted.completed_at.is_some());
+        let succeeded = statuses
+            .iter()
+            .find(|status| status.thread_id == "th_succeeded")
+            .unwrap();
+        assert!(!succeeded.active);
+        assert_eq!(succeeded.attention, SessionAttention::None);
+        assert_eq!(succeeded.outcome, SessionOutcome::Succeeded);
+        assert_eq!(succeeded.latest_cursor, finished_cursor);
+        assert_eq!(succeeded.completed_at, finished_completed_at);
+
+        let replay = reopened
+            .events_after(&Scope::Server, before_restart)
+            .unwrap();
+        assert!(replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status }
+                if status.thread_id == "th_interrupted"
+                    && status.outcome == SessionOutcome::Failed
+        )));
+        assert!(!replay.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::ThreadStatusUpdated { status } if status.thread_id == "th_succeeded"
+        )));
+    }
+
+    #[test]
+    fn lifecycle_mutation_rolls_back_when_its_event_transaction_fails() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_workspace(&Workspace {
+                id: "ws_atomic".into(),
+                name: "atomic".into(),
+                path: "/tmp/atomic".into(),
+            })
+            .unwrap();
+        let session = Session {
+            id: "se_atomic".into(),
+            workspace_id: "ws_atomic".into(),
+            title: "Atomic".into(),
+            branch: "trouve/atomic".into(),
+            worktree_path: "/tmp/atomic-worktree".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let invalid_checkpoint = CheckpointRow {
+            id: "cp_atomic".into(),
+            session_id: "se_missing".into(),
+            thread_id: None,
+            turn: 0,
+            seq: 0,
+            commit_hash: "deadbeef".into(),
+        };
+
+        assert!(
+            store
+                .insert_session_with_lifecycle(
+                    &session,
+                    &invalid_checkpoint,
+                    vec![(
+                        Scope::Server,
+                        Event::SessionCreated {
+                            session_id: session.id.clone(),
+                            workspace_id: session.workspace_id.clone(),
+                        },
+                    )],
+                )
+                .is_err()
+        );
+        assert!(store.session(&session.id).unwrap().is_none());
+        assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
+        assert!(
+            store
+                .session_summaries_snapshot()
+                .unwrap()
+                .summaries
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn replay_silently_skips_retired_events() {
         let store = Store::open_in_memory().unwrap();
         let retired_payload = serde_json::json!({
@@ -6792,6 +10667,34 @@ mod tests {
     }
 
     #[test]
+    fn on_disk_event_writer_does_not_wait_for_read_connection_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("trouve.db")).unwrap();
+        let read_guard = store.conn.lock().unwrap();
+        let writer = store.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let append = std::thread::spawn(move || {
+            result_tx
+                .send(writer.append_event(
+                    Scope::Server,
+                    Event::AssistantDelta {
+                        turn: 1,
+                        text: "persisted independently".into(),
+                    },
+                ))
+                .unwrap();
+        });
+
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("event writer waited for the read-side connection mutex");
+        assert!(result.is_ok());
+        drop(read_guard);
+        append.join().unwrap();
+        assert_eq!(store.events_after(&Scope::Server, 0).unwrap().len(), 1);
+    }
+
+    #[test]
     fn live_subscription_receives_appends() {
         let store = Store::open_in_memory().unwrap();
         let mut rx = store.subscribe();
@@ -6868,6 +10771,8 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            parent_thread_id: None,
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),
@@ -6901,6 +10806,8 @@ mod tests {
         let child = Thread {
             id: "th_child".into(),
             session_id: "se_1".into(),
+            parent_thread_id: Some("th_1".into()),
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),
@@ -6913,6 +10820,13 @@ mod tests {
             .insert_thread(&child, &serde_json::Map::new())
             .unwrap();
         store.insert_spawned("th_child", "th_1", "thread").unwrap();
+        assert_eq!(
+            store
+                .thread("th_child")
+                .unwrap()
+                .and_then(|thread| thread.parent_thread_id),
+            Some("th_1".into()),
+        );
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
@@ -7032,6 +10946,8 @@ mod tests {
                 &Thread {
                     id: thread_id.into(),
                     session_id: "se_q".into(),
+                    parent_thread_id: None,
+                    title: None,
                     mode: "code".into(),
                     model: "p/m".into(),
                     model_options: serde_json::Map::new(),
@@ -7043,6 +10959,33 @@ mod tests {
                 &serde_json::Map::new(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn thread_titles_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_seed");
+        let named = Thread {
+            id: "th_named".into(),
+            session_id: "se_q".into(),
+            parent_thread_id: None,
+            title: Some("Review the parser edge cases".into()),
+            mode: "review".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+
+        store
+            .insert_thread(&named, &serde_json::Map::new())
+            .unwrap();
+
+        let loaded = store.thread("th_named").unwrap().unwrap();
+        assert_eq!(loaded.id, named.id);
+        assert_eq!(loaded.title, named.title);
     }
 
     #[test]
@@ -7067,8 +11010,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_1");
         seed_thread(&store, "th_2");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_queue_edit".into(),
+            name: "layout.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4,
+        };
         let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
-        let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
+        let b = store
+            .enqueue_prompt("th_1", "second", std::slice::from_ref(&attachment))
+            .unwrap();
         let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
         let tool_free = store
             .enqueue_prompt_with_tools("th_2", "other thread", &[], false)
@@ -7084,7 +11035,14 @@ mod tests {
         assert_eq!(store.queued_prompt_thread(&a.id).unwrap().unwrap(), "th_1");
 
         // Edit and delete.
-        assert!(store.update_queued_prompt(&b.id, "second v2").unwrap());
+        assert!(
+            store
+                .update_queued_prompt(&b.id, "second v2", std::slice::from_ref(&attachment))
+                .unwrap()
+        );
+        let edited = store.queued_prompts("th_1").unwrap();
+        assert_eq!(edited[1].content, "second v2");
+        assert_eq!(edited[1].attachments, [attachment]);
         assert!(store.delete_queued_prompt(&a.id).unwrap());
         assert!(!store.delete_queued_prompt(&a.id).unwrap());
 
@@ -7117,6 +11075,330 @@ mod tests {
 
         // The other thread's queue is untouched.
         assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prompt_acceptance_commits_queue_turn_attachments_and_events_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_accept");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_accept".into(),
+            name: "layout.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4,
+        };
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_accept".into(),
+            thread_id: "th_accept".into(),
+            position: 1,
+            content: "Ship the prompt quickly".into(),
+            attachments: vec![attachment.clone()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let events = vec![
+            (
+                Scope::Thread("th_accept".into()),
+                Event::QueueUpdated {
+                    prompts: Vec::new(),
+                },
+            ),
+            (
+                Scope::Thread("th_accept".into()),
+                Event::TurnStarted {
+                    turn: 1,
+                    mode: "code".into(),
+                    model: "p/m".into(),
+                    thinking_level: None,
+                    supports_steering: false,
+                },
+            ),
+            (
+                Scope::Thread("th_accept".into()),
+                Event::UserMessage {
+                    turn: 1,
+                    content: prompt.content.clone(),
+                    attachments: prompt.attachments.clone(),
+                },
+            ),
+        ];
+
+        store
+            .accept_prompt_with_events(
+                PromptAcceptance {
+                    prompt: prompt.clone(),
+                    tools_enabled: false,
+                    attachments: vec![(attachment.clone(), "/tmp/at_accept.png".into())],
+                    claim_prompt_id: Some(prompt.id.clone()),
+                    expected_previous_turn: Some(0),
+                    staging_cleanup_claim: None,
+                },
+                events,
+            )
+            .unwrap();
+
+        assert_eq!(store.last_turn("th_accept").unwrap(), 1);
+        assert!(store.queued_prompts("th_accept").unwrap().is_empty());
+        assert!(!store.queued_prompt_tools_enabled(&prompt.id).unwrap());
+        assert_eq!(
+            store.attachment(&attachment.id).unwrap().unwrap().0,
+            attachment
+        );
+        let persisted = store
+            .events_after(&Scope::Thread("th_accept".into()), 0)
+            .unwrap();
+        assert_eq!(persisted.len(), 3);
+        assert!(matches!(persisted[0].event, Event::QueueUpdated { .. }));
+        assert!(matches!(
+            persisted[1].event,
+            Event::TurnStarted { turn: 1, .. }
+        ));
+        assert!(matches!(
+            persisted[2].event,
+            Event::UserMessage { turn: 1, .. }
+        ));
+        assert!(store.finish_queued_prompt(&prompt.id).unwrap());
+    }
+
+    #[test]
+    fn failed_prompt_acceptance_rolls_back_every_related_row_and_event() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_accept_rollback");
+        let attachment = trouve_protocol::Attachment {
+            id: "at_accept_rollback".into(),
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 5,
+        };
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_accept_rollback".into(),
+            thread_id: "th_accept_rollback".into(),
+            position: 1,
+            content: "This transaction must roll back".into(),
+            attachments: vec![attachment.clone()],
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let result = store.accept_prompt_with_events(
+            PromptAcceptance {
+                prompt,
+                tools_enabled: true,
+                attachments: vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
+                claim_prompt_id: Some("qp_accept_rollback".into()),
+                expected_previous_turn: Some(99),
+                staging_cleanup_claim: None,
+            },
+            vec![(
+                Scope::Thread("th_accept_rollback".into()),
+                Event::QueueUpdated {
+                    prompts: Vec::new(),
+                },
+            )],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(store.last_turn("th_accept_rollback").unwrap(), 0);
+        assert!(
+            store
+                .queued_prompt_thread("qp_accept_rollback")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.attachment(&attachment.id).unwrap().is_none());
+        assert!(
+            store
+                .events_after(&Scope::Thread("th_accept_rollback".into()), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn queued_prompt_priority_can_remain_visible_or_be_claimed() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_priority");
+        let first = store.enqueue_prompt("th_priority", "first", &[]).unwrap();
+        let second = store.enqueue_prompt("th_priority", "second", &[]).unwrap();
+        let third = store.enqueue_prompt("th_priority", "third", &[]).unwrap();
+
+        let prioritized = store
+            .prioritize_queued_prompt(&third.id, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prioritized.position, 0);
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first", "second"]
+        );
+
+        let claimed = store
+            .prioritize_queued_prompt(&second.id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.content, "second");
+        assert!(
+            store
+                .prioritize_queued_prompt(&second.id, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "first"]
+        );
+
+        assert!(store.release_queued_prompt(&second.id).unwrap());
+        assert_eq!(
+            store
+                .queued_prompts("th_priority")
+                .unwrap()
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str(), third.id.as_str(), first.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn queued_prompt_attachment_changes_commit_rows_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_attachment_cleanup");
+        let old = trouve_protocol::Attachment {
+            id: "at_old".into(),
+            name: "old.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        let new = trouve_protocol::Attachment {
+            id: "at_new".into(),
+            name: "new.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        store
+            .add_attachment("th_attachment_cleanup", &old, "/tmp/at_old")
+            .unwrap();
+        let prompt = store
+            .enqueue_prompt("th_attachment_cleanup", "old", std::slice::from_ref(&old))
+            .unwrap();
+
+        let removed = store
+            .update_queued_prompt_attachments(
+                &prompt.id,
+                "new",
+                std::slice::from_ref(&new),
+                &[(new.clone(), "/tmp/at_new".into())],
+                std::slice::from_ref(&old.id),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.unwrap().attachment_paths, ["/tmp/at_old"]);
+        assert!(store.attachment(&old.id).unwrap().is_none());
+        assert!(store.attachment(&new.id).unwrap().is_some());
+        assert_eq!(
+            store.queued_prompts("th_attachment_cleanup").unwrap()[0].attachments,
+            std::slice::from_ref(&new)
+        );
+
+        let (thread_id, removed) = store
+            .delete_queued_prompt_attachments(&prompt.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread_id, "th_attachment_cleanup");
+        assert_eq!(removed.unwrap().attachment_paths, ["/tmp/at_new"]);
+        assert!(store.attachment(&new.id).unwrap().is_none());
+        assert!(
+            store
+                .queued_prompts("th_attachment_cleanup")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn steering_attachment_rollback_is_thread_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_attachment_cleanup");
+        seed_thread(&store, "th_attachment_other");
+        let owned = trouve_protocol::Attachment {
+            id: "at_owned".into(),
+            name: "owned.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        let other = trouve_protocol::Attachment {
+            id: "at_other".into(),
+            name: "other.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        store
+            .add_attachment("th_attachment_cleanup", &owned, "/tmp/at_owned")
+            .unwrap();
+        store
+            .add_attachment("th_attachment_other", &other, "/tmp/at_other")
+            .unwrap();
+
+        let removed = store
+            .remove_attachments(
+                "th_attachment_cleanup",
+                &[owned.id.clone(), other.id.clone()],
+            )
+            .unwrap();
+        assert_eq!(removed, ["/tmp/at_owned"]);
+        assert!(store.attachment(&owned.id).unwrap().is_none());
+        assert!(store.attachment(&other.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn spawned_thread_insert_never_exposes_an_unparented_child() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_spawn_parent");
+        let child = Thread {
+            id: "th_spawn_child".into(),
+            session_id: "se_q".into(),
+            parent_thread_id: Some("th_spawn_parent".into()),
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: true,
+            todos: Vec::new(),
+        };
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), "th_spawn_parent", "thread")
+            .unwrap();
+        let loaded = store.thread(&child.id).unwrap().unwrap();
+        assert!(loaded.spawned);
+        assert_eq!(loaded.parent_thread_id.as_deref(), Some("th_spawn_parent"));
+
+        let orphan = Thread {
+            id: "th_spawn_orphan".into(),
+            ..child
+        };
+        assert!(
+            store
+                .insert_spawned_thread(
+                    &orphan,
+                    &serde_json::Map::new(),
+                    "th_missing_parent",
+                    "thread",
+                )
+                .is_err()
+        );
+        assert!(store.thread(&orphan.id).unwrap().is_none());
     }
 
     #[test]
@@ -7154,6 +11436,7 @@ mod tests {
             workspace_id: "ws_1".into(),
             mode: Some("code".into()),
             model: None,
+            thinking_level: Some("high".into()),
             permission_mode: PermissionMode::Yolo,
             schedule: trouve_protocol::AutomationSchedule {
                 kind: "weekly".into(),
@@ -7174,6 +11457,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].schedule, auto.schedule);
         assert_eq!(listed[0].mode.as_deref(), Some("code"));
+        assert_eq!(listed[0].thinking_level.as_deref(), Some("high"));
         assert_eq!(listed[0].permission_mode, PermissionMode::Yolo);
 
         // Edit: rename + disable clears the next fire time.
@@ -7181,12 +11465,14 @@ mod tests {
         edited.name = "Morning triage".into();
         edited.enabled = false;
         edited.next_run_at = None;
+        edited.thinking_level = Some("max".into());
         edited.permission_mode = PermissionMode::AllowList;
         assert!(store.update_automation(&edited).unwrap());
         let got = store.automation("auto_1").unwrap().unwrap();
         assert_eq!(got.name, "Morning triage");
         assert!(!got.enabled);
         assert!(got.next_run_at.is_none());
+        assert_eq!(got.thinking_level.as_deref(), Some("max"));
         assert_eq!(got.permission_mode, PermissionMode::AllowList);
 
         // A run records its outcome without touching the definition.
@@ -7266,6 +11552,8 @@ mod tests {
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
+            parent_thread_id: None,
+            title: None,
             mode: "code".into(),
             model: "p/m".into(),
             model_options: serde_json::Map::new(),
@@ -7330,23 +11618,53 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.latest_checkpoint_seq("se_1").unwrap(), Some(2));
+        assert_eq!(store.next_checkpoint_seq("se_1").unwrap(), 3);
         // Simulate undo to seq 0, then a new checkpoint: seq 1-2 replaced.
         store.set_undo_pos("se_1", Some(0)).unwrap();
-        store
-            .append_checkpoint(&CheckpointRow {
-                id: "cp_new".into(),
-                session_id: "se_1".into(),
-                thread_id: None,
-                turn: 9,
-                seq: 0,
-                commit_hash: "c1b".into(),
-            })
+        assert_eq!(store.next_checkpoint_seq("se_1").unwrap(), 1);
+        let replacement = CheckpointRow {
+            id: "cp_new".into(),
+            session_id: "se_1".into(),
+            thread_id: None,
+            turn: 9,
+            seq: 0,
+            commit_hash: "c1b".into(),
+        };
+        let envelope = store
+            .append_checkpoint_with_event(
+                &replacement,
+                Scope::Session("se_1".into()),
+                Event::CheckpointCreated {
+                    checkpoint_id: replacement.id.clone(),
+                    thread_id: "th_1".into(),
+                    turn: replacement.turn,
+                    commit: replacement.commit_hash.clone(),
+                },
+            )
             .unwrap();
+        assert!(matches!(
+            envelope.event,
+            Event::CheckpointCreated { checkpoint_id, .. } if checkpoint_id == "cp_new"
+        ));
         assert_eq!(store.latest_checkpoint_seq("se_1").unwrap(), Some(1));
         assert_eq!(store.undo_pos("se_1").unwrap(), None);
         assert_eq!(
             store.checkpoint_at("se_1", 1).unwrap().unwrap().commit_hash,
             "c1b"
+        );
+        let checkpoint = store.checkpoint("cp_new").unwrap().unwrap();
+        assert_eq!(checkpoint.session_id, "se_1");
+        assert_eq!(checkpoint.turn, 9);
+        assert_eq!(checkpoint.seq, 1);
+        assert!(
+            store
+                .events_after(&Scope::Session("se_1".into()), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    Event::CheckpointCreated { checkpoint_id, .. } if checkpoint_id == "cp_new"
+                ))
         );
     }
 
@@ -7614,6 +11932,47 @@ mod tests {
                 trigger_key: "manual:comment:200".into(),
             }]
         );
+    }
+
+    #[test]
+    fn migrations_add_indexed_turn_boundaries_to_legacy_thread_view_items() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thread_view_items (
+               thread_id TEXT NOT NULL,
+               item_index INTEGER NOT NULL,
+               item TEXT NOT NULL,
+               PRIMARY KEY (thread_id, item_index)
+             );",
+        )
+        .unwrap();
+        assert!(!SCHEMA.contains("thread_view_items_turn_start"));
+
+        conn.execute_batch(SCHEMA).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let turn_start_columns = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(thread_view_items)")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|column| column == "turn_start")
+                .count()
+        };
+        assert_eq!(turn_start_columns, 1);
+        let indexed = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'thread_view_items_turn_start'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        apply_migrations(&mut conn).unwrap();
     }
 
     #[test]

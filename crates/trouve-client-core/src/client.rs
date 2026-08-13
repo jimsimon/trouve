@@ -155,8 +155,26 @@ impl ProtocolClient {
 
     /// Refresh account-relevant PR snapshots for every configured GitHub
     /// host. Results arrive on the persisted server event stream.
-    pub async fn refresh_github_prs(&self) -> Result<()> {
-        self.post_empty("/github/prs/refresh").await
+    pub async fn refresh_github_prs(&self, force: bool) -> Result<()> {
+        let path = if force {
+            "/github/prs/refresh?force=true"
+        } else {
+            "/github/prs/refresh"
+        };
+        self.post_empty(path).await
+    }
+
+    /// Fetch durable server-owned UI state without replaying retained server
+    /// history. Live server events resume after the accompanying cursor.
+    pub async fn server_projection(&self) -> Result<(u64, ServerProjection)> {
+        let path = "/server-projection";
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, path).await
     }
 
     pub async fn close_workspace(&self, workspace_id: &str) -> Result<()> {
@@ -186,6 +204,13 @@ impl ProtocolClient {
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.get_json("/sessions").await
+    }
+
+    /// Fetch the materialized session-list projection and the server event
+    /// cursor captured in the same database read transaction. Resume the
+    /// server-scope stream after this cursor to avoid snapshot/stream gaps.
+    pub async fn session_summaries(&self) -> Result<SessionSummariesSnapshot> {
+        self.get_json("/session-summaries").await
     }
 
     pub async fn update_session(
@@ -218,12 +243,25 @@ impl ProtocolClient {
             .await
     }
 
+    pub async fn list_thread_subagents(&self, thread_id: &str) -> Result<Vec<Thread>> {
+        self.get_json(&format!("/threads/{thread_id}/subagents"))
+            .await
+    }
+
+    pub async fn list_thread_statuses(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::ThreadStatus>> {
+        self.get_json(&format!("/thread-statuses?session_id={session_id}"))
+            .await
+    }
+
     pub async fn thread_view(
         &self,
         thread_id: &str,
         before: Option<u64>,
     ) -> Result<(u64, ThreadViewSnapshot)> {
-        let mut path = format!("/threads/{thread_id}/view?limit=256");
+        let mut path = format!("/threads/{thread_id}/view?limit=256&turn_aligned=true");
         if let Some(before) = before {
             path.push_str(&format!("&before={before}"));
         }
@@ -234,6 +272,20 @@ impl ProtocolClient {
             .await
             .with_context(|| format!("GET {path}"))?;
         decode_cursor_response(response, &path).await
+    }
+
+    /// Load the full argument/result payload for one completed historical
+    /// tool call. Folded history pages intentionally contain only compact
+    /// presentation metadata until the call is expanded.
+    pub async fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<ThreadToolDetails> {
+        let thread_id = urlencode_path_segment(thread_id);
+        let call_id = urlencode_path_segment(call_id);
+        self.get_json(&format!("/threads/{thread_id}/tools/{call_id}"))
+            .await
     }
 
     pub async fn send_message(&self, thread_id: &str, content: &str) -> Result<TurnAccepted> {
@@ -258,6 +310,23 @@ impl ProtocolClient {
         .await
     }
 
+    /// Append guidance to the backend turn currently running on a thread.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        content: &str,
+        attachments: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<SteerAccepted> {
+        self.post_json(
+            &format!("/threads/{thread_id}/steer"),
+            &SteerTurnRequest {
+                content: content.into(),
+                attachments,
+            },
+        )
+        .await
+    }
+
     // --- queued prompts ---------------------------------------------------
 
     pub async fn list_queue(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
@@ -271,6 +340,8 @@ impl ProtocolClient {
             .patch(format!("{}{path}", self.base))
             .json(&trouve_protocol::UpdateQueuedPromptRequest {
                 content: content.into(),
+                retained_attachment_ids: None,
+                attachments: Vec::new(),
             })
             .send()
             .await
@@ -309,17 +380,33 @@ impl ProtocolClient {
         .await
     }
 
+    /// Prioritize and dispatch one queued prompt, interrupting the active
+    /// turn first when the thread is busy.
+    pub async fn dispatch_queued_prompt(&self, prompt_id: &str) -> Result<TurnAccepted> {
+        self.post_json(
+            &format!("/queue/{prompt_id}/dispatch"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Interrupt the turn currently running on a thread.
     pub async fn cancel_turn(&self, thread_id: &str) -> Result<()> {
         self.post_empty(&format!("/threads/{thread_id}/cancel"))
             .await
     }
 
-    pub async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Result<()> {
+    pub async fn resolve_thread_approval(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
         let resp = self
             .http
             .post(format!("{}/approvals", self.base))
             .json(&ResolveApprovalRequest {
+                thread_id: thread_id.to_string(),
                 call_id: call_id.into(),
                 decision,
             })
@@ -331,9 +418,9 @@ impl ProtocolClient {
         Ok(())
     }
 
-    /// Answer (or skip, `answers: None`) a pending question request.
-    pub async fn resolve_question(
+    pub async fn resolve_thread_question(
         &self,
+        thread_id: &str,
         request_id: &str,
         answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
     ) -> Result<()> {
@@ -341,6 +428,7 @@ impl ProtocolClient {
             .http
             .post(format!("{}/questions", self.base))
             .json(&trouve_protocol::ResolveQuestionRequest {
+                thread_id: thread_id.to_string(),
                 request_id: request_id.into(),
                 answers,
             })
@@ -360,6 +448,19 @@ impl ProtocolClient {
     pub async fn redo(&self, session_id: &str) -> Result<()> {
         self.post_empty(&format!("/sessions/{session_id}/redo"))
             .await
+    }
+
+    pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<()> {
+        self.post_empty(&format!("/checkpoints/{checkpoint_id}/restore"))
+            .await
+    }
+
+    pub async fn fork_checkpoint(&self, checkpoint_id: &str) -> Result<ForkCheckpointResponse> {
+        self.post_json(
+            &format!("/checkpoints/{checkpoint_id}/fork"),
+            &serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -612,12 +713,14 @@ impl ProtocolClient {
         &self,
         title_model_load_behavior: TitleModelLoadBehavior,
         title_model_resource_policy: TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: Option<bool>,
     ) -> Result<(u64, GitWorktreeSettings)> {
         let path = "/config/git-worktrees";
         let response = self
             .http
             .put(format!("{}{path}", self.base))
             .json(&SetGitWorktreeSettingsRequest {
+                derive_branch_name_from_session_title,
                 title_model_load_behavior,
                 title_model_resource_policy,
             })
@@ -639,6 +742,19 @@ impl ProtocolClient {
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
         self.get_json(&format!("/sessions/{session_id}/diff")).await
+    }
+
+    pub async fn session_diff_summary(&self, session_id: &str) -> Result<SessionDiffSummary> {
+        self.get_json(&format!("/sessions/{session_id}/diff/summary"))
+            .await
+    }
+
+    pub async fn session_file_diff(&self, session_id: &str, path: &str) -> Result<SessionFileDiff> {
+        self.get_json(&format!(
+            "/sessions/{session_id}/diff/file?path={}",
+            urlencode(path)
+        ))
+        .await
     }
 
     pub async fn session_files(&self, session_id: &str, path: &str) -> Result<Vec<DirEntry>> {
@@ -754,7 +870,6 @@ impl ProtocolClient {
         after: u64,
         mut on_chunk: impl FnMut(u64, Vec<u8>) -> std::ops::ControlFlow<()>,
     ) -> Result<(u64, bool)> {
-        use base64::Engine as _;
         let resp = self
             .http
             .get(format!(
@@ -781,8 +896,7 @@ impl ProtocolClient {
                 } else if line == "event: lagged" {
                     return Ok((last, false));
                 } else if let Some(data) = line.strip_prefix("data:") {
-                    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim())
-                    else {
+                    let Some(bytes) = decode_terminal_output_data(data) else {
                         continue;
                     };
                     if let Some(end) = id.take() {
@@ -821,6 +935,7 @@ impl ProtocolClient {
     }
 
     pub async fn upsert_mcp_server(&self, name: &str, req: &UpsertMcpServerRequest) -> Result<()> {
+        let name = urlencode_path_segment(name);
         let resp = self
             .http
             .put(format!("{}/mcp-servers/{name}", self.base))
@@ -839,12 +954,37 @@ impl ProtocolClient {
         Ok(())
     }
 
+    pub async fn set_mcp_server_enabled(
+        &self,
+        name: &str,
+        req: &SetMcpServerEnabledRequest,
+    ) -> Result<()> {
+        let name = urlencode_path_segment(name);
+        let resp = self
+            .http
+            .put(format!("{}/mcp-servers/{name}/enabled", self.base))
+            .json(req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|e| e.message)
+                .unwrap_or_else(|_| status.to_string());
+            bail!("updating MCP server enablement failed: {message}");
+        }
+        Ok(())
+    }
+
     pub async fn delete_mcp_server(
         &self,
         name: &str,
         scope: &str,
         workspace_id: Option<&str>,
     ) -> Result<()> {
+        let name = urlencode_path_segment(name);
         let mut path = format!("/mcp-servers/{name}?scope={scope}");
         if let Some(id) = workspace_id {
             path.push_str(&format!("&workspace_id={id}"));
@@ -853,6 +993,7 @@ impl ProtocolClient {
     }
 
     pub async fn mcp_server_logs(&self, name: &str) -> Result<McpLogs> {
+        let name = urlencode_path_segment(name);
         self.get_json(&format!("/mcp-servers/{name}/logs")).await
     }
 
@@ -914,6 +1055,42 @@ impl ProtocolClient {
             bail!("merge failed: {}", resp.status());
         }
         Ok(())
+    }
+
+    pub async fn session_pr_detail(&self, session_id: &str, number: u64) -> Result<PrDetail> {
+        self.get_json(&format!("/sessions/{session_id}/prs/{number}"))
+            .await
+    }
+
+    pub async fn session_pr_file_diff(
+        &self,
+        session_id: &str,
+        number: u64,
+        path: &str,
+    ) -> Result<PrFileDiff> {
+        let endpoint = format!("/sessions/{session_id}/prs/{number}/file");
+        let mut url = reqwest::Url::parse(&format!("{}{endpoint}", self.base))?;
+        url.query_pairs_mut().append_pair("path", path);
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {endpoint}"))?;
+        decode(response, &endpoint).await
+    }
+
+    pub async fn act_on_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+        action: &PrActionRequest,
+    ) -> Result<PrDetail> {
+        self.post_json(
+            &format!("/sessions/{session_id}/prs/{number}/actions"),
+            action,
+        )
+        .await
     }
 
     // --- automated code reviews ---------------------------------------------
@@ -1172,6 +1349,14 @@ impl LineBuffer {
     }
 }
 
+fn decode_terminal_output_data(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()
+}
+
 fn urlencode(s: &str) -> String {
     let mut encoded = String::with_capacity(s.len());
     for byte in s.as_bytes() {
@@ -1183,6 +1368,10 @@ fn urlencode(s: &str) -> String {
         }
     }
     encoded
+}
+
+fn urlencode_path_segment(s: &str) -> String {
+    urlencode(s).replace('/', "%2F")
 }
 
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &str) -> Result<T> {
@@ -1252,13 +1441,34 @@ fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolClient, ProtocolResponseError, response_error, urlencode};
+    use super::{
+        ProtocolClient, ProtocolResponseError, decode_terminal_output_data, response_error,
+        urlencode, urlencode_path_segment,
+    };
+
+    #[test]
+    fn legacy_terminal_decoder_ignores_json_replay_marker_data() {
+        assert_eq!(decode_terminal_output_data(r#"{"offset":7}"#), None);
+        assert_eq!(decode_terminal_output_data("b2s="), Some(b"ok".to_vec()));
+    }
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
         assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
         assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
         assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
+
+    #[test]
+    fn path_segment_encoding_does_not_allow_opaque_ids_to_add_url_segments() {
+        assert_eq!(
+            urlencode_path_segment("call/with?parts"),
+            "call%2Fwith%3Fparts"
+        );
+        assert_eq!(
+            urlencode_path_segment("MCP server?#name"),
+            "MCP%20server%3F%23name"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
-icon_src="$repo_root/crates/trouve-app/ui/assets/trouve.png"
+icon_src="$repo_root/crates/trouve-app/assets/trouve.png"
 
 apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 icon_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"

@@ -1,18 +1,25 @@
 //! GitHub PR integration: account and repository reads use batched GraphQL;
-//! create and merge mutations use octocrab's REST handlers.
+//! create and selected-PR collaboration mutations use GitHub's public REST
+//! and GraphQL APIs.
 //!
 //! Covered today: account-wide dashboard discovery, PR lookup by branch and
 //! session activity, create (incl. draft), combined status (checks + reviews),
-//! and merge with method selection. Merge queues and GitLab are tracked as
-//! follow-ups.
+//! and the selected PR's conversation, review, metadata, merge, merge-queue,
+//! auto-merge, and native stack state. GitLab remains a follow-up.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use serde::Deserialize;
-use trouve_protocol::{CheckRun, GithubPrList, PrInfo, PrReview};
+use trouve_protocol::{
+    CheckRun, GithubPrList, PrActionRequest, PrActor, PrAutoMerge, PrCapabilities, PrComment,
+    PrCommentKind, PrCommit, PrDetail, PrDetailSection, PrFile, PrFileDiff, PrInfo, PrLabel,
+    PrMergeQueueEntry, PrMergeQueueStatus, PrMilestone, PrReactionSummary, PrReview,
+    PrReviewDetail, PrReviewThread, PrStack, PrStackEntry,
+};
 
 /// A dashboard refresh should stay bounded even for repositories with an
 /// unusually deep PR history. Each page contains up to 100 PRs.
@@ -99,6 +106,440 @@ query TrouvePullRequest($owner: String!, $repository: String!, $number: Int!) {
 }
 "#;
 
+/// Full selected-PR collaboration state. The large connections are aliased so
+/// they can coexist with the compact summary fragment and paged independently.
+const PULL_REQUEST_DETAIL_QUERY: &str = r#"
+query TrouvePullRequestDetail(
+  $owner: String!, $repository: String!, $number: Int!,
+  $commentsAfter: String, $threadsAfter: String, $reviewsAfter: String,
+  $commitsAfter: String, $filesAfter: String,
+  $loadComments: Boolean!, $loadThreads: Boolean!, $loadReviews: Boolean!,
+  $loadCommits: Boolean!, $loadFiles: Boolean!
+) {
+  viewer { login }
+  repository(owner: $owner, name: $repository) {
+    mergeCommitAllowed
+    squashMergeAllowed
+    rebaseMergeAllowed
+    autoMergeAllowed
+    viewerDefaultMergeMethod
+    labels(first: 100, orderBy: { field: NAME, direction: ASC }) {
+      nodes { id name color description }
+    }
+    milestones(first: 100, states: [OPEN], orderBy: { field: DUE_DATE, direction: ASC }) {
+      nodes { id number title state url }
+    }
+    assignableUsers(first: 100) {
+      nodes { id login name avatarUrl url }
+    }
+    pullRequest(number: $number) {
+      ...TrouvePullRequestFields
+      baseRefOid
+      body
+      viewerSubscription
+      reactionGroups { content viewerHasReacted users { totalCount } }
+      createdAt
+      updatedAt
+      additions
+      deletions
+      changedFiles
+      reviewDecision
+      locked
+      activeLockReason
+      maintainerCanModify
+      viewerCanUpdate
+      viewerCanClose
+      viewerCanReopen
+      viewerCanAssign
+      viewerCanLabel
+      viewerCanMergeAsAdmin
+      viewerCanUpdateBranch
+      viewerCanEnableAutoMerge
+      viewerCanDisableAutoMerge
+      viewerDidAuthor
+      isMergeQueueEnabled
+      mergeQueueEntry {
+        id position state enqueuedAt estimatedTimeToMerge
+      }
+      autoMergeRequest {
+        enabledAt mergeMethod commitHeadline commitBody
+        enabledBy { login avatarUrl url ... on User { id name } ... on Bot { id } }
+      }
+      labels(first: 100) { nodes { id name color description } }
+      assignees(first: 100) { nodes { id login name avatarUrl url } }
+      milestone { id number title state url }
+      detailReviewRequests: reviewRequests(first: 100) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User { id login name avatarUrl url }
+            ... on Bot { id login avatarUrl url }
+            ... on Team { id name slug avatarUrl url }
+            ... on Mannequin { id login avatarUrl url }
+          }
+        }
+      }
+      ...TrouvePullRequestDetailConnections
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+/// Continuation pages intentionally omit the expensive summary fragment,
+/// repository metadata, viewer, labels, milestones, assignees, and stack.
+/// Those values are immutable for one detail response and come from page one.
+const PULL_REQUEST_DETAIL_PAGE_QUERY: &str = r#"
+query TrouvePullRequestDetailPage(
+  $owner: String!, $repository: String!, $number: Int!,
+  $commentsAfter: String, $threadsAfter: String, $reviewsAfter: String,
+  $commitsAfter: String, $filesAfter: String,
+  $loadComments: Boolean!, $loadThreads: Boolean!, $loadReviews: Boolean!,
+  $loadCommits: Boolean!, $loadFiles: Boolean!
+) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) { ...TrouvePullRequestDetailConnections }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+const PULL_REQUEST_DETAIL_CONNECTIONS: &str = r#"
+fragment TrouvePullRequestDetailConnections on PullRequest {
+  detailComments: comments(first: 100, after: $commentsAfter) @include(if: $loadComments) {
+    nodes {
+      id databaseId body url createdAt updatedAt lastEditedAt
+      viewerCanUpdate viewerCanDelete viewerDidAuthor
+      author { login avatarUrl url ... on User { id name } ... on Bot { id } }
+      reactionGroups { content viewerHasReacted users { totalCount } }
+    }
+    totalCount
+    pageInfo { hasNextPage endCursor }
+  }
+  detailReviewThreads: reviewThreads(first: 100, after: $threadsAfter) @include(if: $loadThreads) {
+    nodes {
+      id path line startLine diffSide isOutdated isResolved
+      viewerCanReply viewerCanResolve viewerCanUnresolve
+      comments(first: 100) {
+        nodes {
+          id body url createdAt updatedAt lastEditedAt
+          viewerCanUpdate viewerCanDelete viewerDidAuthor
+          path line diffHunk
+          author { login avatarUrl url ... on User { id name } ... on Bot { id } }
+          reactionGroups { content viewerHasReacted users { totalCount } }
+        }
+      }
+    }
+    totalCount
+    pageInfo { hasNextPage endCursor }
+  }
+  detailReviews: reviews(first: 100, after: $reviewsAfter) @include(if: $loadReviews) {
+    nodes {
+      id body state url submittedAt viewerCanUpdate viewerCanDelete viewerDidAuthor
+      author { login avatarUrl url ... on User { id name } ... on Bot { id } }
+      commit { oid }
+    }
+    totalCount
+    pageInfo { hasNextPage endCursor }
+  }
+  detailCommits: commits(first: 100, after: $commitsAfter) @include(if: $loadCommits) {
+    nodes {
+      commit {
+        oid abbreviatedOid messageHeadline messageBody committedDate url
+        author { user { id login name avatarUrl url } name }
+      }
+    }
+    totalCount
+    pageInfo { hasNextPage endCursor }
+  }
+  detailFiles: files(first: 100, after: $filesAfter) @include(if: $loadFiles) {
+    nodes { path additions deletions changeType viewerViewedState }
+    totalCount
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"#;
+
+/// GitHub's native stack fields are new and not present on every GHES
+/// version. Fetch them independently so an unsupported stack schema never
+/// hides the rest of the PR page.
+const PULL_REQUEST_STACK_QUERY: &str = r#"
+query TrouvePullRequestStack($owner: String!, $repository: String!, $number: Int!) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      stack {
+        id number size baseRefName
+        entries(first: 100) {
+          nodes {
+            position
+            pullRequest {
+              number title url state isDraft baseRefName headRefName
+              reviewDecision mergeStateStatus
+            }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+/// Resolve the selected changed file and the immutable base/head object ids
+/// without downloading the pull request's aggregate patch.
+const PULL_REQUEST_FILE_QUERY: &str = r#"
+query TrouvePullRequestFile(
+  $owner: String!, $repository: String!, $number: Int!, $after: String
+) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      baseRefOid
+      headRefOid
+      files(first: 100, after: $after) {
+        nodes { path additions deletions changeType viewerViewedState }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+const PULL_REQUEST_BLOB_METADATA_QUERY: &str = r#"
+query TrouvePullRequestBlobMetadata(
+  $owner: String!, $repository: String!, $base: String!, $head: String!
+) {
+  repository(owner: $owner, name: $repository) {
+    base: object(expression: $base) {
+      __typename
+      ... on Blob { byteSize isBinary isTruncated }
+    }
+    head: object(expression: $head) {
+      __typename
+      ... on Blob { byteSize isBinary isTruncated }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+const PULL_REQUEST_BLOB_TEXT_QUERY: &str = r#"
+query TrouvePullRequestBlobText(
+  $owner: String!, $repository: String!, $base: String!, $head: String!,
+  $loadBase: Boolean!, $loadHead: Boolean!
+) {
+  repository(owner: $owner, name: $repository) {
+    base: object(expression: $base) {
+      __typename
+      ... on Blob { text @include(if: $loadBase) }
+    }
+    head: object(expression: $head) {
+      __typename
+      ... on Blob { text @include(if: $loadHead) }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"#;
+
+const UPDATE_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveUpdatePullRequest($input: UpdatePullRequestInput!) {
+  updatePullRequest(input: $input) { pullRequest { id } }
+}
+"#;
+
+const CLOSE_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveClosePullRequest($input: ClosePullRequestInput!) {
+  closePullRequest(input: $input) { pullRequest { id } }
+}
+"#;
+
+const REOPEN_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveReopenPullRequest($input: ReopenPullRequestInput!) {
+  reopenPullRequest(input: $input) { pullRequest { id } }
+}
+"#;
+
+const CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION: &str = r#"
+mutation TrouveConvertPullRequestToDraft($input: ConvertPullRequestToDraftInput!) {
+  convertPullRequestToDraft(input: $input) { pullRequest { id } }
+}
+"#;
+
+const MARK_PULL_REQUEST_READY_MUTATION: &str = r#"
+mutation TrouveMarkPullRequestReady($input: MarkPullRequestReadyForReviewInput!) {
+  markPullRequestReadyForReview(input: $input) { pullRequest { id } }
+}
+"#;
+
+const REQUEST_REVIEWS_MUTATION: &str = r#"
+mutation TrouveRequestReviews($input: RequestReviewsByLoginInput!) {
+  requestReviewsByLogin(input: $input) { pullRequest { id } }
+}
+"#;
+
+const ADD_REVIEW_MUTATION: &str = r#"
+mutation TrouveAddReview($input: AddPullRequestReviewInput!) {
+  addPullRequestReview(input: $input) { pullRequestReview { id } }
+}
+"#;
+
+const SUBMIT_REVIEW_MUTATION: &str = r#"
+mutation TrouveSubmitReview($input: SubmitPullRequestReviewInput!) {
+  submitPullRequestReview(input: $input) { pullRequestReview { id } }
+}
+"#;
+
+const UPDATE_REVIEW_MUTATION: &str = r#"
+mutation TrouveUpdateReview($input: UpdatePullRequestReviewInput!) {
+  updatePullRequestReview(input: $input) { pullRequestReview { id } }
+}
+"#;
+
+const DELETE_REVIEW_MUTATION: &str = r#"
+mutation TrouveDeleteReview($input: DeletePullRequestReviewInput!) {
+  deletePullRequestReview(input: $input) { clientMutationId }
+}
+"#;
+
+const DISMISS_REVIEW_MUTATION: &str = r#"
+mutation TrouveDismissReview($input: DismissPullRequestReviewInput!) {
+  dismissPullRequestReview(input: $input) { pullRequestReview { id } }
+}
+"#;
+
+const ADD_COMMENT_MUTATION: &str = r#"
+mutation TrouveAddComment($input: AddCommentInput!) {
+  addComment(input: $input) { commentEdge { node { id } } }
+}
+"#;
+
+const UPDATE_ISSUE_COMMENT_MUTATION: &str = r#"
+mutation TrouveUpdateIssueComment($input: UpdateIssueCommentInput!) {
+  updateIssueComment(input: $input) { issueComment { id } }
+}
+"#;
+
+const DELETE_ISSUE_COMMENT_MUTATION: &str = r#"
+mutation TrouveDeleteIssueComment($input: DeleteIssueCommentInput!) {
+  deleteIssueComment(input: $input) { clientMutationId }
+}
+"#;
+
+const UPDATE_REVIEW_COMMENT_MUTATION: &str = r#"
+mutation TrouveUpdateReviewComment($input: UpdatePullRequestReviewCommentInput!) {
+  updatePullRequestReviewComment(input: $input) { pullRequestReviewComment { id } }
+}
+"#;
+
+const DELETE_REVIEW_COMMENT_MUTATION: &str = r#"
+mutation TrouveDeleteReviewComment($input: DeletePullRequestReviewCommentInput!) {
+  deletePullRequestReviewComment(input: $input) { clientMutationId }
+}
+"#;
+
+const REPLY_REVIEW_THREAD_MUTATION: &str = r#"
+mutation TrouveReplyReviewThread($input: AddPullRequestReviewThreadReplyInput!) {
+  addPullRequestReviewThreadReply(input: $input) { comment { id } }
+}
+"#;
+
+const RESOLVE_REVIEW_THREAD_MUTATION: &str = r#"
+mutation TrouveResolveReviewThread($input: ResolveReviewThreadInput!) {
+  resolveReviewThread(input: $input) { thread { id } }
+}
+"#;
+
+const UNRESOLVE_REVIEW_THREAD_MUTATION: &str = r#"
+mutation TrouveUnresolveReviewThread($input: UnresolveReviewThreadInput!) {
+  unresolveReviewThread(input: $input) { thread { id } }
+}
+"#;
+
+const ADD_REVIEW_THREAD_MUTATION: &str = r#"
+mutation TrouveAddReviewThread($input: AddPullRequestReviewThreadInput!) {
+  addPullRequestReviewThread(input: $input) { thread { id } }
+}
+"#;
+
+const MARK_FILE_VIEWED_MUTATION: &str = r#"
+mutation TrouveMarkFileViewed($input: MarkFileAsViewedInput!) {
+  markFileAsViewed(input: $input) { pullRequest { id } }
+}
+"#;
+
+const UNMARK_FILE_VIEWED_MUTATION: &str = r#"
+mutation TrouveUnmarkFileViewed($input: UnmarkFileAsViewedInput!) {
+  unmarkFileAsViewed(input: $input) { pullRequest { id } }
+}
+"#;
+
+const UPDATE_PULL_REQUEST_BRANCH_MUTATION: &str = r#"
+mutation TrouveUpdatePullRequestBranch($input: UpdatePullRequestBranchInput!) {
+  updatePullRequestBranch(input: $input) { pullRequest { id } }
+}
+"#;
+
+const MERGE_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveMergePullRequest($input: MergePullRequestInput!) {
+  mergePullRequest(input: $input) { pullRequest { id merged } }
+}
+"#;
+
+const ENABLE_AUTO_MERGE_MUTATION: &str = r#"
+mutation TrouveEnableAutoMerge($input: EnablePullRequestAutoMergeInput!) {
+  enablePullRequestAutoMerge(input: $input) { pullRequest { id } }
+}
+"#;
+
+const DISABLE_AUTO_MERGE_MUTATION: &str = r#"
+mutation TrouveDisableAutoMerge($input: DisablePullRequestAutoMergeInput!) {
+  disablePullRequestAutoMerge(input: $input) { pullRequest { id } }
+}
+"#;
+
+const ENQUEUE_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveEnqueuePullRequest($input: EnqueuePullRequestInput!) {
+  enqueuePullRequest(input: $input) { mergeQueueEntry { id } }
+}
+"#;
+
+const DEQUEUE_PULL_REQUEST_MUTATION: &str = r#"
+mutation TrouveDequeuePullRequest($input: DequeuePullRequestInput!) {
+  dequeuePullRequest(input: $input) { mergeQueueEntry { id } }
+}
+"#;
+
+const LOCK_LOCKABLE_MUTATION: &str = r#"
+mutation TrouveLockConversation($input: LockLockableInput!) {
+  lockLockable(input: $input) { lockedRecord { locked } }
+}
+"#;
+
+const UNLOCK_LOCKABLE_MUTATION: &str = r#"
+mutation TrouveUnlockConversation($input: UnlockLockableInput!) {
+  unlockLockable(input: $input) { unlockedRecord { locked } }
+}
+"#;
+
+const ADD_REACTION_MUTATION: &str = r#"
+mutation TrouveAddReaction($input: AddReactionInput!) {
+  addReaction(input: $input) { reaction { content } }
+}
+"#;
+
+const REMOVE_REACTION_MUTATION: &str = r#"
+mutation TrouveRemoveReaction($input: RemoveReactionInput!) {
+  removeReaction(input: $input) { reaction { content } }
+}
+"#;
+
+const UPDATE_SUBSCRIPTION_MUTATION: &str = r#"
+mutation TrouveUpdateSubscription($input: UpdateSubscriptionInput!) {
+  updateSubscription(input: $input) { subscribable { viewerSubscription } }
+}
+"#;
+
 const OPEN_PULL_REQUESTS_QUERY: &str = r#"
 query TrouveOpenPullRequests($owner: String!, $repository: String!, $after: String) {
   repository(owner: $owner, name: $repository) {
@@ -166,6 +607,9 @@ fragment TrouvePullRequestFields on PullRequest {
                 name
                 status
                 conclusion
+                detailsUrl
+                startedAt
+                completedAt
               }
             }
           }
@@ -184,6 +628,20 @@ const MAX_OPEN_PR_DISCOVERY_PAGES: usize = 3;
 
 /// Maximum PRs enriched by one evidence-based discovery request.
 const MAX_DISCOVERED_SESSION_PRS: usize = 20;
+
+/// Guard against pathological PRs while still covering GitHub's own largest
+/// practical conversations. Connections are fetched in pages of 100.
+const MAX_PR_DETAIL_PAGES: usize = 20;
+
+/// File lookup stays bounded independently from the richer PR detail
+/// connections. GitHub itself caps changed files at 3,000, so 30 pages covers
+/// the complete public surface without an open-ended request loop.
+const MAX_PR_FILE_PAGES: usize = 30;
+
+/// CodeMirror switches to a virtualized before/after presentation at this
+/// aggregate size. Keep each remote blob bounded at the same threshold so the
+/// protocol never transports an unexpectedly huge GitHub object.
+const MAX_PR_FILE_TEXT_BYTES: u64 = 3_000_000;
 
 /// Parse a git remote URL into (host, owner, repo). Supports
 /// `https://HOST/owner/repo(.git)`, `ssh://git@HOST/owner/repo`, and
@@ -327,8 +785,10 @@ pub fn oauth_config(host: &str, client_id: &str) -> trouve_providers::auth::OAut
         device_authorization_url: Some(format!("https://{host}/login/device/code")),
         authorization_url: None,
         token_url: format!("https://{host}/login/oauth/access_token"),
-        // Classic OAuth-app scope covering PR read/write and checks.
-        scopes: vec!["repo".into()],
+        // `repo` covers pull-request mutations. Rich reviewer details also
+        // resolve requested teams, which GitHub gates behind `read:org` even
+        // when the repository itself is already visible to the token.
+        scopes: vec!["repo".into(), "read:org".into()],
         redirect_port: None,
         redirect_path: None,
     }
@@ -357,6 +817,7 @@ pub struct GitHubDashboardCache {
     viewer: Option<String>,
     entries: HashMap<String, CachedDashboardPullRequest>,
     published_snapshot: Option<String>,
+    last_successful_refresh: Option<Instant>,
 }
 
 struct CachedDashboardPullRequest {
@@ -408,6 +869,30 @@ impl GitHubDashboardCache {
     pub(crate) fn mark_snapshot_published(&mut self, serialized: String) {
         self.published_snapshot = Some(serialized);
     }
+
+    pub(crate) fn should_refresh(
+        &self,
+        force: bool,
+        request_started: Instant,
+        now: Instant,
+        freshness: Duration,
+    ) -> bool {
+        let Some(last_refresh) = self.last_successful_refresh else {
+            return true;
+        };
+        if force {
+            // A manual request waits for an in-flight refresh. Reuse that
+            // result when it completed after the click instead of immediately
+            // issuing an identical forced refresh.
+            last_refresh < request_started
+        } else {
+            now.saturating_duration_since(last_refresh) >= freshness
+        }
+    }
+
+    pub(crate) fn mark_refresh_completed(&mut self) {
+        self.last_successful_refresh = Some(Instant::now());
+    }
 }
 
 #[derive(Deserialize)]
@@ -425,9 +910,20 @@ struct GraphqlViewerData {
     rate_limit: GraphqlRateLimit,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphqlActor {
+    #[serde(default)]
+    id: String,
     login: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "__typename")]
+    typename: String,
 }
 
 #[derive(Deserialize)]
@@ -530,6 +1026,55 @@ struct GraphqlPullRequestData {
     repository: Option<GraphqlPullRequestRepository>,
     #[serde(rename = "rateLimit")]
     rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrFileData {
+    repository: Option<GraphqlPrFileRepository>,
+    #[serde(rename = "rateLimit")]
+    rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrFileRepository {
+    pull_request: Option<GraphqlPrFilePullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrFilePullRequest {
+    base_ref_oid: String,
+    head_ref_oid: String,
+    files: GraphqlPagedNodes<GraphqlDetailFile>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlBlobData {
+    repository: Option<GraphqlBlobRepository>,
+    #[serde(rename = "rateLimit")]
+    rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+struct GraphqlBlobRepository {
+    base: Option<GraphqlBlob>,
+    head: Option<GraphqlBlob>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlBlob {
+    #[serde(default, rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    byte_size: Option<u64>,
+    #[serde(default)]
+    is_binary: Option<bool>,
+    #[serde(default)]
+    is_truncated: Option<bool>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -643,9 +1188,22 @@ struct GraphqlReviewRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphqlRequestedReviewer {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     login: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    avatar_url: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "__typename")]
+    typename: String,
 }
 
 #[derive(Deserialize)]
@@ -696,6 +1254,349 @@ struct GraphqlCheckRun {
     status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
+    #[serde(default, rename = "detailsUrl")]
+    details_url: Option<String>,
+    #[serde(default, rename = "startedAt")]
+    started_at: Option<DateTime<Utc>>,
+    #[serde(default, rename = "completedAt")]
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrDetailData {
+    viewer: GraphqlActor,
+    repository: Option<GraphqlPrDetailRepository>,
+    #[serde(rename = "rateLimit")]
+    rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrDetailPageData {
+    repository: Option<GraphqlPrDetailPageRepository>,
+    #[serde(rename = "rateLimit")]
+    rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrDetailPageRepository {
+    pull_request: Option<GraphqlPrDetailPageNode>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrDetailPageNode {
+    #[serde(flatten)]
+    connections: GraphqlPrDetailConnections,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrDetailRepository {
+    merge_commit_allowed: bool,
+    squash_merge_allowed: bool,
+    rebase_merge_allowed: bool,
+    auto_merge_allowed: bool,
+    viewer_default_merge_method: String,
+    labels: GraphqlNodes<GraphqlDetailLabel>,
+    milestones: GraphqlNodes<GraphqlDetailMilestone>,
+    assignable_users: GraphqlNodes<GraphqlActor>,
+    pull_request: Option<GraphqlPrDetailNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct GraphqlNodes<T> {
+    #[serde(default)]
+    nodes: Vec<Option<T>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct GraphqlPagedNodes<T> {
+    #[serde(default)]
+    nodes: Vec<Option<T>>,
+    page_info: GraphqlPageInfo,
+    #[serde(default)]
+    total_count: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrDetailNode {
+    #[serde(flatten)]
+    summary: GraphqlPullRequest,
+    base_ref_oid: String,
+    body: String,
+    viewer_subscription: String,
+    #[serde(default)]
+    reaction_groups: Vec<GraphqlReactionGroup>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
+    #[serde(default)]
+    review_decision: Option<String>,
+    locked: bool,
+    #[serde(default)]
+    active_lock_reason: Option<String>,
+    maintainer_can_modify: bool,
+    viewer_can_update: bool,
+    viewer_can_close: bool,
+    viewer_can_reopen: bool,
+    viewer_can_assign: bool,
+    viewer_can_label: bool,
+    viewer_can_merge_as_admin: bool,
+    viewer_can_update_branch: bool,
+    viewer_can_enable_auto_merge: bool,
+    viewer_can_disable_auto_merge: bool,
+    viewer_did_author: bool,
+    is_merge_queue_enabled: bool,
+    #[serde(default)]
+    merge_queue_entry: Option<GraphqlMergeQueueEntry>,
+    #[serde(default)]
+    auto_merge_request: Option<GraphqlAutoMerge>,
+    labels: GraphqlNodes<GraphqlDetailLabel>,
+    assignees: GraphqlNodes<GraphqlActor>,
+    #[serde(default)]
+    milestone: Option<GraphqlDetailMilestone>,
+    #[serde(rename = "detailReviewRequests")]
+    detail_review_requests: GraphqlNodes<GraphqlDetailReviewRequest>,
+    #[serde(flatten)]
+    connections: GraphqlPrDetailConnections,
+}
+
+#[derive(Default, Deserialize)]
+struct GraphqlPrDetailConnections {
+    #[serde(default, rename = "detailComments")]
+    detail_comments: Option<GraphqlPagedNodes<GraphqlDetailComment>>,
+    #[serde(default, rename = "detailReviewThreads")]
+    detail_review_threads: Option<GraphqlPagedNodes<GraphqlDetailReviewThread>>,
+    #[serde(default, rename = "detailReviews")]
+    detail_reviews: Option<GraphqlPagedNodes<GraphqlDetailReview>>,
+    #[serde(default, rename = "detailCommits")]
+    detail_commits: Option<GraphqlPagedNodes<GraphqlDetailPullRequestCommit>>,
+    #[serde(default, rename = "detailFiles")]
+    detail_files: Option<GraphqlPagedNodes<GraphqlDetailFile>>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlDetailLabel {
+    id: String,
+    name: String,
+    #[serde(default)]
+    color: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlDetailMilestone {
+    id: String,
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlMergeQueueEntry {
+    id: String,
+    position: u64,
+    state: String,
+    enqueued_at: DateTime<Utc>,
+    #[serde(default)]
+    estimated_time_to_merge: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlAutoMerge {
+    enabled_at: DateTime<Utc>,
+    merge_method: String,
+    #[serde(default)]
+    commit_headline: Option<String>,
+    #[serde(default)]
+    commit_body: Option<String>,
+    #[serde(default)]
+    enabled_by: Option<GraphqlActor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailReviewRequest {
+    requested_reviewer: Option<GraphqlRequestedReviewer>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailComment {
+    id: String,
+    #[serde(default)]
+    database_id: Option<u64>,
+    body: String,
+    url: String,
+    author: Option<GraphqlActor>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    last_edited_at: Option<DateTime<Utc>>,
+    viewer_can_update: bool,
+    viewer_can_delete: bool,
+    viewer_did_author: bool,
+    #[serde(default)]
+    reaction_groups: Vec<GraphqlReactionGroup>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    diff_hunk: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlReactionGroup {
+    content: String,
+    viewer_has_reacted: bool,
+    users: GraphqlCount,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlCount {
+    total_count: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailReviewThread {
+    id: String,
+    path: String,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    start_line: Option<u64>,
+    diff_side: String,
+    is_outdated: bool,
+    is_resolved: bool,
+    viewer_can_reply: bool,
+    viewer_can_resolve: bool,
+    viewer_can_unresolve: bool,
+    comments: GraphqlNodes<GraphqlDetailComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailReview {
+    id: String,
+    author: Option<GraphqlActor>,
+    state: String,
+    #[serde(default)]
+    body: String,
+    url: String,
+    #[serde(default)]
+    submitted_at: Option<DateTime<Utc>>,
+    viewer_can_update: bool,
+    viewer_can_delete: bool,
+    viewer_did_author: bool,
+    #[serde(default)]
+    commit: Option<GraphqlOid>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlOid {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct GraphqlDetailPullRequestCommit {
+    commit: GraphqlDetailCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailCommit {
+    oid: String,
+    abbreviated_oid: String,
+    message_headline: String,
+    #[serde(default)]
+    message_body: String,
+    committed_date: DateTime<Utc>,
+    url: String,
+    #[serde(default)]
+    author: Option<GraphqlCommitAuthor>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlCommitAuthor {
+    #[serde(default)]
+    user: Option<GraphqlActor>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlDetailFile {
+    path: String,
+    additions: u64,
+    deletions: u64,
+    change_type: String,
+    viewer_viewed_state: String,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrStackData {
+    repository: Option<GraphqlPrStackRepository>,
+    #[serde(rename = "rateLimit")]
+    rate_limit: GraphqlRateLimit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrStackRepository {
+    pull_request: Option<GraphqlPrStackPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrStackPullRequest {
+    stack: Option<GraphqlPrStack>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrStack {
+    id: String,
+    number: u64,
+    size: u64,
+    base_ref_name: String,
+    entries: GraphqlNodes<GraphqlPrStackEntry>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrStackEntry {
+    position: u64,
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GraphqlPrStackEntryPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrStackEntryPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    is_draft: bool,
+    base_ref_name: String,
+    head_ref_name: String,
+    #[serde(default)]
+    review_decision: Option<String>,
+    #[serde(default)]
+    merge_state_status: Option<String>,
 }
 
 struct SearchCursor {
@@ -713,6 +1614,133 @@ impl SearchCursor {
             pages: 0,
             active: true,
         }
+    }
+}
+
+struct PrDetailPagination {
+    comments_after: Option<String>,
+    threads_after: Option<String>,
+    reviews_after: Option<String>,
+    commits_after: Option<String>,
+    files_after: Option<String>,
+    load_comments: bool,
+    load_threads: bool,
+    load_reviews: bool,
+    load_commits: bool,
+    load_files: bool,
+    comments: Vec<GraphqlDetailComment>,
+    threads: Vec<GraphqlDetailReviewThread>,
+    reviews: Vec<GraphqlDetailReview>,
+    commits: Vec<GraphqlDetailPullRequestCommit>,
+    files: Vec<GraphqlDetailFile>,
+    commit_count: u64,
+}
+
+impl PrDetailPagination {
+    fn new(sections: &HashSet<PrDetailSection>) -> Self {
+        let load_conversation = sections.contains(&PrDetailSection::Conversation);
+        Self {
+            comments_after: None,
+            threads_after: None,
+            reviews_after: None,
+            commits_after: None,
+            files_after: None,
+            load_comments: load_conversation,
+            load_threads: load_conversation,
+            load_reviews: load_conversation,
+            load_commits: sections.contains(&PrDetailSection::Commits),
+            load_files: sections.contains(&PrDetailSection::Files),
+            comments: Vec::new(),
+            threads: Vec::new(),
+            reviews: Vec::new(),
+            commits: Vec::new(),
+            files: Vec::new(),
+            commit_count: 0,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.load_comments
+            || self.load_threads
+            || self.load_reviews
+            || self.load_commits
+            || self.load_files
+    }
+
+    fn consume(&mut self, mut connections: GraphqlPrDetailConnections) {
+        consume_detail_page(
+            connections.detail_comments.take(),
+            &mut self.comments,
+            &mut self.comments_after,
+            &mut self.load_comments,
+        );
+        consume_detail_page(
+            connections.detail_review_threads.take(),
+            &mut self.threads,
+            &mut self.threads_after,
+            &mut self.load_threads,
+        );
+        consume_detail_page(
+            connections.detail_reviews.take(),
+            &mut self.reviews,
+            &mut self.reviews_after,
+            &mut self.load_reviews,
+        );
+        if let Some(page) = connections.detail_commits.take() {
+            self.commit_count = self.commit_count.max(page.total_count.unwrap_or_default());
+            consume_detail_page(
+                Some(page),
+                &mut self.commits,
+                &mut self.commits_after,
+                &mut self.load_commits,
+            );
+        } else {
+            self.load_commits = false;
+        }
+        consume_detail_page(
+            connections.detail_files.take(),
+            &mut self.files,
+            &mut self.files_after,
+            &mut self.load_files,
+        );
+    }
+
+    fn apply_to(self, mut detail: PrDetail, sections: &HashSet<PrDetailSection>) -> PrDetail {
+        let truncated = self.active();
+        if sections.contains(&PrDetailSection::Conversation) {
+            detail.comments = self
+                .comments
+                .into_iter()
+                .map(GraphqlDetailComment::into_pr_comment)
+                .collect();
+            detail.review_threads = self
+                .threads
+                .into_iter()
+                .map(GraphqlDetailReviewThread::into_pr_thread)
+                .collect();
+            detail.reviews = self
+                .reviews
+                .into_iter()
+                .map(GraphqlDetailReview::into_pr_review)
+                .collect();
+        }
+        if sections.contains(&PrDetailSection::Commits) {
+            detail.commit_count = self.commit_count;
+            detail.commits = self
+                .commits
+                .into_iter()
+                .map(GraphqlDetailPullRequestCommit::into_pr_commit)
+                .collect();
+        }
+        if sections.contains(&PrDetailSection::Files) {
+            detail.files = self
+                .files
+                .into_iter()
+                .map(GraphqlDetailFile::into_pr_file)
+                .collect();
+        }
+        detail.truncated |= truncated;
+        detail
     }
 }
 
@@ -910,6 +1938,288 @@ impl GitHubGraphql {
             .map(|pr| pr.into_pr_info(&self.host)))
     }
 
+    async fn pull_request_detail(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: u64,
+        sections: &HashSet<PrDetailSection>,
+        existing: Option<PrDetail>,
+    ) -> Result<PrDetail> {
+        if !sections.contains(&PrDetailSection::Overview)
+            && let Some(detail) = existing
+        {
+            let pagination = self
+                .load_pull_request_detail_pages(
+                    owner,
+                    repository,
+                    number,
+                    PrDetailPagination::new(sections),
+                    0,
+                )
+                .await?;
+            return Ok(pagination.apply_to(detail, sections));
+        }
+        let query = operation_with_pr_detail_fields(PULL_REQUEST_DETAIL_QUERY);
+        let mut pagination = PrDetailPagination::new(sections);
+        let response: GraphqlPrDetailData = self
+            .client
+            .graphql(&serde_json::json!({
+                "query": query,
+                "variables": {
+                    "owner": owner,
+                    "repository": repository,
+                    "number": number,
+                    "commentsAfter": pagination.comments_after.as_deref(),
+                    "threadsAfter": pagination.threads_after.as_deref(),
+                    "reviewsAfter": pagination.reviews_after.as_deref(),
+                    "commitsAfter": pagination.commits_after.as_deref(),
+                    "filesAfter": pagination.files_after.as_deref(),
+                    "loadComments": pagination.load_comments,
+                    "loadThreads": pagination.load_threads,
+                    "loadReviews": pagination.load_reviews,
+                    "loadCommits": pagination.load_commits,
+                    "loadFiles": pagination.load_files,
+                }
+            }))
+            .await
+            .context("loading full pull request detail through GraphQL")?;
+        self.trace_rate("full pull request detail", &response.rate_limit);
+        let viewer = response.viewer.login;
+        let mut repository_detail = response
+            .repository
+            .with_context(|| format!("repository {owner}/{repository} not found"))?;
+        let mut pull_request = repository_detail
+            .pull_request
+            .take()
+            .with_context(|| format!("pull request #{number} not found"))?;
+        pagination.consume(std::mem::take(&mut pull_request.connections));
+        pagination = self
+            .load_pull_request_detail_pages(owner, repository, number, pagination, 1)
+            .await?;
+
+        let truncated = pagination.active();
+        let stack = if sections.contains(&PrDetailSection::Overview) {
+            match self.pull_request_stack(owner, repository, number).await {
+                Ok(stack) => stack,
+                Err(error) => {
+                    tracing::debug!(
+                        host = self.host,
+                        owner,
+                        repository,
+                        number,
+                        error = %error,
+                        "GitHub host does not expose native pull-request stacks"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        pull_request.into_pr_detail(
+            &self.host,
+            viewer,
+            repository_detail,
+            pagination.comments,
+            pagination.threads,
+            pagination.reviews,
+            pagination.commits,
+            pagination.files,
+            pagination.commit_count,
+            stack,
+            truncated,
+        )
+    }
+
+    async fn load_pull_request_detail_pages(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: u64,
+        mut pagination: PrDetailPagination,
+        mut page_count: usize,
+    ) -> Result<PrDetailPagination> {
+        let page_query = operation_with_pr_detail_connections(PULL_REQUEST_DETAIL_PAGE_QUERY);
+        while pagination.active() && page_count < MAX_PR_DETAIL_PAGES {
+            let response: GraphqlPrDetailPageData = self
+                .client
+                .graphql(&serde_json::json!({
+                    "query": page_query,
+                    "variables": {
+                        "owner": owner,
+                        "repository": repository,
+                        "number": number,
+                        "commentsAfter": pagination.comments_after.as_deref(),
+                        "threadsAfter": pagination.threads_after.as_deref(),
+                        "reviewsAfter": pagination.reviews_after.as_deref(),
+                        "commitsAfter": pagination.commits_after.as_deref(),
+                        "filesAfter": pagination.files_after.as_deref(),
+                        "loadComments": pagination.load_comments,
+                        "loadThreads": pagination.load_threads,
+                        "loadReviews": pagination.load_reviews,
+                        "loadCommits": pagination.load_commits,
+                        "loadFiles": pagination.load_files,
+                    }
+                }))
+                .await
+                .context("loading pull request detail continuation through GraphQL")?;
+            self.trace_rate("pull request detail continuation", &response.rate_limit);
+            let repository_page = response
+                .repository
+                .with_context(|| format!("repository {owner}/{repository} not found"))?;
+            let page = repository_page
+                .pull_request
+                .with_context(|| format!("pull request #{number} not found"))?;
+            pagination.consume(page.connections);
+            page_count += 1;
+        }
+        Ok(pagination)
+    }
+
+    async fn pull_request_stack(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: u64,
+    ) -> Result<Option<PrStack>> {
+        let response: GraphqlPrStackData = self
+            .client
+            .graphql(&serde_json::json!({
+                "query": PULL_REQUEST_STACK_QUERY,
+                "variables": {
+                    "owner": owner,
+                    "repository": repository,
+                    "number": number,
+                }
+            }))
+            .await
+            .context("loading native pull-request stack through GraphQL")?;
+        self.trace_rate("pull request stack", &response.rate_limit);
+        Ok(response
+            .repository
+            .and_then(|repository| repository.pull_request)
+            .and_then(|pull_request| pull_request.stack)
+            .map(GraphqlPrStack::into_pr_stack))
+    }
+
+    async fn pull_request_file_diff(
+        &self,
+        owner: &str,
+        repository: &str,
+        number: u64,
+        path: &str,
+    ) -> Result<PrFileDiff> {
+        anyhow::ensure!(!path.is_empty(), "pull request file path cannot be empty");
+        let mut after = None;
+        let mut selected = None;
+        let mut base_oid = String::new();
+        let mut head_oid = String::new();
+
+        for _ in 0..MAX_PR_FILE_PAGES {
+            let response: GraphqlPrFileData = self
+                .client
+                .graphql(&serde_json::json!({
+                    "query": PULL_REQUEST_FILE_QUERY,
+                    "variables": {
+                        "owner": owner,
+                        "repository": repository,
+                        "number": number,
+                        "after": after,
+                    }
+                }))
+                .await
+                .context("locating pull request file through GraphQL")?;
+            self.trace_rate("pull request file lookup", &response.rate_limit);
+            let pull_request = response
+                .repository
+                .with_context(|| format!("repository {owner}/{repository} not found"))?
+                .pull_request
+                .with_context(|| format!("pull request #{number} not found"))?;
+            base_oid = pull_request.base_ref_oid;
+            head_oid = pull_request.head_ref_oid;
+            let GraphqlPagedNodes {
+                nodes, page_info, ..
+            } = pull_request.files;
+            selected = nodes
+                .into_iter()
+                .flatten()
+                .find(|candidate| candidate.path == path);
+            if selected.is_some() || !page_info.has_next_page {
+                break;
+            }
+            after = page_info.end_cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+
+        let file = selected
+            .with_context(|| format!("{path} is not a changed file in pull request #{number}"))?
+            .into_pr_file();
+        self.pull_request_file_diff_known(owner, repository, &file, &base_oid, &head_oid)
+            .await
+    }
+
+    async fn pull_request_file_diff_known(
+        &self,
+        owner: &str,
+        repository: &str,
+        file: &PrFile,
+        base_oid: &str,
+        head_oid: &str,
+    ) -> Result<PrFileDiff> {
+        let path = &file.path;
+        let base_expression = format!("{base_oid}:{path}");
+        let head_expression = format!("{head_oid}:{path}");
+        let metadata_response: GraphqlBlobData = self
+            .client
+            .graphql(&serde_json::json!({
+                "query": PULL_REQUEST_BLOB_METADATA_QUERY,
+                "variables": {
+                    "owner": owner,
+                    "repository": repository,
+                    "base": base_expression,
+                    "head": head_expression,
+                }
+            }))
+            .await
+            .context("loading pull request file metadata through GraphQL")?;
+        self.trace_rate("pull request file metadata", &metadata_response.rate_limit);
+        let metadata = metadata_response
+            .repository
+            .with_context(|| format!("repository {owner}/{repository} not found"))?;
+        let load_base = blob_text_is_loadable(metadata.base.as_ref());
+        let load_head = blob_text_is_loadable(metadata.head.as_ref());
+        let content = if load_base || load_head {
+            let response: GraphqlBlobData = self
+                .client
+                .graphql(&serde_json::json!({
+                    "query": PULL_REQUEST_BLOB_TEXT_QUERY,
+                    "variables": {
+                        "owner": owner,
+                        "repository": repository,
+                        "base": base_expression,
+                        "head": head_expression,
+                        "loadBase": load_base,
+                        "loadHead": load_head,
+                    }
+                }))
+                .await
+                .context("loading pull request file text through GraphQL")?;
+            self.trace_rate("pull request file text", &response.rate_limit);
+            response
+                .repository
+                .with_context(|| format!("repository {owner}/{repository} not found"))?
+        } else {
+            GraphqlBlobRepository {
+                base: None,
+                head: None,
+            }
+        };
+        Ok(build_pr_file_diff(file.clone(), metadata, content))
+    }
+
     async fn open_prs_referenced_by(
         &self,
         owner: &str,
@@ -970,6 +2280,18 @@ impl GitHubGraphql {
         Ok(prs)
     }
 
+    async fn mutate(&self, query: &str, input: serde_json::Value, operation: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .client
+            .graphql(&serde_json::json!({
+                "query": query,
+                "variables": { "input": input },
+            }))
+            .await
+            .with_context(|| format!("{operation} through GitHub GraphQL"))?;
+        Ok(())
+    }
+
     fn trace_rate(&self, operation: &str, rate: &GraphqlRateLimit) {
         tracing::debug!(
             host = self.host,
@@ -979,6 +2301,105 @@ impl GitHubGraphql {
             reset_at = %rate.reset_at,
             "GitHub GraphQL request"
         );
+    }
+}
+
+fn blob_text_is_loadable(blob: Option<&GraphqlBlob>) -> bool {
+    blob.is_some_and(|blob| {
+        blob.typename == "Blob"
+            && blob.is_binary != Some(true)
+            && blob.is_truncated != Some(true)
+            && blob
+                .byte_size
+                .is_none_or(|bytes| bytes <= MAX_PR_FILE_TEXT_BYTES)
+    })
+}
+
+fn build_pr_file_diff(
+    file: PrFile,
+    metadata: GraphqlBlobRepository,
+    content: GraphqlBlobRepository,
+) -> PrFileDiff {
+    let base_expected = file.change_type != "added";
+    let head_expected = file.change_type != "deleted";
+    let original = if base_expected {
+        content.base.and_then(|blob| blob.text)
+    } else {
+        Some(String::new())
+    };
+    let modified = if head_expected {
+        content.head.and_then(|blob| blob.text)
+    } else {
+        Some(String::new())
+    };
+    let mut notes = Vec::new();
+    let mut binary = false;
+    let mut truncated = false;
+
+    for (side, expected, blob, text) in [
+        (
+            "base",
+            base_expected,
+            metadata.base.as_ref(),
+            original.as_ref(),
+        ),
+        (
+            "changed",
+            head_expected,
+            metadata.head.as_ref(),
+            modified.as_ref(),
+        ),
+    ] {
+        if !expected {
+            continue;
+        }
+        let Some(blob) = blob else {
+            truncated = true;
+            notes.push(if file.change_type == "renamed" && side == "base" {
+                "GitHub did not expose the file's previous path, so the base side of this rename is unavailable."
+                    .to_string()
+            } else {
+                format!("The {side} file is unavailable at this pull request's commit.")
+            });
+            continue;
+        };
+        if blob.typename != "Blob" {
+            truncated = true;
+            notes.push(format!(
+                "The {side} object is a {} rather than a text file.",
+                blob.typename.to_ascii_lowercase()
+            ));
+        } else if blob.is_binary == Some(true) {
+            binary = true;
+            notes.push(format!("The {side} file is binary."));
+        } else if blob.is_truncated == Some(true) {
+            truncated = true;
+            notes.push(format!("GitHub truncated the {side} file."));
+        } else if blob
+            .byte_size
+            .is_some_and(|bytes| bytes > MAX_PR_FILE_TEXT_BYTES)
+        {
+            truncated = true;
+            notes.push(format!(
+                "The {side} file exceeds the {} MB preview limit.",
+                MAX_PR_FILE_TEXT_BYTES / 1_000_000
+            ));
+        } else if text.is_none() {
+            truncated = true;
+            notes.push(format!("GitHub did not return text for the {side} file."));
+        }
+    }
+
+    PrFileDiff {
+        path: file.path,
+        change_type: file.change_type,
+        original,
+        modified,
+        original_bytes: metadata.base.and_then(|blob| blob.byte_size),
+        modified_bytes: metadata.head.and_then(|blob| blob.byte_size),
+        binary,
+        truncated,
+        notice: notes.join(" "),
     }
 }
 
@@ -1032,6 +2453,9 @@ impl GraphqlPullRequest {
                     name: check.name?,
                     status: check.status?.to_ascii_lowercase(),
                     conclusion: check.conclusion.map(|value| value.to_ascii_lowercase()),
+                    details_url: check.details_url,
+                    started_at: check.started_at,
+                    completed_at: check.completed_at,
                 })
             })
             .collect();
@@ -1066,6 +2490,440 @@ impl GraphqlPullRequest {
             merged_at: self.merged_at,
         }
     }
+}
+
+impl GraphqlPrDetailNode {
+    #[allow(clippy::too_many_arguments)]
+    fn into_pr_detail(
+        self,
+        host: &str,
+        viewer: String,
+        repository: GraphqlPrDetailRepository,
+        comments: Vec<GraphqlDetailComment>,
+        threads: Vec<GraphqlDetailReviewThread>,
+        reviews: Vec<GraphqlDetailReview>,
+        commits: Vec<GraphqlDetailPullRequestCommit>,
+        files: Vec<GraphqlDetailFile>,
+        commit_count: u64,
+        stack: Option<PrStack>,
+        truncated: bool,
+    ) -> Result<PrDetail> {
+        let GraphqlPrDetailNode {
+            summary,
+            base_ref_oid,
+            body,
+            viewer_subscription,
+            reaction_groups,
+            created_at,
+            updated_at,
+            additions,
+            deletions,
+            changed_files,
+            review_decision,
+            locked,
+            active_lock_reason,
+            maintainer_can_modify,
+            viewer_can_update,
+            viewer_can_close,
+            viewer_can_reopen,
+            viewer_can_assign,
+            viewer_can_label,
+            viewer_can_merge_as_admin,
+            viewer_can_update_branch,
+            viewer_can_enable_auto_merge,
+            viewer_can_disable_auto_merge,
+            viewer_did_author,
+            is_merge_queue_enabled,
+            merge_queue_entry,
+            auto_merge_request,
+            labels,
+            assignees,
+            milestone,
+            detail_review_requests,
+            connections: _,
+        } = self;
+        let id = summary.id.clone();
+        let info = summary.into_pr_info(host);
+        let mut merge_methods = Vec::new();
+        if repository.merge_commit_allowed {
+            merge_methods.push("merge".to_string());
+        }
+        if repository.squash_merge_allowed {
+            merge_methods.push("squash".to_string());
+        }
+        if repository.rebase_merge_allowed {
+            merge_methods.push("rebase".to_string());
+        }
+        let default_merge_method = repository.viewer_default_merge_method.to_ascii_lowercase();
+        Ok(PrDetail {
+            info,
+            base_sha: Some(base_ref_oid),
+            id,
+            viewer,
+            body,
+            reactions: reaction_groups
+                .into_iter()
+                .map(GraphqlReactionGroup::into_pr_reaction)
+                .collect(),
+            viewer_subscription: viewer_subscription.to_ascii_lowercase(),
+            created_at,
+            updated_at,
+            additions,
+            deletions,
+            changed_files,
+            commit_count,
+            review_decision: review_decision
+                .map(|decision| decision.to_ascii_lowercase())
+                .unwrap_or_default(),
+            locked,
+            active_lock_reason: active_lock_reason
+                .map(|reason| reason.to_ascii_lowercase())
+                .unwrap_or_default(),
+            maintainer_can_modify,
+            capabilities: PrCapabilities {
+                can_update: viewer_can_update,
+                can_close: viewer_can_close,
+                can_reopen: viewer_can_reopen,
+                can_assign: viewer_can_assign,
+                can_label: viewer_can_label,
+                can_merge_as_admin: viewer_can_merge_as_admin,
+                can_update_branch: viewer_can_update_branch,
+                can_enable_auto_merge: viewer_can_enable_auto_merge,
+                can_disable_auto_merge: viewer_can_disable_auto_merge,
+                did_author: viewer_did_author,
+            },
+            merge_methods,
+            default_merge_method,
+            auto_merge_allowed: repository.auto_merge_allowed,
+            labels: labels
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(GraphqlDetailLabel::into_pr_label)
+                .collect(),
+            available_labels: repository
+                .labels
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(GraphqlDetailLabel::into_pr_label)
+                .collect(),
+            assignees: assignees
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|actor| actor.into_pr_actor("user"))
+                .collect(),
+            assignable_users: repository
+                .assignable_users
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|actor| actor.into_pr_actor("user"))
+                .collect(),
+            milestone: milestone.map(GraphqlDetailMilestone::into_pr_milestone),
+            available_milestones: repository
+                .milestones
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(GraphqlDetailMilestone::into_pr_milestone)
+                .collect(),
+            review_requests: detail_review_requests
+                .nodes
+                .into_iter()
+                .flatten()
+                .filter_map(|request| request.requested_reviewer)
+                .map(GraphqlRequestedReviewer::into_pr_actor)
+                .collect(),
+            reviews: reviews
+                .into_iter()
+                .map(GraphqlDetailReview::into_pr_review)
+                .collect(),
+            comments: comments
+                .into_iter()
+                .map(GraphqlDetailComment::into_pr_comment)
+                .collect(),
+            review_threads: threads
+                .into_iter()
+                .map(GraphqlDetailReviewThread::into_pr_thread)
+                .collect(),
+            commits: commits
+                .into_iter()
+                .map(GraphqlDetailPullRequestCommit::into_pr_commit)
+                .collect(),
+            files: files
+                .into_iter()
+                .map(GraphqlDetailFile::into_pr_file)
+                .collect(),
+            merge_queue: PrMergeQueueStatus {
+                enabled: is_merge_queue_enabled,
+                entry: merge_queue_entry.map(GraphqlMergeQueueEntry::into_pr_entry),
+            },
+            auto_merge: auto_merge_request.map(GraphqlAutoMerge::into_pr_auto_merge),
+            stack,
+            truncated,
+        })
+    }
+}
+
+impl GraphqlActor {
+    fn into_pr_actor(self, fallback_kind: &str) -> PrActor {
+        let kind = if self.typename.is_empty() {
+            fallback_kind.to_string()
+        } else {
+            self.typename.to_ascii_lowercase()
+        };
+        PrActor {
+            id: self.id,
+            login: self.login,
+            name: self.name.unwrap_or_default(),
+            kind,
+            avatar_url: self.avatar_url,
+            url: self.url,
+        }
+    }
+}
+
+impl GraphqlRequestedReviewer {
+    fn into_pr_actor(self) -> PrActor {
+        let kind = self.typename.to_ascii_lowercase();
+        let login = self
+            .login
+            .or_else(|| self.slug.clone())
+            .or_else(|| self.name.clone())
+            .unwrap_or_default();
+        PrActor {
+            id: self.id,
+            login,
+            name: self.name.unwrap_or_default(),
+            kind: if kind.is_empty() {
+                "unknown".into()
+            } else {
+                kind
+            },
+            avatar_url: self.avatar_url,
+            url: self.url,
+        }
+    }
+}
+
+impl GraphqlDetailLabel {
+    fn into_pr_label(self) -> PrLabel {
+        PrLabel {
+            id: self.id,
+            name: self.name,
+            color: self.color,
+            description: self.description.unwrap_or_default(),
+        }
+    }
+}
+
+impl GraphqlDetailMilestone {
+    fn into_pr_milestone(self) -> PrMilestone {
+        PrMilestone {
+            id: self.id,
+            number: self.number,
+            title: self.title,
+            state: self.state.to_ascii_lowercase(),
+            url: self.url,
+        }
+    }
+}
+
+impl GraphqlMergeQueueEntry {
+    fn into_pr_entry(self) -> PrMergeQueueEntry {
+        PrMergeQueueEntry {
+            id: self.id,
+            position: self.position,
+            state: self.state.to_ascii_lowercase(),
+            enqueued_at: self.enqueued_at,
+            estimated_time_to_merge: self.estimated_time_to_merge,
+        }
+    }
+}
+
+impl GraphqlAutoMerge {
+    fn into_pr_auto_merge(self) -> PrAutoMerge {
+        PrAutoMerge {
+            method: self.merge_method.to_ascii_lowercase(),
+            enabled_at: self.enabled_at,
+            enabled_by: self.enabled_by.map(|actor| actor.into_pr_actor("user")),
+            commit_title: self.commit_headline.unwrap_or_default(),
+            commit_message: self.commit_body.unwrap_or_default(),
+        }
+    }
+}
+
+impl GraphqlDetailComment {
+    fn into_pr_comment(self) -> PrComment {
+        PrComment {
+            id: self.id,
+            database_id: self.database_id,
+            body: self.body,
+            url: self.url,
+            author: self.author.map(|actor| actor.into_pr_actor("user")),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_edited_at: self.last_edited_at,
+            viewer_can_update: self.viewer_can_update,
+            viewer_can_delete: self.viewer_can_delete,
+            viewer_did_author: self.viewer_did_author,
+            reactions: self
+                .reaction_groups
+                .into_iter()
+                .map(GraphqlReactionGroup::into_pr_reaction)
+                .collect(),
+            path: self.path,
+            line: self.line,
+            diff_hunk: self.diff_hunk,
+        }
+    }
+}
+
+impl GraphqlReactionGroup {
+    fn into_pr_reaction(self) -> PrReactionSummary {
+        PrReactionSummary {
+            content: self.content.to_ascii_lowercase(),
+            count: self.users.total_count,
+            viewer_has_reacted: self.viewer_has_reacted,
+        }
+    }
+}
+
+impl GraphqlDetailReviewThread {
+    fn into_pr_thread(self) -> PrReviewThread {
+        PrReviewThread {
+            id: self.id,
+            path: self.path,
+            line: self.line,
+            start_line: self.start_line,
+            diff_side: self.diff_side.to_ascii_lowercase(),
+            is_outdated: self.is_outdated,
+            is_resolved: self.is_resolved,
+            viewer_can_reply: self.viewer_can_reply,
+            viewer_can_resolve: self.viewer_can_resolve,
+            viewer_can_unresolve: self.viewer_can_unresolve,
+            comments: self
+                .comments
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(GraphqlDetailComment::into_pr_comment)
+                .collect(),
+        }
+    }
+}
+
+impl GraphqlDetailReview {
+    fn into_pr_review(self) -> PrReviewDetail {
+        PrReviewDetail {
+            id: self.id,
+            author: self.author.map(|actor| actor.into_pr_actor("user")),
+            state: self.state.to_ascii_lowercase(),
+            body: self.body,
+            url: self.url,
+            submitted_at: self.submitted_at,
+            commit_oid: self.commit.map(|commit| commit.oid).unwrap_or_default(),
+            viewer_can_update: self.viewer_can_update,
+            viewer_can_delete: self.viewer_can_delete,
+            viewer_did_author: self.viewer_did_author,
+        }
+    }
+}
+
+impl GraphqlDetailPullRequestCommit {
+    fn into_pr_commit(self) -> PrCommit {
+        let actor = self.commit.author.and_then(|author| {
+            author
+                .user
+                .map(|actor| actor.into_pr_actor("user"))
+                .or_else(|| {
+                    author.name.map(|name| PrActor {
+                        id: String::new(),
+                        login: String::new(),
+                        name,
+                        kind: "unknown".into(),
+                        avatar_url: String::new(),
+                        url: String::new(),
+                    })
+                })
+        });
+        PrCommit {
+            oid: self.commit.oid,
+            abbreviated_oid: self.commit.abbreviated_oid,
+            message_headline: self.commit.message_headline,
+            message_body: self.commit.message_body,
+            committed_at: self.commit.committed_date,
+            author: actor,
+            url: self.commit.url,
+        }
+    }
+}
+
+impl GraphqlDetailFile {
+    fn into_pr_file(self) -> PrFile {
+        PrFile {
+            path: self.path,
+            additions: self.additions,
+            deletions: self.deletions,
+            change_type: self.change_type.to_ascii_lowercase(),
+            viewer_viewed_state: self.viewer_viewed_state.to_ascii_lowercase(),
+        }
+    }
+}
+
+impl GraphqlPrStack {
+    fn into_pr_stack(self) -> PrStack {
+        PrStack {
+            id: self.id,
+            number: self.number,
+            size: self.size,
+            base: self.base_ref_name,
+            entries: self
+                .entries
+                .nodes
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let pull_request = entry.pull_request?;
+                    Some(PrStackEntry {
+                        position: entry.position,
+                        number: pull_request.number,
+                        title: pull_request.title,
+                        url: pull_request.url,
+                        state: pull_request.state.to_ascii_lowercase(),
+                        draft: pull_request.is_draft,
+                        base: pull_request.base_ref_name,
+                        head: pull_request.head_ref_name,
+                        review_decision: pull_request
+                            .review_decision
+                            .map(|decision| decision.to_ascii_lowercase())
+                            .unwrap_or_default(),
+                        merge_state_status: pull_request
+                            .merge_state_status
+                            .map(|status| status.to_ascii_lowercase())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+fn consume_detail_page<T>(
+    page: Option<GraphqlPagedNodes<T>>,
+    items: &mut Vec<T>,
+    after: &mut Option<String>,
+    active: &mut bool,
+) {
+    let Some(page) = page else {
+        *active = false;
+        return;
+    };
+    items.extend(page.nodes.into_iter().flatten());
+    *active = page.page_info.has_next_page && page.page_info.end_cursor.is_some();
+    *after = (*active).then_some(page.page_info.end_cursor).flatten();
 }
 
 fn newest_comment(comments: GraphqlComments) -> Option<DateTime<Utc>> {
@@ -1106,8 +2964,148 @@ fn operation_with_pr_fields(operation: &str) -> String {
     format!("{operation}\n{PULL_REQUEST_FIELDS}")
 }
 
+fn operation_with_pr_detail_fields(operation: &str) -> String {
+    format!("{operation}\n{PULL_REQUEST_DETAIL_CONNECTIONS}\n{PULL_REQUEST_FIELDS}")
+}
+
+fn operation_with_pr_detail_connections(operation: &str) -> String {
+    format!("{operation}\n{PULL_REQUEST_DETAIL_CONNECTIONS}")
+}
+
 fn graphql_base_uri(host: &str) -> Option<String> {
     (host != GITHUB_COM).then(|| format!("https://{host}/api"))
+}
+
+fn insert_optional<T: serde::Serialize>(
+    input: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    value: Option<&T>,
+) {
+    if let Some(value) = value {
+        input.insert(field.into(), serde_json::json!(value));
+    }
+}
+
+fn insert_nonempty(
+    input: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    value: &str,
+) {
+    if !value.trim().is_empty() {
+        input.insert(field.into(), serde_json::json!(value));
+    }
+}
+
+fn github_merge_method(method: &str) -> Result<&'static str> {
+    match method.to_ascii_lowercase().as_str() {
+        "" | "merge" => Ok("merge"),
+        "squash" => Ok("squash"),
+        "rebase" => Ok("rebase"),
+        _ => anyhow::bail!("unsupported merge method: {method}"),
+    }
+}
+
+fn github_review_event(event: &str) -> Result<&'static str> {
+    match event.to_ascii_lowercase().as_str() {
+        "approve" => Ok("APPROVE"),
+        "request_changes" | "changes_requested" => Ok("REQUEST_CHANGES"),
+        "comment" => Ok("COMMENT"),
+        _ => anyhow::bail!("unsupported review event: {event}"),
+    }
+}
+
+fn github_diff_side(side: &str) -> Result<&'static str> {
+    match side.to_ascii_lowercase().as_str() {
+        "left" => Ok("LEFT"),
+        "right" => Ok("RIGHT"),
+        _ => anyhow::bail!("unsupported review-comment side: {side}"),
+    }
+}
+
+fn github_lock_reason(reason: &str) -> Result<&'static str> {
+    match reason.to_ascii_lowercase().as_str() {
+        "off_topic" => Ok("OFF_TOPIC"),
+        "too_heated" => Ok("TOO_HEATED"),
+        "resolved" => Ok("RESOLVED"),
+        "spam" => Ok("SPAM"),
+        _ => anyhow::bail!("unsupported conversation lock reason: {reason}"),
+    }
+}
+
+fn github_reaction_content(content: &str) -> Result<&'static str> {
+    match content.to_ascii_uppercase().as_str() {
+        "THUMBS_UP" => Ok("THUMBS_UP"),
+        "THUMBS_DOWN" => Ok("THUMBS_DOWN"),
+        "LAUGH" => Ok("LAUGH"),
+        "HOORAY" => Ok("HOORAY"),
+        "CONFUSED" => Ok("CONFUSED"),
+        "HEART" => Ok("HEART"),
+        "ROCKET" => Ok("ROCKET"),
+        "EYES" => Ok("EYES"),
+        _ => anyhow::bail!("unsupported reaction: {content}"),
+    }
+}
+
+fn github_subscription_state(state: &str) -> Result<&'static str> {
+    match state.to_ascii_lowercase().as_str() {
+        "subscribed" => Ok("SUBSCRIBED"),
+        "unsubscribed" => Ok("UNSUBSCRIBED"),
+        "ignored" => Ok("IGNORED"),
+        _ => anyhow::bail!("unsupported pull request subscription state: {state}"),
+    }
+}
+
+fn ensure_comment_id(detail: &PrDetail, id: &str, kind: &PrCommentKind) -> Result<()> {
+    let found = match kind {
+        PrCommentKind::Issue => detail.comments.iter().any(|comment| comment.id == id),
+        PrCommentKind::Review => detail
+            .review_threads
+            .iter()
+            .flat_map(|thread| &thread.comments)
+            .any(|comment| comment.id == id),
+    };
+    anyhow::ensure!(
+        found,
+        "comment does not belong to the selected pull request"
+    );
+    Ok(())
+}
+
+fn review_by_id<'a>(detail: &'a PrDetail, id: &str) -> Result<&'a PrReviewDetail> {
+    detail
+        .reviews
+        .iter()
+        .find(|review| review.id == id)
+        .context("review does not belong to the selected pull request")
+}
+
+fn ensure_ids_exist<'a>(
+    requested: &[String],
+    available: impl Iterator<Item = &'a str>,
+    kind: &str,
+) -> Result<()> {
+    let available = available.collect::<HashSet<_>>();
+    for id in requested {
+        anyhow::ensure!(
+            available.contains(id.as_str()),
+            "{kind} does not belong to the selected repository"
+        );
+    }
+    Ok(())
+}
+
+fn pr_subject_ids(detail: &PrDetail) -> HashSet<&str> {
+    let mut ids = HashSet::from([detail.id.as_str()]);
+    ids.extend(detail.comments.iter().map(|comment| comment.id.as_str()));
+    ids.extend(detail.reviews.iter().map(|review| review.id.as_str()));
+    ids.extend(
+        detail
+            .review_threads
+            .iter()
+            .flat_map(|thread| thread.comments.iter())
+            .map(|comment| comment.id.as_str()),
+    );
+    ids
 }
 
 impl GitHubAccount {
@@ -1161,6 +3159,607 @@ impl GitHub {
             .pull_request(&self.owner, &self.repo, number)
             .await?
             .with_context(|| format!("pull request #{number} not found"))
+    }
+
+    /// Full, lazily loaded PR-page state for one selected pull request.
+    pub async fn pr_detail(
+        &self,
+        number: u64,
+        sections: &HashSet<PrDetailSection>,
+        existing: Option<PrDetail>,
+    ) -> Result<PrDetail> {
+        self.graphql
+            .pull_request_detail(&self.owner, &self.repo, number, sections, existing)
+            .await
+    }
+
+    /// Load one changed file's immutable base/head text without requesting the
+    /// pull request's aggregate patch. Membership is resolved from GitHub
+    /// before either repository object expression is evaluated.
+    pub async fn pr_file_diff(&self, number: u64, path: &str) -> Result<PrFileDiff> {
+        self.graphql
+            .pull_request_file_diff(&self.owner, &self.repo, number, path)
+            .await
+    }
+
+    /// Load immutable content for a file already returned by a cached PR
+    /// detail snapshot. This deliberately skips GitHub's changed-files
+    /// connection: membership and both object ids were established by the
+    /// selected PR cache.
+    pub async fn pr_file_diff_known(
+        &self,
+        file: &PrFile,
+        base_oid: &str,
+        head_oid: &str,
+    ) -> Result<PrFileDiff> {
+        self.graphql
+            .pull_request_file_diff_known(&self.owner, &self.repo, file, base_oid, head_oid)
+            .await
+    }
+
+    /// Apply one typed collaboration action to a selected pull request. The
+    /// engine supplies a head-keyed cached detail snapshot containing the
+    /// sections required to validate this action, so mutations do not need a
+    /// full detail read both before and after every write.
+    pub async fn act_on_pr(&self, detail: &PrDetail, action: &PrActionRequest) -> Result<()> {
+        self.validate_pr_action(detail, action)?;
+        self.execute_pr_action(detail, action).await?;
+        Ok(())
+    }
+
+    fn validate_pr_action(&self, detail: &PrDetail, action: &PrActionRequest) -> Result<()> {
+        match action {
+            PrActionRequest::Update { .. } => {
+                anyhow::ensure!(
+                    detail.capabilities.can_update,
+                    "GitHub does not permit updating this pull request"
+                );
+            }
+            PrActionRequest::SetState { state } => match state.as_str() {
+                "draft" | "ready" => anyhow::ensure!(
+                    detail.capabilities.can_update,
+                    "GitHub does not permit changing this pull request's review state"
+                ),
+                "close" => anyhow::ensure!(
+                    detail.capabilities.can_close,
+                    "GitHub does not permit closing this pull request"
+                ),
+                "reopen" => anyhow::ensure!(
+                    detail.capabilities.can_reopen,
+                    "GitHub does not permit reopening this pull request"
+                ),
+                _ => anyhow::bail!("unsupported pull request state action: {state}"),
+            },
+            PrActionRequest::RequestReviewers {
+                users,
+                bots,
+                teams,
+                replace,
+            } => {
+                anyhow::ensure!(
+                    *replace || !users.is_empty() || !bots.is_empty() || !teams.is_empty(),
+                    "select at least one reviewer"
+                );
+            }
+            PrActionRequest::SubmitReview { event, .. } => {
+                github_review_event(event)?;
+            }
+            PrActionRequest::UpdateReview { id, .. } => {
+                anyhow::ensure!(
+                    review_by_id(detail, id)?.viewer_can_update,
+                    "GitHub does not permit updating this review"
+                );
+            }
+            PrActionRequest::DeleteReview { id } => {
+                anyhow::ensure!(
+                    review_by_id(detail, id)?.viewer_can_delete,
+                    "GitHub does not permit deleting this review"
+                );
+            }
+            PrActionRequest::DismissReview { id, message } => {
+                review_by_id(detail, id)?;
+                anyhow::ensure!(
+                    detail.capabilities.can_update,
+                    "GitHub does not permit dismissing reviews"
+                );
+                anyhow::ensure!(
+                    !message.trim().is_empty(),
+                    "review dismissal message cannot be empty"
+                );
+            }
+            PrActionRequest::AddComment { body } => {
+                anyhow::ensure!(!body.trim().is_empty(), "comment body cannot be empty");
+            }
+            PrActionRequest::UpdateComment { id, kind, body } => {
+                anyhow::ensure!(!body.trim().is_empty(), "comment body cannot be empty");
+                ensure_comment_id(detail, id, kind)?;
+            }
+            PrActionRequest::DeleteComment { id, kind } => ensure_comment_id(detail, id, kind)?,
+            PrActionRequest::ReplyReviewThread { thread_id, body } => {
+                anyhow::ensure!(!body.trim().is_empty(), "comment body cannot be empty");
+                anyhow::ensure!(
+                    detail
+                        .review_threads
+                        .iter()
+                        .any(|thread| thread.id == *thread_id),
+                    "review thread does not belong to the selected pull request"
+                );
+            }
+            PrActionRequest::ResolveReviewThread { thread_id, .. } => {
+                anyhow::ensure!(
+                    detail
+                        .review_threads
+                        .iter()
+                        .any(|thread| thread.id == *thread_id),
+                    "review thread does not belong to the selected pull request"
+                );
+            }
+            PrActionRequest::AddReviewThread {
+                body,
+                side,
+                start_side,
+                ..
+            } => {
+                anyhow::ensure!(!body.trim().is_empty(), "comment body cannot be empty");
+                github_diff_side(side)?;
+                if let Some(start_side) = start_side {
+                    github_diff_side(start_side)?;
+                }
+            }
+            PrActionRequest::SetFileViewed { path, .. } => {
+                anyhow::ensure!(
+                    detail.files.iter().any(|file| file.path == *path),
+                    "file does not belong to the selected pull request"
+                );
+            }
+            PrActionRequest::UpdateBranch { .. } => {
+                anyhow::ensure!(
+                    detail.capabilities.can_update_branch,
+                    "GitHub does not permit updating this pull request branch"
+                );
+            }
+            PrActionRequest::Merge { method, .. } => {
+                anyhow::ensure!(
+                    detail.info.state == "open",
+                    "only an open pull request can be merged"
+                );
+                let method = github_merge_method(method)?;
+                anyhow::ensure!(
+                    detail.merge_methods.iter().any(|enabled| enabled == method),
+                    "the repository has disabled the selected merge method"
+                );
+            }
+            PrActionRequest::SetAutoMerge {
+                enabled, method, ..
+            } => {
+                if *enabled {
+                    anyhow::ensure!(
+                        detail.auto_merge_allowed,
+                        "auto-merge is disabled for this repository"
+                    );
+                    let method = github_merge_method(method)?;
+                    anyhow::ensure!(
+                        detail.merge_methods.iter().any(|enabled| enabled == method),
+                        "the repository has disabled the selected merge method"
+                    );
+                }
+            }
+            PrActionRequest::SetMergeQueue { enabled, .. } => {
+                anyhow::ensure!(
+                    detail.merge_queue.enabled,
+                    "this branch does not use a merge queue"
+                );
+                if !enabled {
+                    anyhow::ensure!(
+                        detail.merge_queue.entry.is_some(),
+                        "pull request is not in the merge queue"
+                    );
+                }
+            }
+            PrActionRequest::SetLabels { label_ids } => {
+                anyhow::ensure!(
+                    detail.capabilities.can_label,
+                    "GitHub does not permit changing labels"
+                );
+                ensure_ids_exist(
+                    label_ids,
+                    detail
+                        .available_labels
+                        .iter()
+                        .map(|label| label.id.as_str()),
+                    "label",
+                )?;
+            }
+            PrActionRequest::SetAssignees { assignee_ids } => {
+                anyhow::ensure!(
+                    detail.capabilities.can_assign,
+                    "GitHub does not permit changing assignees"
+                );
+                ensure_ids_exist(
+                    assignee_ids,
+                    detail
+                        .assignable_users
+                        .iter()
+                        .map(|actor| actor.id.as_str()),
+                    "assignee",
+                )?;
+            }
+            PrActionRequest::SetMilestone { milestone_id } => {
+                if let Some(id) = milestone_id {
+                    anyhow::ensure!(
+                        detail
+                            .available_milestones
+                            .iter()
+                            .any(|milestone| milestone.id == *id),
+                        "milestone does not belong to the selected repository"
+                    );
+                }
+            }
+            PrActionRequest::SetLock { reason, .. } => {
+                if let Some(reason) = reason {
+                    github_lock_reason(reason)?;
+                }
+            }
+            PrActionRequest::SetSubscription { state } => {
+                github_subscription_state(state)?;
+            }
+            PrActionRequest::AddReaction {
+                subject_id,
+                content,
+            }
+            | PrActionRequest::RemoveReaction {
+                subject_id,
+                content,
+            } => {
+                anyhow::ensure!(
+                    pr_subject_ids(detail).contains(subject_id.as_str()),
+                    "reaction target does not belong to the selected pull request"
+                );
+                github_reaction_content(content)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_pr_action(&self, detail: &PrDetail, action: &PrActionRequest) -> Result<()> {
+        use serde_json::{Map, Value, json};
+
+        let (query, input, operation) = match action {
+            PrActionRequest::Update {
+                title,
+                body,
+                base,
+                maintainer_can_modify,
+            } => {
+                let mut input = Map::from_iter([("pullRequestId".into(), json!(detail.id))]);
+                insert_optional(&mut input, "title", title.as_ref());
+                insert_optional(&mut input, "body", body.as_ref());
+                insert_optional(&mut input, "baseRefName", base.as_ref());
+                insert_optional(
+                    &mut input,
+                    "maintainerCanModify",
+                    maintainer_can_modify.as_ref(),
+                );
+                (
+                    UPDATE_PULL_REQUEST_MUTATION,
+                    Value::Object(input),
+                    "updating pull request",
+                )
+            }
+            PrActionRequest::SetState { state } => match state.as_str() {
+                "draft" => (
+                    CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+                    json!({ "pullRequestId": detail.id }),
+                    "converting pull request to draft",
+                ),
+                "ready" => (
+                    MARK_PULL_REQUEST_READY_MUTATION,
+                    json!({ "pullRequestId": detail.id }),
+                    "marking pull request ready for review",
+                ),
+                "close" => (
+                    CLOSE_PULL_REQUEST_MUTATION,
+                    json!({ "pullRequestId": detail.id }),
+                    "closing pull request",
+                ),
+                "reopen" => (
+                    REOPEN_PULL_REQUEST_MUTATION,
+                    json!({ "pullRequestId": detail.id }),
+                    "reopening pull request",
+                ),
+                _ => unreachable!("state validated before mutation"),
+            },
+            PrActionRequest::RequestReviewers {
+                users,
+                bots,
+                teams,
+                replace,
+            } => (
+                REQUEST_REVIEWS_MUTATION,
+                json!({ "pullRequestId": detail.id, "userLogins": users, "botLogins": bots, "teamSlugs": teams, "union": !replace }),
+                "requesting pull request reviewers",
+            ),
+            PrActionRequest::SubmitReview { event, body } => {
+                let pending = detail
+                    .reviews
+                    .iter()
+                    .find(|review| review.state == "pending" && review.viewer_did_author);
+                if let Some(review) = pending {
+                    (
+                        SUBMIT_REVIEW_MUTATION,
+                        json!({
+                            "pullRequestReviewId": review.id,
+                            "event": github_review_event(event)?,
+                            "body": body,
+                        }),
+                        "submitting pending pull request review",
+                    )
+                } else {
+                    (
+                        ADD_REVIEW_MUTATION,
+                        json!({ "pullRequestId": detail.id, "event": github_review_event(event)?, "body": body }),
+                        "submitting pull request review",
+                    )
+                }
+            }
+            PrActionRequest::UpdateReview { id, body } => (
+                UPDATE_REVIEW_MUTATION,
+                json!({ "pullRequestReviewId": id, "body": body }),
+                "updating pull request review",
+            ),
+            PrActionRequest::DeleteReview { id } => (
+                DELETE_REVIEW_MUTATION,
+                json!({ "pullRequestReviewId": id }),
+                "deleting pull request review",
+            ),
+            PrActionRequest::DismissReview { id, message } => (
+                DISMISS_REVIEW_MUTATION,
+                json!({ "pullRequestReviewId": id, "message": message }),
+                "dismissing pull request review",
+            ),
+            PrActionRequest::AddComment { body } => (
+                ADD_COMMENT_MUTATION,
+                json!({ "subjectId": detail.id, "body": body }),
+                "adding pull request comment",
+            ),
+            PrActionRequest::UpdateComment { id, kind, body } => match kind {
+                PrCommentKind::Issue => (
+                    UPDATE_ISSUE_COMMENT_MUTATION,
+                    json!({ "id": id, "body": body }),
+                    "updating pull request comment",
+                ),
+                PrCommentKind::Review => (
+                    UPDATE_REVIEW_COMMENT_MUTATION,
+                    json!({ "pullRequestReviewCommentId": id, "body": body }),
+                    "updating review comment",
+                ),
+            },
+            PrActionRequest::DeleteComment { id, kind } => match kind {
+                PrCommentKind::Issue => (
+                    DELETE_ISSUE_COMMENT_MUTATION,
+                    json!({ "id": id }),
+                    "deleting pull request comment",
+                ),
+                PrCommentKind::Review => (
+                    DELETE_REVIEW_COMMENT_MUTATION,
+                    json!({ "pullRequestReviewCommentId": id }),
+                    "deleting review comment",
+                ),
+            },
+            PrActionRequest::ReplyReviewThread { thread_id, body } => (
+                REPLY_REVIEW_THREAD_MUTATION,
+                json!({ "pullRequestReviewThreadId": thread_id, "body": body }),
+                "replying to review thread",
+            ),
+            PrActionRequest::ResolveReviewThread {
+                thread_id,
+                resolved,
+            } => {
+                if *resolved {
+                    (
+                        RESOLVE_REVIEW_THREAD_MUTATION,
+                        json!({ "threadId": thread_id }),
+                        "resolving review thread",
+                    )
+                } else {
+                    (
+                        UNRESOLVE_REVIEW_THREAD_MUTATION,
+                        json!({ "threadId": thread_id }),
+                        "reopening review thread",
+                    )
+                }
+            }
+            PrActionRequest::AddReviewThread {
+                body,
+                path,
+                line,
+                side,
+                start_line,
+                start_side,
+            } => {
+                let mut input = Map::from_iter([
+                    ("body".into(), json!(body)),
+                    ("path".into(), json!(path)),
+                    ("line".into(), json!(line)),
+                    ("side".into(), json!(github_diff_side(side)?)),
+                ]);
+                if let Some(review) = detail
+                    .reviews
+                    .iter()
+                    .find(|review| review.state == "pending" && review.viewer_did_author)
+                {
+                    input.insert("pullRequestReviewId".into(), json!(review.id));
+                } else {
+                    input.insert("pullRequestId".into(), json!(detail.id));
+                }
+                insert_optional(&mut input, "startLine", start_line.as_ref());
+                if let Some(start_side) = start_side {
+                    input.insert("startSide".into(), json!(github_diff_side(start_side)?));
+                }
+                (
+                    ADD_REVIEW_THREAD_MUTATION,
+                    Value::Object(input),
+                    "adding review thread",
+                )
+            }
+            PrActionRequest::SetFileViewed { path, viewed } => {
+                if *viewed {
+                    (
+                        MARK_FILE_VIEWED_MUTATION,
+                        json!({ "pullRequestId": detail.id, "path": path }),
+                        "marking pull request file viewed",
+                    )
+                } else {
+                    (
+                        UNMARK_FILE_VIEWED_MUTATION,
+                        json!({ "pullRequestId": detail.id, "path": path }),
+                        "marking pull request file unviewed",
+                    )
+                }
+            }
+            PrActionRequest::UpdateBranch { expected_head_sha } => {
+                let mut input = Map::from_iter([("pullRequestId".into(), json!(detail.id))]);
+                insert_optional(&mut input, "expectedHeadOid", expected_head_sha.as_ref());
+                (
+                    UPDATE_PULL_REQUEST_BRANCH_MUTATION,
+                    Value::Object(input),
+                    "updating pull request branch",
+                )
+            }
+            PrActionRequest::Merge {
+                method,
+                commit_title,
+                commit_message,
+                expected_head_sha,
+            } => {
+                let mut input = Map::from_iter([
+                    ("pullRequestId".into(), json!(detail.id)),
+                    (
+                        "mergeMethod".into(),
+                        json!(github_merge_method(method)?.to_ascii_uppercase()),
+                    ),
+                ]);
+                insert_nonempty(&mut input, "commitHeadline", commit_title);
+                insert_nonempty(&mut input, "commitBody", commit_message);
+                insert_optional(&mut input, "expectedHeadOid", expected_head_sha.as_ref());
+                (
+                    MERGE_PULL_REQUEST_MUTATION,
+                    Value::Object(input),
+                    "merging pull request",
+                )
+            }
+            PrActionRequest::SetAutoMerge {
+                enabled,
+                method,
+                commit_title,
+                commit_message,
+            } => {
+                if *enabled {
+                    let mut input = Map::from_iter([
+                        ("pullRequestId".into(), json!(detail.id)),
+                        (
+                            "mergeMethod".into(),
+                            json!(github_merge_method(method)?.to_ascii_uppercase()),
+                        ),
+                    ]);
+                    insert_nonempty(&mut input, "commitHeadline", commit_title);
+                    insert_nonempty(&mut input, "commitBody", commit_message);
+                    (
+                        ENABLE_AUTO_MERGE_MUTATION,
+                        Value::Object(input),
+                        "enabling pull request auto-merge",
+                    )
+                } else {
+                    (
+                        DISABLE_AUTO_MERGE_MUTATION,
+                        json!({ "pullRequestId": detail.id }),
+                        "disabling pull request auto-merge",
+                    )
+                }
+            }
+            PrActionRequest::SetMergeQueue {
+                enabled,
+                expected_head_sha,
+            } => {
+                if *enabled {
+                    let mut input = Map::from_iter([("pullRequestId".into(), json!(detail.id))]);
+                    insert_optional(&mut input, "expectedHeadOid", expected_head_sha.as_ref());
+                    (
+                        ENQUEUE_PULL_REQUEST_MUTATION,
+                        Value::Object(input),
+                        "adding pull request to merge queue",
+                    )
+                } else {
+                    let entry_id = &detail
+                        .merge_queue
+                        .entry
+                        .as_ref()
+                        .expect("queue entry validated")
+                        .id;
+                    (
+                        DEQUEUE_PULL_REQUEST_MUTATION,
+                        json!({ "id": entry_id }),
+                        "removing pull request from merge queue",
+                    )
+                }
+            }
+            PrActionRequest::SetLabels { label_ids } => (
+                UPDATE_PULL_REQUEST_MUTATION,
+                json!({ "pullRequestId": detail.id, "labelIds": label_ids }),
+                "updating pull request labels",
+            ),
+            PrActionRequest::SetAssignees { assignee_ids } => (
+                UPDATE_PULL_REQUEST_MUTATION,
+                json!({ "pullRequestId": detail.id, "assigneeIds": assignee_ids }),
+                "updating pull request assignees",
+            ),
+            PrActionRequest::SetMilestone { milestone_id } => (
+                UPDATE_PULL_REQUEST_MUTATION,
+                json!({ "pullRequestId": detail.id, "milestoneId": milestone_id }),
+                "updating pull request milestone",
+            ),
+            PrActionRequest::SetLock { locked, reason } => {
+                if *locked {
+                    let mut input = Map::from_iter([("lockableId".into(), json!(detail.id))]);
+                    if let Some(reason) = reason {
+                        input.insert("lockReason".into(), json!(github_lock_reason(reason)?));
+                    }
+                    (
+                        LOCK_LOCKABLE_MUTATION,
+                        Value::Object(input),
+                        "locking pull request conversation",
+                    )
+                } else {
+                    (
+                        UNLOCK_LOCKABLE_MUTATION,
+                        json!({ "lockableId": detail.id }),
+                        "unlocking pull request conversation",
+                    )
+                }
+            }
+            PrActionRequest::SetSubscription { state } => (
+                UPDATE_SUBSCRIPTION_MUTATION,
+                json!({ "subscribableId": detail.id, "state": github_subscription_state(state)? }),
+                "updating pull request notification subscription",
+            ),
+            PrActionRequest::AddReaction {
+                subject_id,
+                content,
+            } => (
+                ADD_REACTION_MUTATION,
+                json!({ "subjectId": subject_id, "content": github_reaction_content(content)? }),
+                "adding reaction",
+            ),
+            PrActionRequest::RemoveReaction {
+                subject_id,
+                content,
+            } => (
+                REMOVE_REACTION_MUTATION,
+                json!({ "subjectId": subject_id, "content": github_reaction_content(content)? }),
+                "removing reaction",
+            ),
+        };
+        self.graphql.mutate(query, input, operation).await
     }
 
     /// Open PRs whose head ref or commit is tied to successful activity in a
@@ -1258,6 +3857,9 @@ impl GitHub {
                             "queued".to_string()
                         },
                         conclusion: run.conclusion,
+                        details_url: run.details_url.map(|url| url.to_string()),
+                        started_at: run.started_at,
+                        completed_at: run.completed_at,
                     })
                     .collect()
             })
@@ -1331,6 +3933,12 @@ impl GitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_oauth_requests_repository_and_team_read_scopes() {
+        let config = oauth_config("github.com", "client-id");
+        assert_eq!(config.scopes, ["repo", "read:org"]);
+    }
 
     #[test]
     fn parses_remote_forms() {
@@ -1547,6 +4155,42 @@ mod tests {
     }
 
     #[test]
+    fn detail_continuation_query_omits_repeated_overview_fields() {
+        let query = operation_with_pr_detail_connections(PULL_REQUEST_DETAIL_PAGE_QUERY);
+        assert!(query.contains("fragment TrouvePullRequestDetailConnections"));
+        assert!(query.contains("detailReviewThreads: reviewThreads"));
+        assert!(!query.contains("TrouvePullRequestFields"));
+        assert!(!query.contains("viewer { login }"));
+        assert!(!query.contains("mergeCommitAllowed"));
+        assert!(!query.contains("assignableUsers"));
+    }
+
+    #[test]
+    fn dashboard_cache_coalesces_background_and_concurrent_forced_refreshes() {
+        let completed = Instant::now();
+        let freshness = Duration::from_secs(25);
+        let cache = GitHubDashboardCache {
+            last_successful_refresh: Some(completed),
+            ..Default::default()
+        };
+
+        assert!(!cache.should_refresh(
+            false,
+            completed,
+            completed + Duration::from_secs(24),
+            freshness,
+        ));
+        assert!(cache.should_refresh(false, completed, completed + freshness, freshness,));
+        assert!(!cache.should_refresh(true, completed, completed + freshness, freshness,));
+        assert!(cache.should_refresh(
+            true,
+            completed + Duration::from_nanos(1),
+            completed + freshness,
+            freshness,
+        ));
+    }
+
+    #[test]
     fn dashboard_cache_reuses_unchanged_probes_and_resets_for_viewer() {
         let fingerprint = |check_state: Option<&str>| DashboardFingerprint {
             updated_at: "2026-07-20T12:00:00Z".parse().unwrap(),
@@ -1610,5 +4254,74 @@ mod tests {
             ..snapshot
         };
         assert!(cache.unpublished_snapshot(&changed).unwrap().is_some());
+    }
+
+    #[test]
+    fn pr_file_diff_preserves_added_file_semantics_and_text() {
+        let file = PrFile {
+            path: "src/new.rs".into(),
+            additions: 1,
+            deletions: 0,
+            change_type: "added".into(),
+            viewer_viewed_state: "unviewed".into(),
+        };
+        let metadata = GraphqlBlobRepository {
+            base: None,
+            head: Some(GraphqlBlob {
+                typename: "Blob".into(),
+                byte_size: Some(12),
+                is_binary: Some(false),
+                is_truncated: Some(false),
+                text: None,
+            }),
+        };
+        let content = GraphqlBlobRepository {
+            base: None,
+            head: Some(GraphqlBlob {
+                typename: "Blob".into(),
+                text: Some("fn main() {}".into()),
+                ..GraphqlBlob::default()
+            }),
+        };
+
+        let diff = build_pr_file_diff(file, metadata, content);
+        assert_eq!(diff.original.as_deref(), Some(""));
+        assert_eq!(diff.modified.as_deref(), Some("fn main() {}"));
+        assert!(!diff.binary);
+        assert!(!diff.truncated);
+        assert!(diff.notice.is_empty());
+    }
+
+    #[test]
+    fn pr_file_diff_refuses_oversized_text_before_content_loading() {
+        let blob = GraphqlBlob {
+            typename: "Blob".into(),
+            byte_size: Some(MAX_PR_FILE_TEXT_BYTES + 1),
+            is_binary: Some(false),
+            is_truncated: Some(false),
+            text: None,
+        };
+        assert!(!blob_text_is_loadable(Some(&blob)));
+        let diff = build_pr_file_diff(
+            PrFile {
+                path: "generated.txt".into(),
+                additions: 1,
+                deletions: 1,
+                change_type: "modified".into(),
+                viewer_viewed_state: String::new(),
+            },
+            GraphqlBlobRepository {
+                base: Some(blob.clone()),
+                head: Some(blob),
+            },
+            GraphqlBlobRepository {
+                base: None,
+                head: None,
+            },
+        );
+        assert!(diff.truncated);
+        assert!(diff.notice.contains("preview limit"));
+        assert!(diff.original.is_none());
+        assert!(diff.modified.is_none());
     }
 }

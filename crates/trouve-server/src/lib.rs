@@ -7,7 +7,14 @@
 mod mcp;
 
 use std::convert::Infallible;
+use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
+use std::path::Path as FsPath;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,20 +33,23 @@ use trouve_protocol::{
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
-    EVENT_CURSOR_HEADER, ErrorBody, FileContent, GenerateSessionTitleRequest,
-    GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus, GithubIntegration, GithubPrList,
-    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
-    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
+    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
+    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo, ProviderInfo,
+    ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
+    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, ThreadViewQuery, ThreadViewSnapshot,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SetMcpServerEnabledRequest,
+    SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
+    TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -94,31 +104,41 @@ impl IntoResponse for ApiError {
         list_workspaces,
         close_workspace,
         workspace_branches,
+        server_projection,
         refresh_github_prs,
         generate_session_title,
         create_session,
         list_sessions,
+        session_summaries,
         get_session,
         update_session,
         delete_session,
         undo_session,
         redo_session,
+        restore_checkpoint,
+        fork_checkpoint,
         create_thread,
         list_threads,
+        list_thread_statuses,
         get_thread,
+        list_thread_subagents,
         get_thread_view,
+        get_thread_tool_details,
         update_thread,
         send_message,
+        steer_turn,
         get_attachment,
         list_queue,
         reorder_queue,
         dispatch_queue,
+        dispatch_queued_prompt,
         update_queued_prompt,
         delete_queued_prompt,
         cancel_turn,
         resolve_approval,
         resolve_question,
         list_models,
+        refresh_models,
         list_modes,
         list_mode_infos,
         upsert_mode,
@@ -156,6 +176,8 @@ impl IntoResponse for ApiError {
         session_usage,
         session_mcp_servers,
         session_diff,
+        session_diff_summary,
+        session_file_diff,
         session_files,
         session_paths,
         session_file,
@@ -170,11 +192,15 @@ impl IntoResponse for ApiError {
         create_session_pr,
         merge_session_pr,
         list_session_prs,
+        get_session_pr_detail,
+        get_session_pr_file_diff,
+        act_on_session_pr,
         get_github_integration,
         add_github_host,
         remove_github_host,
         list_mcp_servers,
         upsert_mcp_server,
+        set_mcp_server_enabled,
         delete_mcp_server,
         mcp_server_logs,
         subscription_health,
@@ -207,16 +233,28 @@ impl IntoResponse for ApiError {
         BranchList,
         CreateSessionRequest,
         Session,
+        ForkCheckpointResponse,
+        SessionSummariesSnapshot,
+        ServerProjection,
+        trouve_protocol::GithubPrHostProjection,
+        trouve_protocol::SessionPrProjection,
+        trouve_protocol::SessionSummary,
+        trouve_protocol::SessionAttention,
+        trouve_protocol::SessionOutcome,
         UpdateSessionRequest,
         CreateThreadRequest,
         Thread,
+        ThreadStatus,
         ThreadViewQuery,
         ThreadViewSnapshot,
         trouve_protocol::ThreadViewItem,
+        ThreadToolDetails,
         trouve_protocol::ThreadToolStatus,
         trouve_protocol::ThreadTurnState,
         UpdateThreadRequest,
         SendMessageRequest,
+        SteerTurnRequest,
+        SteerAccepted,
         TurnAccepted,
         QueuedPrompt,
         UpdateQueuedPromptRequest,
@@ -255,13 +293,39 @@ impl IntoResponse for ApiError {
         GeneratedSessionTitle,
         UsageSummary,
         SessionDiff,
+        SessionDiffFileSummary,
+        SessionDiffSummary,
+        SessionFileDiff,
         DirEntry,
         FileContent,
         OpenTerminalRequest,
         TerminalInfo,
         TerminalInputRequest,
+        TerminalReplayStart,
         TerminalResizeRequest,
         PrInfo,
+        PrDetail,
+        PrDetailSection,
+        PrFileDiff,
+        PrActionRequest,
+        trouve_protocol::PrActor,
+        trouve_protocol::PrAutoMerge,
+        trouve_protocol::PrCapabilities,
+        trouve_protocol::PrComment,
+        trouve_protocol::PrCommentKind,
+        trouve_protocol::PrCommit,
+        trouve_protocol::PrFile,
+        trouve_protocol::PrLabel,
+        trouve_protocol::PrMergeQueueEntry,
+        trouve_protocol::PrMergeQueueStatus,
+        trouve_protocol::PrMilestone,
+        trouve_protocol::PrReactionSummary,
+        trouve_protocol::PrReview,
+        trouve_protocol::PrReviewDetail,
+        trouve_protocol::PrReviewThread,
+        trouve_protocol::PrStack,
+        trouve_protocol::PrStackEntry,
+        trouve_protocol::CheckRun,
         trouve_protocol::FirstPartyCodeReview,
         GithubPrList,
         CreatePrRequest,
@@ -271,6 +335,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::AddGithubHostRequest,
         McpServerInfo,
         UpsertMcpServerRequest,
+        SetMcpServerEnabledRequest,
         McpLogs,
         SubscriptionHealth,
         trouve_protocol::SubscriptionWindow,
@@ -470,9 +535,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::delete(close_workspace),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
+        .route("/v1/server-projection", get(server_projection))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/session-title", post(generate_session_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
+        .route("/v1/session-summaries", get(session_summaries))
         .route(
             "/v1/sessions/{id}",
             get(get_session)
@@ -481,10 +548,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/undo", post(undo_session))
         .route("/v1/sessions/{id}/redo", post(redo_session))
+        .route("/v1/checkpoints/{id}/restore", post(restore_checkpoint))
+        .route("/v1/checkpoints/{id}/fork", post(fork_checkpoint))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/usage", get(session_usage))
         .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
         .route("/v1/sessions/{id}/diff", get(session_diff))
+        .route("/v1/sessions/{id}/diff/summary", get(session_diff_summary))
+        .route("/v1/sessions/{id}/diff/file", get(session_file_diff))
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/paths", get(session_paths))
         .route("/v1/sessions/{id}/file", get(session_file))
@@ -503,6 +574,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/pr/merge", post(merge_session_pr))
         .route("/v1/sessions/{id}/prs", get(list_session_prs))
+        .route("/v1/sessions/{id}/prs/{number}", get(get_session_pr_detail))
+        .route(
+            "/v1/sessions/{id}/prs/{number}/file",
+            get(get_session_pr_file_diff),
+        )
+        .route(
+            "/v1/sessions/{id}/prs/{number}/actions",
+            post(act_on_session_pr),
+        )
         .route("/v1/integrations/github", get(get_github_integration))
         .route("/v1/integrations/github/hosts", post(add_github_host))
         .route(
@@ -514,9 +594,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/mcp-servers/{name}",
             axum::routing::put(upsert_mcp_server).delete(delete_mcp_server),
         )
+        .route(
+            "/v1/mcp-servers/{name}/enabled",
+            axum::routing::put(set_mcp_server_enabled),
+        )
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/refresh", get(refresh_models))
         .route("/v1/modes", get(list_modes))
         .route("/v1/mode-infos", get(list_mode_infos))
         .route(
@@ -634,12 +719,20 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(install_title_model).delete(cancel_title_model_install),
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
+        .route("/v1/thread-statuses", get(list_thread_statuses))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/subagents", get(list_thread_subagents))
         .route("/v1/threads/{id}/view", get(get_thread_view))
+        .route(
+            "/v1/threads/{id}/tools/{call_id}",
+            get(get_thread_tool_details),
+        )
         .route("/v1/threads/{id}/messages", post(send_message))
+        .route("/v1/threads/{id}/steer", post(steer_turn))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route("/v1/queue/{id}/dispatch", post(dispatch_queued_prompt))
         .route("/v1/threads/{id}/cancel", post(cancel_turn))
         .route(
             "/v1/queue/{id}",
@@ -671,24 +764,130 @@ pub async fn serve(
 
 /// Bootstrap the full local stack — store, real config file (provider
 /// changes write back), index hooks, system connectivity probe — and bind
-/// `addr` (port 0 for ephemeral). Returns the bound address and the serve
-/// future.
+/// `addr` (port 0 for ephemeral). The first process receives the bound address
+/// and serve future; later processes receive the elected owner's address and
+/// no future, so they attach without opening the database.
 ///
 /// This is the single entry point for embedders (the desktop app, ADR
 /// 0008) and the standalone binary alike: an embedder spawns the future
 /// and speaks HTTP + SSE to the returned address, keeping the protocol
 /// boundary intact without ever touching engine internals.
+pub type LocalServerFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>;
+
+/// Result of claiming the process-wide local data owner. A second product
+/// window receives the already-running address and must attach over HTTP/SSE;
+/// it never opens SQLite or constructs another Engine.
+pub struct LocalServerBinding {
+    address: SocketAddr,
+    server: Option<LocalServerFuture>,
+}
+
+impl LocalServerBinding {
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn into_server(self) -> Option<LocalServerFuture> {
+        self.server
+    }
+}
+
+enum LocalServerOwnership {
+    Owner(File),
+    Existing(SocketAddr),
+}
+
+const LOCAL_SERVER_OWNER_FILE: &str = "local-server.lock";
+const LOCAL_SERVER_OWNER_WAIT: Duration = Duration::from_secs(5);
+const LOCAL_SERVER_OWNER_RETRY: Duration = Duration::from_millis(50);
+
+fn write_local_server_address(file: &mut File, address: SocketAddr) -> anyhow::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{address}")?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn read_local_server_address(file: &mut File) -> anyhow::Result<Option<SocketAddr>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut registered = String::new();
+    file.read_to_string(&mut registered)?;
+    let registered = registered.trim();
+    if registered.is_empty() {
+        return Ok(None);
+    }
+    let address = registered
+        .parse::<SocketAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid local server owner address: {error}"))?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!("local server owner address is not loopback: {address}");
+    }
+    Ok(Some(address))
+}
+
+async fn claim_local_server(
+    data: &FsPath,
+    address: SocketAddr,
+) -> anyhow::Result<LocalServerOwnership> {
+    std::fs::create_dir_all(data)?;
+    let mut owner = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join(LOCAL_SERVER_OWNER_FILE))?;
+    match owner.try_lock() {
+        Ok(()) => {
+            write_local_server_address(&mut owner, address)?;
+            return Ok(LocalServerOwnership::Owner(owner));
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+
+    // Give a process that just acquired the lock time to replace a stale
+    // registration before reading it. If that process exits during startup,
+    // this claimant can take ownership instead of attaching to a dead port.
+    let deadline = Instant::now() + LOCAL_SERVER_OWNER_WAIT;
+    loop {
+        tokio::time::sleep(LOCAL_SERVER_OWNER_RETRY).await;
+        match owner.try_lock() {
+            Ok(()) => {
+                write_local_server_address(&mut owner, address)?;
+                return Ok(LocalServerOwnership::Owner(owner));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        if let Some(existing) = read_local_server_address(&mut owner)? {
+            return Ok(LocalServerOwnership::Existing(existing));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for the local server owner address");
+        }
+    }
+}
+
 pub async fn bind_local(
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     security: ServerSecurity,
-) -> anyhow::Result<(
-    std::net::SocketAddr,
-    impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
-)> {
+) -> anyhow::Result<LocalServerBinding> {
     install_crypto_provider();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let data = trouve_core::config::data_dir();
+    let owner = match claim_local_server(&data, local).await? {
+        LocalServerOwnership::Owner(owner) => owner,
+        LocalServerOwnership::Existing(address) => {
+            drop(listener);
+            tracing::info!(%address, "attaching to the existing local trouve server");
+            return Ok(LocalServerBinding {
+                address,
+                server: None,
+            });
+        }
+    };
     let store = trouve_core::store::Store::open(&data.join("trouve.db"))?;
     let config = trouve_core::config::Config::load();
     let engine = Arc::new(
@@ -697,7 +896,47 @@ pub async fn bind_local(
             .with_index_hooks()
             .with_connectivity_probe(trouve_core::connectivity::system_probe()),
     );
-    Ok((local, serve_listener(engine, listener, security)))
+    let server = Box::pin(async move {
+        // The registration lock must outlive Engine and the listener. Dropping
+        // this future releases ownership even when startup or serving fails.
+        let _owner = owner;
+        serve_listener(engine, listener, security).await
+    });
+    Ok(LocalServerBinding {
+        address: local,
+        server: Some(server),
+    })
+}
+
+#[cfg(test)]
+mod local_server_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_local_server_owns_a_data_directory_at_a_time() {
+        let data = tempfile::tempdir().unwrap();
+        let first_address: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let second_address: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let owner = match claim_local_server(data.path(), first_address)
+            .await
+            .unwrap()
+        {
+            LocalServerOwnership::Owner(owner) => owner,
+            LocalServerOwnership::Existing(_) => panic!("first claimant must own the server"),
+        };
+        assert!(matches!(
+            claim_local_server(data.path(), second_address).await.unwrap(),
+            LocalServerOwnership::Existing(address) if address == first_address
+        ));
+
+        drop(owner);
+        assert!(matches!(
+            claim_local_server(data.path(), second_address)
+                .await
+                .unwrap(),
+            LocalServerOwnership::Owner(_)
+        ));
+    }
 }
 
 /// Serve on an already-bound listener (embedded mode: bind port 0, read the
@@ -707,6 +946,9 @@ pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
+    engine.reconcile_checkpoint_refs().await;
+    engine.retry_artifact_cleanup_jobs().await;
+    engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
@@ -999,12 +1241,30 @@ async fn workspace_branches(
     Ok(Json(engine.workspace_branches(&id).await?))
 }
 
+#[utoipa::path(get, path = "/v1/server-projection",
+    responses(
+        (status = 200, body = ServerProjection,
+            headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot"))),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn server_projection(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, projection) = engine.server_projection_snapshot()?;
+    Ok((
+        [(EVENT_CURSOR_HEADER, cursor.to_string())],
+        Json(projection),
+    ))
+}
+
 #[utoipa::path(post, path = "/v1/github/prs/refresh",
+    params(("force" = Option<bool>, Query, description = "Bypass the automatic-refresh freshness window for an explicit user refresh")),
     responses((status = 204), (status = 400, body = ErrorBody)))]
 async fn refresh_github_prs(
     State(engine): State<Arc<Engine>>,
+    Query(query): Query<RefreshGithubPrsQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.refresh_github_prs().await?;
+    engine.refresh_github_prs(query.force).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1039,6 +1299,17 @@ async fn list_sessions(
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<Vec<Session>>, ApiError> {
     Ok(Json(engine.list_sessions(q.workspace_id.as_deref())?))
+}
+
+#[utoipa::path(get, path = "/v1/session-summaries",
+    responses(
+        (status = 200, body = SessionSummariesSnapshot),
+        (status = 500, body = ErrorBody)
+    ))]
+async fn session_summaries(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<SessionSummariesSnapshot>, ApiError> {
+    Ok(Json(engine.session_summaries_snapshot()?))
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}", params(("id" = String, Path,)),
@@ -1091,6 +1362,26 @@ async fn redo_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/restore", params(("id" = String, Path,)),
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn restore_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.restore_checkpoint_by_id(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/checkpoints/{id}/fork", params(("id" = String, Path,)),
+    responses((status = 200, body = ForkCheckpointResponse), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn fork_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<ForkCheckpointResponse>, ApiError> {
+    Ok(Json(engine.fork_checkpoint(&id).await?))
+}
+
 #[utoipa::path(post, path = "/v1/threads", request_body = CreateThreadRequest,
     responses((status = 200, body = Thread), (status = 400, body = ErrorBody)))]
 async fn create_thread(
@@ -1105,6 +1396,12 @@ struct ListThreadsQuery {
     session_id: String,
 }
 
+#[derive(Default, Deserialize)]
+struct ListThreadSubagentsQuery {
+    #[serde(default)]
+    recursive: bool,
+}
+
 #[utoipa::path(get, path = "/v1/threads",
     params(("session_id" = String, Query,)),
     responses((status = 200, body = [Thread])))]
@@ -1113,6 +1410,16 @@ async fn list_threads(
     Query(q): Query<ListThreadsQuery>,
 ) -> Result<Json<Vec<Thread>>, ApiError> {
     Ok(Json(engine.list_threads(&q.session_id)?))
+}
+
+#[utoipa::path(get, path = "/v1/thread-statuses",
+    params(("session_id" = String, Query,)),
+    responses((status = 200, body = [ThreadStatus])))]
+async fn list_thread_statuses(
+    State(engine): State<Arc<Engine>>,
+    Query(q): Query<ListThreadsQuery>,
+) -> Result<Json<Vec<ThreadStatus>>, ApiError> {
+    Ok(Json(engine.list_thread_statuses(&q.session_id)?))
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}", params(("id" = String, Path,)),
@@ -1124,11 +1431,31 @@ async fn get_thread(
     Ok(Json(engine.get_thread(&id)?))
 }
 
+#[utoipa::path(get, path = "/v1/threads/{id}/subagents",
+    params(
+        ("id" = String, Path,),
+        ("recursive" = Option<bool>, Query, description = "Include nested descendants instead of only direct children")
+    ),
+    responses((status = 200, body = [Thread]), (status = 404, body = ErrorBody)))]
+async fn list_thread_subagents(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(query): Query<ListThreadSubagentsQuery>,
+) -> Result<Json<Vec<Thread>>, ApiError> {
+    let subagents = if query.recursive {
+        engine.list_thread_descendants(&id)?
+    } else {
+        engine.list_thread_subagents(&id)?
+    };
+    Ok(Json(subagents))
+}
+
 #[utoipa::path(get, path = "/v1/threads/{id}/view",
     params(
         ("id" = String, Path,),
         ("before" = Option<u64>, Query, description = "Exclusive folded-item offset for backward pagination"),
-        ("limit" = Option<u32>, Query, description = "Requested item count; capped by the server")
+        ("limit" = Option<u32>, Query, description = "Maximum item count, capped by the server"),
+        ("turn_aligned" = Option<bool>, Query, description = "Expand backward to a complete turn boundary; the response may exceed limit")
     ),
     responses(
         (status = 200, body = ThreadViewSnapshot,
@@ -1147,15 +1474,33 @@ async fn get_thread_view(
         .limit
         .map(|limit| (limit as usize).clamp(1, MAX_ITEMS))
         .unwrap_or(usize::MAX);
-    let (cursor, snapshot) =
-        tokio::task::spawn_blocking(move || engine.thread_view_snapshot(&id, query.before, limit))
-            .await
-            .map_err(|error| {
-                ApiError(EngineError::Internal(anyhow::anyhow!(
-                    "thread view worker failed: {error}"
-                )))
-            })??;
+    let turn_aligned = query.turn_aligned.unwrap_or(false);
+    let (cursor, snapshot) = tokio::task::spawn_blocking(move || {
+        engine.thread_view_snapshot(&id, query.before, limit, turn_aligned)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(EngineError::Internal(anyhow::anyhow!(
+            "thread view worker failed: {error}"
+        )))
+    })??;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(snapshot)))
+}
+
+#[utoipa::path(get, path = "/v1/threads/{id}/tools/{call_id}",
+    params(
+        ("id" = String, Path,),
+        ("call_id" = String, Path,)
+    ),
+    responses(
+        (status = 200, body = ThreadToolDetails),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_thread_tool_details(
+    State(engine): State<Arc<Engine>>,
+    Path((id, call_id)): Path<(String, String)>,
+) -> Result<Json<ThreadToolDetails>, ApiError> {
+    Ok(Json(engine.thread_tool_details(&id, &call_id)?))
 }
 
 #[utoipa::path(patch, path = "/v1/threads/{id}", params(("id" = String, Path,)),
@@ -1182,6 +1527,21 @@ async fn send_message(
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
+#[utoipa::path(post, path = "/v1/threads/{id}/steer",
+    params(("id" = String, Path,)), request_body = SteerTurnRequest,
+    responses((status = 202, body = SteerAccepted),
+              (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn steer_turn(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<SteerTurnRequest>,
+) -> Result<(StatusCode, Json<SteerAccepted>), ApiError> {
+    let accepted = engine.steer_turn(&id, req.content, req.attachments).await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
 /// Raw bytes of a stored prompt attachment, with its uploaded MIME type.
 #[utoipa::path(get, path = "/v1/attachments/{id}", params(("id" = String, Path,)),
     responses((status = 200, body = String), (status = 404, body = ErrorBody)))]
@@ -1189,22 +1549,100 @@ async fn get_attachment(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
-    let (attachment, path) = engine.attachment(&id)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| ApiError::from(EngineError::NotFound(format!("attachment {id}: {e}"))))?;
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, attachment.mime),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{}\"", attachment.name.replace('"', "")),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    let (attachment, bytes) = engine.attachment(&id).await?;
+    let preview_mime = safe_attachment_preview_mime(&attachment.mime);
+    let disposition = attachment_content_disposition(&attachment.name, preview_mime.is_some());
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(preview_mime.unwrap_or("application/octet-stream")),
+    );
+    headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// Only browser-safe raster formats may render in the application origin.
+/// In particular, SVG and user-supplied text/HTML are downloads even when a
+/// legacy database row claims a renderable MIME type.
+fn safe_attachment_preview_mime(mime: &str) -> Option<&'static str> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn attachment_content_disposition(name: &str, inline: bool) -> axum::http::HeaderValue {
+    const MAX_FILENAME_BYTES: usize = 1024;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut fallback = String::new();
+    let mut encoded = String::new();
+    let mut source_bytes = 0;
+    for ch in name.chars() {
+        let char_bytes = ch.len_utf8();
+        if source_bytes + char_bytes > MAX_FILENAME_BYTES {
+            break;
+        }
+        source_bytes += char_bytes;
+
+        if fallback.len() < 150 {
+            fallback.push(
+                if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                },
+            );
+        }
+        let mut utf8 = [0; 4];
+        for &byte in ch.encode_utf8(&mut utf8).as_bytes() {
+            if byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+            {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    if fallback.trim().is_empty() {
+        fallback = "attachment".to_string();
+    }
+    if encoded.is_empty() {
+        encoded = "attachment".to_string();
+    }
+    let kind = if inline { "inline" } else { "attachment" };
+    axum::http::HeaderValue::try_from(format!(
+        "{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment"))
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/queue", params(("id" = String, Path,)),
@@ -1245,7 +1683,24 @@ async fn dispatch_queue(
             thread_id: id,
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
+            queued_prompt: None,
         }),
+    ))
+}
+
+/// Move one queued prompt to the front and dispatch it immediately. An
+/// active turn is interrupted; its terminal event is persisted before the
+/// selected prompt starts as the next turn.
+#[utoipa::path(post, path = "/v1/queue/{id}/dispatch", params(("id" = String, Path,)),
+    responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn dispatch_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(engine.dispatch_queued_prompt(&id)?),
     ))
 }
 
@@ -1267,7 +1722,7 @@ async fn update_queued_prompt(
     Path(id): Path<String>,
     Json(req): Json<UpdateQueuedPromptRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.update_queued_prompt(&id, &req.content)?;
+    engine.update_queued_prompt(&id, req)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1282,28 +1737,35 @@ async fn delete_queued_prompt(
 }
 
 #[utoipa::path(post, path = "/v1/approvals", request_body = ResolveApprovalRequest,
-    responses((status = 204), (status = 404, body = ErrorBody)))]
+    responses((status = 204), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
 async fn resolve_approval(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.resolve_approval(&req.call_id, req.decision)?;
+    engine.resolve_approval(&req.thread_id, &req.call_id, req.decision)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/questions", request_body = ResolveQuestionRequest,
-    responses((status = 204), (status = 404, body = ErrorBody)))]
+    responses((status = 204), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
 async fn resolve_question(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<ResolveQuestionRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.resolve_question(&req.request_id, req.answers)?;
+    engine.resolve_question(&req.thread_id, &req.request_id, req.answers)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/models", responses((status = 200, body = [ModelInfo])))]
 async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
     Json(engine.list_models().await)
+}
+
+#[utoipa::path(get, path = "/v1/models/refresh", responses((status = 200, body = [ModelInfo])))]
+async fn refresh_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
+    Json(engine.refresh_models().await)
 }
 
 #[utoipa::path(get, path = "/v1/providers", responses((status = 200, body = ProvidersResponse)))]
@@ -1637,6 +2099,7 @@ async fn set_git_worktree_settings(
         .set_git_worktree_settings(
             req.title_model_load_behavior,
             req.title_model_resource_policy,
+            req.derive_branch_name_from_session_title,
         )
         .await?;
     let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
@@ -1734,7 +2197,8 @@ async fn delete_mode(
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}/diff", params(("id" = String, Path,)),
-    responses((status = 200, body = SessionDiff), (status = 404, body = ErrorBody)))]
+    responses((status = 200, body = SessionDiff), (status = 404, body = ErrorBody),
+              (status = 413, body = ErrorBody)))]
 async fn session_diff(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
@@ -1742,6 +2206,39 @@ async fn session_diff(
     Ok(Json(SessionDiff {
         diff: engine.session_diff(&id).await?,
     }))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/diff/summary",
+    params(("id" = String, Path,)),
+    responses(
+        (status = 200, body = SessionDiffSummary),
+        (status = 404, body = ErrorBody),
+        (status = 413, body = ErrorBody),
+    ))]
+async fn session_diff_summary(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionDiffSummary>, ApiError> {
+    Ok(Json(engine.session_diff_summary(&id).await?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/diff/file",
+    params(
+        ("id" = String, Path,),
+        ("path" = String, Query, description = "Changed worktree-relative path"),
+    ),
+    responses(
+        (status = 200, body = SessionFileDiff),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 413, body = ErrorBody),
+    ))]
+async fn session_file_diff(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<SessionFileDiff>, ApiError> {
+    Ok(Json(engine.session_file_diff(&id, &q.path).await?))
 }
 
 #[derive(Deserialize)]
@@ -1826,7 +2323,7 @@ async fn kill_terminal(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.terminal_kill(&id)?;
+    engine.terminal_kill(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1842,7 +2339,7 @@ async fn terminal_input(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&req.data)
         .map_err(|e| EngineError::BadRequest(format!("bad base64 input: {e}")))?;
-    engine.terminal_input(&id, &bytes)?;
+    engine.terminal_input(&id, &bytes).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1854,17 +2351,18 @@ async fn terminal_resize(
     Path(id): Path<String>,
     Json(req): Json<TerminalResizeRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.terminal_resize(&id, req.cols, req.rows)?;
+    engine.terminal_resize(&id, req.cols, req.rows).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// PTY output as SSE: each event's `id` is the byte offset *after* the
-/// chunk, data is base64. `?after=` resumes from an offset (bytes older
-/// than the retained backlog are silently skipped). A final `exit` event
+/// PTY output as SSE. A named, id-less `replay-start` event first announces
+/// the absolute replay offset as JSON. Each following output event's `id` is
+/// the byte offset *after* its base64 data. `?after=` resumes from an offset
+/// (bytes older than the retained backlog are skipped). A final `exit` event
 /// marks shell exit. Ephemeral — not part of the persisted event log.
 #[utoipa::path(get, path = "/v1/terminals/{id}/output",
     params(("id" = String, Path,), ("after" = Option<u64>, Query, description = "Resume byte offset")),
-    responses((status = 200, description = "SSE stream of base64 output chunks"),
+    responses((status = 200, description = "SSE replay-start marker and base64 output chunks"),
               (status = 404, body = ErrorBody)))]
 async fn terminal_output(
     State(engine): State<Arc<Engine>>,
@@ -1873,11 +2371,19 @@ async fn terminal_output(
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let (start, replay, mut live, exited) = engine.terminal_subscribe(&id, q.after.unwrap_or(0))?;
+    let (start, replay, mut live, exited) =
+        engine.terminal_subscribe(&id, q.after.unwrap_or(0)).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
     tokio::spawn(async move {
         let mut offset = start;
+        let replay_start = TerminalReplayStart { offset: start };
+        let marker = SseEvent::default()
+            .event("replay-start")
+            .data(serde_json::to_string(&replay_start).expect("terminal replay marker serializes"));
+        if tx.send(marker).await.is_err() {
+            return;
+        }
         if !replay.is_empty() {
             offset += replay.len() as u64;
             let ev = SseEvent::default()
@@ -1965,6 +2471,76 @@ async fn list_session_prs(
 }
 
 #[derive(Deserialize)]
+struct PrDetailQuery {
+    section: Option<PrDetailSection>,
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/prs/{number}",
+    params(
+        ("id" = String, Path,),
+        ("number" = u64, Path,),
+        ("section" = Option<PrDetailSection>, Query, description = "Optional lazy PR-page section; omitted loads every section for older clients")
+    ),
+    responses(
+        (status = 200, body = PrDetail),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_session_pr_detail(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Query(query): Query<PrDetailQuery>,
+) -> Result<Json<PrDetail>, ApiError> {
+    Ok(Json(
+        engine.session_pr_detail(&id, number, query.section).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PrFileQuery {
+    path: String,
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/prs/{number}/file",
+    params(
+        ("id" = String, Path,),
+        ("number" = u64, Path,),
+        ("path" = String, Query, description = "Exact changed-file path returned by PrDetail")
+    ),
+    responses(
+        (status = 200, body = PrFileDiff),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn get_session_pr_file_diff(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Query(query): Query<PrFileQuery>,
+) -> Result<Json<PrFileDiff>, ApiError> {
+    Ok(Json(
+        engine
+            .session_pr_file_diff(&id, number, &query.path)
+            .await?,
+    ))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/prs/{number}/actions",
+    params(("id" = String, Path,), ("number" = u64, Path,)),
+    request_body = PrActionRequest,
+    responses(
+        (status = 200, body = PrDetail),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn act_on_session_pr(
+    State(engine): State<Arc<Engine>>,
+    Path((id, number)): Path<(String, u64)>,
+    Json(action): Json<PrActionRequest>,
+) -> Result<Json<PrDetail>, ApiError> {
+    Ok(Json(engine.act_on_session_pr(&id, number, &action).await?))
+}
+
+#[derive(Deserialize)]
 struct McpListQuery {
     workspace_id: Option<String>,
     /// Spawn each server and run the MCP handshake to report health.
@@ -1997,7 +2573,23 @@ async fn upsert_mcp_server(
     Path(name): Path<String>,
     Json(req): Json<UpsertMcpServerRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.upsert_mcp_server(&name, &req)?;
+    engine.upsert_mcp_server(&name, &req).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/mcp-servers/{name}/enabled", params(("name" = String, Path,)),
+    request_body = SetMcpServerEnabledRequest,
+    responses(
+        (status = 204),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn set_mcp_server_enabled(
+    State(engine): State<Arc<Engine>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetMcpServerEnabledRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.set_mcp_server_enabled(&name, &req).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2019,7 +2611,9 @@ async fn delete_mcp_server(
     Path(name): Path<String>,
     Query(q): Query<McpDeleteQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.delete_mcp_server(&name, &q.scope, q.workspace_id.as_deref())?;
+    engine
+        .delete_mcp_server(&name, &q.scope, q.workspace_id.as_deref())
+        .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2227,4 +2821,42 @@ async fn code_review_job_events(
 ) -> impl IntoResponse {
     let after = resume_cursor(&headers, &q);
     event_stream(engine, Scope::CodeReviewJob(id), after)
+}
+
+#[cfg(test)]
+mod attachment_response_tests {
+    use super::{attachment_content_disposition, safe_attachment_preview_mime};
+
+    #[test]
+    fn only_safe_raster_mime_types_render_inline() {
+        assert_eq!(safe_attachment_preview_mime("image/png"), Some("image/png"));
+        assert_eq!(
+            safe_attachment_preview_mime("IMAGE/JPEG"),
+            Some("image/jpeg")
+        );
+        assert_eq!(safe_attachment_preview_mime("image/svg+xml"), None);
+        assert_eq!(safe_attachment_preview_mime("text/html"), None);
+        assert_eq!(
+            safe_attachment_preview_mime("image/png; charset=utf-8"),
+            None
+        );
+    }
+
+    #[test]
+    fn content_disposition_cannot_inject_headers() {
+        let value = attachment_content_disposition("bad\"\r\nX-Evil: yes.svg", false);
+        let value = value.to_str().expect("ASCII content-disposition");
+        assert!(value.starts_with("attachment; filename=\""));
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\n'));
+        assert!(value.contains("%22%0D%0AX-Evil%3A%20yes.svg"));
+    }
+
+    #[test]
+    fn content_disposition_preserves_unicode_via_rfc5987() {
+        let value = attachment_content_disposition("snowman-☃.png", true);
+        let value = value.to_str().expect("ASCII content-disposition");
+        assert!(value.starts_with("inline; filename=\"snowman-_.png\""));
+        assert!(value.contains("filename*=UTF-8''snowman-%E2%98%83.png"));
+    }
 }

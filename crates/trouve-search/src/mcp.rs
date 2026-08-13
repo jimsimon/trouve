@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -22,8 +22,11 @@ use crate::utils::{format_results, is_git_url, resolve_chunk};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const CACHE_MAX_SIZE: usize = 10;
+const MAX_TOOL_TOP_K: u64 = 100;
+const MAX_TOOL_SNIPPET_LINES: u64 = 1_000;
 /// Don't re-validate a repo sooner than this many times the last build's duration.
 const MIN_REVALIDATE_FACTOR: u32 = 3;
+const MIN_REVALIDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 const REPO_DESCRIPTION: &str = "A local directory path to index and search. The index is \
     cached after the first call, so repeat queries are fast.";
@@ -45,7 +48,7 @@ struct BuiltIndex {
 /// for unrelated repos proceed in parallel.
 struct RepoEntry {
     last_used: Mutex<Instant>,
-    built: Mutex<Option<BuiltIndex>>,
+    built: RwLock<Option<BuiltIndex>>,
 }
 
 /// Lock, ignoring poisoning: a panicked call must not wedge every later
@@ -54,6 +57,21 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn index_is_fresh(index: &BuiltIndex) -> bool {
+    let cooldown = (index.build_duration * MIN_REVALIDATE_FACTOR).max(MIN_REVALIDATE_INTERVAL);
+    index.built_at.elapsed() < cooldown
 }
 
 /// LRU cache of built indexes, re-validated after a cooldown. Internally
@@ -115,26 +133,30 @@ impl IndexCache {
         }
         let entry = Arc::new(RepoEntry {
             last_used: Mutex::new(Instant::now()),
-            built: Mutex::new(None),
+            built: RwLock::new(None),
         });
         entries.insert(key, Arc::clone(&entry));
         Ok(entry)
     }
 
     /// Run `f` against the repo's up-to-date index, (re)building it first
-    /// if needed. Holds only this repo's entry lock for the duration.
+    /// if needed. Fresh-index queries share a read lock; only incremental
+    /// revalidation is exclusive, so parallel tool calls against one repo do
+    /// not queue behind each other after the initial build.
     fn with_index<R>(&self, repo: &str, f: impl FnOnce(&TrouveIndex) -> R) -> Result<R, String> {
         let entry = self.entry(repo)?;
-        let mut built = lock_unpoisoned(&entry.built);
-        let needs_build = match built.as_ref() {
-            None => true,
-            Some(cached) => {
-                // Re-validated once outside the cooldown window: rebuilds
-                // are cheap incremental patches.
-                cached.built_at.elapsed() >= cached.build_duration * MIN_REVALIDATE_FACTOR
+        let mut f = Some(f);
+        {
+            let built = read_unpoisoned(&entry.built);
+            if let Some(cached) = built.as_ref().filter(|cached| index_is_fresh(cached)) {
+                return Ok(f.take().expect("query closure is available")(&cached.index));
             }
-        };
-        if needs_build {
+        }
+
+        let mut built = write_unpoisoned(&entry.built);
+        // A different caller may have completed revalidation while this one
+        // waited for the write lock.
+        if !built.as_ref().is_some_and(index_is_fresh) {
             let start = Instant::now();
             let index = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
                 .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
@@ -144,7 +166,9 @@ impl IndexCache {
                 build_duration: start.elapsed(),
             });
         }
-        Ok(f(&built.as_ref().unwrap().index))
+        Ok(f.take().expect("query closure is available")(
+            &built.as_ref().expect("index was built").index,
+        ))
     }
 }
 
@@ -164,8 +188,8 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "query": {"type": "string", "description": "Natural language or code query."},
                     "repo": {"type": "string", "description": REPO_DESCRIPTION},
-                    "top_k": {"type": "integer", "description": "Number of results to return.", "minimum": 1, "default": 5},
-                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "default": 10}
+                    "top_k": {"type": "integer", "description": "Number of results to return.", "minimum": 1, "maximum": MAX_TOOL_TOP_K, "default": 5},
+                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10}
                 },
                 "required": ["query", "repo"]
             }
@@ -182,8 +206,8 @@ fn tool_definitions() -> Value {
                     "file_path": {"type": "string", "description": "Path to the file as stored in the index (use file_path from a search result)."},
                     "line": {"type": "integer", "description": "Line number (1-indexed)."},
                     "repo": {"type": "string", "description": REPO_DESCRIPTION},
-                    "top_k": {"type": "integer", "description": "Number of similar chunks to return.", "minimum": 1, "default": 5},
-                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "default": 10}
+                    "top_k": {"type": "integer", "description": "Number of similar chunks to return.", "minimum": 1, "maximum": MAX_TOOL_TOP_K, "default": 5},
+                    "max_snippet_lines": {"type": "integer", "description": snippet_desc, "minimum": 0, "maximum": MAX_TOOL_SNIPPET_LINES, "default": 10}
                 },
                 "required": ["file_path", "line", "repo"]
             }
@@ -196,8 +220,10 @@ fn arg_top_k(args: &Value) -> Result<usize, String> {
     match args.get("top_k") {
         None | Some(Value::Null) => Ok(5),
         Some(v) => match v.as_u64() {
-            Some(n) if n >= 1 => Ok(n as usize),
-            _ => Err("`top_k` must be an integer of at least 1.".to_string()),
+            Some(n) if (1..=MAX_TOOL_TOP_K).contains(&n) => Ok(n as usize),
+            _ => Err(format!(
+                "`top_k` must be an integer from 1 to {MAX_TOOL_TOP_K}."
+            )),
         },
     }
 }
@@ -207,7 +233,10 @@ fn arg_top_k(args: &Value) -> Result<usize, String> {
 fn arg_snippet_lines(args: &Value) -> Option<usize> {
     match args.get("max_snippet_lines") {
         None | Some(Value::Null) => Some(10),
-        Some(v) => v.as_u64().map(|n| n as usize).or(Some(10)),
+        Some(v) => v
+            .as_u64()
+            .map(|n| n.min(MAX_TOOL_SNIPPET_LINES) as usize)
+            .or(Some(10)),
     }
 }
 
@@ -443,6 +472,10 @@ mod tests {
                 json!({"name": "search", "arguments": {"query": "x", "repo": "/n", "top_k": 0}}),
                 "`top_k`",
             ),
+            (
+                json!({"name": "search", "arguments": {"query": "x", "repo": "/n", "top_k": 101}}),
+                "`top_k`",
+            ),
         ] {
             let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params});
             let response = handle_request(&cache, &req).unwrap();
@@ -475,6 +508,10 @@ mod tests {
         assert_eq!(
             arg_snippet_lines(&json!({"max_snippet_lines": 40})),
             Some(40)
+        );
+        assert_eq!(
+            arg_snippet_lines(&json!({"max_snippet_lines": 10_000})),
+            Some(MAX_TOOL_SNIPPET_LINES as usize)
         );
     }
 }

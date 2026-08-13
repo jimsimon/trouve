@@ -9,6 +9,9 @@ use trouve_protocol::{TodoItem, TodoStatus};
 use super::{Tool, ToolCtx, ToolResult};
 
 const STATUSES: [&str; 4] = ["pending", "in_progress", "completed", "cancelled"];
+const MAX_TODOS: usize = 128;
+const MAX_TODO_ID_BYTES: usize = 256;
+const MAX_TODO_CONTENT_BYTES: usize = 4 * 1024;
 
 pub struct TodoWrite;
 
@@ -30,11 +33,12 @@ impl Tool for TodoWrite {
                 "todos": {
                     "type": "array",
                     "description": "Task items to write",
+                    "maxItems": MAX_TODOS,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable identifier for the task"},
-                            "content": {"type": "string", "description": "What the task is"},
+                            "id": {"type": "string", "description": "Stable identifier for the task", "maxLength": MAX_TODO_ID_BYTES},
+                            "content": {"type": "string", "description": "What the task is", "maxLength": MAX_TODO_CONTENT_BYTES},
                             "status": {"type": "string", "enum": STATUSES}
                         },
                         "required": ["id", "content", "status"]
@@ -51,33 +55,70 @@ impl Tool for TodoWrite {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("TODO update cancelled");
+        }
         let Some(items) = args.get("todos").and_then(Value::as_array) else {
             return ToolResult::error("missing required argument: todos");
         };
+        if items.len() > MAX_TODOS {
+            return ToolResult::error(format!(
+                "too many TODOs: {} (maximum {MAX_TODOS})",
+                items.len()
+            ));
+        }
         let mut incoming: Vec<TodoItem> = Vec::new();
         for item in items {
             let todo: TodoItem = match serde_json::from_value(item.clone()) {
                 Ok(t) => t,
-                Err(e) => return ToolResult::error(format!("bad todo item: {e}")),
+                Err(e) => return ToolResult::error(format!("bad TODO item: {e}")),
             };
+            if todo.id.len() > MAX_TODO_ID_BYTES {
+                return ToolResult::error(format!(
+                    "TODO ID is {} bytes (maximum {MAX_TODO_ID_BYTES})",
+                    todo.id.len()
+                ));
+            }
+            if todo.content.len() > MAX_TODO_CONTENT_BYTES {
+                return ToolResult::error(format!(
+                    "TODO content is {} bytes (maximum {MAX_TODO_CONTENT_BYTES})",
+                    todo.content.len()
+                ));
+            }
             incoming.push(todo);
         }
         let merge = args.get("merge").and_then(Value::as_bool).unwrap_or(false);
 
         let mut list = ctx.todos.lock().unwrap();
+        let mut updated = if merge { list.clone() } else { Vec::new() };
         if merge {
+            let mut positions = updated
+                .iter()
+                .enumerate()
+                .map(|(index, todo)| (todo.id.clone(), index))
+                .collect::<std::collections::HashMap<_, _>>();
             for todo in incoming {
-                match list.iter_mut().find(|t| t.id == todo.id) {
-                    Some(existing) => *existing = todo,
-                    None => list.push(todo),
+                match positions.get(&todo.id).copied() {
+                    Some(index) => updated[index] = todo,
+                    None => {
+                        positions.insert(todo.id.clone(), updated.len());
+                        updated.push(todo);
+                    }
                 }
             }
         } else {
-            *list = incoming;
+            updated = incoming;
         }
-        if list.is_empty() {
-            return ToolResult::error("todos must not be empty");
+        if updated.is_empty() {
+            return ToolResult::error("TODOs must not be empty");
         }
+        if updated.len() > MAX_TODOS {
+            return ToolResult::error(format!(
+                "merged TODO list has {} items (maximum {MAX_TODOS})",
+                updated.len()
+            ));
+        }
+        *list = updated;
 
         let done = list
             .iter()
@@ -165,6 +206,25 @@ mod tests {
             .await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
         assert!(res.result["error"].as_str().unwrap().contains("doing"));
+
+        let oversized =
+            vec![json!({"id": "x", "content": "bounded", "status": "pending"}); MAX_TODOS + 1];
+        let res = tool
+            .run(&ctx(&tmp, "th_1"), &json!({"todos": oversized}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+
+        let res = tool
+            .run(
+                &ctx(&tmp, "th_1"),
+                &json!({"todos": [{
+                    "id": "x",
+                    "content": "x".repeat(MAX_TODO_CONTENT_BYTES + 1),
+                    "status": "pending"
+                }]}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
     }
 
     #[tokio::test]

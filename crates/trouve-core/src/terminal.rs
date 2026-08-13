@@ -57,6 +57,15 @@ struct Backlog {
     data: Vec<u8>,
 }
 
+impl Backlog {
+    fn replay_from(&self, after: u64) -> (u64, Vec<u8>) {
+        let end = self.start.saturating_add(self.data.len() as u64);
+        let from = after.clamp(self.start, end);
+        let skip = (from - self.start) as usize;
+        (from, self.data[skip..].to_vec())
+    }
+}
+
 impl Terminal {
     pub fn exited(&self) -> bool {
         self.exited.load(Ordering::Relaxed)
@@ -100,9 +109,7 @@ impl Terminal {
         // skew every subsequent SSE offset.
         let backlog = self.backlog.lock().unwrap();
         let rx = self.live.subscribe();
-        let from = after.max(backlog.start);
-        let skip = (from - backlog.start) as usize;
-        let replay = backlog.data.get(skip..).unwrap_or_default().to_vec();
+        let (from, replay) = backlog.replay_from(after);
         (from, replay, rx)
     }
 }
@@ -379,6 +386,18 @@ fn shell_args(shell: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_start_is_clamped_to_the_retained_range() {
+        let backlog = Backlog {
+            start: 5,
+            data: b"abcdef".to_vec(),
+        };
+
+        assert_eq!(backlog.replay_from(0), (5, b"abcdef".to_vec()));
+        assert_eq!(backlog.replay_from(7), (7, b"cdef".to_vec()));
+        assert_eq!(backlog.replay_from(99), (11, Vec::new()));
+    }
 
     #[test]
     fn fish_shell_disables_terminal_queries() {

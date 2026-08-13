@@ -263,22 +263,51 @@ pub fn escaping_write_path(
 /// allow-list that `always_approve` decisions feed.
 #[derive(Default)]
 pub struct ApprovalHub {
-    pending: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
+    pending: Mutex<HashMap<(String, String), oneshot::Sender<ApprovalDecision>>>,
     allow_lists: Mutex<HashMap<String, HashSet<String>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResolution {
+    Resolved,
+    NotFound,
+}
+
 impl ApprovalHub {
-    pub fn request(&self, call_id: &str) -> oneshot::Receiver<ApprovalDecision> {
+    /// Registers one vendor-local call id in its owning thread. Returns `None`
+    /// rather than replacing a still-pending duplicate in the same thread.
+    pub fn request(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Option<oneshot::Receiver<ApprovalDecision>> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(call_id.to_string(), tx);
-        rx
+        let mut pending = self.pending.lock().unwrap();
+        let key = (thread_id.to_string(), call_id.to_string());
+        if pending.contains_key(&key) {
+            return None;
+        }
+        pending.insert(key, tx);
+        Some(rx)
     }
 
-    /// Returns false when the call id is unknown (already resolved or bogus).
-    pub fn resolve(&self, call_id: &str, decision: ApprovalDecision) -> bool {
-        match self.pending.lock().unwrap().remove(call_id) {
-            Some(tx) => tx.send(decision).is_ok(),
-            None => false,
+    pub fn resolve(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+        decision: ApprovalDecision,
+    ) -> ApprovalResolution {
+        let mut pending = self.pending.lock().unwrap();
+        let key = (thread_id.to_string(), call_id.to_string());
+        match pending.remove(&key) {
+            Some(tx) => {
+                if tx.send(decision).is_ok() {
+                    ApprovalResolution::Resolved
+                } else {
+                    ApprovalResolution::NotFound
+                }
+            }
+            None => ApprovalResolution::NotFound,
         }
     }
 
@@ -304,26 +333,53 @@ impl ApprovalHub {
 /// Pending agent questions, mirroring [`ApprovalHub`]: one oneshot per
 /// outstanding `question.requested`, resolved by the answers endpoint
 /// (`None` = the user skipped).
+type QuestionKey = (String, String);
+type QuestionResponder = oneshot::Sender<Option<Vec<QuestionAnswer>>>;
+
 #[derive(Default)]
 pub struct QuestionHub {
-    pending: Mutex<HashMap<String, oneshot::Sender<Option<Vec<QuestionAnswer>>>>>,
+    pending: Mutex<HashMap<QuestionKey, QuestionResponder>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionResolution {
+    Resolved,
+    NotFound,
 }
 
 impl QuestionHub {
-    pub fn request(&self, request_id: &str) -> oneshot::Receiver<Option<Vec<QuestionAnswer>>> {
+    pub fn request(
+        &self,
+        thread_id: &str,
+        request_id: &str,
+    ) -> Option<oneshot::Receiver<Option<Vec<QuestionAnswer>>>> {
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(request_id.to_string(), tx);
-        rx
+        let mut pending = self.pending.lock().unwrap();
+        let key = (thread_id.to_string(), request_id.to_string());
+        if pending.contains_key(&key) {
+            return None;
+        }
+        pending.insert(key, tx);
+        Some(rx)
     }
 
-    /// Returns false when the request id is unknown (already resolved).
-    pub fn resolve(&self, request_id: &str, answers: Option<Vec<QuestionAnswer>>) -> bool {
-        match self.pending.lock().unwrap().remove(request_id) {
-            Some(tx) => tx.send(answers).is_ok(),
-            None => false,
+    pub fn resolve(
+        &self,
+        thread_id: &str,
+        request_id: &str,
+        answers: Option<Vec<QuestionAnswer>>,
+    ) -> QuestionResolution {
+        let mut pending = self.pending.lock().unwrap();
+        let key = (thread_id.to_string(), request_id.to_string());
+        match pending.remove(&key) {
+            Some(tx) => {
+                if tx.send(answers).is_ok() {
+                    QuestionResolution::Resolved
+                } else {
+                    QuestionResolution::NotFound
+                }
+            }
+            None => QuestionResolution::NotFound,
         }
     }
 }
@@ -599,9 +655,56 @@ mod tests {
     #[tokio::test]
     async fn approval_roundtrip() {
         let hub = ApprovalHub::default();
-        let rx = hub.request("call_1");
-        assert!(hub.resolve("call_1", ApprovalDecision::Approve));
+        let rx = hub.request("thread_1", "call_1").unwrap();
+        assert_eq!(
+            hub.resolve("thread_1", "call_1", ApprovalDecision::Approve),
+            ApprovalResolution::Resolved
+        );
         assert_eq!(rx.await.unwrap(), ApprovalDecision::Approve);
-        assert!(!hub.resolve("call_1", ApprovalDecision::Deny));
+        assert_eq!(
+            hub.resolve("thread_1", "call_1", ApprovalDecision::Deny),
+            ApprovalResolution::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_vendor_call_ids_are_scoped() {
+        let hub = ApprovalHub::default();
+        let first = hub.request("thread_1", "call_1").unwrap();
+        let second = hub.request("thread_2", "call_1").unwrap();
+        assert!(hub.request("thread_1", "call_1").is_none());
+        assert_eq!(
+            hub.resolve("thread_2", "call_1", ApprovalDecision::Deny),
+            ApprovalResolution::Resolved
+        );
+        assert_eq!(second.await.unwrap(), ApprovalDecision::Deny);
+        assert_eq!(
+            hub.resolve("thread_1", "call_1", ApprovalDecision::Approve),
+            ApprovalResolution::Resolved
+        );
+        assert_eq!(first.await.unwrap(), ApprovalDecision::Approve);
+    }
+
+    #[tokio::test]
+    async fn duplicate_question_ids_are_scoped() {
+        let hub = QuestionHub::default();
+        let first = hub.request("thread_1", "request_1").unwrap();
+        let second = hub.request("thread_2", "request_1").unwrap();
+        assert!(hub.request("thread_1", "request_1").is_none());
+        assert_eq!(
+            hub.resolve("thread_2", "request_1", None),
+            QuestionResolution::Resolved
+        );
+        assert_eq!(second.await.unwrap(), None);
+        let answers = vec![QuestionAnswer {
+            question_id: "q1".into(),
+            selected_option_ids: vec!["yes".into()],
+            other_text: None,
+        }];
+        assert_eq!(
+            hub.resolve("thread_1", "request_1", Some(answers.clone())),
+            QuestionResolution::Resolved
+        );
+        assert_eq!(first.await.unwrap(), Some(answers));
     }
 }

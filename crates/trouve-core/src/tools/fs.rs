@@ -1,6 +1,7 @@
 //! File tools: read, write, list.
 
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -8,10 +9,13 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 /// Images larger than this are rejected rather than truncated (a partial
 /// image is useless as vision input).
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-/// Text files larger than this are refused up front: `read_to_string`
-/// buffers the whole file regardless of offset/limit, so an adversarial
-/// multi-GB file would otherwise exhaust memory before the line paging runs.
+/// Text files larger than this are refused up front. Ranged reads are
+/// streamed and stop at the requested page, but retaining this scan bound
+/// also protects against pathological single-line files and enormous offsets.
 const MAX_TEXT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_WRITE_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LIST_ENTRIES: usize = 1_000;
 
 /// MIME type for paths `read_file` should return as vision content.
 fn image_mime(path: &str) -> Option<&'static str> {
@@ -33,16 +37,24 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a file from the workspace. Text returns at most 64KB (use offset to page through \
-         larger files); images (png/jpeg/gif/webp) are returned as vision content."
+        "Read a workspace file or a host-registered read-only resource. Text returns at most \
+         64KB (use offset to page through larger files); images (png/jpeg/gif/webp) are returned as vision content. Set \
+         format=\"hashline\" to receive a whole-file snapshot tag and numbered lines for \
+         compact hashline_edit calls."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Workspace-relative file path"},
+                "path": {"type": "string", "description": "Workspace-relative file path, or an absolute path under a host-registered read-only root"},
                 "offset": {"type": "integer", "description": "Line to start from (1-based)", "minimum": 1},
-                "limit": {"type": "integer", "description": "Maximum number of lines", "minimum": 1}
+                "limit": {"type": "integer", "description": "Maximum number of lines", "minimum": 1},
+                "format": {
+                    "type": "string",
+                    "enum": ["plain", "hashline"],
+                    "default": "plain",
+                    "description": "Use hashline to include a whole-file snapshot tag and numbered lines"
+                }
             },
             "required": ["path"]
         })
@@ -55,7 +67,7 @@ impl Tool for ReadFile {
         let Some(path) = args.get("path").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: path");
         };
-        let full = match ctx.resolve(path) {
+        let full = match ctx.resolve_read(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
@@ -98,10 +110,6 @@ impl Tool for ReadFile {
                 meta.len()
             ));
         }
-        let text = match tokio::fs::read_to_string(&full).await {
-            Ok(t) => t,
-            Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
-        };
         let offset = args
             .get("offset")
             .and_then(Value::as_u64)
@@ -110,26 +118,97 @@ impl Tool for ReadFile {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
-            .map(|l| l as usize);
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX).max(1));
+        let format = args
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("plain");
+        if !matches!(format, "plain" | "hashline") {
+            return ToolResult::error("format must be plain or hashline");
+        }
+        if format == "hashline" {
+            let content = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("file read cancelled");
+                }
+                content = tokio::fs::read_to_string(&full) => {
+                    match content {
+                        Ok(content) => content,
+                        Err(error) => {
+                            return ToolResult::error(format!("cannot read {path}: {error}"));
+                        }
+                    }
+                }
+            };
+            return match super::hashline::render_read(path, &content, offset, limit, MAX_READ_BYTES)
+            {
+                Ok(result) => ToolResult::ok(result),
+                Err(error) => ToolResult::error(error),
+            };
+        }
 
+        let file = match tokio::fs::File::open(&full).await {
+            Ok(file) => file,
+            Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut line_number = 0usize;
+        let mut lines_read = 0usize;
         let mut out = String::new();
         let mut truncated = false;
-        let mut remaining = limit;
-        for line in text.lines().skip(offset - 1) {
-            if remaining == Some(0) || out.len() + line.len() + 1 > MAX_READ_BYTES {
+        let mut total_lines = None;
+        loop {
+            line.clear();
+            let read = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("file read cancelled");
+                }
+                read = reader.read_line(&mut line) => read,
+            };
+            let bytes = match read {
+                Ok(bytes) => bytes,
+                Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+            };
+            if bytes == 0 {
+                total_lines = Some(line_number);
+                break;
+            }
+            line_number += 1;
+            if line_number < offset {
+                continue;
+            }
+
+            let content = line.strip_suffix('\n').unwrap_or(&line);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            if out.len() + content.len() + 1 > MAX_READ_BYTES {
                 truncated = true;
                 break;
             }
-            out.push_str(line);
+            out.push_str(content);
             out.push('\n');
-            if let Some(r) = remaining.as_mut() {
-                *r -= 1;
+            lines_read += 1;
+
+            if limit.is_some_and(|limit| lines_read >= limit) {
+                let has_more = match reader.fill_buf().await {
+                    Ok(buffer) => !buffer.is_empty(),
+                    Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+                };
+                truncated = has_more;
+                if !has_more {
+                    total_lines = Some(line_number);
+                }
+                break;
             }
         }
         ToolResult::ok(json!({
             "content": out,
             "truncated": truncated,
-            "total_lines": text.lines().count(),
+            "lines_read": lines_read,
+            "next_offset": truncated.then_some(offset + lines_read),
+            "total_lines": total_lines,
         }))
     }
 }
@@ -165,6 +244,15 @@ impl Tool for WriteFile {
         ) else {
             return ToolResult::error("missing required arguments: path, content");
         };
+        if content.len() > MAX_WRITE_FILE_BYTES {
+            return ToolResult::error(format!(
+                "content is {} bytes; write_file's limit is {MAX_WRITE_FILE_BYTES}",
+                content.len()
+            ));
+        }
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("write cancelled");
+        }
         let full = match ctx.resolve(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
@@ -233,32 +321,111 @@ impl Tool for EditFile {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
+        if let Ok(metadata) = tokio::fs::metadata(&full).await
+            && metadata.len() > MAX_EDIT_FILE_BYTES
+        {
+            return ToolResult::error(format!(
+                "{path} is {} bytes; edit_file's limit is {MAX_EDIT_FILE_BYTES}. Use apply_patch or a targeted shell transformation.",
+                metadata.len()
+            ));
+        }
         let content = match tokio::fs::read_to_string(&full).await {
             Ok(t) => t,
             Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
         };
-        let count = content.matches(old).count();
-        if count == 0 {
-            return ToolResult::error(format!(
-                "old_string not found in {path}; re-read the file and match its content exactly"
-            ));
-        }
-        if count > 1 && !replace_all {
-            return ToolResult::error(format!(
-                "old_string matches {count} places in {path}; add surrounding context to make \
-                 it unique, or set replace_all"
-            ));
-        }
-        let updated = if replace_all {
-            content.replace(old, new)
-        } else {
-            content.replacen(old, new, 1)
+        let old = old.to_owned();
+        let new = new.to_owned();
+        let replaced = tokio::task::spawn_blocking(move || {
+            let count = content.matches(&old).count();
+            if count == 0 {
+                return Err("old_string not found".to_owned());
+            }
+            if count > 1 && !replace_all {
+                return Err(format!("old_string matches {count} places"));
+            }
+            let updated = if replace_all {
+                content.replace(&old, &new)
+            } else {
+                content.replacen(&old, &new, 1)
+            };
+            Ok((updated, count))
+        })
+        .await;
+        let (updated, count) = match replaced {
+            Ok(Ok(replaced)) => replaced,
+            Ok(Err(error)) if error == "old_string not found" => {
+                return ToolResult::error(format!(
+                    "old_string not found in {path}; re-read the file and match its content exactly"
+                ));
+            }
+            Ok(Err(error)) => {
+                return ToolResult::error(format!(
+                    "{error} in {path}; add surrounding context to make it unique, or set replace_all"
+                ));
+            }
+            Err(error) => {
+                return ToolResult::error(format!("edit worker failed: {error}"));
+            }
         };
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("edit cancelled");
+        }
         match tokio::fs::write(&full, &updated).await {
             Ok(()) => ToolResult::ok(json!({
                 "replacements": if replace_all { count } else { 1 },
             })),
             Err(e) => ToolResult::error(format!("cannot write {path}: {e}")),
+        }
+    }
+}
+
+pub struct DeleteFile;
+
+#[async_trait::async_trait]
+impl Tool for DeleteFile {
+    fn name(&self) -> &'static str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete one workspace file. Directories are rejected."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative file path"}
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return ToolResult::error("missing required argument: path");
+        };
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("delete cancelled");
+        }
+        let full = match ctx.resolve(path) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(error),
+        };
+        let metadata = match tokio::fs::symlink_metadata(&full).await {
+            Ok(metadata) => metadata,
+            Err(error) => return ToolResult::error(format!("cannot delete {path}: {error}")),
+        };
+        if metadata.is_dir() {
+            return ToolResult::error(format!("cannot delete {path}: path is a directory"));
+        }
+        match tokio::fs::remove_file(&full).await {
+            Ok(()) => ToolResult::ok(json!({"path": path, "action": "delete"})),
+            Err(error) => ToolResult::error(format!("cannot delete {path}: {error}")),
         }
     }
 }
@@ -271,13 +438,13 @@ impl Tool for ListDir {
         "list_dir"
     }
     fn description(&self) -> &'static str {
-        "List the entries of a workspace directory (non-recursive)."
+        "List a workspace or host-registered read-only directory (non-recursive)."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Workspace-relative directory (default: workspace root)"}
+                "path": {"type": "string", "description": "Workspace-relative directory (default: workspace root), or an absolute directory under a host-registered read-only root"}
             }
         })
     }
@@ -287,7 +454,7 @@ impl Tool for ListDir {
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let full = match ctx.resolve(rel) {
+        let full = match ctx.resolve_read(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
@@ -296,7 +463,26 @@ impl Tool for ListDir {
             Err(e) => return ToolResult::error(format!("cannot list {rel}: {e}")),
         };
         let mut entries = Vec::new();
-        while let Ok(Some(entry)) = rd.next_entry().await {
+        let mut truncated = false;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return ToolResult::error("directory listing cancelled");
+                }
+                next = rd.next_entry() => next,
+            };
+            let entry = match next {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    return ToolResult::error(format!("cannot list {rel}: {error}"));
+                }
+            };
+            if entries.len() >= MAX_LIST_ENTRIES {
+                truncated = true;
+                break;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             let kind = match entry.file_type().await {
                 Ok(ft) if ft.is_dir() => "dir",
@@ -306,7 +492,7 @@ impl Tool for ListDir {
             entries.push(json!({"name": name, "kind": kind}));
         }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        ToolResult::ok(json!({"entries": entries}))
+        ToolResult::ok(json!({"entries": entries, "truncated": truncated}))
     }
 }
 
@@ -334,10 +520,91 @@ mod tests {
             .run(&ctx, &json!({"path": "a/b.txt", "offset": 2, "limit": 1}))
             .await;
         assert_eq!(res.result["content"], "line2\n");
-        assert_eq!(res.result["total_lines"], 3);
+        assert_eq!(res.result["total_lines"], Value::Null);
+        assert_eq!(res.result["next_offset"], 3);
 
         let res = ListDir.run(&ctx, &json!({"path": "a"})).await;
         assert_eq!(res.result["entries"][0]["name"], "b.txt");
+    }
+
+    #[tokio::test]
+    async fn ranged_read_does_not_consume_an_invalid_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("mixed.txt"), b"first\n\xff\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let res = ReadFile
+            .run(&ctx, &json!({"path": "mixed.txt", "offset": 1, "limit": 1}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(res.result["content"], "first\n");
+        assert_eq!(res.result["truncated"], true);
+        assert_eq!(res.result["next_offset"], 2);
+    }
+
+    #[tokio::test]
+    async fn registered_host_resources_are_readable_but_never_writable() {
+        let worktree = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        let skill = package.path().join("SKILL.md");
+        std::fs::write(&skill, "host instructions\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: worktree.path().to_path_buf(),
+            read_only_roots: vec![package.path().canonicalize().unwrap()].into(),
+            ..Default::default()
+        };
+        let absolute = skill.to_str().unwrap();
+
+        let read = ReadFile.run(&ctx, &json!({"path": absolute})).await;
+        assert_eq!(read.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(read.result["content"], "host instructions\n");
+
+        let listed = ListDir.run(&ctx, &json!({"path": package.path()})).await;
+        assert_eq!(listed.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(listed.result["entries"][0]["name"], "SKILL.md");
+
+        let write = WriteFile
+            .run(&ctx, &json!({"path": absolute, "content": "changed\n"}))
+            .await;
+        assert_eq!(write.status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(skill).unwrap(),
+            "host instructions\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn hashline_read_returns_snapshot_header_and_numbered_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let res = ReadFile
+            .run(
+                &ctx,
+                &json!({
+                    "path": "f.txt",
+                    "offset": 2,
+                    "limit": 1,
+                    "format": "hashline",
+                }),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        let snapshot = res.result["snapshot"].as_str().unwrap();
+        assert_eq!(snapshot.len(), 12);
+        assert_eq!(
+            res.result["content"],
+            format!("[f.txt#{snapshot}]\n2:two\n")
+        );
+        assert_eq!(res.result["next_offset"], 3);
+        assert_eq!(res.result["total_lines"], 3);
     }
 
     #[tokio::test]
@@ -456,5 +723,24 @@ mod tests {
             )
             .await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_only_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("gone.txt"), "gone").unwrap();
+        std::fs::create_dir(tmp.path().join("kept")).unwrap();
+
+        let result = DeleteFile.run(&ctx, &json!({"path": "gone.txt"})).await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        assert!(!tmp.path().join("gone.txt").exists());
+
+        let result = DeleteFile.run(&ctx, &json!({"path": "kept"})).await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert!(tmp.path().join("kept").is_dir());
     }
 }

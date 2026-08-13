@@ -6,33 +6,456 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
-use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
+use trouve_agents::{
+    AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
+    BackendPermission, BackendSteer, BackendTurn,
+};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
-    TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
-    Workspace,
+    ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
+    SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
-use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
-use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
+use crate::permissions::{
+    ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
+};
+use crate::store::{
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance, Store,
+};
+use crate::tools::{
+    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
+    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
+    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
+    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
+/// Bound native provider fan-out so a malformed or over-eager response cannot
+/// monopolize the runtime. Results are still written to the provider
+/// transcript in request order.
+const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_NAME_BYTES: usize = 1024;
+const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
+/// Production tools observe `ToolCtx::cancel` and clean up promptly. This
+/// bound prevents a third-party/custom executor that violates that contract
+/// from wedging the dispatcher forever.
+#[cfg(not(test))]
+const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
+
+fn attachment_mime_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_'
+        )
+}
+
+fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Validate the request envelope, including its exact decoded sizes, before
+/// allocating decoded buffers or creating any durable cleanup/file state.
+fn validate_attachment_uploads(
+    uploads: &[trouve_protocol::AttachmentUpload],
+) -> Result<(), EngineError> {
+    if uploads.len() > MAX_ATTACHMENTS_PER_PROMPT {
+        return Err(EngineError::BadRequest(format!(
+            "a prompt may contain at most {MAX_ATTACHMENTS_PER_PROMPT} attachments"
+        )));
+    }
+
+    let mut total_bytes = 0usize;
+    for upload in uploads {
+        if upload.name.is_empty()
+            || upload.name.trim().is_empty()
+            || upload.name.len() > MAX_ATTACHMENT_NAME_BYTES
+            || upload.name == "."
+            || upload.name == ".."
+            || upload
+                .name
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return Err(EngineError::BadRequest(
+                "attachment name must be a non-empty filename of at most 1024 bytes without controls or path separators"
+                    .into(),
+            ));
+        }
+        let Some((mime_type, mime_subtype)) = upload.mime.split_once('/') else {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} has an invalid MIME type",
+                upload.name
+            )));
+        };
+        if upload.mime.len() > MAX_ATTACHMENT_MIME_BYTES
+            || mime_type.is_empty()
+            || mime_subtype.is_empty()
+            || mime_subtype.contains('/')
+            || !mime_type.bytes().all(attachment_mime_token_byte)
+            || !mime_subtype.bytes().all(attachment_mime_token_byte)
+        {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} has an invalid MIME type",
+                upload.name
+            )));
+        }
+
+        let data = upload.data.as_bytes();
+        let padding = match data {
+            [.., b'=', b'='] => 2usize,
+            [.., b'='] => 1usize,
+            _ => 0usize,
+        };
+        let payload_len = data.len().saturating_sub(padding);
+        let canonical_tail = payload_len
+            .checked_sub(1)
+            .and_then(|index| data.get(index))
+            .and_then(|byte| base64_sextet(*byte))
+            .is_some_and(|sextet| match padding {
+                2 => sextet & 0x0f == 0,
+                1 => sextet & 0x03 == 0,
+                _ => true,
+            });
+        let valid_base64 = !data.is_empty()
+            && data.len() % 4 == 0
+            && data[..payload_len]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+            && data[payload_len..].iter().all(|byte| *byte == b'=')
+            && canonical_tail;
+        if !valid_base64 {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {}: invalid base64",
+                upload.name
+            )));
+        }
+        let decoded_bytes = data
+            .len()
+            .checked_div(4)
+            .and_then(|groups| groups.checked_mul(3))
+            .and_then(|bytes| bytes.checked_sub(padding))
+            .ok_or_else(|| EngineError::BadRequest("attachment size overflow".into()))?;
+        if decoded_bytes == 0 {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} is empty",
+                upload.name
+            )));
+        }
+        if decoded_bytes > MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} exceeds {} MB",
+                upload.name,
+                MAX_ATTACHMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(decoded_bytes)
+            .ok_or_else(|| EngineError::BadRequest("attachment size overflow".into()))?;
+        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+            return Err(EngineError::BadRequest(format!(
+                "attachments exceed {} MB in total",
+                MAX_ATTACHMENT_TOTAL_BYTES / (1024 * 1024)
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct PreparedAttachmentCleanup {
+    store: Store,
+    executor: Arc<dyn ToolExecutor>,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    claim: Option<ArtifactCleanupClaim>,
+    heartbeat_cancel: tokio_util::sync::CancellationToken,
+    ownership_lost: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+impl PreparedAttachmentCleanup {
+    fn new(
+        store: Store,
+        executor: Arc<dyn ToolExecutor>,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        claim: Option<ArtifactCleanupClaim>,
+    ) -> Self {
+        let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+        let ownership_lost = tokio_util::sync::CancellationToken::new();
+        if let Some(claim) = claim.clone()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(maintain_artifact_cleanup_claim(
+                store.clone(),
+                claim,
+                heartbeat_cancel.clone(),
+                ownership_lost.clone(),
+            ));
+        }
+        Self {
+            store,
+            executor,
+            root,
+            paths,
+            claim,
+            heartbeat_cancel,
+            ownership_lost,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.heartbeat_cancel.cancel();
+        self.armed = false;
+    }
+
+    fn claim(&self) -> Option<ArtifactCleanupClaim> {
+        self.claim.clone()
+    }
+}
+
+impl Drop for PreparedAttachmentCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.heartbeat_cancel.cancel();
+        if self.ownership_lost.is_cancelled() {
+            if let Some(claim) = self.claim.as_ref() {
+                tracing::warn!(job_id = %claim.id, "staging cleanup claim was lost before rollback");
+            }
+            return;
+        }
+        if let Some(claim) = self.claim.as_ref() {
+            match self.store.renew_artifact_cleanup_claim(claim) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(job_id = %claim.id, "staging cleanup claim was lost before rollback");
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(job_id = %claim.id, %error, "could not verify staging cleanup ownership before rollback");
+                    return;
+                }
+            }
+        }
+        let cleanup = self
+            .executor
+            .rollback_attachment_files(&self.root, &self.paths);
+        if let Some(claim) = self.claim.as_ref() {
+            match cleanup {
+                Ok(()) => {
+                    if let Err(error) = self.store.complete_claimed_artifact_cleanup_job(claim) {
+                        tracing::error!(%error, job_id = %claim.id, "failed to retire rolled-back attachment job");
+                    }
+                }
+                Err(error) => {
+                    let _ = self.store.fail_claimed_artifact_cleanup_job(claim, &error);
+                    tracing::error!(%error, job_id = %claim.id, "failed to roll back staged attachment files");
+                }
+            }
+        } else if let Err(error) = cleanup {
+            tracing::error!(%error, "failed to roll back unstaged attachment files");
+        }
+    }
+}
+
+async fn maintain_artifact_cleanup_claim(
+    store: Store,
+    claim: ArtifactCleanupClaim,
+    cancel: tokio_util::sync::CancellationToken,
+    ownership_lost: tokio_util::sync::CancellationToken,
+) {
+    #[cfg(not(test))]
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    #[cfg(test)]
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                match store.renew_artifact_cleanup_claim(&claim) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(job_id = %claim.id, "artifact cleanup claim heartbeat lost ownership");
+                        ownership_lost.cancel();
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(job_id = %claim.id, %error, "artifact cleanup claim heartbeat failed");
+                        ownership_lost.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn execute_artifact_cleanup_job(
+    store: Store,
+    executor: Arc<dyn ToolExecutor>,
+    attachment_root: PathBuf,
+    managed_worktree_root: PathBuf,
+    job: ArtifactCleanupJob,
+    index_hooks: bool,
+) {
+    let Some(claim) = job.claim() else {
+        tracing::error!(job_id = %job.id, "refusing to execute an unclaimed artifact cleanup job");
+        return;
+    };
+    let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+    let ownership_lost = tokio_util::sync::CancellationToken::new();
+    let heartbeat = tokio::spawn(maintain_artifact_cleanup_claim(
+        store.clone(),
+        claim.clone(),
+        heartbeat_cancel.clone(),
+        ownership_lost.clone(),
+    ));
+    let repository_for_gc = job.repository_path.clone();
+    let mut result = if let Some(session_id) = job.session_id.as_deref() {
+        match store.session(session_id) {
+            Ok(Some(_)) => Err(format!(
+                "refusing cleanup because session {session_id} is live again"
+            )),
+            Err(error) => Err(format!(
+                "could not verify that session {session_id} remains deleted: {error:#}"
+            )),
+            Ok(None) => match store.list_sessions(None) {
+                Err(error) => Err(format!(
+                    "could not verify that deleted-session worktree has no live owner: {error:#}"
+                )),
+                Ok(sessions) => {
+                    match (job.worktree_path.as_deref(), job.repository_path.as_deref()) {
+                        (Some(worktree), Some(repository)) => {
+                            if let Some(owner) = sessions
+                                .iter()
+                                .find(|session| session.worktree_path == worktree)
+                            {
+                                Err(format!(
+                                    "refusing cleanup because worktree {worktree} is owned by live session {}",
+                                    owner.id
+                                ))
+                            } else {
+                                executor
+                                    .cleanup_deleted_session(&DeletedSessionCleanup {
+                                        managed_worktree_root,
+                                        worktree: PathBuf::from(worktree),
+                                        repository: PathBuf::from(repository),
+                                        session_id: session_id.to_string(),
+                                        attachment_root: attachment_root.clone(),
+                                        attachment_paths: job
+                                            .attachment_paths
+                                            .iter()
+                                            .map(PathBuf::from)
+                                            .collect(),
+                                        ownership_lost: ownership_lost.clone(),
+                                    })
+                                    .await
+                            }
+                        }
+                        _ => Err("deleted-session cleanup job is missing artifact paths".into()),
+                    }
+                }
+            },
+        }
+    } else {
+        executor
+            .cleanup_attachment_files(
+                &attachment_root,
+                job.attachment_paths.iter().map(PathBuf::from).collect(),
+                ownership_lost.clone(),
+            )
+            .await
+    };
+    if result.is_ok() {
+        result = match store.renew_artifact_cleanup_claim(&claim) {
+            Ok(true) if !ownership_lost.is_cancelled() => Ok(()),
+            Ok(_) => {
+                ownership_lost.cancel();
+                Err("artifact cleanup claim is no longer owned".into())
+            }
+            Err(error) => {
+                ownership_lost.cancel();
+                Err(format!(
+                    "could not verify artifact cleanup claim before completion: {error:#}"
+                ))
+            }
+        };
+    }
+    heartbeat_cancel.cancel();
+    let _ = heartbeat.await;
+
+    match result {
+        Ok(()) => {
+            if let Err(error) = store.complete_claimed_artifact_cleanup_job(&claim) {
+                tracing::warn!(job_id = %job.id, %error, "failed to retire artifact cleanup job");
+            }
+            if index_hooks && let Some(repository) = repository_for_gc {
+                crate::tools::gc_index_store_in_background(PathBuf::from(repository));
+            }
+        }
+        Err(error) => {
+            if let Err(store_error) = store.fail_claimed_artifact_cleanup_job(&claim, &error) {
+                tracing::error!(
+                    job_id = %job.id,
+                    %error,
+                    %store_error,
+                    "artifact cleanup failed and its durable retry could not be updated"
+                );
+            } else {
+                tracing::warn!(job_id = %job.id, %error, "artifact cleanup deferred for retry");
+            }
+        }
+    }
+}
 
 /// Keep backend persistence efficient without making live SSE output feel
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
-const BACKEND_EVENT_BATCH_MAX: usize = 64;
-const BACKEND_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+const STREAM_EVENT_BATCH_MAX: usize = 64;
+const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Give an already-queued steer a deterministic turn even when a backend
+/// stream can produce output forever without yielding Pending.
+const MAX_BACKEND_EVENTS_BEFORE_STEER: usize = 32;
+
+/// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
+/// checkpoint is post-response bookkeeping, so briefly retry those transient
+/// conflicts instead of turning an otherwise successful model turn into a
+/// failure. The total delay is bounded below one second.
+const CHECKPOINT_SQLITE_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
 
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
@@ -41,6 +464,10 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Let every visible client retain its 30-second background cadence while
+/// collapsing slightly staggered requests into one upstream refresh. The
+/// five-second margin avoids stretching a single client's normal cadence.
+const GITHUB_DASHBOARD_REFRESH_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(25);
 // The title model independently bounds a cold sidecar start and decoding.
 // Leave a little handoff margin beyond those combined budgets so this outer
 // timeout does not silently replace a valid model request with heuristics.
@@ -50,6 +477,23 @@ const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duratio
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Codex collaborators inherit the root thread's MCP URL. Stable Codex sends
+/// its vendor thread id in the MCP request metadata, and app-server separately
+/// emits the matching `mcpToolCall` item id. Bound the rendezvous between those
+/// two independently scheduled transports.
+#[cfg(not(test))]
+const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Bounded recursive delegation. Depth counts spawn edges from the root
+/// conversation thread, so a value of four permits root → child → grandchild
+/// → great-grandchild → great-great-grandchild. The active-tree cap prevents
+/// breadth at several levels from multiplying without bound.
+const MAX_SUBAGENT_DEPTH: usize = 4;
+const MAX_CONCURRENT_CHILDREN: usize = 4;
+const MAX_ACTIVE_DESCENDANTS: usize = 16;
+
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
 const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
@@ -58,6 +502,16 @@ const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
 const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
 const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+
+fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
+    let id = session_id.strip_prefix("se_").unwrap_or(session_id);
+    let short_id = id.get(..6).unwrap_or(id);
+    if derive_from_session_title {
+        format!("trouve/{}-{short_id}", git::slugify(title))
+    } else {
+        format!("trouve/{short_id}")
+    }
+}
 
 fn positive_limit_from_env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -76,6 +530,529 @@ async fn flush_backend_event_batch(
         store
             .append_events_async(scope.clone(), std::mem::take(events))
             .await?;
+    }
+    Ok(())
+}
+
+struct BackendCollaboratorProjection {
+    thread: Thread,
+    mode: AgentMode,
+    turn: u64,
+    /// Whether the durable parent-rail link for this collaborator has been
+    /// published. Child activity can arrive before the provider's formal
+    /// collaborator announcement, so projection existence alone is not proof
+    /// that the parent has seen `SubagentSpawned`.
+    spawn_link_published: bool,
+    vendor_turn_id: Option<String>,
+    thinking_level: Option<String>,
+    last_user_message: Option<String>,
+    pending_prompt: Option<String>,
+    text: String,
+    segment: String,
+    usage: Usage,
+    tool_calls: HashMap<String, (String, serde_json::Value)>,
+    tool_started_at: HashMap<String, Instant>,
+    /// Codex emits a presentation wrapper around every MCP call in addition
+    /// to the canonical ToolExecutor lifecycle. Retain its ids only long
+    /// enough to suppress output/completion after ownership is correlated.
+    suppressed_bridge_calls: HashSet<String>,
+    /// Vendor-native mutations retain the session execution lane from
+    /// approval until the matching completion event.
+    mutation_permits: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
+    pending_approval: Option<PendingCollaboratorApproval>,
+    approval_cancels: HashMap<String, tokio_util::sync::CancellationToken>,
+    persisted: Vec<Event>,
+    terminal: bool,
+}
+
+struct PendingCollaboratorApproval {
+    thread: Thread,
+    turn: u64,
+    mode: AgentMode,
+    call_id: String,
+    tool: String,
+    args: serde_json::Value,
+    responder: tokio::sync::oneshot::Sender<bool>,
+}
+
+struct PendingCodexVendorOwner {
+    id: u64,
+    sender: tokio::sync::oneshot::Sender<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexCallValidationOutcome {
+    Matched,
+    Mismatched,
+}
+
+struct PendingCodexCallValidation {
+    id: u64,
+    vendor_thread_id: String,
+    sender: tokio::sync::oneshot::Sender<CodexCallValidationOutcome>,
+}
+
+#[derive(Default)]
+struct ActiveCodexBridgeRoot {
+    next_id: u64,
+    /// Active-turn vendor thread/session id -> durable trouve thread id.
+    vendor_threads: HashMap<String, String>,
+    pending_vendor_owners: HashMap<String, Vec<PendingCodexVendorOwner>>,
+    /// App-server wrapper item ids that arrived before their HTTP call.
+    wrapper_owners: HashMap<String, String>,
+    /// HTTP calls waiting for their app-server wrapper item.
+    pending_calls: HashMap<String, PendingCodexCallValidation>,
+    /// Successfully matched ids cannot authorize a second execution.
+    consumed_calls: HashSet<String>,
+    /// Timed-out/cancelled ids remain unusable for the rest of the root turn.
+    retired_calls: HashSet<String>,
+}
+
+#[derive(Default)]
+struct BridgedToolOwnerState {
+    roots: HashMap<String, ActiveCodexBridgeRoot>,
+}
+
+enum CodexVendorOwnerRegistration {
+    Immediate(String),
+    Pending {
+        id: u64,
+        receiver: tokio::sync::oneshot::Receiver<String>,
+    },
+    InactiveRoot,
+}
+
+enum CodexCallValidationRegistration {
+    Immediate,
+    Pending {
+        id: u64,
+        receiver: tokio::sync::oneshot::Receiver<CodexCallValidationOutcome>,
+    },
+    InactiveRoot,
+    UnknownOwner,
+    MismatchedOwner,
+    Replayed,
+}
+
+/// Authorizes Codex's inherited MCP requests with explicit vendor identity.
+/// Payload equality is deliberately absent: byte-identical calls from sibling
+/// collaborators must remain independently routable.
+#[derive(Default)]
+struct BridgedToolOwnerRouter {
+    state: Mutex<BridgedToolOwnerState>,
+}
+
+impl BridgedToolOwnerRouter {
+    fn begin_root(&self, root_thread_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .roots
+            .insert(root_thread_id.to_string(), ActiveCodexBridgeRoot::default());
+    }
+
+    fn bind_vendor_thread(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+    ) -> std::result::Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return Err(format!(
+                "Codex bridge root turn {root_thread_id} is no longer active"
+            ));
+        };
+        if let Some(existing) = root.vendor_threads.get(vendor_thread_id) {
+            if existing == owner_thread_id {
+                return Ok(());
+            }
+            return Err(format!(
+                "Codex vendor thread {vendor_thread_id} is already bound to {existing}, not {owner_thread_id}"
+            ));
+        }
+        root.vendor_threads
+            .insert(vendor_thread_id.to_string(), owner_thread_id.to_string());
+        if let Some(waiters) = root.pending_vendor_owners.remove(vendor_thread_id) {
+            for waiter in waiters {
+                let _ = waiter.sender.send(owner_thread_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn register_vendor_owner(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+    ) -> CodexVendorOwnerRegistration {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return CodexVendorOwnerRegistration::InactiveRoot;
+        };
+        if let Some(owner) = root.vendor_threads.get(vendor_thread_id) {
+            return CodexVendorOwnerRegistration::Immediate(owner.clone());
+        }
+        root.next_id = root.next_id.wrapping_add(1);
+        let id = root.next_id;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        root.pending_vendor_owners
+            .entry(vendor_thread_id.to_string())
+            .or_default()
+            .push(PendingCodexVendorOwner { id, sender });
+        CodexVendorOwnerRegistration::Pending { id, receiver }
+    }
+
+    fn abandon_vendor_owner(&self, root_thread_id: &str, vendor_thread_id: &str, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return;
+        };
+        if let Some(waiters) = root.pending_vendor_owners.get_mut(vendor_thread_id) {
+            waiters.retain(|waiter| waiter.id != id);
+            if waiters.is_empty() {
+                root.pending_vendor_owners.remove(vendor_thread_id);
+            }
+        }
+    }
+
+    fn register_call_validation(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+        call_id: &str,
+    ) -> CodexCallValidationRegistration {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return CodexCallValidationRegistration::InactiveRoot;
+        };
+        if root
+            .vendor_threads
+            .get(vendor_thread_id)
+            .map(String::as_str)
+            != Some(owner_thread_id)
+        {
+            return CodexCallValidationRegistration::UnknownOwner;
+        }
+        if root.consumed_calls.contains(call_id)
+            || root.retired_calls.contains(call_id)
+            || root.pending_calls.contains_key(call_id)
+        {
+            return CodexCallValidationRegistration::Replayed;
+        }
+        if let Some(wrapper_owner) = root.wrapper_owners.get(call_id) {
+            if wrapper_owner != vendor_thread_id {
+                return CodexCallValidationRegistration::MismatchedOwner;
+            }
+            root.wrapper_owners.remove(call_id);
+            root.consumed_calls.insert(call_id.to_string());
+            return CodexCallValidationRegistration::Immediate;
+        }
+        root.next_id = root.next_id.wrapping_add(1);
+        let id = root.next_id;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        root.pending_calls.insert(
+            call_id.to_string(),
+            PendingCodexCallValidation {
+                id,
+                vendor_thread_id: vendor_thread_id.to_string(),
+                sender,
+            },
+        );
+        CodexCallValidationRegistration::Pending { id, receiver }
+    }
+
+    fn announce_wrapper(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+        call_id: &str,
+    ) -> bool {
+        if call_id.is_empty() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return false;
+        };
+        if root
+            .vendor_threads
+            .get(vendor_thread_id)
+            .map(String::as_str)
+            != Some(owner_thread_id)
+        {
+            return false;
+        }
+        if root.consumed_calls.contains(call_id) || root.retired_calls.contains(call_id) {
+            return false;
+        }
+        if let Some(pending) = root.pending_calls.remove(call_id) {
+            if pending.vendor_thread_id == vendor_thread_id {
+                root.consumed_calls.insert(call_id.to_string());
+                let _ = pending.sender.send(CodexCallValidationOutcome::Matched);
+            } else {
+                let _ = pending.sender.send(CodexCallValidationOutcome::Mismatched);
+                root.wrapper_owners
+                    .insert(call_id.to_string(), vendor_thread_id.to_string());
+            }
+            return true;
+        }
+        match root.wrapper_owners.get(call_id) {
+            Some(existing) => existing == vendor_thread_id,
+            None => {
+                root.wrapper_owners
+                    .insert(call_id.to_string(), vendor_thread_id.to_string());
+                true
+            }
+        }
+    }
+
+    fn abandon_call_validation(&self, root_thread_id: &str, call_id: &str, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(root) = state.roots.get_mut(root_thread_id) else {
+            return;
+        };
+        if root
+            .pending_calls
+            .get(call_id)
+            .is_some_and(|pending| pending.id == id)
+        {
+            root.pending_calls.remove(call_id);
+            root.retired_calls.insert(call_id.to_string());
+        }
+    }
+
+    fn clear_root(&self, root_thread_id: &str) {
+        self.state.lock().unwrap().roots.remove(root_thread_id);
+    }
+}
+
+/// Return the canonical trouve tool nested in a Codex MCP presentation item.
+/// User-configured MCP servers retain their vendor wrapper; only the reserved
+/// first-party `trouve` server is projected through ToolExecutor instead.
+fn trouve_bridge_wrapper_call<'a>(
+    tool: &str,
+    args: &'a serde_json::Value,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    if tool != "mcpToolCall" {
+        return None;
+    }
+    let server = args
+        .get("server")
+        .or_else(|| args.get("serverName"))?
+        .as_str()?;
+    if server != "trouve" {
+        return None;
+    }
+    let nested_tool = args
+        .get("tool")
+        .or_else(|| args.get("toolName"))?
+        .as_str()?;
+    let arguments = args.get("arguments")?;
+    Some((nested_tool, arguments))
+}
+
+struct BackendApprovalOutcome {
+    owner_thread_id: Option<String>,
+    call_id: String,
+    responder: tokio::sync::oneshot::Sender<bool>,
+    approved: Result<bool>,
+    /// Held from approval until the vendor reports tool completion. This is
+    /// the fallback confinement mechanism for vendor protocols that cannot
+    /// replace their mutation tools with trouve's full MCP bridge.
+    mutation_permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+struct PendingApprovalCleanup {
+    approvals: Arc<ApprovalHub>,
+    store: Store,
+    scope: Scope,
+    thread_id: String,
+    call_id: String,
+    armed: bool,
+    requested_persisted: bool,
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .approvals
+            .resolve(&self.thread_id, &self.call_id, ApprovalDecision::Deny);
+        if !self.requested_persisted {
+            return;
+        }
+        if let Err(error) = self.store.append_event(
+            self.scope.clone(),
+            Event::ApprovalResolved {
+                call_id: self.call_id.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        ) {
+            tracing::error!(
+                call_id = %self.call_id,
+                %error,
+                "failed to persist approval denial during backend cleanup"
+            );
+        }
+    }
+}
+
+struct PendingQuestionCleanup {
+    questions: Arc<QuestionHub>,
+    store: Store,
+    scope: Scope,
+    thread_id: String,
+    request_id: String,
+    armed: bool,
+    requested_persisted: bool,
+}
+
+impl Drop for PendingQuestionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .questions
+            .resolve(&self.thread_id, &self.request_id, None);
+        if !self.requested_persisted {
+            return;
+        }
+        if let Err(error) = self.store.append_event(
+            self.scope.clone(),
+            Event::QuestionResolved {
+                request_id: self.request_id.clone(),
+                answers: None,
+            },
+        ) {
+            tracing::error!(
+                request_id = %self.request_id,
+                %error,
+                "failed to persist skipped question during cleanup"
+            );
+        }
+    }
+}
+
+async fn deny_pending_backend_approvals(
+    pending: &mut futures::stream::FuturesUnordered<
+        futures::future::BoxFuture<'static, BackendApprovalOutcome>,
+    >,
+    root_cancels: &mut HashMap<String, tokio_util::sync::CancellationToken>,
+    collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+) {
+    for cancel in root_cancels.drain().map(|(_, cancel)| cancel) {
+        cancel.cancel();
+    }
+    for collaborator in collaborators.values_mut() {
+        for cancel in collaborator
+            .approval_cancels
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.cancel();
+        }
+    }
+    while let Some(outcome) = pending.next().await {
+        let _ = outcome.responder.send(false);
+        // Dropping the outcome releases any mutation permit acquired before
+        // cancellation won the cleanup race.
+    }
+}
+
+enum BackendLoopInput {
+    Event(Option<Result<BackendEvent, BackendError>>),
+    Approval(BackendApprovalOutcome),
+}
+
+/// Native collaborators are real, navigable threads while the vendor owns
+/// their current turn. Claiming them in the normal dispatcher registry makes
+/// messages queue instead of racing a second turn against the same vendor
+/// session. The parent dispatcher remains active for this guard's lifetime,
+/// so adding/removing child claims cannot change session activity by itself.
+struct BackendCollaboratorClaims<'a> {
+    active_threads: &'a Mutex<HashMap<String, String>>,
+    claimed: HashSet<String>,
+}
+
+impl<'a> BackendCollaboratorClaims<'a> {
+    fn new(active_threads: &'a Mutex<HashMap<String, String>>) -> Self {
+        Self {
+            active_threads,
+            claimed: HashSet::new(),
+        }
+    }
+
+    /// Claim an existing collaborator only when no independent dispatcher
+    /// already owns it. Never overwrite another claim: doing so would let our
+    /// later release erase a live replacement turn.
+    fn claim(&mut self, thread_id: &str, session_id: &str) -> bool {
+        if self.claimed.contains(thread_id) {
+            return true;
+        }
+        let mut active = self.active_threads.lock().unwrap();
+        if active.contains_key(thread_id) {
+            return false;
+        }
+        active.insert(thread_id.to_string(), session_id.to_string());
+        self.claimed.insert(thread_id.to_string());
+        true
+    }
+
+    /// Create and claim a new collaborator while holding the same registry
+    /// lock used by prompt dispatch. `ThreadCreated` may be published inside
+    /// `create`, but clients cannot claim the visible thread until this method
+    /// has installed the provider's ownership entry.
+    fn create_claimed_thread(
+        &mut self,
+        session_id: &str,
+        create: impl FnOnce() -> Result<Thread, EngineError>,
+    ) -> Result<Thread, EngineError> {
+        let mut active = self.active_threads.lock().unwrap();
+        let thread = create()?;
+        if active.contains_key(&thread.id) {
+            return Err(EngineError::Conflict(format!(
+                "thread {} became active while its collaborator was being created",
+                thread.id
+            )));
+        }
+        active.insert(thread.id.clone(), session_id.to_string());
+        self.claimed.insert(thread.id.clone());
+        Ok(thread)
+    }
+
+    fn release(&mut self, thread_id: &str) {
+        if self.claimed.remove(thread_id) {
+            self.active_threads.lock().unwrap().remove(thread_id);
+        }
+    }
+}
+
+impl Drop for BackendCollaboratorClaims<'_> {
+    fn drop(&mut self) {
+        let mut active = self.active_threads.lock().unwrap();
+        for thread_id in self.claimed.drain() {
+            active.remove(&thread_id);
+        }
+    }
+}
+
+async fn flush_backend_collaborator_batches(
+    store: &Store,
+    collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+) -> Result<()> {
+    for collaborator in collaborators.values_mut() {
+        flush_backend_event_batch(
+            store,
+            &Scope::Thread(collaborator.thread.id.clone()),
+            &mut collaborator.persisted,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -151,7 +1128,12 @@ impl TurnScheduler {
             .clone()
     }
 
-    async fn acquire(&self, model: &str, background: bool) -> Result<TurnCapacityGuard> {
+    async fn acquire(
+        &self,
+        model: &str,
+        background: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<TurnCapacityGuard> {
         let started = Instant::now();
         let provider = self.provider(model);
         let cooldown = provider
@@ -161,41 +1143,43 @@ impl TurnScheduler {
             .until
             .and_then(|until| until.checked_duration_since(Instant::now()));
         if let Some(cooldown) = cooldown {
-            tokio::time::sleep(cooldown).await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                _ = tokio::time::sleep(cooldown) => {}
+            }
         }
         let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
         if background {
-            permits.push(
-                self.background
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("background turn scheduler closed"))?,
-            );
-            permits.push(
-                provider
-                    .background
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("provider background scheduler closed"))?,
-            );
+            permits.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                permit = self.background.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("background turn scheduler closed"))?
+                }
+            });
+            permits.push(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                permit = provider.background.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
+                }
+            });
         }
-        permits.push(
-            self.all
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("turn scheduler closed"))?,
-        );
-        permits.push(
-            provider
-                .all
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("provider turn scheduler closed"))?,
-        );
+        permits.push(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = self.all.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("turn scheduler closed"))?
+            }
+        });
+        permits.push(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = provider.all.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
+            }
+        });
         Ok(TurnCapacityGuard {
             _permits: permits,
             wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -244,6 +1228,14 @@ pub enum EngineError {
     SessionDiffTooLarge(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+fn session_diff_executor_error(error: String) -> EngineError {
+    if error.contains("too large to render") {
+        EngineError::SessionDiffTooLarge(error)
+    } else {
+        EngineError::Internal(anyhow!(error))
+    }
 }
 
 const THINKING_OPTION_KEYS: [&str; 4] =
@@ -374,15 +1366,298 @@ fn normalize_thinking_option(
     }
 }
 
+fn thinking_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(if *value { "on" } else { "off" }.into()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Return the effective thinking selection that will be handed to the
+/// provider. Explicit normalized options win; otherwise the advertised model
+/// default describes the behavior obtained by omitting the option.
+fn resolved_thinking_level(
+    options: &serde_json::Map<String, serde_json::Value>,
+    model: Option<&trouve_protocol::ModelInfo>,
+) -> Option<String> {
+    THINKING_OPTION_KEYS
+        .iter()
+        .find_map(|key| options.get(*key).and_then(thinking_value))
+        .or_else(|| {
+            options
+                .get("thinking_budget_tokens")
+                .and_then(thinking_value)
+        })
+        .or_else(|| {
+            model
+                .and_then(thinking_option_property)
+                .and_then(|(_, property, _)| property.get("default"))
+                .and_then(thinking_value)
+        })
+        .or_else(|| {
+            model
+                .and_then(|model| {
+                    model
+                        .options_schema
+                        .pointer("/properties/thinking_budget_tokens/default")
+                })
+                .and_then(thinking_value)
+        })
+}
+
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
+
+const GITHUB_PR_DETAIL_CACHE_CAPACITY: usize = 48;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GithubPrDetailKey {
+    host: String,
+    repository: String,
+    number: u64,
+    head_sha: String,
+}
+
+impl GithubPrDetailKey {
+    fn from_info(info: &trouve_protocol::PrInfo) -> Self {
+        Self {
+            host: info.host.to_ascii_lowercase(),
+            repository: info.repository.to_ascii_lowercase(),
+            number: info.number,
+            head_sha: info
+                .head_sha
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedGithubPrDetail {
+    detail: trouve_protocol::PrDetail,
+    sections: HashSet<trouve_protocol::PrDetailSection>,
+    last_access: u64,
+}
+
+#[derive(Default)]
+struct GithubPrDetailCache {
+    entries: HashMap<GithubPrDetailKey, CachedGithubPrDetail>,
+    access_counter: u64,
+}
+
+impl GithubPrDetailCache {
+    fn invalidate_pr(&mut self, info: &trouve_protocol::PrInfo) {
+        let host = info.host.to_ascii_lowercase();
+        let repository = info.repository.to_ascii_lowercase();
+        self.entries.retain(|key, _| {
+            key.host != host || key.repository != repository || key.number != info.number
+        });
+    }
+
+    fn get(
+        &mut self,
+        key: &GithubPrDetailKey,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) -> Option<trouve_protocol::PrDetail> {
+        let entry = self.entries.get_mut(key)?;
+        if !sections.is_subset(&entry.sections) {
+            return None;
+        }
+        self.access_counter = self.access_counter.wrapping_add(1);
+        entry.last_access = self.access_counter;
+        Some(entry.detail.clone())
+    }
+
+    fn loaded_sections(
+        &self,
+        key: &GithubPrDetailKey,
+    ) -> HashSet<trouve_protocol::PrDetailSection> {
+        self.entries
+            .get(key)
+            .map(|entry| entry.sections.clone())
+            .unwrap_or_default()
+    }
+
+    fn detail(&self, key: &GithubPrDetailKey) -> Option<trouve_protocol::PrDetail> {
+        self.entries.get(key).map(|entry| entry.detail.clone())
+    }
+
+    fn mark_stale(
+        &mut self,
+        key: &GithubPrDetailKey,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.sections.retain(|section| !sections.contains(section));
+        }
+    }
+
+    fn merge(
+        &mut self,
+        requested_key: &GithubPrDetailKey,
+        mut detail: trouve_protocol::PrDetail,
+        mut sections: HashSet<trouve_protocol::PrDetailSection>,
+    ) -> trouve_protocol::PrDetail {
+        let overview_fetched = sections.contains(&trouve_protocol::PrDetailSection::Overview);
+        sections.insert(trouve_protocol::PrDetailSection::Overview);
+        let actual_key = GithubPrDetailKey::from_info(&detail.info);
+        let same_head = actual_key == *requested_key;
+        if same_head && let Some(previous) = self.entries.remove(requested_key) {
+            if !sections.contains(&trouve_protocol::PrDetailSection::Conversation) {
+                detail.comments = previous.detail.comments;
+                detail.review_threads = previous.detail.review_threads;
+                detail.reviews = previous.detail.reviews;
+            }
+            if !sections.contains(&trouve_protocol::PrDetailSection::Commits) {
+                detail.commits = previous.detail.commits;
+                detail.commit_count = previous.detail.commit_count;
+            }
+            if !sections.contains(&trouve_protocol::PrDetailSection::Files) {
+                detail.files = previous.detail.files;
+            }
+            if !overview_fetched {
+                detail.stack = previous.detail.stack;
+            }
+            sections.extend(previous.sections);
+        } else {
+            self.entries.remove(requested_key);
+        }
+        self.access_counter = self.access_counter.wrapping_add(1);
+        self.entries.insert(
+            actual_key,
+            CachedGithubPrDetail {
+                detail: detail.clone(),
+                sections,
+                last_access: self.access_counter,
+            },
+        );
+        while self.entries.len() > GITHUB_PR_DETAIL_CACHE_CAPACITY {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        detail
+    }
+}
+
+struct SteerTurnCommand {
+    content: String,
+    attachments: Vec<trouve_protocol::Attachment>,
+    attachment_rows: Vec<(trouve_protocol::Attachment, String)>,
+    attachment_cleanup: PreparedAttachmentCleanup,
+    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurnSteerer {
+    turn: u64,
+    sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+}
+
+/// Remove only the registration installed by this backend turn. A cancelled
+/// dispatcher can overlap the next turn's startup while its future unwinds.
+struct ActiveTurnSteererGuard<'a> {
+    registry: &'a Mutex<HashMap<String, ActiveTurnSteerer>>,
+    thread_id: String,
+    turn: u64,
+}
+
+async fn receive_steer_command(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    pending: &mut Option<SteerTurnCommand>,
+    backend_session_ready: bool,
+) -> Option<SteerTurnCommand> {
+    if !backend_session_ready {
+        return std::future::pending().await;
+    }
+    if pending.is_some() {
+        return pending.take();
+    }
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn reserve_ready_steer_after_event_budget<T>(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    pending: &mut Option<T>,
+    consecutive_events: &mut usize,
+) -> bool {
+    if pending.is_some() {
+        return true;
+    }
+    if *consecutive_events < MAX_BACKEND_EVENTS_BEFORE_STEER {
+        return false;
+    }
+    *consecutive_events = 0;
+    let Some(active_receiver) = receiver.as_mut() else {
+        return false;
+    };
+    match active_receiver.try_recv() {
+        Ok(command) => {
+            *pending = Some(command);
+            true
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            *receiver = None;
+            false
+        }
+    }
+}
+
+impl Drop for ActiveTurnSteererGuard<'_> {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap();
+        if registry
+            .get(&self.thread_id)
+            .is_some_and(|active| active.turn == self.turn)
+        {
+            registry.remove(&self.thread_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeTicketClaims {
+    pub bridge_tools: bool,
+    pub serve_approval: bool,
+    pub correlate_codex_owner: bool,
+}
+
+struct ActiveBridgeTicket {
+    root_thread_id: String,
+    claims: BridgeTicketClaims,
+}
+
+struct DeletingSessionMarker<'a> {
+    sessions: &'a Mutex<std::collections::HashSet<String>>,
+    session_id: String,
+}
+
+impl Drop for DeletingSessionMarker<'_> {
+    fn drop(&mut self) {
+        self.sessions.lock().unwrap().remove(&self.session_id);
+    }
+}
 
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     config_dir: Option<PathBuf>,
-    /// Canonical provider/model metadata and option-schema catalog shared by
-    /// API providers and CLI backends. Live sources contribute availability.
+    /// Canonical provider/model rosters, metadata, and option-schema catalog
+    /// shared by API providers and CLI backends. Explicit integrations may
+    /// still contribute models the catalog cannot represent (notably Cursor).
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved
@@ -403,6 +1678,15 @@ pub struct Engine {
     /// write guard. This lets review/plan work fan out without weakening the
     /// sessions-own-worktrees serialization invariant.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// Narrower execution lanes for tools operating on a session worktree.
+    /// Read-only tools may overlap; every potential mutation is exclusive.
+    /// Weak entries keep completed/deleted sessions from growing this map.
+    tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// Per-root delegation lanes. Providers may request multiple spawn tools
+    /// in one parallel batch; serializing only the admission/create window
+    /// for one tree makes the depth and active-descendant caps atomic without
+    /// blocking unrelated subagent trees.
+    subagent_tree_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Threads with a dispatcher currently running turns, mapped to their
     /// session. A thread in this map drains its own prompt queue; sends
     /// while present just enqueue. The session ids feed `Session.active`
@@ -411,6 +1695,10 @@ pub struct Engine {
     /// Orders active-thread transitions with their persisted session activity
     /// events without holding `active_threads` across durable event appends.
     session_activity_publication: Mutex<()>,
+    /// Serializes relational prompt-queue mutations with the full queue
+    /// snapshots published on the durable thread stream. Lock ordering is
+    /// activity publication -> prompt_queue_mutations -> active_threads.
+    prompt_queue_mutations: Mutex<()>,
     /// Sessions currently being deleted. Dispatch checks this while holding
     /// `active_threads`, making "no active turns" and "no new turns" one
     /// atomic state transition before destructive cleanup begins.
@@ -419,6 +1707,10 @@ pub struct Engine {
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Capability-aware channels into backend loops that can accept
+    /// additional user input during an active turn. The turn number protects
+    /// cleanup from removing a newer registration for the same thread.
+    turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -427,6 +1719,10 @@ pub struct Engine {
     /// management and identity validation; each host has its own async lock so
     /// network refreshes do not block host removal or unrelated hosts.
     github_dashboard_caches: Mutex<HashMap<String, GithubDashboardCacheHandle>>,
+    /// Selected-PR page state, bounded and keyed by immutable head SHA. Tabs
+    /// add sections to an entry on demand instead of repeating GitHub's rich
+    /// nested detail query on every render or pane switch.
+    github_pr_detail_cache: Mutex<GithubPrDetailCache>,
     /// Orders authenticated-host capture, cache registration, and snapshot
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
@@ -479,6 +1775,15 @@ pub struct Engine {
     base_url: RwLock<Option<String>>,
     /// Ephemeral credential appended only to internal MCP bridge URLs.
     bridge_token: RwLock<Option<String>>,
+    /// Per-thread capabilities layered over the process-wide bridge
+    /// credential. Query flags and URL paths are never authorities by
+    /// themselves; the opaque ticket binds their exact claims. Tickets remain
+    /// stable across resumed vendor turns because Codex retains its MCP
+    /// client, but validation also requires the owning thread to be active.
+    bridge_tickets: Mutex<HashMap<String, ActiveBridgeTicket>>,
+    /// Routes Codex MCP calls from the inherited root URL to the root or
+    /// collaborator thread identified by app-server's item lifecycle.
+    bridged_tool_owners: BridgedToolOwnerRouter,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
     /// embedding model; the server enables it (`with_index_hooks`).
@@ -487,7 +1792,7 @@ pub struct Engine {
     /// runtime connections and settings health probes land in one place.
     mcp_logs: crate::mcp::McpLogStore,
     /// Interactive shells (one per session) for the client terminal panel.
-    terminals: crate::terminal::TerminalManager,
+    terminals: Arc<crate::terminal::TerminalManager>,
     /// Whether the server can reach the internet. Defaults to true; only a
     /// configured probe (`with_connectivity_probe`) or `set_online` ever
     /// flips it, so probe-less engines (tests, embedders) never go offline.
@@ -731,6 +2036,10 @@ fn build_all_backends(
 
 impl Engine {
     pub fn new(store: Store, data_dir: PathBuf, config: &Config) -> Self {
+        // Desktop launchers commonly inherit a reduced PATH. Capture the
+        // user's login-shell PATH during server startup so the first provider
+        // or MCP launch never pays shell initialization latency.
+        let _ = trouve_agents::process_env::effective_path();
         let secrets: Arc<dyn trouve_providers::secrets::SecretStore> =
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
         let model_catalog =
@@ -750,6 +2059,9 @@ impl Engine {
             data_dir.clone(),
             config.title_model_load_behavior.unwrap_or_default(),
             config.title_model_resource_policy.unwrap_or_default(),
+            config
+                .derive_branch_name_from_session_title
+                .unwrap_or(false),
             &local_manager,
             store.clone(),
         ));
@@ -778,12 +2090,17 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
+            tool_execution_locks: Mutex::new(HashMap::new()),
+            subagent_tree_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
+            prompt_queue_mutations: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
+            turn_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
+            github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
@@ -818,9 +2135,11 @@ impl Engine {
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             bridge_token: RwLock::new(None),
+            bridge_tickets: Mutex::new(HashMap::new()),
+            bridged_tool_owners: BridgedToolOwnerRouter::default(),
             index_hooks: false,
             mcp_logs,
-            terminals: crate::terminal::TerminalManager::default(),
+            terminals: Arc::new(crate::terminal::TerminalManager::default()),
             online: std::sync::atomic::AtomicBool::new(true),
             connectivity_probe: None,
         }
@@ -832,6 +2151,139 @@ impl Engine {
     pub fn with_index_hooks(mut self) -> Self {
         self.index_hooks = true;
         self
+    }
+
+    /// Remove immutable checkpoint refs that have no durable row. Server
+    /// startup calls this before accepting requests so a crash between Git
+    /// anchoring and SQLite commit cannot leak objects indefinitely.
+    pub async fn reconcile_checkpoint_refs(&self) {
+        let sessions = match self.store.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "failed to list sessions for checkpoint reconciliation");
+                return;
+            }
+        };
+        for session in sessions {
+            let live = match self.store.checkpoint_ids(&session.id) {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %error,
+                        "failed to load durable checkpoints for reconciliation"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .executor
+                .reconcile_checkpoint_worktree_refs(
+                    Path::new(&session.worktree_path),
+                    &session.id,
+                    &live,
+                )
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session.id,
+                    %error,
+                    "failed to reconcile checkpoint refs at startup"
+                );
+            }
+        }
+    }
+
+    /// Retry every durable artifact-deletion intent before the server starts
+    /// accepting requests. Cleanup operations are idempotent, so a crash
+    /// after filesystem success but before row retirement is harmless.
+    pub async fn retry_artifact_cleanup_jobs(&self) {
+        loop {
+            let job = match self.store.claim_next_artifact_cleanup_job() {
+                Ok(Some(job)) => job,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to claim durable artifact cleanup job");
+                    break;
+                }
+            };
+            execute_artifact_cleanup_job(
+                self.store.clone(),
+                self.executor.clone(),
+                self.data_dir.join("attachments"),
+                self.data_dir.join("worktrees"),
+                job,
+                self.index_hooks,
+            )
+            .await;
+        }
+    }
+
+    /// Keep retrying failed cleanup intents while the process remains alive.
+    /// Atomic store claims prevent this worker from overlapping immediate
+    /// cleanup or another server instance sharing the database.
+    pub fn start_artifact_cleanup_worker(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                engine.retry_artifact_cleanup_jobs().await;
+            }
+        });
+    }
+
+    fn schedule_artifact_cleanup(&self, job: ArtifactCleanupJob) {
+        let store = self.store.clone();
+        let executor = self.executor.clone();
+        let attachment_root = self.data_dir.join("attachments");
+        let managed_worktree_root = self.data_dir.join("worktrees");
+        let index_hooks = self.index_hooks;
+        let cleanup = async move {
+            match store.claim_artifact_cleanup_job(&job.id) {
+                Ok(Some(job)) => {
+                    execute_artifact_cleanup_job(
+                        store,
+                        executor,
+                        attachment_root,
+                        managed_worktree_root,
+                        job,
+                        index_hooks,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "failed to claim immediate artifact cleanup"
+                ),
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(cleanup);
+            }
+            Err(no_runtime) => {
+                // Core's synchronous APIs are also exercised by embedders and
+                // tests outside Tokio. Complete the immediate best-effort
+                // cleanup there instead of panicking; the durable job remains
+                // available to the startup worker if runtime construction
+                // itself fails.
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(cleanup),
+                    Err(error) => tracing::warn!(
+                        %no_runtime,
+                        %error,
+                        "could not start a runtime for immediate artifact cleanup"
+                    ),
+                }
+            }
+        }
     }
 
     /// Enable internet-reachability monitoring with the given probe (the
@@ -912,8 +2364,8 @@ impl Engine {
         });
     }
 
-    /// Record the server's reachable base URL (enables the MCP tool bridge
-    /// for backends configured with `tool_bridge = true`).
+    /// Record the server's reachable base URL (enables the default MCP tool
+    /// bridge for supported vendor backends).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
     }
@@ -923,6 +2375,63 @@ impl Engine {
     /// backwards-compatible.
     pub fn set_bridge_token(&self, token: Option<String>) {
         *self.bridge_token.write().unwrap() = token;
+    }
+
+    /// Validate one engine-issued MCP bridge capability. The process-wide
+    /// bridge token authenticates the caller to the internal route; this
+    /// active-turn ticket additionally binds the durable root path and exact
+    /// tool/approval surface so query-string tampering cannot widen it.
+    pub fn validate_bridge_ticket(
+        &self,
+        ticket: &str,
+        root_thread_id: &str,
+        bridge_tools: bool,
+        serve_approval: bool,
+    ) -> Option<BridgeTicketClaims> {
+        if !self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .contains_key(root_thread_id)
+        {
+            return None;
+        }
+        let tickets = self.bridge_tickets.lock().unwrap();
+        let ticket = tickets.get(ticket)?;
+        (ticket.root_thread_id == root_thread_id
+            && ticket.claims.bridge_tools == bridge_tools
+            && ticket.claims.serve_approval == serve_approval)
+            .then_some(ticket.claims)
+    }
+
+    fn bridge_ticket_for(&self, root_thread_id: &str, claims: BridgeTicketClaims) -> String {
+        let mut tickets = self.bridge_tickets.lock().unwrap();
+        if let Some(ticket) = tickets.iter().find_map(|(ticket, active)| {
+            (active.root_thread_id == root_thread_id && active.claims == claims)
+                .then(|| ticket.clone())
+        }) {
+            return ticket;
+        }
+
+        // A thread can change provider or bridge policy between turns. Never
+        // leave its previous capability surface reusable when that happens.
+        tickets.retain(|_, ticket| ticket.root_thread_id != root_thread_id);
+        let ticket = new_id("bridge");
+        tickets.insert(
+            ticket.clone(),
+            ActiveBridgeTicket {
+                root_thread_id: root_thread_id.to_string(),
+                claims,
+            },
+        );
+        ticket
+    }
+
+    fn revoke_bridge_tickets(&self, root_thread_id: &str) {
+        self.bridge_tickets
+            .lock()
+            .unwrap()
+            .retain(|_, ticket| ticket.root_thread_id != root_thread_id);
     }
 
     /// Swap the tool executor (cloud isolation hook, ADR 0004).
@@ -994,22 +2503,61 @@ impl Engine {
         ids
     }
 
-    /// All models available right now. Catalog-covered providers and backends
-    /// use live account-visible ids over canonical models.dev metadata;
-    /// uncatalogued custom, Cursor-only, and local models come from explicit
-    /// adapters. Backends without credentials are skipped entirely — their
-    /// models cannot run, so listing them only clutters the picker.
+    /// Instant model snapshot for first paint. Catalog-covered providers and
+    /// backends use their offline-safe static rosters, while explicit adapters
+    /// may expose a cached live result. Backends without credentials are
+    /// skipped entirely — their models cannot run, so listing them only
+    /// clutters the picker.
     ///
     /// While the server is offline, only models that can actually run are
     /// listed: the built-in local provider and loopback endpoints (Ollama
     /// etc.). Remote providers and vendor backends are dropped instead of
-    /// degrading to static/fallback catalogs of models every turn would
-    /// fail on; clients gate prompt entry on this list being non-empty.
+    /// degrading to static/fallback catalogs of models every turn would fail
+    /// on. Live account and vendor-CLI availability is resolved separately by
+    /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let online = self.is_online();
-        // A model-list request is an explicit synchronization point. Refresh
-        // here rather than mutating UI-visible metadata silently from the
-        // background connectivity poll.
+        let offline_capable = if online {
+            std::collections::HashSet::new()
+        } else {
+            self.offline_capable_provider_ids()
+        };
+        let providers: Vec<_> = self
+            .providers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
+            .map(|(_, p)| p.clone())
+            .collect();
+        let mut models: Vec<_> = providers
+            .iter()
+            .flat_map(|provider| provider.models())
+            .collect();
+        let ready: Vec<_> = if online {
+            self.backends
+                .read()
+                .unwrap()
+                .values()
+                .filter(|b| {
+                    let status = b.status();
+                    status.installed && status.has_credentials
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new() // vendor backends all need their cloud
+        };
+        models.extend(ready.iter().flat_map(|backend| backend.models()));
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
+
+    /// Resolve live account-visible and vendor-CLI model availability. Clients
+    /// call this after painting list_models, then replace the static snapshot
+    /// when this richer result arrives.
+    pub async fn refresh_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let online = self.is_online();
         if online
             && self.connectivity_probe.is_some()
             && let Err(error) = self.model_catalog.refresh_if_stale().await
@@ -1027,24 +2575,25 @@ impl Engine {
             .unwrap()
             .iter()
             .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(_, p)| p.clone())
+            .map(|(_, provider)| provider.clone())
             .collect();
         let provider_lists =
-            futures::future::join_all(providers.iter().map(|p| p.list_models())).await;
+            futures::future::join_all(providers.iter().map(|provider| provider.list_models()))
+                .await;
         let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
         let ready: Vec<_> = if online {
             self.backends
                 .read()
                 .unwrap()
                 .values()
-                .filter(|b| {
-                    let status = b.status();
+                .filter(|backend| {
+                    let status = backend.status();
                     status.installed && status.has_credentials
                 })
                 .cloned()
                 .collect()
         } else {
-            Vec::new() // vendor backends all need their cloud
+            Vec::new()
         };
         let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
         models.extend(listings.into_iter().flatten());
@@ -1790,6 +3339,7 @@ impl Engine {
             workspace_id: req.workspace_id,
             mode: req.mode,
             model: req.model,
+            thinking_level: req.thinking_level,
             permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
@@ -1818,6 +3368,7 @@ impl Engine {
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
+        automation.thinking_level = req.thinking_level;
         automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
@@ -1847,6 +3398,15 @@ impl Engine {
         }
         if req.prompt.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a prompt".into()));
+        }
+        if req
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| level.trim().is_empty())
+        {
+            return Err(EngineError::BadRequest(
+                "automation thinking_level must not be empty".into(),
+            ));
         }
         if self.store.open_workspace(&req.workspace_id)?.is_none() {
             return Err(EngineError::NotFound(format!(
@@ -1961,7 +3521,7 @@ impl Engine {
                         .monitor_automation_turn(
                             automation_id,
                             automation_name,
-                            session_id,
+                            session_id.clone(),
                             thread_id,
                             turn,
                         )
@@ -2007,11 +3567,19 @@ impl Engine {
                 fetch_latest: true,
             })
             .await?;
+        let mut model_options = serde_json::Map::new();
+        if let Some(thinking_level) = automation.thinking_level.as_ref() {
+            model_options.insert(
+                "thinking_level".into(),
+                serde_json::Value::String(thinking_level.clone()),
+            );
+        }
         let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
             session_id: session.id.clone(),
+            title: Some(automation.name.clone()),
             mode: automation.mode.clone(),
             model: automation.model.clone(),
-            model_options: Default::default(),
+            model_options,
             // Scoped to this fresh run session; it does not change global
             // mode defaults or carry approvals into future runs.
             permission_mode: Some(automation.permission_mode),
@@ -2647,6 +4215,7 @@ impl Engine {
         &self,
         behavior: trouve_protocol::TitleModelLoadBehavior,
         resources: trouve_protocol::TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: Option<bool>,
     ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
         if resources == trouve_protocol::TitleModelResourcePolicy::GpuOnly
             && self.hardware().await.gpus.is_empty()
@@ -2656,14 +4225,18 @@ impl Engine {
             ));
         }
         let _transition = self.title_model_behavior_transition.lock().await;
+        let derive_branch_name_from_session_title = derive_branch_name_from_session_title
+            .unwrap_or_else(|| self.title_model.derive_branch_name_from_session_title());
         {
             let mut config = self.config.lock().unwrap();
             config.title_model_load_behavior = Some(behavior);
             config.title_model_resource_policy = Some(resources);
+            config.derive_branch_name_from_session_title =
+                Some(derive_branch_name_from_session_title);
             self.persist_config(&config);
         }
         self.title_model
-            .set_configuration(behavior, resources)
+            .set_configuration(behavior, resources, derive_branch_name_from_session_title)
             .await;
         Ok(self.git_worktree_settings())
     }
@@ -2744,6 +4317,28 @@ impl Engine {
                     source: "heuristic".into(),
                 }
             }
+        }
+    }
+
+    async fn generate_subagent_title(
+        &self,
+        supplied_name: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Option<String> {
+        let name = match supplied_name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => name.to_string(),
+            None => {
+                let prompt = prompt.map(str::trim).filter(|prompt| !prompt.is_empty())?;
+                self.generate_session_title(prompt).await.title
+            }
+        };
+        let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else if normalized.starts_with("Subagent:") {
+            Some(normalized)
+        } else {
+            Some(format!("Subagent: {normalized}"))
         }
     }
 
@@ -3011,6 +4606,23 @@ impl Engine {
             .collect())
     }
 
+    /// Browser URLs already linked through persisted session events. Unlike
+    /// `session_prs`, this never contacts GitHub and is therefore safe to fold
+    /// for every session during client bootstrap.
+    fn recorded_session_pr_urls(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
+        Ok(self
+            .store
+            .events_after(&Scope::Session(session_id.to_string()), 0)?
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::SessionPrOpened { url, .. } => {
+                    Some(url.trim_end_matches('/').to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Provider-neutral evidence tying GitHub activity to this session.
     /// Explicit PR references work for any integration; successful tool args
     /// and produced commit IDs preserve enough identity to discover a PR that
@@ -3120,6 +4732,360 @@ impl Engine {
         Ok(prs)
     }
 
+    /// Session-to-PR authorization from the newest persisted account
+    /// snapshots. Unlike discovery (`session_prs`), this never contacts
+    /// GitHub; the shell's 30-second account refresh keeps the projection
+    /// current in the background.
+    fn projected_session_prs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
+        let session = self.get_session(session_id)?;
+        let linked_urls = self.recorded_session_pr_urls(session_id)?;
+        let mut seen = HashSet::new();
+        let mut prs = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
+                continue;
+            };
+            prs.extend(snapshot.prs.into_iter().filter(|pr| {
+                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
+                    && seen.insert((
+                        pr.host.to_ascii_lowercase(),
+                        pr.repository.to_ascii_lowercase(),
+                        pr.number,
+                    ))
+            }));
+        }
+        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        Ok(prs)
+    }
+
+    fn projected_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+    ) -> Result<(Session, trouve_protocol::PrInfo), EngineError> {
+        let session = self.get_session(session_id)?;
+        let pr = self
+            .projected_session_prs(session_id)?
+            .into_iter()
+            .find(|pr| pr.number == number)
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "pull request #{number} is not associated with session {session_id}"
+                ))
+            })?;
+        Ok((session, pr))
+    }
+
+    async fn cached_session_pr_detail(
+        &self,
+        session: &Session,
+        pr: &trouve_protocol::PrInfo,
+        sections: &HashSet<trouve_protocol::PrDetailSection>,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        let key = GithubPrDetailKey::from_info(pr);
+        if let Some(detail) = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .get(&key, sections)
+        {
+            return Ok(detail);
+        }
+        let loaded = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .loaded_sections(&key);
+        let existing = self.github_pr_detail_cache.lock().unwrap().detail(&key);
+        let mut missing = sections
+            .difference(&loaded)
+            .copied()
+            .collect::<HashSet<_>>();
+        if loaded.is_empty() {
+            missing.insert(trouve_protocol::PrDetailSection::Overview);
+        }
+        let mut detail = self
+            .github_for_session(session)?
+            .pr_detail(pr.number, &missing, existing)
+            .await
+            .map_err(EngineError::Internal)?;
+        detail.info.workspace_id = pr.workspace_id.clone();
+        detail.info.trouve_review = pr.trouve_review.clone();
+        Ok(self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .merge(&key, detail, missing))
+    }
+
+    /// Full GitHub collaboration state for one pull request already
+    /// associated with this session. The association check prevents a
+    /// session-scoped route from becoming a repository-wide PR browser.
+    pub async fn session_pr_detail(
+        &self,
+        session_id: &str,
+        number: u64,
+        section: Option<trouve_protocol::PrDetailSection>,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let sections = section.map_or_else(
+            || {
+                HashSet::from([
+                    trouve_protocol::PrDetailSection::Overview,
+                    trouve_protocol::PrDetailSection::Conversation,
+                    trouve_protocol::PrDetailSection::Commits,
+                    trouve_protocol::PrDetailSection::Files,
+                ])
+            },
+            |section| HashSet::from([trouve_protocol::PrDetailSection::Overview, section]),
+        );
+        self.cached_session_pr_detail(&session, &pr, &sections)
+            .await
+    }
+
+    /// Bounded before/after content for one changed file in an associated
+    /// session PR. The GitHub layer independently verifies that `path` belongs
+    /// to the selected pull request before resolving either immutable blob.
+    pub async fn session_pr_file_diff(
+        &self,
+        session_id: &str,
+        number: u64,
+        path: &str,
+    ) -> Result<trouve_protocol::PrFileDiff, EngineError> {
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let detail = self
+            .cached_session_pr_detail(
+                &session,
+                &pr,
+                &HashSet::from([
+                    trouve_protocol::PrDetailSection::Overview,
+                    trouve_protocol::PrDetailSection::Files,
+                ]),
+            )
+            .await?;
+        let file = detail
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "{path} is not a changed file in pull request #{number}"
+                ))
+            })?;
+        let github = self.github_for_session(&session)?;
+        match (detail.base_sha.as_deref(), detail.info.head_sha.as_deref()) {
+            (Some(base), Some(head)) if !base.is_empty() && !head.is_empty() => github
+                .pr_file_diff_known(file, base, head)
+                .await
+                .map_err(EngineError::Internal),
+            _ => github
+                .pr_file_diff(number, path)
+                .await
+                .map_err(EngineError::Internal),
+        }
+    }
+
+    /// Apply a typed action to one associated pull request, then refresh the
+    /// durable account projection used by the dashboard, session badges, and
+    /// every open PR pane. A successful GitHub mutation is not reported as a
+    /// failure merely because another configured host failed its refresh.
+    pub async fn act_on_session_pr(
+        &self,
+        session_id: &str,
+        number: u64,
+        action: &trouve_protocol::PrActionRequest,
+    ) -> Result<trouve_protocol::PrDetail, EngineError> {
+        use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
+
+        let (session, pr) = self.projected_session_pr(session_id, number)?;
+        let key = GithubPrDetailKey::from_info(&pr);
+        let required = match action {
+            Action::UpdateReview { .. }
+            | Action::DeleteReview { .. }
+            | Action::DismissReview { .. }
+            | Action::AddComment { .. }
+            | Action::UpdateComment { .. }
+            | Action::DeleteComment { .. }
+            | Action::ReplyReviewThread { .. }
+            | Action::ResolveReviewThread { .. }
+            | Action::AddReaction { .. }
+            | Action::RemoveReaction { .. } => {
+                HashSet::from([Section::Overview, Section::Conversation])
+            }
+            Action::AddReviewThread { .. } | Action::SetFileViewed { .. } => {
+                HashSet::from([Section::Overview, Section::Files])
+            }
+            _ => HashSet::from([Section::Overview]),
+        };
+        let detail = self
+            .cached_session_pr_detail(&session, &pr, &required)
+            .await?;
+        self.github_for_session(&session)?
+            .act_on_pr(&detail, action)
+            .await
+            .map_err(EngineError::Internal)?;
+
+        let mut stale = HashSet::from([Section::Overview]);
+        match action {
+            Action::SubmitReview { .. }
+            | Action::UpdateReview { .. }
+            | Action::DeleteReview { .. }
+            | Action::DismissReview { .. }
+            | Action::AddComment { .. }
+            | Action::UpdateComment { .. }
+            | Action::DeleteComment { .. }
+            | Action::ReplyReviewThread { .. }
+            | Action::ResolveReviewThread { .. }
+            | Action::AddReaction { .. }
+            | Action::RemoveReaction { .. } => {
+                stale.insert(Section::Conversation);
+            }
+            Action::AddReviewThread { .. } => {
+                stale.insert(Section::Conversation);
+                stale.insert(Section::Files);
+            }
+            Action::SetFileViewed { .. } => {
+                stale.insert(Section::Files);
+            }
+            Action::UpdateBranch { .. } => {
+                stale.insert(Section::Commits);
+                stale.insert(Section::Files);
+            }
+            _ => {}
+        }
+        let mut refresh_sections = self
+            .github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .loaded_sections(&key);
+        if matches!(action, Action::UpdateBranch { .. }) {
+            // A new head invalidates every cached connection, not only files
+            // and commits. Re-fetch only the tabs this client population had
+            // actually loaded, but never carry old-head data into the new key.
+            stale.extend(refresh_sections.iter().copied());
+        }
+        refresh_sections.extend(stale.iter().copied());
+        self.github_pr_detail_cache
+            .lock()
+            .unwrap()
+            .mark_stale(&key, &stale);
+        let refreshed = self
+            .cached_session_pr_detail(&session, &pr, &refresh_sections)
+            .await?;
+        self.publish_github_pr_summary(&refreshed.info)?;
+        Ok(refreshed)
+    }
+
+    /// Publish a mutation's already-returned summary into the durable account
+    /// projection. This updates all open clients immediately without another
+    /// GitHub discovery pass; the regular background refresh remains the
+    /// authority for subsequent external changes.
+    fn publish_github_pr_summary(&self, info: &trouve_protocol::PrInfo) -> Result<(), EngineError> {
+        let _publication = self.github_dashboard_publication.lock().unwrap();
+        let mut snapshot = self.store.latest_github_pr_snapshot(&info.host)?.unwrap_or(
+            trouve_protocol::GithubPrList {
+                viewer: String::new(),
+                host: info.host.clone(),
+                prs: Vec::new(),
+            },
+        );
+        if let Some(existing) = snapshot.prs.iter_mut().find(|candidate| {
+            candidate.number == info.number
+                && candidate.repository.eq_ignore_ascii_case(&info.repository)
+        }) {
+            *existing = info.clone();
+        } else {
+            snapshot.prs.push(info.clone());
+            snapshot
+                .prs
+                .sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        }
+        self.store.append_event(
+            Scope::Server,
+            Event::GithubPullRequestsUpdated {
+                pull_requests: snapshot,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Current durable server-owned UI projections paired with a server
+    /// cursor. This is intentionally local-only: account PR state comes from
+    /// the newest persisted replacement event and session associations come
+    /// from branch identity plus recorded `session.pr_opened` links.
+    pub fn server_projection_snapshot(
+        &self,
+    ) -> Result<(u64, trouve_protocol::ServerProjection), EngineError> {
+        // Capture the resume boundary before reading any projection data. A
+        // concurrent event can then only make the returned data newer than
+        // this cursor; it cannot be hidden behind a cursor that already
+        // covers data we did not read.
+        let cursor = self
+            .store
+            .latest_event_cursor(&trouve_protocol::Scope::Server)?;
+        let mut github_pull_requests = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(envelope) = self.store.latest_github_pr_snapshot_event(&host)? else {
+                continue;
+            };
+            let Event::GithubPullRequestsUpdated { pull_requests } = envelope.event else {
+                continue;
+            };
+            github_pull_requests.push(trouve_protocol::GithubPrHostProjection {
+                cursor: envelope.cursor,
+                refreshed_at: envelope.ts,
+                pull_requests,
+            });
+        }
+
+        let account_prs = github_pull_requests
+            .iter()
+            .flat_map(|snapshot| snapshot.pull_requests.prs.iter())
+            .collect::<Vec<_>>();
+        let mut session_pull_requests = Vec::new();
+        for session in self.list_sessions(None)? {
+            let linked_urls = self.recorded_session_pr_urls(&session.id)?;
+            let mut seen = HashSet::new();
+            let mut prs = account_prs
+                .iter()
+                .copied()
+                .filter(|pr| {
+                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+                })
+                .filter(|pr| {
+                    seen.insert((
+                        pr.host.to_ascii_lowercase(),
+                        pr.repository.to_ascii_lowercase(),
+                        pr.number,
+                    ))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+            if !prs.is_empty() {
+                session_pull_requests.push(trouve_protocol::SessionPrProjection {
+                    session_id: session.id,
+                    prs,
+                });
+            }
+        }
+
+        let git_worktree_settings = self.git_worktree_settings();
+        Ok((
+            cursor,
+            trouve_protocol::ServerProjection {
+                github_pull_requests,
+                session_pull_requests,
+                git_worktree_settings,
+            },
+        ))
+    }
+
     /// Path of the MCP config file for a scope; workspace scope requires
     /// a workspace id.
     fn mcp_config_path(
@@ -3219,7 +5185,10 @@ impl Engine {
                         match probed {
                             Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
                             Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
-                            None => ("unknown".to_string(), String::new()),
+                            None => self
+                                .mcp_logs
+                                .health(&name, &config)
+                                .unwrap_or_else(|| ("unknown".to_string(), String::new())),
                         }
                     };
                     trouve_protocol::McpServerInfo {
@@ -3230,6 +5199,7 @@ impl Engine {
                         command: config.command,
                         args: config.args,
                         env: config.env,
+                        enabled: Some(!config.disabled),
                         health,
                         detail,
                     }
@@ -3257,30 +5227,41 @@ impl Engine {
             Path::new(&session.worktree_path),
         )
         .into_iter()
-        .map(|(name, config, source)| trouve_protocol::McpServerInfo {
-            name,
-            scope: source.clone(),
-            workspace_id: session.workspace_id.clone(),
-            workspace_name: String::new(),
-            command: config.command,
-            args: config.args,
-            env: config.env,
-            health: if config.disabled {
-                "disabled".into()
+        .map(|(name, config, source)| {
+            let (health, detail) = if config.disabled {
+                (
+                    "disabled".into(),
+                    format!("disabled by the {source} config"),
+                )
+            } else if source != "app-wide" {
+                (
+                    "untrusted".into(),
+                    "defined in this repository; copy it into the app-wide MCP settings to trust it"
+                        .into(),
+                )
             } else {
-                "unknown".into()
-            },
-            detail: if config.disabled {
-                format!("disabled by the {source} config")
-            } else {
-                String::new()
-            },
+                self.mcp_logs
+                    .health(&name, &config)
+                    .unwrap_or_else(|| ("unknown".into(), "Health not checked".into()))
+            };
+            trouve_protocol::McpServerInfo {
+                name,
+                scope: source,
+                workspace_id: session.workspace_id.clone(),
+                workspace_name: String::new(),
+                command: config.command,
+                args: config.args,
+                env: config.env,
+                enabled: Some(!config.disabled),
+                health,
+                detail,
+            }
         })
         .collect())
     }
 
     /// Add or replace an MCP server in the scope's config file.
-    pub fn upsert_mcp_server(
+    pub async fn upsert_mcp_server(
         &self,
         name: &str,
         req: &trouve_protocol::UpsertMcpServerRequest,
@@ -3299,20 +5280,65 @@ impl Engine {
             command: req.command.trim().to_string(),
             args: req.args.clone(),
             env: req.env.clone(),
-            disabled: false,
+            disabled: !req.enabled.unwrap_or(true),
         };
-        crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)
+        self.executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::Upsert(config),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        Ok(())
+    }
+
+    /// Persistently enable or disable an existing MCP server without
+    /// replacing the rest of its configuration.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        name: &str,
+        req: &trouve_protocol::SetMcpServerEnabledRequest,
+    ) -> Result<(), EngineError> {
+        let name = name.trim();
+        if name.is_empty() || name.contains("__") || name.contains('/') {
+            return Err(EngineError::BadRequest(
+                "server name must be non-empty and free of '__' and '/'".into(),
+            ));
+        }
+        let path = self.mcp_config_path(&req.scope, req.workspace_id.as_deref())?;
+        let outcome = self
+            .executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::SetEnabled(req.enabled),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        if outcome == McpConfigMutationOutcome::NotFound {
+            return Err(EngineError::NotFound(format!("MCP server {name}")));
+        }
+        Ok(())
     }
 
     /// Remove an MCP server from the scope's config file.
-    pub fn delete_mcp_server(
+    pub async fn delete_mcp_server(
         &self,
         name: &str,
         scope: &str,
         workspace_id: Option<&str>,
     ) -> Result<(), EngineError> {
         let path = self.mcp_config_path(scope, workspace_id)?;
-        crate::mcp::remove_server(&path, name).map_err(EngineError::Internal)
+        self.executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::Remove,
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        Ok(())
     }
 
     /// Recent log lines (stderr + lifecycle) for one MCP server.
@@ -3506,27 +5532,33 @@ impl Engine {
         session_id: &str,
         req: &trouve_protocol::CreatePrRequest,
     ) -> Result<trouve_protocol::PrInfo, EngineError> {
-        let session = self.get_session(session_id)?;
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
         let github = self.github_for_session(&session)?;
-        let worktree = PathBuf::from(&session.worktree_path);
-        let branch = session.branch.clone();
-        let requested_base = req.base.clone();
-        let session_base = session.base_ref.clone();
-        let base = tokio::task::spawn_blocking(move || -> Result<String> {
-            let base = requested_base.unwrap_or_else(|| {
-                git::remote_branch_name(&worktree, &session_base)
-                    .unwrap_or_else(|| session_base.clone())
-            });
-            git::push_branch(&worktree, "origin", &branch)?;
-            Ok(base)
-        })
-        .await
-        .map_err(|e| EngineError::Internal(anyhow!(e)))?
-        .map_err(EngineError::Internal)?;
-        let pr = github
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let base = self
+            .executor
+            .push_session_branch(&SessionRepositoryPush {
+                managed_root: self.data_dir.join("worktrees"),
+                worktree: PathBuf::from(&session.worktree_path),
+                base_ref: session.base_ref.clone(),
+                requested_base: req.base.clone(),
+                branch: session.branch.clone(),
+                cancel,
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        drop(_execution);
+        let mut pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
             .map_err(EngineError::Internal)?;
+        pr.workspace_id = session.workspace_id.clone();
         self.store.append_event(
             Scope::Session(session.id.clone()),
             Event::SessionPrOpened {
@@ -3534,6 +5566,7 @@ impl Engine {
                 url: pr.url.clone(),
             },
         )?;
+        self.publish_github_pr_summary(&pr)?;
         Ok(pr)
     }
 
@@ -3557,18 +5590,118 @@ impl Engine {
 
     /// Unified diff of the session worktree against its base ref.
     pub async fn session_diff(&self, session_id: &str) -> Result<String, EngineError> {
-        let session = self.get_session(session_id)?;
-        let wt = PathBuf::from(&session.worktree_path);
-        let base = session.base_ref.clone();
-        let result = tokio::task::spawn_blocking(move || git::session_diff(&wt, &base))
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: None,
+            cancel,
+        };
+        self.executor
+            .session_diff(&request)
             .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-        match result {
-            Ok(diff) => Ok(diff),
-            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
-                Err(EngineError::SessionDiffTooLarge(error.to_string()))
-            }
-            Err(error) => Err(EngineError::Internal(error)),
+            .map_err(session_diff_executor_error)
+    }
+
+    /// Return only bounded changed-path metadata. Patch text is loaded through
+    /// `session_file_diff` after the client selects a file.
+    pub async fn session_diff_summary(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionDiffSummary, EngineError> {
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: None,
+            cancel,
+        };
+        let stats = self
+            .executor
+            .session_diff_summary(&request)
+            .await
+            .map_err(session_diff_executor_error)?;
+        let additions = stats.iter().map(|file| file.additions).sum();
+        let deletions = stats.iter().map(|file| file.deletions).sum();
+        Ok(SessionDiffSummary {
+            additions,
+            deletions,
+            files: stats
+                .into_iter()
+                .map(|file| SessionDiffFileSummary {
+                    path: file.path,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    binary: file.binary,
+                })
+                .collect(),
+        })
+    }
+
+    /// Return a bounded unified patch for one worktree-relative changed path.
+    pub async fn session_file_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<SessionFileDiff, EngineError> {
+        let relative = Path::new(path);
+        if path.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(EngineError::BadRequest(
+                "diff path must be worktree-relative".into(),
+            ));
+        }
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        let selected_path = path.to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: Some(selected_path.clone()),
+            cancel,
+        };
+        match self.executor.session_diff(&request).await {
+            Ok(diff) => Ok(SessionFileDiff {
+                path: selected_path,
+                diff,
+            }),
+            Err(error) if error.contains("not a changed file") => Err(EngineError::NotFound(
+                format!("path is not changed in this session: {path}"),
+            )),
+            Err(error) => Err(session_diff_executor_error(error)),
         }
     }
 
@@ -3658,7 +5791,11 @@ impl Engine {
 
     // --- integrated terminal --------------------------------------------
 
-    fn ensure_terminal_session_available(&self, session: &Session) -> Result<(), EngineError> {
+    fn ensure_terminal_session_available(
+        &self,
+        session_id: &str,
+    ) -> Result<(Session, std::sync::MutexGuard<'_, HashSet<String>>), EngineError> {
+        let (session, deleting) = self.ensure_terminal_session_exists(session_id)?;
         if session.archived {
             return Err(EngineError::Conflict(format!(
                 "session {} is archived",
@@ -3671,7 +5808,27 @@ impl Engine {
                 session.workspace_id
             )));
         }
-        Ok(())
+        Ok((session, deleting))
+    }
+
+    fn ensure_terminal_session_exists(
+        &self,
+        session_id: &str,
+    ) -> Result<(Session, std::sync::MutexGuard<'_, HashSet<String>>), EngineError> {
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {session_id} is being deleted"
+            )));
+        }
+        // Re-read under the deletion admission lock. A caller may have loaded
+        // the session before a concurrent delete committed and cleared its
+        // transient marker.
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        Ok((session, deleting))
     }
 
     /// The session's default interactive terminal, spawning a shell in its
@@ -3683,12 +5840,12 @@ impl Engine {
         cols: u16,
         rows: u16,
     ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
-        let session = self.get_session(session_id)?;
-        self.ensure_terminal_session_available(&session)?;
+        let (session, deleting) = self.ensure_terminal_session_available(session_id)?;
         let terminal = self
             .terminals
             .open_default(session_id, Path::new(&session.worktree_path), cols, rows)
             .map_err(EngineError::Internal)?;
+        drop(deleting);
         Ok(terminal_info(&terminal))
     }
 
@@ -3697,13 +5854,18 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> Result<Vec<trouve_protocol::TerminalInfo>, EngineError> {
-        self.get_session(session_id)?;
-        Ok(self
+        // Listing is observational: archive/workspace close tears terminals
+        // down, so callers should see an empty list while creation remains
+        // rejected until the owner is reopened.
+        let (_session, deleting) = self.ensure_terminal_session_exists(session_id)?;
+        let terminals = self
             .terminals
             .list_session(session_id)
             .iter()
             .map(|terminal| terminal_info(terminal))
-            .collect())
+            .collect();
+        drop(deleting);
+        Ok(terminals)
     }
 
     /// Spawn another independent interactive terminal in the session worktree.
@@ -3713,24 +5875,37 @@ impl Engine {
         cols: u16,
         rows: u16,
     ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
-        let session = self.get_session(session_id)?;
-        self.ensure_terminal_session_available(&session)?;
+        let (session, deleting) = self.ensure_terminal_session_available(session_id)?;
         let terminal = self
             .terminals
             .create(session_id, Path::new(&session.worktree_path), cols, rows)
             .map_err(EngineError::Internal)?;
+        drop(deleting);
         Ok(terminal_info(&terminal))
     }
 
-    pub fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
+    pub async fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
         let terminal = self
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        terminal.write(bytes).map_err(EngineError::Internal)
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminal.write(&bytes)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?
+        .map_err(EngineError::Internal)
     }
 
-    pub fn terminal_resize(
+    pub async fn terminal_resize(
         &self,
         terminal_id: &str,
         cols: u16,
@@ -3740,22 +5915,48 @@ impl Engine {
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        terminal.resize(cols, rows).map_err(EngineError::Internal)
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminal.resize(cols, rows)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?
+        .map_err(EngineError::Internal)
     }
 
     /// Kill one terminal without disturbing the session's other terminals.
-    pub fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
+    pub async fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
         // get() first so unknown ids surface as 404 rather than a no-op.
-        self.terminals
+        let terminal = self
+            .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        self.terminals.remove(terminal_id);
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        let terminals = self.terminals.clone();
+        let terminal_id = terminal_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminals.remove(&terminal_id);
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         Ok(())
     }
 
     /// Attach to a terminal's output from byte offset `after`: the retained
     /// backlog from there plus a live receiver (empty chunk = shell exited).
-    pub fn terminal_subscribe(
+    pub async fn terminal_subscribe(
         &self,
         terminal_id: &str,
         after: u64,
@@ -3772,6 +5973,12 @@ impl Engine {
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        let _operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
         let (from, replay, rx) = terminal.subscribe(after);
         Ok((from, replay, rx, terminal.exited()))
     }
@@ -3783,6 +5990,17 @@ impl Engine {
             .entry(session_id.to_string())
             .or_default()
             .clone()
+    }
+
+    fn tool_execution_lock(&self, session_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self.tool_execution_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -3889,7 +6107,8 @@ impl Engine {
     }
 
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
-    pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
+    pub async fn refresh_github_prs(&self, force: bool) -> Result<(), EngineError> {
+        let request_started = Instant::now();
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
         let workspace_repositories = tokio::task::spawn_blocking(move || {
@@ -3907,10 +6126,24 @@ impl Engine {
         let mut failures = Vec::new();
         let refreshes = self.prepare_github_dashboard_refreshes();
         for (host, token, cache_handle) in refreshes {
-            let Ok(mut cache) = cache_handle.try_lock() else {
-                tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
-                continue;
+            let mut cache = if force {
+                cache_handle.lock().await
+            } else {
+                let Ok(cache) = cache_handle.try_lock() else {
+                    tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
+                    continue;
+                };
+                cache
             };
+            if !cache.should_refresh(
+                force,
+                request_started,
+                Instant::now(),
+                GITHUB_DASHBOARD_REFRESH_FRESHNESS,
+            ) {
+                tracing::debug!(host, force, "reusing fresh GitHub dashboard snapshot");
+                continue;
+            }
             let account =
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
             let refresh = tokio::time::timeout(
@@ -3949,16 +6182,31 @@ impl Engine {
                 )?;
             }
             let pull_requests = trouve_protocol::GithubPrList { viewer, host, prs };
-            if !cache.has_published_snapshot()
-                && let Some(persisted) =
-                    self.store.latest_github_pr_snapshot(&pull_requests.host)?
-            {
-                cache.seed_published_snapshot(&persisted)?;
+            let persisted = self.store.latest_github_pr_snapshot(&pull_requests.host)?;
+            if let Some(previous) = persisted.as_ref() {
+                let mut detail_cache = self.github_pr_detail_cache.lock().unwrap();
+                for pr in &pull_requests.prs {
+                    let changed = previous
+                        .prs
+                        .iter()
+                        .find(|candidate| {
+                            candidate.number == pr.number
+                                && candidate.repository.eq_ignore_ascii_case(&pr.repository)
+                        })
+                        .is_none_or(|candidate| {
+                            serde_json::to_value(candidate).ok() != serde_json::to_value(pr).ok()
+                        });
+                    if changed {
+                        detail_cache.invalidate_pr(pr);
+                    }
+                }
             }
-            let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
-                continue;
-            };
+            if !cache.has_published_snapshot()
+                && let Some(persisted) = persisted.as_ref()
             {
+                cache.seed_published_snapshot(persisted)?;
+            }
+            if let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? {
                 let _publication = self.github_dashboard_publication.lock().unwrap();
                 let cache_is_current = {
                     let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
@@ -3977,6 +6225,7 @@ impl Engine {
                 )?;
                 cache.mark_snapshot_published(snapshot);
             }
+            cache.mark_refresh_completed();
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));
@@ -4024,6 +6273,38 @@ impl Engine {
 
     // --- sessions -----------------------------------------------------------
 
+    async fn rollback_failed_session_creation(
+        &self,
+        worktree: &Path,
+        session_id: &str,
+        creation: crate::tools::SessionWorktreeCreation,
+    ) {
+        if let Err(error) = self.executor.evict_worktree(worktree).await {
+            // The creation receipt is an independent ownership proof. Always
+            // exercise its rollback even when ephemeral cleanup could not be
+            // acknowledged; the receipt's compare-and-swap checks fail closed
+            // if an owned artifact changed in the meantime.
+            tracing::error!(
+                session_id,
+                %error,
+                "failed to evict worktree resources before session creation rollback"
+            );
+        }
+
+        let cleanup = self
+            .executor
+            .rollback_session_worktree(crate::tools::SessionWorktreeRollback { creation })
+            .await;
+        match cleanup {
+            Ok(()) => {}
+            Err(error) => tracing::error!(
+                session_id,
+                %error,
+                "failed to roll back git artifacts after session creation error"
+            ),
+        }
+    }
+
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
         let ws = self
             .store
@@ -4032,48 +6313,41 @@ impl Engine {
         let repo = PathBuf::from(&ws.path);
         let title = req.title.unwrap_or_else(|| "New session".into());
         let session_id = new_id("se");
-        let slug = git::slugify(&title);
-        // Session id suffix keeps branches unique across same-titled sessions.
-        let branch = format!("trouve/{slug}-{}", &session_id[3..9]);
-        let base_ref = match req.base_ref {
-            Some(r) => r,
-            None => {
-                let repo = repo.clone();
-                tokio::task::spawn_blocking(move || git::head_ref(&repo))
-                    .await
-                    .map_err(|e| EngineError::Internal(anyhow!(e)))?
-                    .map_err(EngineError::Internal)?
-            }
-        };
+        let checkpoint_id = new_id("cp");
+        let branch = session_branch_name(
+            &title,
+            &session_id,
+            self.title_model.derive_branch_name_from_session_title(),
+        );
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
-        let base_ref = {
-            let repo = repo.clone();
-            let worktree_path = worktree_path.clone();
-            let branch = branch.clone();
-            let selected_base = base_ref.clone();
-            let fetch_latest = req.fetch_latest;
-            let checkout_ref = req.checkout_ref.clone();
-            tokio::task::spawn_blocking(move || -> Result<String> {
-                let mut session_base = selected_base.clone();
-                let worktree_base = if fetch_latest {
-                    match git::fetch_upstream_base(&repo, &selected_base)? {
-                        Some(fetched) => {
-                            session_base = fetched.upstream_ref;
-                            fetched.commit
-                        }
-                        None => selected_base,
-                    }
-                } else {
-                    selected_base
-                };
-                let checkout_ref = checkout_ref.as_deref().unwrap_or(&worktree_base);
-                git::create_worktree(&repo, &worktree_path, &branch, checkout_ref)?;
-                Ok(session_base)
-            })
-            .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)?
+        if self.store.session(&session_id)?.is_some() {
+            return Err(EngineError::Conflict(format!(
+                "generated session id {session_id} already exists"
+            )));
+        }
+        let creation_request = crate::tools::SessionWorktreeCreate {
+            repository: repo,
+            worktree: worktree_path.clone(),
+            session_id: session_id.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            branch: branch.clone(),
+            base_ref: req.base_ref,
+            checkout_ref: req.checkout_ref,
+            fetch_latest: req.fetch_latest,
         };
+        // Creation runs in an engine-owned task. If the request future is
+        // cancelled after a custom executor has started mutating but before it
+        // returns its guard, this task continues; its eventual receipt is then
+        // dropped and synchronously rolls the attempt back.
+        let executor = self.executor.clone();
+        let mut creation =
+            tokio::spawn(async move { executor.create_session_worktree(&creation_request).await })
+                .await
+                .map_err(|error| {
+                    EngineError::Internal(anyhow!("session creation task failed: {error}"))
+                })?
+                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let base_ref = creation.base_ref.clone();
 
         let session = Session {
             id: session_id.clone(),
@@ -4086,47 +6360,81 @@ impl Engine {
             active: false,
             created_at: chrono::Utc::now(),
         };
-        self.store.insert_session(&session)?;
 
-        // Checkpoint 0: pristine state, so the first turn can be undone.
-        let commit = self
-            .executor
-            .checkpoint_worktree(&worktree_path, &session_id, 0, "trouve: session start")
-            .await
-            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
-        let checkpoint_id = new_id("cp");
-        self.store.append_checkpoint(&CheckpointRow {
+        // Checkpoint 0 was created atomically with the executor-owned worktree
+        // receipt, so cancellation between those two mutations cannot leak
+        // either artifact.
+        let commit = creation.checkpoint_commit.clone();
+        let checkpoint = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session_id.clone(),
             thread_id: None,
             turn: 0,
             seq: 0,
             commit_hash: commit.clone(),
-        })?;
+        };
 
-        self.store.append_event(
-            Scope::Server,
-            Event::SessionCreated {
-                session_id: session_id.clone(),
-                workspace_id: ws.id.clone(),
+        let inserted = self.store.insert_session_with_lifecycle(
+            &session,
+            &checkpoint,
+            vec![
+                (
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: session_id.clone(),
+                        workspace_id: ws.id.clone(),
+                    },
+                ),
+                (
+                    Scope::Session(session_id.clone()),
+                    Event::WorktreeCreated {
+                        path: session.worktree_path.clone(),
+                        branch: branch.clone(),
+                    },
+                ),
+                (
+                    Scope::Session(session_id.clone()),
+                    Event::CheckpointCreated {
+                        checkpoint_id,
+                        thread_id: String::new(),
+                        turn: 0,
+                        commit: commit.clone(),
+                    },
+                ),
+            ],
+        );
+        match inserted {
+            Ok(_) => {
+                // Intentionally synchronous and immediately after commit.
+                creation.mark_durable();
+            }
+            Err(error) => match self.store.session(&session_id) {
+                Ok(Some(_)) => {
+                    // The writer may have committed and then lost its reply.
+                    // The relational mutation and lifecycle events share that
+                    // transaction, so an existing row proves durability.
+                    tracing::warn!(session_id, %error, "session insert reply failed after durable commit");
+                    creation.mark_durable();
+                }
+                Ok(None) => {
+                    self.rollback_failed_session_creation(&worktree_path, &session_id, creation)
+                        .await;
+                    return Err(error.into());
+                }
+                Err(inspect_error) => {
+                    creation.preserve_for_recovery();
+                    return Err(EngineError::Internal(error.context(format!(
+                        "session insert outcome is ambiguous and its ownership marker was retained: {inspect_error:#}"
+                    ))));
+                }
             },
-        )?;
-        self.store.append_event(
-            Scope::Session(session_id.clone()),
-            Event::WorktreeCreated {
-                path: session.worktree_path.clone(),
-                branch,
-            },
-        )?;
-        self.store.append_event(
-            Scope::Session(session_id.clone()),
-            Event::CheckpointCreated {
-                checkpoint_id,
-                thread_id: String::new(),
-                turn: 0,
-                commit,
-            },
-        )?;
+        }
+        match self.executor.finalize_session_worktree(creation).await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(session_id, %error, "failed to remove session creation marker");
+            }
+        }
         if self.index_hooks {
             crate::tools::warm_index_in_background(worktree_path);
         }
@@ -4140,6 +6448,12 @@ impl Engine {
             session.active = active.values().any(|s| *s == session.id);
         }
         Ok(sessions)
+    }
+
+    pub fn session_summaries_snapshot(
+        &self,
+    ) -> Result<trouve_protocol::SessionSummariesSnapshot, EngineError> {
+        Ok(self.store.session_summaries_snapshot()?)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Session, EngineError> {
@@ -4160,50 +6474,64 @@ impl Engine {
         id: &str,
         req: &UpdateSessionRequest,
     ) -> Result<Session, EngineError> {
-        let session = self.get_session(id)?;
+        self.get_session(id)?;
         if let Some(title) = req.title.as_deref()
             && title.trim().is_empty()
         {
             return Err(EngineError::BadRequest("title cannot be empty".into()));
         }
-        let newly_archived = req.archived == Some(true) && !session.archived;
-        let newly_unarchived = req.archived == Some(false) && session.archived;
-        {
+        let updated = {
             // Serialize mutation against delete's marker. Besides preserving
             // the session row, this prevents an unarchive from reopening the
             // terminal manager while deletion is tearing the session down.
+            let _activity_publication = self.session_activity_publication.lock().unwrap();
+            let active_threads = self.active_threads.lock().unwrap();
             let deleting = self.deleting_sessions.lock().unwrap();
             if deleting.contains(id) {
                 return Err(EngineError::Conflict(format!(
                     "session {id} is being deleted"
                 )));
             }
-            self.store
-                .update_session(id, req.title.as_deref(), req.archived)?;
-            if newly_archived {
-                self.terminals.remove_session(id);
-            } else if newly_unarchived {
-                self.terminals.reopen_session(id);
-            }
-            self.store.append_event(
-                Scope::Server,
+            let mut session = self
+                .store
+                .session(id)?
+                .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
+            let newly_archived = req.archived == Some(true) && !session.archived;
+            let newly_unarchived = req.archived == Some(false) && session.archived;
+            self.store.update_session_with_event(
+                id,
+                req.title.as_deref(),
+                req.archived,
                 Event::SessionUpdated {
                     session_id: id.to_string(),
                     workspace_id: session.workspace_id.clone(),
                 },
             )?;
+            if let Some(title) = req.title.as_ref() {
+                session.title = title.clone();
+            }
+            if let Some(archived) = req.archived {
+                session.archived = archived;
+            }
+            session.active = active_threads.values().any(|owner| owner == id);
+            if newly_archived {
+                self.terminals.remove_session(id);
+            } else if newly_unarchived {
+                self.terminals.reopen_session(id);
+            }
             if self.index_hooks
                 && newly_archived
                 && let Some(ws) = self.store.workspace(&session.workspace_id)?
             {
                 crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
             }
-        }
-        self.get_session(id)
+            session
+        };
+        Ok(updated)
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
-        let session = self.get_session(id)?;
+        self.get_session(id)?;
         {
             // Lock ordering is always activity publication -> active_threads
             // -> deleting_sessions; dispatch_queue uses the same order. This
@@ -4224,8 +6552,30 @@ impl Engine {
                 )));
             }
         }
+        // The marker must clear even if this future is aborted while waiting
+        // for the lifecycle lease or post-commit cleanup.
+        let _deleting_marker = DeletingSessionMarker {
+            sessions: &self.deleting_sessions,
+            session_id: id.to_string(),
+        };
 
-        let result = async {
+        // The marker rejects new lock-free mutations; the exclusive
+        // lifecycle lease waits out settings changes, restores, and any
+        // already-admitted turn before relational or filesystem teardown.
+        let lifecycle = self.session_lock(id);
+        let _lifecycle_guard = lifecycle.write().await;
+
+        async {
+            let session = self
+                .store
+                .session(id)?
+                .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
+            let bridge_thread_ids = self
+                .store
+                .list_threads(id)?
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>();
             let ws = self
                 .store
                 .workspace(&session.workspace_id)?
@@ -4237,56 +6587,72 @@ impl Engine {
             // filesystem work. A database error must leave the session and
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
-            self.terminals.remove_session(id);
-            if let Err(error) = self.store.delete_session(id) {
-                // Restore terminal access when the database transaction left
-                // a live, unarchived session behind.
-                if !session.archived {
-                    self.terminals.reopen_session(id);
-                }
-                return Err(error.into());
-            }
-            self.executor
-                .evict_worktree(Path::new(&session.worktree_path))
-                .await;
-            for path in attachment_paths {
-                let _ = std::fs::remove_file(&path);
-            }
-
-            let repo = PathBuf::from(&ws.path);
-            let wt = PathBuf::from(&session.worktree_path);
-            if wt.exists() {
-                let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
-                    .await
-                    .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-                if let Err(e) = res {
-                    tracing::warn!("failed to remove worktree for {id}: {e}");
-                }
-            }
-            // Session-scoped events are deleted with the session for privacy;
-            // the persisted server event is the replayable deletion signal.
-            self.store.append_event(
-                Scope::Server,
+            let cleanup_job = ArtifactCleanupJob::deleted_session(
+                id.to_string(),
+                session.worktree_path.clone(),
+                ws.path.clone(),
+                attachment_paths,
+            );
+            self.store.delete_session_with_event(
+                id,
+                cleanup_job.clone(),
                 Event::SessionDeleted {
                     session_id: id.to_string(),
                     workspace_id: session.workspace_id.clone(),
                 },
             )?;
-            if self.index_hooks {
-                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
+            // Only kill ephemeral terminals after the durable deletion has
+            // committed. A database error therefore leaves live PTYs intact.
+            self.terminals.remove_session(id);
+            for thread_id in bridge_thread_ids {
+                self.revoke_bridge_tickets(&thread_id);
+                self.bridged_tool_owners.clear_root(&thread_id);
             }
+            // The cleanup job was committed with the tombstone. Scheduling is
+            // best effort here; startup retries any intent left behind by an
+            // aborted request or process crash.
+            self.schedule_artifact_cleanup(cleanup_job);
             Ok(())
         }
-        .await;
-
-        self.deleting_sessions.lock().unwrap().remove(id);
-        result
+        .await
     }
 
     // --- threads ------------------------------------------------------------
 
     pub fn create_thread(&self, req: CreateThreadRequest) -> Result<Thread, EngineError> {
         let session = self.get_session(&req.session_id)?;
+        self.create_thread_for_session(session, req)
+    }
+
+    /// Create a thread from already-loaded session metadata. Provider-native
+    /// collaborator creation uses this while holding the active-thread
+    /// registry lock, so it must not call `get_session` (which reads that same
+    /// registry to project `Session.active`).
+    fn create_thread_for_session(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+    ) -> Result<Thread, EngineError> {
+        self.create_thread_for_session_with_parent(session, req, None)
+    }
+
+    fn create_spawned_thread_for_session(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+        parent_thread_id: &str,
+        kind: &str,
+    ) -> Result<Thread, EngineError> {
+        self.create_thread_for_session_with_parent(session, req, Some((parent_thread_id, kind)))
+    }
+
+    fn create_thread_for_session_with_parent(
+        &self,
+        session: Session,
+        req: CreateThreadRequest,
+        spawn: Option<(&str, &str)>,
+    ) -> Result<Thread, EngineError> {
+        debug_assert_eq!(session.id, req.session_id);
         let ws = self.store.workspace(&session.workspace_id)?.unwrap();
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode_id = req.mode.unwrap_or_else(|| "code".into());
@@ -4314,6 +6680,12 @@ impl Engine {
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
+            parent_thread_id: spawn.map(|(parent, _)| parent.to_string()),
+            title: req
+                .title
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .map(|title| title.chars().take(96).collect::<String>())
+                .filter(|title| !title.is_empty()),
             mode: mode.id.clone(),
             model,
             model_options: model_options.clone(),
@@ -4324,19 +6696,33 @@ impl Engine {
                 .or(mode.default_permission_mode)
                 .unwrap_or_else(|| *self.default_permission_mode.read().unwrap()),
             created_at: chrono::Utc::now(),
-            // Spawn parentage is recorded by the spawn tools after insert;
-            // reads recompute this flag from the spawned_threads table.
-            spawned: false,
+            spawned: spawn.is_some(),
             todos: Vec::new(),
         };
-        self.store.insert_thread(&thread, &model_options)?;
-        self.store.append_event(
-            Scope::Server,
+        // Hold the deletion marker lock through relational insertion and the
+        // source event. A delete that has not marked the session yet waits;
+        // once marked, no new thread can materialize behind its snapshot.
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
+        }
+        let live_session = self
+            .store
+            .session(&session.id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
+        self.store.insert_thread_with_event(
+            &thread,
+            &model_options,
+            spawn,
             Event::ThreadCreated {
                 thread_id: thread.id.clone(),
-                session_id: session.id,
+                session_id: live_session.id,
             },
         )?;
+        drop(deleting);
         Ok(thread)
     }
 
@@ -4346,18 +6732,182 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("thread {id}")))
     }
 
+    /// Spawn parentage controls hierarchy, while the selected data-driven
+    /// mode controls whether a child is an audit transcript or an interactive
+    /// conversation. Unknown/missing modes fail closed.
+    fn subagent_is_read_only(&self, thread: &Thread) -> Result<bool, EngineError> {
+        if !thread.spawned {
+            return Ok(false);
+        }
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
+        let modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        Ok(modes::find_mode(&modes, &thread.mode)
+            .map(|mode| mode.read_only)
+            .unwrap_or(true))
+    }
+
+    fn backend_collaborator_mode(
+        &self,
+        session: &Session,
+        inherited_thread: &Thread,
+        access: BackendCollaboratorAccess,
+    ) -> Result<String, EngineError> {
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
+        let modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let inherited = modes::find_mode(&modes, &inherited_thread.mode);
+        // Provider metadata may reduce a collaborator's authority, but it is
+        // never an authorization source that can widen the parent's mode.
+        // Unknown parent modes fail closed just like turn execution does.
+        let inherited_read_only = inherited.is_none_or(|mode| mode.read_only);
+        let access = match access {
+            BackendCollaboratorAccess::Interactive if inherited_read_only => {
+                tracing::warn!(
+                    parent_thread_id = %inherited_thread.id,
+                    parent_mode = %inherited_thread.mode,
+                    "provider requested writable collaborator under a read-only parent; clamping access"
+                );
+                BackendCollaboratorAccess::ReadOnly
+            }
+            access => access,
+        };
+        if access == BackendCollaboratorAccess::Inherit {
+            return Ok(inherited_thread.mode.clone());
+        }
+        let read_only = access == BackendCollaboratorAccess::ReadOnly;
+        let inherited_matches = inherited.is_some_and(|mode| mode.read_only == read_only);
+        if inherited_matches {
+            return Ok(inherited_thread.mode.clone());
+        }
+        let preferred = match access {
+            BackendCollaboratorAccess::ReadOnly => ["plan", "review", "question"].as_slice(),
+            BackendCollaboratorAccess::Interactive => ["code", "architect"].as_slice(),
+            BackendCollaboratorAccess::Inherit => unreachable!(),
+        };
+        preferred
+            .iter()
+            .find_map(|id| modes::find_mode(&modes, id).filter(|mode| mode.read_only == read_only))
+            .or_else(|| modes.iter().find(|mode| mode.read_only == read_only))
+            .map(|mode| mode.id.clone())
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!(
+                    "no {} mode is configured for this subagent",
+                    if access == BackendCollaboratorAccess::ReadOnly {
+                        "read-only"
+                    } else {
+                        "interactive"
+                    }
+                ))
+            })
+    }
+
     pub fn thread_view_snapshot(
         &self,
         id: &str,
         before: Option<u64>,
         limit: usize,
+        turn_aligned: bool,
     ) -> Result<(u64, trouve_protocol::ThreadViewSnapshot), EngineError> {
         self.get_thread(id)?;
-        Ok(self.store.thread_view_snapshot(id, before, limit)?)
+        Ok(self
+            .store
+            .thread_view_snapshot(id, before, limit, turn_aligned)?)
+    }
+
+    pub fn thread_tool_details(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> Result<trouve_protocol::ThreadToolDetails, EngineError> {
+        self.get_thread(thread_id)?;
+        self.store
+            .thread_tool_details(thread_id, call_id)?
+            .ok_or_else(|| {
+                EngineError::NotFound(format!("tool call {call_id} in thread {thread_id}"))
+            })
     }
 
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>, EngineError> {
         Ok(self.store.list_threads(session_id)?)
+    }
+
+    pub fn list_thread_subagents(&self, thread_id: &str) -> Result<Vec<Thread>, EngineError> {
+        self.get_thread(thread_id)?;
+        let mut children = self
+            .store
+            .spawned_children(thread_id)?
+            .into_iter()
+            .map(|child_id| self.store.thread(&child_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        children.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(children)
+    }
+
+    /// List every durable provider-native or trouve-owned descendant below a
+    /// thread. The direct-child endpoint remains the default contract; the
+    /// Details panel opts into this recursive projection so a nested worker
+    /// cannot remain active while disappearing from the parent's overview.
+    pub fn list_thread_descendants(&self, thread_id: &str) -> Result<Vec<Thread>, EngineError> {
+        self.get_thread(thread_id)?;
+        Ok(self.store.spawned_descendants(thread_id)?)
+    }
+
+    /// Root thread and number of spawn edges above `thread_id`. Parentage is
+    /// persisted across sessions, so this works for mixed spawn_thread /
+    /// spawn_session trees. Corrupt cycles fail closed instead of permitting
+    /// an unbounded delegation loop.
+    fn subagent_root_and_depth(&self, thread_id: &str) -> Result<(String, usize), EngineError> {
+        self.get_thread(thread_id)?;
+        let mut current = thread_id.to_string();
+        let mut depth = 0usize;
+        let mut seen = HashSet::from([current.clone()]);
+        while let Some(parent) = self.store.spawn_parent(&current)? {
+            if !seen.insert(parent.clone()) {
+                return Err(EngineError::Internal(anyhow!(
+                    "cycle in spawned-thread parentage at {parent}"
+                )));
+            }
+            current = parent;
+            depth += 1;
+        }
+        Ok((current, depth))
+    }
+
+    fn thread_can_spawn_subagents(&self, thread_id: &str) -> Result<bool, EngineError> {
+        Ok(self.subagent_root_and_depth(thread_id)?.1 < MAX_SUBAGENT_DEPTH)
+    }
+
+    fn subagent_tree_lock(&self, root_thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.subagent_tree_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(root_thread_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(root_thread_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub fn list_thread_statuses(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::ThreadStatus>, EngineError> {
+        Ok(self.store.list_thread_statuses(session_id)?)
     }
 
     /// Change thread settings (mode/model/options) between turns. Conflicts
@@ -4368,6 +6918,11 @@ impl Engine {
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
         let thread = self.get_thread(id)?;
+        if self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
         let session = self.get_session(&thread.session_id)?;
 
         // The session lock is held for the duration of a turn; a locked
@@ -4376,6 +6931,21 @@ impl Engine {
         let _guard = lock.try_write().map_err(|_| {
             EngineError::Conflict("cannot change thread settings while a turn is running".into())
         })?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
+        }
+        let thread = self
+            .store
+            .thread(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {id}")))?;
+        let session = self
+            .store
+            .session(&thread.session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {}", thread.session_id)))?;
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
@@ -4391,20 +6961,18 @@ impl Engine {
                 "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
             )));
         }
-        self.store.update_thread(
+        self.store.update_thread_with_event(
             id,
             req.mode.as_deref(),
             req.model.as_deref(),
             req.model_options.as_ref(),
             req.permission_mode,
-        )?;
-        self.store.append_event(
-            Scope::Server,
             Event::ThreadUpdated {
                 thread_id: id.to_string(),
                 session_id: session.id,
             },
         )?;
+        drop(deleting);
         self.get_thread(id)
     }
 
@@ -4472,13 +7040,15 @@ impl Engine {
 
     pub fn resolve_approval(
         &self,
+        thread_id: &str,
         call_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), EngineError> {
-        if self.approvals.resolve(call_id, decision) {
-            Ok(())
-        } else {
-            Err(EngineError::NotFound(format!("pending approval {call_id}")))
+        match self.approvals.resolve(thread_id, call_id, decision) {
+            ApprovalResolution::Resolved => Ok(()),
+            ApprovalResolution::NotFound => {
+                Err(EngineError::NotFound(format!("pending approval {call_id}")))
+            }
         }
     }
 
@@ -4487,15 +7057,15 @@ impl Engine {
     /// Answer (or skip, `answers: None`) a pending `question.requested`.
     pub fn resolve_question(
         &self,
+        thread_id: &str,
         request_id: &str,
         answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
     ) -> Result<(), EngineError> {
-        if self.questions.resolve(request_id, answers) {
-            Ok(())
-        } else {
-            Err(EngineError::NotFound(format!(
+        match self.questions.resolve(thread_id, request_id, answers) {
+            QuestionResolution::Resolved => Ok(()),
+            QuestionResolution::NotFound => Err(EngineError::NotFound(format!(
                 "pending question {request_id}"
-            )))
+            ))),
         }
     }
 
@@ -4508,9 +7078,24 @@ impl Engine {
         request_id: &str,
         title: Option<String>,
         questions: Vec<trouve_protocol::Question>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<Vec<trouve_protocol::QuestionAnswer>>> {
         let scope = Scope::Thread(thread_id.to_string());
-        let rx = self.questions.request(request_id);
+        let rx = self
+            .questions
+            .request(thread_id, request_id)
+            .with_context(|| {
+                format!("duplicate pending question {request_id} in thread {thread_id}")
+            })?;
+        let mut cleanup = PendingQuestionCleanup {
+            questions: self.questions.clone(),
+            store: self.store.clone(),
+            scope: scope.clone(),
+            thread_id: thread_id.to_string(),
+            request_id: request_id.to_string(),
+            armed: true,
+            requested_persisted: false,
+        };
         self.store.append_event(
             scope.clone(),
             Event::QuestionRequested {
@@ -4520,7 +7105,18 @@ impl Engine {
                 questions,
             },
         )?;
-        let answers = rx.await.unwrap_or(None);
+        cleanup.requested_persisted = true;
+        let answers = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Remove the pending sender so a late HTTP answer cannot
+                // target a turn that has already entered cleanup.
+                let _ = self.questions.resolve(thread_id, request_id, None);
+                None
+            }
+            answers = rx => answers.unwrap_or(None),
+        };
+        let answers = if cancel.is_cancelled() { None } else { answers };
         self.store.append_event(
             scope,
             Event::QuestionResolved {
@@ -4528,6 +7124,7 @@ impl Engine {
                 answers: answers.clone(),
             },
         )?;
+        cleanup.armed = false;
         Ok(answers)
     }
 
@@ -4543,6 +7140,98 @@ impl Engine {
             .await
     }
 
+    /// Restore the worktree to one exact turn checkpoint rather than taking
+    /// a relative step through the session's undo stack.
+    pub async fn restore_checkpoint_by_id(&self, checkpoint_id: &str) -> Result<(), EngineError> {
+        let cp = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        let session = self.get_session(&cp.session_id)?;
+        let lock = self.session_lock(&session.id);
+        let _guard = lock.write().await;
+        if self.deleting_sessions.lock().unwrap().contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
+        }
+
+        let latest = self
+            .store
+            .latest_checkpoint_seq(&session.id)?
+            .ok_or_else(|| EngineError::BadRequest("session has no checkpoints".into()))?;
+        let cp = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .filter(|current| current.session_id == session.id)
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        if cp.seq < 0 || cp.seq > latest {
+            return Err(EngineError::NotFound(format!(
+                "checkpoint {checkpoint_id} is no longer available"
+            )));
+        }
+        self.restore_checkpoint_row(&session, cp, latest, RestoreDirection::Exact)
+            .await
+    }
+
+    /// Create a new session whose worktree starts at one exact turn
+    /// checkpoint. The initial thread inherits the source thread's current
+    /// mode, model, model options, and permission policy.
+    pub async fn fork_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<ForkCheckpointResponse, EngineError> {
+        let checkpoint = self
+            .store
+            .checkpoint(checkpoint_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("checkpoint {checkpoint_id}")))?;
+        let source_session = self.get_session(&checkpoint.session_id)?;
+        let source_thread_id = checkpoint.thread_id.as_deref().ok_or_else(|| {
+            EngineError::BadRequest("the session-start checkpoint has no source thread".into())
+        })?;
+        let source_thread = self.get_thread(source_thread_id)?;
+        if source_thread.session_id != source_session.id {
+            return Err(EngineError::Internal(anyhow!(
+                "checkpoint {checkpoint_id} references a thread outside its session"
+            )));
+        }
+
+        let session = self
+            .create_session(CreateSessionRequest {
+                workspace_id: source_session.workspace_id,
+                title: Some(format!(
+                    "{} (fork after turn {})",
+                    source_session.title, checkpoint.turn
+                )),
+                base_ref: Some(source_session.base_ref),
+                checkout_ref: Some(checkpoint.commit_hash),
+                fetch_latest: false,
+            })
+            .await?;
+        let thread = match self.create_thread(CreateThreadRequest {
+            session_id: session.id.clone(),
+            title: Some(session.title.clone()),
+            mode: Some(source_thread.mode),
+            model: Some(source_thread.model),
+            model_options: source_thread.model_options,
+            permission_mode: Some(source_thread.permission_mode),
+        }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Err(cleanup_error) = self.delete_session(&session.id).await {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        "failed to clean up checkpoint fork after thread creation failed: {cleanup_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(ForkCheckpointResponse { session, thread })
+    }
+
     async fn restore_checkpoint(
         &self,
         session_id: &str,
@@ -4551,6 +7240,11 @@ impl Engine {
         let session = self.get_session(session_id)?;
         let lock = self.session_lock(session_id);
         let _guard = lock.write().await;
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {session_id} is being deleted"
+            )));
+        }
 
         let latest = self
             .store
@@ -4560,6 +7254,11 @@ impl Engine {
         let target = match direction {
             RestoreDirection::Undo => current - 1,
             RestoreDirection::Redo => current + 1,
+            RestoreDirection::Exact => {
+                return Err(EngineError::BadRequest(
+                    "an exact restore requires a checkpoint id".into(),
+                ));
+            }
         };
         if target < 0 || target > latest {
             return Err(EngineError::BadRequest(format!(
@@ -4567,6 +7266,7 @@ impl Engine {
                 match direction {
                     RestoreDirection::Undo => "undo",
                     RestoreDirection::Redo => "redo",
+                    RestoreDirection::Exact => "restore",
                 }
             )));
         }
@@ -4574,20 +7274,36 @@ impl Engine {
             .store
             .checkpoint_at(session_id, target)?
             .ok_or_else(|| EngineError::NotFound(format!("checkpoint seq {target}")))?;
+        self.restore_checkpoint_row(&session, cp, latest, direction)
+            .await?;
+        Ok(())
+    }
+
+    async fn restore_checkpoint_row(
+        &self,
+        session: &Session,
+        checkpoint: CheckpointRow,
+        latest: i64,
+        direction: RestoreDirection,
+    ) -> Result<(), EngineError> {
         let wt = PathBuf::from(&session.worktree_path);
-        let commit = cp.commit_hash.clone();
+        let commit = checkpoint.commit_hash.clone();
         tokio::task::spawn_blocking(move || git::restore(&wt, &commit))
             .await
             .map_err(|e| EngineError::Internal(anyhow!(e)))?
             .map_err(EngineError::Internal)?;
         self.store.set_undo_pos(
-            session_id,
-            if target == latest { None } else { Some(target) },
+            &session.id,
+            if checkpoint.seq == latest {
+                None
+            } else {
+                Some(checkpoint.seq)
+            },
         )?;
         self.store.append_event(
-            Scope::Session(session_id.to_string()),
+            Scope::Session(session.id.clone()),
             Event::CheckpointRestored {
-                checkpoint_id: cp.id,
+                checkpoint_id: checkpoint.id,
                 direction,
             },
         )?;
@@ -4607,7 +7323,7 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
-        self.send_message_with_tools(thread_id, content, uploads, true)
+        self.send_message_with_tools(thread_id, content, uploads, true, false)
     }
 
     pub(crate) fn send_message_without_tools(
@@ -4615,7 +7331,135 @@ impl Engine {
         thread_id: &str,
         content: String,
     ) -> Result<TurnAccepted, EngineError> {
-        self.send_message_with_tools(thread_id, content, Vec::new(), false)
+        self.send_message_with_tools(thread_id, content, Vec::new(), false, false)
+    }
+
+    fn turn_shell_events(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        prompt: &trouve_protocol::QueuedPrompt,
+        tools_enabled: bool,
+    ) -> Result<Vec<Event>, EngineError> {
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let (selected_model, supports_steering) =
+            if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
+                (
+                    backend
+                        .models()
+                        .into_iter()
+                        .find(|model| model.id == thread.model),
+                    tools_enabled && backend.supports_steering(),
+                )
+            } else {
+                (
+                    self.resolve_provider(&thread.model)
+                        .ok()
+                        .and_then(|(provider, _)| {
+                            provider
+                                .models()
+                                .into_iter()
+                                .find(|model| model.id == thread.model)
+                        }),
+                    false,
+                )
+            };
+        if selected_model.is_some() {
+            normalize_thinking_option(&mut model_options, selected_model.as_ref());
+        }
+        let thinking_level = resolved_thinking_level(&model_options, selected_model.as_ref());
+        Ok(vec![
+            Event::TurnStarted {
+                turn,
+                mode: thread.mode.clone(),
+                model: thread.model.clone(),
+                thinking_level,
+                supports_steering,
+            },
+            Event::UserMessage {
+                turn,
+                content: prompt.content.clone(),
+                attachments: prompt.attachments.clone(),
+            },
+        ])
+    }
+
+    /// Append user guidance to the exact backend turn currently running on a
+    /// thread. The backend loop owns acceptance and durable ordering so a
+    /// steer cannot jump ahead of output already received from the vendor.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<trouve_protocol::SteerAccepted, EngineError> {
+        let thread = self.get_thread(thread_id)?;
+        if self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
+        if content.trim().is_empty() && uploads.is_empty() {
+            return Err(EngineError::BadRequest(
+                "a steering message needs text or an attachment".into(),
+            ));
+        }
+        // The registration belongs to the exact running turn and is the
+        // capability authority. Do not re-read the thread's selected model:
+        // an API client can change that selection while the previous model's
+        // turn is still unwinding, but steering must still target that turn.
+        let active = self
+            .turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
+            })?;
+        let (prepared, attachment_cleanup) = self.prepare_attachments(uploads)?;
+        let attachments = prepared
+            .iter()
+            .map(|(attachment, _)| attachment.clone())
+            .collect::<Vec<_>>();
+        let attachment_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect();
+        let (response, accepted) = tokio::sync::oneshot::channel();
+        if active
+            .sender
+            .send(SteerTurnCommand {
+                content,
+                attachments,
+                attachment_rows,
+                attachment_cleanup,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return Err(EngineError::Conflict(format!(
+                "turn {} finished before it could be steered",
+                active.turn
+            )));
+        }
+        match accepted.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(EngineError::Conflict(error));
+            }
+            Err(_) => {
+                return Err(EngineError::Conflict(format!(
+                    "turn {} finished before steering was acknowledged",
+                    active.turn
+                )));
+            }
+        }
+        Ok(trouve_protocol::SteerAccepted {
+            thread_id: thread_id.to_string(),
+            turn: active.turn,
+        })
     }
 
     fn send_message_with_tools(
@@ -4624,32 +7468,182 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
         tools_enabled: bool,
+        allow_spawned: bool,
     ) -> Result<TurnAccepted, EngineError> {
-        self.get_thread(thread_id)?; // 404 for unknown threads
-        let attachments = self.save_attachments(thread_id, uploads)?;
-        self.store
-            .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
-        self.emit_queue(thread_id)?;
-        let turn = self.dispatch_queue(thread_id)?;
+        let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        if !allow_spawned && self.subagent_is_read_only(&thread)? {
+            return Err(EngineError::Conflict(
+                "this subagent uses a read-only exploration, audit, or review mode".into(),
+            ));
+        }
+        let (prepared, mut attachment_cleanup) = self.prepare_attachments(uploads)?;
+        let attachments = prepared
+            .iter()
+            .map(|(attachment, _)| attachment.clone())
+            .collect::<Vec<_>>();
+        let attachment_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+        let mut active = self.active_threads.lock().unwrap();
+        if self
+            .deleting_sessions
+            .lock()
+            .unwrap()
+            .contains(&thread.session_id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
+
+        let position = self.store.next_queued_prompt_position(thread_id)?;
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: format!("qp_{}", uuid::Uuid::new_v4().simple()),
+            thread_id: thread_id.to_string(),
+            position,
+            content,
+            attachments,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let mut visible_queue = self.store.queued_prompts(thread_id)?;
+        visible_queue.push(prompt.clone());
+        visible_queue.sort_by_key(|candidate| candidate.position);
+
+        if active.contains_key(thread_id) {
+            let cancelling = self
+                .turn_cancels
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+            if cancelling {
+                self.resume_after_cancel
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.to_string());
+            }
+            let queued_prompt = prompt.clone();
+            let result = self.store.accept_prompt_with_events(
+                PromptAcceptance {
+                    prompt,
+                    tools_enabled,
+                    attachments: attachment_rows,
+                    claim_prompt_id: None,
+                    expected_previous_turn: None,
+                    staging_cleanup_claim: attachment_cleanup.claim(),
+                },
+                vec![(
+                    Scope::Thread(thread_id.to_string()),
+                    Event::QueueUpdated {
+                        prompts: visible_queue,
+                    },
+                )],
+            );
+            drop(active);
+            drop(activity_publication);
+            if let Err(error) = result {
+                return Err(error.into());
+            }
+            attachment_cleanup.disarm();
+            return Ok(TurnAccepted {
+                thread_id: thread_id.to_string(),
+                turn: 0,
+                queued: true,
+                queued_prompt: Some(queued_prompt),
+            });
+        }
+
+        let started_prompt = visible_queue.remove(0);
+        let started_tools_enabled = if started_prompt.id == prompt.id {
+            tools_enabled
+        } else {
+            self.store.queued_prompt_tools_enabled(&started_prompt.id)?
+        };
+        let previous_turn = self.store.last_turn(thread_id)?;
+        let turn = previous_turn + 1;
+        let session_woke = !active
+            .values()
+            .any(|session_id| session_id == &thread.session_id);
+        let mut events = Vec::with_capacity(if session_woke { 4 } else { 3 });
+        if session_woke {
+            let workspace_id = self
+                .store
+                .session(&thread.session_id)?
+                .map(|session| session.workspace_id)
+                .unwrap_or_default();
+            events.push((
+                Scope::Server,
+                Event::SessionActivity {
+                    session_id: thread.session_id.clone(),
+                    workspace_id,
+                    active: true,
+                },
+            ));
+        }
+        events.push((
+            Scope::Thread(thread_id.to_string()),
+            Event::QueueUpdated {
+                prompts: visible_queue,
+            },
+        ));
+        events.extend(
+            self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled)?
+                .into_iter()
+                .map(|event| (Scope::Thread(thread_id.to_string()), event)),
+        );
+
+        active.insert(thread_id.to_string(), thread.session_id.clone());
+        let cancel = self.register_cancel(thread_id);
+        let accepted = self.store.accept_prompt_with_events(
+            PromptAcceptance {
+                prompt,
+                tools_enabled,
+                attachments: attachment_rows,
+                claim_prompt_id: Some(started_prompt.id.clone()),
+                expected_previous_turn: Some(previous_turn),
+                staging_cleanup_claim: attachment_cleanup.claim(),
+            },
+            events,
+        );
+        if let Err(error) = accepted {
+            active.remove(thread_id);
+            self.clear_cancel(thread_id);
+            drop(active);
+            drop(activity_publication);
+            return Err(error.into());
+        }
+        drop(active);
+        drop(activity_publication);
+        attachment_cleanup.disarm();
+        self.spawn_claimed_prompt(thread, turn, started_prompt, cancel, true);
         Ok(TurnAccepted {
             thread_id: thread_id.to_string(),
-            turn: turn.unwrap_or(0),
-            queued: turn.is_none(),
+            turn,
+            queued: false,
+            queued_prompt: None,
         })
     }
 
-    /// Decode and persist prompt uploads under `data_dir/attachments`,
-    /// recording each in the store. Rejects the whole message on a bad or
-    /// oversized attachment — better than silently dropping a file the
-    /// prompt refers to.
-    fn save_attachments(
+    /// Decode uploads and write their opaque files without touching SQLite.
+    /// Ordinary sends pass these records to the event writer so attachment
+    /// indexing and prompt acceptance share one durable transaction.
+    fn prepare_attachments(
         &self,
-        thread_id: &str,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
-    ) -> Result<Vec<trouve_protocol::Attachment>, EngineError> {
+    ) -> Result<
+        (
+            Vec<(trouve_protocol::Attachment, PathBuf)>,
+            PreparedAttachmentCleanup,
+        ),
+        EngineError,
+    > {
         use base64::Engine as _;
-        const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-        let mut out = Vec::new();
+        validate_attachment_uploads(&uploads)?;
+        let mut decoded = Vec::new();
         let dir = self.data_dir.join("attachments");
         for up in uploads {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -4657,20 +7651,7 @@ impl Engine {
                 .map_err(|e| {
                     EngineError::BadRequest(format!("attachment {}: invalid base64: {e}", up.name))
                 })?;
-            if bytes.is_empty() {
-                return Err(EngineError::BadRequest(format!(
-                    "attachment {} is empty",
-                    up.name
-                )));
-            }
-            if bytes.len() > MAX_ATTACHMENT_BYTES {
-                return Err(EngineError::BadRequest(format!(
-                    "attachment {} exceeds {} MB",
-                    up.name,
-                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
-                )));
-            }
-            std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+            debug_assert!(!bytes.is_empty() && bytes.len() <= MAX_ATTACHMENT_BYTES);
             let id = format!("at_{}", uuid::Uuid::new_v4().simple());
             // Store under the opaque id; keep the (sanitized) extension so
             // tools and vendor CLIs sniff the type naturally.
@@ -4681,52 +7662,119 @@ impl Engine {
                 .map(|e| format!(".{}", e.to_ascii_lowercase()))
                 .unwrap_or_default();
             let path = dir.join(format!("{id}{ext}"));
-            std::fs::write(&path, &bytes).map_err(anyhow::Error::from)?;
             let attachment = trouve_protocol::Attachment {
                 id,
                 name: up.name,
                 mime: up.mime,
                 size_bytes: bytes.len() as u64,
             };
-            self.store
-                .add_attachment(thread_id, &attachment, &path.to_string_lossy())?;
-            out.push(attachment);
+            decoded.push((attachment, path, bytes));
         }
-        Ok(out)
+        let paths = decoded
+            .iter()
+            .map(|(_, path, _)| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // Record every intended path before the first write. If the process
+        // exits after creation but before prompt ownership commits, the
+        // durable job becomes retryable when its preparation lease expires.
+        let cleanup_job = self.store.stage_attachment_cleanup(paths)?;
+        let mut cleanup = PreparedAttachmentCleanup::new(
+            self.store.clone(),
+            self.executor.clone(),
+            dir.clone(),
+            decoded.iter().map(|(_, path, _)| path.clone()).collect(),
+            cleanup_job.and_then(|job| job.claim()),
+        );
+        for (_, path, bytes) in &decoded {
+            self.executor
+                .prepare_attachment_file(&dir, path, bytes)
+                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        }
+        let prepared = decoded
+            .into_iter()
+            .map(|(attachment, path, _)| (attachment, path))
+            .collect();
+        // The caller disarms only after deleting the staging job in the same
+        // transaction that establishes durable attachment ownership.
+        cleanup.armed = true;
+        Ok((prepared, cleanup))
     }
 
-    /// Metadata and stored file for one attachment (serves
+    /// Metadata and verified bytes for one attachment (serves
     /// `GET /v1/attachments/{id}`).
-    pub fn attachment(
+    pub async fn attachment(
         &self,
         id: &str,
-    ) -> Result<(trouve_protocol::Attachment, PathBuf), EngineError> {
+    ) -> Result<(trouve_protocol::Attachment, Vec<u8>), EngineError> {
         let (attachment, path) = self
             .store
             .attachment(id)?
             .ok_or_else(|| EngineError::NotFound(format!("attachment {id}")))?;
-        Ok((attachment, PathBuf::from(path)))
+        let bytes = self
+            .executor
+            .read_attachment_file(
+                &self.data_dir.join("attachments"),
+                Path::new(&path),
+                attachment.size_bytes,
+            )
+            .await
+            .map_err(|error| EngineError::NotFound(format!("attachment {id}: {error}")))?;
+        Ok((attachment, bytes))
     }
 
-    /// Look up the stored file behind each attachment; rows that vanished
-    /// (e.g. a pruned data dir) are dropped with a warning rather than
-    /// failing the turn.
+    /// Resolve durable rows to executor inputs without inspecting or opening
+    /// the host filesystem in the engine.
     fn resolve_attachments(
         &self,
         attachments: &[trouve_protocol::Attachment],
-    ) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
+    ) -> Result<Vec<AttachmentMaterializationFile>, EngineError> {
         attachments
             .iter()
-            .filter_map(|a| match self.store.attachment(&a.id) {
-                Ok(Some((meta, path))) if Path::new(&path).exists() => {
-                    Some((meta, PathBuf::from(path)))
+            .map(|attachment| match self.store.attachment(&attachment.id)? {
+                Some((metadata, path)) if metadata == *attachment => {
+                    Ok(AttachmentMaterializationFile {
+                        attachment: metadata,
+                        source: PathBuf::from(path),
+                    })
                 }
-                _ => {
-                    tracing::warn!("attachment {} ({}) missing; skipped", a.id, a.name);
-                    None
-                }
+                Some(_) => Err(EngineError::Conflict(format!(
+                    "attachment {} metadata changed after prompt acceptance",
+                    attachment.id
+                ))),
+                None => Err(EngineError::NotFound(format!(
+                    "attachment {}",
+                    attachment.id
+                ))),
             })
             .collect()
+    }
+
+    async fn materialize_attachments_for_turn(
+        &self,
+        session: &Session,
+        attachments: &[trouve_protocol::Attachment],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<MaterializedAttachment>, EngineError> {
+        let files = self.resolve_attachments(attachments)?;
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lane = self.tool_execution_lock(&session.id);
+        let _mutation = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(EngineError::Conflict("turn cancelled".into())),
+            permit = lane.write_owned() => permit,
+        };
+        self.executor
+            .materialize_attachments(&AttachmentMaterialization {
+                source_root: self.data_dir.join("attachments"),
+                managed_worktree_root: self.data_dir.join("worktrees"),
+                worktree: PathBuf::from(&session.worktree_path),
+                files,
+                cancel: cancel.clone(),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -4749,38 +7797,258 @@ impl Engine {
         Ok(self.store.queued_prompts(thread_id)?)
     }
 
-    pub fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<(), EngineError> {
+    pub fn update_queued_prompt(
+        &self,
+        prompt_id: &str,
+        request: trouve_protocol::UpdateQueuedPromptRequest,
+    ) -> Result<(), EngineError> {
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
-        if !self.store.update_queued_prompt(prompt_id, content)? {
-            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        let thread = self.get_thread(&thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
         }
-        self.emit_queue(&thread_id)
+        let prompt = self
+            .store
+            .queued_prompts(&thread_id)?
+            .into_iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+
+        let original_attachments = prompt.attachments;
+        let mut attachments = if let Some(retained_ids) = request.retained_attachment_ids {
+            let by_id: std::collections::HashMap<_, _> = original_attachments
+                .iter()
+                .cloned()
+                .map(|attachment| (attachment.id.clone(), attachment))
+                .collect();
+            let mut retained = Vec::with_capacity(retained_ids.len());
+            let mut seen = std::collections::HashSet::with_capacity(retained_ids.len());
+            for id in retained_ids {
+                if !seen.insert(id.clone()) {
+                    return Err(EngineError::BadRequest(format!(
+                        "queued attachment {id} was retained more than once"
+                    )));
+                }
+                retained.push(by_id.get(&id).cloned().ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "attachment {id} does not belong to queued prompt {prompt_id}"
+                    ))
+                })?);
+            }
+            retained
+        } else {
+            original_attachments.clone()
+        };
+        let retained_ids = attachments
+            .iter()
+            .map(|attachment| attachment.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let removed_ids = original_attachments
+            .iter()
+            .filter(|attachment| !retained_ids.contains(attachment.id.as_str()))
+            .map(|attachment| attachment.id.clone())
+            .collect::<Vec<_>>();
+
+        let (prepared, mut added_cleanup) = self.prepare_attachments(request.attachments)?;
+        attachments.extend(prepared.iter().map(|(attachment, _)| attachment.clone()));
+        let added_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        let Some(cleanup_job) = self.store.update_queued_prompt_attachments(
+            prompt_id,
+            &request.content,
+            &attachments,
+            &added_rows,
+            &removed_ids,
+            added_cleanup.claim().as_ref(),
+        )?
+        else {
+            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        };
+        added_cleanup.disarm();
+        if let Some(cleanup_job) = cleanup_job {
+            self.schedule_artifact_cleanup(cleanup_job);
+        }
+        let result = self.emit_queue(&thread_id);
+        drop(deleting);
+        result
     }
 
     pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
-        if !self.store.delete_queued_prompt(prompt_id)? {
-            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        let thread = self.get_thread(&thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
         }
-        self.emit_queue(&thread_id)
+        let Some((thread_id, cleanup_job)) =
+            self.store.delete_queued_prompt_attachments(prompt_id)?
+        else {
+            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        };
+        if let Some(cleanup_job) = cleanup_job {
+            self.schedule_artifact_cleanup(cleanup_job);
+        }
+        let result = self.emit_queue(&thread_id);
+        drop(deleting);
+        result
     }
 
     /// Apply a full new order for the thread's queue. `ids` must name every
     /// currently queued prompt exactly once.
     pub fn reorder_queue(&self, thread_id: &str, ids: &[String]) -> Result<(), EngineError> {
-        self.get_thread(thread_id)?;
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+        let thread = self.get_thread(thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
         if !self.store.reorder_queued_prompts(thread_id, ids)? {
             return Err(EngineError::Conflict(
                 "queue changed while reordering; refresh and retry".into(),
             ));
         }
-        self.emit_queue(thread_id)
+        let result = self.emit_queue(thread_id);
+        drop(deleting);
+        result
+    }
+
+    /// Prioritize one queued prompt and run it next. If a turn still owns the
+    /// thread, interrupt that turn and explicitly resume the dispatcher after
+    /// its terminal event; otherwise claim and start the selected prompt now.
+    pub fn dispatch_queued_prompt(
+        self: &Arc<Self>,
+        prompt_id: &str,
+    ) -> Result<TurnAccepted, EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+        let mut active = self.active_threads.lock().unwrap();
+        if self
+            .deleting_sessions
+            .lock()
+            .unwrap()
+            .contains(&thread.session_id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
+
+        let turn_running = active.contains_key(&thread_id);
+        let turn_cancel = if turn_running {
+            Some(
+                self.turn_cancels
+                    .lock()
+                    .unwrap()
+                    .get(&thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::Conflict(format!(
+                            "thread {thread_id} is between interruptible turns"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let original_order = self
+            .store
+            .queued_prompts(&thread_id)?
+            .into_iter()
+            .map(|prompt| prompt.id)
+            .collect::<Vec<_>>();
+        let prompt = self
+            .store
+            .prioritize_queued_prompt(prompt_id, !turn_running)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        if turn_running {
+            // The dispatcher owns the active-thread claim until it publishes
+            // the cancelled turn. Mark the explicit resume before tripping
+            // the token so it will claim the newly prioritized prompt next.
+            self.resume_after_cancel
+                .lock()
+                .unwrap()
+                .insert(thread_id.clone());
+            if let Err(error) = self.emit_queue(&thread_id) {
+                self.resume_after_cancel.lock().unwrap().remove(&thread_id);
+                if !self
+                    .store
+                    .reorder_queued_prompts(&thread_id, &original_order)?
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "queue changed while rolling back failed priority publication for {prompt_id}"
+                    )));
+                }
+                return Err(error);
+            }
+            drop(active);
+            drop(activity_publication);
+            turn_cancel
+                .expect("an active thread must have an interrupt token")
+                .cancel();
+            return Ok(TurnAccepted {
+                thread_id,
+                turn: 0,
+                queued: true,
+                queued_prompt: Some(prompt),
+            });
+        }
+
+        let session_woke = !active.values().any(|session| *session == thread.session_id);
+        active.insert(thread_id.clone(), thread.session_id.clone());
+        let cancel = self.register_cancel(&thread_id);
+        drop(active);
+        let turn = match self.launch_claimed_prompt(
+            thread,
+            prompt,
+            session_woke,
+            cancel,
+            activity_publication,
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                if !self
+                    .store
+                    .reorder_queued_prompts(&thread_id, &original_order)?
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "queue changed while rolling back failed priority dispatch for {prompt_id}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        Ok(TurnAccepted {
+            thread_id,
+            turn,
+            queued: false,
+            queued_prompt: None,
+        })
     }
 
     /// Start draining the thread's queue if it's idle — the "Send now"
@@ -4793,9 +8061,10 @@ impl Engine {
     pub fn dispatch_queue(self: &Arc<Self>, thread_id: &str) -> Result<Option<u64>, EngineError> {
         let thread = self.get_thread(thread_id)?;
         let activity_publication = self.session_activity_publication.lock().unwrap();
+        let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         // Claim the thread and take the queue front atomically so two
         // concurrent sends can't both start a dispatcher.
-        let (prompt, session_woke) = {
+        let (prompt, session_woke, cancel) = {
             let mut active = self.active_threads.lock().unwrap();
             if self
                 .deleting_sessions
@@ -4833,11 +8102,28 @@ impl Engine {
             };
             let was_active = active.values().any(|s| *s == thread.session_id);
             active.insert(thread_id.to_string(), thread.session_id.clone());
-            (p, !was_active)
+            let cancel = self.register_cancel(thread_id);
+            (p, !was_active, cancel)
         };
+        self.launch_claimed_prompt(thread, prompt, session_woke, cancel, activity_publication)
+            .map(Some)
+    }
+
+    /// Complete setup for a prompt already claimed under the active-thread
+    /// lock and launch its queue-draining task.
+    fn launch_claimed_prompt(
+        self: &Arc<Self>,
+        thread: Thread,
+        prompt: trouve_protocol::QueuedPrompt,
+        session_woke: bool,
+        cancel: tokio_util::sync::CancellationToken,
+        activity_publication: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<u64, EngineError> {
+        let thread_id = thread.id.clone();
         if session_woke && let Err(error) = self.emit_session_activity(&thread.session_id, true) {
             let prompt_release = self.store.release_queued_prompt(&prompt.id);
-            self.active_threads.lock().unwrap().remove(thread_id);
+            self.active_threads.lock().unwrap().remove(&thread_id);
+            self.clear_cancel(&thread_id);
             drop(activity_publication);
             prompt_release?;
             return Err(error);
@@ -4845,33 +8131,46 @@ impl Engine {
         drop(activity_publication);
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
-        if let Err(e) = self.emit_queue(thread_id) {
+        if let Err(e) = self.emit_queue(&thread_id) {
             let _ = self.store.release_queued_prompt(&prompt.id);
-            self.release_thread(thread_id)?;
+            self.clear_cancel(&thread_id);
+            self.release_thread(&thread_id)?;
             return Err(e);
         }
-        let turn = match self.store.next_turn(thread_id) {
+        let turn = match self.store.next_turn(&thread_id) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.store.release_queued_prompt(&prompt.id);
-                self.release_thread(thread_id)?;
+                self.clear_cancel(&thread_id);
+                self.release_thread(&thread_id)?;
                 return Err(e.into());
             }
         };
-        // Register cancellation before returning from dispatch so an
-        // immediate cancel cannot race the spawned turn task.
-        let cancel = self.register_cancel(thread_id);
+        self.spawn_claimed_prompt(thread, turn, prompt, cancel, false);
+        Ok(turn)
+    }
+
+    fn spawn_claimed_prompt(
+        self: &Arc<Self>,
+        thread: Thread,
+        turn: u64,
+        prompt: trouve_protocol::QueuedPrompt,
+        cancel: tokio_util::sync::CancellationToken,
+        prompt_persisted: bool,
+    ) {
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
-            if let Err(error) = engine.drain_queue(thread, turn, prompt, cancel).await {
+            if let Err(error) = engine
+                .drain_queue(thread, turn, prompt, cancel, prompt_persisted)
+                .await
+            {
                 // A terminal or activity event failed to persist. The
                 // transition keeps or restores the active claim so no later
                 // turn can overtake the unrecorded state.
                 tracing::error!("turn dispatcher for {thread_id} retained its claim: {error:#}");
             }
         });
-        Ok(Some(turn))
     }
 
     /// Run `content` as `turn`, then keep pulling queued prompts until the
@@ -4883,19 +8182,27 @@ impl Engine {
         turn: u64,
         prompt: trouve_protocol::QueuedPrompt,
         first_cancel: tokio_util::sync::CancellationToken,
+        first_prompt_persisted: bool,
     ) -> Result<()> {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
-        let mut first_cancel = Some(first_cancel);
+        let mut turn_cancel = Some(first_cancel);
+        let mut shell_persisted = first_prompt_persisted;
         loop {
-            let cancel = first_cancel
+            let cancel = turn_cancel
                 .take()
-                .unwrap_or_else(|| self.register_cancel(&thread.id));
-            let result =
-                std::panic::AssertUnwindSafe(self.run_turn(&thread, turn, &prompt, cancel.clone()))
-                    .catch_unwind()
-                    .await;
+                .expect("an active queue prompt must have a cancellation token");
+            let prompt_persisted = AtomicBool::new(shell_persisted);
+            let result = std::panic::AssertUnwindSafe(self.run_turn(
+                &thread,
+                turn,
+                &prompt,
+                cancel.clone(),
+                &prompt_persisted,
+            ))
+            .catch_unwind()
+            .await;
             let result = match result {
                 Ok(result) => result,
                 Err(_) => {
@@ -4921,11 +8228,60 @@ impl Engine {
                     return Ok(());
                 }
             };
-            let outcome_error = result.as_ref().err().map(ToString::to_string);
-            self.turn_scheduler
-                .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
-            if let Err(e) = result {
+            if !cancelled {
+                let outcome_error = result.as_ref().err().map(ToString::to_string);
+                self.turn_scheduler
+                    .record_outcome(&thread.model, outcome_error.as_deref());
+            }
+            // Cancellation wins a race with startup/stream errors only after
+            // run_turn has returned, which is the adapter/tool acknowledgement
+            // that its bounded cleanup is complete. Never publish both failed
+            // and cancelled terminal states for one turn.
+            if cancelled {
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        "turn {turn} of {} returned during cancellation cleanup: {error}",
+                        thread.id
+                    );
+                }
+                // A cancellation can arrive before run_turn consumes the
+                // claimed queue row. Remove it here as an idempotent fallback.
+                let _ = self.store.finish_queued_prompt(&prompt.id);
+                let mut terminal_events = Vec::with_capacity(3);
+                if !prompt_persisted.load(Ordering::Acquire) {
+                    // Cancellation becomes available as soon as dispatch is
+                    // claimed, before provider discovery or scheduler waits
+                    // can publish the display events. Preserve the claimed
+                    // prompt even when cancellation wins that startup race.
+                    terminal_events.extend([
+                        Event::TurnStarted {
+                            turn,
+                            mode: thread.mode.clone(),
+                            model: thread.model.clone(),
+                            thinking_level: None,
+                            supports_steering: false,
+                        },
+                        Event::UserMessage {
+                            turn,
+                            content: prompt.content.clone(),
+                            attachments: prompt.attachments.clone(),
+                        },
+                    ]);
+                }
+                terminal_events.push(Event::TurnCancelled { turn });
+                self.store
+                    .append_events_async(Scope::Thread(thread.id.clone()), terminal_events)
+                    .await
+                    .with_context(|| {
+                        format!("persisting cancellation for turn {turn} of {}", thread.id)
+                    })?;
+                let resume = self.finish_interrupted_turn(&thread.id)?;
+                if !resume {
+                    return Ok(());
+                }
+            }
+            let resume_after_failure = if !cancelled && let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 self.store
                     .append_event(
@@ -4938,50 +8294,43 @@ impl Engine {
                     .with_context(|| {
                         format!("persisting failure for turn {turn} of {}", thread.id)
                     })?;
-                self.clear_cancel(&thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
-                self.release_thread(&thread.id)?;
-                return Ok(());
-            }
-            if cancelled {
-                // A user-cancelled turn normally pauses the queue (like a
-                // failure, but not an error). A prompt submitted after the
-                // cancel request is itself an explicit resume, though.
-                // Publish the terminal event before making that decision so
-                // a subsequent turn cannot overtake it in the event log.
-                self.store
-                    .append_event(
-                        Scope::Thread(thread.id.clone()),
-                        Event::TurnCancelled { turn },
-                    )
-                    .with_context(|| {
-                        format!("persisting cancellation for turn {turn} of {}", thread.id)
-                    })?;
-                // Decide atomically with releasing the active claim so a
-                // racing send cannot be stranded between the two.
-                let resume = self.finish_cancelled_turn(&thread.id)?;
+                let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
                 }
+                true
             } else {
-                self.clear_cancel(&thread.id);
-            }
+                false
+            };
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
-            let next = {
+            let (next, next_cancel) = {
                 let _activity_publication = self.session_activity_publication.lock().unwrap();
-                let (next, idle_session) = {
+                let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
+                let (next, next_cancel, idle_session) = {
                     let mut active = self.active_threads.lock().unwrap();
+                    if !resume_after_failure && !cancelled {
+                        self.clear_cancel(&thread.id);
+                    }
                     match self.store.claim_queued_prompt(&thread.id) {
-                        Ok(Some(p)) => (Some(p), None),
-                        _ => (None, Self::remove_thread_claim(&mut active, &thread.id)),
+                        Ok(Some(prompt)) => {
+                            let cancel = self.register_cancel(&thread.id);
+                            (Some(prompt), Some(cancel), None)
+                        }
+                        _ => (
+                            None,
+                            None,
+                            Self::remove_thread_claim(&mut active, &thread.id),
+                        ),
                     }
                 };
                 self.publish_idle_or_restore(&thread.id, idle_session)?;
-                next
+                (next, next_cancel)
             };
             let Some(next) = next else { return Ok(()) };
+            turn_cancel = next_cancel;
             let _ = self.emit_queue(&thread.id);
             // Thread settings may have changed between turns.
             if let Ok(t) = self.get_thread(&thread.id) {
@@ -4998,6 +8347,7 @@ impl Engine {
                 }
             };
             prompt = next;
+            shell_persisted = false;
         }
     }
 
@@ -5045,6 +8395,7 @@ impl Engine {
 
     /// Register a fresh cancellation token for a turn about to run.
     fn register_cancel(&self, thread_id: &str) -> tokio_util::sync::CancellationToken {
+        self.bridged_tool_owners.begin_root(thread_id);
         let token = tokio_util::sync::CancellationToken::new();
         self.turn_cancels
             .lock()
@@ -5056,18 +8407,22 @@ impl Engine {
     fn clear_cancel(&self, thread_id: &str) {
         self.turn_cancels.lock().unwrap().remove(thread_id);
         self.resume_after_cancel.lock().unwrap().remove(thread_id);
+        self.bridged_tool_owners.clear_root(thread_id);
     }
 
-    /// Finish a cancelled turn while coordinating with sends that may be
+    /// Finish a cancelled or failed turn while coordinating with dispatches
     /// waiting on the same active-thread claim. Returns true when one of
-    /// those sends requested that the queue continue draining.
-    fn finish_cancelled_turn(&self, thread_id: &str) -> Result<bool, EngineError> {
+    /// those dispatches requested that the queue continue draining.
+    fn finish_interrupted_turn(&self, thread_id: &str) -> Result<bool, EngineError> {
         // Lock ordering matches `dispatch_queue`: activity publication,
         // active thread, cancel token, then resume marker.
         let _activity_publication = self.session_activity_publication.lock().unwrap();
         let (resume, idle_session) = {
             let mut active = self.active_threads.lock().unwrap();
-            let resume = self.resume_after_cancel.lock().unwrap().contains(thread_id);
+            let mut cancels = self.turn_cancels.lock().unwrap();
+            let mut resumes = self.resume_after_cancel.lock().unwrap();
+            let resume = resumes.remove(thread_id);
+            cancels.remove(thread_id);
             let idle_session = if resume {
                 None
             } else {
@@ -5075,15 +8430,15 @@ impl Engine {
             };
             (resume, idle_session)
         };
+        self.bridged_tool_owners.clear_root(thread_id);
         self.publish_idle_or_restore(thread_id, idle_session)?;
-        self.clear_cancel(thread_id);
         Ok(resume)
     }
 
-    /// Interrupt the turn currently running on a thread. Trips its
-    /// cancellation token, which stops the provider stream, in-flight tool
-    /// call, or approval wait at the next await point. No-op error when the
-    /// thread has no running turn.
+    /// Interrupt the turn currently running on a thread. The request only
+    /// trips its shared token; the dispatcher publishes `turn.cancelled`
+    /// after provider/tool cleanup acknowledges that no stale work can race
+    /// a replacement turn. No-op error when the thread has no running turn.
     pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
         match self.turn_cancels.lock().unwrap().get(thread_id) {
             Some(token) => {
@@ -5121,10 +8476,20 @@ impl Engine {
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
+        prompt_persisted: &AtomicBool,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
+        if !prompt_persisted.load(Ordering::Acquire) {
+            self.store
+                .append_events_async(
+                    Scope::Thread(thread.id.clone()),
+                    self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
+                )
+                .await?;
+            prompt_persisted.store(true, Ordering::Release);
+        }
         let session = self
             .store
             .session(&thread.session_id)?
@@ -5135,22 +8500,43 @@ impl Engine {
             .context("workspace vanished")?;
         let scope = Scope::Thread(thread.id.clone());
         let worktree = PathBuf::from(&session.worktree_path);
+        let canonical_worktree = worktree.canonicalize()?;
         let ctx = ToolCtx {
+            cancel: cancel.clone(),
             worktree: worktree.clone(),
+            canonical_worktree: Some(canonical_worktree),
+            read_only_roots: crate::skills::trusted_read_roots(
+                self.config_dir.as_deref(),
+                Some(Path::new(&ws.path)),
+            )
+            .into(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            edit_strategy: edit_strategy_for_model(&thread.model),
+            background_mutation_lease: None,
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        // A turn owns only a shared session lifecycle lease. Sibling turns in
+        // the same worktree may reason and invoke tools concurrently; the
+        // narrower tool-execution lane is the authority that serializes
+        // actual mutations. Exclusive lifecycle operations still wait for
+        // every active turn.
+        let session_lifecycle = self.session_lock(&session.id);
+        let _session_lifecycle_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = session_lifecycle.read() => guard,
+        };
         let background = self.store.is_code_review_thread(&thread.id)?;
         let turn_capacity = self
             .turn_scheduler
-            .acquire(&thread.model, background)
+            .acquire(&thread.model, background, &cancel)
             .await?;
         if background
             && let Some(progress) = self
@@ -5159,39 +8545,22 @@ impl Engine {
         {
             self.emit_code_review_task_progress(progress).await?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnCapacityAcquired {
-                turn,
-                wait_ms: turn_capacity.wait_ms,
-                background,
-            },
-        )?;
+        self.store
+            .append_event_async(
+                scope.clone(),
+                Event::TurnCapacityAcquired {
+                    turn,
+                    wait_ms: turn_capacity.wait_ms,
+                    background,
+                },
+            )
+            .await?;
 
-        // Serialize worktree mutations across the session's threads while
-        // allowing ordinary read-only siblings (review, plan, question) to
-        // run together. Agent-spawned read-only children retain their
-        // lock-free exception so they can inspect while a writing parent
-        // holds the write guard; that pre-existing trade-off is what makes
-        // spawn_thread fan-out usable from code mode.
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
-        let lock = self.session_lock(&session.id);
-        let _read_guard;
-        let _write_guard;
-        if concurrent_child {
-            _read_guard = None;
-            _write_guard = None;
-        } else if mode.read_only {
-            _read_guard = Some(lock.read().await);
-            _write_guard = None;
-        } else {
-            _read_guard = None;
-            _write_guard = Some(lock.write().await);
-        }
         let _turn_capacity = turn_capacity;
 
         // External agent backend? The vendor harness owns the loop; we
-        // stream its events and bridge approvals. (Session lock stays held.)
+        // stream its events and bridge approvals. The shared lifecycle lease
+        // stays held; mutation tools take the exclusive execution lane.
         if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
@@ -5204,7 +8573,6 @@ impl Engine {
                     model_name,
                     content,
                     attachments,
-                    concurrent_child,
                     cancel,
                     &prompt.id,
                     tools_enabled,
@@ -5216,37 +8584,19 @@ impl Engine {
             .resolve_provider(&thread.model)
             .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = provider.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
-
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-            },
-        )?;
-        // Show the prompt in the UI before any slow pre-turn work:
-        // compaction below can block for a while (its model probe may even
-        // spawn the local llama-server and load a model).
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
+        let model_catalog = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            models = provider.list_models() => models,
+        };
+        let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
+        normalize_thinking_option(&mut model_options, selected_model);
 
         // Compact the transcript when it nears the model's context window,
         // before this turn's user message joins it (the stored transcript —
         // the event above is display-only).
         if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name)
+            .maybe_compact(thread, turn, &provider, &model_name, &cancel)
             .await
         {
             // Compaction is best-effort; the turn proceeds with full history.
@@ -5257,26 +8607,33 @@ impl Engine {
         // follow. Copy them into the worktree first: the file tools reject
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
-        let resolved = self.resolve_attachments(&attachments);
-        let materialized = materialize_attachments(&worktree, &resolved);
-        let content = annotate_attachments(content, &materialized);
+        let materialized = self
+            .materialize_attachments_for_turn(&session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let content = annotate_attachments(content, &prompt_files);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
-        self.emit_queue(&thread.id)?;
 
         // Tool policy: empty allowed_tools = all registered tools. Engine-
         // served tools are added only when tools_enabled is true; tool-free
         // JSON-repair turns receive no tools.
         let mut specs: Vec<ToolSpec> = if tools_enabled {
-            self.executor
-                .specs(&ctx)
-                .await
-                .into_iter()
-                .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
-                .collect()
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("turn cancelled"),
+                specs = self.executor.specs(&ctx) => specs,
+            }
+            .into_iter()
+            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .collect()
         } else {
             Vec::new()
         };
@@ -5284,14 +8641,13 @@ impl Engine {
             specs.push(ask_question_spec());
             specs.push(search_transcript_spec());
         }
-        // Spawn tools are for top-level agents only: children don't get to
-        // spawn grandchildren (also enforced at execution). They also respect
-        // the mode's tool policy, so restrictive/read-only modes that don't
-        // list them can't create branches or child agents.
+        // Recursive spawn tools remain bounded by the durable tree depth and
+        // also respect the mode policy, so restrictive/read-only modes that
+        // do not list them cannot create child agents.
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
         };
-        if tools_enabled && self.store.spawn_parent(&thread.id)?.is_none() {
+        if tools_enabled && self.thread_can_spawn_subagents(&thread.id)? {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
@@ -5304,7 +8660,11 @@ impl Engine {
         }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
-        let live_models = provider.list_models().await;
+        let live_models = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            models = provider.list_models() => models,
+        };
         let known_models = provider.models();
         let pricing_model = live_models
             .iter()
@@ -5329,11 +8689,14 @@ impl Engine {
             if let Some(cost) = cost {
                 usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
             }
+            if usage.context_window.is_some() {
+                usage_total.context_window = usage.context_window;
+            }
         };
-        // The last request's input size — the context-size proxy for
-        // compaction. Summing per-iteration inputs (usage_total) would
-        // over-count a multi-tool turn many-fold; the final request carries
-        // the whole transcript, so its input is what "context size" means.
+        // The last request's provider-authoritative context measurement.
+        // Summing per-iteration inputs (usage_total) would over-count a
+        // multi-tool turn many-fold; the final request carries the whole
+        // transcript, so its context size is the useful value.
         let mut context_input_tokens = 0u64;
         // Becomes false when the loop ends because the model stopped calling
         // tools (or was cancelled); stays true only if we exhaust the
@@ -5355,10 +8718,17 @@ impl Engine {
             // dangling tool_use/tool_call, which would wedge the thread.
             let messages = sanitize_transcript(messages);
 
-            let mut stream = provider
-                .stream_chat(&model_name, &messages, &specs, &model_options)
-                .await
-                .map_err(|e| anyhow!("provider error: {e}"))?;
+            let stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                stream = provider.stream_chat(&model_name, &messages, &specs, &model_options) => {
+                    Some(stream.map_err(|e| anyhow!("provider error: {e}"))?)
+                }
+            };
+            let Some(mut stream) = stream else {
+                hit_iteration_limit = false;
+                break;
+            };
             stream = trouve_providers::coalesce_event_stream(stream);
 
             let mut text = String::new();
@@ -5367,53 +8737,78 @@ impl Engine {
             // persist and replay verbatim — Anthropic rejects a follow-up
             // tool-use turn whose thinking blocks aren't preserved.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
+            let mut thinking_streamed = false;
+            let mut pending_events = Vec::new();
+            let mut persist_deadline = None;
             loop {
+                let flush_at = persist_deadline.unwrap_or_else(Instant::now);
                 let ev = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
-                    ev = stream.next() => match ev {
-                        Some(ev) => ev,
-                        None => break,
-                    },
+                    _ = cancel.cancelled() => None,
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
+                    ev = stream.next() => ev,
                 };
-                match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
+                let Some(ev) = ev else { break };
+                let event = match ev {
+                    Ok(event) => event,
+                    Err(error) => {
+                        flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                        return Err(anyhow!("provider stream error: {error}"));
+                    }
+                };
+                match event {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantDelta { turn, text: delta },
-                        )?;
+                        pending_events.push(Event::AssistantDelta { turn, text: delta });
                     }
                     // Display-only; never joins the provider transcript.
                     ProviderEvent::ThinkingDelta(delta) => {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantThinking { turn, text: delta },
-                        )?;
+                        thinking_streamed = true;
+                        pending_events.push(Event::AssistantThinking { turn, text: delta });
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
                     // carried in the transcript for replay only.
                     ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
-                    ProviderEvent::Completed { usage } => {
+                    ProviderEvent::Completed { mut usage } => {
+                        context_input_tokens = usage.context_input_tokens.unwrap_or_else(|| {
+                            usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                        });
+                        usage.context_input_tokens = Some(context_input_tokens);
                         accumulate_usage(&usage);
-                        context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+                        pending_events.push(Event::TurnUsageUpdated { turn, usage });
                     }
                 }
+                if pending_events.len() >= STREAM_EVENT_BATCH_MAX {
+                    flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                    persist_deadline = None;
+                } else if !pending_events.is_empty() && persist_deadline.is_none() {
+                    persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
+                }
             }
+            if thinking_streamed {
+                pending_events.push(Event::AssistantThinkingCompleted { turn });
+            }
+            flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
             // Interrupted mid-stream: keep any streamed text for display, but
             // drop the (unexecuted) tool calls so we don't strand tool_use
             // without results, and stop the turn.
             if cancel.is_cancelled() {
                 if !text.is_empty() {
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::AssistantMessage {
-                            turn,
-                            content: text.clone(),
-                        },
-                    )?;
+                    self.store
+                        .append_event_async(
+                            scope.clone(),
+                            Event::AssistantMessage {
+                                turn,
+                                content: text.clone(),
+                            },
+                        )
+                        .await?;
                     self.store.append_message(
                         &thread.id,
                         &serde_json::to_value(Message::Assistant {
@@ -5428,13 +8823,15 @@ impl Engine {
             }
 
             if !text.is_empty() {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::AssistantMessage {
-                        turn,
-                        content: text.clone(),
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::AssistantMessage {
+                            turn,
+                            content: text.clone(),
+                        },
+                    )
+                    .await?;
             }
             // Skip a fully-empty assistant message (no text, no tool calls —
             // e.g. a thinking-only or empty provider response): it serializes
@@ -5448,6 +8845,7 @@ impl Engine {
                 );
                 tool_calls.clear();
             }
+            normalize_tool_call_ids(&mut tool_calls);
             if !text.is_empty() || !tool_calls.is_empty() {
                 self.store.append_message(
                     &thread.id,
@@ -5464,14 +8862,22 @@ impl Engine {
                 break;
             }
 
-            for call in tool_calls {
-                let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
-                    .await?;
+            // Providers may request independent calls in one response. Poll
+            // them concurrently, but collect in provider order so the
+            // transcript remains valid for APIs that require ordered
+            // tool-result blocks. Tool events retain their real start and
+            // completion ordering through the durable event log.
+            let results = self
+                .handle_tool_calls_parallel(
+                    &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
+                )
+                .await;
+            for (call_id, result) in results {
+                let (result_content, images) = result?;
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::ToolResult {
-                        call_id: call.id.clone(),
+                        call_id,
                         content: result_content,
                         images,
                     })?,
@@ -5483,7 +8889,7 @@ impl Engine {
         // tool-free provider pass over the last tool results so the user gets
         // a truthful model-authored progress report rather than a completed
         // turn whose transcript ends at a tool result.
-        if hit_iteration_limit {
+        if hit_iteration_limit && !cancel.is_cancelled() {
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
                 messages.push(serde_json::from_value(payload)?);
@@ -5496,32 +8902,51 @@ impl Engine {
             )));
             let mut final_text = String::new();
             let mut final_reasoning = Vec::new();
-            match provider
-                .stream_chat(&model_name, &messages, &[], &model_options)
-                .await
-            {
-                Ok(stream) => {
+            let final_stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                stream = provider.stream_chat(&model_name, &messages, &[], &model_options) => Some(stream),
+            };
+            match final_stream {
+                None => {}
+                Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    while let Some(event) = stream.next().await {
+                    let mut thinking_streamed = false;
+                    let mut pending_events = Vec::new();
+                    let mut persist_deadline = None;
+                    loop {
+                        let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+                        let event = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                                flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+                                persist_deadline = None;
+                                continue;
+                            }
+                            event = stream.next() => match event {
+                                Some(event) => event,
+                                None => break,
+                            },
+                        };
                         match event {
                             Ok(ProviderEvent::TextDelta(delta)) => {
                                 final_text.push_str(&delta);
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantDelta { turn, text: delta },
-                                )?;
+                                pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
                             Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantThinking { turn, text: delta },
-                                )?;
+                                thinking_streamed = true;
+                                pending_events.push(Event::AssistantThinking { turn, text: delta });
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
-                            Ok(ProviderEvent::Completed { usage }) => {
-                                accumulate_usage(&usage);
+                            Ok(ProviderEvent::Completed { mut usage }) => {
                                 context_input_tokens =
-                                    usage.input_tokens + usage.cached_input_tokens;
+                                    usage.context_input_tokens.unwrap_or_else(|| {
+                                        usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                                    });
+                                usage.context_input_tokens = Some(context_input_tokens);
+                                accumulate_usage(&usage);
+                                pending_events.push(Event::TurnUsageUpdated { turn, usage });
                             }
                             // Tools are deliberately unavailable on this
                             // final pass. Ignore a non-conforming provider's
@@ -5532,9 +8957,23 @@ impl Engine {
                                 break;
                             }
                         }
+                        if pending_events.len() >= STREAM_EVENT_BATCH_MAX {
+                            flush_backend_event_batch(&self.store, &scope, &mut pending_events)
+                                .await?;
+                            persist_deadline = None;
+                        } else if !pending_events.is_empty() && persist_deadline.is_none() {
+                            persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
+                        }
                     }
+                    if thinking_streamed {
+                        pending_events.push(Event::AssistantThinkingCompleted { turn });
+                    }
+                    flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
-                Err(e) => tracing::warn!("iteration-limit summary failed: {e}"),
+                Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
+            }
+            if cancel.is_cancelled() {
+                return Ok(());
             }
             if final_text.trim().is_empty() {
                 final_text = format!(
@@ -5542,13 +8981,15 @@ impl Engine {
                      Send another message to continue."
                 );
             }
-            self.store.append_event(
-                scope.clone(),
-                Event::AssistantMessage {
-                    turn,
-                    content: final_text.clone(),
-                },
-            )?;
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::AssistantMessage {
+                        turn,
+                        content: final_text.clone(),
+                    },
+                )
+                .await?;
             self.store.append_message(
                 &thread.id,
                 &serde_json::to_value(Message::Assistant {
@@ -5559,6 +9000,10 @@ impl Engine {
             )?;
         }
 
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        usage_total.context_input_tokens = Some(context_input_tokens);
         self.store.record_usage(
             &session.id,
             &thread.id,
@@ -5567,22 +9012,28 @@ impl Engine {
             context_input_tokens,
         )?;
 
-        // Snapshot the worktree when the turn changed it. Lock-free child
-        // turns never snapshot: they can't write, so any dirt is the
-        // parent's in-flight work — not theirs to checkpoint.
-        let checkpoint_id = if concurrent_child {
+        // Read-only turns never snapshot: any dirty worktree state belongs to
+        // a concurrent mutation-capable turn. Code turns checkpoint through
+        // the same exclusive mutation lane as edits and Git commands.
+        let checkpoint_id = if mode.read_only {
             None
         } else {
-            self.maybe_checkpoint(&session, thread, turn).await?
+            self.maybe_checkpoint(&session, thread, turn, &cancel)
+                .await?
         };
-        self.store.append_event(
-            scope,
-            Event::TurnCompleted {
-                turn,
-                usage: usage_total,
-                checkpoint_id,
-            },
-        )?;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        self.store
+            .append_event_async(
+                scope,
+                Event::TurnCompleted {
+                    turn,
+                    usage: usage_total,
+                    checkpoint_id,
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -5593,11 +9044,10 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code always gets
-    /// the bridge (it carries the approval-prompt gate for Ask mode, and
-    /// optionally — `tool_bridge = true` — trouve's tools in place of
-    /// Claude's built-ins). Codex gets it too, for trouve's semantic search
-    /// and question tools; its approvals stay native app-server RPCs.
+    /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
+    /// the full bridge by default so mutation-capable work crosses the same
+    /// ToolExecutor and per-session execution lane as native provider calls.
+    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
     fn mcp_bridge_for(
         &self,
         model: &str,
@@ -5607,13 +9057,11 @@ impl Engine {
         let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
-            (pc.kind.clone(), pc.tool_bridge.unwrap_or(false))
+            (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
         if kind != "claude-cli" && kind != "codex-app-server" {
             return None;
         }
-        // Full tool bridging (vendor built-ins stand down) is Claude-only.
-        let bridge_tools = bridge_tools && kind == "claude-cli";
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -5623,13 +9071,20 @@ impl Engine {
         };
         // Codex approvals are native RPCs; serving Claude's permission-gate
         // tool would only tempt the model to call it.
-        let approval = if kind == "codex-app-server" { 0 } else { 1 };
+        let serve_approval = kind != "codex-app-server";
+        let claims = BridgeTicketClaims {
+            bridge_tools,
+            serve_approval,
+            correlate_codex_owner: kind == "codex-app-server",
+        };
+        let ticket = self.bridge_ticket_for(thread_id, claims);
         let mut url = format!(
-            "{}/internal/threads/{}/mcp?tools={}&approval={}",
+            "{}/internal/threads/{}/mcp?tools={}&approval={}&ticket={}",
             base_url.trim_end_matches('/'),
             thread_id,
             bridge_tools as u8,
-            approval,
+            serve_approval as u8,
+            ticket,
         );
         if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
             url.push_str("&bridge_token=");
@@ -5638,9 +9093,9 @@ impl Engine {
         Some(trouve_agents::McpBridgeConfig {
             url,
             bridge_tools,
-            // Claude built-ins stand down; trouve's executor is the tool
-            // source (reads included, for full permission fidelity).
-            disallowed_tools: if bridge_tools {
+            // Claude built-ins stand down; Codex uses the same bridge while
+            // its remaining built-ins are confined by a read-only sandbox.
+            disallowed_tools: if bridge_tools && kind == "claude-cli" {
                 [
                     "Bash",
                     "Edit",
@@ -5667,23 +9122,48 @@ impl Engine {
 
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
-    pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
+    pub async fn bridged_tool_specs(
+        &self,
+        thread_id: &str,
+        bridge_tools: bool,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
-        let mut specs: Vec<ToolSpec> = self
-            .executor
-            .specs(&ctx)
-            .await
+        let discovered = if bridge_tools {
+            self.executor.specs(&ctx).await
+        } else {
+            // The minimal bridge must not consult external MCP discovery:
+            // listing three native tools is not authority to launch trusted
+            // workspace/user servers.
+            self.executor.native_specs(&ctx).await
+        };
+        let mut specs: Vec<ToolSpec> = discovered
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|spec| {
+                (bridge_tools || matches!(spec.name.as_str(), "search" | "find_related"))
+                    && (mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&spec.name))
+            })
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
+        if !bridge_tools {
+            return Ok(specs);
+        }
         specs.push(search_transcript_spec());
-        // Spawn tools: top-level agents only, same as native turns.
-        if self.store.spawn_parent(thread_id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+        // Recursive spawn tools use the same mode and depth policy as native
+        // provider turns.
+        let spawn_allowed = |name: &str| {
+            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|tool| tool == name)
+        };
+        if self.thread_can_spawn_subagents(thread_id)? {
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
         Ok(specs)
     }
@@ -5696,7 +9176,149 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, EngineError> {
-        let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
+        let cancel = self.active_bridge_cancel(thread_id)?;
+        self.bridged_tool_call_for(thread_id, name, arguments, cancel)
+            .await
+    }
+
+    /// Execute a Codex MCP call after correlating app-server's authoritative
+    /// root-or-collaborator owner. Spawned Codex agents inherit the root MCP
+    /// URL, so the URL path alone is not a safe persistence scope.
+    pub async fn bridged_codex_tool_call(
+        self: &Arc<Self>,
+        root_thread_id: &str,
+        vendor_thread_id: Option<&str>,
+        vendor_call_id: Option<&str>,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, EngineError> {
+        let vendor_thread_id = vendor_thread_id
+            .filter(|thread_id| !thread_id.is_empty())
+            .ok_or_else(|| {
+                EngineError::BadRequest(
+                    "Codex MCP metadata is missing the required _meta.threadId".into(),
+                )
+            })?;
+        let root_cancel = self.active_bridge_cancel(root_thread_id)?;
+        let owner_registration = self
+            .bridged_tool_owners
+            .register_vendor_owner(root_thread_id, vendor_thread_id);
+        let owner_thread_id = match owner_registration {
+            CodexVendorOwnerRegistration::Immediate(owner) => owner,
+            CodexVendorOwnerRegistration::InactiveRoot => {
+                return Err(EngineError::Conflict(
+                    "Codex MCP request belongs to an inactive root turn".into(),
+                ));
+            }
+            CodexVendorOwnerRegistration::Pending { id, receiver } => {
+                let outcome = tokio::select! {
+                    biased;
+                    _ = root_cancel.cancelled() => {
+                        self.bridged_tool_owners.abandon_vendor_owner(
+                            root_thread_id,
+                            vendor_thread_id,
+                            id,
+                        );
+                        return Err(EngineError::Conflict("tool call cancelled".into()));
+                    }
+                    owner = receiver => owner.ok(),
+                    _ = tokio::time::sleep(CODEX_BRIDGE_METADATA_WAIT_TIMEOUT) => None,
+                };
+                match outcome {
+                    Some(owner) => owner,
+                    None => {
+                        self.bridged_tool_owners.abandon_vendor_owner(
+                            root_thread_id,
+                            vendor_thread_id,
+                            id,
+                        );
+                        return Err(EngineError::BadRequest(format!(
+                            "Codex MCP _meta.threadId {vendor_thread_id} is unknown, external to this root, or stale"
+                        )));
+                    }
+                }
+            }
+        };
+        if let Some(call_id) = vendor_call_id.filter(|call_id| !call_id.is_empty()) {
+            let validation = self.bridged_tool_owners.register_call_validation(
+                root_thread_id,
+                vendor_thread_id,
+                &owner_thread_id,
+                call_id,
+            );
+            match validation {
+                CodexCallValidationRegistration::Immediate => {}
+                CodexCallValidationRegistration::Pending { id, receiver } => {
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = root_cancel.cancelled() => {
+                            self.bridged_tool_owners.abandon_call_validation(
+                                root_thread_id,
+                                call_id,
+                                id,
+                            );
+                            return Err(EngineError::Conflict("tool call cancelled".into()));
+                        }
+                        outcome = receiver => outcome.ok(),
+                        _ = tokio::time::sleep(CODEX_BRIDGE_METADATA_WAIT_TIMEOUT) => None,
+                    };
+                    match outcome {
+                        Some(CodexCallValidationOutcome::Matched) => {}
+                        Some(CodexCallValidationOutcome::Mismatched) => {
+                            return Err(EngineError::BadRequest(format!(
+                                "Codex MCP _meta.callId {call_id} belongs to another vendor thread"
+                            )));
+                        }
+                        None => {
+                            self.bridged_tool_owners.abandon_call_validation(
+                                root_thread_id,
+                                call_id,
+                                id,
+                            );
+                            return Err(EngineError::BadRequest(format!(
+                                "Codex MCP _meta.callId {call_id} was not observed on the app-server stream"
+                            )));
+                        }
+                    }
+                }
+                CodexCallValidationRegistration::InactiveRoot => {
+                    return Err(EngineError::Conflict(
+                        "Codex MCP request belongs to an inactive root turn".into(),
+                    ));
+                }
+                CodexCallValidationRegistration::UnknownOwner => {
+                    return Err(EngineError::BadRequest(format!(
+                        "Codex MCP _meta.threadId {vendor_thread_id} is not bound to {owner_thread_id}"
+                    )));
+                }
+                CodexCallValidationRegistration::MismatchedOwner => {
+                    return Err(EngineError::BadRequest(format!(
+                        "Codex MCP _meta.callId {call_id} belongs to another vendor thread"
+                    )));
+                }
+                CodexCallValidationRegistration::Replayed => {
+                    return Err(EngineError::Conflict(format!(
+                        "Codex MCP _meta.callId {call_id} was already used or retired"
+                    )));
+                }
+            }
+        }
+        if root_cancel.is_cancelled() {
+            return Err(EngineError::Conflict("tool call cancelled".into()));
+        }
+        self.bridged_tool_call_for(&owner_thread_id, name, arguments, root_cancel)
+            .await
+    }
+
+    async fn bridged_tool_call_for(
+        self: &Arc<Self>,
+        thread_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, EngineError> {
+        let (session, thread, mode, ctx) =
+            self.bridged_context_with_cancel(thread_id, cancel.clone())?;
         let turn = self.store.last_turn(thread_id)?;
         let call = trouve_providers::ToolCallRequest {
             id: new_id("call"),
@@ -5707,20 +9329,77 @@ impl Engine {
         // images, but no bridged vendor consumes them yet); the summary the
         // engine leaves in place of "_images" still tells the model the
         // image was read.
-        // Share the running turn's cancellation token when there is one, so a
-        // cancel also unblocks a bridged tool's approval wait.
-        let cancel = self
-            .turn_cancels
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
         let (content, _images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
+    }
+
+    fn announce_trouve_bridge_wrapper(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        owner_thread_id: &str,
+        call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        if trouve_bridge_wrapper_call(tool, args).is_none() {
+            return false;
+        }
+        if !self.bridged_tool_owners.announce_wrapper(
+            root_thread_id,
+            vendor_thread_id,
+            owner_thread_id,
+            call_id,
+        ) {
+            tracing::warn!(
+                root_thread_id,
+                vendor_thread_id,
+                owner_thread_id,
+                call_id,
+                "ignoring unbound, stale, or replayed Codex MCP wrapper identity"
+            );
+        }
+        true
+    }
+
+    /// Consume Codex's MCP presentation lifecycle. The matching ToolExecutor
+    /// call writes the sole durable card in the collaborator thread.
+    fn suppress_collaborator_bridge_wrapper(
+        &self,
+        root_thread_id: &str,
+        vendor_thread_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        event: &BackendCollaboratorEvent,
+    ) -> bool {
+        match event {
+            BackendCollaboratorEvent::ToolStarted {
+                call_id,
+                tool,
+                args,
+            } if trouve_bridge_wrapper_call(tool, args).is_some() => {
+                if collaborator.suppressed_bridge_calls.insert(call_id.clone()) {
+                    self.announce_trouve_bridge_wrapper(
+                        root_thread_id,
+                        vendor_thread_id,
+                        &collaborator.thread.id,
+                        call_id,
+                        tool,
+                        args,
+                    );
+                }
+                true
+            }
+            BackendCollaboratorEvent::ToolOutput { call_id, .. } => {
+                collaborator.suppressed_bridge_calls.contains(call_id)
+            }
+            BackendCollaboratorEvent::ToolCompleted { call_id, .. } => {
+                collaborator.suppressed_bridge_calls.remove(call_id)
+            }
+            _ => false,
+        }
     }
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
@@ -5735,7 +9414,7 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<bool, EngineError> {
-        let (session, thread, mode, _ctx) = self.bridged_context(thread_id)?;
+        let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self
             .store
             .last_turn(thread_id)
@@ -5744,29 +9423,28 @@ impl Engine {
         let matched = self.open_vendor_call(&thread.id, turn, tool, args);
         let synthetic = matched.is_none();
         let call_id = matched.unwrap_or_else(|| new_id("appr"));
-        if synthetic {
-            self.store
-                .append_event(
-                    scope.clone(),
-                    Event::ToolRequested {
-                        turn,
-                        call_id: call_id.clone(),
-                        tool: tool.to_string(),
-                        args: args.clone(),
-                        requires_approval: true,
-                    },
-                )
-                .map_err(EngineError::Internal)?;
-        }
+        // `gate_backend_approval` creates a missing tool card and batches it
+        // with approval.requested. Do not pre-write a synthetic card here:
+        // that used to force an extra SQLite transaction for every bridged
+        // approval.
         let approved = self
-            .gate_backend_approval(&session, &thread, turn, &mode, &call_id, tool, args)
+            .gate_backend_approval(
+                &session,
+                &thread,
+                turn,
+                &mode,
+                &call_id,
+                tool,
+                args,
+                &ctx.cancel,
+            )
             .await
             .map_err(EngineError::Internal)?;
         // A matched card gets its completion from the vendor's own
         // tool_result; only the synthetic card needs closing here.
         if synthetic {
             self.store
-                .append_event(
+                .append_event_async(
                     scope,
                     Event::ToolCompleted {
                         call_id,
@@ -5776,8 +9454,10 @@ impl Engine {
                             ToolStatus::Denied
                         },
                         result: serde_json::json!(if approved { "approved" } else { "denied" }),
+                        execution_duration_ms: None,
                     },
                 )
+                .await
                 .map_err(EngineError::Internal)?;
         }
         Ok(approved)
@@ -5904,8 +9584,13 @@ impl Engine {
         result: &serde_json::Value,
         args: Option<&serde_json::Value>,
     ) -> Result<Option<Vec<trouve_protocol::TodoItem>>> {
-        let base = tool.rsplit("__").next().unwrap_or(tool);
-        if status != ToolStatus::Ok || !matches!(base, "todo_write" | "TodoWrite") {
+        // TODO state is an authoritative first-party thread snapshot. Do not
+        // infer ownership from a tool's basename: an unrelated MCP server can
+        // legitimately expose its own `todo_write`, but its result must remain
+        // an ordinary tool result rather than mutating trouve's thread state.
+        let is_authoritative_todo_tool =
+            matches!(tool, "todo_write" | "TodoWrite" | "mcp__trouve__todo_write");
+        if status != ToolStatus::Ok || !is_authoritative_todo_tool {
             return Ok(None);
         }
         let result_todos = result.get("todos").and_then(Self::parse_todo_snapshot);
@@ -5953,6 +9638,38 @@ impl Engine {
         &self,
         thread_id: &str,
     ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+        let cancel = self.active_bridge_cancel(thread_id)?;
+        self.bridged_context_with_cancel(thread_id, cancel)
+    }
+
+    fn active_bridge_cancel(
+        &self,
+        thread_id: &str,
+    ) -> Result<tokio_util::sync::CancellationToken, EngineError> {
+        let cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Conflict(format!(
+                    "the tool bridge for thread {thread_id} is not attached to an active turn"
+                ))
+            })?;
+        if cancel.is_cancelled() {
+            return Err(EngineError::Conflict(format!(
+                "the active turn for thread {thread_id} is cancelled"
+            )));
+        }
+        Ok(cancel)
+    }
+
+    fn bridged_context_with_cancel(
+        &self,
+        thread_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let ws = self
@@ -5964,12 +9681,25 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        let worktree = PathBuf::from(&session.worktree_path);
+        let canonical_worktree = worktree
+            .canonicalize()
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let ctx = ToolCtx {
-            worktree: PathBuf::from(&session.worktree_path),
+            cancel,
+            worktree,
+            canonical_worktree: Some(canonical_worktree),
+            read_only_roots: crate::skills::trusted_read_roots(
+                self.config_dir.as_deref(),
+                Some(Path::new(&ws.path)),
+            )
+            .into(),
             thread_id: thread.id.clone(),
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            edit_strategy: edit_strategy_for_model(&thread.model),
+            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -6010,6 +9740,679 @@ impl Engine {
             .collect())
     }
 
+    fn record_backend_collaborator_input(
+        &self,
+        collaborator: &mut BackendCollaboratorProjection,
+        content: String,
+    ) -> Result<()> {
+        if content.is_empty() || collaborator.last_user_message.as_deref() == Some(&content) {
+            return Ok(());
+        }
+        if !collaborator.segment.is_empty() {
+            collaborator.persisted.push(Event::AssistantMessage {
+                turn: collaborator.turn,
+                content: std::mem::take(&mut collaborator.segment),
+            });
+        }
+        let event = if collaborator.last_user_message.is_some() {
+            Event::TurnSteered {
+                turn: collaborator.turn,
+                content: content.clone(),
+                attachments: Vec::new(),
+            }
+        } else {
+            Event::UserMessage {
+                turn: collaborator.turn,
+                content: content.clone(),
+                attachments: Vec::new(),
+            }
+        };
+        collaborator.persisted.push(event);
+        self.store.append_message(
+            &collaborator.thread.id,
+            &serde_json::to_value(Message::User(content.clone()))?,
+        )?;
+        collaborator.last_user_message = Some(content);
+        Ok(())
+    }
+
+    async fn begin_backend_collaborator_turn(
+        &self,
+        collaborator: &mut BackendCollaboratorProjection,
+        vendor_turn_id: Option<String>,
+        prompt: String,
+    ) -> Result<()> {
+        debug_assert!(collaborator.persisted.is_empty());
+        collaborator.turn = self.store.next_turn(&collaborator.thread.id)?;
+        collaborator.vendor_turn_id = vendor_turn_id;
+        collaborator.last_user_message = None;
+        collaborator.pending_prompt = None;
+        collaborator.text.clear();
+        collaborator.segment.clear();
+        collaborator.usage = Usage::default();
+        collaborator.tool_calls.clear();
+        collaborator.tool_started_at.clear();
+        collaborator.suppressed_bridge_calls.clear();
+        collaborator.terminal = false;
+        // Provider-native collaborators execute inside the containing vendor
+        // turn and therefore inherit its already-acquired capacity. Publish
+        // that fact before `TurnStarted` so direct and nested children project
+        // as running instead of remaining in the scheduler's waiting state.
+        self.store
+            .append_events_async(
+                Scope::Thread(collaborator.thread.id.clone()),
+                vec![
+                    Event::TurnCapacityAcquired {
+                        turn: collaborator.turn,
+                        wait_ms: 0,
+                        background: false,
+                    },
+                    Event::TurnStarted {
+                        turn: collaborator.turn,
+                        mode: collaborator.thread.mode.clone(),
+                        model: collaborator.thread.model.clone(),
+                        thinking_level: collaborator.thinking_level.clone(),
+                        // The containing app-server turn owns native child steering.
+                        supports_steering: false,
+                    },
+                ],
+            )
+            .await?;
+        self.record_backend_collaborator_input(collaborator, prompt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_backend_collaborator_claimed(
+        &self,
+        session: &Session,
+        parent_thread: &Thread,
+        backend_id: &str,
+        vendor_session_id: String,
+        parent_vendor_session_id: &str,
+        name: Option<String>,
+        access: BackendCollaboratorAccess,
+        prompt: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+        collaborator_claims: &mut BackendCollaboratorClaims<'_>,
+        vendor_threads: &mut HashMap<String, String>,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let prompt = prompt.filter(|prompt| !prompt.is_empty());
+        if let Some(collaborator) = collaborators.get_mut(&vendor_session_id) {
+            if !collaborator_claims.claim(&collaborator.thread.id, &session.id) {
+                bail!(
+                    "cannot reactivate provider collaborator {} while another turn owns it",
+                    collaborator.thread.id
+                );
+            }
+            if let Some(prompt) = prompt {
+                if collaborator.terminal {
+                    collaborator.pending_prompt = Some(prompt);
+                } else {
+                    self.record_backend_collaborator_input(collaborator, prompt)?;
+                }
+            }
+            return Ok(());
+        }
+        if let Some(existing_thread_id) = vendor_threads.get(&vendor_session_id) {
+            // A provider-native activity notification can point from a child
+            // back to its parent/root. That vendor session is already bound;
+            // materializing it again would create a phantom descendant whose
+            // turn can never finish and would keep the real root active.
+            tracing::warn!(
+                vendor_session_id,
+                existing_thread_id,
+                parent_vendor_session_id,
+                "ignoring collaborator announcement for an already-bound vendor session"
+            );
+            return Ok(());
+        }
+        let parent_thread_id = vendor_threads
+            .get(parent_vendor_session_id)
+            .cloned()
+            .unwrap_or_else(|| parent_thread.id.clone());
+        let inherited_thread = collaborators
+            .values()
+            .find(|collaborator| collaborator.thread.id == parent_thread_id)
+            .map(|collaborator| collaborator.thread.clone())
+            .unwrap_or_else(|| parent_thread.clone());
+        let (root_thread_id, depth) = self
+            .subagent_root_and_depth(&inherited_thread.id)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        if depth >= MAX_SUBAGENT_DEPTH {
+            bail!(
+                "provider collaborator nesting is limited to {MAX_SUBAGENT_DEPTH} levels below the root thread"
+            );
+        }
+        let tree_lock = self.subagent_tree_lock(&root_thread_id);
+        let _tree_spawn = tree_lock.lock().await;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
+        let all_modes =
+            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let inherited_mode = modes::find_mode(&all_modes, &inherited_thread.mode)
+            .cloned()
+            .unwrap_or_else(modes::fallback_mode);
+        if !inherited_mode.allowed_tools.is_empty()
+            && !inherited_mode
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "spawn_thread")
+        {
+            bail!(
+                "provider-native collaborators are not permitted in {} mode",
+                inherited_mode.id
+            );
+        }
+        let children = self.store.spawned_children(&inherited_thread.id)?;
+        let descendants = self
+            .list_thread_descendants(&root_thread_id)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        {
+            let active = self.active_threads.lock().unwrap();
+            let running = children
+                .iter()
+                .filter(|child| active.contains_key(*child))
+                .count();
+            if running >= MAX_CONCURRENT_CHILDREN {
+                bail!(
+                    "provider collaborator parent already has {running} active children; the limit is {MAX_CONCURRENT_CHILDREN}"
+                );
+            }
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            if active_descendants >= MAX_ACTIVE_DESCENDANTS {
+                bail!(
+                    "provider collaborator tree already has {active_descendants} active descendants; the limit is {MAX_ACTIVE_DESCENDANTS}"
+                );
+            }
+        }
+        let model = model
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| {
+                if model.contains('/') {
+                    model
+                } else {
+                    format!("{backend_id}/{model}")
+                }
+            })
+            .unwrap_or_else(|| inherited_thread.model.clone());
+        let mut model_options = if model == inherited_thread.model {
+            self.store.thread_model_options(&inherited_thread.id)?
+        } else {
+            serde_json::Map::new()
+        };
+        let mut thinking_level = thinking_level.filter(|level| !level.trim().is_empty());
+        if let Some(level) = thinking_level.as_ref() {
+            // The canonical inherited key keeps this useful even when the
+            // selected model advertises a differently named vendor option.
+            model_options.insert("thinking_level".into(), serde_json::json!(level));
+        }
+        thinking_level = thinking_level.or_else(|| {
+            THINKING_OPTION_KEYS.iter().find_map(|key| {
+                model_options
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+        let title = self
+            .generate_subagent_title(name.as_deref(), prompt.as_deref())
+            .await;
+        let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
+        let collaborator_mode = modes::find_mode(&all_modes, &child_mode)
+            .cloned()
+            .unwrap_or_else(modes::fallback_mode);
+        let child = collaborator_claims
+            .create_claimed_thread(&session.id, || {
+                self.create_spawned_thread_for_session(
+                    session.clone(),
+                    CreateThreadRequest {
+                        session_id: session.id.clone(),
+                        title,
+                        mode: Some(child_mode),
+                        model: Some(model),
+                        model_options,
+                        permission_mode: Some(inherited_thread.permission_mode),
+                    },
+                    &parent_thread_id,
+                    "vendor",
+                )
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.store
+            .set_backend_session(&child.id, backend_id, &vendor_session_id)?;
+        vendor_threads.insert(vendor_session_id.clone(), child.id.clone());
+        let mut collaborator = BackendCollaboratorProjection {
+            thread: child,
+            mode: collaborator_mode,
+            turn: 0,
+            spawn_link_published: false,
+            vendor_turn_id: None,
+            thinking_level,
+            last_user_message: None,
+            pending_prompt: None,
+            text: String::new(),
+            segment: String::new(),
+            usage: Usage::default(),
+            tool_calls: HashMap::new(),
+            tool_started_at: HashMap::new(),
+            suppressed_bridge_calls: HashSet::new(),
+            mutation_permits: HashMap::new(),
+            pending_approval: None,
+            approval_cancels: HashMap::new(),
+            persisted: Vec::new(),
+            terminal: true,
+        };
+        self.begin_backend_collaborator_turn(&mut collaborator, None, prompt.unwrap_or_default())
+            .await?;
+        collaborators.insert(vendor_session_id, collaborator);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn start_backend_collaborator(
+        &self,
+        session: &Session,
+        parent_thread: &Thread,
+        backend_id: &str,
+        vendor_session_id: String,
+        parent_vendor_session_id: &str,
+        name: Option<String>,
+        access: BackendCollaboratorAccess,
+        prompt: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+        vendor_threads: &mut HashMap<String, String>,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let mut claims = BackendCollaboratorClaims::new(&self.active_threads);
+        self.start_backend_collaborator_claimed(
+            session,
+            parent_thread,
+            backend_id,
+            vendor_session_id,
+            parent_vendor_session_id,
+            name,
+            access,
+            prompt,
+            model,
+            thinking_level,
+            &mut claims,
+            vendor_threads,
+            collaborators,
+        )
+        .await
+    }
+
+    async fn publish_backend_collaborator_spawn(
+        &self,
+        root_thread: &Thread,
+        root_turn: u64,
+        vendor_session_id: &str,
+        collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+    ) -> Result<()> {
+        let Some(collaborator) = collaborators
+            .get(vendor_session_id)
+            .filter(|collaborator| !collaborator.spawn_link_published)
+        else {
+            return Ok(());
+        };
+        let child_thread_id = collaborator.thread.id.clone();
+        let child_session_id = collaborator.thread.session_id.clone();
+        let child_model = collaborator.thread.model.clone();
+        let child_prompt = collaborator.last_user_message.clone().unwrap_or_default();
+        let parent_thread_id = self
+            .store
+            .spawn_parent(&child_thread_id)?
+            .unwrap_or_else(|| root_thread.id.clone());
+        let parent_turn = if parent_thread_id == root_thread.id {
+            root_turn
+        } else {
+            collaborators
+                .values()
+                .find(|candidate| candidate.thread.id == parent_thread_id)
+                .map_or(root_turn, |candidate| candidate.turn)
+        };
+        self.store
+            .append_event_async(
+                Scope::Thread(parent_thread_id),
+                Event::SubagentSpawned {
+                    turn: parent_turn,
+                    thread_id: child_thread_id,
+                    session_id: child_session_id,
+                    prompt: child_prompt,
+                    model: child_model,
+                    call_id: None,
+                },
+            )
+            .await?;
+        if let Some(collaborator) = collaborators.get_mut(vendor_session_id) {
+            collaborator.spawn_link_published = true;
+        }
+        Ok(())
+    }
+
+    async fn finish_backend_collaborator(
+        &self,
+        session: &Session,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        outcome: Result<Usage, String>,
+    ) -> Result<()> {
+        if collaborator.terminal {
+            return Ok(());
+        }
+        // A terminal collaborator cannot emit a later completion event; drop
+        // every vendor-native mutation lease before persistence bookkeeping.
+        collaborator.mutation_permits.clear();
+        collaborator.pending_approval = None;
+        for cancel in collaborator
+            .approval_cancels
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.cancel();
+        }
+        if !collaborator.segment.is_empty() {
+            collaborator.persisted.push(Event::AssistantMessage {
+                turn: collaborator.turn,
+                content: std::mem::take(&mut collaborator.segment),
+            });
+        }
+        flush_backend_event_batch(
+            &self.store,
+            &Scope::Thread(collaborator.thread.id.clone()),
+            &mut collaborator.persisted,
+        )
+        .await?;
+        self.store.append_message(
+            &collaborator.thread.id,
+            &serde_json::to_value(Message::Assistant {
+                content: collaborator.text.clone(),
+                tool_calls: Vec::new(),
+                reasoning: Vec::new(),
+            })?,
+        )?;
+        match outcome {
+            Ok(mut usage) => {
+                let context_input_tokens = usage.context_input_tokens.unwrap_or_else(|| {
+                    usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                });
+                usage.context_input_tokens = Some(context_input_tokens);
+                collaborator.usage = usage.clone();
+                let seen = self.store.messages(&collaborator.thread.id)?.len() as u64;
+                self.store
+                    .mark_backend_seen(&collaborator.thread.id, backend_id, seen)?;
+                self.store.record_usage(
+                    &session.id,
+                    &collaborator.thread.id,
+                    collaborator.turn,
+                    &usage,
+                    context_input_tokens,
+                )?;
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnCompleted {
+                        turn: collaborator.turn,
+                        usage,
+                        checkpoint_id: None,
+                    },
+                )?;
+            }
+            Err(error) if error == "turn cancelled" => {
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnCancelled {
+                        turn: collaborator.turn,
+                    },
+                )?;
+            }
+            Err(error) => {
+                self.store.append_event(
+                    Scope::Thread(collaborator.thread.id.clone()),
+                    Event::TurnFailed {
+                        turn: collaborator.turn,
+                        error,
+                    },
+                )?;
+            }
+        }
+        collaborator.terminal = true;
+        Ok(())
+    }
+
+    async fn prepare_backend_collaborator_turn(
+        &self,
+        session: &Session,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        vendor_turn_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(vendor_turn_id) = vendor_turn_id else {
+            return Ok(());
+        };
+        match collaborator.vendor_turn_id.as_deref() {
+            Some(current) if current == vendor_turn_id => return Ok(()),
+            None if !collaborator.terminal => {
+                collaborator.vendor_turn_id = Some(vendor_turn_id.to_string());
+                return Ok(());
+            }
+            _ => {}
+        }
+        if !collaborator.terminal {
+            self.finish_backend_collaborator(
+                session,
+                backend_id,
+                collaborator,
+                Err("vendor collaborator started a replacement turn before completing the prior turn".into()),
+            )
+            .await?;
+        }
+        let prompt = collaborator.pending_prompt.take().unwrap_or_default();
+        self.begin_backend_collaborator_turn(collaborator, Some(vendor_turn_id.to_string()), prompt)
+            .await
+    }
+
+    async fn persist_backend_collaborator_event(
+        &self,
+        session: &Session,
+        _root_mode: &AgentMode,
+        backend_id: &str,
+        collaborator: &mut BackendCollaboratorProjection,
+        event: BackendCollaboratorEvent,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        if collaborator.terminal {
+            return Ok(());
+        }
+        let turn = collaborator.turn;
+        match event {
+            BackendCollaboratorEvent::TurnStarted => {}
+            BackendCollaboratorEvent::UserMessage(content) => {
+                self.record_backend_collaborator_input(collaborator, content)?;
+            }
+            BackendCollaboratorEvent::TextDelta(delta) => {
+                collaborator.text.push_str(&delta);
+                collaborator.segment.push_str(&delta);
+                collaborator
+                    .persisted
+                    .push(Event::AssistantDelta { turn, text: delta });
+            }
+            BackendCollaboratorEvent::ThinkingDelta(delta) => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                collaborator
+                    .persisted
+                    .push(Event::AssistantThinking { turn, text: delta });
+            }
+            BackendCollaboratorEvent::ThinkingCompleted => collaborator
+                .persisted
+                .push(Event::AssistantThinkingCompleted { turn }),
+            BackendCollaboratorEvent::ToolStarted {
+                call_id,
+                tool,
+                mut args,
+            } => {
+                collaborator
+                    .tool_started_at
+                    .insert(call_id.clone(), Instant::now());
+                collaborator
+                    .tool_calls
+                    .insert(call_id.clone(), (tool.clone(), args.clone()));
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                if !self.tool_card_exists(&collaborator.thread.id, turn, &call_id) {
+                    collaborator.persisted.push(Event::ToolRequested {
+                        turn,
+                        call_id: call_id.clone(),
+                        tool,
+                        args,
+                        requires_approval: false,
+                    });
+                }
+                collaborator.persisted.push(Event::ToolStarted { call_id });
+            }
+            BackendCollaboratorEvent::ToolOutput { call_id, chunk } => collaborator
+                .persisted
+                .push(Event::ToolOutput { call_id, chunk }),
+            BackendCollaboratorEvent::ToolCompleted {
+                call_id,
+                ok,
+                result,
+            } => {
+                // Match the root backend path: the vendor has acknowledged
+                // tool completion, so release its exclusive worktree lane
+                // before event persistence and result-derived bookkeeping.
+                collaborator.mutation_permits.remove(&call_id);
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                let status = if ok {
+                    ToolStatus::Ok
+                } else {
+                    ToolStatus::Error
+                };
+                let execution_duration_ms = collaborator
+                    .tool_started_at
+                    .remove(&call_id)
+                    .map(monotonic_elapsed_ms);
+                let todos = match collaborator.tool_calls.get(&call_id) {
+                    Some((tool, args)) => self.persist_todos_from_result(
+                        &collaborator.thread.id,
+                        tool,
+                        status,
+                        &result,
+                        Some(args),
+                    )?,
+                    None => None,
+                };
+                collaborator.persisted.push(Event::ToolCompleted {
+                    call_id,
+                    status,
+                    result,
+                    execution_duration_ms,
+                });
+                if let Some(todos) = todos {
+                    collaborator.persisted.push(Event::TodosUpdated { todos });
+                }
+            }
+            BackendCollaboratorEvent::ApprovalNeeded {
+                call_id,
+                tool,
+                args,
+                responder,
+            } => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                collaborator.pending_approval = Some(PendingCollaboratorApproval {
+                    thread: collaborator.thread.clone(),
+                    turn,
+                    mode: collaborator.mode.clone(),
+                    call_id,
+                    tool,
+                    args,
+                    responder,
+                });
+            }
+            BackendCollaboratorEvent::TodosUpdated { todos } => {
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+                self.store
+                    .update_thread_todos(&collaborator.thread.id, &todos)?;
+                collaborator.persisted.push(Event::TodosUpdated { todos });
+            }
+            BackendCollaboratorEvent::UsageUpdated { usage } => {
+                collaborator
+                    .persisted
+                    .push(Event::TurnUsageUpdated { turn, usage });
+            }
+            BackendCollaboratorEvent::CompactionStarted => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                collaborator
+                    .persisted
+                    .push(Event::CompactionStarted { turn });
+            }
+            BackendCollaboratorEvent::CompactionCompleted => {
+                collaborator.persisted.push(Event::CompactionCompleted {
+                    turn,
+                    messages_compacted: 0,
+                });
+            }
+            BackendCollaboratorEvent::CompactionFailed => {
+                collaborator
+                    .persisted
+                    .push(Event::CompactionFailed { turn });
+            }
+            BackendCollaboratorEvent::Completed { usage } => {
+                self.finish_backend_collaborator(session, backend_id, collaborator, Ok(usage))
+                    .await?;
+            }
+            BackendCollaboratorEvent::Failed { error } => {
+                self.finish_backend_collaborator(session, backend_id, collaborator, Err(error))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -6019,7 +10422,7 @@ impl Engine {
     /// and history, not as the model's context.
     #[allow(clippy::too_many_arguments)]
     async fn run_backend_turn(
-        &self,
+        self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
         turn: u64,
@@ -6029,12 +10432,20 @@ impl Engine {
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
-        concurrent_child: bool,
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
         tools_enabled: bool,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let model_catalog = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            models = backend.list_models() => models,
+        };
+        let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
+        normalize_thinking_option(&mut model_options, selected_model);
+        let supports_steering = tools_enabled && backend.supports_steering();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -6044,7 +10455,7 @@ impl Engine {
         // A vendor session retains the tools it was created with. Tool-free
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
-        let (resume, handoff, seen_after) = if tools_enabled {
+        let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
             let payloads = self.store.messages(&thread.id)?;
             let unseen = match &resume {
@@ -6058,44 +10469,39 @@ impl Engine {
                 .filter_map(|p| serde_json::from_value(p.clone()).ok())
                 .collect();
             let handoff = render_history_digest(&messages, resume.is_some());
-            // After this turn the vendor has seen everything up to and
-            // including its own reply (appended below on completion).
-            let seen_after = payloads.len() as u64 + 2;
-            (resume, handoff, seen_after)
+            (resume, handoff)
         } else {
-            (None, None, 0)
+            (None, None)
         };
         let vendor_session = resume.map(|(id, _)| id);
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-            },
-        )?;
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
+        let mut active_vendor_session = vendor_session.clone();
+        if let Some(vendor_session_id) = active_vendor_session.as_deref() {
+            self.bridged_tool_owners
+                .bind_vendor_thread(&thread.id, vendor_session_id, &thread.id)
+                .map_err(anyhow::Error::msg)?;
+        }
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
-        let resolved = self.resolve_attachments(&attachments);
-        let (images, files): (Vec<_>, Vec<_>) = resolved
+        let materialized = self
+            .materialize_attachments_for_turn(session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
-            .partition(|(a, _)| a.mime.starts_with("image/"));
-        let content = annotate_attachments(content, &files);
+            .partition(|file| file.attachment.mime.starts_with("image/"));
+        let prompt_files = files
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let content = annotate_attachments(content, &prompt_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
-            .map(|(a, path)| trouve_agents::TurnAttachment {
-                name: a.name,
-                mime: a.mime,
-                path,
+            .map(|file| trouve_agents::TurnAttachment {
+                name: file.attachment.name,
+                mime: file.attachment.mime,
+                bytes: file.bytes,
+                local_path: Some(file.absolute_path),
             })
             .collect();
         self.store.append_message(
@@ -6105,7 +10511,6 @@ impl Engine {
         if !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
-        self.emit_queue(&thread.id)?;
 
         let permission = if mode.read_only {
             BackendPermission::ReadOnly
@@ -6129,19 +10534,31 @@ impl Engine {
             }
             instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
         }
+        let full_tool_bridge = mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_tools);
+        if full_tool_bridge {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(crate::tools::VENDOR_TOOL_BRIDGE_GUIDANCE);
+        }
+        // A full bridge already exposes user MCP servers through the local
+        // ToolExecutor. Mounting them directly as well would bypass trouve's
+        // permission and per-session concurrency gates.
+        let mcp_servers = if tools_enabled && !full_tool_bridge {
+            self.mcp_servers_for(session)?
+        } else {
+            Vec::new()
+        };
         // The digest decorates only the prompt sent to the vendor; the
         // stored transcript keeps the user's words alone.
         let prompt = match &handoff {
             Some(digest) => format!("{digest}\n\n{content}"),
             None => content,
         };
-        let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = backend.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
         let backend_turn = BackendTurn {
+            cancel: cancel.clone(),
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
@@ -6153,17 +10570,31 @@ impl Engine {
             permission,
             tool_free: !tools_enabled,
             mcp_bridge,
-            mcp_servers: if tools_enabled {
-                self.mcp_servers_for(session)?
-            } else {
-                Vec::new()
-            },
+            mcp_servers,
         };
 
-        let mut stream = backend
-            .run_turn(backend_turn)
-            .await
-            .map_err(|e| anyhow!("backend error: {e}"))?;
+        let mut stream = match backend.run_turn(backend_turn).await {
+            Ok(stream) => stream,
+            Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
+            Err(error) => return Err(anyhow!("backend error: {error}")),
+        };
+
+        let mut steer_rx = None;
+        let _steerer_guard = if supports_steering {
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            self.turn_steerers
+                .lock()
+                .unwrap()
+                .insert(thread.id.clone(), ActiveTurnSteerer { turn, sender });
+            steer_rx = Some(receiver);
+            Some(ActiveTurnSteererGuard {
+                registry: &self.turn_steerers,
+                thread_id: thread.id.clone(),
+                turn,
+            })
+        } else {
+            None
+        };
 
         // `text` records the whole turn for the transcript; `segment` is the
         // current streamed block, flushed (finalized) at each tool boundary
@@ -6176,6 +10607,7 @@ impl Engine {
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
+        let mut tool_started_at = HashMap::<String, Instant>::new();
         // Creation tools sometimes stream their final PR URL before the
         // completion payload. Buffer output only for calls whose request is
         // demonstrably creating a PR; list/view output must never associate
@@ -6184,42 +10616,272 @@ impl Engine {
         // A vendor may use any GitHub client instead of trouve's create-PR
         // endpoint. Turn repository-specific PR references in its output into
         // the same durable session event, independent of the tool name.
-        let github_repository = self.github_repository_for_session(session).ok();
-        let mut recorded_prs = if github_repository.is_some() {
-            self.recorded_session_pr_numbers(&session.id)?
-        } else {
-            HashSet::new()
-        };
+        // Repository discovery shells out to Git. Defer it until a tool call
+        // can plausibly create a pull request so ordinary turns do not pay
+        // that process-startup cost.
+        let mut github_repository = None;
+        let mut recorded_prs = HashSet::new();
+        let mut vendor_threads = HashMap::<String, String>::new();
+        if let Some(vendor_session_id) = active_vendor_session.as_ref() {
+            vendor_threads.insert(vendor_session_id.clone(), thread.id.clone());
+        }
+        let mut collaborators = HashMap::<String, BackendCollaboratorProjection>::new();
+        let mut collaborator_claims = BackendCollaboratorClaims::new(&self.active_threads);
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
         let mut seen_tool_cards = HashSet::new();
+        let mut suppressed_bridge_calls = HashSet::new();
+        let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
+        let mut backend_approval_cancels =
+            HashMap::<String, tokio_util::sync::CancellationToken>::new();
+        let mut backend_mutation_permits =
+            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut pending_steer = None;
+        let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let ev = tokio::select! {
+            let steer_must_run = active_vendor_session.is_some()
+                && !cancel.is_cancelled()
+                && reserve_ready_steer_after_event_budget(
+                    &mut steer_rx,
+                    &mut pending_steer,
+                    &mut consecutive_backend_events,
+                );
+            let input = tokio::select! {
                 biased;
-                // Cancellation drops the backend stream, whose Drop kills the
-                // vendor process (kill_on_drop). We stop consuming and finish
-                // the turn with whatever streamed so far.
-                _ = cancel.cancelled() => break,
+                // Persist vendor output that is already available before
+                // accepting simultaneously-ready steering. This preserves
+                // the causal order observed at the backend boundary.
+                event = stream.next(), if !steer_must_run => BackendLoopInput::Event(event),
                 _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                     persist_deadline = None;
                     continue;
                 }
-                ev = stream.next() => match ev {
-                    Some(ev) => ev,
-                    None => break,
-                },
-            };
-            let event = match ev {
-                Ok(event) => event,
-                Err(error) => {
+                steer = receive_steer_command(
+                    &mut steer_rx,
+                    &mut pending_steer,
+                    active_vendor_session.is_some(),
+                ), if !cancel.is_cancelled() => {
+                    let Some(command) = steer else {
+                        steer_rx = None;
+                        continue;
+                    };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    return Err(anyhow!("backend stream error: {error}"));
+                    persist_deadline = None;
+                    let SteerTurnCommand {
+                        content,
+                        attachments,
+                        attachment_rows,
+                        mut attachment_cleanup,
+                        response,
+                    } = command;
+                    let staged = attachment_rows
+                        .iter()
+                        .map(|(attachment, path)| AttachmentMaterializationFile {
+                            attachment: attachment.clone(),
+                            source: PathBuf::from(path),
+                        })
+                        .collect::<Vec<_>>();
+                    let lane = self.tool_execution_lock(&session.id);
+                    let _materialization_permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = response.send(Err("turn cancelled".into()));
+                            bail!("turn cancelled");
+                        }
+                        permit = lane.write_owned() => permit,
+                    };
+                    let materialized = match self.executor.materialize_attachments(
+                        &AttachmentMaterialization {
+                            source_root: self.data_dir.join("attachments"),
+                            managed_worktree_root: self.data_dir.join("worktrees"),
+                            worktree: PathBuf::from(&session.worktree_path),
+                            files: staged,
+                            cancel: cancel.clone(),
+                        },
+                    ).await {
+                        Ok(materialized) => materialized,
+                        Err(error) => {
+                            let _ = response.send(Err(error.clone()));
+                            bail!("steering attachment materialization failed: {error}");
+                        }
+                    };
+                    drop(_materialization_permit);
+                    let (images, files): (Vec<_>, Vec<_>) = materialized
+                        .into_iter()
+                        .partition(|file| file.attachment.mime.starts_with("image/"));
+                    let prompt_files = files
+                        .iter()
+                        .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+                        .collect::<Vec<_>>();
+                    let backend_prompt = annotate_attachments(content.clone(), &prompt_files);
+                    let backend_attachments = images
+                        .into_iter()
+                        .map(|file| trouve_agents::TurnAttachment {
+                            name: file.attachment.name,
+                            mime: file.attachment.mime,
+                            bytes: file.bytes,
+                            local_path: Some(file.absolute_path),
+                        })
+                        .collect();
+                    let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            let error = anyhow::Error::from(error);
+                            let _ = response.send(Err(error.to_string()));
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = self.store.append_event_with_message(
+                        scope.clone(),
+                        Event::TurnSteered {
+                            turn,
+                            content,
+                            attachments,
+                        },
+                        &thread.id,
+                        &payload,
+                        attachment_rows,
+                        attachment_cleanup.claim(),
+                    ) {
+                        let message = error.to_string();
+                        let _ = response.send(Err(message));
+                        return Err(error);
+                    }
+                    attachment_cleanup.disarm();
+                    // Durable transcript order is established before the
+                    // vendor sees the guidance. A rejection therefore fails
+                    // the owning turn instead of erasing accepted input.
+                    let backend_result = backend
+                        .steer_turn(BackendSteer {
+                            cancel: cancel.clone(),
+                            session: active_vendor_session
+                                .clone()
+                                .expect("steering branch requires a backend session"),
+                            prompt: backend_prompt.clone(),
+                            attachments: backend_attachments,
+                        })
+                        .await;
+                    if let Err(error) = backend_result {
+                        let message = error.to_string();
+                        let _ = response.send(Err(message.clone()));
+                        bail!("backend rejected durable steering input: {message}");
+                    }
+                    let _ = response.send(Ok(()));
+                    consecutive_backend_events = 0;
+                    continue;
                 }
+                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                    BackendLoopInput::Approval(
+                        approval.expect("non-empty approval queue must yield an outcome")
+                    )
+                }
+            };
+            let event = match input {
+                BackendLoopInput::Event(None) => break,
+                BackendLoopInput::Approval(outcome) => {
+                    consecutive_backend_events = 0;
+                    let BackendApprovalOutcome {
+                        owner_thread_id,
+                        call_id,
+                        responder,
+                        approved,
+                        mutation_permit,
+                    } = outcome;
+                    if let Some(owner_thread_id) = owner_thread_id {
+                        let Some(collaborator) = collaborators
+                            .values_mut()
+                            .find(|collaborator| collaborator.thread.id == owner_thread_id)
+                        else {
+                            let _ = responder.send(false);
+                            continue;
+                        };
+                        collaborator.approval_cancels.remove(&call_id);
+                        if collaborator.terminal {
+                            let _ = responder.send(false);
+                            continue;
+                        }
+                        let approved = match approved {
+                            Ok(approved) => approved,
+                            Err(error) => {
+                                let _ = responder.send(false);
+                                return Err(error);
+                            }
+                        };
+                        if approved {
+                            if let Some(permit) = mutation_permit {
+                                collaborator
+                                    .mutation_permits
+                                    .insert(call_id.clone(), permit);
+                            }
+                            if responder.send(true).is_err() {
+                                collaborator.mutation_permits.remove(&call_id);
+                            }
+                        } else {
+                            let _ = responder.send(false);
+                        }
+                        continue;
+                    }
+                    backend_approval_cancels.remove(&call_id);
+                    let approved = match approved {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            let _ = responder.send(false);
+                            return Err(error);
+                        }
+                    };
+                    if approved {
+                        if let Some(permit) = mutation_permit {
+                            backend_mutation_permits.insert(call_id.clone(), permit);
+                        }
+                        if responder.send(true).is_err() {
+                            backend_mutation_permits.remove(&call_id);
+                        }
+                    } else {
+                        let _ = responder.send(false);
+                    }
+                    continue;
+                }
+                BackendLoopInput::Event(Some(ev)) => match ev {
+                    Ok(event) => {
+                        consecutive_backend_events = consecutive_backend_events.saturating_add(1);
+                        event
+                    }
+                    Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
+                    Err(error) => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        for collaborator in collaborators.values_mut() {
+                            if !collaborator.terminal {
+                                self.finish_backend_collaborator(
+                                    session,
+                                    backend_id,
+                                    collaborator,
+                                    Err(format!("parent backend stream failed: {error}")),
+                                )
+                                .await?;
+                            }
+                            collaborator_claims.release(&collaborator.thread.id);
+                        }
+                        deny_pending_backend_approvals(
+                            &mut pending_backend_approvals,
+                            &mut backend_approval_cancels,
+                            &mut collaborators,
+                        )
+                        .await;
+                        return Err(anyhow!("backend stream error: {error}"));
+                    }
+                },
             };
             match event {
                 BackendEvent::SessionStarted { session_id } => {
+                    active_vendor_session = Some(session_id.clone());
+                    vendor_threads.insert(session_id.clone(), thread.id.clone());
+                    self.bridged_tool_owners
+                        .bind_vendor_thread(&thread.id, &session_id, &thread.id)
+                        .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
@@ -6243,14 +10905,46 @@ impl Engine {
                     }
                     persisted.push(Event::AssistantThinking { turn, text: delta });
                 }
+                BackendEvent::ThinkingCompleted => {
+                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                }
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
                     mut args,
                 } => {
+                    if trouve_bridge_wrapper_call(&tool, &args).is_some() {
+                        if suppressed_bridge_calls.insert(call_id.clone()) {
+                            if let Some(vendor_thread_id) = active_vendor_session.as_deref() {
+                                self.announce_trouve_bridge_wrapper(
+                                    &thread.id,
+                                    vendor_thread_id,
+                                    &thread.id,
+                                    &call_id,
+                                    &tool,
+                                    &args,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    root_thread_id = %thread.id,
+                                    call_id,
+                                    "Codex MCP wrapper arrived before its root vendor thread identity"
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     if !tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
+                    }
+                    tool_started_at.insert(call_id.clone(), Instant::now());
+                    if github_repository.is_none()
+                        && might_request_pull_request_creation(&tool, &args)
+                        && let Ok(repository) = self.github_repository_for_session(session)
+                    {
+                        recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
+                        github_repository = Some(repository);
                     }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
@@ -6277,6 +10971,9 @@ impl Engine {
                     persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
+                    if suppressed_bridge_calls.contains(&call_id) {
+                        continue;
+                    }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                         && requests_pull_request_creation(tool, args, owner, repo)
@@ -6291,17 +10988,219 @@ impl Engine {
                 BackendEvent::CommandsUpdated { commands } => {
                     persisted.push(Event::CommandsUpdated { commands });
                 }
+                BackendEvent::TodosUpdated { todos } => {
+                    // Vendor-native plans are authoritative replacements just
+                    // like todo_write results, but they are not transcript
+                    // tool calls. Persist the thread snapshot and publish the
+                    // existing durable event so every client sees the pane.
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    self.store.update_thread_todos(&thread.id, &todos)?;
+                    persisted.push(Event::TodosUpdated { todos });
+                }
+                BackendEvent::UsageUpdated { usage } => {
+                    persisted.push(Event::TurnUsageUpdated { turn, usage });
+                }
+                BackendEvent::CompactionStarted => {
+                    if !segment.is_empty() {
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
+                    }
+                    persisted.push(Event::CompactionStarted { turn });
+                }
+                BackendEvent::CompactionCompleted => {
+                    persisted.push(Event::CompactionCompleted {
+                        turn,
+                        messages_compacted: 0,
+                    });
+                }
+                BackendEvent::CompactionFailed => {
+                    persisted.push(Event::CompactionFailed { turn });
+                }
+                BackendEvent::CollaboratorStarted {
+                    session_id,
+                    parent_session_id,
+                    name,
+                    access,
+                    prompt,
+                    model,
+                    thinking_level,
+                } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    let vendor_session_id = session_id.clone();
+                    let prompt_announced =
+                        prompt.as_deref().is_some_and(|prompt| !prompt.is_empty());
+                    self.start_backend_collaborator_claimed(
+                        session,
+                        thread,
+                        backend_id,
+                        session_id,
+                        &parent_session_id,
+                        name,
+                        access,
+                        prompt,
+                        model,
+                        thinking_level,
+                        &mut collaborator_claims,
+                        &mut vendor_threads,
+                        &mut collaborators,
+                    )
+                    .await?;
+                    if let Some(owner_thread_id) = vendor_threads.get(&vendor_session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &vendor_session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    self.publish_backend_collaborator_spawn(
+                        thread,
+                        turn,
+                        &vendor_session_id,
+                        &mut collaborators,
+                    )
+                    .await?;
+                    // The child route does not replay its initial user item.
+                    // When the backend announcement supplies or recovers the
+                    // spawn prompt, publish it immediately instead of waiting
+                    // for the child's first tool completion or terminal event.
+                    if prompt_announced
+                        && let Some(collaborator) = collaborators.get_mut(&vendor_session_id)
+                    {
+                        flush_backend_event_batch(
+                            &self.store,
+                            &Scope::Thread(collaborator.thread.id.clone()),
+                            &mut collaborator.persisted,
+                        )
+                        .await?;
+                    }
+                }
+                BackendEvent::CollaboratorEvent {
+                    session_id,
+                    turn_id,
+                    event,
+                } => {
+                    if !collaborators.contains_key(&session_id) {
+                        let parent_session_id = active_vendor_session
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.start_backend_collaborator_claimed(
+                            session,
+                            thread,
+                            backend_id,
+                            session_id.clone(),
+                            &parent_session_id,
+                            None,
+                            BackendCollaboratorAccess::Inherit,
+                            None,
+                            None,
+                            None,
+                            &mut collaborator_claims,
+                            &mut vendor_threads,
+                            &mut collaborators,
+                        )
+                        .await?;
+                    }
+                    if let Some(owner_thread_id) = vendor_threads.get(&session_id) {
+                        self.bridged_tool_owners
+                            .bind_vendor_thread(&thread.id, &session_id, owner_thread_id)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    if let Some(collaborator) = collaborators.get(&session_id)
+                        && !collaborator_claims.claim(&collaborator.thread.id, &session.id)
+                    {
+                        bail!(
+                            "cannot route provider collaborator {} while another turn owns it",
+                            collaborator.thread.id
+                        );
+                    }
+                    let completed_successfully =
+                        matches!(&event, BackendCollaboratorEvent::Completed { .. });
+                    let terminal_thread =
+                        if let Some(collaborator) = collaborators.get_mut(&session_id) {
+                            self.prepare_backend_collaborator_turn(
+                                session,
+                                backend_id,
+                                collaborator,
+                                turn_id.as_deref(),
+                            )
+                            .await?;
+                            if !self.suppress_collaborator_bridge_wrapper(
+                                &thread.id,
+                                &session_id,
+                                collaborator,
+                                &event,
+                            ) {
+                                self.persist_backend_collaborator_event(
+                                    session,
+                                    mode,
+                                    backend_id,
+                                    collaborator,
+                                    event,
+                                    &cancel,
+                                )
+                                .await?;
+                            }
+                            if let Some(approval) = collaborator.pending_approval.take() {
+                                let owner_thread_id = approval.thread.id.clone();
+                                let approval_call_id = approval.call_id.clone();
+                                let approval_cancel = cancel.child_token();
+                                collaborator
+                                    .approval_cancels
+                                    .insert(approval_call_id, approval_cancel.clone());
+                                pending_backend_approvals.push(self.pending_backend_approval(
+                                    session.clone(),
+                                    approval.thread,
+                                    approval.turn,
+                                    approval.mode,
+                                    approval.call_id,
+                                    approval.tool,
+                                    approval.args,
+                                    approval.responder,
+                                    approval_cancel,
+                                    // Full-bridge calls acquire the lane in
+                                    // handle_tool_call; vendor-native child
+                                    // mutations need it here.
+                                    !full_tool_bridge,
+                                    Some(owner_thread_id),
+                                ));
+                            }
+                            collaborator
+                                .terminal
+                                .then(|| collaborator.thread.id.clone())
+                        } else {
+                            None
+                        };
+                    if let Some(thread_id) = terminal_thread {
+                        collaborator_claims.release(&thread_id);
+                        if completed_successfully {
+                            self.dispatch_queue(&thread_id)
+                                .map_err(|error| anyhow!(error.to_string()))?;
+                        }
+                    }
+                }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
                     result,
                 } => {
+                    // Release even for bridge calls whose duplicate vendor
+                    // lifecycle card is suppressed.
+                    backend_mutation_permits.remove(&call_id);
+                    if suppressed_bridge_calls.remove(&call_id) {
+                        continue;
+                    }
+                    // The vendor has finished touching the worktree. Release
+                    // its exclusive lane before persistence/network-derived
+                    // bookkeeping so the next approved mutation can start.
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
                         ToolStatus::Error
                     };
+                    let execution_duration_ms =
+                        tool_started_at.remove(&call_id).map(monotonic_elapsed_ms);
                     let todos = match tool_calls.get(&call_id) {
                         Some((tool, args)) => self.persist_todos_from_result(
                             &thread.id,
@@ -6337,6 +11236,7 @@ impl Engine {
                         call_id,
                         status,
                         result,
+                        execution_duration_ms,
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
@@ -6359,10 +11259,26 @@ impl Engine {
                         });
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    let approved = self
-                        .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
-                        .await?;
-                    let _ = responder.send(approved);
+                    let approval_cancel = cancel.child_token();
+                    backend_approval_cancels.insert(call_id.clone(), approval_cancel.clone());
+                    pending_backend_approvals.push(self.pending_backend_approval(
+                        session.clone(),
+                        thread.clone(),
+                        turn,
+                        mode.clone(),
+                        call_id,
+                        tool,
+                        args,
+                        responder,
+                        approval_cancel,
+                        // Full-bridge calls acquire the same lane inside
+                        // handle_tool_call; pre-acquiring here would make the
+                        // vendor wait on its own permit. Native Codex tools
+                        // are read-only under the full-bridge sandbox.
+                        !full_tool_bridge,
+                        None,
+                    ));
+                    continue;
                 }
                 BackendEvent::QuestionsNeeded {
                     request_id,
@@ -6378,7 +11294,14 @@ impl Engine {
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let answers = self
-                        .ask_user_questions(&thread.id, turn, &request_id, title, questions)
+                        .ask_user_questions(
+                            &thread.id,
+                            turn,
+                            &request_id,
+                            title,
+                            questions,
+                            &cancel,
+                        )
                         .await?;
                     let _ = responder.send(answers);
                 }
@@ -6392,21 +11315,58 @@ impl Engine {
                     if usage.context_window.is_some() {
                         usage_total.context_window = usage.context_window;
                     }
+                    if usage.context_input_tokens.is_some() {
+                        usage_total.context_input_tokens = usage.context_input_tokens;
+                    }
                 }
             }
-            if persisted.is_empty() {
+            let collaborator_pending = collaborators
+                .values()
+                .any(|collaborator| !collaborator.persisted.is_empty());
+            if persisted.is_empty() && !collaborator_pending {
                 persist_deadline = None;
-            } else if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
+            } else if persisted.len()
+                + collaborators
+                    .values()
+                    .map(|collaborator| collaborator.persisted.len())
+                    .sum::<usize>()
+                >= STREAM_EVENT_BATCH_MAX
+            {
                 flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                 persist_deadline = None;
             } else if persist_deadline.is_none() {
-                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
+                persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
             }
         }
-        // Drop the backend stream promptly so a cancelled turn kills the
-        // vendor process now rather than at end of scope.
+        // Adapters close only after cancellation cleanup has completed. The
+        // stream can now be dropped without racing a replacement vendor turn.
         drop(stream);
+        // Vendors may omit ToolCompleted on cancellation or protocol failure.
+        // Never carry their mutation lease into flush, checkpoint, or terminal
+        // turn bookkeeping.
+        backend_mutation_permits.clear();
         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+
+        for collaborator in collaborators.values_mut() {
+            if !collaborator.terminal {
+                let reason = if cancel.is_cancelled() {
+                    "turn cancelled".to_string()
+                } else {
+                    "parent turn ended before collaborator completion".to_string()
+                };
+                self.finish_backend_collaborator(session, backend_id, collaborator, Err(reason))
+                    .await?;
+            }
+            collaborator_claims.release(&collaborator.thread.id);
+        }
+        deny_pending_backend_approvals(
+            &mut pending_backend_approvals,
+            &mut backend_approval_cancels,
+            &mut collaborators,
+        )
+        .await;
 
         if cancel.is_cancelled() {
             if !segment.is_empty() {
@@ -6449,13 +11409,20 @@ impl Engine {
             })?,
         )?;
         if tools_enabled {
+            let seen_after = self.store.messages(&thread.id)?.len() as u64;
             self.store
                 .mark_backend_seen(&thread.id, backend_id, seen_after)?;
         }
 
-        // Vendors report one usage per turn, so the totals already reflect
-        // the last (only) request — use them as the context-size proxy.
-        let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
+        // Vendor turns can contain several model calls. Their final usage is
+        // aggregate billing data, while context_input_tokens tracks only the
+        // newest call's provider-authoritative context measurement.
+        let context_input_tokens = usage_total.context_input_tokens.unwrap_or_else(|| {
+            usage_total
+                .input_tokens
+                .saturating_add(usage_total.cached_input_tokens)
+        });
+        usage_total.context_input_tokens = Some(context_input_tokens);
         self.store.record_usage(
             &session.id,
             &thread.id,
@@ -6463,15 +11430,17 @@ impl Engine {
             &usage_total,
             context_input_tokens,
         )?;
-        // Lock-free children (read-only spawned agents) never checkpoint:
-        // they hold no session lock, so `git add`/write-tree here would race
-        // the parent's concurrent turn and snapshot its half-finished work as
-        // the child's checkpoint. Matches the native path (invariant 4).
-        let checkpoint_id = if concurrent_child {
+        // Read-only turns never checkpoint shared dirt. Mutation-capable
+        // turns serialize the snapshot with every other worktree mutation.
+        let checkpoint_id = if mode.read_only {
             None
         } else {
-            self.maybe_checkpoint(session, thread, turn).await?
+            self.maybe_checkpoint(session, thread, turn, &cancel)
+                .await?
         };
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         self.store.append_event(
             scope,
             Event::TurnCompleted {
@@ -6481,6 +11450,64 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    fn backend_tool_mutates(&self, tool: &str) -> bool {
+        // Bridged trouve tools have authoritative metadata. Vendor-native
+        // permission requests are conservatively mutations: vendors request
+        // approval specifically for actions with side effects.
+        crate::mcp::split_tool_name(tool)
+            .filter(|(server, _)| *server == "trouve")
+            .and_then(|(_, name)| self.executor.tool_mutates(name))
+            .unwrap_or(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pending_backend_approval(
+        self: &Arc<Self>,
+        session: Session,
+        thread: Thread,
+        turn: u64,
+        mode: AgentMode,
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+        responder: tokio::sync::oneshot::Sender<bool>,
+        cancel: tokio_util::sync::CancellationToken,
+        acquire_mutation_permit: bool,
+        owner_thread_id: Option<String>,
+    ) -> futures::future::BoxFuture<'static, BackendApprovalOutcome> {
+        let engine = self.clone();
+        async move {
+            let mut approved = engine
+                .gate_backend_approval(
+                    &session, &thread, turn, &mode, &call_id, &tool, &args, &cancel,
+                )
+                .await;
+            let mut mutation_permit = None;
+            if acquire_mutation_permit
+                && approved.as_ref().is_ok_and(|approved| *approved)
+                && engine.backend_tool_mutates(&tool)
+            {
+                let lock = engine.tool_execution_lock(&session.id);
+                match tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    permit = lock.write_owned() => Some(permit),
+                } {
+                    Some(permit) => mutation_permit = Some(permit),
+                    None => approved = Ok(false),
+                }
+            }
+            BackendApprovalOutcome {
+                owner_thread_id,
+                call_id,
+                responder,
+                approved,
+                mutation_permit,
+            }
+        }
+        .boxed()
     }
 
     /// Gate one backend approval request through trouve's permission layer:
@@ -6496,6 +11523,7 @@ impl Engine {
         call_id: &str,
         tool: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<bool> {
         // A vendor write aimed outside the session worktree is denied
         // without asking: the vendor executes the tool itself, so this is
@@ -6517,10 +11545,7 @@ impl Engine {
         // flag so read-only tools (code search) pass even in read-only
         // modes. Anything else the vendor asks about is treated as mutating
         // (it only asks for things it considers mutating).
-        let mutates = crate::mcp::split_tool_name(tool)
-            .filter(|(server, _)| *server == "trouve")
-            .and_then(|(_, name)| self.executor.tool_mutates(name))
-            .unwrap_or(true);
+        let mutates = self.backend_tool_mutates(tool);
         let decision = gate(
             thread.permission_mode,
             mode.read_only,
@@ -6536,40 +11561,66 @@ impl Engine {
                 // before the tool_call announcement that normally creates the
                 // card. Without a synthetic card the Approve/Deny UI has
                 // nowhere to attach and the turn hangs forever.
+                let mut approval_events = Vec::with_capacity(2);
                 if !self.tool_card_exists(&thread.id, turn, call_id) {
                     let mut display_args = args.clone();
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolRequested {
-                            turn,
-                            call_id: call_id.to_string(),
-                            tool: tool.to_string(),
-                            args: display_args,
-                            requires_approval: true,
-                        },
-                    )?;
-                }
-                let cancel = self
-                    .turn_cancels
-                    .lock()
-                    .unwrap()
-                    .get(&thread.id)
-                    .cloned()
-                    .unwrap_or_default();
-                let rx = self.approvals.request(call_id);
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ApprovalRequested {
+                    approval_events.push(Event::ToolRequested {
                         turn,
                         call_id: call_id.to_string(),
-                    },
-                )?;
+                        tool: tool.to_string(),
+                        args: display_args,
+                        requires_approval: true,
+                    });
+                }
+                let rx = self
+                    .approvals
+                    .request(&thread.id, call_id)
+                    .with_context(|| {
+                        format!(
+                            "duplicate pending approval {call_id} in thread {}",
+                            thread.id
+                        )
+                    })?;
+                // Arm cleanup immediately after registration. There is no
+                // await before this guard exists, so dropping the future can
+                // never orphan a pending sender.
+                let mut cleanup = PendingApprovalCleanup {
+                    approvals: self.approvals.clone(),
+                    store: self.store.clone(),
+                    scope: scope.clone(),
+                    thread_id: thread.id.clone(),
+                    call_id: call_id.to_string(),
+                    armed: true,
+                    requested_persisted: false,
+                };
+                approval_events.push(Event::ApprovalRequested {
+                    turn,
+                    call_id: call_id.to_string(),
+                });
+                self.store.append_events(scope.clone(), approval_events)?;
+                cleanup.requested_persisted = true;
                 // A cancelled turn must not hang on an unanswered approval.
                 let decision = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    _ = cancel.cancelled() => {
+                        // Remove the pending sender so a late HTTP approval
+                        // cannot target a turn that has entered cleanup.
+                        let _ = self.approvals.resolve(
+                            &thread.id,
+                            call_id,
+                            ApprovalDecision::Deny,
+                        );
+                        ApprovalDecision::Deny
+                    },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
+                };
+                // Cancellation owns the terminal outcome. A user response
+                // racing cleanup must not approve work or broaden policy.
+                let decision = if cancel.is_cancelled() {
+                    ApprovalDecision::Deny
+                } else {
+                    decision
                 };
                 self.store.append_event(
                     scope,
@@ -6578,15 +11629,18 @@ impl Engine {
                         decision,
                     },
                 )?;
+                cleanup.armed = false;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
-                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                if !cancel.is_cancelled()
+                    && (decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server)
+                {
                     // MCP approval is first-use per server and session: a
                     // plain approval unlocks this server, matching native MCP
                     // calls without broadening approval to other servers.
                     self.approvals.extend_allow_list(&session.id, key);
                 }
-                Ok(decision != ApprovalDecision::Deny)
+                Ok(decision != ApprovalDecision::Deny && !cancel.is_cancelled())
             }
         }
     }
@@ -6599,12 +11653,17 @@ impl Engine {
         turn: u64,
         provider: &Arc<dyn Provider>,
         model_name: &str,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
         // the static catalog doesn't; it is cached, so this is cheap. Never
         // compact against a guessed window: an early lossy summary is worse
         // than surfacing that the provider omitted the required metadata.
-        let live = provider.list_models().await;
+        let live = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            models = provider.list_models() => models,
+        };
         let known = provider.models();
         let Some(context_window) = live
             .iter()
@@ -6663,13 +11722,32 @@ impl Engine {
             "Summarize the conversation so far per your instructions.".into(),
         ));
 
-        let mut stream = provider
-            .stream_chat(model_name, &messages, &[], &serde_json::Map::new())
-            .await
-            .map_err(|e| anyhow!("compaction provider error: {e}"))?;
+        let empty_options = serde_json::Map::new();
+        let stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.store.append_event(scope, Event::CompactionFailed { turn })?;
+                return Ok(());
+            }
+            stream = provider.stream_chat(model_name, &messages, &[], &empty_options) => {
+                stream.map_err(|e| anyhow!("compaction provider error: {e}"))?
+            }
+        };
+        let mut stream = stream;
         stream = trouve_providers::coalesce_event_stream(stream);
         let mut summary = String::new();
-        while let Some(ev) = stream.next().await {
+        loop {
+            let ev = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.store.append_event(scope, Event::CompactionFailed { turn })?;
+                    return Ok(());
+                }
+                ev = stream.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                }
+            };
             if let ProviderEvent::TextDelta(delta) =
                 ev.map_err(|e| anyhow!("compaction stream error: {e}"))?
             {
@@ -6694,6 +11772,93 @@ impl Engine {
             },
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_calls_parallel(
+        self: &Arc<Self>,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        mode: &AgentMode,
+        ctx: &ToolCtx,
+        calls: Vec<trouve_providers::ToolCallRequest>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Vec<(String, NativeToolCallResult)> {
+        let mut results = Vec::with_capacity(calls.len());
+        let mut read_batch = Vec::new();
+        for (index, call) in calls.into_iter().enumerate() {
+            let definitely_read_only = call.name != "ask_question"
+                && self.executor.tool_mutates(&call.name) == Some(false);
+            if definitely_read_only {
+                read_batch.push((index, call));
+                continue;
+            }
+            if !read_batch.is_empty() {
+                results.extend(
+                    self.handle_native_tool_batch(
+                        session,
+                        thread,
+                        turn,
+                        mode,
+                        ctx,
+                        std::mem::take(&mut read_batch),
+                        cancel,
+                    )
+                    .await,
+                );
+            }
+            // Mutating, interactive, and unknown calls are FIFO barriers.
+            // Awaiting each one prevents a later mutation from acquiring the
+            // session lane first and prevents reads from crossing it.
+            let call_id = call.id.clone();
+            let result = self
+                .handle_tool_call(session, thread, turn, mode, ctx, &call, cancel)
+                .await;
+            results.push((index, call_id, result));
+        }
+        if !read_batch.is_empty() {
+            results.extend(
+                self.handle_native_tool_batch(session, thread, turn, mode, ctx, read_batch, cancel)
+                    .await,
+            );
+        }
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        results
+            .into_iter()
+            .map(|(_, call_id, result)| (call_id, result))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_native_tool_batch(
+        self: &Arc<Self>,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        mode: &AgentMode,
+        ctx: &ToolCtx,
+        calls: Vec<(usize, trouve_providers::ToolCallRequest)>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Vec<(usize, String, NativeToolCallResult)> {
+        futures::stream::iter(calls.into_iter().map(|(index, call)| {
+            let engine = self.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            let cancel = cancel.clone();
+            async move {
+                let call_id = call.id.clone();
+                let result = engine
+                    .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
+                    .await;
+                (index, call_id, result)
+            }
+        }))
+        .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+        .collect::<Vec<_>>()
+        .await
     }
 
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
@@ -6724,7 +11889,14 @@ impl Engine {
             let result = match parse_question_args(&call.arguments) {
                 Ok((title, questions)) => {
                     let answers = self
-                        .ask_user_questions(&thread.id, turn, &call_id, title, questions.clone())
+                        .ask_user_questions(
+                            &thread.id,
+                            turn,
+                            &call_id,
+                            title,
+                            questions.clone(),
+                            cancel,
+                        )
                         .await?;
                     question_result_json(&questions, answers)
                 }
@@ -6742,22 +11914,31 @@ impl Engine {
             call.name.as_str(),
             "spawn_thread" | "spawn_session" | "spawn_output" | "search_transcript"
         ) {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: call.name.clone(),
-                    args: call.arguments.clone(),
-                    requires_approval: false,
-                },
-            )?;
+            self.store
+                .append_events_async(
+                    scope.clone(),
+                    vec![
+                        Event::ToolRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                            tool: call.name.clone(),
+                            args: call.arguments.clone(),
+                            requires_approval: false,
+                        },
+                        Event::ToolStarted {
+                            call_id: call_id.clone(),
+                        },
+                    ],
+                )
+                .await?;
+            let execution_started = std::time::Instant::now();
             let outcome = if call.name == "search_transcript" {
                 self.handle_search_transcript(session, thread, &call.arguments)
             } else {
-                self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
+                self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments, cancel)
                     .await
             };
+            let execution_duration_ms = monotonic_elapsed_ms(execution_started);
             let result = match outcome {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "error": e.to_string() }),
@@ -6767,15 +11948,45 @@ impl Engine {
             } else {
                 ToolStatus::Ok
             };
-            self.store.append_event(
-                scope,
-                Event::ToolCompleted {
-                    call_id,
-                    status,
-                    result: result.clone(),
-                },
-            )?;
-            return Ok((result.to_string(), Vec::new()));
+            let model_result = result.to_string();
+            let spawned = if status == ToolStatus::Ok
+                && matches!(call.name.as_str(), "spawn_thread" | "spawn_session")
+            {
+                match (
+                    result.get("thread_id").and_then(serde_json::Value::as_str),
+                    result.get("session_id").and_then(serde_json::Value::as_str),
+                    result.get("prompt").and_then(serde_json::Value::as_str),
+                    result.get("model").and_then(serde_json::Value::as_str),
+                ) {
+                    (Some(thread_id), Some(session_id), Some(prompt), Some(model)) => Some((
+                        thread_id.to_string(),
+                        session_id.to_string(),
+                        prompt.to_string(),
+                        model.to_string(),
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut completed = vec![Event::ToolCompleted {
+                call_id: call_id.clone(),
+                status,
+                result,
+                execution_duration_ms: Some(execution_duration_ms),
+            }];
+            if let Some((thread_id, session_id, prompt, model)) = spawned {
+                completed.push(Event::SubagentSpawned {
+                    turn,
+                    thread_id,
+                    session_id,
+                    prompt,
+                    model,
+                    call_id: Some(call_id),
+                });
+            }
+            self.store.append_events_async(scope, completed).await?;
+            return Ok((model_result, Vec::new()));
         }
 
         let known = self.executor.tool_mutates(&call.name);
@@ -6800,49 +12011,88 @@ impl Engine {
         // UI diff can number its gutter. Stored/executed args stay pristine.
         let mut display_args = call.arguments.clone();
         annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolRequested {
-                turn,
-                call_id: call_id.clone(),
-                tool: call.name.clone(),
-                args: display_args,
-                requires_approval: decision == Gate::NeedsApproval,
-            },
-        )?;
+        let requested_event = Event::ToolRequested {
+            turn,
+            call_id: call_id.clone(),
+            tool: call.name.clone(),
+            args: display_args,
+            requires_approval: decision == Gate::NeedsApproval,
+        };
+        if decision != Gate::NeedsApproval {
+            self.store
+                .append_event(scope.clone(), requested_event.clone())?;
+        }
 
         let decision = match decision {
             Gate::Deny => {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ToolCompleted {
-                        call_id: call_id.clone(),
-                        status: ToolStatus::Denied,
-                        result: serde_json::json!({
-                            "error": "tool not permitted in this mode"
-                        }),
-                    },
-                )?;
+                self.store
+                    .append_event_async(
+                        scope.clone(),
+                        Event::ToolCompleted {
+                            call_id: call_id.clone(),
+                            status: ToolStatus::Denied,
+                            result: serde_json::json!({
+                                "error": "tool not permitted in this mode"
+                            }),
+                            execution_duration_ms: None,
+                        },
+                    )
+                    .await?;
                 return Ok((
                     "Tool call denied: not permitted in this mode.".into(),
                     Vec::new(),
                 ));
             }
             Gate::NeedsApproval => {
-                let rx = self.approvals.request(&call_id);
-                self.store.append_event(
+                let rx = self
+                    .approvals
+                    .request(&thread.id, &call_id)
+                    .with_context(|| {
+                        format!(
+                            "duplicate pending approval {call_id} in thread {}",
+                            thread.id
+                        )
+                    })?;
+                let mut cleanup = PendingApprovalCleanup {
+                    approvals: self.approvals.clone(),
+                    store: self.store.clone(),
+                    scope: scope.clone(),
+                    thread_id: thread.id.clone(),
+                    call_id: call_id.clone(),
+                    armed: true,
+                    requested_persisted: false,
+                };
+                self.store.append_events(
                     scope.clone(),
-                    Event::ApprovalRequested {
-                        turn,
-                        call_id: call_id.clone(),
-                    },
+                    vec![
+                        requested_event,
+                        Event::ApprovalRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                        },
+                    ],
                 )?;
+                cleanup.requested_persisted = true;
                 // A cancelled turn must not hang on an unanswered approval:
                 // treat cancellation as a denial so the wait unblocks.
                 let decision = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    _ = cancel.cancelled() => {
+                        // Remove the pending sender so a late HTTP approval
+                        // cannot target a turn that has entered cleanup.
+                        let _ = self.approvals.resolve(
+                            &thread.id,
+                            &call_id,
+                            ApprovalDecision::Deny,
+                        );
+                        ApprovalDecision::Deny
+                    },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
+                };
+                let decision = if cancel.is_cancelled() {
+                    ApprovalDecision::Deny
+                } else {
+                    decision
                 };
                 self.store.append_event(
                     scope.clone(),
@@ -6851,9 +12101,12 @@ impl Engine {
                         decision,
                     },
                 )?;
+                cleanup.armed = false;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
-                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                if !cancel.is_cancelled()
+                    && (decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server)
+                {
                     // MCP approval is per server per session (first use).
                     self.approvals.extend_allow_list(&session.id, key);
                 }
@@ -6862,28 +12115,124 @@ impl Engine {
             Gate::Allow => ApprovalDecision::Approve,
         };
 
-        if decision == ApprovalDecision::Deny {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolCompleted {
-                    call_id: call_id.clone(),
-                    status: ToolStatus::Denied,
-                    result: serde_json::json!({"error": "denied by user"}),
-                },
-            )?;
+        if decision == ApprovalDecision::Deny || cancel.is_cancelled() {
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::ToolCompleted {
+                        call_id: call_id.clone(),
+                        status: ToolStatus::Denied,
+                        result: serde_json::json!({"error": "denied by user"}),
+                        execution_duration_ms: None,
+                    },
+                )
+                .await?;
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolStarted {
-                call_id: call_id.clone(),
+        enum ExecutionPermit {
+            Read {
+                _guard: tokio::sync::OwnedRwLockReadGuard<()>,
             },
-        )?;
-        let mut outcome = self
-            .executor
-            .execute(ctx, &call.name, &call.arguments)
-            .await;
+            Write {
+                guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+            },
+            /// Background-job control must be able to poll or terminate a
+            /// process while that process retains the write lane.
+            BackgroundControl,
+        }
+        let execution_lock = self.tool_execution_lock(&session.id);
+        let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
+            Some(ExecutionPermit::BackgroundControl)
+        } else if mutates {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { guard: Some(permit) }),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                permit = execution_lock.clone().read_owned() => Some(ExecutionPermit::Read { _guard: permit }),
+            }
+        };
+        let (mut outcome, execution_duration_ms) = if let Some(permit) = permit {
+            // Retain the lane until the executor has acknowledged cancellation
+            // and cleaned up its process/protocol resources.
+            let mut permit = Some(permit);
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::ToolStarted {
+                        call_id: call_id.clone(),
+                    },
+                )
+                .await?;
+            let executor = self.executor.clone();
+            let mut tool_ctx = ctx.clone();
+            if call.name == "shell"
+                && call
+                    .arguments
+                    .get("run_in_background")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
+                && let Some(guard) = guard.take()
+            {
+                tool_ctx.background_mutation_lease =
+                    Some(Arc::new(BackgroundMutationLease::new(guard)));
+            }
+            let tool_name = call.name.clone();
+            let tool_arguments = call.arguments.clone();
+            let execution_started = std::time::Instant::now();
+            let mut execute = Box::pin(async move {
+                executor
+                    .execute(&tool_ctx, &tool_name, &tool_arguments)
+                    .await
+            });
+            let outcome = tokio::select! {
+                biased;
+                result = &mut execute => result,
+                _ = cancel.cancelled() => {
+                    match tokio::time::timeout(TOOL_CANCEL_CLEANUP_TIMEOUT, &mut execute).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                tool = %call.name,
+                                call_id,
+                                "tool executor did not acknowledge cancellation within {}s",
+                                TOOL_CANCEL_CLEANUP_TIMEOUT.as_secs(),
+                            );
+                            // A custom executor may violate ToolCtx's cleanup
+                            // contract. Do not let it hold the turn terminal
+                            // state forever, but quarantine its execution lane
+                            // until it eventually returns so replacement work
+                            // cannot race a still-live mutation.
+                            let quarantine = permit
+                                .take()
+                                .expect("an executing tool owns its session lane");
+                            let tool = call.name.clone();
+                            let call_id = call_id.clone();
+                            tokio::spawn(async move {
+                                let _quarantine = quarantine;
+                                let _ = execute.await;
+                                tracing::warn!(
+                                    tool,
+                                    call_id,
+                                    "late tool cancellation cleanup completed; session lane released",
+                                );
+                            });
+                            ToolResult::error("tool cancellation cleanup timed out")
+                        }
+                    }
+                }
+            };
+            drop(permit);
+            (outcome, Some(monotonic_elapsed_ms(execution_started)))
+        } else {
+            (ToolResult::error("tool call cancelled"), None)
+        };
         // Peel vision content ("_images") out of the result: megabytes of
         // base64 must not land in the event log or the text transcript —
         // it becomes native image input on the tool-result message instead.
@@ -6896,6 +12245,7 @@ impl Engine {
             Some(&call.arguments),
         )?;
         if matches!(outcome.status, ToolStatus::Ok)
+            && might_request_pull_request_creation(&call.name, &call.arguments)
             && let Ok(repository) = self.github_repository_for_session(session)
             && requests_pull_request_creation(
                 &call.name,
@@ -6910,29 +12260,30 @@ impl Engine {
             numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
             self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolCompleted {
-                call_id,
-                status: outcome.status,
-                result: outcome.result.clone(),
-            },
-        )?;
+        let model_result = outcome.result.to_string();
+        let mut completion_events = vec![Event::ToolCompleted {
+            call_id,
+            status: outcome.status,
+            result: outcome.result,
+            execution_duration_ms,
+        }];
         if let Some(todos) = todos {
-            self.store
-                .append_event(scope, Event::TodosUpdated { todos })?;
+            completion_events.push(Event::TodosUpdated { todos });
         }
-        Ok((outcome.result.to_string(), images))
+        self.store
+            .append_events_async(scope, completion_events)
+            .await?;
+        Ok((model_result, images))
     }
 
     /// The spawn tool family: `spawn_thread` starts a child agent on a new
     /// thread in the caller's session, `spawn_session` starts one in a fresh
     /// worktree session branched from the caller's branch, and
     /// `spawn_output` reports (and optionally waits for) a child's result.
-    /// Guardrails: children never spawn grandchildren, at most
-    /// `MAX_CONCURRENT_CHILDREN` children run at once, children inherit the
-    /// parent's permission mode, and read-only parents can't escalate a
-    /// child into a writing mode.
+    /// Guardrails: delegation depth and active tree size are bounded, at most
+    /// `MAX_CONCURRENT_CHILDREN` direct children run per parent, children
+    /// inherit the parent's permission mode, and read-only parents cannot
+    /// escalate a child into a writing mode.
     async fn handle_spawn_tool(
         self: &Arc<Self>,
         session: &Session,
@@ -6940,9 +12291,8 @@ impl Engine {
         mode: &AgentMode,
         name: &str,
         args: &serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        const MAX_CONCURRENT_CHILDREN: usize = 4;
-
         if name == "spawn_output" {
             let child_id = args
                 .get("thread_id")
@@ -6965,16 +12315,22 @@ impl Engine {
                 if !running || std::time::Instant::now() >= deadline {
                     return Ok(status);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("spawn_output wait cancelled"),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                }
             }
         }
 
-        // Depth guard: one level only. Fan-out stays useful; runaway
-        // recursive spawning does not. Checked before the mode policy so a
-        // child always gets the depth message regardless of its mode.
-        if self.store.spawn_parent(&thread.id)?.is_some() {
-            bail!("spawned agents cannot spawn further agents");
+        let (root_thread_id, depth) = self.subagent_root_and_depth(&thread.id)?;
+        if depth >= MAX_SUBAGENT_DEPTH {
+            bail!(
+                "subagent nesting is limited to {MAX_SUBAGENT_DEPTH} levels below the root thread"
+            );
         }
+        let tree_lock = self.subagent_tree_lock(&root_thread_id);
+        let _tree_spawn = tree_lock.lock().await;
 
         // Respect the mode's tool policy: a restrictive/read-only mode that
         // doesn't list the spawn tool can't create branches or child agents
@@ -6984,11 +12340,22 @@ impl Engine {
             bail!("{name} is not permitted in {} mode", mode.id);
         }
         let children = self.store.spawned_children(&thread.id)?;
+        let descendants = self.list_thread_descendants(&root_thread_id)?;
         {
             let active = self.active_threads.lock().unwrap();
             let running = children.iter().filter(|c| active.contains_key(*c)).count();
             if running >= MAX_CONCURRENT_CHILDREN {
                 bail!("already {running} children running; collect some with spawn_output first");
+            }
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            if active_descendants >= MAX_ACTIVE_DESCENDANTS {
+                bail!(
+                    "the root subagent tree already has {active_descendants} active descendants; \
+                     wait for some to finish before spawning more"
+                );
             }
         }
 
@@ -7023,24 +12390,40 @@ impl Engine {
         } else {
             serde_json::Map::new()
         };
-
-        let (child_session_id, extra) = if name == "spawn_session" {
-            let title = args
-                .get("title")
+        let explicit_session_title = args
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(String::from);
+        let supplied_child_name = ["name", "task_name", "title"].into_iter().find_map(|key| {
+            args.get(key)
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|t| !t.is_empty())
+                .filter(|name| !name.is_empty())
                 .map(String::from)
-                .unwrap_or_else(|| {
-                    let snippet: String = prompt
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(48)
-                        .collect();
-                    format!("Agent: {snippet}")
-                });
+        });
+        let generated_title = if supplied_child_name.is_none()
+            || (name == "spawn_session" && explicit_session_title.is_none())
+        {
+            Some(self.generate_session_title(prompt).await.title)
+        } else {
+            None
+        };
+        let child_title = self
+            .generate_subagent_title(
+                supplied_child_name
+                    .as_deref()
+                    .or(generated_title.as_deref()),
+                None,
+            )
+            .await;
+
+        let (child_session_id, extra) = if name == "spawn_session" {
+            let title = explicit_session_title
+                .clone()
+                .or_else(|| generated_title.clone())
+                .expect("a missing child-session title is generated");
             // Base the child on the parent's latest checkpoint commit, not
             // its branch: turn checkpoints are written to hidden refs and
             // never move the session branch, so basing on the branch would
@@ -7074,27 +12457,40 @@ impl Engine {
             (session.id.clone(), None)
         };
 
-        let child = self
-            .create_thread(CreateThreadRequest {
-                session_id: child_session_id.clone(),
-                mode: Some(child_mode),
-                model: Some(child_model),
-                model_options,
-                permission_mode: Some(thread.permission_mode),
-            })
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let child_session = if child_session_id == session.id {
+            session.clone()
+        } else {
+            self.get_session(&child_session_id)
+                .map_err(|error| anyhow!(error.to_string()))?
+        };
         let kind = if name == "spawn_session" {
             "session"
         } else {
             "thread"
         };
-        self.store.insert_spawned(&child.id, &thread.id, kind)?;
-        self.send_message(&child.id, prompt.to_string(), Vec::new())
+        let child = self
+            .create_spawned_thread_for_session(
+                child_session,
+                CreateThreadRequest {
+                    session_id: child_session_id.clone(),
+                    title: child_title,
+                    mode: Some(child_mode),
+                    model: Some(child_model),
+                    model_options,
+                    permission_mode: Some(thread.permission_mode),
+                },
+                &thread.id,
+                kind,
+            )
+            .map_err(|e| anyhow!(e.to_string()))?;
+        self.send_message_with_tools(&child.id, prompt.to_string(), Vec::new(), true, true)
             .map_err(|e| anyhow!(e.to_string()))?;
 
         let mut result = serde_json::json!({
             "thread_id": child.id,
             "session_id": child_session_id,
+            "prompt": prompt,
+            "model": child.model,
             "note": "child agent started; check on it with spawn_output",
         });
         if let Some(extra) = extra {
@@ -7108,9 +12504,22 @@ impl Engine {
     /// A child agent's status, folded from its event log: running (its
     /// dispatcher is live), failed (last turn errored), completed (ran and
     /// idle), or pending (never ran). Includes the latest assistant message
-    /// and aggregate token usage so the parent sees what its money bought.
+    /// and aggregate subtree token usage so the parent sees what nested
+    /// delegation cost. An active descendant keeps the collected child in
+    /// `running` state even if the child's own provider turn has returned.
     fn spawn_status(&self, thread_id: &str) -> Result<serde_json::Value> {
-        let running = self.active_threads.lock().unwrap().contains_key(thread_id);
+        let descendants = self.list_thread_descendants(thread_id)?;
+        let (running, active_descendants) = {
+            let active = self.active_threads.lock().unwrap();
+            let active_descendants = descendants
+                .iter()
+                .filter(|descendant| active.contains_key(&descendant.id))
+                .count();
+            (
+                active.contains_key(thread_id) || active_descendants > 0,
+                active_descendants,
+            )
+        };
         let mut last_message = String::new();
         let mut completed_turns = 0u64;
         let mut failure: Option<String> = None;
@@ -7128,6 +12537,12 @@ impl Engine {
                 _ => {}
             }
         }
+        let failed_descendants = self.store.failed_spawned_descendants(thread_id)?;
+        if failure.is_none()
+            && let Some(descendant) = failed_descendants.first()
+        {
+            failure = Some(format!("descendant thread {descendant} failed"));
+        }
         let status = if running {
             "running"
         } else if failure.is_some() {
@@ -7137,14 +12552,15 @@ impl Engine {
         } else {
             "pending"
         };
-        let usage = self
-            .store
-            .usage_summary(crate::store::UsageScope::Thread(thread_id))?;
+        let usage = self.store.spawned_subtree_usage(thread_id)?;
         let mut out = serde_json::json!({
             "thread_id": thread_id,
             "status": status,
             "turns": completed_turns,
             "last_message": last_message,
+            "descendants": descendants.len(),
+            "active_descendants": active_descendants,
+            "failed_descendants": failed_descendants,
             "usage": {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
@@ -7335,7 +12751,14 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<String>> {
+        let execution_lock = self.tool_execution_lock(&session.id);
+        let _mutation_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(None),
+            guard = execution_lock.write_owned() => guard,
+        };
         let worktree = PathBuf::from(&session.worktree_path);
         let dirty = {
             let wt = worktree.clone();
@@ -7344,32 +12767,193 @@ impl Engine {
         if !dirty {
             return Ok(None);
         }
-        let seq = self.store.latest_checkpoint_seq(&session.id)?.unwrap_or(-1) + 1;
+        let seq = match retry_checkpoint_sqlite(
+            cancel,
+            "reading the next checkpoint sequence",
+            &CHECKPOINT_SQLITE_RETRY_DELAYS,
+            || self.store.next_checkpoint_seq(&session.id),
+        )
+        .await
+        {
+            Ok(Some(seq)) => seq,
+            Ok(None) => return Ok(None),
+            Err(error) if is_transient_sqlite_contention(&error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    thread_id = %thread.id,
+                    turn,
+                    error = %error,
+                    "skipping checkpoint after repeated SQLite contention"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let message = format!("trouve: turn {turn} of {}", thread.id);
+        let checkpoint_id = new_id("cp");
         let commit = self
             .executor
-            .checkpoint_worktree(&worktree, &session.id, seq, &message)
+            .checkpoint_worktree(&worktree, &session.id, &checkpoint_id, &message)
             .await
             .map_err(anyhow::Error::msg)?;
-        let checkpoint_id = new_id("cp");
-        self.store.append_checkpoint(&CheckpointRow {
+        let row = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session.id.clone(),
             thread_id: Some(thread.id.clone()),
             turn,
             seq,
             commit_hash: commit.clone(),
-        })?;
-        self.store.append_event(
-            Scope::Session(session.id.clone()),
-            Event::CheckpointCreated {
-                checkpoint_id: checkpoint_id.clone(),
-                thread_id: thread.id.clone(),
-                turn,
-                commit,
+        };
+        let checkpoint_event = Event::CheckpointCreated {
+            checkpoint_id: checkpoint_id.clone(),
+            thread_id: thread.id.clone(),
+            turn,
+            commit,
+        };
+        match retry_checkpoint_sqlite(
+            cancel,
+            "persisting the checkpoint and lifecycle event",
+            &CHECKPOINT_SQLITE_RETRY_DELAYS,
+            || {
+                self.store.append_checkpoint_with_event(
+                    &row,
+                    Scope::Session(session.id.clone()),
+                    checkpoint_event.clone(),
+                )
             },
-        )?;
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                return Ok(None);
+            }
+            Err(error) if is_transient_sqlite_contention(&error) => {
+                self.executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                tracing::warn!(
+                    session_id = %session.id,
+                    thread_id = %thread.id,
+                    turn,
+                    error = %error,
+                    "checkpoint remained locked after bounded retries; completing the turn without an undo checkpoint"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                if let Err(rollback) = self
+                    .executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                {
+                    return Err(error.context(format!(
+                        "checkpoint persistence failed and its Git anchor could not be restored: {rollback:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+        let live_checkpoint_ids = self.store.checkpoint_ids(&session.id)?;
+        if let Err(error) = self
+            .executor
+            .reconcile_checkpoint_worktree_refs(&worktree, &session.id, &live_checkpoint_ids)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "failed to reconcile checkpoint refs after persistence"
+            );
+        }
         Ok(Some(checkpoint_id))
+    }
+}
+
+fn is_transient_sqlite_contention(error: &anyhow::Error) -> bool {
+    sqlite_error_code(error).is_some_and(|code| {
+        matches!(
+            code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    })
+}
+
+fn is_immediate_sqlite_lock(error: &anyhow::Error) -> bool {
+    sqlite_error_code(error) == Some(rusqlite::ErrorCode::DatabaseLocked)
+}
+
+fn sqlite_error_code(error: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(|error| match error {
+                    rusqlite::Error::SqliteFailure(details, _) => Some(details.code),
+                    _ => None,
+                })
+        })
+        .or_else(|| crate::store::event_writer_sqlite_error_code(error))
+}
+
+/// Retry one short synchronous checkpoint-store operation without retaining a
+/// connection or mutex guard across the delay. `None` means cancellation won
+/// while waiting; the caller can then skip optional checkpoint bookkeeping.
+async fn retry_checkpoint_sqlite<T>(
+    cancel: &tokio_util::sync::CancellationToken,
+    operation: &'static str,
+    delays: &[Duration],
+    mut call: impl FnMut() -> Result<T>,
+) -> Result<Option<T>> {
+    let mut retry = 0usize;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        match call() {
+            Ok(value) => return Ok(Some(value)),
+            // `busy_timeout` already waits for SQLITE_BUSY on every Store
+            // connection. Only SQLITE_LOCKED bypasses that handler and should
+            // receive this additional bounded retry schedule.
+            Err(error) if is_immediate_sqlite_lock(&error) && retry < delays.len() => {
+                let delay = delays[retry];
+                retry += 1;
+                tracing::debug!(
+                    operation,
+                    retry,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "retrying checkpoint SQLite contention"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -7505,40 +13089,6 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
         at += 1;
     }
     at
-}
-
-/// Copy prompt attachments into the session worktree (under a gitignored
-/// `.trouve/attachments/` dir) so the native file tools — which only open
-/// worktree-relative paths — can read them. Returns each attachment paired
-/// with its worktree-relative path. Failures drop that attachment with a
-/// warning rather than failing the turn.
-fn materialize_attachments(
-    worktree: &Path,
-    files: &[(trouve_protocol::Attachment, PathBuf)],
-) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
-    if files.is_empty() {
-        return Vec::new();
-    }
-    let rel_dir = Path::new(".trouve").join("attachments");
-    let abs_dir = worktree.join(&rel_dir);
-    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
-        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
-        return Vec::new();
-    }
-    // Keep the staged files out of the user's diffs/commits.
-    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
-    let mut out = Vec::new();
-    for (meta, src) in files {
-        // Prefix with the id so distinct attachments with the same filename
-        // don't collide.
-        let file_name = format!("{}-{}", meta.id, meta.name);
-        let rel = rel_dir.join(&file_name);
-        match std::fs::copy(src, worktree.join(&rel)) {
-            Ok(_) => out.push((meta.clone(), rel)),
-            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
-        }
-    }
-    out
 }
 
 fn annotate_attachments(
@@ -7725,6 +13275,52 @@ fn contains_rest_mutation(
 
 /// A successful tool call that actually creates a pull request. Merely
 /// listing, viewing, or mentioning a PR must not associate it with a session.
+fn might_request_pull_request_creation(tool: &str, args: &serde_json::Value) -> bool {
+    let tool_compact = compact_activity(tool);
+    if tool_compact.contains("createpullrequest") || tool_compact.ends_with("createpr") {
+        return true;
+    }
+
+    // Restrict argument inspection to execution/integration tools. File and
+    // search arguments often contain phrases such as "pull request" but can
+    // never create one; treating those as candidates caused a git subprocess
+    // after nearly every successful read/search call.
+    let execution_like = [
+        "shell",
+        "bash",
+        "command",
+        "terminal",
+        "exec",
+        "gh",
+        "github",
+        "browser",
+        "web",
+        "playwright",
+        "mcp",
+        "dynamictoolcall",
+    ]
+    .iter()
+    .any(|marker| tool_compact.contains(marker));
+    if !execution_like {
+        return false;
+    }
+
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let args_compact = compact_activity(&args_text);
+    args_words.contains("gh pr create")
+        || args_words.contains("create pull request")
+        || args_compact.contains("createpullrequest")
+        || (args_words.split_whitespace().any(|word| word == "post")
+            && args_text.to_ascii_lowercase().contains("/pulls"))
+}
+
+fn monotonic_elapsed_ms(started: std::time::Instant) -> u64 {
+    // UI durations are integral milliseconds. Round a real sub-millisecond
+    // execution up instead of presenting the misleading "0ms" placeholder.
+    u64::try_from(started.elapsed().as_millis().max(1)).unwrap_or(u64::MAX)
+}
+
 fn requests_pull_request_creation(
     tool: &str,
     args: &serde_json::Value,
@@ -7849,6 +13445,7 @@ fn pr_evidence_from_events(
                 call_id,
                 status,
                 result,
+                ..
             } => {
                 let request = requested.remove(&call_id);
                 let output = output.remove(&call_id).unwrap_or_default();
@@ -7889,6 +13486,25 @@ fn pr_evidence_from_events(
 /// reject — permanently wedging the thread. Synthesize an "interrupted"
 /// result for every tool call left unanswered, and drop empty assistant
 /// messages (they serialize to an empty content block Anthropic rejects).
+/// Provider call ids are transcript keys as well as UI/event identities.
+/// Preserve the first non-empty id and replace missing or duplicate ids
+/// before either the assistant message or concurrent execution observes
+/// them.
+fn normalize_tool_call_ids(calls: &mut [trouve_providers::ToolCallRequest]) {
+    let mut seen = HashSet::with_capacity(calls.len());
+    for call in calls {
+        if call.id.trim().is_empty() || !seen.insert(call.id.clone()) {
+            loop {
+                let id = new_id("call");
+                if seen.insert(id.clone()) {
+                    call.id = id;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut iter = messages.into_iter().peekable();
@@ -8051,20 +13667,18 @@ pub fn ask_question_spec() -> ToolSpec {
 }
 
 /// Spec for the engine-served `spawn_thread` tool (child agent, same
-/// session/worktree). Offered only to threads that aren't themselves
-/// spawned children.
+/// session/worktree). Offered while the caller remains below the bounded
+/// recursive delegation depth.
 pub fn spawn_thread_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_thread".into(),
         description: "Start a child agent on a new thread in this session (same working \
                       tree). Returns the child's thread_id immediately; collect results \
                       with spawn_output. The child inherits your mode, model and \
-                      permission level unless overridden. Children in read-only modes \
-                      (e.g. plan) run concurrently with your turn — ideal for parallel \
-                      exploration and research. Children that can write must wait for \
-                      your current turn to finish before starting, so never block on \
-                      one with spawn_output's wait_ms; prefer spawn_session for \
-                      write-heavy delegation."
+                      permission level unless overridden. Children run concurrently with \
+                      your turn. Same-session mutations are serialized by trouve, but \
+                      agents share one worktree and can still make semantically conflicting \
+                      changes; use spawn_session when work needs full isolation."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -8072,6 +13686,10 @@ pub fn spawn_thread_spec() -> ToolSpec {
                 "prompt": {
                     "type": "string",
                     "description": "The task for the child agent. Self-contained: the child does not see your conversation."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional concise name for the child. When omitted, trouve applies the configured session/thread naming model to the prompt."
                 },
                 "mode": {
                     "type": "string",
@@ -8109,7 +13727,11 @@ pub fn spawn_session_spec() -> ToolSpec {
                 },
                 "title": {
                     "type": "string",
-                    "description": "Session title (also names the branch); derived from the prompt when omitted."
+                    "description": "Session title; derived from the prompt when omitted. It also contributes to the branch name when title-derived branch naming is enabled."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional concise name for the child thread. The session title is used when omitted; otherwise trouve applies the configured session/thread naming model to the prompt."
                 },
                 "mode": {
                     "type": "string",
@@ -8134,9 +13756,7 @@ pub fn spawn_output_spec() -> ToolSpec {
                       spawn_thread or spawn_session. Returns status (pending | running \
                       | completed | failed), the child's last assistant message, turns \
                       completed, and token usage. Set wait_ms to block until the child \
-                      finishes (or the timeout passes) — but only wait on children that \
-                      run concurrently (read-only same-session children, or any \
-                      spawn_session child)."
+                      finishes or the timeout passes."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -8620,6 +14240,2739 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {
+        trouve_protocol::AttachmentUpload {
+            name: name.into(),
+            mime: mime.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn attachment_upload_validation_rejects_hostile_envelopes_before_decode() {
+        let valid = upload("screen.png", "image/png", "aGVsbG8=".into());
+        validate_attachment_uploads(std::slice::from_ref(&valid)).unwrap();
+
+        let cases = [
+            upload("../escape.png", "image/png", "aGVsbG8=".into()),
+            upload("bad\nname.png", "image/png", "aGVsbG8=".into()),
+            upload("screen.png", "text/html; charset=utf-8", "aGVsbG8=".into()),
+            upload("screen.png", "image/", "aGVsbG8=".into()),
+            upload("screen.png", "image/png", "aGVsbG8".into()),
+            upload("screen.png", "image/png", "Zh==".into()),
+        ];
+        for hostile in cases {
+            assert!(
+                matches!(
+                    validate_attachment_uploads(&[hostile]),
+                    Err(EngineError::BadRequest(_))
+                ),
+                "hostile attachment envelope was accepted"
+            );
+        }
+
+        assert!(matches!(
+            validate_attachment_uploads(&vec![valid; MAX_ATTACHMENTS_PER_PROMPT + 1]),
+            Err(EngineError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn attachment_upload_validation_enforces_item_and_aggregate_limits() {
+        let oversized_bytes = MAX_ATTACHMENT_BYTES + (3 - MAX_ATTACHMENT_BYTES % 3);
+        let oversized = upload(
+            "large.bin",
+            "application/octet-stream",
+            "A".repeat(oversized_bytes / 3 * 4),
+        );
+        assert!(matches!(
+            validate_attachment_uploads(&[oversized]),
+            Err(EngineError::BadRequest(_))
+        ));
+
+        let seven_mib_divisible_by_three = 7 * 1024 * 1024 - 1;
+        let encoded = "A".repeat(seven_mib_divisible_by_three / 3 * 4);
+        let aggregate = (0..3)
+            .map(|index| {
+                upload(
+                    &format!("part-{index}.bin"),
+                    "application/octet-stream",
+                    encoded.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_attachment_uploads(&aggregate),
+            Err(EngineError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn continuously_ready_backend_stream_yields_to_queued_steer_at_budget() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send(7_u8).unwrap();
+        let mut receiver = Some(receiver);
+        let mut pending = None;
+        let mut consecutive_events = 0;
+
+        // The first simultaneous backend event keeps causal priority.
+        assert!(!reserve_ready_steer_after_event_budget(
+            &mut receiver,
+            &mut pending,
+            &mut consecutive_events,
+        ));
+        for _ in 0..MAX_BACKEND_EVENTS_BEFORE_STEER {
+            consecutive_events += 1;
+        }
+
+        // At the bound, the select disables its otherwise-continuously-ready
+        // event branch for one iteration and consumes this reserved steer.
+        assert!(reserve_ready_steer_after_event_budget(
+            &mut receiver,
+            &mut pending,
+            &mut consecutive_events,
+        ));
+        assert_eq!(pending, Some(7));
+        assert_eq!(consecutive_events, 0);
+    }
+
+    fn init_engine_test_repo(path: &Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::create_dir_all(path).unwrap();
+        run(&["init", "-b", "main"]);
+        std::fs::write(path.join("README.md"), "test\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&[
+            "-c",
+            "user.name=trouve test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+    }
+
+    fn sqlite_busy_error() -> anyhow::Error {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("checkpoint-contention.sqlite3");
+        let holder = rusqlite::Connection::open(&database).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE value (id INTEGER); BEGIN EXCLUSIVE; INSERT INTO value VALUES (1);",
+            )
+            .unwrap();
+        let contender = rusqlite::Connection::open(&database).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let error = contender
+            .query_row("SELECT COUNT(*) FROM value", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        holder.execute_batch("ROLLBACK").unwrap();
+        anyhow::Error::new(error)
+    }
+
+    fn sqlite_locked_error() -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sqlite_retry_recovers_from_transient_contention() {
+        let mut first_error = Some(sqlite_locked_error());
+        let mut calls = 0usize;
+        let result = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "test checkpoint operation",
+            &[Duration::ZERO],
+            || {
+                calls += 1;
+                match first_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(42),
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, Some(42));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sqlite_retry_is_bounded_and_cancellation_aware() {
+        let mut errors = [sqlite_locked_error(), sqlite_locked_error()].into_iter();
+        let error = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "test checkpoint operation",
+            &[Duration::ZERO],
+            || Err::<(), _>(errors.next().unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_transient_sqlite_contention(&error));
+
+        // SQLITE_BUSY has already exhausted the connection's busy timeout,
+        // so it is skippable checkpoint contention but is not multiplied by
+        // the SQLITE_LOCKED retry schedule.
+        let mut busy = Some(sqlite_busy_error());
+        let mut busy_calls = 0usize;
+        let error = retry_checkpoint_sqlite(
+            &tokio_util::sync::CancellationToken::new(),
+            "busy checkpoint operation",
+            &[Duration::ZERO],
+            || {
+                busy_calls += 1;
+                Err::<(), _>(busy.take().unwrap())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_transient_sqlite_contention(&error));
+        assert!(!is_immediate_sqlite_lock(&error));
+        assert_eq!(busy_calls, 1);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let skipped = retry_checkpoint_sqlite(&cancel, "cancelled operation", &[], || {
+            panic!("a cancelled checkpoint operation must not run")
+        })
+        .await
+        .unwrap();
+        assert_eq!(skipped, None::<()>);
+    }
+
+    #[tokio::test]
+    async fn codex_bridge_router_correlates_explicit_vendor_and_call_identity() {
+        let router = BridgedToolOwnerRouter::default();
+        router.begin_root("root");
+        router
+            .bind_vendor_thread("root", "vendor-a", "owner-a")
+            .unwrap();
+        router
+            .bind_vendor_thread("root", "vendor-b", "owner-b")
+            .unwrap();
+
+        assert!(matches!(
+            router.register_vendor_owner("root", "vendor-a"),
+            CodexVendorOwnerRegistration::Immediate(owner) if owner == "owner-a"
+        ));
+
+        // HTTP first: wait for app-server's item identity, independent of
+        // payload equality or any sibling call's ordering.
+        let CodexCallValidationRegistration::Pending { receiver, .. } =
+            router.register_call_validation("root", "vendor-a", "owner-a", "call-a")
+        else {
+            panic!("request-first identity should wait for its wrapper");
+        };
+        assert!(router.announce_wrapper("root", "vendor-a", "owner-a", "call-a"));
+        assert_eq!(receiver.await.unwrap(), CodexCallValidationOutcome::Matched);
+
+        // Wrapper first: the same rendezvous works in the opposite order.
+        assert!(router.announce_wrapper("root", "vendor-b", "owner-b", "call-b"));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-b"),
+            CodexCallValidationRegistration::Immediate
+        ));
+
+        // A call id can authorize only its announced vendor owner and only
+        // once, even when sibling calls carry byte-identical tool payloads.
+        assert!(router.announce_wrapper("root", "vendor-a", "owner-a", "call-owner-a"));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-owner-a"),
+            CodexCallValidationRegistration::MismatchedOwner
+        ));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-b", "owner-b", "call-b"),
+            CodexCallValidationRegistration::Replayed
+        ));
+
+        // A not-yet-announced collaborator may rendezvous briefly, but an
+        // external id is not borrowed from another root.
+        let CodexVendorOwnerRegistration::Pending {
+            id,
+            receiver: unknown,
+        } = router.register_vendor_owner("root", "external-vendor")
+        else {
+            panic!("unknown vendor ids should never resolve immediately");
+        };
+        router.abandon_vendor_owner("root", "external-vendor", id);
+        assert!(unknown.await.is_err());
+
+        router.clear_root("root");
+        assert!(matches!(
+            router.register_vendor_owner("root", "vendor-a"),
+            CodexVendorOwnerRegistration::InactiveRoot
+        ));
+        assert!(matches!(
+            router.register_call_validation("root", "vendor-a", "owner-a", "stale-call"),
+            CodexCallValidationRegistration::InactiveRoot
+        ));
+    }
+
+    struct DiscoveryProbeExecutor {
+        full_catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn probe_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for DiscoveryProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            self.full_catalog_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![probe_spec("mcp__trusted__external")]
+        }
+
+        async fn native_specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            vec![probe_spec("search"), probe_spec("find_related")]
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn minimal_bridge_listing_never_discovers_external_mcp_tools() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_minimal_bridge".into(),
+            name: "minimal bridge".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_minimal_bridge".into(),
+            workspace_id: workspace.id,
+            title: "Minimal bridge".into(),
+            branch: "trouve/minimal-bridge".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_minimal_bridge".into(),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "codex/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let full_catalog_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(store, data.path().into(), &Config::default()).with_executor(
+            Arc::new(DiscoveryProbeExecutor {
+                full_catalog_calls: full_catalog_calls.clone(),
+            }),
+        );
+        let _cancel = engine.register_cancel(&thread.id);
+
+        let minimal = engine.bridged_tool_specs(&thread.id, false).await.unwrap();
+        assert_eq!(
+            full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "minimal listing must not enter external MCP discovery"
+        );
+        assert_eq!(
+            minimal
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["search", "find_related", "ask_question"])
+        );
+
+        let full = engine.bridged_tool_specs(&thread.id, true).await.unwrap();
+        assert_eq!(
+            full_catalog_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            full.iter()
+                .any(|spec| spec.name == "mcp__trusted__external")
+        );
+        engine.clear_cancel(&thread.id);
+    }
+
+    #[test]
+    fn backend_collaborator_claims_never_overwrite_an_active_dispatcher() {
+        let active_threads = Mutex::new(HashMap::from([(
+            "already-running".to_string(),
+            "session-a".to_string(),
+        )]));
+        {
+            let mut claims = BackendCollaboratorClaims::new(&active_threads);
+            assert!(!claims.claim("already-running", "session-b"));
+            assert!(claims.claim("new-collaborator", "session-b"));
+            let active = active_threads.lock().unwrap();
+            assert_eq!(
+                active.get("already-running").map(String::as_str),
+                Some("session-a")
+            );
+            assert_eq!(
+                active.get("new-collaborator").map(String::as_str),
+                Some("session-b")
+            );
+        }
+        let active = active_threads.lock().unwrap();
+        assert_eq!(
+            active.get("already-running").map(String::as_str),
+            Some("session-a")
+        );
+        assert!(!active.contains_key("new-collaborator"));
+    }
+
+    #[test]
+    fn only_first_party_codex_mcp_items_are_bridge_wrappers() {
+        let args = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "read_file",
+            "arguments": { "path": "README.md" }
+        });
+        let (tool, nested) = trouve_bridge_wrapper_call("mcpToolCall", &args).unwrap();
+        assert_eq!(tool, "read_file");
+        assert_eq!(nested, &serde_json::json!({ "path": "README.md" }));
+        assert!(
+            trouve_bridge_wrapper_call(
+                "mcpToolCall",
+                &serde_json::json!({
+                    "server": "github",
+                    "tool": "get_issue",
+                    "arguments": {}
+                })
+            )
+            .is_none()
+        );
+        assert!(trouve_bridge_wrapper_call("commandExecution", &args).is_none());
+    }
+
+    struct CatalogTestProvider {
+        live_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
+        trouve_protocol::ModelInfo {
+            id: id.into(),
+            display_name: display_name.into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({}),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CatalogTestProvider {
+        fn id(&self) -> &str {
+            "catalog-test"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                "catalog-test/static",
+                "Static catalog model",
+            )]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            self.live_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![catalog_test_model(
+                "catalog-test/live",
+                "Live discovered model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("model catalog tests never start a provider turn")
+        }
+    }
+
+    struct BlockingToolExecutor {
+        started: tokio::sync::mpsc::UnboundedSender<String>,
+        releases: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct McpInvalidationProbeExecutor {
+        started: Arc<tokio::sync::Semaphore>,
+        releases: Arc<tokio::sync::Semaphore>,
+        names: Arc<Mutex<Vec<String>>>,
+        fail_after_commit: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for McpInvalidationProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+
+        async fn mutate_mcp_config(
+            &self,
+            request: &McpConfigMutationRequest,
+        ) -> Result<McpConfigMutationOutcome, String> {
+            let outcome = match &request.mutation {
+                McpConfigMutation::Upsert(config) => {
+                    crate::mcp::upsert_server(&request.path, &request.name, config)
+                        .map_err(|error| format!("{error:#}"))?;
+                    McpConfigMutationOutcome::Applied
+                }
+                McpConfigMutation::SetEnabled(enabled) => {
+                    if crate::mcp::set_server_enabled(&request.path, &request.name, *enabled)
+                        .map_err(|error| format!("{error:#}"))?
+                    {
+                        McpConfigMutationOutcome::Applied
+                    } else {
+                        McpConfigMutationOutcome::NotFound
+                    }
+                }
+                McpConfigMutation::Remove => {
+                    crate::mcp::remove_server(&request.path, &request.name)
+                        .map_err(|error| format!("{error:#}"))?;
+                    McpConfigMutationOutcome::Applied
+                }
+            };
+            if outcome == McpConfigMutationOutcome::NotFound {
+                return Ok(outcome);
+            }
+            self.names.lock().unwrap().push(request.name.clone());
+            self.started.add_permits(1);
+            self.releases
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap()
+                .forget();
+            if self.fail_after_commit.swap(false, Ordering::SeqCst) {
+                tracing::warn!(
+                    server = %request.name,
+                    "injected post-commit MCP cleanup failure left the server quarantined"
+                );
+            }
+            Ok(outcome)
+        }
+    }
+
+    async fn await_mcp_invalidation_start(
+        started: &Arc<tokio::sync::Semaphore>,
+        task: &mut tokio::task::JoinHandle<Result<(), EngineError>>,
+    ) {
+        tokio::select! {
+            permit = started.clone().acquire_owned() => {
+                permit.expect("MCP invalidation probe semaphore closed").forget();
+            }
+            result = task => {
+                panic!("MCP settings mutation exited before cache invalidation started: {result:?}");
+            }
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("MCP settings mutation did not reach cache invalidation within five seconds");
+            }
+        }
+    }
+
+    struct SuccessfulTodoExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SuccessfulTodoExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::ok(serde_json::json!({"todos": [
+                {"id": "external", "content": "External", "status": "completed"}
+            ]}))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for BlockingToolExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, name: &str) -> Option<bool> {
+            Some(name.starts_with("write_"))
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            self.started.send(name.to_string()).unwrap();
+            self.releases.acquire().await.unwrap().forget();
+            ToolResult::ok(serde_json::json!({ "tool": name }))
+        }
+    }
+
+    struct CancellationAwareToolExecutor {
+        started: Arc<tokio::sync::Semaphore>,
+        cleanup_started: Arc<tokio::sync::Semaphore>,
+        cleanup_release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct FailingSessionCreationExecutor(LocalToolExecutor);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for FailingSessionCreationExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+
+        async fn create_session_worktree(
+            &self,
+            request: &crate::tools::SessionWorktreeCreate,
+        ) -> Result<crate::tools::SessionWorktreeCreation, String> {
+            let creation =
+                <LocalToolExecutor as ToolExecutor>::create_session_worktree(&self.0, request)
+                    .await?;
+            drop(creation);
+            Err("injected checkpoint failure".into())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SessionFinalizeBehavior {
+        Complete,
+        Block,
+        Fail,
+    }
+
+    struct SessionCreationProbeExecutor {
+        block_create: bool,
+        finalize_behavior: SessionFinalizeBehavior,
+        create_started: Arc<tokio::sync::Semaphore>,
+        create_release: Arc<tokio::sync::Semaphore>,
+        finalize_started: Arc<tokio::sync::Semaphore>,
+        finalize_release: Arc<tokio::sync::Semaphore>,
+        rollback_count: Arc<std::sync::atomic::AtomicUsize>,
+        finalize_count: Arc<std::sync::atomic::AtomicUsize>,
+        owned_artifact: Arc<std::sync::atomic::AtomicBool>,
+        requested_worktrees: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl SessionCreationProbeExecutor {
+        fn new(block_create: bool, finalize_behavior: SessionFinalizeBehavior) -> Self {
+            Self {
+                block_create,
+                finalize_behavior,
+                create_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                finalize_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                finalize_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                rollback_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                finalize_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                owned_artifact: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                requested_worktrees: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SessionCreationProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+        async fn create_session_worktree(
+            &self,
+            request: &crate::tools::SessionWorktreeCreate,
+        ) -> Result<crate::tools::SessionWorktreeCreation, String> {
+            self.requested_worktrees
+                .lock()
+                .unwrap()
+                .push(request.worktree.clone());
+            self.owned_artifact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let rollback_count = self.rollback_count.clone();
+            let owned_artifact = self.owned_artifact.clone();
+            let finalize_count = self.finalize_count.clone();
+            let creation = crate::tools::SessionWorktreeCreation::guarded(
+                request
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "probe-base".into()),
+                "0123456789abcdef0123456789abcdef01234567".into(),
+                move || {
+                    rollback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    owned_artifact.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                move || {
+                    finalize_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            if self.block_create {
+                self.create_started.add_permits(1);
+                self.create_release
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .forget();
+            }
+            Ok(creation)
+        }
+        async fn finalize_session_worktree(
+            &self,
+            creation: crate::tools::SessionWorktreeCreation,
+        ) -> Result<(), String> {
+            match self.finalize_behavior {
+                SessionFinalizeBehavior::Complete => creation.finalize(),
+                SessionFinalizeBehavior::Fail => Err("injected finalization failure".into()),
+                SessionFinalizeBehavior::Block => {
+                    self.finalize_started.add_permits(1);
+                    self.finalize_release
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .forget();
+                    creation.finalize()
+                }
+            }
+        }
+        async fn rollback_session_worktree(
+            &self,
+            request: crate::tools::SessionWorktreeRollback,
+        ) -> Result<(), String> {
+            request.creation.rollback()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CancellationAwareToolExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn execute(
+            &self,
+            ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            self.started.add_permits(1);
+            ctx.cancel.cancelled().await;
+            self.cleanup_started.add_permits(1);
+            self.cleanup_release
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap()
+                .forget();
+            ToolResult::error("tool cancelled after cleanup")
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_settings_persist_before_waiting_for_cache_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let releases = Arc::new(tokio::sync::Semaphore::new(0));
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let fail_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(
+                Store::open_in_memory().unwrap(),
+                tmp.path().join("data"),
+                &config,
+            )
+            .with_config_dir(Some(config_dir.clone()))
+            .with_executor(Arc::new(McpInvalidationProbeExecutor {
+                started: started.clone(),
+                releases: releases.clone(),
+                names: names.clone(),
+                fail_after_commit: fail_after_commit.clone(),
+            })),
+        );
+        let config_path = crate::mcp::user_config_path(&config_dir);
+
+        let request = trouve_protocol::UpsertMcpServerRequest {
+            scope: "user".into(),
+            workspace_id: None,
+            command: "first".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            enabled: Some(true),
+        };
+        assert!(engine.upsert_mcp_server("", &request).await.is_err());
+        assert!(started.try_acquire().is_err());
+
+        let task_engine = engine.clone();
+        let mut task =
+            tokio::spawn(async move { task_engine.upsert_mcp_server("docs", &request).await });
+        await_mcp_invalidation_start(&started, &mut task).await;
+        let servers = crate::mcp::read_servers(&config_path);
+        assert_eq!(servers["docs"].command, "first");
+        assert!(!servers["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        fail_after_commit.store(true, Ordering::SeqCst);
+        let task_engine = engine.clone();
+        let mut committed = tokio::spawn(async move {
+            task_engine
+                .upsert_mcp_server(
+                    "committed",
+                    &trouve_protocol::UpsertMcpServerRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        command: "committed-mcp".into(),
+                        args: Vec::new(),
+                        env: std::collections::BTreeMap::new(),
+                        enabled: Some(true),
+                    },
+                )
+                .await
+        });
+        await_mcp_invalidation_start(&started, &mut committed).await;
+        assert_eq!(
+            crate::mcp::read_servers(&config_path)["committed"].command,
+            "committed-mcp"
+        );
+        releases.add_permits(1);
+        committed.await.unwrap().unwrap();
+        assert_eq!(
+            crate::mcp::read_servers(&config_path)["committed"].command,
+            "committed-mcp",
+            "an invalidation failure must not retry or roll back the committed RMW"
+        );
+
+        let task_engine = engine.clone();
+        let mut task = tokio::spawn(async move {
+            task_engine
+                .set_mcp_server_enabled(
+                    "docs",
+                    &trouve_protocol::SetMcpServerEnabledRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        enabled: false,
+                    },
+                )
+                .await
+        });
+        await_mcp_invalidation_start(&started, &mut task).await;
+        assert!(crate::mcp::read_servers(&config_path)["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let mut task = tokio::spawn(async move {
+            task_engine
+                .set_mcp_server_enabled(
+                    "docs",
+                    &trouve_protocol::SetMcpServerEnabledRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        enabled: true,
+                    },
+                )
+                .await
+        });
+        await_mcp_invalidation_start(&started, &mut task).await;
+        assert!(!crate::mcp::read_servers(&config_path)["docs"].disabled);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let mut task = tokio::spawn(async move {
+            task_engine
+                .upsert_mcp_server(
+                    "docs",
+                    &trouve_protocol::UpsertMcpServerRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        command: "replacement".into(),
+                        args: vec!["--new".into()],
+                        env: std::collections::BTreeMap::new(),
+                        enabled: Some(true),
+                    },
+                )
+                .await
+        });
+        await_mcp_invalidation_start(&started, &mut task).await;
+        let servers = crate::mcp::read_servers(&config_path);
+        assert_eq!(servers["docs"].command, "replacement");
+        assert_eq!(servers["docs"].args, ["--new"]);
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let task_engine = engine.clone();
+        let mut task =
+            tokio::spawn(async move { task_engine.delete_mcp_server("docs", "user", None).await });
+        await_mcp_invalidation_start(&started, &mut task).await;
+        assert!(!crate::mcp::read_servers(&config_path).contains_key("docs"));
+        assert!(!task.is_finished());
+        releases.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        let missing = engine
+            .set_mcp_server_enabled(
+                "missing",
+                &trouve_protocol::SetMcpServerEnabledRequest {
+                    scope: "user".into(),
+                    workspace_id: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(matches!(missing, Err(EngineError::NotFound(_))));
+        assert!(started.try_acquire().is_err());
+        assert_eq!(
+            names.lock().unwrap().as_slice(),
+            ["docs", "committed", "docs", "docs", "docs", "docs"]
+        );
+    }
+
+    struct RejectingMcpConfigExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RejectingMcpConfigExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_executor_cannot_fall_through_to_host_mcp_config_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let config_path = crate::mcp::user_config_path(&config_dir);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir))
+        .with_executor(Arc::new(RejectingMcpConfigExecutor));
+
+        let error = engine
+            .upsert_mcp_server(
+                "docs",
+                &trouve_protocol::UpsertMcpServerRequest {
+                    scope: "user".into(),
+                    workspace_id: None,
+                    command: "docs-mcp".into(),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(!config_path.exists(), "engine bypassed the custom executor");
+    }
+
+    #[test]
+    fn session_branches_default_to_short_ids_and_can_include_title_slugs() {
+        assert_eq!(
+            session_branch_name("Fix the Login Bug", "se_abc123def456", false),
+            "trouve/abc123"
+        );
+        assert_eq!(
+            session_branch_name("Fix the Login Bug", "se_abc123def456", true),
+            "trouve/fix-the-login-bug-abc123"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_session_creation_rolls_back_worktree_branch_and_database_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repo);
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_session_rollback".into(),
+            name: "rollback".into(),
+            path: repo.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Engine::new(store.clone(), data_dir.clone(), &Config::default())
+            .with_executor(Arc::new(FailingSessionCreationExecutor(
+                LocalToolExecutor::default(),
+            )));
+
+        let error = engine
+            .create_session(CreateSessionRequest {
+                workspace_id: workspace.id.clone(),
+                title: Some("Must roll back".into()),
+                base_ref: Some("main".into()),
+                checkout_ref: None,
+                fetch_latest: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected checkpoint failure"));
+        assert!(store.list_sessions(Some(&workspace.id)).unwrap().is_empty());
+        assert_eq!(git::list_branches(&repo).unwrap(), ["main"]);
+        let worktree_root = data_dir.join("worktrees");
+        assert!(
+            !worktree_root.exists() || std::fs::read_dir(worktree_root).unwrap().next().is_none(),
+            "failed creation left a worktree directory"
+        );
+        let refs = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/trouve/checkpoints/",
+            ])
+            .output()
+            .unwrap();
+        assert!(refs.status.success());
+        assert!(
+            refs.stdout.is_empty(),
+            "failed creation left a checkpoint ref"
+        );
+    }
+
+    fn session_probe_engine(
+        probe: Arc<SessionCreationProbeExecutor>,
+    ) -> (tempfile::TempDir, Store, Workspace, Arc<Engine>) {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host-workspace");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::write(host.join("sentinel"), "unchanged").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_session_probe".into(),
+            name: "probe".into(),
+            path: host.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Arc::new(
+            Engine::new(store.clone(), temp.path().join("data"), &Config::default())
+                .with_executor(probe),
+        );
+        (temp, store, workspace, engine)
+    }
+
+    fn session_probe_request(workspace: &Workspace) -> CreateSessionRequest {
+        CreateSessionRequest {
+            workspace_id: workspace.id.clone(),
+            title: Some("Executor boundary".into()),
+            base_ref: Some("main".into()),
+            checkout_ref: None,
+            fetch_latest: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_session_executor_never_mutates_the_host_workspace() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (temp, store, workspace, engine) = session_probe_engine(probe.clone());
+
+        let session = engine
+            .create_session(session_probe_request(&workspace))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("host-workspace/sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!Path::new(&session.worktree_path).exists());
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            probe
+                .finalize_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_session_creation_before_receipt_delivery_cleans_late_receipt() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            true,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let request = session_probe_request(&workspace);
+            async move { engine.create_session(request).await }
+        });
+        probe
+            .create_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        assert!(
+            probe
+                .owned_artifact
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        probe.create_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while probe
+                .owned_artifact
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late session creation receipt was not cleaned");
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(store.list_sessions(Some(&workspace.id)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_session_finalization_preserves_the_durable_session() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Block,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let request = session_probe_request(&workspace);
+            async move { engine.create_session(request).await }
+        });
+        probe
+            .finalize_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            probe
+                .finalize_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_finalization_failure_cannot_roll_back_durable_state() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Fail,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let session = engine
+            .create_session(session_probe_request(&workspace))
+            .await
+            .unwrap();
+
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_output_wait_is_immediately_cancellation_aware() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_spawn_cancel".into(),
+            name: "spawn cancel".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: "se_spawn_cancel".into(),
+            workspace_id: workspace.id.clone(),
+            title: "spawn cancel".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let parent = Thread {
+            id: "th_spawn_cancel_parent".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let child = Thread {
+            id: "th_spawn_cancel_child".into(),
+            parent_thread_id: Some(parent.id.clone()),
+            spawned: true,
+            ..parent.clone()
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&parent, &serde_json::Map::new())
+            .unwrap();
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), &parent.id, "thread")
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            store,
+            temp.path().join("data"),
+            &Config::default(),
+        ));
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), session.id.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            engine.handle_spawn_tool(
+                &session,
+                &parent,
+                &modes::fallback_mode(),
+                "spawn_output",
+                &serde_json::json!({"thread_id": child.id, "wait_ms": 180_000}),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("spawn_output did not wake promptly on cancellation")
+        .unwrap_err();
+        assert!(result.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn queued_attachment_removal_cleans_index_rows_and_owned_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let attachment_dir = data_dir.join("attachments");
+        std::fs::create_dir_all(&attachment_dir).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_attachment_cleanup".into(),
+            name: "attachments".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: "se_attachment_cleanup".into(),
+            workspace_id: workspace.id.clone(),
+            title: "attachments".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let thread = Thread {
+            id: "th_attachment_cleanup".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        let engine = Engine::new(store.clone(), data_dir, &Config::default());
+
+        let removed = trouve_protocol::Attachment {
+            id: "at_removed".into(),
+            name: "removed.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 7,
+        };
+        let removed_path = attachment_dir.join("at_removed.txt");
+        std::fs::write(&removed_path, "removed").unwrap();
+        store
+            .add_attachment(
+                &thread.id,
+                &removed,
+                removed_path.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        let updated = store
+            .enqueue_prompt(&thread.id, "before", std::slice::from_ref(&removed))
+            .unwrap();
+        engine
+            .update_queued_prompt(
+                &updated.id,
+                trouve_protocol::UpdateQueuedPromptRequest {
+                    content: "after".into(),
+                    retained_attachment_ids: Some(Vec::new()),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(!removed_path.exists());
+        assert!(store.attachment(&removed.id).unwrap().is_none());
+
+        let deleted = trouve_protocol::Attachment {
+            id: "at_deleted".into(),
+            name: "deleted.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 7,
+        };
+        let deleted_path = attachment_dir.join("at_deleted.txt");
+        std::fs::write(&deleted_path, "deleted").unwrap();
+        store
+            .add_attachment(
+                &thread.id,
+                &deleted,
+                deleted_path.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        let deleted_prompt = store
+            .enqueue_prompt(&thread.id, "delete", std::slice::from_ref(&deleted))
+            .unwrap();
+        engine.delete_queued_prompt(&deleted_prompt.id).unwrap();
+        assert!(!deleted_path.exists());
+        assert!(store.attachment(&deleted.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn static_model_catalog_does_not_wait_for_live_discovery() {
+        let data = tempfile::tempdir().unwrap();
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "catalog-test",
+            Arc::new(CatalogTestProvider {
+                live_calls: live_calls.clone(),
+            }),
+        );
+
+        let static_models = engine.list_models().await;
+        assert!(
+            static_models
+                .iter()
+                .any(|model| model.id == "catalog-test/static")
+        );
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let live_models = engine.refresh_models().await;
+        assert!(
+            live_models
+                .iter()
+                .any(|model| model.id == "catalog-test/live")
+        );
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_message_acceptance_persists_the_turn_shell_before_startup() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_fast_accept".into(),
+            name: "fast accept".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_fast_accept".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Fast acceptance".into(),
+            branch: "trouve/fast-accept".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_fast_accept".into(),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        ));
+
+        let accepted = engine
+            .send_message(&thread.id, "Visible immediately".into(), Vec::new())
+            .unwrap();
+
+        assert_eq!(accepted.turn, 1);
+        assert!(!accepted.queued);
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(matches!(
+            events.first().map(|event| &event.event),
+            Some(Event::QueueUpdated { prompts }) if prompts.is_empty()
+        ));
+        assert!(matches!(
+            events.get(1).map(|event| &event.event),
+            Some(Event::TurnStarted { turn: 1, .. })
+        ));
+        assert!(matches!(
+            events.get(2).map(|event| &event.event),
+            Some(Event::UserMessage {
+                turn: 1,
+                content,
+                ..
+            }) if content == "Visible immediately"
+        ));
+    }
+
+    #[test]
+    fn active_message_acceptance_publishes_one_visible_queue_state() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_fast_queue".into(),
+            name: "fast queue".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_fast_queue".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Fast queue".into(),
+            branch: "trouve/fast-queue".into(),
+            worktree_path: workspace.path,
+            base_ref: "main".into(),
+            archived: false,
+            active: true,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_fast_queue".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        ));
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(thread.id.clone(), session.id);
+
+        let accepted = engine
+            .send_message(&thread.id, "Queue immediately".into(), Vec::new())
+            .unwrap();
+
+        assert_eq!(accepted.turn, 0);
+        assert!(accepted.queued);
+        let queue = store.queued_prompts(&thread.id).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].content, "Queue immediately");
+        assert_eq!(accepted.queued_prompt.as_ref(), queue.first());
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::QueueUpdated { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, Event::TurnStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_resolves_and_removes_pending_user_questions() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_cancel_question".into(),
+            name: "cancel question".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_cancel_question".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Cancel question".into(),
+            branch: "trouve/cancel-question".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_cancel_question".into(),
+            session_id: session.id,
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            data.path().into(),
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            let thread_id = thread.id.clone();
+            async move {
+                engine
+                    .ask_user_questions(
+                        &thread_id,
+                        1,
+                        "question-cancelled",
+                        None,
+                        Vec::new(),
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let requested = store
+                    .events_after(&Scope::Thread(thread.id.clone()), 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, Event::QuestionRequested { .. }));
+                if requested {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("question should enter its pending wait");
+
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("question wait should stop on cancellation")
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            engine.resolve_question(&thread.id, "question-cancelled", None),
+            Err(EngineError::NotFound(_))
+        ));
+        assert!(
+            store
+                .events_after(&Scope::Thread(thread.id), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, Event::QuestionResolved { answers: None, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_collaborators_are_durable_resumable_spawned_threads() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_collaborator".into(),
+            name: "collaborator".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_collaborator".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Native collaborators".into(),
+            branch: "trouve/collab".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine =
+            Arc::new(Engine::new(store.clone(), data.path().into(), &config).with_config_dir(None));
+        let parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: Some(session.title.clone()),
+                mode: Some("code".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+            })
+            .unwrap();
+        let read_only_parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: Some("Read-only parent".into()),
+                mode: Some("review".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+            })
+            .unwrap();
+        assert_eq!(
+            engine
+                .backend_collaborator_mode(
+                    &session,
+                    &read_only_parent,
+                    BackendCollaboratorAccess::Interactive,
+                )
+                .unwrap(),
+            "review",
+            "provider metadata must not widen a read-only parent"
+        );
+        store
+            .set_backend_session(&parent.id, "codex", "vendor-root")
+            .unwrap();
+
+        let mut vendor_threads = HashMap::from([("vendor-root".into(), parent.id.clone())]);
+        let mut collaborators = HashMap::new();
+        assert_eq!(
+            engine
+                .generate_subagent_title(None, Some("Investigate the failing test"))
+                .await
+                .as_deref(),
+            Some("Subagent: Investigate failing test")
+        );
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                Some("Native reviewer".into()),
+                BackendCollaboratorAccess::Interactive,
+                Some("Investigate the failing test".into()),
+                Some("gpt-5.6-terra".into()),
+                Some("high".into()),
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+
+        let child_id = vendor_threads["vendor-child"].clone();
+        let child = engine.get_thread(&child_id).unwrap();
+        assert!(child.spawned);
+        assert_eq!(child.session_id, session.id);
+        assert_eq!(child.title.as_deref(), Some("Subagent: Native reviewer"));
+        assert_eq!(child.model, "codex/gpt-5.6-terra");
+        assert_eq!(child.permission_mode, trouve_protocol::PermissionMode::Yolo);
+        assert_eq!(
+            store.spawn_parent(&child.id).unwrap(),
+            Some(parent.id.clone())
+        );
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 0))
+        );
+        assert_eq!(
+            store.thread_model_options(&child.id).unwrap()["thinking_level"],
+            "high"
+        );
+
+        // Inter-agent activity can name an ancestor as `agentThreadId`. The
+        // root vendor session is already bound to the parent trouve thread and
+        // must never be materialized again as a descendant of the child.
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-root".into(),
+                "vendor-child",
+                Some("root".into()),
+                BackendCollaboratorAccess::Inherit,
+                None,
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        assert!(!collaborators.contains_key("vendor-root"));
+        assert_eq!(vendor_threads["vendor-root"], parent.id);
+        assert_eq!(
+            engine
+                .list_thread_subagents(&parent.id)
+                .unwrap()
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![child.id.clone()]
+        );
+
+        let child_lifecycle = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        let capacity_cursor = child_lifecycle
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCapacityAcquired {
+                        turn: 1,
+                        wait_ms: 0,
+                        background: false,
+                    }
+                )
+                .then_some(event.cursor)
+            })
+            .expect("native collaborator inherits the parent turn's capacity");
+        let started_cursor = child_lifecycle
+            .iter()
+            .find_map(|event| {
+                matches!(event.event, Event::TurnStarted { turn: 1, .. }).then_some(event.cursor)
+            })
+            .expect("native collaborator turn starts");
+        assert!(capacity_cursor < started_cursor);
+
+        // Child activity can create the projection before Codex emits its
+        // formal collaborator-start notification. Publishing is tracked
+        // independently from projection existence, and remains idempotent.
+        assert!(
+            store
+                .events_after(&Scope::Thread(parent.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.event, Event::SubagentSpawned { .. }))
+        );
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-child", &mut collaborators)
+            .await
+            .unwrap();
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-child", &mut collaborators)
+            .await
+            .unwrap();
+        let parent_spawns = store
+            .events_after(&Scope::Thread(parent.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Event::SubagentSpawned {
+                    thread_id, prompt, ..
+                } => Some((thread_id, prompt)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_spawns,
+            vec![(child.id.clone(), "Investigate the failing test".into())]
+        );
+        assert!(collaborators["vendor-child"].spawn_link_published);
+
+        let mut claims = BackendCollaboratorClaims::new(&engine.active_threads);
+        claims.claim(&child.id, &session.id);
+        assert!(!engine.subagent_is_read_only(&child).unwrap());
+        let accepted = engine
+            .send_message(&child.id, "Follow up when finished".into(), Vec::new())
+            .unwrap();
+        assert!(accepted.queued);
+        assert_eq!(store.queued_prompts(&child.id).unwrap().len(), 1);
+
+        let workspace_modes = data.path().join(".agents/modes");
+        std::fs::create_dir_all(&workspace_modes).unwrap();
+        std::fs::write(
+            workspace_modes.join("plan.toml"),
+            r#"
+id = "plan"
+display_name = "Interactive Plan Override"
+system_prompt = "This workspace intentionally made plan interactive."
+allowed_tools = ["read_file"]
+read_only = false
+default_permission_mode = "ask"
+"#,
+        )
+        .unwrap();
+        let restricted_parent = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: Some("Restricted provider parent".into()),
+                mode: Some("plan".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(trouve_protocol::PermissionMode::Ask),
+            })
+            .unwrap();
+        let blocked = engine
+            .start_backend_collaborator(
+                &session,
+                &restricted_parent,
+                "codex",
+                "vendor-blocked".into(),
+                "vendor-plan-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                Some("This collaborator must not start".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("provider-native collaborators are not permitted")
+        );
+        assert!(!vendor_threads.contains_key("vendor-blocked"));
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-audit".into(),
+                "vendor-root",
+                Some("Implementation auditor".into()),
+                BackendCollaboratorAccess::ReadOnly,
+                Some("Audit the implementation and report issues only".into()),
+                Some("gpt-5.6-terra".into()),
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let audit_child = engine.get_thread(&vendor_threads["vendor-audit"]).unwrap();
+        assert!(audit_child.spawned);
+        assert_eq!(audit_child.mode, "review");
+        assert!(engine.subagent_is_read_only(&audit_child).unwrap());
+        assert!(matches!(
+            engine.send_message(&audit_child.id, "Make a follow-up change".into(), Vec::new()),
+            Err(EngineError::Conflict(message))
+                if message.contains("read-only exploration, audit, or review mode")
+        ));
+        assert!(store.queued_prompts(&audit_child.id).unwrap().is_empty());
+
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        std::fs::write(data.path().join("bridge-owner.txt"), "owned by the child").unwrap();
+        let bridge_arguments = serde_json::json!({ "path": "bridge-owner.txt" });
+        let bridge_wrapper = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "read_file",
+            "arguments": bridge_arguments.clone()
+        });
+        let root_cancel = engine.register_cancel(&parent.id);
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-root", &parent.id)
+            .unwrap();
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-child", &child.id)
+            .unwrap();
+        engine
+            .bridged_tool_owners
+            .bind_vendor_thread(&parent.id, "vendor-audit", &audit_child.id)
+            .unwrap();
+        let missing_owner = engine
+            .bridged_codex_tool_call(&parent.id, None, None, "read_file", &bridge_arguments)
+            .await
+            .unwrap_err();
+        assert!(missing_owner.to_string().contains("_meta.threadId"));
+        let unknown_owner = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-external"),
+                None,
+                "read_file",
+                &bridge_arguments,
+            )
+            .await
+            .unwrap_err();
+        assert!(unknown_owner.to_string().contains("unknown, external"));
+        let thread_only_output = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-audit"),
+                None,
+                "read_file",
+                &bridge_arguments,
+            )
+            .await
+            .unwrap();
+        assert!(thread_only_output.contains("owned by the child"));
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "codex-wrapper".into(),
+                    tool: "mcpToolCall".into(),
+                    args: bridge_wrapper,
+                },
+            ));
+        }
+        let bridge_output = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-child"),
+                Some("codex-wrapper"),
+                "read_file",
+                &bridge_arguments,
+            )
+            .await
+            .unwrap();
+        assert!(bridge_output.contains("owned by the child"));
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolCompleted {
+                    call_id: "codex-wrapper".into(),
+                    ok: true,
+                    result: serde_json::json!({ "status": "completed" }),
+                },
+            ));
+        }
+        let child_bridge_events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            child_bridge_events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    Event::ToolRequested { tool, .. } if tool == "read_file"
+                ))
+                .count(),
+            1
+        );
+        assert!(child_bridge_events.iter().all(|event| !matches!(
+            &event.event,
+            Event::ToolRequested { tool, .. } if tool == "mcpToolCall"
+        )));
+        assert!(
+            store
+                .events_after(&Scope::Thread(parent.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    &event.event,
+                    Event::ToolRequested { tool, .. } if tool == "read_file"
+                ))
+        );
+
+        // Two collaborators submit byte-identical mutations while the HTTP
+        // and wrapper transports arrive in opposite orders. Explicit vendor
+        // metadata sends each call through its own mode policy: the code
+        // child writes, while the review child is denied.
+        let identical_write_args = serde_json::json!({
+            "path": "metadata-owner.txt",
+            "content": "written by interactive child"
+        });
+        let write_wrapper = serde_json::json!({
+            "type": "mcpToolCall",
+            "server": "trouve",
+            "tool": "write_file",
+            "arguments": identical_write_args.clone()
+        });
+        let request_first = tokio::spawn({
+            let engine = engine.clone();
+            let parent_id = parent.id.clone();
+            let arguments = identical_write_args.clone();
+            async move {
+                engine
+                    .bridged_codex_tool_call(
+                        &parent_id,
+                        Some("vendor-child"),
+                        Some("request-first-write"),
+                        "write_file",
+                        &arguments,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = engine
+                    .bridged_tool_owners
+                    .state
+                    .lock()
+                    .unwrap()
+                    .roots
+                    .get(&parent.id)
+                    .is_some_and(|root| root.pending_calls.contains_key("request-first-write"));
+                if pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP-first call should enter identity rendezvous");
+        {
+            let projection = collaborators.get_mut("vendor-child").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-child",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "request-first-write".into(),
+                    tool: "mcpToolCall".into(),
+                    args: write_wrapper.clone(),
+                },
+            ));
+        }
+        request_first.await.unwrap().unwrap();
+
+        {
+            let projection = collaborators.get_mut("vendor-audit").unwrap();
+            assert!(engine.suppress_collaborator_bridge_wrapper(
+                &parent.id,
+                "vendor-audit",
+                projection,
+                &BackendCollaboratorEvent::ToolStarted {
+                    call_id: "wrapper-first-write".into(),
+                    tool: "mcpToolCall".into(),
+                    args: write_wrapper,
+                },
+            ));
+        }
+        let review_result = engine
+            .bridged_codex_tool_call(
+                &parent.id,
+                Some("vendor-audit"),
+                Some("wrapper-first-write"),
+                "write_file",
+                &identical_write_args,
+            )
+            .await
+            .unwrap();
+        assert!(review_result.contains("not permitted in this mode"));
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("metadata-owner.txt")).unwrap(),
+            "written by interactive child"
+        );
+
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ThinkingDelta("Checking the suite.".into()),
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ThinkingCompleted,
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolStarted {
+                    call_id: "call-1".into(),
+                    tool: "shell".into(),
+                    args: serde_json::json!({ "command": "cargo test" }),
+                },
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolOutput {
+                    call_id: "call-1".into(),
+                    chunk: "all green".into(),
+                },
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::ToolCompleted {
+                    call_id: "call-1".into(),
+                    ok: true,
+                    result: serde_json::json!({ "exit_code": 0 }),
+                },
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TextDelta("The suite passes.".into()),
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::Completed {
+                    usage: Usage {
+                        input_tokens: 7,
+                        cached_input_tokens: 2,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                },
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        assert!(projection.terminal);
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 2))
+        );
+
+        let events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::UserMessage { turn: 1, content, .. }
+                if content == "Investigate the failing test"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::AssistantThinking { turn: 1, text }
+                if text == "Checking the suite."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ToolCompleted { call_id, status: ToolStatus::Ok, .. }
+                if call_id == "call-1"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::AssistantMessage { turn: 1, content }
+                if content == "The suite passes."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            Event::TurnCompleted {
+                turn: 1,
+                checkpoint_id: None,
+                ..
+            }
+        )));
+        claims.release(&child.id);
+
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                Some("Run a follow-up check".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .prepare_backend_collaborator_turn(
+                &session,
+                "codex",
+                projection,
+                Some("vendor-child-turn-2"),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TurnStarted,
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-child".into(),
+                "vendor-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                Some("Also inspect the current protocol".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let projection = collaborators.get_mut("vendor-child").unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::UserMessage("Also inspect the current protocol".into()),
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::TextDelta("The follow-up passes.".into()),
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_backend_collaborator_event(
+                &session,
+                &mode,
+                "codex",
+                projection,
+                BackendCollaboratorEvent::Completed {
+                    usage: Usage::default(),
+                },
+                &root_cancel,
+            )
+            .await
+            .unwrap();
+        let events = store
+            .events_after(&Scope::Thread(child.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::UserMessage { turn: 2, content, .. } if content == "Run a follow-up check"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::TurnSteered { turn: 2, content, .. }
+                if content == "Also inspect the current protocol"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::TurnCompleted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            store.backend_session(&child.id, "codex").unwrap(),
+            Some(("vendor-child".into(), 5))
+        );
+
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-grandchild".into(),
+                "vendor-child",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                Some("Verify one more edge case".into()),
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let grandchild_id = vendor_threads["vendor-grandchild"].clone();
+        assert_eq!(
+            store.spawn_parent(&grandchild_id).unwrap(),
+            Some(child.id.clone())
+        );
+        let grandchild = engine.get_thread(&grandchild_id).unwrap();
+        assert!(grandchild.spawned);
+        assert_eq!(grandchild.model, "codex/gpt-5.6-terra");
+        assert_eq!(
+            store.thread_model_options(&grandchild.id).unwrap()["thinking_level"],
+            "high"
+        );
+        let grandchild_events = store
+            .events_after(&Scope::Thread(grandchild.id.clone()), 0)
+            .unwrap();
+        let grandchild_capacity = grandchild_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCapacityAcquired {
+                        turn: 1,
+                        wait_ms: 0,
+                        background: false,
+                    }
+                )
+            })
+            .expect("nested collaborator inherits capacity");
+        let grandchild_started = grandchild_events
+            .iter()
+            .position(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
+            .expect("nested collaborator starts");
+        assert!(grandchild_capacity < grandchild_started);
+        engine
+            .publish_backend_collaborator_spawn(&parent, 1, "vendor-grandchild", &mut collaborators)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .events_after(&Scope::Thread(child.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    Event::SubagentSpawned {
+                        turn: 2,
+                        thread_id,
+                        prompt,
+                        ..
+                    } if thread_id == &grandchild.id && prompt == "Verify one more edge case"
+                ))
+        );
+        let direct_children = engine.list_thread_subagents(&parent.id).unwrap();
+        assert!(direct_children.iter().any(|thread| thread.id == child.id));
+        assert!(
+            direct_children
+                .iter()
+                .any(|thread| thread.id == audit_child.id)
+        );
+        assert!(
+            direct_children
+                .iter()
+                .all(|thread| thread.id != grandchild.id),
+            "the existing subagents API remains direct-child-only"
+        );
+        let descendants = engine.list_thread_descendants(&parent.id).unwrap();
+        assert!(descendants.iter().any(|thread| thread.id == child.id));
+        assert!(descendants.iter().any(|thread| thread.id == audit_child.id));
+        assert!(descendants.iter().any(|thread| thread.id == grandchild.id));
+        assert!(engine.thread_can_spawn_subagents(&grandchild.id).unwrap());
+
+        let mut deepest = grandchild;
+        for title in ["Great grandchild", "Great great grandchild"] {
+            let nested = engine
+                .create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    title: Some(title.into()),
+                    mode: Some("code".into()),
+                    model: Some("codex/gpt-5.6-terra".into()),
+                    model_options: serde_json::Map::new(),
+                    permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+                })
+                .unwrap();
+            store
+                .insert_spawned(&nested.id, &deepest.id, "thread")
+                .unwrap();
+            deepest = nested;
+        }
+        assert_eq!(
+            engine.subagent_root_and_depth(&deepest.id).unwrap(),
+            (parent.id.clone(), MAX_SUBAGENT_DEPTH)
+        );
+        assert!(!engine.thread_can_spawn_subagents(&deepest.id).unwrap());
+
+        let cancelled_call = tokio::spawn({
+            let engine = engine.clone();
+            let parent_id = parent.id.clone();
+            async move {
+                engine
+                    .bridged_codex_tool_call(
+                        &parent_id,
+                        Some("vendor-child"),
+                        Some("cancelled-metadata-call"),
+                        "read_file",
+                        &serde_json::json!({ "path": "bridge-owner.txt" }),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = engine
+                    .bridged_tool_owners
+                    .state
+                    .lock()
+                    .unwrap()
+                    .roots
+                    .get(&parent.id)
+                    .is_some_and(|root| root.pending_calls.contains_key("cancelled-metadata-call"));
+                if pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("call should wait for its wrapper before root cancellation");
+        root_cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), cancelled_call)
+                .await
+                .expect("root cancellation should stop metadata rendezvous")
+                .unwrap(),
+            Err(EngineError::Conflict(message)) if message.contains("cancelled")
+        ));
+        engine.clear_cancel(&parent.id);
+    }
+
+    fn projection_pr(number: u64, workspace_id: &str, head: &str) -> trouve_protocol::PrInfo {
+        trouve_protocol::PrInfo {
+            host: "github.com".into(),
+            repository: "acme/widgets".into(),
+            workspace_id: workspace_id.into(),
+            number,
+            url: format!("https://github.com/acme/widgets/pull/{number}"),
+            title: format!("Pull request {number}"),
+            state: "open".into(),
+            draft: false,
+            base: "main".into(),
+            head: head.into(),
+            head_sha: None,
+            checks: Vec::new(),
+            reviews: Vec::new(),
+            trouve_review: None,
+            author: "octocat".into(),
+            requested_reviewers: Vec::new(),
+            comments: 0,
+            last_comment_at: None,
+            mergeable: None,
+            merge_state_status: None,
+            merged_at: None,
+        }
+    }
+
+    fn projection_detail(info: trouve_protocol::PrInfo) -> trouve_protocol::PrDetail {
+        serde_json::from_value(serde_json::json!({
+            "info": info,
+            "base_sha": "base-sha",
+            "id": "PR_node",
+            "viewer": "octocat",
+            "created_at": "2026-08-08T00:00:00Z",
+            "updated_at": "2026-08-08T00:00:00Z",
+            "additions": 1,
+            "deletions": 1,
+            "changed_files": 1,
+            "commit_count": 1,
+            "capabilities": {},
+            "merge_queue": { "enabled": false }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pr_detail_cache_merges_lazy_sections_and_invalidates_independently() {
+        use trouve_protocol::PrDetailSection as Section;
+
+        let mut info = projection_pr(42, "ws", "trouve/cache");
+        info.head_sha = Some("head-one".into());
+        let key = GithubPrDetailKey::from_info(&info);
+        let mut cache = GithubPrDetailCache::default();
+        cache.merge(
+            &key,
+            projection_detail(info.clone()),
+            HashSet::from([Section::Overview]),
+        );
+
+        let mut files = projection_detail(info.clone());
+        files.files.push(trouve_protocol::PrFile {
+            path: "src/lib.rs".into(),
+            additions: 1,
+            deletions: 1,
+            change_type: "modified".into(),
+            viewer_viewed_state: "unviewed".into(),
+        });
+        cache.merge(&key, files, HashSet::from([Section::Files]));
+        let cached = cache
+            .get(&key, &HashSet::from([Section::Overview, Section::Files]))
+            .unwrap();
+        assert_eq!(cached.files.len(), 1);
+
+        cache.mark_stale(&key, &HashSet::from([Section::Files]));
+        assert!(cache.get(&key, &HashSet::from([Section::Files])).is_none());
+        assert!(
+            cache
+                .get(&key, &HashSet::from([Section::Overview]))
+                .is_some()
+        );
+
+        let mut next = info;
+        next.head_sha = Some("head-two".into());
+        let next_detail = cache.merge(
+            &key,
+            projection_detail(next),
+            HashSet::from([Section::Overview]),
+        );
+        assert!(next_detail.files.is_empty());
+        assert!(!cache.entries.contains_key(&key));
+    }
+
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
@@ -8712,6 +17065,77 @@ mod tests {
         };
         let cache = cache.lock().await;
         assert!(!cache.has_published_snapshot());
+    }
+
+    #[test]
+    fn server_projection_bootstraps_branch_and_recorded_session_prs_locally() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_workspace(&trouve_protocol::Workspace {
+                id: "ws_projection".into(),
+                name: "projection".into(),
+                path: "/tmp/projection".into(),
+            })
+            .unwrap();
+        let session = Session {
+            id: "se_projection".into(),
+            workspace_id: "ws_projection".into(),
+            title: "Projection".into(),
+            branch: "trouve/exact".into(),
+            worktree_path: "/tmp/projection".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let exact = projection_pr(10, &session.workspace_id, &session.branch);
+        let linked = projection_pr(11, &session.workspace_id, "external-branch");
+        store
+            .append_event(
+                Scope::Server,
+                Event::GithubPullRequestsUpdated {
+                    pull_requests: trouve_protocol::GithubPrList {
+                        viewer: "octocat".into(),
+                        host: "github.com".into(),
+                        prs: vec![exact, linked.clone()],
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Session(session.id.clone()),
+                Event::SessionPrOpened {
+                    number: linked.number,
+                    url: linked.url,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(store, data.path().into(), &Config::default());
+
+        let local = engine.projected_session_prs(&session.id).unwrap();
+        assert_eq!(
+            local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![11, 10]
+        );
+
+        let (cursor, projection) = engine.server_projection_snapshot().unwrap();
+
+        assert!(cursor > 0);
+        assert_eq!(projection.github_pull_requests.len(), 1);
+        assert_eq!(projection.github_pull_requests[0].cursor, cursor);
+        assert_eq!(projection.session_pull_requests.len(), 1);
+        assert_eq!(projection.session_pull_requests[0].session_id, session.id);
+        assert_eq!(
+            projection.session_pull_requests[0]
+                .prs
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![11, 10]
+        );
     }
 
     #[test]
@@ -8838,6 +17262,7 @@ mod tests {
                     "ref": "refs/heads/fix/manual-pr",
                     "object": {"sha": remote_commit}
                 }),
+                execution_duration_ms: None,
             },
             Event::ToolRequested {
                 turn: 1,
@@ -8854,6 +17279,7 @@ mod tests {
                 call_id: "failed".into(),
                 status: ToolStatus::Error,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             Event::ToolRequested {
                 turn: 1,
@@ -8872,6 +17298,7 @@ mod tests {
                 call_id: "graphql".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             // Successful list/view output may mention many PRs, but none of
             // them were created by this session.
@@ -8890,6 +17317,7 @@ mod tests {
                 call_id: "list".into(),
                 status: ToolStatus::Ok,
                 result: serde_json::Value::Null,
+                execution_duration_ms: None,
             },
             Event::UserMessage {
                 turn: 2,
@@ -9141,6 +17569,8 @@ mod tests {
         let thread = Thread {
             id: "th_todo".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
             mode: "code".into(),
             model: "test/model".into(),
             model_options: Default::default(),
@@ -9223,6 +17653,95 @@ mod tests {
             store.thread(&thread.id).unwrap().unwrap().todos,
             vendor_todos
         );
+
+        // An external MCP server may use the same basename, or a provider may
+        // report a generic wrapper whose nested tool is named `todo_write`.
+        // Neither is allowed to replace trouve's authoritative thread TODOs
+        // or synthesize a TodosUpdated event.
+        let todos_updated_before = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .iter()
+            .filter(|env| matches!(env.event, Event::TodosUpdated { .. }))
+            .count();
+        let external_engine = Arc::new(
+            Engine::new(store.clone(), tmp.path().into(), &config)
+                .with_executor(Arc::new(SuccessfulTodoExecutor)),
+        );
+        let mut external_thread = thread.clone();
+        external_thread.permission_mode = trouve_protocol::PermissionMode::Yolo;
+        let external_ctx = ToolCtx {
+            worktree: tmp.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let mode = modes::fallback_mode();
+        for (turn, call) in [
+            (
+                2,
+                trouve_providers::ToolCallRequest {
+                    id: "call_external_todo".into(),
+                    name: "mcp__external__todo_write".into(),
+                    arguments: serde_json::json!({"todos": [
+                        {"id": "external", "content": "External", "status": "completed"}
+                    ]}),
+                },
+            ),
+            (
+                3,
+                trouve_providers::ToolCallRequest {
+                    id: "call_external_todo_wrapper".into(),
+                    name: "mcpToolCall".into(),
+                    arguments: serde_json::json!({
+                        "server": "external",
+                        "tool": "todo_write",
+                        "arguments": {"todos": [
+                            {"id": "external", "content": "External", "status": "completed"}
+                        ]}
+                    }),
+                },
+            ),
+        ] {
+            external_engine
+                .handle_tool_call(
+                    &session,
+                    &external_thread,
+                    turn,
+                    &mode,
+                    &external_ctx,
+                    &call,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.thread(&thread.id).unwrap().unwrap().todos,
+            vendor_todos
+        );
+        let todos_updated_after = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .iter()
+            .filter(|env| matches!(env.event, Event::TodosUpdated { .. }))
+            .count();
+        assert_eq!(todos_updated_after, todos_updated_before);
+
+        // The reserved first-party bridge namespace is still authoritative if
+        // a supported provider exposes the native tool under that identifier.
+        let bridged = external_engine
+            .persist_todos_from_result(
+                &thread.id,
+                "mcp__trouve__todo_write",
+                ToolStatus::Ok,
+                &serde_json::json!({"todos": [
+                    {"id": "bridged", "content": "Bridged", "status": "pending"}
+                ]}),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bridged[0].id, "bridged");
     }
 
     #[test]
@@ -9418,6 +17937,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_ids_are_non_empty_and_unique_before_execution() {
+        let mut calls = vec![
+            trouve_providers::ToolCallRequest {
+                id: String::new(),
+                name: "read_one".into(),
+                arguments: serde_json::json!({}),
+            },
+            trouve_providers::ToolCallRequest {
+                id: "provider-id".into(),
+                name: "read_two".into(),
+                arguments: serde_json::json!({}),
+            },
+            trouve_providers::ToolCallRequest {
+                id: "provider-id".into(),
+                name: "read_three".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        normalize_tool_call_ids(&mut calls);
+        assert!(calls.iter().all(|call| !call.id.is_empty()));
+        assert_eq!(calls[1].id, "provider-id");
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_ne!(calls[1].id, calls[2].id);
+    }
+
+    #[test]
     fn inherited_thinking_level_resolves_through_model_schema() {
         let mut inherited = serde_json::Map::new();
         inherit_thinking_option(&mut inherited, Some("low"), Some("high"));
@@ -9454,6 +17999,10 @@ mod tests {
             options.get("reasoning_effort"),
             Some(&serde_json::json!("high"))
         );
+        assert_eq!(
+            resolved_thinking_level(&options, Some(&model)).as_deref(),
+            Some("high")
+        );
         assert!(!options.contains_key("thinking_level"));
 
         // A global token the selected model does not offer falls back to
@@ -9464,6 +18013,11 @@ mod tests {
         assert_eq!(
             options.get("reasoning_effort"),
             Some(&serde_json::json!("medium"))
+        );
+        assert_eq!(
+            resolved_thinking_level(&serde_json::Map::new(), Some(&model)).as_deref(),
+            Some("medium"),
+            "omitting an option uses the model schema default"
         );
 
         let fixed_model = trouve_protocol::ModelInfo {
@@ -9487,6 +18041,10 @@ mod tests {
         assert_eq!(
             options.get("thinking_budget_tokens"),
             Some(&serde_json::json!(16384))
+        );
+        assert_eq!(
+            resolved_thinking_level(&options, Some(&fixed_model)).as_deref(),
+            Some("16384")
         );
 
         // No thinking enum means the inherited option is not sent.
@@ -9554,7 +18112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_access_shares_readers_and_excludes_writers() {
+    async fn session_lifecycle_shares_turns_and_excludes_destructive_operations() {
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
             Store::open_in_memory().unwrap(),
@@ -9568,11 +18126,512 @@ mod tests {
             .expect("a second read-only turn should overlap");
         assert!(
             lock.try_write().is_err(),
-            "mutating work must wait for every read-only turn"
+            "destructive lifecycle work must wait for every active turn"
         );
         drop(second_reader);
         drop(first_reader);
         assert!(lock.try_write().is_ok());
+    }
+
+    #[test]
+    fn codex_and_claude_default_to_the_full_tool_bridge() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "claude".into(),
+            ProviderConfig {
+                kind: "claude-cli".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.insert(
+            "claude-native".into(),
+            ProviderConfig {
+                kind: "claude-cli".into(),
+                tool_bridge: Some(false),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+        let _cancel = engine.register_cancel("th_1");
+
+        let codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
+        assert!(codex.bridge_tools);
+        assert!(codex.url.contains("tools=1"));
+        assert!(codex.disallowed_tools.is_empty());
+        let codex_ticket = codex
+            .url
+            .split('?')
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("ticket="))
+            .unwrap();
+        let claims = engine
+            .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+            .unwrap();
+        assert!(claims.correlate_codex_owner);
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_tampered", true, false)
+                .is_none()
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", false, false)
+                .is_none()
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, true)
+                .is_none()
+        );
+
+        engine.clear_cancel("th_1");
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_none(),
+            "a retained capability must remain dormant between turns"
+        );
+        let _resumed_cancel = engine.register_cancel("th_1");
+        let resumed_codex = engine.mcp_bridge_for("codex/model", "th_1").unwrap();
+        assert_eq!(
+            resumed_codex.url, codex.url,
+            "a resumed vendor runtime must receive the URL its persistent MCP client already uses"
+        );
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_some()
+        );
+
+        let claude = engine.mcp_bridge_for("claude/model", "th_1").unwrap();
+        assert!(claude.bridge_tools);
+        assert!(claude.disallowed_tools.iter().any(|tool| tool == "Edit"));
+        assert!(
+            engine
+                .validate_bridge_ticket(codex_ticket, "th_1", true, false)
+                .is_none(),
+            "changing the bridge capability surface must rotate the old ticket"
+        );
+
+        let native = engine
+            .mcp_bridge_for("claude-native/model", "th_1")
+            .unwrap();
+        assert!(!native.bridge_tools);
+        assert!(native.url.contains("tools=0"));
+        engine.clear_cancel("th_1");
+    }
+
+    #[tokio::test]
+    async fn approved_vendor_mutation_waits_for_the_session_tool_lane() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let session = Session {
+            id: "se_vendor_lane".into(),
+            workspace_id: "ws_vendor_lane".into(),
+            title: "Vendor lane".into(),
+            branch: "trouve/vendor-lane".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let thread = Thread {
+            id: "th_vendor_lane".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "cursor/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let read_permit = engine.tool_execution_lock(&session.id).read_owned().await;
+        let (response, _response_rx) = tokio::sync::oneshot::channel();
+        let mut approval = engine.pending_backend_approval(
+            session,
+            thread,
+            1,
+            mode,
+            "vendor-call".into(),
+            "CommandExecution".into(),
+            serde_json::json!({}),
+            response,
+            tokio_util::sync::CancellationToken::new(),
+            true,
+            None,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut approval)
+                .await
+                .is_err(),
+            "vendor mutation approval must not pass while a read permit is active"
+        );
+        drop(read_permit);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), approval)
+            .await
+            .expect("vendor mutation should acquire the lane after release");
+        assert_eq!(outcome.call_id, "vendor-call");
+        assert!(outcome.approved.unwrap());
+        assert!(outcome.mutation_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_tool_retains_execution_lane_until_cleanup_acknowledgement() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_cancel_tool".into(),
+            name: "cancel tool".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_cancel_tool".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Cancel tool".into(),
+            branch: "trouve/cancel-tool".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_cancel_tool".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().into(), &Config::default()).with_executor(Arc::new(
+                CancellationAwareToolExecutor {
+                    started: started.clone(),
+                    cleanup_started: cleanup_started.clone(),
+                    cleanup_release: cleanup_release.clone(),
+                },
+            )),
+        );
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let call = trouve_providers::ToolCallRequest {
+            id: "call-cancel-tool".into(),
+            name: "write_test".into(),
+            arguments: serde_json::json!({}),
+        };
+        let execution = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .handle_tool_call(&session, &thread, 1, &mode, &ctx, &call, &cancel)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started.clone().acquire_owned(),
+        )
+        .await
+        .expect("tool should begin")
+        .unwrap()
+        .forget();
+
+        cancel.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_started.clone().acquire_owned(),
+        )
+        .await
+        .expect("tool should observe cancellation")
+        .unwrap()
+        .forget();
+        assert!(!execution.is_finished());
+        let lane = engine.tool_execution_lock(&session.id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), lane.read())
+                .await
+                .is_err(),
+            "mutation lane was released before tool cleanup completed"
+        );
+
+        cleanup_release.add_permits(1);
+        let (result, images) = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("tool call should finish after cleanup acknowledgement")
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("tool cancelled after cleanup"));
+        assert!(images.is_empty());
+
+        // A misbehaving executor that exceeds the bounded acknowledgement
+        // wait may no longer block the terminal turn state, but its mutation
+        // lane remains quarantined until the executor really returns.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let call = trouve_providers::ToolCallRequest {
+            id: "call-quarantine-tool".into(),
+            name: "write_test".into(),
+            arguments: serde_json::json!({}),
+        };
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let execution = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .handle_tool_call(&session, &thread, 2, &mode, &ctx, &call, &cancel)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            started.clone().acquire_owned(),
+        )
+        .await
+        .expect("second tool should begin")
+        .unwrap()
+        .forget();
+        cancel.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_started.clone().acquire_owned(),
+        )
+        .await
+        .expect("second tool should enter cleanup")
+        .unwrap()
+        .forget();
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("engine should bound a non-acknowledging executor")
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("tool cancellation cleanup timed out"));
+        let lane = engine.tool_execution_lock(&session.id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), lane.read())
+                .await
+                .is_err(),
+            "timed-out mutation lane must remain quarantined"
+        );
+        cleanup_release.add_permits(1);
+        let _released = tokio::time::timeout(std::time::Duration::from_secs(1), lane.read())
+            .await
+            .expect("quarantined lane should release after late cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_tool_batches_overlap_reads_and_serialize_mutations() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_parallel_tools".into(),
+            name: "parallel tools".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_parallel_tools".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Parallel tools".into(),
+            branch: "trouve/parallel".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_parallel_tools".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Yolo,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let releases = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().into(), &Config::default()).with_executor(Arc::new(
+                BlockingToolExecutor {
+                    started: started_tx,
+                    releases: releases.clone(),
+                },
+            )),
+        );
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let ctx = ToolCtx {
+            worktree: data.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let calls = |names: &[&str]| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| trouve_providers::ToolCallRequest {
+                    id: format!("call-{name}-{index}"),
+                    name: (*name).to_string(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let read_batch = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            async move {
+                engine
+                    .handle_tool_calls_parallel(
+                        &session,
+                        &thread,
+                        1,
+                        &mode,
+                        &ctx,
+                        calls(&["read_one", "read_two"]),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let mut started_reads = HashSet::new();
+        for _ in 0..2 {
+            started_reads.insert(
+                tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                    .await
+                    .expect("both read-only calls should start together")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            started_reads,
+            HashSet::from(["read_one".to_string(), "read_two".to_string()])
+        );
+        releases.add_permits(2);
+        assert!(
+            read_batch
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, result)| result.is_ok())
+        );
+
+        let write_batch = tokio::spawn({
+            let engine = engine.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            async move {
+                engine
+                    .handle_tool_calls_parallel(
+                        &session,
+                        &thread,
+                        2,
+                        &mode,
+                        &ctx,
+                        calls(&["write_one", "write_two"]),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        let first_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("the first mutation should start")
+                .unwrap();
+        assert!(first_write.starts_with("write_"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "a second mutation must wait for the first"
+        );
+        releases.add_permits(1);
+        let second_write =
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("the second mutation should start after release")
+                .unwrap();
+        assert!(second_write.starts_with("write_"));
+        assert_ne!(first_write, second_write);
+        releases.add_permits(1);
+        assert!(
+            write_batch
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, result)| result.is_ok())
+        );
     }
 
     #[tokio::test]
@@ -9597,6 +18656,7 @@ mod tests {
             engine.set_git_worktree_settings(
                 trouve_protocol::TitleModelLoadBehavior::Always,
                 trouve_protocol::TitleModelResourcePolicy::GpuOnly,
+                None,
             ),
         )
         .await

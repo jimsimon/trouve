@@ -1,6 +1,8 @@
 //! Recursive filename search by glob pattern, honouring .gitignore.
 
 use serde_json::{Value, json};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -14,7 +16,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &'static str {
-        "Find workspace files whose path matches a glob pattern (e.g. \"*.rs\", \
+        "Find files under the workspace or a host-registered read-only root whose path matches a glob pattern (e.g. \"*.rs\", \
          \"src/**/*.slint\"). Bare patterns match at any depth. Respects .gitignore; \
          results are sorted by modification time, newest first."
     }
@@ -23,7 +25,7 @@ impl Tool for Glob {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob pattern; \"*.rs\" matches at any depth, use \"/\" for structure (\"src/**/*.ts\")"},
-                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root)"}
+                "path": {"type": "string", "description": "Workspace-relative directory to search (default: root), or an absolute directory under a host-registered read-only root"}
             },
             "required": ["pattern"]
         })
@@ -33,11 +35,14 @@ impl Tool for Glob {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult::error("glob cancelled");
+        }
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: pattern");
         };
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = match ctx.resolve(rel) {
+        let root = match ctx.resolve_read(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
@@ -56,10 +61,12 @@ impl Tool for Glob {
             Err(e) => return ToolResult::error(format!("invalid pattern: {e}")),
         };
         let worktree = ctx.worktree.clone();
+        let cancel = ctx.cancel.clone();
         // The walker is synchronous; run it off the async threads.
-        let found = tokio::task::spawn_blocking(move || search(&worktree, &root, &matcher))
-            .await
-            .unwrap_or_else(|e| Err(format!("glob walk panicked: {e}")));
+        let found =
+            tokio::task::spawn_blocking(move || search(&worktree, &root, &matcher, &cancel))
+                .await
+                .unwrap_or_else(|e| Err(format!("glob walk panicked: {e}")));
         match found {
             Ok((files, truncated)) => ToolResult::ok(json!({
                 "files": files,
@@ -74,13 +81,41 @@ fn search(
     worktree: &std::path::Path,
     root: &std::path::Path,
     matcher: &globset::GlobMatcher,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Vec<Value>, bool), String> {
-    let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
+    #[derive(Eq, PartialEq)]
+    struct Candidate {
+        modified: std::time::SystemTime,
+        path: String,
+    }
+
+    impl Ord for Candidate {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.modified
+                .cmp(&other.modified)
+                // Lexically smaller paths rank higher for deterministic ties.
+                .then_with(|| other.path.cmp(&self.path))
+        }
+    }
+
+    impl PartialOrd for Candidate {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    // Reverse makes this a min-heap: once full, its root is the least useful
+    // retained result. Memory stays O(MAX_RESULTS) even in giant repos.
+    let mut files = BinaryHeap::<Reverse<Candidate>>::with_capacity(MAX_RESULTS + 1);
+    let mut truncated = false;
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .require_git(false)
         .build();
     for entry in walker {
+        if cancel.is_cancelled() {
+            return Err("glob cancelled".into());
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -102,14 +137,35 @@ fn search(
             .unwrap_or(entry.path())
             .to_string_lossy()
             .to_string();
-        files.push((mtime, rel));
+        let candidate = Candidate {
+            modified: mtime,
+            path: rel,
+        };
+        if files.len() < MAX_RESULTS {
+            files.push(Reverse(candidate));
+        } else {
+            truncated = true;
+            if files.peek().is_some_and(|worst| candidate > worst.0) {
+                files.pop();
+                files.push(Reverse(candidate));
+            }
+        }
     }
     // Newest first: recently touched files are almost always the relevant
     // ones. Path as tiebreaker keeps the order deterministic.
-    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let truncated = files.len() > MAX_RESULTS;
-    files.truncate(MAX_RESULTS);
-    let files = files.into_iter().map(|(_, p)| json!(p)).collect();
+    let mut files = files
+        .into_iter()
+        .map(|Reverse(candidate)| candidate)
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let files = files
+        .into_iter()
+        .map(|candidate| json!(candidate.path))
+        .collect();
     Ok((files, truncated))
 }
 

@@ -1,13 +1,13 @@
 //! Model metadata from the public, tokenless models.dev catalog.
 //!
-//! Provider APIs and vendor CLIs contribute account-specific availability,
-//! while this catalog remains authoritative for provider identity, model
-//! metadata, and model-specific option schemas. Explicit adapters own metadata
-//! only for integrations the catalog cannot describe (custom gateways, local
-//! runtimes, and Cursor-only models). A generated snapshot keeps the complete
-//! provider roster plus model details available offline; a validated disk
-//! cache is refreshed from models.dev when the server has connectivity
-//! monitoring.
+//! Provider APIs may contribute account-specific availability, while this
+//! catalog remains authoritative for provider identity, model metadata, model
+//! rosters, and model-specific option schemas. Cursor remains an explicit
+//! exception because its CLI is the only source for Cursor-only models. A
+//! generated snapshot keeps the complete public provider roster plus model
+//! details available offline; a small trouve-owned overlay describes serving
+//! surfaces that models.dev does not yet distinguish. A validated disk cache
+//! is refreshed from models.dev when the server has connectivity monitoring.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +27,10 @@ const CACHE_VERSION: u32 = 2;
 const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
 const RETRY_TTL: Duration = Duration::from_secs(5 * 60);
 const SNAPSHOT: &str = include_str!("../data/models-dev-snapshot.json");
+const TROUVE_CATALOG: &str = include_str!("../data/trouve-model-catalog.json");
 
 type Catalog = BTreeMap<String, CatalogProvider>;
+type CatalogOverlay = BTreeMap<String, CatalogOverlayProvider>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionsDialect {
@@ -53,6 +55,17 @@ struct CatalogProvider {
     name: String,
     #[serde(default)]
     models: BTreeMap<String, CatalogModel>,
+}
+
+/// A trouve-owned provider record has the same provider/model nesting as
+/// models.dev's `api.json`, but model bodies stay as JSON until lookup so a
+/// `base_model` can inherit from the latest remote (or embedded) catalog.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CatalogOverlayProvider {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    models: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -85,6 +98,11 @@ struct ReasoningOption {
     min: Option<i64>,
     #[serde(default)]
     max: Option<i64>,
+    /// Trouve-owned catalogs may pin a serving surface's actual default. The
+    /// public `api.json` currently omits this field, so upstream records retain
+    /// the conventional midpoint fallback.
+    #[serde(default)]
+    default: Option<String>,
 }
 
 fn deserialize_string_values<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -101,6 +119,8 @@ where
 struct ModelLimit {
     #[serde(default)]
     context: Option<u64>,
+    #[serde(default)]
+    input: Option<u64>,
     #[serde(default)]
     output: Option<u64>,
 }
@@ -148,6 +168,7 @@ struct DiskCache {
 
 struct CatalogState {
     embedded: Catalog,
+    owned: CatalogOverlay,
     remote: Option<Catalog>,
     etag: Option<String>,
     fetched_at: Option<u64>,
@@ -183,6 +204,8 @@ impl ModelsDevCatalog {
 
     fn from_cache_path(cache_path: Option<PathBuf>) -> Self {
         let embedded = parse_catalog(SNAPSHOT).expect("bundled models.dev snapshot must be valid");
+        let owned = parse_catalog_overlay(TROUVE_CATALOG)
+            .expect("bundled trouve model catalog must be valid");
         let disk = cache_path
             .as_deref()
             .and_then(|path| load_disk_cache(path).ok().flatten());
@@ -199,6 +222,7 @@ impl ModelsDevCatalog {
         Self {
             state: RwLock::new(CatalogState {
                 embedded,
+                owned,
                 remote,
                 etag,
                 fetched_at,
@@ -350,13 +374,17 @@ impl ModelsDevCatalog {
     ) -> Vec<ModelInfo> {
         let models = {
             let state = self.state.read().unwrap();
-            state
-                .remote
-                .as_ref()
-                .and_then(|catalog| provider_by_setup_id(catalog, catalog_provider))
-                .or_else(|| provider_by_setup_id(&state.embedded, catalog_provider))
+            let mut models = source_provider(&state, catalog_provider)
                 .map(|provider| provider.models.clone())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if let Some(provider) = overlay_provider_by_setup_id(&state.owned, catalog_provider) {
+                for (id, patch) in &provider.models {
+                    if let Some(model) = resolve_overlay_model(&state, id, patch) {
+                        models.insert(id.clone(), model);
+                    }
+                }
+            }
+            models
         };
         models
             .into_iter()
@@ -486,16 +514,10 @@ impl ModelsDevCatalog {
 
     fn model_record(&self, provider: &str, model: &str) -> Option<CatalogModel> {
         let state = self.state.read().unwrap();
-        state
-            .remote
-            .as_ref()
-            .and_then(|catalog| provider_by_setup_id(catalog, provider))
+        overlay_provider_by_setup_id(&state.owned, provider)
             .and_then(|provider| provider.models.get(model))
-            .or_else(|| {
-                provider_by_setup_id(&state.embedded, provider)
-                    .and_then(|provider| provider.models.get(model))
-            })
-            .cloned()
+            .and_then(|patch| resolve_overlay_model(&state, model, patch))
+            .or_else(|| source_model(&state, provider, model).cloned())
     }
 }
 
@@ -545,14 +567,15 @@ impl CatalogModel {
                         "enum": option.values,
                         "description": "How much thinking the model does before answering"
                     });
-                    // models.dev supplies the supported ordering but not a
-                    // separate default. Normalize that once for every client:
-                    // prefer the conventional midpoint, then the catalog's
-                    // first supported value.
+                    // Public models.dev records supply the supported ordering
+                    // but not a separate default. Trouve-owned serving-surface
+                    // records can pin one; otherwise prefer the conventional
+                    // midpoint, then the catalog's first supported value.
                     if let Some(default) = option
-                        .values
-                        .iter()
-                        .find(|value| *value == "medium")
+                        .default
+                        .as_ref()
+                        .filter(|default| option.values.contains(default))
+                        .or_else(|| option.values.iter().find(|value| *value == "medium"))
                         .or_else(|| option.values.first())
                     {
                         schema["default"] = json!(default);
@@ -839,6 +862,89 @@ fn provider_by_setup_id<'a>(catalog: &'a Catalog, requested: &str) -> Option<&'a
     provider_entry_by_setup_id(catalog, requested).map(|(_, provider)| provider)
 }
 
+fn source_provider<'a>(state: &'a CatalogState, requested: &str) -> Option<&'a CatalogProvider> {
+    state
+        .remote
+        .as_ref()
+        .and_then(|catalog| provider_by_setup_id(catalog, requested))
+        .or_else(|| provider_by_setup_id(&state.embedded, requested))
+}
+
+fn source_model<'a>(
+    state: &'a CatalogState,
+    provider: &str,
+    model: &str,
+) -> Option<&'a CatalogModel> {
+    state
+        .remote
+        .as_ref()
+        .and_then(|catalog| provider_by_setup_id(catalog, provider))
+        .and_then(|provider| provider.models.get(model))
+        .or_else(|| {
+            provider_by_setup_id(&state.embedded, provider)
+                .and_then(|provider| provider.models.get(model))
+        })
+}
+
+fn overlay_provider_by_setup_id<'a>(
+    catalog: &'a CatalogOverlay,
+    requested: &str,
+) -> Option<&'a CatalogOverlayProvider> {
+    let canonical = canonical_provider_id(requested);
+    catalog.get(canonical).or_else(|| {
+        catalog.iter().find_map(|(catalog_id, provider)| {
+            let source_id = if provider.id.is_empty() {
+                catalog_id
+            } else {
+                &provider.id
+            };
+            (setup_provider_id(source_id) == requested).then_some(provider)
+        })
+    })
+}
+
+/// Resolve one trouve-owned model against the newest available public base.
+/// Objects deep-merge and arrays/scalars replace, matching models.dev's
+/// `base_model` authoring semantics. The target map key remains the model id.
+fn resolve_overlay_model(
+    state: &CatalogState,
+    target_id: &str,
+    patch: &Value,
+) -> Option<CatalogModel> {
+    let mut patch = patch.clone();
+    let patch_object = patch.as_object_mut()?;
+    let base = patch_object
+        .remove("base_model")
+        .and_then(|value| value.as_str().map(String::from));
+    let mut merged = match base {
+        Some(base) => {
+            let (provider, model) = base.split_once('/')?;
+            serde_json::to_value(source_model(state, provider, model)?).ok()?
+        }
+        None => Value::Object(Map::new()),
+    };
+    merge_json(&mut merged, &patch);
+    merged
+        .as_object_mut()?
+        .insert("id".into(), Value::String(target_id.into()));
+    serde_json::from_value(merged).ok()
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                if let Some(existing) = target.get_mut(key) {
+                    merge_json(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
 /// API endpoints omitted by models.dev because those records target a native
 /// JavaScript SDK. Trouve's transport is different, so these are integration
 /// adapters rather than catalog records; all roster/name/env data still comes
@@ -1004,6 +1110,15 @@ fn parse_catalog(text: &str) -> Result<Catalog> {
     serde_json::from_str(text).context("parsing models.dev catalog")
 }
 
+fn parse_catalog_overlay(text: &str) -> Result<CatalogOverlay> {
+    let catalog: CatalogOverlay =
+        serde_json::from_str(text).context("parsing trouve model catalog")?;
+    if catalog.is_empty() || catalog.values().all(|provider| provider.models.is_empty()) {
+        bail!("trouve model catalog contains no models");
+    }
+    Ok(catalog)
+}
+
 fn validate_catalog(catalog: &Catalog) -> Result<()> {
     if catalog.is_empty() || catalog.values().all(|provider| provider.models.is_empty()) {
         bail!("models.dev catalog contains no models");
@@ -1071,6 +1186,70 @@ mod tests {
                 .pointer("/properties/effort/enum")
                 .unwrap(),
             &json!(["low", "medium", "high", "xhigh", "max"])
+        );
+    }
+
+    #[test]
+    fn trouve_owned_codex_provider_inherits_and_overrides_openai_models() {
+        let catalog = ModelsDevCatalog::embedded();
+        let models = catalog.provider_models("openai-codex", "codex", OptionsDialect::CodexCli);
+        assert_eq!(models.len(), 7);
+
+        let sol = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.display_name, "GPT-5.6 Sol");
+        assert_eq!(sol.context_window, 500_000);
+        assert_eq!(sol.input_price_per_mtok, Some(5.0));
+        assert_eq!(
+            sol.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
+        );
+        assert_eq!(
+            sol.options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("low"))
+        );
+
+        let luna = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(luna.context_window, 500_000);
+        assert_eq!(
+            luna.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+
+        let gpt_55 = catalog
+            .model("openai-codex", "codex", "gpt-5.5", OptionsDialect::CodexCli)
+            .unwrap();
+        assert_eq!(gpt_55.context_window, 400_000);
+        assert_eq!(
+            catalog
+                .model_record("openai-codex", "gpt-5.5")
+                .unwrap()
+                .limit
+                .input,
+            Some(272_000)
+        );
+
+        // The direct API surface remains the upstream models.dev record.
+        assert_eq!(
+            catalog
+                .model("openai", "openai", "gpt-5.6-sol", OptionsDialect::OpenAi)
+                .unwrap()
+                .context_window,
+            1_050_000
+        );
+        assert!(
+            catalog
+                .provider_presets()
+                .iter()
+                .all(|provider| provider.id != "openai-codex")
         );
     }
 
@@ -1281,7 +1460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models-dev-cache.json");
         let remote = parse_catalog(
-            r#"{"openai":{"models":{"future":{"id":"future","name":"Future","tool_call":true,"limit":{"context":42}}}}}"#,
+            r#"{"openai":{"models":{"future":{"id":"future","name":"Future","tool_call":true,"limit":{"context":42}},"gpt-5.6-sol":{"id":"gpt-5.6-sol","name":"Remote Sol","tool_call":true,"reasoning_options":[{"type":"effort","values":["medium"]}],"limit":{"context":777000,"input":649000,"output":128000},"cost":{"input":9.0,"output":18.0}}}}}"#,
         )
         .unwrap();
         let cache = DiskCache {
@@ -1303,6 +1482,27 @@ mod tests {
             catalog
                 .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
                 .is_some()
+        );
+
+        // Owned records resolve their base lazily, so a refreshed public
+        // catalog updates inherited fields without replacing Codex-specific
+        // limits, defaults, or reasoning levels.
+        let codex = catalog
+            .model(
+                "openai-codex",
+                "codex",
+                "gpt-5.6-sol",
+                OptionsDialect::CodexCli,
+            )
+            .unwrap();
+        assert_eq!(codex.display_name, "Remote Sol");
+        assert_eq!(codex.context_window, 500_000);
+        assert_eq!(codex.input_price_per_mtok, Some(9.0));
+        assert_eq!(
+            codex
+                .options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
         );
     }
 }

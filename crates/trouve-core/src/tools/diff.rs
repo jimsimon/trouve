@@ -60,10 +60,16 @@ impl Tool for GitDiff {
         let worktree = ctx.worktree.clone();
         let base = base.to_string();
         let path = args.get("path").and_then(Value::as_str).map(str::to_string);
-        if let Some(path) = path.as_deref()
-            && let Err(error) = ctx.resolve(path)
-        {
-            return ToolResult::error(error);
+        if let Some(path) = path.as_deref() {
+            let valid = !path.is_empty()
+                && std::path::Path::new(path)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+            if !valid {
+                return ToolResult::error(format!(
+                    "invalid repository-relative diff path: {path:?}"
+                ));
+            }
         }
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let limit = args
@@ -72,9 +78,12 @@ impl Tool for GitDiff {
             .map(|value| value as usize)
             .unwrap_or(MAX_DIFF_BYTES)
             .clamp(1, MAX_DIFF_BYTES);
+        let cancel = ctx.cancel.clone();
         match tokio::task::spawn_blocking(move || match path {
-            Some(path) => crate::git::session_diff_path(&worktree, &base, &path),
-            None => crate::git::session_diff(&worktree, &base),
+            Some(path) => {
+                crate::git::session_diff_path_cancellable(&worktree, &base, &path, &cancel)
+            }
+            None => crate::git::session_diff_cancellable(&worktree, &base, &cancel),
         })
         .await
         {

@@ -1,0 +1,13 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+const source = readFileSync(new URL("./main.tsx", import.meta.url), "utf8");
+
+test("review data and CLI status do not rely on manual refresh controls", () => {
+  assert.doesNotMatch(source, /Reconcile now/u);
+  assert.doesNotMatch(source, />\s*Refresh\s*</u);
+  assert.match(source, /DASHBOARD_FALLBACK_REFRESH_MS/u);
+  assert.match(source, /CLI_IDLE_REFRESH_MS/u);
+  assert.match(source, /Retrying automatically\./u);
+});

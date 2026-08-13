@@ -30,10 +30,11 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 use trouve_protocol::{ModelInfo, Usage};
 
+use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
     BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
@@ -50,6 +51,11 @@ pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
+    /// Serialized one-shot usage process. A failed cleanup remains here so a
+    /// later poll cannot spawn over an unproven prior process tree.
+    usage_process: Mutex<Option<ProcessTreeChild>>,
+    #[cfg(test)]
+    injected_usage_cleanup_failure: std::sync::atomic::AtomicBool,
     catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 }
 
@@ -59,6 +65,9 @@ impl ClaudeBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
             pool: Arc::new(Pool::default()),
+            usage_process: Mutex::new(None),
+            #[cfg(test)]
+            injected_usage_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
             catalog: Arc::new(trouve_providers::models_dev::ModelsDevCatalog::embedded()),
         }
     }
@@ -80,7 +89,7 @@ fn auth_status_is_logged_in(output: &[u8]) -> bool {
 }
 
 fn claude_is_logged_in(command: &str) -> bool {
-    std::process::Command::new(command)
+    crate::process_env::std_command(command)
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -97,13 +106,23 @@ struct Pool {
 }
 
 impl Pool {
-    async fn remove(&self, thread_id: &str, proc_: &Arc<ClaudeProc>) {
+    /// Quarantine a process, prove its complete process tree has exited, and
+    /// only then make its key available for replacement.
+    async fn terminate_and_remove(
+        &self,
+        thread_id: &str,
+        proc_: &Arc<ClaudeProc>,
+    ) -> Result<std::process::ExitStatus, BackendError> {
         let mut procs = self.procs.lock().await;
-        // Only remove the entry if it is still this process (a respawn may
-        // have replaced it already).
-        if procs.get(thread_id).is_some_and(|p| Arc::ptr_eq(p, proc_)) {
+        proc_.quarantine();
+        let status = proc_.terminate().await?;
+        if procs
+            .get(thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, proc_))
+        {
             procs.remove(thread_id);
         }
+        Ok(status)
     }
 
     /// Kill processes idle past the timeout, skipping any with a turn in
@@ -120,8 +139,22 @@ impl Pool {
             }
         }
         for id in dead {
-            if let Some(p) = procs.remove(&id) {
-                p.kill().await;
+            let Some(p) = procs.get(&id).cloned() else {
+                continue;
+            };
+            p.quarantine();
+            match p.terminate().await {
+                Ok(_) => {
+                    if procs.get(&id).is_some_and(|entry| Arc::ptr_eq(entry, &p)) {
+                        procs.remove(&id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %id,
+                        "claude: retaining idle process after unacknowledged cleanup: {error}"
+                    );
+                }
             }
         }
     }
@@ -131,12 +164,31 @@ impl Pool {
         while procs.len() >= POOL_CAP {
             let lru = procs
                 .iter()
-                .filter(|(_, p)| Arc::strong_count(p) == 1 && p.lines.try_lock().is_ok())
+                .filter(|(_, p)| {
+                    p.is_reusable() && Arc::strong_count(p) == 1 && p.lines.try_lock().is_ok()
+                })
                 .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
             let Some(id) = lru else { break }; // all busy: allow overflow
-            if let Some(p) = procs.remove(&id) {
-                p.kill().await;
+            let Some(p) = procs.get(&id).cloned() else {
+                continue;
+            };
+            p.quarantine();
+            match p.terminate().await {
+                Ok(_) => {
+                    if procs.get(&id).is_some_and(|entry| Arc::ptr_eq(entry, &p)) {
+                        procs.remove(&id);
+                    }
+                }
+                Err(error) => {
+                    // Keep this key quarantined, but let an unrelated thread
+                    // overflow the soft cap rather than losing availability.
+                    tracing::warn!(
+                        thread_id = %id,
+                        "claude: retaining LRU process after unacknowledged cleanup: {error}"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -147,7 +199,12 @@ struct ClaudeProc {
     stdin: Mutex<ChildStdin>,
     /// Stdout lines; locked by the active turn for its whole duration.
     lines: Mutex<mpsc::Receiver<String>>,
-    child: Mutex<Child>,
+    child: Mutex<ProcessTreeChild>,
+    /// False as soon as any path decides this transport must be recycled.
+    /// The pool retains a false entry until full-tree cleanup is acknowledged.
+    reusable: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    injected_terminate_failure: std::sync::atomic::AtomicBool,
     /// Claude reads user MCP credentials from this owner-only file. Keeping
     /// the handle alive for the child lifetime also removes it on drop.
     _mcp_config: Option<tempfile::NamedTempFile>,
@@ -162,8 +219,32 @@ struct ClaudeProc {
 }
 
 impl ClaudeProc {
-    async fn kill(&self) {
-        let _ = self.child.lock().await.kill().await;
+    fn quarantine(&self) {
+        self.reusable
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_reusable(&self) -> bool {
+        self.reusable.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn terminate(&self) -> Result<std::process::ExitStatus, BackendError> {
+        self.quarantine();
+        #[cfg(test)]
+        if self
+            .injected_terminate_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(BackendError::Protocol(
+                "injected Claude process-tree cleanup failure".into(),
+            ));
+        }
+
+        let mut child = self.child.lock().await;
+        if let Some(status) = child.try_wait_tree().map_err(BackendError::Io)? {
+            return Ok(status);
+        }
+        child.terminate_and_reap().await.map_err(BackendError::Io)
     }
 
     fn touch(&self) {
@@ -313,29 +394,51 @@ impl AgentBackend for ClaudeBackend {
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         self.start_reaper();
-        let proc_ = self.proc_for(&turn).await?;
+        let cancel = turn.cancel.clone();
+        // Process acquisition may have to clean a stale tree. Do not cancel
+        // that future midway through its acknowledgement: it keeps the pool
+        // key quarantined and checks cancellation before spawning.
+        let proc_ = self.proc_for(&turn, &cancel).await?;
         let pool = self.pool.clone();
         let thread_id = turn.thread_id.clone();
+        if cancel.is_cancelled() {
+            pool.terminate_and_remove(&thread_id, &proc_).await?;
+            return Err(BackendError::Cancelled);
+        }
         let prompt = turn.prompt.clone();
         // Anthropic-style base64 image blocks, alongside the text block.
         let mut content = vec![json!({ "type": "text", "text": prompt })];
         for att in &turn.attachments {
-            match att.read_base64() {
-                Ok(data) => content.push(json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": att.mime,
-                        "data": data,
-                    }
-                })),
-                Err(e) => tracing::warn!("skipping attachment {}: {e}", att.name),
-            }
+            content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": att.mime,
+                    "data": att.base64(),
+                }
+            }));
         }
 
         let stream = async_stream(move |tx| async move {
             // Exclusive claim on the process for this turn.
-            let mut lines = proc_.lines.lock().await;
+            let mut lines = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                        let _ = tx.send(Err(error)).await;
+                    }
+                    return;
+                }
+                _ = tx.closed() => {
+                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                        tracing::warn!(
+                            "claude: stream-drop cleanup was not acknowledged: {error}"
+                        );
+                    }
+                    return;
+                }
+                lines = proc_.lines.lock() => lines,
+            };
             proc_.touch();
 
             let msg = json!({
@@ -345,14 +448,28 @@ impl AgentBackend for ClaudeBackend {
                     "content": content,
                 }
             });
-            let sent = {
-                let mut stdin = proc_.stdin.lock().await;
-                async {
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                        let _ = tx.send(Err(error)).await;
+                    }
+                    return;
+                }
+                _ = tx.closed() => {
+                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                        tracing::warn!(
+                            "claude: stream-drop cleanup was not acknowledged: {error}"
+                        );
+                    }
+                    return;
+                }
+                sent = async {
+                    let mut stdin = proc_.stdin.lock().await;
                     stdin.write_all(msg.to_string().as_bytes()).await?;
                     stdin.write_all(b"\n").await?;
                     stdin.flush().await
-                }
-                .await
+                } => sent,
             };
             if let Err(e) = sent {
                 // Likely the process died between turns; keep reading — the
@@ -362,7 +479,28 @@ impl AgentBackend for ClaudeBackend {
             }
 
             let mut completed = false;
-            while let Some(line) = lines.recv().await {
+            loop {
+                let line = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                            let _ = tx.send(Err(error)).await;
+                        }
+                        return;
+                    }
+                    _ = tx.closed() => {
+                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                            tracing::warn!(
+                                "claude: stream-drop cleanup was not acknowledged: {error}"
+                            );
+                        }
+                        return;
+                    }
+                    line = lines.recv() => match line {
+                        Some(line) => line,
+                        None => break,
+                    },
+                };
                 let Ok(ev) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -386,12 +524,20 @@ impl AgentBackend for ClaudeBackend {
                 }
                 let is_result = ev["type"].as_str() == Some("result");
                 for out in events {
-                    if tx.send(Ok(out)).await.is_err() {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => false,
+                        sent = tx.send(Ok(out)) => sent.is_ok(),
+                    };
+                    if !sent {
                         // Consumer dropped mid-turn (cancel): the CLI has no
                         // per-turn abort in this mode, so kill the process.
                         // The transcript is on disk; next turn resumes it.
-                        pool.remove(&thread_id, &proc_).await;
-                        proc_.kill().await;
+                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
+                            tracing::warn!(
+                                "claude: consumer-drop cleanup was not acknowledged: {error}"
+                            );
+                        }
                         return;
                     }
                 }
@@ -403,16 +549,16 @@ impl AgentBackend for ClaudeBackend {
             proc_.touch();
 
             if !completed {
-                // Stdout closed without a result: the process died.
-                pool.remove(&thread_id, &proc_).await;
-                let status = proc_.child.lock().await.wait().await;
-                let _ = tx
-                    .send(Err(BackendError::Protocol(format!(
-                        "claude exited with {:?}: {}",
-                        status.ok(),
+                // Stdout closed without a result. Terminate and acknowledge
+                // any surviving descendants before releasing the pool key.
+                let error = match pool.terminate_and_remove(&thread_id, &proc_).await {
+                    Ok(status) => BackendError::Protocol(format!(
+                        "claude exited with {status:?}: {}",
                         proc_.stderr_tail.lock().unwrap().trim()
-                    ))))
-                    .await;
+                    )),
+                    Err(error) => error,
+                };
+                let _ = tx.send(Err(error)).await;
             }
         });
         Ok(stream.boxed())
@@ -474,12 +620,42 @@ const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const USAGE_REQUEST_ID: &str = "trouve-usage";
 
 impl ClaudeBackend {
+    async fn cleanup_usage_process(
+        &self,
+        child: &mut ProcessTreeChild,
+    ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        if self
+            .injected_usage_cleanup_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(BackendError::Protocol(
+                "injected Claude usage process-tree cleanup failure".into(),
+            ));
+        }
+        if child.try_wait_tree().map_err(BackendError::Io)?.is_some() {
+            return Ok(());
+        }
+        child
+            .terminate_and_reap()
+            .await
+            .map(|_| ())
+            .map_err(BackendError::Io)
+    }
+
     /// Ask a short-lived print-mode process for subscription usage via the
     /// `get_usage` control request — the same data the TUI's `/usage`
     /// dialog shows (which has no headless equivalent). Returns the inner
     /// response payload (`subscription_type`, `rate_limits`, ...).
     async fn query_usage(&self) -> Result<Value, BackendError> {
-        let mut child = Command::new(&self.command)
+        let mut usage_process = self.usage_process.lock().await;
+        if let Some(stale) = usage_process.as_mut() {
+            self.cleanup_usage_process(stale).await?;
+            usage_process.take();
+        }
+
+        let mut command = crate::process_env::tokio_command(&self.command);
+        command
             .arg("-p")
             .args(["--input-format", "stream-json"])
             .args(["--output-format", "stream-json"])
@@ -492,14 +668,17 @@ impl ClaudeBackend {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
-                _ => BackendError::Io(e),
-            })?;
-        let mut stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
+            .kill_on_drop(true);
+        let child = spawn_process_tree(&mut command).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
+            _ => BackendError::Io(e),
+        })?;
+        *usage_process = Some(child);
+        let child = usage_process
+            .as_mut()
+            .expect("usage process was installed above");
+        let mut stdin = child.take_stdin().expect("stdin piped");
+        let stdout = child.take_stdout().expect("stdout piped");
 
         let query = async move {
             let request = json!({
@@ -538,8 +717,10 @@ impl ClaudeBackend {
             ))
         };
         let result = tokio::time::timeout(USAGE_TIMEOUT, query).await;
-        // Reap the child either way (kill_on_drop only covers hard drops).
-        let _ = child.kill().await;
+        // A usage response is not complete until the short-lived process and
+        // every descendant have been terminated and reaped.
+        self.cleanup_usage_process(child).await?;
+        usage_process.take();
         result
             .map_err(|_| BackendError::Protocol("timed out waiting for the usage query".into()))?
     }
@@ -565,24 +746,52 @@ impl ClaudeBackend {
     /// Fetch the pooled process for this thread, or (re)spawn one when there
     /// is none, it died, or the turn's spawn-time config / session id no
     /// longer matches.
-    async fn proc_for(&self, turn: &BackendTurn) -> Result<Arc<ClaudeProc>, BackendError> {
+    async fn proc_for(
+        &self,
+        turn: &BackendTurn,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<ClaudeProc>, BackendError> {
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         let fp = config_fingerprint(turn);
         let mut procs = self.pool.procs.lock().await;
-        if let Some(p) = procs.get(&turn.thread_id) {
-            let alive = p.child.lock().await.try_wait().ok().flatten().is_none();
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        if let Some(p) = procs.get(&turn.thread_id).cloned() {
+            let alive = if p.is_reusable() {
+                matches!(p.child.lock().await.try_wait_leader(), Ok(None))
+            } else {
+                false
+            };
             let session_matches = match (&turn.session, p.session.lock().unwrap().as_ref()) {
                 (Some(want), Some(have)) => want == have,
                 (None, _) => false, // explicit fresh session: start over
                 (Some(_), None) => false,
             };
             if alive && p.config_fp == fp && session_matches {
-                return Ok(p.clone());
+                return Ok(p);
             }
-            let p = procs.remove(&turn.thread_id).expect("checked above");
-            p.kill().await;
+            p.quarantine();
+            p.terminate().await?;
+            if procs
+                .get(&turn.thread_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &p))
+            {
+                procs.remove(&turn.thread_id);
+            }
+            // Cancellation may arrive during non-cancellable stale cleanup.
+            // Observe it before starting a replacement process.
+            if cancel.is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
         }
 
         Pool::enforce_cap(&mut procs).await;
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         let proc_ = Arc::new(self.spawn(turn, fp)?);
         procs.insert(turn.thread_id.clone(), proc_.clone());
         Ok(proc_)
@@ -591,7 +800,7 @@ impl ClaudeBackend {
     /// Spawn a persistent `claude` process configured for this turn's
     /// thread. The prompt is NOT passed here; turns arrive over stdin.
     fn spawn(&self, turn: &BackendTurn, config_fp: String) -> Result<ClaudeProc, BackendError> {
-        let mut cmd = Command::new(&self.command);
+        let mut cmd = crate::process_env::tokio_command(&self.command);
         let mut mcp_config_file = None;
         cmd.arg("-p")
             .args(["--input-format", "stream-json"])
@@ -725,13 +934,13 @@ impl ClaudeBackend {
             BackendPermission::Ask => {}
         }
 
-        let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        let mut child = spawn_process_tree(&mut cmd).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
             _ => BackendError::Io(e),
         })?;
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+        let stdin = child.take_stdin().expect("stdin piped");
+        let stdout = child.take_stdout().expect("stdout piped");
+        let stderr = child.take_stderr().expect("stderr piped");
 
         // Stdout pump: lines flow into the channel the active turn drains.
         let (line_tx, line_rx) = mpsc::channel::<String>(256);
@@ -764,6 +973,9 @@ impl ClaudeBackend {
             stdin: Mutex::new(stdin),
             lines: Mutex::new(line_rx),
             child: Mutex::new(child),
+            reusable: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            injected_terminate_failure: std::sync::atomic::AtomicBool::new(false),
             _mcp_config: mcp_config_file,
             config_fp,
             session: std::sync::Mutex::new(turn.session.clone()),
@@ -872,6 +1084,7 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                     cached_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                    context_input_tokens: None,
                     // The CLI reports an estimate even on subscription
                     // plans, where nothing is billed per turn; suppress it
                     // like the other subscription backends.
@@ -1022,6 +1235,7 @@ mod tests {
 
     fn turn(model: &str, key: &str, value: &str) -> BackendTurn {
         BackendTurn {
+            cancel: Default::default(),
             thread_id: "thread".into(),
             worktree: std::env::temp_dir(),
             session: None,
@@ -1037,9 +1251,358 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn write_claude_stub(
+        directory: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = directory.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn marker_path(stub: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.{suffix}", stub.display()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lifecycle_turn(
+        worktree: &std::path::Path,
+        thread_id: &str,
+        model: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BackendTurn {
+        BackendTurn {
+            cancel,
+            thread_id: thread_id.into(),
+            worktree: worktree.to_path_buf(),
+            session: Some("session-1".into()),
+            model: model.into(),
+            model_options: serde_json::Map::new(),
+            prompt: "test prompt".into(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: true,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pids(path: &std::path::Path, count: usize) -> Vec<u32> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    let pids: Vec<u32> = contents
+                        .lines()
+                        .filter_map(|line| line.trim().parse().ok())
+                        .collect();
+                    if pids.len() >= count {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {} PID records", path.display()))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_pids_gone(pids: &[u32]) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if pids
+                    .iter()
+                    .all(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Claude process tree still present: {pids:?}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    const HANGING_CLAUDE_STUB: &str = r#"#!/bin/sh
+printf '%s\n' "$$" >> "$0.leaders"
+sleep 60 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >> "$0.descendants"
+cat >/dev/null
+"#;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_acknowledges_complete_process_tree_before_stream_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(directory.path(), "claude-cancel", HANGING_CLAUDE_STUB);
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let turn = lifecycle_turn(directory.path(), "cancel-thread", "model-a", cancel.clone());
+        let mut stream = backend.run_turn(turn).await.unwrap();
+        let leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+
+        cancel.cancel();
+        while tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("cancelled Claude stream did not finish after cleanup")
+            .is_some()
+        {}
+
+        assert_pids_gone(&leaders).await;
+        assert_pids_gone(&descendants).await;
+        assert!(backend.pool.procs.lock().await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_stream_acknowledges_complete_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(directory.path(), "claude-drop", HANGING_CLAUDE_STUB);
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let turn = lifecycle_turn(
+            directory.path(),
+            "drop-thread",
+            "model-a",
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let stream = backend.run_turn(turn).await.unwrap();
+        let leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if backend.pool.procs.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping the Claude stream did not acknowledge cleanup");
+        assert_pids_gone(&leaders).await;
+        assert_pids_gone(&descendants).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_before_run_turn_returns_does_not_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(directory.path(), "claude-pre-cancel", HANGING_CLAUDE_STUB);
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let turn = lifecycle_turn(directory.path(), "cancelled", "model-a", cancel);
+
+        assert!(matches!(
+            backend.run_turn(turn).await,
+            Err(BackendError::Cancelled)
+        ));
+        assert!(!marker_path(&stub, "leaders").exists());
+        assert!(backend.pool.procs.lock().await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cleanup_failure_denies_replacement_until_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(directory.path(), "claude-quarantine", HANGING_CLAUDE_STUB);
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let original_turn = lifecycle_turn(
+            directory.path(),
+            "quarantine-thread",
+            "model-a",
+            cancel.clone(),
+        );
+        let original = backend.proc_for(&original_turn, &cancel).await.unwrap();
+        let original_leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let original_descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+        original
+            .injected_terminate_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let changed_turn = lifecycle_turn(
+            directory.path(),
+            "quarantine-thread",
+            "model-b",
+            cancel.clone(),
+        );
+
+        for _ in 0..2 {
+            let error = match backend.proc_for(&changed_turn, &cancel).await {
+                Ok(_) => panic!("replacement started over an unclean Claude tree"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("injected Claude"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker_path(&stub, "leaders"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let retained = backend
+            .pool
+            .procs
+            .lock()
+            .await
+            .get("quarantine-thread")
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&retained, &original));
+        assert!(!retained.is_reusable());
+
+        original
+            .injected_terminate_failure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let replacement = backend.proc_for(&changed_turn, &cancel).await.unwrap();
+        let all_leaders = wait_for_pids(&marker_path(&stub, "leaders"), 2).await;
+        let all_descendants = wait_for_pids(&marker_path(&stub, "descendants"), 2).await;
+        assert!(!Arc::ptr_eq(&replacement, &original));
+        assert_pids_gone(&original_leaders).await;
+        assert_pids_gone(&original_descendants).await;
+
+        backend
+            .pool
+            .terminate_and_remove("quarantine-thread", &replacement)
+            .await
+            .unwrap();
+        assert_pids_gone(&all_leaders).await;
+        assert_pids_gone(&all_descendants).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn eof_cleanup_reaps_surviving_descendant_before_reporting() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(
+            directory.path(),
+            "claude-eof",
+            r#"#!/bin/sh
+printf '%s\n' "$$" >> "$0.leaders"
+sleep 60 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >> "$0.descendants"
+exit 7
+"#,
+        );
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let turn = lifecycle_turn(
+            directory.path(),
+            "eof-thread",
+            "model-a",
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let mut stream = backend.run_turn(turn).await.unwrap();
+        let leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+        let mut saw_exit = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("Claude EOF cleanup did not finish")
+        {
+            if event.is_err() {
+                saw_exit = true;
+            }
+        }
+        assert!(saw_exit);
+        assert_pids_gone(&leaders).await;
+        assert_pids_gone(&descendants).await;
+        assert!(backend.pool.procs.lock().await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn usage_query_reaps_its_complete_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(
+            directory.path(),
+            "claude-usage",
+            r#"#!/bin/sh
+printf '%s\n' "$$" >> "$0.leaders"
+sleep 60 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >> "$0.descendants"
+IFS= read -r request
+printf '%s\n' '{"type":"control_response","response":{"request_id":"trouve-usage","subtype":"success","response":{"subscription_type":"pro"}}}'
+cat >/dev/null
+"#,
+        );
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+
+        let payload = backend.query_usage().await.unwrap();
+        let leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+        assert_eq!(payload["subscription_type"], "pro");
+        assert_pids_gone(&leaders).await;
+        assert_pids_gone(&descendants).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn usage_cleanup_failure_denies_next_probe_until_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(
+            directory.path(),
+            "claude-usage-quarantine",
+            r#"#!/bin/sh
+printf '%s\n' "$$" >> "$0.leaders"
+sleep 60 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" >> "$0.descendants"
+IFS= read -r request
+printf '%s\n' '{"type":"control_response","response":{"request_id":"trouve-usage","subtype":"success","response":{"subscription_type":"max"}}}'
+cat >/dev/null
+"#,
+        );
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        backend
+            .injected_usage_cleanup_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..2 {
+            let error = backend.query_usage().await.unwrap_err();
+            assert!(error.to_string().contains("injected Claude usage"));
+        }
+        let first_leaders = wait_for_pids(&marker_path(&stub, "leaders"), 1).await;
+        let first_descendants = wait_for_pids(&marker_path(&stub, "descendants"), 1).await;
+        assert_eq!(
+            std::fs::read_to_string(marker_path(&stub, "leaders"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a second usage process started over an unclean first tree"
+        );
+        assert!(backend.usage_process.lock().await.is_some());
+
+        backend
+            .injected_usage_cleanup_failure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let payload = backend.query_usage().await.unwrap();
+        let all_leaders = wait_for_pids(&marker_path(&stub, "leaders"), 2).await;
+        let all_descendants = wait_for_pids(&marker_path(&stub, "descendants"), 2).await;
+        assert_eq!(payload["subscription_type"], "max");
+        assert_pids_gone(&first_leaders).await;
+        assert_pids_gone(&first_descendants).await;
+        assert_pids_gone(&all_leaders).await;
+        assert_pids_gone(&all_descendants).await;
+        assert!(backend.usage_process.lock().await.is_none());
+    }
+
     #[test]
     fn adaptive_models_use_cli_effort_flag() {
-        let mut cmd = Command::new("claude");
+        let mut cmd = tokio::process::Command::new("claude");
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
         configure_thinking(
             &mut cmd,
@@ -1070,7 +1633,7 @@ mod tests {
 
     #[test]
     fn legacy_off_explicitly_disables_thinking() {
-        let mut cmd = Command::new("claude");
+        let mut cmd = tokio::process::Command::new("claude");
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
         configure_thinking(
             &mut cmd,

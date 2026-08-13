@@ -612,14 +612,7 @@ fn prune_old_versions(root: &Path, active: &str) {
 /// Resolve a bare command name to its full path via `$PATH` (absolute and
 /// relative paths pass through when they exist).
 pub fn find_on_path(command: &str) -> Option<PathBuf> {
-    if command.contains('/') {
-        let p = PathBuf::from(command);
-        return p.exists().then_some(p);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(command))
-        .find(|p| p.is_file())
+    crate::process_env::find_executable(command)
 }
 
 /// Best-effort `<bin> --version` (first line, trimmed), for reporting the
@@ -627,7 +620,7 @@ pub fn find_on_path(command: &str) -> Option<PathBuf> {
 pub async fn binary_version(command: &str) -> Option<String> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        tokio::process::Command::new(command)
+        crate::process_env::tokio_command(command)
             .arg("--version")
             .stdin(std::process::Stdio::null())
             .output(),

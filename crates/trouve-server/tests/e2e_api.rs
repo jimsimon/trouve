@@ -12,7 +12,7 @@ use futures::StreamExt;
 use trouve_core::Engine;
 use trouve_core::config::Config;
 use trouve_core::store::{NewCodeReviewJob, NewCodeReviewTask, Store};
-use trouve_protocol::Usage;
+use trouve_protocol::{Event, Scope, Usage};
 use trouve_providers::{
     EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
 };
@@ -20,6 +20,48 @@ use trouve_providers::{
 /// Turn 1: asks to write hello.txt, then finishes with a message.
 struct ScriptedProvider {
     calls: AtomicUsize,
+}
+
+struct StaticThenLiveModelProvider {
+    live_calls: Arc<AtomicUsize>,
+}
+
+fn catalog_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
+    trouve_protocol::ModelInfo {
+        id: id.into(),
+        display_name: display_name.into(),
+        context_window: 100_000,
+        supports_tools: true,
+        input_price_per_mtok: None,
+        output_price_per_mtok: None,
+        options_schema: serde_json::json!({}),
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for StaticThenLiveModelProvider {
+    fn id(&self) -> &str {
+        "catalog-test"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![catalog_model("catalog-test/static", "Static catalog model")]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.live_calls.fetch_add(1, Ordering::SeqCst);
+        vec![catalog_model("catalog-test/live", "Live discovered model")]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        Err(ProviderError::Request("catalog-only provider".into()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -87,6 +129,243 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# test\n").unwrap();
     run(&["add", "-A"]);
     run(&["commit", "-m", "init"]);
+}
+
+#[tokio::test]
+async fn models_return_static_data_then_refresh_live_discovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(
+        Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config {
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "catalog-test",
+            Arc::new(StaticThenLiveModelProvider {
+                live_calls: live_calls.clone(),
+            }),
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    let static_models: Vec<trouve_protocol::ModelInfo> = client
+        .get(format!("http://{addr}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        static_models
+            .iter()
+            .any(|model| model.id == "catalog-test/static")
+    );
+    assert_eq!(live_calls.load(Ordering::SeqCst), 0);
+
+    let live_models: Vec<trouve_protocol::ModelInfo> = client
+        .get(format!("http://{addr}/v1/models/refresh"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        live_models
+            .iter()
+            .any(|model| model.id == "catalog-test/live")
+    );
+    assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mcp_server_enablement_is_persisted_without_removing_the_definition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("config");
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(config_dir.clone())),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let created = client
+        .put(format!("{base}/mcp-servers/docs"))
+        .json(&serde_json::json!({
+            "scope": "user",
+            "command": "docs-mcp",
+            "args": ["--stdio"],
+            "env": {"TOKEN": "${DOCS_TOKEN}"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let disabled = client
+        .put(format!("{base}/mcp-servers/docs/enabled"))
+        .json(&serde_json::json!({"scope": "user", "enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let servers: serde_json::Value = client
+        .get(format!("{base}/mcp-servers?probe=false"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(servers[0]["name"], "docs");
+    assert_eq!(servers[0]["enabled"], false);
+    assert_eq!(servers[0]["health"], "disabled");
+    assert_eq!(servers[0]["command"], "docs-mcp");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_dir.join("mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["mcpServers"]["docs"]["disabled"], true);
+    assert_eq!(
+        persisted["mcpServers"]["docs"]["env"]["TOKEN"],
+        "${DOCS_TOKEN}"
+    );
+
+    let enabled = client
+        .put(format!("{base}/mcp-servers/docs/enabled"))
+        .json(&serde_json::json!({"scope": "user", "enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), reqwest::StatusCode::NO_CONTENT);
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_dir.join("mcp.json")).unwrap())
+            .unwrap();
+    assert!(persisted["mcpServers"]["docs"].get("disabled").is_none());
+
+    let missing = client
+        .put(format!("{base}/mcp-servers/missing/enabled"))
+        .json(&serde_json::json!({"scope": "user", "enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_diff_manifest_and_selected_file_patch_are_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::create_dir(repo.join("docs")).unwrap();
+    std::fs::write(repo.join("docs/setup guide.md"), "old guide\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "docs/setup guide.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "add guide"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = session["id"].as_str().unwrap();
+    let worktree = Path::new(session["worktree_path"].as_str().unwrap());
+    std::fs::write(
+        worktree.join("docs/setup guide.md"),
+        "new guide\nextra line\n",
+    )
+    .unwrap();
+
+    let summary: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/summary"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary["files"][0]["path"], "docs/setup guide.md");
+    assert_eq!(summary["additions"], 2);
+    assert_eq!(summary["deletions"], 1);
+
+    let selected: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "docs/setup guide.md")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(selected["path"], "docs/setup guide.md");
+    assert!(selected["diff"].as_str().unwrap().contains("+extra line"));
+
+    let invalid = client
+        .get(format!("{base}/sessions/{session_id}/diff/file"))
+        .query(&[("path", "../README.md")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 async fn wait_for_event(
@@ -282,11 +561,13 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     let worktree = session["worktree_path"].as_str().unwrap().to_string();
+    let branch = session["branch"].as_str().unwrap();
+    let short_id = branch.strip_prefix("trouve/").unwrap();
+    assert_eq!(short_id.len(), 6);
     assert!(
-        session["branch"]
-            .as_str()
-            .unwrap()
-            .starts_with("trouve/test-session")
+        short_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
     );
     assert!(Path::new(&worktree).join("README.md").exists());
 
@@ -342,7 +623,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     // Approve; the turn then finishes with a checkpoint.
     let resp = client
         .post(format!("{base}/approvals"))
-        .json(&serde_json::json!({"call_id": call_id, "decision": "approve"}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": call_id,
+            "decision": "approve",
+        }))
         .send()
         .await
         .unwrap();
@@ -357,7 +642,16 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         completed["checkpoint_id"].is_string(),
         "mutating turn must checkpoint"
     );
+    let checkpoint_id = completed["checkpoint_id"].as_str().unwrap().to_string();
     assert_eq!(completed["usage"]["input_tokens"], 30);
+    assert_eq!(completed["usage"]["context_input_tokens"], 20);
+    let live_usage = events
+        .iter()
+        .filter(|event| event["type"] == "turn.usage_updated")
+        .collect::<Vec<_>>();
+    assert_eq!(live_usage.len(), 2);
+    assert_eq!(live_usage[0]["usage"]["context_input_tokens"], 10);
+    assert_eq!(live_usage[1]["usage"]["context_input_tokens"], 20);
     assert!(
         events
             .iter()
@@ -393,14 +687,39 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
             .iter()
             .any(|item| item["kind"] == "assistant" && item["content"] == "Writing the file.")
     );
+    let folded_tool = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        .expect("completed tool call in folded view");
     assert!(
-        view["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["kind"] == "tool_call" && item["status"] == "ok")
+        folded_tool["duration_ms"].is_u64(),
+        "folded tool calls retain server-measured execution time"
     );
+    assert_eq!(folded_tool["details_deferred"], true);
+    assert!(folded_tool.get("result").is_none() || folded_tool["result"].is_null());
+    let folded_call_id = folded_tool["call_id"].as_str().unwrap();
+    let tool_details: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/tools/{folded_call_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tool_details["call_id"], folded_call_id);
+    assert_eq!(tool_details["args"]["content"], "hi\n");
+    assert_eq!(tool_details["result"]["bytes_written"], 3);
     assert_eq!(view["turn_running"], false);
+    assert_eq!(view["last_usage"]["context_input_tokens"], 20);
+    let folded_turn = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "turn_status" && item["turn"] == 1)
+        .expect("completed turn in folded view");
+    assert_eq!(folded_turn["state"]["checkpoint_id"], checkpoint_id);
     let total_items = view["total_items"].as_u64().unwrap();
     assert!(total_items > 1);
     let tail: serde_json::Value = client
@@ -415,6 +734,23 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     assert_eq!(tail["item_offset"], total_items - 1);
     assert_eq!(tail["total_items"], total_items);
     assert_eq!(tail["has_older"], true);
+    let aligned: serde_json::Value = client
+        .get(format!(
+            "{base}/threads/{thread_id}/view?limit=1&turn_aligned=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(aligned["item_offset"], 0);
+    assert_eq!(
+        aligned["items"].as_array().unwrap().len() as u64,
+        total_items
+    );
+    assert_eq!(aligned["has_older"], false);
+    assert_eq!(aligned["items"][0]["kind"], "turn_status");
     let older: serde_json::Value = client
         .get(format!(
             "{base}/threads/{thread_id}/view?limit=1&before={}",
@@ -459,6 +795,54 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     .await;
     assert!(tail.iter().all(|e| e["cursor"].as_u64().unwrap() > mid));
 
+    // A checkpoint fork starts a distinct session/worktree at the exact
+    // post-turn tree and carries the source thread's effective settings.
+    let fork: serde_json::Value = client
+        .post(format!("{base}/checkpoints/{checkpoint_id}/fork"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_session_id = fork["session"]["id"].as_str().unwrap();
+    let fork_worktree = fork["session"]["worktree_path"].as_str().unwrap();
+    assert_ne!(fork_session_id, session["id"]);
+    assert_eq!(fork["thread"]["session_id"], fork_session_id);
+    assert_eq!(fork["thread"]["model"], thread["model"]);
+    assert_eq!(fork["thread"]["model_options"], thread["model_options"]);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(fork_worktree).join("hello.txt")).unwrap(),
+        "hi\n"
+    );
+    let resp = client
+        .delete(format!("{base}/sessions/{fork_session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // An exact restore also resets uncheckpointed terminal/editor drift when
+    // the checkpoint is already the undo stack's current position.
+    std::fs::write(Path::new(&worktree).join("hello.txt"), "drift\n").unwrap();
+    let resp = client
+        .post(format!("{base}/checkpoints/{checkpoint_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&worktree).join("hello.txt")).unwrap(),
+        "hi\n"
+    );
+    let restored = wait_for_event(
+        &client,
+        &format!("{base}/sessions/{}/events", session["id"].as_str().unwrap()),
+        |event| event["type"] == "checkpoint.restored" && event["checkpoint_id"] == checkpoint_id,
+    )
+    .await;
+    assert_eq!(restored.last().unwrap()["direction"], "exact");
+
     // Undo restores the pre-turn state.
     let session_id = session["id"].as_str().unwrap();
     let resp = client
@@ -488,7 +872,13 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert!(!Path::new(&worktree).exists());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while Path::new(&worktree).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deleted session worktree was not cleaned up");
     let resp = client
         .get(format!("{base}/sessions/{session_id}"))
         .send()
@@ -778,6 +1168,29 @@ async fn compaction_summarizes_transcript_near_context_window() {
         .find(|e| e["type"] == "thread.compaction_completed")
         .expect("compaction completes");
     assert!(completed["messages_compacted"].as_u64().unwrap() >= 2);
+
+    // The folded transcript retains the boundary after completion instead
+    // of reducing it to the snapshot's transient `compacting` flag.
+    let view: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let marker = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "compaction")
+        .expect("completed compaction remains in the folded transcript");
+    assert_eq!(marker["turn"], 2);
+    assert_eq!(marker["state"]["state"], "completed");
+    assert_eq!(
+        marker["state"]["messages_compacted"],
+        completed["messages_compacted"]
+    );
 }
 
 #[tokio::test]
@@ -850,6 +1263,22 @@ async fn session_and_thread_updates_and_provider_config() {
     let session_id = session["id"].as_str().unwrap();
     assert_eq!(session["archived"], false);
 
+    // The web/PWA bootstrap projection is an atomic snapshot paired with a
+    // resume cursor after its transactionally emitted replacement event.
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let summary = &summaries["summaries"][0];
+    assert_eq!(summary["session_id"], session_id);
+    assert_eq!(summary["workspace_id"], ws_id);
+    assert_eq!(summary["archived"], false);
+    assert!(summaries["cursor"].as_u64().unwrap() > summary["latest_cursor"].as_u64().unwrap());
+
     // Rename + archive via PATCH.
     let updated: serde_json::Value = client
         .patch(format!("{base}/sessions/{session_id}"))
@@ -862,6 +1291,15 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     assert_eq!(updated["title"], "Renamed");
     assert_eq!(updated["archived"], true);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summaries["summaries"][0]["archived"], true);
 
     // Thread creation succeeds even with an unconfigured model (validation
     // is deferred to send time), then PATCH switches mode/model.
@@ -869,6 +1307,7 @@ async fn session_and_thread_updates_and_provider_config() {
         .post(format!("{base}/threads"))
         .json(&serde_json::json!({
             "session_id": session_id,
+            "title": "  Review   the parser\nedge cases  ",
             "model": "nonexistent/model"
         }))
         .send()
@@ -879,6 +1318,21 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     let thread_id = thread["id"].as_str().unwrap();
     assert_eq!(thread["model"], "nonexistent/model");
+    assert_eq!(thread["title"], "Review the parser edge cases");
+
+    let thread_statuses: serde_json::Value = client
+        .get(format!("{base}/thread-statuses?session_id={session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread_statuses[0]["thread_id"], thread_id);
+    assert_eq!(thread_statuses[0]["session_id"], session_id);
+    assert_eq!(thread_statuses[0]["active"], false);
+    assert_eq!(thread_statuses[0]["attention"], "none");
+    assert_eq!(thread_statuses[0]["outcome"], "idle");
 
     let patched: serde_json::Value = client
         .patch(format!("{base}/threads/{thread_id}"))
@@ -1054,6 +1508,24 @@ async fn session_and_thread_updates_and_provider_config() {
             .iter()
             .any(|p| p["id"] == "openrouter")
     );
+
+    // Deletion commits its relational cleanup and durable summary tombstone
+    // together, so a following bootstrap cannot resurrect the session.
+    let response = client
+        .delete(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let summaries: serde_json::Value = client
+        .get(format!("{base}/session-summaries"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(summaries["summaries"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1279,7 +1751,11 @@ async fn ask_question_tool_round_trips_answers() {
     // Unknown request ids are a 404.
     let resp = client
         .post(format!("{base}/questions"))
-        .json(&serde_json::json!({"request_id": "bogus", "answers": []}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "request_id": "bogus",
+            "answers": [],
+        }))
         .send()
         .await
         .unwrap();
@@ -1289,6 +1765,7 @@ async fn ask_question_tool_round_trips_answers() {
     let resp = client
         .post(format!("{base}/questions"))
         .json(&serde_json::json!({
+            "thread_id": thread_id,
             "request_id": request_id,
             "answers": [
                 {"question_id": "q1", "selected_option_ids": ["opt1"]},
@@ -1343,6 +1820,71 @@ impl HandoffBackend {
             name,
             turns: std::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// Backend whose turns remain open until the test releases them. Entering
+/// `run_turn` proves that scheduler capacity and the session lifecycle lease
+/// have both been acquired.
+struct ConcurrentBackend {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl ConcurrentBackend {
+    fn new() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for ConcurrentBackend {
+    fn id(&self) -> &str {
+        "concurrent"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "concurrent/m".into(),
+            display_name: "Concurrent".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        _turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        self.started.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test release semaphore remains open")
+            .forget();
+        let events = vec![Ok(trouve_agents::BackendEvent::Completed {
+            usage: Usage::default(),
+        })];
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }
 
@@ -1408,6 +1950,93 @@ impl trouve_agents::AgentBackend for HandoffBackend {
         });
         let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
         Ok(Box::pin(stream))
+    }
+}
+
+#[tokio::test]
+async fn code_turns_in_two_threads_of_one_session_enter_the_backend_concurrently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(ConcurrentBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("concurrent", backend.clone())
+            .with_default_model("concurrent/m"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut thread_ids = Vec::new();
+    for _ in 0..2 {
+        let thread: serde_json::Value = client
+            .post(format!("{base}/threads"))
+            .json(&serde_json::json!({"session_id": session["id"]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        thread_ids.push(thread["id"].as_str().unwrap().to_owned());
+    }
+
+    for thread_id in &thread_ids {
+        let response = client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": "work concurrently"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), backend.started.acquire_many(2))
+        .await
+        .expect("both same-session code turns should reach the backend")
+        .expect("test started semaphore remains open")
+        .forget();
+    backend.release.add_permits(2);
+
+    for thread_id in thread_ids {
+        let events = wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.completed",
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "turn.capacity_acquired")
+        );
     }
 }
 
@@ -1570,17 +2199,262 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
     }
 }
 
+/// Holds a vendor turn open until its native steering method is called, then
+/// completes. This exercises the real HTTP endpoint, engine turn registry,
+/// backend capability, durable event ordering, and folded thread view.
+struct SteerableBackend {
+    steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl SteerableBackend {
+    fn new() -> Self {
+        Self {
+            steers: std::sync::Mutex::new(Vec::new()),
+            release: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for SteerableBackend {
+    fn id(&self) -> &str {
+        "steerable-agent"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "steerable-agent/model".into(),
+            display_name: "Steerable Agent".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(
+        &self,
+        steer: trouve_agents::BackendSteer,
+    ) -> Result<(), trouve_agents::BackendError> {
+        self.steers.lock().unwrap().push((
+            steer.session,
+            steer.prompt,
+            steer
+                .attachments
+                .into_iter()
+                .map(|attachment| {
+                    attachment
+                        .local_path
+                        .expect("steered attachment has a verified local path")
+                        .display()
+                        .to_string()
+                })
+                .collect(),
+        ));
+        let release =
+            self.release.lock().await.take().ok_or_else(|| {
+                trouve_agents::BackendError::Protocol("no active fake turn".into())
+            })?;
+        let _ = release.send(());
+        Ok(())
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        _turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.release.lock().await = Some(release_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            use trouve_agents::BackendEvent as E;
+            let _ = tx
+                .send(Ok(E::SessionStarted {
+                    session_id: "steerable-vendor-session".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(E::ThinkingDelta("Initial direction.".into())))
+                .await;
+            if release_rx.await.is_err() {
+                return;
+            }
+            let _ = tx.send(Ok(E::ThinkingCompleted)).await;
+            let _ = tx.send(Ok(E::TextDelta("Steering applied.".into()))).await;
+            let _ = tx
+                .send(Ok(E::Completed {
+                    usage: Usage::default(),
+                }))
+                .await;
+        });
+        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+            rx.poll_recv(cx)
+        })))
+    }
+}
+
+#[tokio::test]
+async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(SteerableBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("steerable-agent", backend.clone())
+            .with_default_model("steerable-agent/model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin the implementation."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking"
+    })
+    .await;
+    assert!(
+        before
+            .iter()
+            .any(|event| { event["type"] == "turn.started" && event["supports_steering"] == true })
+    );
+
+    let steered = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({
+            "content": "Prioritize the layout regression.",
+            "attachments": [{
+                "name": "reference.png",
+                "mime": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    let thinking_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.thinking")
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let response_index = events
+        .iter()
+        .position(|event| event["type"] == "assistant.delta")
+        .unwrap();
+    assert!(thinking_index < steering_index && steering_index < response_index);
+    let steering = &events[steering_index];
+    assert_eq!(steering["content"], "Prioritize the layout regression.");
+    assert_eq!(steering["attachments"][0]["name"], "reference.png");
+
+    let view: serde_json::Value = client
+        .get(format!("{base}/threads/{thread_id}/view"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["turn_steerable"]["1"], true);
+    assert!(view["items"].as_array().unwrap().iter().any(|item| {
+        item["kind"] == "steered" && item["content"] == "Prioritize the layout regression."
+    }));
+
+    let received = backend.steers.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0, "steerable-vendor-session");
+    assert_eq!(received[0].1, "Prioritize the layout regression.");
+    assert_eq!(received[0].2.len(), 1);
+    assert!(Path::new(&received[0].2[0]).exists());
+}
+
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
 /// writes a file to the worktree when approved, and completes with usage.
 /// Records the vendor session id it was resumed with, per turn.
 struct ScriptedBackend {
     sessions_seen: std::sync::Mutex<Vec<Option<String>>>,
+    bridge_urls_seen: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 impl ScriptedBackend {
     fn new() -> Self {
         Self {
             sessions_seen: std::sync::Mutex::new(Vec::new()),
+            bridge_urls_seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -1624,6 +2498,10 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             .lock()
             .unwrap()
             .push(turn.session.clone());
+        self.bridge_urls_seen
+            .lock()
+            .unwrap()
+            .push(turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let fresh = turn.session.is_none();
         let worktree = turn.worktree.clone();
@@ -1636,6 +2514,20 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
                     }))
                     .await;
             }
+            let _ = tx.send(Ok(E::CompactionStarted)).await;
+            let _ = tx.send(Ok(E::CompactionCompleted)).await;
+            let _ = tx
+                .send(Ok(E::UsageUpdated {
+                    usage: Usage {
+                        input_tokens: 12,
+                        output_tokens: 3,
+                        cached_input_tokens: 28,
+                        context_input_tokens: Some(40),
+                        context_window: Some(100_000),
+                        ..Default::default()
+                    },
+                }))
+                .await;
             let _ = tx.send(Ok(E::TextDelta("Working on it. ".into()))).await;
             let (ok_tx, ok_rx) = tokio::sync::oneshot::channel();
             let _ = tx
@@ -1671,6 +2563,8 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
                     usage: Usage {
                         input_tokens: 40,
                         output_tokens: 9,
+                        context_input_tokens: Some(40),
+                        context_window: Some(100_000),
                         ..Default::default()
                     },
                 }))
@@ -1698,6 +2592,14 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
             ..Default::default()
         },
     );
+    config.providers.insert(
+        "fake-agent".into(),
+        trouve_core::config::ProviderConfig {
+            kind: "claude-cli".into(),
+            command: Some("/definitely/not/a/fake-agent-test-binary".into()),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(
         Engine::new(store, tmp.path().join("data"), &config)
             .with_config_dir(None)
@@ -1707,6 +2609,7 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    engine.set_base_url(&format!("http://{addr}"));
     let router = trouve_server::build_router(engine);
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
@@ -1780,9 +2683,132 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .to_string();
     assert_eq!(call_id, "vendor-call-1");
 
+    // The embedded MCP bridge is scoped to the active vendor turn. While
+    // that turn is waiting for approval, it can advertise and execute trouve
+    // tools through the engine's policy gate.
+    let mcp_url = backend
+        .bridge_urls_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .flatten()
+        .expect("active backend turn receives an engine-issued bridge capability");
+    let mcp = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = mcp_url.clone();
+        async move {
+            let request_id = body["id"].clone();
+            let response = client.post(url).json(&body).send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert!(
+                status.is_success(),
+                "MCP bridge request {request_id} returned {status}: {text}"
+            );
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|error| panic!("MCP bridge returned invalid JSON: {error}: {text}"))
+        }
+    };
+    let init = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"}
+    }))
+    .await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "trouve-bridge");
+
+    let listed = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }))
+    .await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|spec| spec["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"read_file") && names.contains(&"write_file"));
+    assert!(names.contains(&"approval_prompt"));
+
+    let called = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "list_dir", "arguments": {"path": "."}}
+    }))
+    .await;
+    assert_eq!(called["result"]["isError"], false, "{called}");
+
+    // The vendor-side permission shim is also bound to this exact active
+    // ticket. An in-worktree write reaches the ordinary approval flow and
+    // returns allow after the user approves it.
+    let in_worktree_input = serde_json::json!({
+        "file_path": Path::new(&worktree)
+            .join("bridge-approved.txt")
+            .to_string_lossy()
+            .to_string(),
+    });
+    let in_worktree_call = tokio::spawn(mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {
+            "name": "approval_prompt",
+            "arguments": {"tool_name": "Write", "input": in_worktree_input.clone()}
+        }
+    })));
+    let approval_events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "approval.requested" && event["call_id"] != "vendor-call-1"
+    })
+    .await;
+    let bridge_call_id = approval_events
+        .iter()
+        .find(|event| event["type"] == "approval.requested" && event["call_id"] != "vendor-call-1")
+        .unwrap()["call_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = client
+        .post(format!("{base}/approvals"))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": bridge_call_id,
+            "decision": "approve",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let allowed = in_worktree_call.await.unwrap();
+    let allowed_verdict: serde_json::Value =
+        serde_json::from_str(allowed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(allowed_verdict["behavior"], "allow", "{allowed}");
+    assert_eq!(allowed_verdict["updatedInput"], in_worktree_input);
+
+    // The same valid ticket cannot authorize a vendor write outside the
+    // session worktree, even while another backend approval is still live.
+    let outside_input = serde_json::json!({
+        "file_path": tmp
+            .path()
+            .join("outside-agent-write.txt")
+            .to_string_lossy()
+            .to_string(),
+    });
+    let denied = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {
+            "name": "approval_prompt",
+            "arguments": {"tool_name": "Write", "input": outside_input}
+        }
+    }))
+    .await;
+    let denied_verdict: serde_json::Value =
+        serde_json::from_str(denied["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(denied_verdict["behavior"], "deny", "{denied}");
+
     let resp = client
         .post(format!("{base}/approvals"))
-        .json(&serde_json::json!({"call_id": call_id, "decision": "approve"}))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "call_id": call_id,
+            "decision": "approve",
+        }))
         .send()
         .await
         .unwrap();
@@ -1799,6 +2825,18 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         "backend turn must checkpoint"
     );
     assert_eq!(completed["usage"]["input_tokens"], 40);
+    assert_eq!(completed["usage"]["context_input_tokens"], 40);
+    assert!(events.iter().any(|e| e["type"] == "turn.usage_updated"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "thread.compaction_started")
+    );
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "thread.compaction_completed" && e["messages_compacted"] == 0
+        })
+    );
     assert!(
         events
             .iter()
@@ -1842,6 +2880,12 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         vec![None, Some("vendor-sess-1".to_string())],
         "turn 2 must resume the vendor session persisted in turn 1"
     );
+    let bridge_urls = backend.bridge_urls_seen.lock().unwrap().clone();
+    assert_eq!(bridge_urls.len(), 2);
+    assert_eq!(
+        bridge_urls[0], bridge_urls[1],
+        "a persistent vendor MCP client must keep one capability URL across resumed turns"
+    );
 
     // Usage from both turns is accounted.
     let usage: serde_json::Value = client
@@ -1855,94 +2899,24 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     assert_eq!(usage["turns"], 2);
     assert_eq!(usage["input_tokens"], 80);
 
-    // Embedded MCP bridge endpoint: a bridged vendor agent can list and
-    // call trouve tools for this thread through the engine's gate.
-    let mcp_url = format!("http://{addr}/internal/threads/{thread_id}/mcp?tools=1&approval=1");
-    let mcp = |body: serde_json::Value| {
-        let client = client.clone();
-        let url = mcp_url.clone();
-        async move {
-            client
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .unwrap()
-                .json::<serde_json::Value>()
-                .await
-                .unwrap()
-        }
-    };
-
-    let init = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-03-26"}
-    }))
-    .await;
-    assert_eq!(init["result"]["serverInfo"]["name"], "trouve-bridge");
-
-    let listed = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
-    }))
-    .await;
-    let names: Vec<&str> = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["name"].as_str().unwrap())
-        .collect();
-    assert!(names.contains(&"read_file") && names.contains(&"write_file"));
-    assert!(names.contains(&"approval_prompt"));
-
-    // Non-mutating call runs without approval (thread is yolo by now anyway).
-    let called = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": "list_dir", "arguments": {"path": "."}}
-    }))
-    .await;
+    // The persistent capability is dormant at terminal state. Even discovery
+    // and the approval shim fail until this same thread starts another turn.
+    let response = client
+        .post(&mcp_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert!(
-        called["result"]["content"][0]["text"]
-            .as_str()
+        response
+            .text()
+            .await
             .unwrap()
-            .contains("agent.txt"),
-        "{called}"
+            .contains("invalid or stale bridge capability ticket")
     );
-
-    // Vendor-executed tool gating (Claude's permission-prompt hook): the
-    // thread is yolo by now, so the gate auto-approves.
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Bash", "input": {"command": "ls"}}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
-
-    // Worktree confinement still applies in yolo mode. Vendor file tools
-    // auto-approve inside the session checkout but an absolute target in
-    // the main repo (or anywhere else) is denied before execution.
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Write", "input": {
-                       "file_path": Path::new(&worktree).join("safe.txt")
-                   }}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
-
-    let verdict = mcp(serde_json::json!({
-        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-        "params": {"name": "approval_prompt",
-                   "arguments": {"tool_name": "Write", "input": {
-                       "file_path": repo.join("escaped.txt")
-                   }}}
-    }))
-    .await;
-    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\"behavior\":\"deny\""), "{verdict}");
 
     // CLI-kind provider CRUD: upsert reports auth "cli"; login relays the
     // vendor flow (the configured test binary is absent, so it fails with
@@ -1964,6 +2938,194 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// Backend whose startup owns an explicit cancellation-cleanup boundary.
+/// It does not return from `run_turn` until the test acknowledges cleanup,
+/// mirroring a vendor request that must be interrupted before the next turn.
+struct CancellationAckBackend {
+    entered: Arc<tokio::sync::Semaphore>,
+    cleanup_started: Arc<tokio::sync::Semaphore>,
+    cleanup_release: Arc<tokio::sync::Semaphore>,
+}
+
+impl CancellationAckBackend {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            cleanup_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            cleanup_release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for CancellationAckBackend {
+    fn id(&self) -> &str {
+        "cancellation-ack"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "cancellation-ack/model".into(),
+            display_name: "Cancellation acknowledgement".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        self.entered.add_permits(1);
+        turn.cancel.cancelled().await;
+        self.cleanup_started.add_permits(1);
+        self.cleanup_release
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        Err(trouve_agents::BackendError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn cancellation_terminal_event_waits_for_backend_cleanup_acknowledgement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let backend = Arc::new(CancellationAckBackend::new());
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("cancellation-ack", backend.clone())
+            .with_default_model("cancellation-ack/model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Cancel ack"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "begin"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.entered.clone().acquire_owned(),
+    )
+    .await
+    .expect("backend startup should begin")
+    .unwrap()
+    .forget();
+
+    let cancelled = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), reqwest::StatusCode::NO_CONTENT);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.cleanup_started.clone().acquire_owned(),
+    )
+    .await
+    .expect("backend should observe cancellation")
+    .unwrap()
+    .forget();
+
+    let before_ack = store
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .unwrap();
+    assert!(
+        !before_ack
+            .iter()
+            .any(|event| matches!(event.event, Event::TurnCancelled { .. })),
+        "turn.cancelled must not overtake vendor cleanup"
+    );
+
+    backend.cleanup_release.add_permits(1);
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.cancelled",
+    )
+    .await;
+    assert!(events.iter().any(|event| event["type"] == "turn.cancelled"));
+    let after_ack = store
+        .events_after(&Scope::Thread(thread_id.to_string()), 0)
+        .unwrap();
+    assert_eq!(
+        after_ack
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    Event::TurnCancelled { .. }
+                        | Event::TurnCompleted { .. }
+                        | Event::TurnFailed { .. }
+                )
+            })
+            .count(),
+        1,
+        "a cancelled turn must have exactly one terminal event"
+    );
 }
 
 /// Echoes the last user message, but holds each reply until the test grants
@@ -2121,6 +3283,196 @@ async fn prompt_submitted_during_cancellation_starts_next_turn() {
 }
 
 #[tokio::test]
+async fn selected_queued_prompt_interrupts_the_active_turn_and_runs_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("gated", Arc::new(GatedProvider { gate: gate.clone() }))
+            .with_default_model("gated/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Priority queue"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    for content in ["interrupt me", "ordinary follow-up", "send this now"] {
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue.len(), 2);
+    let selected_id = queue[1]["id"].as_str().unwrap();
+
+    let accepted: serde_json::Value = client
+        .post(format!("{base}/queue/{selected_id}/dispatch"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["thread_id"], thread_id);
+    assert_eq!(accepted["turn"], 0);
+    assert_eq!(accepted["queued"], true);
+
+    // The interrupted stream consumes no permit. The selected prompt gets
+    // the first one, then normal queue draining resumes with the older item.
+    gate.add_permits(2);
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.completed" && event["turn"] == 3,
+        ),
+    )
+    .await
+    .expect("selected queued prompt never ran after interrupting the active turn");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "turn.cancelled" && event["turn"] == 1)
+    );
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "user.message")
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        user_messages,
+        ["interrupt me", "send this now", "ordinary follow-up"]
+    );
+
+    // The same prompt-specific endpoint also starts an explicitly paused
+    // idle queue without relying on a separate reorder request.
+    for content in [
+        "pause again",
+        "older paused prompt",
+        "selected paused prompt",
+    ] {
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let response = client
+        .post(format!("{base}/threads/{thread_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.cancelled" && event["turn"] == 4,
+        ),
+    )
+    .await
+    .expect("second turn never reached its cancelled state");
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let selected_id = queue[1]["id"].as_str().unwrap();
+    let accepted: serde_json::Value = client
+        .post(format!("{base}/queue/{selected_id}/dispatch"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["turn"], 5);
+    assert_eq!(accepted["queued"], false);
+
+    gate.add_permits(2);
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| event["type"] == "turn.completed" && event["turn"] == 6,
+        ),
+    )
+    .await
+    .expect("selected prompt never started from the paused idle queue");
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "user.message")
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        user_messages,
+        [
+            "interrupt me",
+            "send this now",
+            "ordinary follow-up",
+            "pause again",
+            "selected paused prompt",
+            "older paused prompt",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn queued_prompts_crud_and_in_order_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -2194,9 +3546,29 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     let first = send("one").await;
     assert_eq!(first["turn"], 1);
     assert_eq!(first["queued"], false);
-    let second = send("two").await;
+    let second: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({
+            "content": "two",
+            "attachments": [{
+                "name": "before.png",
+                "mime": "image/png",
+                "data": "YmVmb3Jl"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(second["queued"], true);
     assert_eq!(second["turn"], 0);
+    assert_eq!(second["queued_prompt"]["content"], "two");
+    assert_eq!(
+        second["queued_prompt"]["attachments"][0]["name"],
+        "before.png"
+    );
     send("three").await;
 
     // While turn 1 is held open the session reports activity (drives the
@@ -2222,17 +3594,57 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     assert_eq!(queue.len(), 2);
     assert_eq!(queue[0]["content"], "two");
     assert_eq!(queue[1]["content"], "three");
+    assert_eq!(queue[0]["attachments"][0]["name"], "before.png");
     let id_two = queue[0]["id"].as_str().unwrap().to_string();
     let id_three = queue[1]["id"].as_str().unwrap().to_string();
+    assert_eq!(second["queued_prompt"]["id"], id_two);
 
-    // Edit a queued prompt.
+    // Old clients send only content; omitted attachment fields preserve the
+    // prompt's stored files.
     let resp = client
         .patch(format!("{base}/queue/{id_two}"))
-        .json(&serde_json::json!({"content": "two v2"}))
+        .json(&serde_json::json!({"content": "two v1"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"][0]["name"], "before.png");
+
+    // New clients can remove retained files and append fresh uploads in the
+    // same edit without re-uploading attachments that remain selected.
+    let resp = client
+        .patch(format!("{base}/queue/{id_two}"))
+        .json(&serde_json::json!({
+            "content": "two v2",
+            "retained_attachment_ids": [],
+            "attachments": [{
+                "name": "after.png",
+                "mime": "image/png",
+                "data": "YWZ0ZXI="
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(queue[0]["attachments"][0]["name"], "after.png");
 
     // Reorder: "three" now runs before "two v2". A stale id set conflicts.
     let resp = client
@@ -2808,6 +4220,75 @@ async fn terminal_shell_in_session_worktree() {
         .unwrap();
     assert_eq!(resp.status(), 204);
 
+    // An already-exited terminal still announces the absolute replay start,
+    // replays its retained bytes, and only then emits `exit`. The marker has
+    // no id so legacy EventSource clients keep their last output-event id.
+    let resp = client
+        .post(format!("{base}/terminals/{term_id}/input"))
+        .json(&serde_json::json!({
+            "data": b64.encode("printf 'replay-exit'; exit\r")
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let mut terminal_exited = false;
+    for _ in 0..100 {
+        let terminals: Vec<serde_json::Value> = client
+            .get(format!("{base}/sessions/{session_id}/terminals"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        terminal_exited = terminals[0]["exited"] == true;
+        if terminal_exited {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(terminal_exited, "terminal did not exit in time");
+
+    let replay = tokio::time::timeout(Duration::from_secs(10), async {
+        client
+            .get(&out_url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("timed out reading exited terminal replay");
+    let replay = replay.replace("\r\n", "\n");
+    let events: Vec<_> = replay
+        .split("\n\n")
+        .filter(|event| !event.trim().is_empty())
+        .collect();
+    let first = events.first().expect("replay-start event");
+    assert!(first.lines().any(|line| line == "event: replay-start"));
+    assert!(first.lines().any(|line| line == "data: {\"offset\":0}"));
+    assert!(!first.lines().any(|line| line.starts_with("id:")));
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.lines().any(|line| line == "event: exit"))
+    );
+    let replayed: Vec<u8> = events
+        .iter()
+        .skip(1)
+        .flat_map(|event| {
+            event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|data| b64.decode(data.trim()).ok())
+                .flatten()
+        })
+        .collect();
+    assert!(String::from_utf8_lossy(&replayed).contains("replay-exit"));
+
     // Kill; input to a dead terminal 404s, and reopening spawns a new one.
     let resp = client
         .delete(format!("{base}/terminals/{term_id}"))
@@ -2939,6 +4420,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "prompt": "run",
             "workspace_id": workspace["id"],
             "permission_mode": "yolo",
+            "thinking_level": "high",
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -2949,6 +4431,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .await
         .unwrap();
     assert_eq!(automation["permission_mode"], "yolo");
+    assert_eq!(automation["thinking_level"], "high");
     let automation_id = automation["id"].as_str().unwrap();
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
@@ -2998,6 +4481,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["permission_mode"], "yolo");
+    assert_eq!(threads[0]["model_options"]["thinking_level"], "high");
 }
 
 /// Session naming settings persist through the protocol, and missing model
@@ -3032,6 +4516,7 @@ async fn session_title_settings_and_fallback() {
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], false);
     assert_eq!(settings["title_model_load_behavior"], "auto");
     assert_eq!(settings["title_model_resource_policy"], "cpu_ram_only");
     assert_eq!(settings["title_model"]["state"], "not_installed");
@@ -3039,6 +4524,7 @@ async fn session_title_settings_and_fallback() {
     let response = client
         .put(format!("{base}/config/git-worktrees"))
         .json(&serde_json::json!({
+            "derive_branch_name_from_session_title": true,
             "title_model_load_behavior": "off",
             "title_model_resource_policy": "gpu_cpu_ram"
         }))
@@ -3051,8 +4537,25 @@ async fn session_title_settings_and_fallback() {
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], true);
     assert_eq!(settings["title_model_load_behavior"], "off");
     assert_eq!(settings["title_model_resource_policy"], "gpu_cpu_ram");
+
+    // Requests from clients predating the additive branch-naming option must
+    // preserve an explicit opt-in rather than resetting it to the default.
+    let settings: serde_json::Value = client
+        .put(format!("{base}/config/git-worktrees"))
+        .json(&serde_json::json!({
+            "title_model_load_behavior": "off",
+            "title_model_resource_policy": "gpu_cpu_ram"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["derive_branch_name_from_session_title"], true);
     let response = client
         .delete(format!("{base}/config/git-worktrees/title-model/install"))
         .send()
@@ -3068,6 +4571,11 @@ async fn session_title_settings_and_fallback() {
         std::fs::read_to_string(&config_file)
             .unwrap()
             .contains("title_model_resource_policy = \"gpu_cpu_ram\"")
+    );
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("derive_branch_name_from_session_title = true")
     );
     assert!(
         engine
@@ -3633,8 +5141,8 @@ async fn search_transcript_recovers_history() {
 
 /// Drives the spawn tool family end-to-end. The parent turn spawns a child
 /// agent, pokes spawn_output with a bogus id (denied: not its child), waits
-/// on the real child, then summarizes. The child turn first tries to spawn
-/// a grandchild (denied: depth guard) and then answers.
+/// on the real child, then summarizes. The child delegates to a grandchild
+/// and collects that result before answering.
 struct SpawnProvider {
     /// "spawn_thread" (same session) or "spawn_session" (fresh worktree).
     spawn_tool: &'static str,
@@ -3676,17 +5184,25 @@ impl Provider for SpawnProvider {
                 ..Default::default()
             },
         });
-        let events: Vec<Result<ProviderEvent, ProviderError>> = if users.contains("child task") {
-            // The child agent's turn.
-            if results.contains("cannot spawn") {
+        let events: Vec<Result<ProviderEvent, ProviderError>> = if users.contains("grandchild task")
+        {
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "Grandchild done: the nested answer is 21.".into(),
+                )),
+                done,
+            ]
+        } else if users.contains("child task") {
+            // The child agent delegates once, waits for that grandchild, then
+            // completes its own durable transcript.
+            if results.contains("Grandchild done") {
                 vec![
                     Ok(ProviderEvent::TextDelta(
                         "Child done: the answer is 42.".into(),
                     )),
                     done,
                 ]
-            } else {
-                // Try (and fail) to spawn a grandchild: the depth guard.
+            } else if !results.contains("thread_id") {
                 vec![
                     Ok(ProviderEvent::ToolCall(ToolCallRequest {
                         id: "c1".into(),
@@ -3695,14 +5211,31 @@ impl Provider for SpawnProvider {
                     })),
                     done,
                 ]
+            } else {
+                let grandchild_id = results
+                    .split("\"thread_id\":\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "c2".into(),
+                        name: "spawn_output".into(),
+                        arguments: serde_json::json!({
+                            "thread_id": grandchild_id,
+                            "wait_ms": 25_000
+                        }),
+                    })),
+                    done,
+                ]
             }
         } else if !results.contains("thread_id") {
             // Parent iteration 1: spawn the child.
             let mut args = serde_json::json!({"prompt": "child task: compute the answer"});
-            if self.spawn_tool == "spawn_thread" {
-                // Read-only children run concurrently with this very turn.
-                args["mode"] = "plan".into();
-            } else {
+            if self.spawn_tool == "spawn_session" {
                 args["title"] = "Sub experiment".into();
             }
             vec![
@@ -3815,8 +5348,8 @@ fn tool_results(events: &[serde_json::Value]) -> Vec<(&str, &serde_json::Value)>
 }
 
 /// spawn_thread: a child agent on a new thread in the same session, running
-/// concurrently with the parent's turn (read-only child), collected with
-/// spawn_output — plus the authorization and depth guardrails.
+/// concurrently with the parent's turn, recursively delegating once, and
+/// collected with spawn_output — plus authorization and hierarchy checks.
 #[tokio::test]
 async fn spawn_thread_child_agent_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3864,8 +5397,7 @@ async fn spawn_thread_child_agent_end_to_end() {
     assert!(events.iter().any(|e| e["type"] == "assistant.message"
         && e["content"].as_str().unwrap().contains("child reported 42")));
 
-    // The child rides the same session, marked as agent-spawned, in the
-    // requested read-only mode.
+    // The child rides the same session and is marked as agent-spawned.
     let threads: Vec<serde_json::Value> = client
         .get(format!("{base}/threads?session_id={session_id}"))
         .send()
@@ -3876,22 +5408,78 @@ async fn spawn_thread_child_agent_end_to_end() {
         .unwrap();
     let child = threads.iter().find(|t| t["id"] == child_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
-    assert_eq!(child["mode"], "plan");
+    assert_eq!(child["mode"], "code");
+    assert_eq!(child["title"], "Subagent: Child task compute answer");
+    let subagents: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/subagents"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(subagents.len(), 1, "{subagents:?}");
+    assert_eq!(subagents[0]["id"], child_id);
+    assert_eq!(subagents[0]["spawned"], true);
+    let descendants: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/threads/{thread_id}/subagents?recursive=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(descendants.len(), 2, "{descendants:?}");
+    assert!(descendants.iter().any(|thread| thread["id"] == child_id));
+    let grandchild = descendants
+        .iter()
+        .find(|thread| thread["id"] != child_id)
+        .expect("recursive listing should include the grandchild");
+    let grandchild_id = grandchild["id"].as_str().unwrap();
+    let child_subagents: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{child_id}/subagents"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(child_subagents.len(), 1, "{child_subagents:?}");
+    assert_eq!(child_subagents[0]["id"], grandchild_id);
+    let subagent = events
+        .iter()
+        .find(|event| event["type"] == "subagent.spawned")
+        .expect("parent transcript should link the spawned child");
+    assert_eq!(subagent["thread_id"], child_id);
+    assert_eq!(subagent["session_id"], session_id);
+    assert_eq!(subagent["prompt"], "child task: compute the answer");
+    assert_eq!(subagent["model"], child["model"]);
     let parent = threads
         .iter()
         .find(|t| t["id"] == thread_id.as_str())
         .unwrap();
     assert!(!parent["spawned"].as_bool().unwrap_or(false));
 
-    // Depth guard: the child's own spawn attempt was refused.
-    let child_events = wait_for_event(&client, &format!("{base}/threads/{child_id}/events"), |e| {
-        e["type"] == "tool.completed"
-            && e["result"]["error"]
-                .as_str()
-                .is_some_and(|s| s.contains("cannot spawn"))
-    })
+    let grandchild_events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{grandchild_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
     .await;
-    assert!(!child_events.is_empty());
+    assert!(grandchild_events.iter().any(|event| {
+        event["type"] == "assistant.message"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Grandchild done"))
+    }));
 }
 
 /// spawn_session: a child agent in a fresh worktree session branched from
@@ -3917,9 +5505,17 @@ async fn spawn_session_child_agent_isolated() {
     .await;
 
     let results = tool_results(&events);
-    let spawn = results.iter().find(|(id, _)| *id == "p1").unwrap().1;
-    let child_thread_id = spawn["thread_id"].as_str().unwrap();
-    let child_session_id = spawn["session_id"].as_str().unwrap();
+    let spawn = results
+        .iter()
+        .find(|(id, _)| *id == "p1")
+        .unwrap_or_else(|| panic!("missing spawn_session result in events: {events:#?}"))
+        .1;
+    let child_thread_id = spawn["thread_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("spawn_session did not return a thread: {spawn}"));
+    let child_session_id = spawn["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("spawn_session did not return a session: {spawn}"));
     assert_ne!(child_session_id, session["id"].as_str().unwrap());
     // The child is based on the parent's latest checkpoint commit (its
     // actual work), not the session branch — checkpoints never move the
@@ -3978,9 +5574,25 @@ async fn spawn_session_child_agent_isolated() {
 #[tokio::test]
 async fn secured_router_enforces_loopback_host_and_internal_token() {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let backend = Arc::new(ScriptedBackend::new());
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let mut config = Config::default();
+    config.providers.insert(
+        "fake-agent".into(),
+        trouve_core::config::ProviderConfig {
+            kind: "claude-cli".into(),
+            command: Some("/definitely/not/a/fake-agent-test-binary".into()),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(
-        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+        Engine::new(store, tmp.path().join("data"), &config)
+            .with_config_dir(None)
+            .with_backend("fake-agent", backend.clone())
+            .with_default_model("fake-agent/agent-model"),
     );
 
     let security = trouve_server::ServerSecurity {
@@ -3989,6 +5601,7 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    engine.set_base_url(&format!("http://{addr}"));
     let router = trouve_server::build_secured_router(engine, security);
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
@@ -4023,16 +5636,64 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
         "method": "initialize",
         "params": {"protocolVersion": "2025-03-26"}
     });
-    let internal = format!("http://{addr}/internal/threads/missing/mcp?tools=0&approval=0");
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Secured bridge"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "hold for approval"}))
+        .send()
+        .await
+        .unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "approval.requested"
+    })
+    .await;
+    let internal = backend
+        .bridge_urls_seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .flatten()
+        .expect("active turn receives an exact bridge capability");
+    let unauthenticated = internal.replace("&bridge_token=bridge-secret", "");
+    assert_ne!(unauthenticated, internal);
     let resp = client
-        .post(&internal)
+        .post(&unauthenticated)
         .json(&initialize)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     let resp = client
-        .post(format!("{internal}&bridge_token=bridge-secret"))
+        .post(internal)
         .json(&initialize)
         .send()
         .await
@@ -4602,4 +6263,47 @@ async fn provider_login_callback_endpoint_validates_requests() {
         .await
         .unwrap();
     assert_eq!(absent.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_projection_returns_cached_state_with_a_resume_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let expected_cursor = store
+        .append_event(
+            trouve_protocol::Scope::Server,
+            trouve_protocol::Event::GithubPullRequestsUpdated {
+                pull_requests: trouve_protocol::GithubPrList {
+                    viewer: "octocat".into(),
+                    host: "github.com".into(),
+                    prs: Vec::new(),
+                },
+            },
+        )
+        .unwrap()
+        .cursor;
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let response = reqwest::get(format!("http://{addr}/v1/server-projection"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(trouve_protocol::EVENT_CURSOR_HEADER)
+            .unwrap(),
+        expected_cursor.to_string().as_str()
+    );
+    let projection: trouve_protocol::ServerProjection = response.json().await.unwrap();
+    assert_eq!(projection.github_pull_requests.len(), 1);
+    assert_eq!(projection.github_pull_requests[0].cursor, expected_cursor);
+    assert!(projection.session_pull_requests.is_empty());
 }

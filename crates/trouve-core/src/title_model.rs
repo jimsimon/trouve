@@ -52,6 +52,7 @@ pub struct TitleModelManager {
     http: reqwest::Client,
     behavior: RwLock<TitleModelLoadBehavior>,
     resources: RwLock<TitleModelResourcePolicy>,
+    derive_branch_name_from_session_title: AtomicBool,
     install: Mutex<Option<InstallState>>,
     install_generation: AtomicU64,
     use_generation: AtomicU64,
@@ -75,6 +76,7 @@ impl TitleModelManager {
         data_dir: PathBuf,
         behavior: TitleModelLoadBehavior,
         resources: TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: bool,
         local_model: &Arc<crate::local::LlamaManager>,
         store: crate::store::Store,
     ) -> Self {
@@ -92,6 +94,9 @@ impl TitleModelManager {
             data_dir,
             behavior: RwLock::new(behavior),
             resources: RwLock::new(resources),
+            derive_branch_name_from_session_title: AtomicBool::new(
+                derive_branch_name_from_session_title,
+            ),
             install: Mutex::new(None),
             install_generation: AtomicU64::new(0),
             use_generation: AtomicU64::new(0),
@@ -108,8 +113,14 @@ impl TitleModelManager {
         *self.resources.read().unwrap()
     }
 
+    pub fn derive_branch_name_from_session_title(&self) -> bool {
+        self.derive_branch_name_from_session_title
+            .load(Ordering::Relaxed)
+    }
+
     pub fn settings(&self) -> trouve_protocol::GitWorktreeSettings {
         trouve_protocol::GitWorktreeSettings {
+            derive_branch_name_from_session_title: self.derive_branch_name_from_session_title(),
             title_model_load_behavior: self.behavior(),
             title_model_resource_policy: self.resources(),
             title_model: self.status(),
@@ -200,10 +211,13 @@ impl TitleModelManager {
         self: &Arc<Self>,
         behavior: TitleModelLoadBehavior,
         resources: TitleModelResourcePolicy,
+        derive_branch_name_from_session_title: bool,
     ) {
         let resources_changed = self.resources() != resources;
         *self.behavior.write().unwrap() = behavior;
         *self.resources.write().unwrap() = resources;
+        self.derive_branch_name_from_session_title
+            .store(derive_branch_name_from_session_title, Ordering::Relaxed);
         self.llama.set_title_resources(resources);
         self.use_generation.fetch_add(1, Ordering::Relaxed);
         if resources_changed {
@@ -710,6 +724,7 @@ mod tests {
             data.path().into(),
             TitleModelLoadBehavior::Auto,
             TitleModelResourcePolicy::CpuRamOnly,
+            false,
             &local_model,
             crate::store::Store::open_in_memory().unwrap(),
         );

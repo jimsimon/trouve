@@ -15,13 +15,19 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
 - `crates/trouve-providers` — LLM provider abstraction and implementations.
 - `crates/trouve-server` — axum HTTP/SSE server exposing core over the
   protocol.
-- `crates/trouve-client-core` — shared client logic (protocol client, session
-  state, view models) for native clients.
+- `crates/trouve-client-core` — shared Rust client logic (protocol client,
+  compatibility checks, session state, view models) for native hosts and
+  tools.
 - `crates/trouve-thread-view` — shared deterministic fold from thread events
   into rebuildable protocol snapshots; no transport or UI dependencies.
-- `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
-  view, markdown, terminal). No trouve-specific types in their public APIs.
-- `crates/trouve-app` — thin Slint desktop/mobile app composing the above.
+- `crates/trouve-desktop-host` — app-owned static-asset gateway, typed native
+  capability boundary, and replaceable desktop webview host.
+- `crates/trouve-app` — main desktop application; ships the Lit frontend in
+  Wry and embeds the protocol server for local use.
+- `crates/trouve-servo-embed-preview` — disposable, chrome-free Servo
+  embedding qualification harness. It is an excluded nested Cargo workspace
+  with its own lockfile, not the shipping desktop host (ADR 0024).
+- `web/app-ui` — Lit application shared by the desktop webview and mobile PWA.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
   design docs (event log schema, UX screen map).
 
@@ -44,22 +50,50 @@ These are load-bearing. Do not violate them without a new ADR.
 3. **Every side effect goes through `ToolExecutor`.** File edits, shell,
    git, MCP calls — one chokepoint for permissions, audit, and (later)
    sandboxed executors. Never spawn a process or write a file from the agent
-   loop directly.
-4. **Sessions own worktrees.** Agent file operations happen in the session's
-   git worktree, never in the user's checkout. Threads share the session
-   worktree; worktree mutations are serialized.
+   loop directly. Vendor harnesses use the full tool bridge by default;
+   unavoidable vendor-native tools are disabled or confined read-only, and
+   approval-only fallbacks hold an engine mutation lease (ADR 0030).
+4. **Sessions own worktrees.** Agent mutations happen in the session's git
+   worktree, never in the user's checkout. Read-only filesystem tools may also
+   inspect canonical host-registered instruction/package roots, but those
+   capabilities never widen mutation paths (ADR 0037). Threads share the
+   session worktree and their turns may run concurrently; read-only tools may
+   overlap, but mutation-capable tool calls and checkpoints are exclusive per
+   session (ADRs 0030 and 0034).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
-   deliberately with a version bump.
+   deliberately with a version bump. Generated clients require an exact
+   protocol-version match because closed wire enums and unions are not
+   automatically forward-compatible (ADR 0036).
 6. **Agent modes are data.** Modes (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a mode must not require new Rust
    control flow.
-7. **Widget crates stay generic.** `trouve-slint-*` crates take plain data (text,
-   spans, hunks), not trouve protocol types.
+7. **One product frontend.** `web/app-ui` is the shared Lit application for
+   Wry desktop and the PWA. Native hosts provide only the gateway and typed OS
+   capabilities; they do not reimplement product screens or durable state.
 8. **One workspace version.** Every first-party Cargo crate, Node package,
    plugin manifest, internal package pin, and release artifact uses root
    `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
    0012). Protocol and storage-format compatibility versions remain separate.
+   `crates/trouve-servo-embed-preview` is the sole Cargo-membership and
+   lockfile exception: its resolver graph is isolated because the pinned Servo
+   nightly and the product server require incompatible native SQLite link
+   versions, but its first-party version and internal pins are still
+   synchronized to the root version (ADRs 0024 and 0025).
+9. **The web host is not a second client protocol.** Wry/Lit is the shipping
+   desktop frontend (ADR 0028). The desktop gateway may
+   serve assets, proxy HTTP/SSE, and expose narrowly typed native capabilities
+   such as window state, pickers, clipboard, notifications, and external-open.
+   It never carries durable agent state or arbitrary filesystem, shell, URL,
+   git, MCP, or tool operations. The desktop webview and mobile PWA obtain all
+   harness state and effects through `trouve-server` (ADR 0023). Runtime asset
+   directories and Vite proxying are explicit development/qualification
+   sources, remain loopback-only behind the same gateway origin, and are never
+   enabled by shipping product hosts (ADR 0026). The first default Wry process
+   owns one embedded server through `trouve_server::bind_local`; additional
+   default windows attach to that elected owner and never open a second Engine
+   or database connection (ADR 0032). Comparison and Servo qualification hosts
+   require an explicit server URL and never open the default database.
 
 ## Conventions
 
@@ -78,5 +112,5 @@ These are load-bearing. Do not violate them without a new ADR.
   version-bearing artifacts.
 - Commit style: imperative, concise subject; explain *why* in the body when
   it isn't obvious.
-- Licensing: workspace code is MIT. Slint is used under its Royalty-Free
-  license (ADR 0006); keep the AboutSlint attribution in the app.
+- Licensing: workspace code is MIT. Keep generated Rust and npm third-party
+  notices synchronized with their locked dependency graphs.

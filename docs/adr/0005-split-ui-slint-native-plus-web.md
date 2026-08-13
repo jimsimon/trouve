@@ -1,6 +1,6 @@
 # ADR 0005: Split UI — Slint native clients + separate web client
 
-Status: Accepted (2026-07)
+Status: Superseded by 0023
 
 ## Context
 

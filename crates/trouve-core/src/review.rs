@@ -3246,6 +3246,7 @@ impl Engine {
                 base_sha: job.review_base_sha.clone(),
                 head_sha: job.head_sha.clone(),
                 token,
+                cancel: superseded.clone(),
             })
             .await
             .map_err(|error| anyhow!(error))?;
@@ -3265,6 +3266,7 @@ impl Engine {
             .await?;
         let coordinator = self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
+            title: Some(session.title.clone()),
             mode: Some("review".into()),
             model: Some(coordinator_model),
             model_options: thinking_model_options(job.coordinator_thinking_level.as_deref()),
@@ -3300,8 +3302,10 @@ impl Engine {
             let loaded = Arc::new(
                 self.executor
                     .review_repository_diff(&ReviewRepositoryDiff {
+                        managed_root: self.data_dir.join("worktrees"),
                         worktree: session.worktree_path.clone().into(),
                         base_sha: job.review_base_sha.clone(),
+                        cancel: superseded.clone(),
                     })
                     .await
                     .map_err(|error| anyhow!(error))?,
@@ -3525,6 +3529,7 @@ impl Engine {
                     let result = async {
                         let thread = engine.create_thread(CreateThreadRequest {
                             session_id,
+                            title: None,
                             mode: Some("review".into()),
                             model: Some(reviewer_model(&job, &reviewer)?),
                             model_options: reviewer_model_options(&reviewer),
@@ -4100,6 +4105,7 @@ impl Engine {
                     engine.emit_code_review_task(&job.id, task.clone())?;
                     let thread = match engine.create_thread(CreateThreadRequest {
                         session_id,
+                        title: None,
                         mode: Some("review".into()),
                         model: Some(routing_model),
                         model_options: thinking_model_options(job.router_thinking_level.as_deref()),
@@ -4394,7 +4400,11 @@ impl Engine {
                     coalesce_observed_stage = false;
                 }
                 Event::QuestionRequested { request_id, .. } => {
-                    let _ = self.resolve_question(&request_id, None);
+                    // Automated review turns have no interactive user. Resolve
+                    // against the owning disposable thread so the provider is
+                    // unblocked without allowing a colliding request id from a
+                    // different thread to be consumed.
+                    let _ = self.resolve_question(thread_id, &request_id, None);
                 }
                 Event::TurnCompleted {
                     turn: event_turn,
@@ -7465,6 +7475,8 @@ mod tests {
         let thread = Thread {
             id: "th_progress".into(),
             session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
             mode: "review".into(),
             model: "provider/progress".into(),
             model_options: Default::default(),

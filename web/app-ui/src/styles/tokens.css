@@ -1,0 +1,136 @@
+:root {
+  /* An empty font-family preference means the platform UI font. Keep the
+   * browser default on that same contract instead of preferring a font that
+   * may happen to be installed on only one host. */
+  --trouve-font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  --trouve-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --trouve-font-size: 13px;
+  --trouve-settings-info-font-size: 11px;
+  --trouve-line-height: 1.35;
+  --trouve-radius-sm: 4px;
+  --trouve-radius: 6px;
+  --trouve-space-1: 4px;
+  --trouve-space-2: 8px;
+  --trouve-space-3: 12px;
+  --trouve-space-4: 16px;
+  --trouve-navigation-width: 260px;
+  --trouve-inspection-width: 460px;
+  --trouve-chat-timeline-rail-width: 1px;
+  --trouve-chat-streaming-animation: pulse 1s steps(2, end) infinite;
+}
+
+/* Re-declare derived roles at each theme boundary. This lets a nested theme
+ * (the parity gallery) and a host-provided appearance override resolve the
+ * aliases against their own semantic palette instead of the root palette. */
+:root,
+[data-theme] {
+  --trouve-accent-fg: var(--trouve-on-accent);
+  --trouve-focus: var(--trouve-accent);
+  --trouve-font-ui: var(--trouve-font-sans);
+  --trouve-link: var(--trouve-accent);
+  --trouve-muted: var(--trouve-text-dim);
+  --trouve-selection-bg: var(--trouve-selection);
+  --trouve-terminal-bg: var(--trouve-code-bg);
+  --trouve-syn-comment: var(--trouve-text-dim);
+  --trouve-syn-keyword: var(--trouve-accent);
+  --trouve-syn-number: var(--trouve-warn);
+  --trouve-syn-string: var(--trouve-ok);
+  --trouve-term-cyan: var(--trouve-accent-tint);
+  --trouve-syn-type: var(--trouve-term-cyan);
+
+  /* WebAwesome supplies the control implementation and its complete default
+   * variable graph. These overrides make that graph use Trouve's compact
+   * compact Trouve geometry and semantic palette. */
+  --wa-font-family-body: var(--trouve-font-sans);
+  --wa-font-family-heading: var(--trouve-font-sans);
+  --wa-font-family-code: var(--trouve-font-mono);
+  --wa-font-size-m: var(--trouve-font-size);
+  --wa-font-size-s: 12px;
+  --wa-font-size-xs: 11px;
+  --wa-font-size-2xs: 10px;
+  --wa-font-size-smaller: 11px;
+  --wa-line-height-condensed: 1.2;
+  --wa-line-height-normal: var(--trouve-line-height);
+
+  --wa-color-surface-raised: var(--trouve-popup-bg);
+  --wa-color-surface-default: var(--trouve-surface);
+  --wa-color-surface-lowered: var(--trouve-inset-bg);
+  --wa-color-surface-border: var(--trouve-border);
+  --wa-color-text-normal: var(--trouve-text);
+  --wa-color-text-quiet: var(--trouve-text-dim);
+  --wa-color-text-link: var(--trouve-link);
+  --wa-color-focus: var(--trouve-focus);
+  --wa-color-overlay-modal: var(--trouve-scrim);
+  --wa-color-shadow: var(--trouve-scrim);
+  --wa-color-mix-hover: var(--trouve-text-hi) 8%;
+  --wa-color-mix-active: var(--trouve-text-hi) 14%;
+
+  --wa-color-brand-fill-quiet: var(--trouve-accent-bg);
+  --wa-color-brand-fill-normal: var(--trouve-accent-bg);
+  --wa-color-brand-fill-loud: var(--trouve-primary-bg);
+  --wa-color-brand-border-quiet: var(--trouve-border);
+  --wa-color-brand-border-normal: var(--trouve-primary-border);
+  --wa-color-brand-border-loud: var(--trouve-primary-border);
+  --wa-color-brand-on-quiet: var(--trouve-accent-tint);
+  --wa-color-brand-on-normal: var(--trouve-text-accent-soft);
+  --wa-color-brand-on-loud: var(--trouve-on-accent);
+
+  --wa-color-neutral-fill-quiet: transparent;
+  --wa-color-neutral-fill-normal: var(--trouve-control-bg);
+  --wa-color-neutral-fill-loud: var(--trouve-control-bg);
+  --wa-color-neutral-border-quiet: var(--trouve-border);
+  --wa-color-neutral-border-normal: var(--trouve-border);
+  --wa-color-neutral-border-loud: var(--trouve-border-strong);
+  --wa-color-neutral-on-quiet: var(--trouve-text-dim);
+  --wa-color-neutral-on-normal: var(--trouve-text);
+  --wa-color-neutral-on-loud: var(--trouve-text-hi);
+
+  --wa-color-success-fill-quiet: var(--trouve-agent-bg);
+  --wa-color-success-fill-normal: var(--trouve-agent-bg);
+  --wa-color-success-fill-loud: var(--trouve-ok);
+  --wa-color-success-border-quiet: var(--trouve-agent-border);
+  --wa-color-success-border-normal: var(--trouve-agent-border);
+  --wa-color-success-border-loud: var(--trouve-ok);
+  --wa-color-success-on-quiet: var(--trouve-ok);
+  --wa-color-success-on-normal: var(--trouve-ok);
+  --wa-color-success-on-loud: var(--trouve-win-bg);
+
+  --wa-color-warning-fill-quiet: var(--trouve-warn-bg);
+  --wa-color-warning-fill-normal: var(--trouve-warn-bg);
+  --wa-color-warning-fill-loud: var(--trouve-warn);
+  --wa-color-warning-border-quiet: var(--trouve-warn-border);
+  --wa-color-warning-border-normal: var(--trouve-warn-border);
+  --wa-color-warning-border-loud: var(--trouve-warn);
+  --wa-color-warning-on-quiet: var(--trouve-warn);
+  --wa-color-warning-on-normal: var(--trouve-warn);
+  --wa-color-warning-on-loud: var(--trouve-win-bg);
+
+  --wa-color-danger-fill-quiet: var(--trouve-err-bg);
+  --wa-color-danger-fill-normal: var(--trouve-err-bg);
+  --wa-color-danger-fill-loud: var(--trouve-err);
+  --wa-color-danger-border-quiet: var(--trouve-err);
+  --wa-color-danger-border-normal: var(--trouve-err);
+  --wa-color-danger-border-loud: var(--trouve-err);
+  --wa-color-danger-on-quiet: var(--trouve-err-soft);
+  --wa-color-danger-on-normal: var(--trouve-err-soft);
+  --wa-color-danger-on-loud: var(--trouve-win-bg);
+
+  --wa-border-radius-s: var(--trouve-radius-sm);
+  --wa-border-radius-m: var(--trouve-radius);
+  --wa-border-radius-l: 8px;
+  --wa-focus-ring-width: 2px;
+  --wa-focus-ring-offset: 1px;
+  --wa-form-control-background-color: var(--trouve-control-bg);
+  --wa-form-control-border-color: var(--trouve-border);
+  --wa-form-control-border-radius: var(--trouve-radius);
+  --wa-form-control-height: 30px;
+  --wa-form-control-padding-block: 4px;
+  --wa-form-control-padding-inline: 8px;
+  --wa-form-control-label-color: var(--trouve-text);
+  --wa-form-control-value-color: var(--trouve-text);
+  --wa-form-control-hint-color: var(--trouve-text-dim);
+  --wa-form-control-placeholder-color: var(--trouve-text-faint);
+  --wa-button-transform-hover: none;
+  --wa-button-transform-active: none;
+}
