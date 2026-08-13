@@ -159,4 +159,22 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(currentScope).toContain('route?.kind === "session"');
     expect(currentScope).toContain('(route.threadId ?? "") === threadId');
   });
+
+  it("refreshes elapsed activity only while the visible thread is running", () => {
+    const syncActivity = section(
+      "#syncActivityRefresh(): void {",
+      "\n  #clearActivityRefresh(): void {",
+    );
+    const clearActivity = section(
+      "#clearActivityRefresh(): void {",
+      "\n  #selectThreadWithKeyboard(",
+    );
+    expect(syncActivity).toContain("threadView(this.threadId)?.turnRunning");
+    expect(syncActivity).toContain("this.#activityNowMs = Date.now();");
+    expect(syncActivity).toContain("globalThis.setInterval");
+    expect(syncActivity).toContain("this.isConnected");
+    expect(syncActivity).toContain("this.requestUpdate();");
+    expect(clearActivity).toContain("globalThis.clearInterval");
+    expect(disconnected).toContain("this.#clearActivityRefresh();");
+  });
 });
