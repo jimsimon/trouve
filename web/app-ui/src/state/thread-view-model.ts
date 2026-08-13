@@ -797,11 +797,12 @@ export class ThreadViewModel {
         }
         return true;
       }
-      case "turn.completed":
+      case "turn.completed": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
+        const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
         this.lastUsage = envelope.usage;
         this.lastUsageCursor = envelope.cursor;
@@ -812,28 +813,32 @@ export class ThreadViewModel {
           ...(envelope.checkpoint_id == null
             ? {}
             : { checkpointId: envelope.checkpoint_id }),
-        });
-      case "turn.failed":
+        }) || toolsChanged;
+      }
+      case "turn.failed": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
+        const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
         return this.replaceActiveTurn(envelope.turn, {
           kind: "failed",
           error: envelope.error,
-        });
+        }) || toolsChanged;
+      }
       case "turn.cancelled": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
         this.finishThinking();
+        const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
         this.recordTurnDuration(envelope.turn, envelope.ts);
         const index = this.items.findIndex((item) =>
           item.kind === "turn-status" && item.turn === envelope.turn);
-        if (index < 0) return false;
+        if (index < 0) return toolsChanged;
         this.items.splice(index, 1);
         this.totalItems = Math.max(this.itemOffset + this.items.length, this.totalItems - 1);
         return true;
@@ -942,6 +947,30 @@ export class ThreadViewModel {
     if (item?.kind !== "thinking") return wasThinking;
     item.complete = true;
     return true;
+  }
+
+  /**
+   * A thread has at most one active turn, so every non-terminal tool row
+   * belongs to the turn that is ending. Provider control-plane calls can be
+   * interrupted without a matching tool.completed event; preserve the row,
+   * but never leave a terminal transcript looking active.
+   */
+  private abortOpenTools(endedAt: string): boolean {
+    const ended = Date.parse(endedAt);
+    let changed = false;
+    for (const item of this.items) {
+      if (item.kind !== "tool" || terminalToolStatus(item.status)) continue;
+      item.status = "aborted";
+      if (item.durationMs === undefined && item.startedAt !== undefined) {
+        const started = Date.parse(item.startedAt);
+        if (Number.isFinite(ended) && Number.isFinite(started)) {
+          item.durationMs = Math.max(0, ended - started);
+        }
+      }
+      changed = true;
+    }
+    this.pendingApprovals.length = 0;
+    return changed;
   }
 
   private recordTurnDuration(turn: number, endedAt: string): void {

@@ -261,6 +261,7 @@ export class ComposerDraftController {
   readonly #attachmentStorage: ComposerDraftAttachmentStorage | undefined;
   readonly #drafts = new Map<string, ComposerDraft>();
   readonly #versions = new Map<string, number>();
+  readonly #discarded = new Set<string>();
   readonly #attachmentWrites = new Map<string, Promise<void>>();
   readonly #queuedAttachments = new Map<string, readonly PendingAttachment[]>();
   readonly #persistedAttachments = new Map<string, readonly PendingAttachment[]>();
@@ -274,7 +275,7 @@ export class ComposerDraftController {
   }
 
   read(threadId: string): ComposerDraft {
-    if (threadId === "") return EMPTY_COMPOSER_DRAFT;
+    if (threadId === "" || this.#discarded.has(threadId)) return EMPTY_COMPOSER_DRAFT;
     const cached = this.#drafts.get(threadId);
     if (cached !== undefined) return cached;
     const stored = this.#textStorage?.load(threadId);
@@ -288,7 +289,7 @@ export class ComposerDraftController {
   }
 
   stage(threadId: string, value: ComposerDraft): ComposerDraft {
-    if (threadId === "") return EMPTY_COMPOSER_DRAFT;
+    if (threadId === "" || this.#discarded.has(threadId)) return EMPTY_COMPOSER_DRAFT;
     const draft = normalizeComposerDraft(value);
     this.#drafts.set(threadId, draft);
     this.#versions.set(threadId, (this.#versions.get(threadId) ?? 0) + 1);
@@ -297,12 +298,19 @@ export class ComposerDraftController {
 
   async hydrate(threadId: string): Promise<ComposerDraft> {
     const current = this.read(threadId);
-    if (threadId === "" || this.#attachmentStorage === undefined) return current;
+    if (
+      threadId === ""
+      || this.#discarded.has(threadId)
+      || this.#attachmentStorage === undefined
+    ) return current;
     const version = this.#versions.get(threadId) ?? 0;
     try {
       await this.#attachmentWrites.get(threadId);
       const attachments = await this.#attachmentStorage.load(threadId);
-      if ((this.#versions.get(threadId) ?? 0) !== version) return this.read(threadId);
+      if (
+        this.#discarded.has(threadId)
+        || (this.#versions.get(threadId) ?? 0) !== version
+      ) return this.read(threadId);
       const hydrated = normalizeComposerDraft({ ...current, attachments });
       this.#drafts.set(threadId, hydrated);
       this.#persistedAttachments.set(threadId, hydrated.attachments);
@@ -314,6 +322,14 @@ export class ComposerDraftController {
 
   persist(threadId: string): Promise<void> {
     if (threadId === "") return Promise.resolve();
+    if (this.#discarded.has(threadId)) {
+      try {
+        this.#textStorage?.clear(threadId);
+      } catch {
+        // The permanent in-memory tombstone still blocks late staging.
+      }
+      return this.#queueAttachmentPersistence(threadId, Object.freeze([]), true);
+    }
     const draft = this.read(threadId);
     try {
       if (draft.text === "") this.#textStorage?.clear(threadId);
@@ -331,12 +347,30 @@ export class ComposerDraftController {
 
   clear(threadId: string): Promise<void> {
     if (threadId === "") return Promise.resolve();
+    if (this.#discarded.has(threadId)) return this.persist(threadId);
     this.#drafts.set(threadId, EMPTY_COMPOSER_DRAFT);
     this.#versions.set(threadId, (this.#versions.get(threadId) ?? 0) + 1);
     try {
       this.#textStorage?.clear(threadId);
     } catch {
       // The in-memory clear still prevents this page from restoring the draft.
+    }
+    return this.#queueAttachmentPersistence(threadId, Object.freeze([]), true);
+  }
+
+  /** Permanently discard a deleted thread's draft for this controller
+   * lifetime. Unlike submission `clear`, this tombstone rejects every late
+   * stage, persist, and hydrate completion that was already queued by the
+   * composer when its session disappeared. */
+  discard(threadId: string): Promise<void> {
+    if (threadId === "") return Promise.resolve();
+    this.#discarded.add(threadId);
+    this.#drafts.set(threadId, EMPTY_COMPOSER_DRAFT);
+    this.#versions.set(threadId, (this.#versions.get(threadId) ?? 0) + 1);
+    try {
+      this.#textStorage?.clear(threadId);
+    } catch {
+      // The permanent in-memory tombstone still blocks late staging.
     }
     return this.#queueAttachmentPersistence(threadId, Object.freeze([]), true);
   }

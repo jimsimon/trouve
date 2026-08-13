@@ -11,17 +11,18 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 const QUEUE_CAPACITY: usize = 16;
 static WORKER: OnceLock<Option<SyncSender<OsString>>> = OnceLock::new();
 
-pub fn open(path: impl AsRef<OsStr>) {
-    let path: OsString = path.as_ref().to_owned();
+pub fn open(path: impl AsRef<OsStr>) -> Result<(), String> {
+    enqueue(path.as_ref().to_owned())
+}
+
+fn enqueue(request: OsString) -> Result<(), String> {
     let Some(sender) = WORKER.get_or_init(start_worker) else {
-        tracing::warn!(path = %path.to_string_lossy(), "system opener worker is unavailable");
-        return;
+        return Err("system opener worker is unavailable".into());
     };
-    if let Err(error) = sender.try_send(path) {
-        let path = match &error {
-            TrySendError::Full(path) | TrySendError::Disconnected(path) => path,
-        };
-        tracing::warn!(%error, path = %path.to_string_lossy(), "could not queue system handler");
+    match sender.try_send(request) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err("system opener queue is full".into()),
+        Err(TrySendError::Disconnected(_)) => Err("system opener worker disconnected".into()),
     }
 }
 

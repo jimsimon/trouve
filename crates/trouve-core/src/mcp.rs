@@ -70,6 +70,14 @@ const TEST_RELEASE_CLEANUP_AT_ENV: &str = "TROUVE_TEST_RELEASE_MCP_CLEANUP_AT";
 const TEST_PAUSE_CONFIG_READ_AT_ENV: &str = "TROUVE_TEST_PAUSE_MCP_CONFIG_READ_AT";
 #[cfg(test)]
 const TEST_RELEASE_CONFIG_READ_AT_ENV: &str = "TROUVE_TEST_RELEASE_MCP_CONFIG_READ_AT";
+#[cfg(test)]
+const TEST_CONFIG_PROCESS_MODE_ENV: &str = "TROUVE_TEST_MCP_CONFIG_PROCESS_MODE";
+#[cfg(test)]
+const TEST_CONFIG_PROCESS_PATH_ENV: &str = "TROUVE_TEST_MCP_CONFIG_PROCESS_PATH";
+#[cfg(test)]
+const TEST_CONFIG_PROCESS_MARKER_ENV: &str = "TROUVE_TEST_MCP_CONFIG_PROCESS_MARKER";
+#[cfg(test)]
+const TEST_CONFIG_PROCESS_RELEASE_ENV: &str = "TROUVE_TEST_MCP_CONFIG_PROCESS_RELEASE";
 
 type ConfigFileLock = std::sync::Mutex<()>;
 
@@ -338,39 +346,81 @@ fn edit_file<T>(
     create_if_missing: bool,
     mutate: impl FnOnce(&mut serde_json::Map<String, Value>) -> T,
 ) -> Result<Option<T>> {
-    // A missing-file enable/remove linearizes before a concurrent creator.
-    // Avoid creating parent directories for those documented no-op cases.
-    if !create_if_missing && !path.exists() {
-        return Ok(None);
-    }
-    let target = canonical_config_target(path, create_if_missing)?;
+    // The stable adjacent lockfile needs its canonical parent even for a
+    // missing-file no-op. Creating that directory is the only way to make the
+    // no-op linearize with a concurrent creator in another process.
+    let target = canonical_config_target(path, true)?;
     let file_lock = config_file_lock(&target);
     let _guard = file_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let interprocess_lock = lock_config_target(&target)?;
 
-    let mut doc: Value = match std::fs::read_to_string(&target) {
-        Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("{} is not valid JSON", target.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
-            json!({})
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", target.display()));
-        }
-    };
-    let root = doc
-        .as_object_mut()
-        .with_context(|| format!("{} is not a JSON object", target.display()))?;
-    let servers = root
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .with_context(|| format!("mcpServers in {} is not an object", target.display()))?;
-    let result = mutate(servers);
-    persist_config_file(&target, &doc)?;
-    Ok(Some(result))
+    let result = (|| {
+        // Read only after both locks are held. In particular, a documented
+        // missing-file no-op must linearize against a creator in another
+        // process rather than racing an early existence check.
+        let mut doc: Value = match std::fs::read_to_string(&target) {
+            Ok(text) => serde_json::from_str(&text)
+                .with_context(|| format!("{} is not valid JSON", target.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
+                json!({})
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", target.display()));
+            }
+        };
+        let root = doc
+            .as_object_mut()
+            .with_context(|| format!("{} is not a JSON object", target.display()))?;
+        let servers = root
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| format!("mcpServers in {} is not an object", target.display()))?;
+        let result = mutate(servers);
+        persist_config_file(&target, &doc)?;
+        Ok(Some(result))
+    })();
+    unlock_config_target(interprocess_lock, result)
+}
+
+fn config_lock_path(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .with_context(|| format!("MCP config path has no parent: {}", target.display()))?;
+    Ok(parent.join(format!(
+        ".{}.lock",
+        target
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("mcp")
+    )))
+}
+
+fn lock_config_target(target: &Path) -> Result<std::fs::File> {
+    use fs4::fs_std::FileExt as _;
+
+    let lock_path = config_lock_path(target)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening MCP config lock {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("locking MCP config target {}", target.display()))?;
+    Ok(lock)
+}
+
+fn unlock_config_target<T>(lock: std::fs::File, result: Result<T>) -> Result<T> {
+    let unlock = fs4::fs_std::FileExt::unlock(&lock).context("unlocking MCP config target");
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 fn canonical_config_target(path: &Path, create_parent: bool) -> Result<PathBuf> {
@@ -2104,7 +2154,7 @@ impl McpManager {
     /// Drop every cached connection for a worktree (killing their child
     /// processes). Called when a session is deleted so its MCP servers don't
     /// leak for the lifetime of the process.
-    pub async fn evict_worktree(&self, worktree: &Path) {
+    pub async fn evict_worktree(&self, worktree: &Path) -> Result<()> {
         let prefix = worktree.to_string_lossy().to_string();
         let (quarantined, cleanups) = {
             let mut state = self.connections.lock().await;
@@ -2144,26 +2194,31 @@ impl McpManager {
                 .collect::<Vec<_>>();
             (quarantined, cleanups)
         };
+        let mut failures = Vec::new();
         for (key, connection) in quarantined {
             if let Err(error) = self.terminate_cached_entry(&key, &connection).await {
-                tracing::warn!(
-                    "retaining quarantined MCP connection after worktree eviction cleanup failed: {error:#}"
-                );
+                failures.push(format!("{}: {error:#}", key.1));
             }
         }
         for (key, cleanup) in cleanups {
             if let Err(error) = wait_for_managed_cleanup(&self.connections, &key, cleanup).await {
-                tracing::warn!(
-                    "MCP worktree eviction could not acknowledge in-flight cleanup: {error:#}"
-                );
+                failures.push(format!("{}: {error:#}", key.1));
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "MCP worktree eviction cleanup was not acknowledged: {}",
+                failures.join("; ")
+            ))
         }
     }
 
     /// Invalidate one named server across every worktree. Entries become
     /// non-reusable under the state lock and are removed only after complete
     /// process-tree cleanup is acknowledged.
-    pub async fn evict_server(&self, server: &str) {
+    pub async fn evict_server(&self, server: &str) -> Result<()> {
         let (quarantined, cleanups) = {
             let mut state = self.connections.lock().await;
             // Advance even when this server has no cached state. A caller may
@@ -2204,19 +2259,24 @@ impl McpManager {
                 .collect::<Vec<_>>();
             (quarantined, cleanups)
         };
+        let mut failures = Vec::new();
         for (key, connection) in quarantined {
             if let Err(error) = self.terminate_cached_entry(&key, &connection).await {
-                tracing::warn!(
-                    "retaining quarantined MCP connection after server eviction cleanup failed: {error:#}"
-                );
+                failures.push(format!("{}: {error:#}", key.0));
             }
         }
         for (key, cleanup) in cleanups {
             if let Err(error) = wait_for_managed_cleanup(&self.connections, &key, cleanup).await {
-                tracing::warn!(
-                    "MCP server eviction could not acknowledge in-flight cleanup: {error:#}"
-                );
+                failures.push(format!("{}: {error:#}", key.0));
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "MCP server eviction cleanup was not acknowledged: {}",
+                failures.join("; ")
+            ))
         }
     }
 
@@ -2607,7 +2667,7 @@ for line in sys.stdin:
         wait_for_test_marker(&paused, "paused old config read").await;
 
         remove_server(&config_path, "fake").unwrap();
-        manager.evict_server("fake").await;
+        manager.evict_server("fake").await.unwrap();
         std::fs::write(&release, b"release").unwrap();
 
         let error = connection
@@ -2654,14 +2714,14 @@ for line in sys.stdin:
         wait_for_test_marker(&paused, "paused old config read").await;
 
         upsert_server(&config_path, "fake", &new_config).unwrap();
-        manager.evict_server("fake").await;
+        manager.evict_server("fake").await.unwrap();
         std::fs::write(&release, b"release").unwrap();
 
         let connected = connection.await.unwrap().unwrap();
         wait_for_test_marker(&new_started, "replacement MCP process").await;
         assert_eq!(connected.config, new_config);
         assert!(!old_started.exists(), "stale replaced command was spawned");
-        manager.evict_worktree(tmp.path()).await;
+        manager.evict_worktree(tmp.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -2696,7 +2756,7 @@ for line in sys.stdin:
         wait_for_test_marker(&paused, "paused stale catalog read").await;
 
         remove_server(&config_path, "fake").unwrap();
-        manager.evict_server("fake").await;
+        manager.evict_server("fake").await.unwrap();
         manager
             .reconcile_effective_connections(Some(config_dir.path()), None, tmp.path())
             .await;
@@ -2748,7 +2808,7 @@ for line in sys.stdin:
         wait_for_test_marker(&paused, "paused stale catalog read").await;
 
         upsert_server(&config_path, "fake", &new_config).unwrap();
-        manager.evict_server("fake").await;
+        manager.evict_server("fake").await.unwrap();
         manager
             .reconcile_effective_connections(Some(config_dir.path()), None, tmp.path())
             .await;
@@ -2768,7 +2828,7 @@ for line in sys.stdin:
             Some(&BTreeMap::from([("fake".into(), new_config)])),
             "stale catalog replaced the newer config snapshot"
         );
-        manager.evict_worktree(tmp.path()).await;
+        manager.evict_worktree(tmp.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -3158,6 +3218,89 @@ for line in sys.stdin:
         assert_eq!(doc["mcpServers"]["held"]["command"], "held-mcp");
         assert_eq!(doc["mcpServers"]["added"]["command"], "added-mcp");
         assert!(doc["mcpServers"].get("obsolete").is_none());
+    }
+
+    #[test]
+    fn mcp_config_process_helper() {
+        let Ok(mode) = std::env::var(TEST_CONFIG_PROCESS_MODE_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os(TEST_CONFIG_PROCESS_PATH_ENV).unwrap());
+        match mode.as_str() {
+            "hold" => {
+                let marker =
+                    PathBuf::from(std::env::var_os(TEST_CONFIG_PROCESS_MARKER_ENV).unwrap());
+                let release =
+                    PathBuf::from(std::env::var_os(TEST_CONFIG_PROCESS_RELEASE_ENV).unwrap());
+                edit_file(&path, true, |servers| {
+                    servers.insert("first".into(), json!({"command": "first-mcp"}));
+                    std::fs::write(&marker, b"locked").unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !release.exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "parent never released held config mutation"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                })
+                .unwrap();
+            }
+            "upsert" => upsert_server(&path, "second", &test_server_config("second-mcp")).unwrap(),
+            other => panic!("unknown config-process helper mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn independent_process_mutations_do_not_lose_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        let marker = tmp.path().join("first.locked");
+        let release = tmp.path().join("first.release");
+        let test_binary = std::env::current_exe().unwrap();
+        let spawn_helper = |mode: &str| {
+            let mut command = std::process::Command::new(&test_binary);
+            command
+                .arg("--exact")
+                .arg("mcp::tests::mcp_config_process_helper")
+                .arg("--nocapture")
+                .env(TEST_CONFIG_PROCESS_MODE_ENV, mode)
+                .env(TEST_CONFIG_PROCESS_PATH_ENV, &path)
+                .env(TEST_CONFIG_PROCESS_MARKER_ENV, &marker)
+                .env(TEST_CONFIG_PROCESS_RELEASE_ENV, &release)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.spawn().unwrap()
+        };
+
+        let mut first = spawn_helper("hold");
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < marker_deadline,
+                "first process never entered its locked mutation"
+            );
+            assert!(
+                first.try_wait().unwrap().is_none(),
+                "first config process exited before publishing its lock marker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut second = spawn_helper("upsert");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second process bypassed the first process's config lock"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        let servers = read_servers(&path);
+        assert_eq!(servers["first"].command, "first-mcp");
+        assert_eq!(servers["second"].command, "second-mcp");
     }
 
     #[cfg(unix)]
@@ -3787,6 +3930,73 @@ for line in sys.stdin:
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn server_eviction_attempts_every_connection_and_aggregates_cleanup_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree_a = tempfile::tempdir().unwrap();
+        let worktree_b = tempfile::tempdir().unwrap();
+        let script = root.path().join("aggregate_eviction.py");
+        let started_a = root.path().join("a.started");
+        let started_b = root.path().join("b.started");
+        std::fs::write(&script, CONFIG_RACE_TEST_SERVER).unwrap();
+        let manager = McpManager::default();
+        let first = manager
+            .connection_with_config(
+                worktree_a.path(),
+                "shared",
+                &config_race_test_config(&script, &started_a, None),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .connection_with_config(
+                worktree_b.path(),
+                "shared",
+                &config_race_test_config(&script, &started_b, None),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        first
+            .connection
+            .injected_terminate_failure
+            .store(true, Ordering::Relaxed);
+        second
+            .connection
+            .injected_terminate_failure
+            .store(true, Ordering::Relaxed);
+
+        let error = manager
+            .evict_server("shared")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&worktree_a.path().to_string_lossy().to_string()),
+            "first connection cleanup was not attempted: {error}"
+        );
+        assert!(
+            error.contains(&worktree_b.path().to_string_lossy().to_string()),
+            "second connection cleanup was not attempted: {error}"
+        );
+        let state = manager.connections.lock().await;
+        assert!(state.entries.values().all(|entry| !entry.reusable));
+        drop(state);
+
+        first
+            .connection
+            .injected_terminate_failure
+            .store(false, Ordering::Relaxed);
+        second
+            .connection
+            .injected_terminate_failure
+            .store(false, Ordering::Relaxed);
+        manager.evict_server("shared").await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn failed_call_cleanup_denies_reconnect_until_cleanup_can_be_retried() {
         let script = r#"
 import json, os, sys
@@ -3912,7 +4122,7 @@ for line in sys.stdin:
             2,
             "cleanup recovery did not reconnect exactly once"
         );
-        manager.evict_worktree(tmp.path()).await;
+        manager.evict_worktree(tmp.path()).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -4439,7 +4649,7 @@ for line in sys.stdin:
             manager.logs.health("single-flight", &config),
             Some(("error".into(), "installed connection failed".into()))
         );
-        manager.evict_worktree(tmp.path()).await;
+        manager.evict_worktree(tmp.path()).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -4526,7 +4736,7 @@ for line in sys.stdin:
                 .count(),
             1
         );
-        manager.evict_worktree(tmp.path()).await;
+        manager.evict_worktree(tmp.path()).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -4691,7 +4901,7 @@ for line in sys.stdin:
         assert!(!overlap_path.exists());
 
         std::fs::write(&cleanup_release, b"release").unwrap();
-        eviction.await.unwrap();
+        eviction.await.unwrap().unwrap();
         assert!(first.await.unwrap().is_err());
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), reconnect)
             .await
@@ -4992,7 +5202,7 @@ for line in sys.stdin:
             1,
             "a queued failure replaced the active cached connection"
         );
-        manager.evict_worktree(&worktree).await;
+        manager.evict_worktree(&worktree).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -5140,7 +5350,7 @@ for line in sys.stdin:
             1,
             "a JSON-RPC application error evicted the healthy cached process"
         );
-        manager.evict_worktree(&worktree).await;
+        manager.evict_worktree(&worktree).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -5246,7 +5456,7 @@ for line in sys.stdin:
             2,
             "malformed framing did not replace the dirty cached process"
         );
-        manager.evict_worktree(worktree).await;
+        manager.evict_worktree(worktree).await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -5400,10 +5610,10 @@ for _line in sys.stdin:
         let pid_a = wait_for_pid(&pid_a_path).await;
         let pid_b = wait_for_pid(&pid_b_path).await;
 
-        manager.evict_server("shared").await;
+        manager.evict_server("shared").await.unwrap();
         assert!(attempt_a.await.unwrap().is_err());
         assert!(attempt_b.await.unwrap().is_err());
         assert_processes_exit(&[pid_a, pid_b]).await;
-        manager.evict_server("shared").await;
+        manager.evict_server("shared").await.unwrap();
     }
 }

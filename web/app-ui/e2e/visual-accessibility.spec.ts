@@ -119,5 +119,11 @@ test("forced colors, reduced motion, and enlarged text retain usable structure",
 
   await expect(page.locator(".gallery-theme").first()).toHaveScreenshot(
     "gallery-forced-colors-200-percent.png",
+    {
+      // Chromium delegates forced-color glyph rasterization to the Linux
+      // runner even after the test font is fixed. Preserve a tight structural
+      // comparison while allowing the observed cross-runner edge-pixel drift.
+      maxDiffPixelRatio: 0.015,
+    },
   );
 });

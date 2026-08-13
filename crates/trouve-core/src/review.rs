@@ -3302,8 +3302,10 @@ impl Engine {
             let loaded = Arc::new(
                 self.executor
                     .review_repository_diff(&ReviewRepositoryDiff {
+                        managed_root: self.data_dir.join("worktrees"),
                         worktree: session.worktree_path.clone().into(),
                         base_sha: job.review_base_sha.clone(),
+                        cancel: superseded.clone(),
                     })
                     .await
                     .map_err(|error| anyhow!(error))?,
@@ -4398,7 +4400,11 @@ impl Engine {
                     coalesce_observed_stage = false;
                 }
                 Event::QuestionRequested { request_id, .. } => {
-                    let _ = self.resolve_question(&request_id, None);
+                    // Automated review turns have no interactive user. Resolve
+                    // against the owning disposable thread so the provider is
+                    // unblocked without allowing a colliding request id from a
+                    // different thread to be consumed.
+                    let _ = self.resolve_question(thread_id, &request_id, None);
                 }
                 Event::TurnCompleted {
                     turn: event_turn,

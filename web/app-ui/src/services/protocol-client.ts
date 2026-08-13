@@ -94,6 +94,8 @@ export type ProtocolRelativeRestoreDirection = Exclude<
 export type ProtocolDirEntry = ProtocolComponents["schemas"]["DirEntry"];
 export type ProtocolFileContent = ProtocolComponents["schemas"]["FileContent"];
 export type ProtocolTerminalInfo = ProtocolComponents["schemas"]["TerminalInfo"];
+export type ProtocolTerminalReplayStart =
+  ProtocolComponents["schemas"]["TerminalReplayStart"];
 export type ProtocolServerInfo = ProtocolComponents["schemas"]["ServerInfo"];
 export type ProtocolServerProjection =
   ProtocolComponents["schemas"]["ServerProjection"];
@@ -419,7 +421,7 @@ export class ProtocolClientError extends Error {
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "4.0";
+export const SUPPORTED_PROTOCOL_VERSION = "5.0";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {

@@ -498,14 +498,11 @@ impl AgentBackend for CursorBackend {
             // ACP image content blocks carry base64 data inline.
             let mut prompt_blocks = vec![json!({ "type": "text", "text": text })];
             for att in &turn.attachments {
-                match att.read_base64() {
-                    Ok(data) => prompt_blocks.push(json!({
-                        "type": "image",
-                        "mimeType": att.mime,
-                        "data": data,
-                    })),
-                    Err(e) => tracing::warn!("skipping attachment {}: {e}", att.name),
-                }
+                prompt_blocks.push(json!({
+                    "type": "image",
+                    "mimeType": att.mime,
+                    "data": att.base64(),
+                }));
             }
 
             // Subscribe after session setup so a session/load's history

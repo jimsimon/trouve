@@ -547,6 +547,56 @@ describe("ProtocolIngress", () => {
     ingress.stop();
   });
 
+  it("does not resurrect a tombstone from in-flight metadata and summary snapshots", async () => {
+    const store = new AppStore();
+    const staleSessions = deferred<Sessions>();
+    let sessionRequest = 0;
+    const sessions = vi.fn(() => {
+      sessionRequest += 1;
+      return sessionRequest === 1
+        ? Promise.resolve([session("Initial")])
+        : staleSessions.promise;
+    });
+    let eventOptions: ServerEventOptions | undefined;
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions,
+      sessionSummaries: vi.fn(async () => ({ summaries: [summary], cursor: 20 })),
+      workspaces: vi.fn(async () => [workspace]),
+      serverEvents: vi.fn(async (options: ServerEventOptions) => {
+        eventOptions = options;
+        return stream();
+      }),
+    };
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+    );
+    await ingress.start();
+
+    const refresh = ingress.refreshProjection();
+    await vi.waitFor(() => expect(sessions).toHaveBeenCalledTimes(2));
+    eventOptions?.onEvent({
+      kind: "known",
+      cursor: 21,
+      envelope: {
+        cursor: 21,
+        scope: "server",
+        ts: "2026-08-01T12:02:21Z",
+        type: "session.deleted",
+        session_id: "se_1",
+        workspace_id: "ws_1",
+      },
+    });
+    staleSessions.resolve([session("Stale in-flight metadata")]);
+    await refresh;
+
+    expect(store.isSessionTombstoned("se_1")).toBe(true);
+    expect(store.session("se_1")).toBeUndefined();
+    expect(readSignal(store.sessions)).toEqual([]);
+    ingress.stop();
+  });
+
   it("reconciles missed idle activity without a full projection refresh", async () => {
     const store = new AppStore();
     const activeSummary = { ...summary, active: true, outcome: "running" as const };
@@ -634,6 +684,51 @@ describe("ProtocolIngress", () => {
         expect.objectContaining({ id: "th_child", spawned: true }),
       ]);
     });
+    ingress.stop();
+  });
+
+  it("does not resurrect deleted-session threads from an in-flight refresh", async () => {
+    const store = new AppStore();
+    const staleThreads = deferred<Threads>();
+    const threads = vi.fn(() => staleThreads.promise);
+    let eventOptions: ServerEventOptions | undefined;
+    const protocol = {
+      serverInfo: vi.fn(async () => info),
+      sessions: vi.fn(async () => [session("Current")]),
+      sessionSummaries: vi.fn(async () => ({ summaries: [summary], cursor: 10 })),
+      workspaces: vi.fn(async () => [workspace]),
+      threads,
+      serverEvents: vi.fn(async (options: ServerEventOptions) => {
+        eventOptions = options;
+        return stream();
+      }),
+    };
+    const ingress = new ProtocolIngress(
+      protocol as unknown as ProtocolClient,
+      store,
+    );
+    await ingress.start();
+
+    eventOptions?.onEvent(threadLifecycleEvent(11, "thread.created", "th_stale"));
+    await vi.waitFor(() => expect(threads).toHaveBeenCalledOnce());
+    eventOptions?.onEvent({
+      kind: "known",
+      cursor: 12,
+      envelope: {
+        cursor: 12,
+        scope: "server",
+        ts: "2026-08-01T12:02:12Z",
+        type: "session.deleted",
+        session_id: "se_1",
+        workspace_id: "ws_1",
+      },
+    });
+    staleThreads.resolve([thread("th_stale", false)]);
+    await staleThreads.promise;
+    await Promise.resolve();
+
+    expect(store.threadsForSession("se_1")).toEqual([]);
+    expect(readSignal(store.sessions)).toEqual([]);
     ingress.stop();
   });
 

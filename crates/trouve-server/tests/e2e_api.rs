@@ -2240,7 +2240,13 @@ impl trouve_agents::AgentBackend for SteerableBackend {
             steer
                 .attachments
                 .into_iter()
-                .map(|attachment| attachment.path.display().to_string())
+                .map(|attachment| {
+                    attachment
+                        .local_path
+                        .expect("steered attachment has a verified local path")
+                        .display()
+                        .to_string()
+                })
                 .collect(),
         ));
         let release =
@@ -4190,6 +4196,75 @@ async fn terminal_shell_in_session_worktree() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+
+    // An already-exited terminal still announces the absolute replay start,
+    // replays its retained bytes, and only then emits `exit`. The marker has
+    // no id so legacy EventSource clients keep their last output-event id.
+    let resp = client
+        .post(format!("{base}/terminals/{term_id}/input"))
+        .json(&serde_json::json!({
+            "data": b64.encode("printf 'replay-exit'; exit\r")
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let mut terminal_exited = false;
+    for _ in 0..100 {
+        let terminals: Vec<serde_json::Value> = client
+            .get(format!("{base}/sessions/{session_id}/terminals"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        terminal_exited = terminals[0]["exited"] == true;
+        if terminal_exited {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(terminal_exited, "terminal did not exit in time");
+
+    let replay = tokio::time::timeout(Duration::from_secs(10), async {
+        client
+            .get(&out_url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("timed out reading exited terminal replay");
+    let replay = replay.replace("\r\n", "\n");
+    let events: Vec<_> = replay
+        .split("\n\n")
+        .filter(|event| !event.trim().is_empty())
+        .collect();
+    let first = events.first().expect("replay-start event");
+    assert!(first.lines().any(|line| line == "event: replay-start"));
+    assert!(first.lines().any(|line| line == "data: {\"offset\":0}"));
+    assert!(!first.lines().any(|line| line.starts_with("id:")));
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.lines().any(|line| line == "event: exit"))
+    );
+    let replayed: Vec<u8> = events
+        .iter()
+        .skip(1)
+        .flat_map(|event| {
+            event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|data| b64.decode(data.trim()).ok())
+                .flatten()
+        })
+        .collect();
+    assert!(String::from_utf8_lossy(&replayed).contains("replay-exit"));
 
     // Kill; input to a dead terminal 404s, and reopening spawns a new one.
     let resp = client

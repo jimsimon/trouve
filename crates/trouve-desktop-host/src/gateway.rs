@@ -242,13 +242,30 @@ struct GatewayState {
     capabilities: HostCapabilities,
     font_families: Arc<[String]>,
     preferences: Arc<tokio::sync::Mutex<HostPreferences>>,
+    /// Snapshot last presented to this gateway's web client. Incoming PUTs
+    /// are full snapshots, so this baseline identifies which top-level fields
+    /// the client actually changed before merging with another process.
+    preference_baseline: Arc<tokio::sync::Mutex<HostPreferences>>,
     preference_path: Option<Arc<PathBuf>>,
     csrf_token: Arc<str>,
     protocol_upstream: Option<Url>,
+    protocol_upstream_ownership: ProtocolUpstreamOwnership,
     http: reqwest::Client,
     native_actions: HostNativeActions,
     native_picker_permit: Arc<tokio::sync::Semaphore>,
     clipboard_image_permit: Arc<tokio::sync::Semaphore>,
+}
+
+/// Whether a configured protocol upstream is owned by this desktop app.
+///
+/// Only an app-owned embedded/elected server is known to share the desktop
+/// host's filesystem namespace. Every URL supplied by a user or launcher is
+/// explicit, including loopback URLs that may terminate a tunnel or container
+/// port-forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolUpstreamOwnership {
+    Explicit,
+    AppOwned,
 }
 
 /// Same-origin loopback gateway for packaged frontend assets, a narrow native
@@ -279,15 +296,18 @@ impl HostPreferencesHandle {
         geometry: crate::WindowGeometry,
     ) -> Result<(), HostGatewayError> {
         let mut current = self.preferences.lock().await;
-        let mut next = current.clone();
-        next.geometry = Some(geometry);
+        let baseline = current.clone();
+        let geometry = Some(geometry);
+        let mut next = baseline.clone();
+        next.geometry = geometry.clone();
         validate_preferences(&next)?;
         if let Some(path) = self.preference_path.clone() {
-            let persisted = next.clone();
-            tokio::task::spawn_blocking(move || persist_preferences(&path, &persisted))
-                .await
-                .map_err(|error| HostGatewayError::PreferencesIo(error.to_string()))?
-                .map_err(|error| HostGatewayError::PreferencesIo(error.to_string()))?;
+            next = tokio::task::spawn_blocking(move || {
+                merge_and_persist_preferences(&path, &baseline, &next, true)
+            })
+            .await
+            .map_err(|error| HostGatewayError::PreferencesIo(error.to_string()))?
+            .map_err(|error| HostGatewayError::PreferencesIo(error.to_string()))?;
         }
         *current = next;
         Ok(())
@@ -334,10 +354,12 @@ impl HostGateway {
                 frontend: Arc::new(frontend.into()),
                 capabilities,
                 font_families: system_font_families(),
-                preferences: Arc::new(tokio::sync::Mutex::new(preferences)),
+                preferences: Arc::new(tokio::sync::Mutex::new(preferences.clone())),
+                preference_baseline: Arc::new(tokio::sync::Mutex::new(preferences)),
                 preference_path: None,
                 csrf_token: fresh_token().into(),
                 protocol_upstream: None,
+                protocol_upstream_ownership: ProtocolUpstreamOwnership::AppOwned,
                 http,
                 native_actions: HostNativeActions::default(),
                 native_picker_permit: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -376,14 +398,12 @@ impl HostGateway {
         self.state.capabilities.sleep_inhibition = self.state.native_actions.can_inhibit_sleep();
         self.state.capabilities.visibility = self.state.native_actions.can_report_visibility();
         self.state.capabilities.occlusion = self.state.native_actions.can_report_occlusion();
-        // A path chosen on this device is meaningful only to a server on this
-        // device. Fail closed for HTTPS remote deployments and retain their
-        // manual server-host path form.
-        let picker_targets_local_server = self
-            .state
-            .protocol_upstream
-            .as_ref()
-            .is_none_or(protocol_upstream_is_loopback);
+        // Only the app-owned embedded/elected server is known to share this
+        // process's filesystem namespace. An explicit upstream can be a
+        // loopback tunnel or container port-forward, so fail closed for every
+        // configured URL and retain the manual server-host path form.
+        let picker_targets_local_server = self.state.protocol_upstream.is_none()
+            || self.state.protocol_upstream_ownership == ProtocolUpstreamOwnership::AppOwned;
         self.state.capabilities.directory_picker =
             picker_targets_local_server && self.state.native_actions.can_pick_directory();
         let local_file_actions =
@@ -392,7 +412,15 @@ impl HostGateway {
         self.state.capabilities.reveal_local_file = local_file_actions;
     }
 
-    pub fn with_protocol_upstream(mut self, upstream: &str) -> Result<Self, HostGatewayError> {
+    pub fn with_protocol_upstream(self, upstream: &str) -> Result<Self, HostGatewayError> {
+        self.with_protocol_upstream_ownership(upstream, ProtocolUpstreamOwnership::Explicit)
+    }
+
+    fn with_protocol_upstream_ownership(
+        mut self,
+        upstream: &str,
+        ownership: ProtocolUpstreamOwnership,
+    ) -> Result<Self, HostGatewayError> {
         let url = Url::parse(upstream)
             .map_err(|error| HostValidationError::InvalidUrl(error.to_string()))?;
         if !matches!(url.scheme(), "http" | "https")
@@ -418,6 +446,7 @@ impl HostGateway {
             .into());
         }
         self.state.protocol_upstream = Some(url);
+        self.state.protocol_upstream_ownership = ownership;
         self.refresh_native_capabilities();
         Ok(self)
     }
@@ -525,6 +554,41 @@ impl HostGateway {
         ),
         HostGatewayBindError,
     > {
+        Self::bind_loopback_with_protocol_ownership_and_preferences(
+            address,
+            frontend,
+            capabilities,
+            preferences,
+            protocol_upstream,
+            ProtocolUpstreamOwnership::Explicit,
+            preference_path,
+            native_actions,
+        )
+        .await
+    }
+
+    /// Variant for hosts that must distinguish an app-owned embedded/elected
+    /// server from an explicitly configured URL. `AppOwned` is valid only when
+    /// the desktop app itself bound or elected the server and therefore knows
+    /// that session worktree paths refer to the same filesystem namespace.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_loopback_with_protocol_ownership_and_preferences(
+        address: std::net::SocketAddr,
+        frontend: impl Into<FrontendSource>,
+        capabilities: HostCapabilities,
+        preferences: HostPreferences,
+        protocol_upstream: Option<&str>,
+        protocol_upstream_ownership: ProtocolUpstreamOwnership,
+        preference_path: Option<PathBuf>,
+        native_actions: HostNativeActions,
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            impl std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+            HostPreferencesHandle,
+        ),
+        HostGatewayBindError,
+    > {
         if !address.ip().is_loopback() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -546,7 +610,8 @@ impl HostGateway {
             .with_native_actions(native_actions);
         gateway.state.preference_path = preference_path.map(Arc::new);
         if let Some(upstream) = protocol_upstream {
-            gateway = gateway.with_protocol_upstream(upstream)?;
+            gateway =
+                gateway.with_protocol_upstream_ownership(upstream, protocol_upstream_ownership)?;
         }
         let preference_handle = HostPreferencesHandle {
             preferences: gateway.state.preferences.clone(),
@@ -557,15 +622,6 @@ impl HostGateway {
             async move { axum::serve(listener, gateway.router()).await },
             preference_handle,
         ))
-    }
-}
-
-fn protocol_upstream_is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
     }
 }
 
@@ -639,6 +695,7 @@ async fn get_preferences(
 ) -> Result<Response, GatewayRejection> {
     validate_read(&state, &headers)?;
     let preferences = state.preferences.lock().await.clone();
+    *state.preference_baseline.lock().await = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
         .headers_mut()
@@ -667,18 +724,25 @@ async fn put_preferences(
     // operation. Concurrent resize/theme writes can no longer complete out
     // of order or leave disk and memory on different versions.
     let mut current = state.preferences.lock().await;
+    let mut baseline = state.preference_baseline.lock().await;
     // Geometry is owned by the native window adapter. A web-client PUT is a
     // snapshot replacement for web-owned fields, so preserve a resize that
     // happened after the client read that snapshot.
     preferences.geometry = current.geometry.clone();
     validate_preferences(&preferences).map_err(|_| GatewayRejection::InvalidPreferences)?;
     if let Some(path) = state.preference_path.clone() {
-        let persisted = preferences.clone();
-        tokio::task::spawn_blocking(move || persist_preferences(&path, &persisted))
-            .await
-            .map_err(|_| GatewayRejection::Internal)?
-            .map_err(|_| GatewayRejection::Internal)?;
+        let client_baseline = baseline.clone();
+        let incoming = preferences.clone();
+        preferences = tokio::task::spawn_blocking(move || {
+            merge_and_persist_preferences(&path, &client_baseline, &incoming, false)
+        })
+        .await
+        .map_err(|_| GatewayRejection::Internal)?
+        .map_err(|_| GatewayRejection::Internal)?;
     }
+    // Advance this client's baseline to what it submitted, while serving the
+    // merged snapshot so the frontend immediately learns concurrent changes.
+    *baseline = preferences.clone();
     *current = preferences.clone();
     let mut response = Json(preferences).into_response();
     response
@@ -1205,6 +1269,125 @@ fn load_preferences(
     Ok(preferences)
 }
 
+fn merge_and_persist_preferences(
+    path: &Path,
+    baseline: &HostPreferences,
+    incoming: &HostPreferences,
+    include_geometry: bool,
+) -> std::io::Result<HostPreferences> {
+    use fs4::fs_std::FileExt as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preference path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let lock_path = parent.join(format!(
+        ".{}.lock",
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("preferences")
+    ));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = (|| {
+        let latest = load_preferences(path, baseline.clone()).map_err(std::io::Error::other)?;
+        let merged = merge_preference_changes(&latest, baseline, incoming, include_geometry);
+        validate_preferences(&merged).map_err(std::io::Error::other)?;
+        persist_preferences(path, &merged)?;
+        Ok(merged)
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(preferences), Ok(())) => Ok(preferences),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn merge_preference_changes(
+    latest: &HostPreferences,
+    baseline: &HostPreferences,
+    incoming: &HostPreferences,
+    include_geometry: bool,
+) -> HostPreferences {
+    let mut merged = latest.clone();
+    if include_geometry && incoming.geometry != baseline.geometry {
+        merged.geometry = incoming.geometry.clone();
+    }
+    macro_rules! merge_leaf {
+        ($($field:ident).+) => {
+            if incoming.$($field).+ != baseline.$($field).+ {
+                merged.$($field).+ = incoming.$($field).+.clone();
+            }
+        };
+    }
+    merge_leaf!(appearance.theme);
+    merge_leaf!(appearance.font_family);
+    merge_leaf!(appearance.font_size);
+    merge_leaf!(appearance.reduce_motion);
+    merge_leaf!(general.prevent_sleep_while_running);
+    merge_leaf!(chat.collapse_sequential_tool_calls);
+    merge_leaf!(chat.collapse_thinking_with_tools);
+    merge_leaf!(chat.collapse_compaction_with_tools);
+    merge_leaf!(chat.collapse_todo_updates_with_tools);
+    merge_leaf!(notifications.enabled);
+    merge_leaf!(notifications.on_finish);
+    merge_leaf!(notifications.on_fail);
+    merge_leaf!(notifications.on_attention);
+    merge_leaf!(notifications.sound);
+    merge_leaf!(workspace_order);
+    merge_leaf!(pull_request_group_order);
+    merge_leaf!(resume.selected_session_id);
+    merged.resume.session_threads = merge_preference_map_changes(
+        &latest.resume.session_threads,
+        &baseline.resume.session_threads,
+        &incoming.resume.session_threads,
+    );
+    merged.resume.thread_scroll = merge_preference_map_changes(
+        &latest.resume.thread_scroll,
+        &baseline.resume.thread_scroll,
+        &incoming.resume.thread_scroll,
+    );
+    merge_leaf!(resume.closed_thread_tabs);
+    merge_leaf!(resume.pinned_thread_tabs);
+    merge_leaf!(navigation_width);
+    merge_leaf!(inspection_width);
+    merged
+}
+
+fn merge_preference_map_changes<K, V>(
+    latest: &std::collections::BTreeMap<K, V>,
+    baseline: &std::collections::BTreeMap<K, V>,
+    incoming: &std::collections::BTreeMap<K, V>,
+) -> std::collections::BTreeMap<K, V>
+where
+    K: Ord + Clone,
+    V: PartialEq + Clone,
+{
+    let mut merged = latest.clone();
+    for key in baseline.keys().chain(incoming.keys()) {
+        if incoming.get(key) == baseline.get(key) {
+            continue;
+        }
+        match incoming.get(key) {
+            Some(value) => {
+                merged.insert(key.clone(), value.clone());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+    merged
+}
+
 fn persist_preferences(path: &Path, preferences: &HostPreferences) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -1234,12 +1417,26 @@ fn persist_preferences(path: &Path, preferences: &HostPreferences) -> std::io::R
         file.write_all(b"\n")?;
         file.sync_all()?;
         replace_file(&temporary, path)?;
+        sync_preference_parent(parent)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_preference_parent(parent: &Path) -> std::io::Result<()> {
+    // The file contents are durable before rename; syncing the directory
+    // makes the replacement itself durable across a crash or power loss.
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_preference_parent(_parent: &Path) -> std::io::Result<()> {
+    // Windows replacement requests MOVEFILE_WRITE_THROUGH below.
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -2577,7 +2774,7 @@ mod tests {
         let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
         assert!(!bootstrap.capabilities.directory_picker);
 
-        let local = gateway()
+        let explicit_loopback = gateway()
             .with_native_actions(
                 HostNativeActions::default().with_directory_picker(|| async {
                     Ok(Some(PathBuf::from("/srv/repos/local")))
@@ -2586,7 +2783,7 @@ mod tests {
             .with_protocol_upstream("http://localhost:7433")
             .unwrap()
             .router();
-        let bootstrap_response = local
+        let bootstrap_response = explicit_loopback
             .oneshot(
                 Request::builder()
                     .uri(CAPABILITIES_PATH)
@@ -2597,7 +2794,7 @@ mod tests {
             .await
             .unwrap();
         let bootstrap: HostBootstrap = response_json(bootstrap_response).await;
-        assert!(bootstrap.capabilities.directory_picker);
+        assert!(!bootstrap.capabilities.directory_picker);
     }
 
     #[tokio::test]
@@ -3063,7 +3260,7 @@ mod tests {
         assert_eq!(handled.lock().unwrap().len(), 1);
 
         let remote = gateway()
-            .with_native_actions(actions)
+            .with_native_actions(actions.clone())
             .with_protocol_upstream("https://server.example:7433")
             .unwrap()
             .router();
@@ -3085,6 +3282,39 @@ mod tests {
             .oneshot(json_action_request(
                 LOCAL_FILE_ACTION_PATH,
                 &remote_bootstrap.csrf_token,
+                LocalFileActionRequest {
+                    session_id: "se-active".into(),
+                    relative_path: "src/main.rs".into(),
+                    action: LocalFileAction::Open,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+
+        let explicit_loopback = gateway()
+            .with_native_actions(actions)
+            .with_protocol_upstream("http://localhost:7433")
+            .unwrap()
+            .router();
+        let loopback_bootstrap_response = explicit_loopback
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(CAPABILITIES_PATH)
+                    .header(HOST, "127.0.0.1:43127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let loopback_bootstrap: HostBootstrap = response_json(loopback_bootstrap_response).await;
+        assert!(!loopback_bootstrap.capabilities.open_local_file);
+        assert!(!loopback_bootstrap.capabilities.reveal_local_file);
+        let denied = explicit_loopback
+            .oneshot(json_action_request(
+                LOCAL_FILE_ACTION_PATH,
+                &loopback_bootstrap.csrf_token,
                 LocalFileActionRequest {
                     session_id: "se-active".into(),
                     relative_path: "src/main.rs".into(),
@@ -3427,6 +3657,200 @@ mod tests {
             load_preferences(&path, HostPreferences::default()).unwrap(),
             second
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_gateway_snapshots_merge_only_changed_fields() {
+        let path = temporary_preference_path("cross-process-merge");
+        let baseline = HostPreferences::default();
+        persist_preferences(&path, &baseline).unwrap();
+
+        let mut first = baseline.clone();
+        first.appearance.theme = "light".into();
+        first
+            .resume
+            .session_threads
+            .insert("se-first".into(), "th-first".into());
+        let first = merge_and_persist_preferences(&path, &baseline, &first, false).unwrap();
+        assert_eq!(first.appearance.theme, "light");
+
+        // A second gateway still has the original full snapshot, but changed
+        // only navigation width. Its write must retain the first process's
+        // theme rather than reverting it to the stale baseline value.
+        let mut second = baseline.clone();
+        second.navigation_width = 318.0;
+        second.appearance.font_size = 15;
+        second
+            .resume
+            .session_threads
+            .insert("se-second".into(), "th-second".into());
+        let second = merge_and_persist_preferences(&path, &baseline, &second, false).unwrap();
+        assert_eq!(second.appearance.theme, "light");
+        assert_eq!(second.appearance.font_size, 15);
+        assert_eq!(second.navigation_width, 318.0);
+        assert_eq!(
+            second.resume.session_threads,
+            [
+                ("se-first".into(), "th-first".into()),
+                ("se-second".into(), "th-second".into()),
+            ]
+            .into()
+        );
+        assert_eq!(
+            load_preferences(&path, HostPreferences::default()).unwrap(),
+            second
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn separate_gateways_merge_writes_from_stale_client_snapshots() {
+        let path = temporary_preference_path("two-gateway-merge");
+        let assets = || {
+            AssetManifest::new([(
+                "/index.html".into(),
+                asset("text/html", b"<html></html>", false),
+            )])
+            .unwrap()
+        };
+        let (first_address, first_server) = HostGateway::bind_loopback(
+            "127.0.0.1:0".parse().unwrap(),
+            assets(),
+            HostCapabilities::desktop(),
+            HostPreferences::default(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        let (second_address, second_server) = HostGateway::bind_loopback(
+            "127.0.0.1:0".parse().unwrap(),
+            assets(),
+            HostCapabilities::desktop(),
+            HostPreferences::default(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        let first_task = tokio::spawn(first_server);
+        let second_task = tokio::spawn(second_server);
+        let client = reqwest::Client::new();
+        let first_origin = format!("http://{first_address}");
+        let second_origin = format!("http://{second_address}");
+
+        let first_bootstrap: HostBootstrap = client
+            .get(format!("{first_origin}{CAPABILITIES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second_bootstrap: HostBootstrap = client
+            .get(format!("{second_origin}{CAPABILITIES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut first_snapshot: HostPreferences = client
+            .get(format!("{first_origin}{PREFERENCES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut second_snapshot: HostPreferences = client
+            .get(format!("{second_origin}{PREFERENCES_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        first_snapshot.appearance.theme = "light".into();
+        let first_response = client
+            .put(format!("{first_origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &first_origin)
+            .header(CSRF_HEADER, first_bootstrap.csrf_token)
+            .json(&first_snapshot)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        second_snapshot.navigation_width = 318.0;
+        // This edit is queued locally before the first response arrives, so
+        // it still lacks the other process's theme while including the first
+        // optimistic edit.
+        let mut queued_second_snapshot = second_snapshot.clone();
+        queued_second_snapshot.inspection_width = 512.0;
+        let second_response = client
+            .put(format!("{second_origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &second_origin)
+            .header(CSRF_HEADER, &second_bootstrap.csrf_token)
+            .json(&second_snapshot)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let merged: HostPreferences = second_response.json().await.unwrap();
+        assert_eq!(merged.appearance.theme, "light");
+        assert_eq!(merged.navigation_width, 318.0);
+
+        // HostClient rebases queued intent onto this merged response before
+        // sending it. Mirror that wire contract here; raw stale snapshots are
+        // indistinguishable from intentional reversions at the gateway.
+        queued_second_snapshot.appearance = merged.appearance.clone();
+        queued_second_snapshot.resume = merged.resume.clone();
+        let queued_response = client
+            .put(format!("{second_origin}{PREFERENCES_PATH}"))
+            .header(ORIGIN, &second_origin)
+            .header(CSRF_HEADER, &second_bootstrap.csrf_token)
+            .json(&queued_second_snapshot)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(queued_response.status(), StatusCode::OK);
+        let merged: HostPreferences = queued_response.json().await.unwrap();
+        assert_eq!(merged.appearance.theme, "light");
+        assert_eq!(merged.navigation_width, 318.0);
+        assert_eq!(merged.inspection_width, 512.0);
+        assert_eq!(
+            load_preferences(&path, HostPreferences::default()).unwrap(),
+            merged
+        );
+
+        first_task.abort();
+        second_task.abort();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn native_geometry_patch_preserves_external_web_preferences() {
+        let path = temporary_preference_path("cross-process-geometry");
+        let baseline = HostPreferences::default();
+        persist_preferences(&path, &baseline).unwrap();
+        let mut web = baseline.clone();
+        web.appearance.theme = "light".into();
+        merge_and_persist_preferences(&path, &baseline, &web, false).unwrap();
+
+        let mut native = baseline.clone();
+        native.geometry = Some(crate::WindowGeometry {
+            x: 40,
+            y: 60,
+            width: 1200,
+            height: 800,
+            maximized: false,
+        });
+        let merged = merge_and_persist_preferences(&path, &baseline, &native, true).unwrap();
+        assert_eq!(merged.appearance.theme, "light");
+        assert_eq!(merged.geometry, native.geometry);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

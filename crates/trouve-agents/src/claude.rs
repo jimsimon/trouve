@@ -409,17 +409,14 @@ impl AgentBackend for ClaudeBackend {
         // Anthropic-style base64 image blocks, alongside the text block.
         let mut content = vec![json!({ "type": "text", "text": prompt })];
         for att in &turn.attachments {
-            match att.read_base64() {
-                Ok(data) => content.push(json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": att.mime,
-                        "data": data,
-                    }
-                })),
-                Err(e) => tracing::warn!("skipping attachment {}: {e}", att.name),
-            }
+            content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": att.mime,
+                    "data": att.base64(),
+                }
+            }));
         }
 
         let stream = async_stream(move |tx| async move {

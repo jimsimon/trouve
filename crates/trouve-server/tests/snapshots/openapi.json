@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "4.0"
+    "version": "5.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -29,6 +29,16 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -2531,6 +2541,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }
@@ -2955,6 +2975,16 @@
             }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
             "description": "",
             "content": {
               "application/json": {
@@ -3967,7 +3997,7 @@
     "/v1/terminals/{id}/output": {
       "get": {
         "tags": [],
-        "summary": "PTY output as SSE: each event's `id` is the byte offset *after* the\nchunk, data is base64. `?after=` resumes from an offset (bytes older\nthan the retained backlog are silently skipped). A final `exit` event\nmarks shell exit. Ephemeral — not part of the persisted event log.",
+        "summary": "PTY output as SSE. A named, id-less `replay-start` event first announces\nthe absolute replay offset as JSON. Each following output event's `id` is\nthe byte offset *after* its base64 data. `?after=` resumes from an offset\n(bytes older than the retained backlog are skipped). A final `exit` event\nmarks shell exit. Ephemeral — not part of the persisted event log.",
         "operationId": "terminal_output",
         "parameters": [
           {
@@ -3992,7 +4022,7 @@
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of base64 output chunks"
+            "description": "SSE replay-start marker and base64 output chunks"
           },
           "404": {
             "description": "",
@@ -11112,6 +11142,7 @@
       "ResolveApprovalRequest": {
         "type": "object",
         "required": [
+          "thread_id",
           "call_id",
           "decision"
         ],
@@ -11121,6 +11152,10 @@
           },
           "decision": {
             "$ref": "#/components/schemas/ApprovalDecision"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String",
+            "description": "Owning thread for this vendor-local call id."
           }
         }
       },
@@ -11128,6 +11163,7 @@
         "type": "object",
         "description": "Answers for a pending `question.requested`. `answers: null` skips the\nquestions (the agent is told the user declined to answer).",
         "required": [
+          "thread_id",
           "request_id"
         ],
         "properties": {
@@ -11142,6 +11178,10 @@
           },
           "request_id": {
             "$ref": "#/components/schemas/String"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String",
+            "description": "Owning thread for this vendor-local request id."
           }
         }
       },
@@ -11864,6 +11904,20 @@
         "properties": {
           "data": {
             "type": "string"
+          }
+        }
+      },
+      "TerminalReplayStart": {
+        "type": "object",
+        "description": "Absolute byte offset at which a terminal output subscription begins.\n\nSent as JSON in the named, id-less `replay-start` SSE event before any\nreplayed or live base64 output chunks.",
+        "required": [
+          "offset"
+        ],
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

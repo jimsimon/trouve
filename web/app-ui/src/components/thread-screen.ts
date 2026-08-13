@@ -163,6 +163,7 @@ import {
   CheckpointActionScope,
   checkpointBoundaryAfterTurn,
   checkpointBoundaryBeforeTurn,
+  type CheckpointActionToken,
   type TurnCheckpointBoundary,
 } from "./turn-checkpoint-actions.js";
 import {
@@ -192,6 +193,13 @@ interface OptimisticPromptSubmission {
   turn?: number;
   durablePrompt?: QueuedPrompt;
   readonly queueRevision: QueueRevisionTracker;
+}
+
+interface NewThreadRequestToken {
+  readonly workspaceId: string;
+  readonly sessionId: string;
+  readonly initialThreadId: string;
+  createdThreadId?: string;
 }
 
 const CHAT_START_SPACER_ID = "ephemeral:chat-start-spacer";
@@ -369,6 +377,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #newThreadSetupOpen = false;
   #newThreadBusy = false;
   #newThreadError = "";
+  #newThreadRequest: NewThreadRequestToken | undefined;
   #accessibleHistory = false;
   #historyLoading = false;
   #historyError = "";
@@ -515,12 +524,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const composerScopeChanged = changed.has("sessionId") || changed.has("threadId");
     if (composerScopeChanged) this.#persistComposerDraftNow();
     if (changed.has("workspaceId")) {
+      this.#newThreadRequest = undefined;
       this.#workspaceProvider.setValue({ workspaceId: this.workspaceId });
       this.#optionCatalogKey = "";
       this.#modes = [];
       this.#observedSubscriptionUsageCursor = 0;
     }
     if (changed.has("sessionId")) {
+      this.#newThreadRequest = undefined;
       this.#threadSwitcherOpen = false;
       this.#threadSwitcherQuery = "";
       this.#threadSwitcherFilter = "all";
@@ -561,6 +572,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#usagePending = false;
     }
     if (changed.has("threadId")) {
+      const newThreadRequest = this.#newThreadRequest;
+      if (
+        newThreadRequest !== undefined
+        && this.threadId !== newThreadRequest.initialThreadId
+        && this.threadId !== newThreadRequest.createdThreadId
+      ) {
+        this.#newThreadRequest = undefined;
+      }
       this.#checkpointActions.reset();
       this.#checkpointErrorId = "";
       this.#checkpointError = "";
@@ -895,6 +914,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#turnRequestGeneration += 1;
     this.#attachmentGeneration += 1;
     this.#threadInteractionGeneration += 1;
+    this.#historyGeneration += 1;
+    this.#historyLoading = false;
+    this.#historyStatusVisible = false;
+    this.#pendingHistoryPrepend = undefined;
+    this.#newThreadRequest = undefined;
+    this.#newThreadBusy = false;
+    this.#checkpointActions.reset();
+    this.#queueBusy = "";
     this.#requestPending = false;
     this.#attachmentPending = false;
     this.#messageRequest = undefined;
@@ -2365,24 +2392,19 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       await services.protocol.restoreCheckpoint(boundary.checkpointId);
-      if (
-        this.sessionId !== sessionId
-        || this.threadId !== threadId
-        || !this.#checkpointActions.isCurrent(token)
-      ) return;
+      if (!this.#isCurrentCheckpointAction(sessionId, threadId, token)) return;
       globalThis.dispatchEvent(new CustomEvent("trouve-checkpoint-restored", {
         detail: { sessionId },
       }));
     } catch {
-      if (
-        this.sessionId !== sessionId
-        || this.threadId !== threadId
-        || !this.#checkpointActions.isCurrent(token)
-      ) return;
+      if (!this.#isCurrentCheckpointAction(sessionId, threadId, token)) return;
       this.#checkpointErrorId = boundary.checkpointId;
       this.#checkpointError = "Could not restore this checkpoint.";
     } finally {
-      if (this.#checkpointActions.finish(token)) this.requestUpdate();
+      if (
+        this.#isCurrentCheckpointAction(sessionId, threadId, token)
+        && this.#checkpointActions.finish(token)
+      ) this.requestUpdate();
     }
   }
 
@@ -2399,11 +2421,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       const fork = await services.protocol.forkCheckpoint(boundary.checkpointId);
-      if (
-        this.sessionId !== sessionId
-        || this.threadId !== threadId
-        || !this.#checkpointActions.isCurrent(token)
-      ) return;
+      if (!this.#isCurrentCheckpointAction(sessionId, threadId, token)) return;
       store.upsertSessionMetadata(fork.session);
       store.upsertThread(fork.thread);
       store.markSessionRead(fork.session.id);
@@ -2418,15 +2436,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : {}),
       });
     } catch {
-      if (
-        this.sessionId !== sessionId
-        || this.threadId !== threadId
-        || !this.#checkpointActions.isCurrent(token)
-      ) return;
+      if (!this.#isCurrentCheckpointAction(sessionId, threadId, token)) return;
       this.#checkpointErrorId = boundary.checkpointId;
       this.#checkpointError = "Could not fork this checkpoint.";
     } finally {
-      if (this.#checkpointActions.finish(token)) this.requestUpdate();
+      if (
+        this.#isCurrentCheckpointAction(sessionId, threadId, token)
+        && this.#checkpointActions.finish(token)
+      ) this.requestUpdate();
     }
   }
 
@@ -4085,6 +4102,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const store = this.#store.value;
     const services = this.#services.value;
     if (store === undefined || services === undefined) return;
+    const sessionId = this.sessionId;
+    if (sessionId === "" || store.isSessionTombstoned(sessionId)) return;
     const threadId = this.threadId;
     const generation = this.#historyGeneration;
     const initialView = store.threadView(threadId);
@@ -4101,7 +4120,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const view = store.threadView(threadId);
         if (!view.hasOlder || view.itemOffset === 0) break;
         const page = await services.protocol.threadView(threadId, view.itemOffset);
-        if (generation !== this.#historyGeneration || threadId !== this.threadId) return;
+        if (!this.#isCurrentHistoryRequest(sessionId, threadId, generation)) return;
         const virtualWindow = this.#virtualizer.window();
         const viewport = this.querySelector<HTMLElement>(".chat-stream");
         this.#pendingHistoryPrepend = {
@@ -4115,12 +4134,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
       } while (loadAll);
     } catch {
-      if (generation === this.#historyGeneration && threadId === this.threadId) {
+      if (this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
         this.#historyError = "Earlier messages could not be loaded.";
         this.#scheduleHistoryRetry();
       }
     } finally {
-      if (generation === this.#historyGeneration && threadId === this.threadId) {
+      if (this.#isCurrentHistoryRequest(sessionId, threadId, generation)) {
         this.#clearHistoryStatusTimer();
         this.#historyStatusVisible = false;
         this.#historyLoading = false;
@@ -5205,9 +5224,66 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #isCurrentThreadInteraction(threadId: string, generation: number): boolean {
+    return this.#threadInteractionGeneration === generation
+      && this.#isCurrentThreadScope(this.sessionId, threadId);
+  }
+
+  #isCurrentThreadScope(sessionId: string, threadId: string): boolean {
+    const services = this.#services.value;
+    const route = services === undefined ? undefined : readSignal(services.router.route);
     return this.isConnected
+      && this.sessionId === sessionId
       && this.threadId === threadId
-      && this.#threadInteractionGeneration === generation;
+      && this.#store.value?.isSessionTombstoned(sessionId) !== true
+      && route?.kind === "session"
+      && route.sessionId === sessionId
+      && (route.threadId ?? "") === threadId;
+  }
+
+  #isCurrentHistoryRequest(
+    sessionId: string,
+    threadId: string,
+    generation: number,
+  ): boolean {
+    return generation === this.#historyGeneration
+      && this.#isCurrentThreadScope(sessionId, threadId);
+  }
+
+  #isCurrentTurnRequest(
+    sessionId: string,
+    threadId: string,
+    generation: number,
+  ): boolean {
+    return generation === this.#turnRequestGeneration
+      && this.#isCurrentThreadScope(sessionId, threadId);
+  }
+
+  #isCurrentCheckpointAction(
+    sessionId: string,
+    threadId: string,
+    token: CheckpointActionToken,
+  ): boolean {
+    return this.#checkpointActions.isCurrent(token)
+      && this.#isCurrentThreadScope(sessionId, threadId);
+  }
+
+  #isCurrentNewThreadRequest(token: NewThreadRequestToken): boolean {
+    const services = this.#services.value;
+    const route = services === undefined ? undefined : readSignal(services.router.route);
+    const currentThreadIds = [token.initialThreadId, token.createdThreadId];
+    return this.#newThreadRequest === token
+      && this.isConnected
+      && this.workspaceId === token.workspaceId
+      && this.sessionId === token.sessionId
+      && (
+        this.threadId === token.initialThreadId
+        || this.threadId === token.createdThreadId
+      )
+      && this.#store.value?.isSessionTombstoned(token.sessionId) !== true
+      && route?.kind === "session"
+      && route.workspaceId === token.workspaceId
+      && route.sessionId === token.sessionId
+      && currentThreadIds.includes(route.threadId ?? "");
   }
 
   async #updateThreadModelOption(
@@ -5467,8 +5543,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       || this.#newThreadBusy
       || event.detail.workspaceId !== this.workspaceId
       || event.detail.sessionId !== this.sessionId
+      || store.isSessionTombstoned(event.detail.sessionId)
     ) return;
     event.preventDefault();
+    const token: NewThreadRequestToken = {
+      workspaceId: this.workspaceId,
+      sessionId: this.sessionId,
+      initialThreadId: this.threadId,
+    };
+    this.#newThreadRequest = token;
     this.#newThreadBusy = true;
     this.#newThreadError = "";
     this.requestUpdate();
@@ -5483,31 +5566,39 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           const generated = await services.protocol.generateSessionTitle(prompt, {
             signal: abort.signal,
           });
+          if (!this.#isCurrentNewThreadRequest(token)) return;
           if (generated.title.trim() !== "") {
             request = { ...request, title: generated.title.trim() };
           }
         } catch {
+          if (!this.#isCurrentNewThreadRequest(token)) return;
           // The request already carries the same bounded prompt fallback used
           // when session-title generation is unavailable.
         } finally {
           globalThis.clearTimeout(timeout);
         }
       }
+      if (!this.#isCurrentNewThreadRequest(token)) return;
       const thread = await services.protocol.createThread(request);
+      if (!this.#isCurrentNewThreadRequest(token)) return;
       createdThreadId = thread.id;
+      token.createdThreadId = thread.id;
       store.upsertThread(thread);
       this.#newThreadSetupOpen = false;
       services.router.navigate({
         kind: "session",
-        workspaceId: this.workspaceId,
-        sessionId: this.sessionId,
+        workspaceId: token.workspaceId,
+        sessionId: token.sessionId,
         threadId: thread.id,
       });
       this.requestUpdate();
       if (event.detail.initialMessage !== undefined) {
+        if (!this.#isCurrentNewThreadRequest(token)) return;
         await services.protocol.sendMessage(thread.id, event.detail.initialMessage);
+        if (!this.#isCurrentNewThreadRequest(token)) return;
       }
     } catch {
+      if (!this.#isCurrentNewThreadRequest(token)) return;
       if (createdThreadId === undefined) {
         this.#newThreadError = "Thread could not be created. Review the setup and try again.";
       } else {
@@ -5521,8 +5612,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           "Thread was created, but its first message could not be sent. The message was not queued.";
       }
     } finally {
-      this.#newThreadBusy = false;
-      this.requestUpdate();
+      if (this.#newThreadRequest === token) {
+        this.#newThreadRequest = undefined;
+        this.#newThreadBusy = false;
+        if (this.isConnected) this.requestUpdate();
+      }
     }
   };
 
@@ -5635,8 +5729,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       });
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
       try {
-        store.replaceThreadQueue(threadId, await services.protocol.listQueue(threadId));
+        const queue = await services.protocol.listQueue(threadId);
+        if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
+        store.replaceThreadQueue(threadId, queue);
       } catch {
+        if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
         const retained = [...this.#queueEditRetainedAttachments];
         const view = store.threadView(threadId);
         store.replaceThreadQueue(
@@ -6040,20 +6137,22 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         ? "Queue order updated."
         : `Queued prompt dropped at position ${position + 1} of ${reordered.length}.`;
     } catch {
-      if (this.#isCurrentThreadInteraction(threadId, generation)) {
-        try {
-          store.replaceThreadQueue(threadId, await services.protocol.listQueue(threadId));
-        } catch {
-          const currentIds = store.threadView(threadId).queue.map(({ id }) => id);
-          if (
-            currentIds.length === ids.length
-            && currentIds.every((id, index) => id === ids[index])
-          ) {
-            store.replaceThreadQueue(threadId, previousQueue);
-          }
+      if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
+      try {
+        const queue = await services.protocol.listQueue(threadId);
+        if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
+        store.replaceThreadQueue(threadId, queue);
+      } catch {
+        if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
+        const currentIds = store.threadView(threadId).queue.map(({ id }) => id);
+        if (
+          currentIds.length === ids.length
+          && currentIds.every((id, index) => id === ids[index])
+        ) {
+          store.replaceThreadQueue(threadId, previousQueue);
         }
-        this.#queueError = "Queue order could not be changed.";
       }
+      this.#queueError = "Queue order could not be changed.";
     } finally {
       if (this.#isCurrentThreadInteraction(threadId, generation)) {
         this.#queueBusy = "";
@@ -6369,9 +6468,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const draftContent = textarea?.value ?? "";
     const content = draftContent.trim();
     const attachments = [...this.#pendingAttachments];
+    const sessionId = this.sessionId;
     if (
       services === undefined ||
       store === undefined ||
+      sessionId === "" ||
+      store.isSessionTombstoned(sessionId) ||
       this.threadId === "" ||
       this.#connectivityBlocked() ||
       (content === "" && attachments.length === 0)
@@ -6431,8 +6533,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       let acceptedTurn: number | undefined;
       if (steering) {
         await services.protocol.steerTurn(threadId, request);
+        if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
       } else {
         const accepted = await services.protocol.sendMessage(threadId, request);
+        if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
+          if (optimistic !== undefined) this.#clearOptimisticPrompt(optimistic.id);
+          return;
+        }
         const pendingOptimistic = this.#optimisticPrompt;
         if (optimistic !== undefined && pendingOptimistic?.id === optimistic.id) {
           pendingOptimistic.disposition = accepted.queued ? "queue" : "turn";
@@ -6476,10 +6583,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           acceptedTurn = accepted.turn;
         }
       }
-      if (
-        requestGeneration !== this.#turnRequestGeneration
-        || threadId !== this.threadId
-      ) return;
+      if (!this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) return;
       if (acceptedTurn !== undefined) this.#pendingStartTurn = acceptedTurn;
       if (steering) {
         if (textarea !== null) {
@@ -6496,10 +6600,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         void services.composerDrafts.clear(threadId).catch(() => undefined);
       }
     } catch {
-      if (
-        requestGeneration === this.#turnRequestGeneration
-        && threadId === this.threadId
-      ) {
+      if (this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
         if (
           !steering
           && optimistic !== undefined
@@ -6525,10 +6626,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           : "Message could not be sent.";
       }
     } finally {
-      if (
-        requestGeneration === this.#turnRequestGeneration
-        && threadId === this.threadId
-      ) {
+      if (this.#isCurrentTurnRequest(sessionId, threadId, requestGeneration)) {
         this.#messageRequest = undefined;
         this.#requestPending = false;
         this.requestUpdate();
@@ -7051,7 +7149,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     let submitted = false;
     try {
-      await services.protocol.resolveApproval({ call_id: callId, decision });
+      await services.protocol.resolveApproval({
+        thread_id: threadId,
+        call_id: callId,
+        decision,
+      });
       if (!this.#isCurrentThreadInteraction(threadId, generation)) return;
       submitted = true;
       // The HTTP response can win the race with its durable SSE event. Remove
@@ -7163,6 +7265,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (!canAdvanceQuestionWizard(state, item.questions.length)) return;
     if (state.step === item.questions.length) {
       void this.#submitQuestion({
+        thread_id: this.threadId,
         request_id: item.requestId,
         answers: questionWizardAnswers(item.questions, state),
       });
@@ -7186,7 +7289,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   readonly #skipQuestions = (requestId: string): void => {
-    void this.#submitQuestion({ request_id: requestId, answers: null });
+    void this.#submitQuestion({
+      thread_id: this.threadId,
+      request_id: requestId,
+      answers: null,
+    });
   };
 
   async #submitQuestion(request: ProtocolResolveQuestionRequest): Promise<void> {

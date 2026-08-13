@@ -66,7 +66,11 @@ fn permission_settings(
     match permission {
         BackendPermission::ReadOnly => ("never", "read-only", "readOnly"),
         BackendPermission::Ask => ("untrusted", "danger-full-access", "dangerFullAccess"),
-        BackendPermission::Yolo => ("never", "danger-full-access", "dangerFullAccess"),
+        // Even Yolo asks Codex to emit native approval callbacks. Trouve's
+        // permission gate auto-approves them, but still validates the target
+        // and acquires the session mutation lane before replying. `never`
+        // would let vendor-native writes bypass both boundaries.
+        BackendPermission::Yolo => ("untrusted", "danger-full-access", "dangerFullAccess"),
     }
 }
 
@@ -258,7 +262,13 @@ impl AgentBackend for CodexBackend {
             input.push(json!({ "type": "text", "text": steer.prompt }));
         }
         for attachment in steer.attachments {
-            input.push(json!({ "type": "localImage", "path": attachment.path }));
+            let path = attachment.local_path.ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "attachment {} has no verified worktree-local image path",
+                    attachment.name
+                ))
+            })?;
+            input.push(json!({ "type": "localImage", "path": path }));
         }
         server.steer_turn(&steer.session, input, &cancel).await
     }
@@ -421,7 +431,13 @@ impl AgentBackend for CodexBackend {
         // references inside the prompt text.
         let mut input = vec![json!({ "type": "text", "text": text })];
         for att in &turn.attachments {
-            input.push(json!({ "type": "localImage", "path": att.path }));
+            let path = att.local_path.as_ref().ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "attachment {} has no verified worktree-local image path",
+                    att.name
+                ))
+            })?;
+            input.push(json!({ "type": "localImage", "path": path }));
         }
         let mut turn_params = json!({
             "threadId": codex_thread_id,
@@ -7164,7 +7180,7 @@ cat > /dev/null
         );
         assert_eq!(
             permission_settings(crate::BackendPermission::Yolo),
-            ("never", "danger-full-access", "dangerFullAccess")
+            ("untrusted", "danger-full-access", "dangerFullAccess")
         );
 
         let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, true);
@@ -7175,6 +7191,15 @@ cat > /dev/null
         assert_eq!(sandbox, "read-only");
         assert_eq!(policy["type"], "readOnly");
         assert_eq!(policy["networkAccess"], false);
+
+        let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Yolo, false);
+        assert_eq!(
+            approval_policy(crate::BackendPermission::Yolo, false),
+            "untrusted",
+            "Yolo must retain callbacks so trouve can validate and serialize native mutations"
+        );
+        assert_eq!(sandbox, "danger-full-access");
+        assert_eq!(policy["type"], "dangerFullAccess");
 
         let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, false);
         assert_eq!(

@@ -37,6 +37,39 @@ const viewSnapshot = (
 });
 
 describe("ThreadIngress", () => {
+  it("does not repopulate a tombstoned session from a deferred route load", async () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([{
+      id: "se_1",
+      workspace_id: "ws_1",
+      title: "Session",
+      branch: "trouve/session",
+      worktree_path: "/tmp/session",
+      base_ref: "main",
+      created_at: "2026-08-01T12:00:00Z",
+    }]);
+    let resolveThreads!: (threads: ReturnType<typeof thread>[]) => void;
+    const threads = new Promise<ReturnType<typeof thread>[]>((resolve) => {
+      resolveThreads = resolve;
+    });
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(() => threads),
+      threadView: vi.fn(async () => viewSnapshot()),
+      threadEvents: vi.fn(async () => ({
+        start: vi.fn(),
+        close: vi.fn(),
+      }) as unknown as CursorEventStream<ProtocolIngressEvent>),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+    const opening = ingress.openSession("se_1");
+    store.removeSession("se_1");
+    resolveThreads([thread("th_stale")]);
+
+    await expect(opening).resolves.toBeUndefined();
+    expect(store.threadsForSession("se_1")).toEqual([]);
+    expect(protocol.threadView).not.toHaveBeenCalled();
+  });
+
   it("opens the conversation when auxiliary thread statuses are unavailable", async () => {
     const store = new AppStore();
     const start = vi.fn();
@@ -193,6 +226,61 @@ describe("ThreadIngress", () => {
       "th_2",
       expect.objectContaining({ after: 20 }),
     );
+    expect(store.threadView("th_1").items).toEqual([]);
+  });
+
+  it("discards a delayed view when its session is tombstoned", async () => {
+    const store = new AppStore();
+    let resolveView!: (snapshot: ReturnType<typeof viewSnapshot>) => void;
+    const pendingView = new Promise<ReturnType<typeof viewSnapshot>>((resolve) => {
+      resolveView = resolve;
+    });
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(() => pendingView),
+      threadEvents: vi.fn(),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+    const opening = ingress.openSession("se_1", "th_1");
+    await vi.waitFor(() => expect(protocol.threadView).toHaveBeenCalledOnce());
+
+    store.removeSession("se_1");
+    resolveView(viewSnapshot(10, [{
+      kind: "user",
+      turn: 1,
+      content: "ghost",
+      attachments: [],
+    }]));
+
+    await expect(opening).resolves.toBeUndefined();
+    expect(protocol.threadEvents).not.toHaveBeenCalled();
+    expect(store.threadView("th_1").items).toEqual([]);
+  });
+
+  it("closes a delayed stream returned after session invalidation", async () => {
+    const store = new AppStore();
+    let resolveStream!: (stream: CursorEventStream<ProtocolIngressEvent>) => void;
+    const pendingStream = new Promise<CursorEventStream<ProtocolIngressEvent>>((resolve) => {
+      resolveStream = resolve;
+    });
+    const start = vi.fn();
+    const close = vi.fn();
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => viewSnapshot(10)),
+      threadEvents: vi.fn(() => pendingStream),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+    const opening = ingress.openSession("se_1", "th_1");
+    await vi.waitFor(() => expect(protocol.threadEvents).toHaveBeenCalledOnce());
+
+    store.removeSession("se_1");
+    ingress.invalidateSession("se_1");
+    resolveStream({ start, close } as unknown as CursorEventStream<ProtocolIngressEvent>);
+
+    await expect(opening).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
     expect(store.threadView("th_1").items).toEqual([]);
   });
 

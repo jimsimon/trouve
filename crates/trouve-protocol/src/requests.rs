@@ -675,6 +675,8 @@ pub struct ReorderQueueRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveApprovalRequest {
+    /// Owning thread for this vendor-local call id.
+    pub thread_id: ThreadId,
     pub call_id: CallId,
     pub decision: ApprovalDecision,
 }
@@ -685,6 +687,8 @@ pub struct ResolveApprovalRequest {
 /// questions (the agent is told the user declined to answer).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveQuestionRequest {
+    /// Owning thread for this vendor-local request id.
+    pub thread_id: ThreadId,
     pub request_id: CallId,
     #[serde(default)]
     pub answers: Option<Vec<crate::QuestionAnswer>>,
@@ -757,6 +761,15 @@ pub struct TerminalInfo {
     pub rows: u16,
     /// True once the shell process has exited (the stream is complete).
     pub exited: bool,
+}
+
+/// Absolute byte offset at which a terminal output subscription begins.
+///
+/// Sent as JSON in the named, id-less `replay-start` SSE event before any
+/// replayed or live base64 output chunks.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TerminalReplayStart {
+    pub offset: u64,
 }
 
 /// Keyboard/paste bytes for the PTY, base64-encoded.

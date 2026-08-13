@@ -100,8 +100,9 @@ describe("session list component contract", () => {
     expect(component).toContain(">Rename</button>");
     expect(component).toContain('${session.archived ? "Unarchive" : "Archive"}');
     expect(component).toContain("await services.protocol.deleteSession(sessionId)");
-    expect(component).toContain('route.kind === "session" && route.sessionId === sessionId');
-    expect(component).toContain('services.router.navigate({ kind: "inbox" }, true)');
+    expect(component).toContain("services.tombstoneSession(sessionId)");
+    expect(shell).toContain("this.#threadIngress.invalidateSession(sessionId)");
+    expect(shell).toContain("this.#composerDrafts.discard(threadId)");
     expect(shell).toContain("?? inboxRecoverySession(sessions)");
     expect(shell).toContain('route.kind === "inbox" && recoverySession !== undefined');
   });

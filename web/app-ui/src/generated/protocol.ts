@@ -1435,9 +1435,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * PTY output as SSE: each event's `id` is the byte offset *after* the
-         *     chunk, data is base64. `?after=` resumes from an offset (bytes older
-         *     than the retained backlog are silently skipped). A final `exit` event
+         * PTY output as SSE. A named, id-less `replay-start` event first announces
+         *     the absolute replay offset as JSON. Each following output event's `id` is
+         *     the byte offset *after* its base64 data. `?after=` resumes from an offset
+         *     (bytes older than the retained backlog are skipped). A final `exit` event
          *     marks shell exit. Ephemeral — not part of the persisted event log.
          */
         get: operations["terminal_output"];
@@ -3872,6 +3873,8 @@ export interface components {
         ResolveApprovalRequest: {
             call_id: components["schemas"]["String"];
             decision: components["schemas"]["ApprovalDecision"];
+            /** @description Owning thread for this vendor-local call id. */
+            thread_id: components["schemas"]["String"];
         };
         /**
          * @description Answers for a pending `question.requested`. `answers: null` skips the
@@ -3880,6 +3883,8 @@ export interface components {
         ResolveQuestionRequest: {
             answers?: components["schemas"]["QuestionAnswer"][] | null;
             request_id: components["schemas"]["String"];
+            /** @description Owning thread for this vendor-local request id. */
+            thread_id: components["schemas"]["String"];
         };
         /** @enum {string} */
         RestoreDirection: "undo" | "redo" | "exact";
@@ -4194,6 +4199,16 @@ export interface components {
         /** @description Keyboard/paste bytes for the PTY, base64-encoded. */
         TerminalInputRequest: {
             data: string;
+        };
+        /**
+         * @description Absolute byte offset at which a terminal output subscription begins.
+         *
+         *     Sent as JSON in the named, id-less `replay-start` SSE event before any
+         *     replayed or live base64 output chunks.
+         */
+        TerminalReplayStart: {
+            /** Format: int64 */
+            offset: number;
         };
         TerminalResizeRequest: {
             /** Format: int32 */
@@ -4770,6 +4785,14 @@ export interface operations {
                 content?: never;
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6796,6 +6819,14 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     delete_queued_prompt: {
@@ -7134,6 +7165,14 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7865,7 +7904,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description SSE stream of base64 output chunks */
+            /** @description SSE replay-start marker and base64 output chunks */
             200: {
                 headers: {
                     [name: string]: unknown;

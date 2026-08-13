@@ -309,7 +309,7 @@ export class TrouveTerminalPanel extends LitElement {
   }
 
   #follow(terminal: ProtocolTerminalInfo): void {
-    if (terminal.exited || this.#streams.has(terminal.id)) return;
+    if (this.#streams.has(terminal.id)) return;
     const services = this.#services.value;
     if (services === undefined) return;
     const stream = new TerminalOutputStream({
@@ -319,8 +319,10 @@ export class TrouveTerminalPanel extends LitElement {
         this.#exited.add(terminal.id);
         this.requestUpdate();
       },
-      onDiagnostic: () => {
-        this.#error = "Some terminal output could not be decoded.";
+      onDiagnostic: (diagnostic) => {
+        this.#error = diagnostic.kind === "non-contiguous-offset"
+          ? "Some earlier terminal output is no longer available."
+          : "Some terminal output could not be decoded.";
         this.requestUpdate();
       },
     });

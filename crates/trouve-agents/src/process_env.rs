@@ -14,6 +14,9 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,9 +86,11 @@ pub fn apply_path_to_tokio(command: &mut tokio::process::Command) {
 /// A Tokio child whose descendants share an owned operating-system process
 /// tree boundary.
 ///
-/// On Unix the child leads a new process group. On Windows it is assigned to
-/// a kill-on-close Job Object. Call [`Self::terminate_and_reap`] on normal
-/// cleanup paths; `Drop` still signals the complete tree as a last resort.
+/// On Unix the child leads a new process group and inherits a private lifetime
+/// sentinel, so descendants that call `setsid()` remain owned. On Windows it
+/// is assigned to a kill-on-close Job Object. Call
+/// [`Self::terminate_and_reap`] on normal cleanup paths; `Drop` still signals
+/// the complete tree as a last resort.
 /// This wrapper deliberately accepts an already-configured `Command`, so
 /// callers can set argv, environment, cwd, and stdio without invoking a shell.
 pub struct ProcessTreeChild {
@@ -95,12 +100,139 @@ pub struct ProcessTreeChild {
     leader_status: Option<std::process::ExitStatus>,
     /// Whether this wrapper still owns a live or not-yet-proven-empty process
     /// tree. The flag prevents Drop from signalling a reused numeric Unix
-    /// process-group id after the complete tree has exited.
+    /// process-group id after the group and inherited sentinel are empty.
     tree_active: bool,
     #[cfg(unix)]
     process_group: i32,
+    #[cfg(unix)]
+    descendant_sentinel: OwnedFd,
+    #[cfg(target_os = "macos")]
+    process_group_signalled: bool,
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
+}
+
+/// A standard-library child whose descendants share the same owned process
+/// tree boundary as [`ProcessTreeChild`]. Synchronous subsystems use this
+/// variant when they already run on a dedicated blocking thread and need
+/// polling, bounded pipe drains, or file-backed stdin without nesting a Tokio
+/// runtime.
+pub struct BlockingProcessTreeChild {
+    child: std::process::Child,
+    leader_status: Option<std::process::ExitStatus>,
+    tree_active: bool,
+    #[cfg(unix)]
+    process_group: i32,
+    #[cfg(unix)]
+    descendant_sentinel: OwnedFd,
+    #[cfg(target_os = "macos")]
+    process_group_signalled: bool,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+}
+
+impl BlockingProcessTreeChild {
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Reap the leader, terminate descendants that inherited its sentinel, and
+    /// return completion only once the complete owned tree is empty.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait_until(Instant::now() + PROCESS_TREE_REAP_TIMEOUT)
+    }
+
+    /// [`Self::try_wait`] with an absolute deadline for descendant cleanup.
+    ///
+    /// Callers that impose an operation-wide timeout use this form so the
+    /// process-tree cleanup budget is included in, rather than added after,
+    /// that timeout.
+    pub fn try_wait_until(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.leader_status.is_none() {
+            self.leader_status = self.child.try_wait()?;
+        }
+        let Some(status) = self.leader_status else {
+            return Ok(None);
+        };
+        terminate_blocking_process_tree(self)?;
+        wait_for_blocking_process_tree_exit_until(self, deadline)?;
+        self.tree_active = false;
+        Ok(Some(status))
+    }
+
+    /// Terminate every descendant and synchronously reap the direct child.
+    pub fn terminate_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.terminate_and_reap_until(Instant::now() + PROCESS_TREE_REAP_TIMEOUT)
+    }
+
+    /// [`Self::terminate_and_reap`] with an absolute cleanup deadline.
+    pub fn terminate_and_reap_until(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let terminate_result = terminate_blocking_process_tree(self);
+        if self.leader_status.is_none() {
+            let _ = self.child.kill();
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    self.leader_status = Some(status);
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out reaping terminated blocking child process",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+            }
+        }
+        let empty_result = wait_for_blocking_process_tree_exit_until(self, deadline);
+        if empty_result.is_ok() {
+            self.tree_active = false;
+        }
+        terminate_result.and(empty_result)?;
+        Ok(self.leader_status.expect("leader was reaped above"))
+    }
+}
+
+impl Drop for BlockingProcessTreeChild {
+    fn drop(&mut self) {
+        if self.tree_active {
+            let _ = terminate_blocking_process_tree(self);
+            let _ = self.child.kill();
+            // Drop must remain non-blocking even if the OS refuses or cannot
+            // confirm tree termination. On Unix, arrange detached zombie
+            // reaping without extending the caller's operation deadline.
+            #[cfg(unix)]
+            {
+                let pid = self.child.id();
+                std::thread::spawn(move || {
+                    let Ok(pid) = i32::try_from(pid) else {
+                        return;
+                    };
+                    let mut status = 0;
+                    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+                });
+            }
+        }
+    }
 }
 
 impl ProcessTreeChild {
@@ -135,7 +267,7 @@ impl ProcessTreeChild {
     }
 
     /// Report completion only after the leader has been reaped and every
-    /// descendant has left the owned process group / Job Object.
+    /// descendant has left the inherited Unix sentinel / Windows Job Object.
     ///
     /// Unlike [`Self::try_wait`], this does not terminate a live descendant
     /// merely because its original leader exited.
@@ -176,6 +308,31 @@ impl ProcessTreeChild {
         cleanup_result.and(empty_result).map(|()| status)
     }
 
+    /// Wait for the leader only until `leader_deadline`, then include complete
+    /// descendant cleanup in the caller's absolute `cleanup_deadline`.
+    pub async fn wait_and_cleanup_until(
+        &mut self,
+        leader_deadline: tokio::time::Instant,
+        cleanup_deadline: tokio::time::Instant,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let status = tokio::time::timeout_at(leader_deadline, self.wait_for_leader())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for child process",
+                )
+            })??;
+        let cleanup_result = terminate_platform_process_tree(self);
+        let cleanup_deadline =
+            cleanup_deadline.min(tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT);
+        let empty_result = wait_for_platform_process_tree_exit_until(self, cleanup_deadline).await;
+        if empty_result.is_ok() {
+            self.tree_active = false;
+        }
+        cleanup_result.and(empty_result).map(|()| status)
+    }
+
     /// Signal the complete process tree, and the leader as a fallback.
     ///
     /// This method is synchronous so `Drop` can use it. Prefer
@@ -192,8 +349,18 @@ impl ProcessTreeChild {
 
     /// Terminate the complete tree and reap its leader before returning.
     pub async fn terminate_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.terminate_and_reap_until(tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::terminate_and_reap`] bounded by an absolute deadline.
+    pub async fn terminate_and_reap_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<std::process::ExitStatus> {
         let terminate_result = self.terminate_now();
-        let status = tokio::time::timeout(PROCESS_TREE_REAP_TIMEOUT, self.wait_for_leader())
+        let deadline = deadline.min(tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT);
+        let status = tokio::time::timeout_at(deadline, self.wait_for_leader())
             .await
             .map_err(|_| {
                 std::io::Error::new(
@@ -201,7 +368,7 @@ impl ProcessTreeChild {
                     "timed out reaping terminated child process",
                 )
             })??;
-        let empty_result = wait_for_platform_process_tree_exit(self).await;
+        let empty_result = wait_for_platform_process_tree_exit_until(self, deadline).await;
         if empty_result.is_ok() {
             self.tree_active = false;
         }
@@ -238,6 +405,10 @@ pub fn spawn_process_tree(
         command.as_std_mut().process_group(0);
     }
 
+    #[cfg(unix)]
+    let (descendant_sentinel, descendant_sentinel_writer) =
+        install_unix_descendant_sentinel(command.as_std_mut())?;
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -253,6 +424,9 @@ pub fn spawn_process_tree(
     let job = create_kill_on_close_job()?;
 
     let mut child = command.spawn()?;
+
+    #[cfg(unix)]
+    drop(descendant_sentinel_writer);
 
     #[cfg(unix)]
     let process_group = match child.id().and_then(|pid| i32::try_from(pid).ok()) {
@@ -283,21 +457,233 @@ pub fn spawn_process_tree(
         tree_active: true,
         #[cfg(unix)]
         process_group,
+        #[cfg(unix)]
+        descendant_sentinel,
+        #[cfg(target_os = "macos")]
+        process_group_signalled: false,
         #[cfg(windows)]
         job,
     })
 }
 
+/// Spawn a standard-library command inside an owned process group / Windows
+/// Job Object. This is the blocking counterpart to [`spawn_process_tree`].
+pub fn spawn_blocking_process_tree(
+    command: &mut std::process::Command,
+) -> std::io::Result<BlockingProcessTreeChild> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(unix)]
+    let (descendant_sentinel, descendant_sentinel_writer) =
+        install_unix_descendant_sentinel(command)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(WINDOWS_PROCESS_TREE_CREATION_FLAGS);
+    }
+
+    #[cfg(windows)]
+    let job = create_kill_on_close_job()?;
+    let mut child = command.spawn()?;
+
+    #[cfg(unix)]
+    drop(descendant_sentinel_writer);
+
+    #[cfg(unix)]
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(
+                "spawned child did not expose a valid process id",
+            ));
+        }
+    };
+
+    #[cfg(windows)]
+    if let Err(error) = assign_pid_to_job(&job, child.id()) {
+        abort_blocking_windows_spawn(&mut child, None);
+        return Err(error);
+    }
+    #[cfg(windows)]
+    if let Err(error) = resume_suspended_pid(child.id()) {
+        abort_blocking_windows_spawn(&mut child, Some(&job));
+        return Err(error);
+    }
+
+    Ok(BlockingProcessTreeChild {
+        child,
+        leader_status: None,
+        tree_active: true,
+        #[cfg(unix)]
+        process_group,
+        #[cfg(unix)]
+        descendant_sentinel,
+        #[cfg(target_os = "macos")]
+        process_group_signalled: false,
+        #[cfg(windows)]
+        job,
+    })
+}
+
+#[cfg(unix)]
+fn install_unix_descendant_sentinel(
+    command: &mut std::process::Command,
+) -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut descriptors = [-1; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let created = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let created = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
+    if created != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for descriptor in [&reader, &writer] {
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        if flags == -1
+            || unsafe {
+                libc::fcntl(
+                    descriptor.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags | libc::FD_CLOEXEC,
+                )
+            } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    let writer_fd = writer.as_raw_fd();
+    // SAFETY: this closure only invokes async-signal-safe `fcntl` between fork
+    // and exec. The parent copy stays close-on-exec and is dropped immediately
+    // after spawn; the child copy deliberately survives exec and is inherited
+    // across forks and `setsid()` calls until the last descendant exits.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(writer_fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(writer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok((reader, writer))
+}
+
+fn wait_for_blocking_process_tree_exit_until(
+    child: &BlockingProcessTreeChild,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while blocking_process_tree_active(child)? {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for terminated blocking process tree",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn blocking_process_tree_active(child: &BlockingProcessTreeChild) -> std::io::Result<bool> {
+    if !child.tree_active {
+        return Ok(false);
+    }
+    let sentinel_active = unix_descendant_sentinel_active(&child.descendant_sentinel)?;
+    #[cfg(target_os = "macos")]
+    let group_active =
+        !child.process_group_signalled && unix_process_group_active(child.process_group)?;
+    #[cfg(not(target_os = "macos"))]
+    let group_active = unix_process_group_active(child.process_group)?;
+    Ok(sentinel_active || group_active)
+}
+
+#[cfg(windows)]
+fn blocking_process_tree_active(child: &BlockingProcessTreeChild) -> std::io::Result<bool> {
+    if child.tree_active {
+        windows_job_active(&child.job)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn blocking_process_tree_active(child: &BlockingProcessTreeChild) -> std::io::Result<bool> {
+    Ok(child.tree_active && child.leader_status.is_none())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std::io::Result<()> {
+    if !child.tree_active {
+        return Ok(());
+    }
+    let group = signal_unix_process_group(child.process_group);
+    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel);
+    group.and(escaped)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std::io::Result<()> {
+    if !child.tree_active {
+        return Ok(());
+    }
+    signal_unix_process_group(child.process_group)?;
+    // Darwin may retain killed group members as zombies. Ignore that stale
+    // group after signalling, but keep the sentinel armed: a `setsid()` child
+    // that survived the group signal must continue to block acknowledgement.
+    child.process_group_signalled = true;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std::io::Result<()> {
+    if child.tree_active {
+        terminate_windows_job(&child.job)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_blocking_process_tree(_child: &mut BlockingProcessTreeChild) -> std::io::Result<()> {
+    Ok(())
+}
+
 async fn wait_for_platform_process_tree_exit(child: &ProcessTreeChild) -> std::io::Result<()> {
-    let deadline = tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT;
+    wait_for_platform_process_tree_exit_until(
+        child,
+        tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT,
+    )
+    .await
+}
+
+async fn wait_for_platform_process_tree_exit_until(
+    child: &ProcessTreeChild,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
     while platform_process_tree_active(child)? {
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "timed out waiting for terminated process tree",
             ));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10).min(deadline - now)).await;
     }
     Ok(())
 }
@@ -307,20 +693,22 @@ fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<boo
     if !child.tree_active {
         return Ok(false);
     }
-    let result = unsafe { libc::kill(-child.process_group, 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(error),
-    }
+    let sentinel_active = unix_descendant_sentinel_active(&child.descendant_sentinel)?;
+    #[cfg(target_os = "macos")]
+    let group_active =
+        !child.process_group_signalled && unix_process_group_active(child.process_group)?;
+    #[cfg(not(target_os = "macos"))]
+    let group_active = unix_process_group_active(child.process_group)?;
+    Ok(sentinel_active || group_active)
 }
 
 #[cfg(windows)]
 fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<bool> {
+    windows_job_active(&child.job)
+}
+
+#[cfg(windows)]
+fn windows_job_active(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<bool> {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::System::JobObjects::{
@@ -328,13 +716,10 @@ fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<boo
         QueryInformationJobObject,
     };
 
-    if !child.tree_active {
-        return Ok(false);
-    }
     let mut accounting = unsafe { std::mem::zeroed::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() };
     let queried = unsafe {
         QueryInformationJobObject(
-            child.job.as_raw_handle().cast(),
+            job.as_raw_handle().cast(),
             JobObjectBasicAccountingInformation,
             std::ptr::from_mut(&mut accounting).cast::<c_void>(),
             std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
@@ -353,12 +738,73 @@ fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<boo
     Ok(child.tree_active && child.leader_status.is_none())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Result<()> {
     if !child.tree_active {
         return Ok(());
     }
-    let result = unsafe { libc::kill(-child.process_group, libc::SIGKILL) };
+    let group = signal_unix_process_group(child.process_group);
+    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel);
+    group.and(escaped)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Result<()> {
+    if !child.tree_active {
+        return Ok(());
+    }
+    signal_unix_process_group(child.process_group)?;
+    // Darwin can keep a killed group visible as zombies. Stop consulting that
+    // group after signalling, but do not disarm the inherited sentinel: it is
+    // the ownership proof for a live descendant that moved to another group.
+    child.process_group_signalled = true;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn unix_descendant_sentinel_active(sentinel: &OwnedFd) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: sentinel.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(std::ptr::from_mut(&mut descriptor), 1, 0) };
+        if result == 0 {
+            return Ok(true);
+        }
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::other(
+                    "process-tree descendant sentinel became invalid",
+                ));
+            }
+            return Ok(descriptor.revents & libc::POLLHUP == 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_unix_process_group(process_group: i32) -> std::io::Result<()> {
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
     if result == 0 {
         return Ok(());
     }
@@ -370,15 +816,68 @@ fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Res
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_unix_sentinel_holders(sentinel: &OwnedFd) -> std::io::Result<()> {
+    let sentinel_target = std::fs::read_link(format!("/proc/self/fd/{}", sentinel.as_raw_fd()))?;
+    let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    let mut first_error = None;
+    for process in std::fs::read_dir("/proc")? {
+        let Ok(process) = process else { continue };
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        let holds_sentinel = descriptors.filter_map(Result::ok).any(|descriptor| {
+            std::fs::read_link(descriptor.path()).is_ok_and(|target| target == sentinel_target)
+        });
+        if !holds_sentinel {
+            continue;
+        }
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn terminate_unix_sentinel_holders(_sentinel: &OwnedFd) -> std::io::Result<()> {
+    // The inherited sentinel still prevents a false cleanup acknowledgement
+    // on these platforms. Without a portable process-holder query, an escaped
+    // descendant remains quarantined until it exits rather than racing a new
+    // mutation.
+    Ok(())
+}
+
 #[cfg(windows)]
 fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
     if !child.tree_active {
         return Ok(());
     }
-    let terminated = unsafe { TerminateJobObject(child.job.as_raw_handle().cast(), 1) };
+    terminate_windows_job(&child.job)
+}
+
+#[cfg(windows)]
+fn terminate_windows_job(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+    let terminated = unsafe { TerminateJobObject(job.as_raw_handle().cast(), 1) };
     if terminated == 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -427,15 +926,20 @@ fn assign_process_to_job(
     job: &std::os::windows::io::OwnedHandle,
     child: &tokio::process::Child,
 ) -> std::io::Result<()> {
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("spawned child did not expose a process id"))?;
+    assign_pid_to_job(job, pid)
+}
+
+#[cfg(windows)]
+fn assign_pid_to_job(job: &std::os::windows::io::OwnedHandle, pid: u32) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
-    let pid = child
-        .id()
-        .ok_or_else(|| std::io::Error::other("spawned child did not expose a process id"))?;
     let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
     if process.is_null() {
         return Err(std::io::Error::last_os_error());
@@ -453,6 +957,14 @@ fn assign_process_to_job(
 
 #[cfg(windows)]
 fn resume_suspended_process(child: &tokio::process::Child) -> std::io::Result<()> {
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("spawned child did not expose a process id"))?;
+    resume_suspended_pid(pid)
+}
+
+#[cfg(windows)]
+fn resume_suspended_pid(pid: u32) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -460,9 +972,6 @@ fn resume_suspended_process(child: &tokio::process::Child) -> std::io::Result<()
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
-    let pid = child
-        .id()
-        .ok_or_else(|| std::io::Error::other("spawned child did not expose a process id"))?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -518,6 +1027,24 @@ fn abort_windows_spawn(
         let _ = unsafe { TerminateJobObject(job.as_raw_handle().cast(), 1) };
     }
     let _ = child.start_kill();
+    let deadline = Instant::now() + PROCESS_TREE_REAP_TIMEOUT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn abort_blocking_windows_spawn(
+    child: &mut std::process::Child,
+    assigned_job: Option<&std::os::windows::io::OwnedHandle>,
+) {
+    if let Some(job) = assigned_job {
+        let _ = terminate_windows_job(job);
+    }
+    let _ = child.kill();
     let deadline = Instant::now() + PROCESS_TREE_REAP_TIMEOUT;
     while Instant::now() < deadline {
         match child.try_wait() {
@@ -643,9 +1170,45 @@ fn merge_paths(shell: Option<&OsStr>, inherited: Option<&OsStr>) -> Option<OsStr
 }
 
 fn find_executable_in_path(command: &str, path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .map(|directory| directory.join(command))
-        .find(|candidate| executable_file(candidate))
+    #[cfg(windows)]
+    let candidates = windows_command_candidates(
+        command,
+        std::env::var_os("PATHEXT")
+            .filter(|value| !value.is_empty())
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(".COM;.EXE;.BAT;.CMD")),
+    );
+    #[cfg(not(windows))]
+    let candidates = [OsString::from(command)];
+
+    std::env::split_paths(path).find_map(|directory| {
+        candidates
+            .iter()
+            .map(|candidate| directory.join(candidate))
+            .find(|candidate| executable_file(candidate))
+    })
+}
+
+#[cfg(windows)]
+fn windows_command_candidates(command: &str, extensions: &OsStr) -> Vec<OsString> {
+    let command_path = Path::new(command);
+    if command_path.extension().is_some() {
+        return vec![OsString::from(command)];
+    }
+    extensions
+        .to_string_lossy()
+        .split(';')
+        .filter_map(|extension| {
+            let extension = extension.trim();
+            if extension.is_empty() {
+                None
+            } else if extension.starts_with('.') {
+                Some(OsString::from(format!("{command}{extension}")))
+            } else {
+                Some(OsString::from(format!("{command}.{extension}")))
+            }
+        })
+        .collect()
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -700,6 +1263,19 @@ mod tests {
         use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
         assert_ne!(WINDOWS_PROCESS_TREE_CREATION_FLAGS & CREATE_SUSPENDED, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_lookup_honors_pathext() {
+        assert_eq!(
+            windows_command_candidates("codex", OsStr::new(".EXE;.CMD")),
+            [OsString::from("codex.EXE"), OsString::from("codex.CMD")]
+        );
+        assert_eq!(
+            windows_command_candidates("codex.exe", OsStr::new(".EXE;.CMD")),
+            [OsString::from("codex.exe")]
+        );
     }
 
     #[cfg(windows)]
@@ -768,6 +1344,32 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn blocking_process_tree_closes_descendant_held_pipes_after_leader_exit() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_blocking_process_tree(&mut command).unwrap();
+        let mut stdout = child.take_stdout().unwrap();
+        let mut stderr = child.take_stderr().unwrap();
+        let started = Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        stderr.read_to_end(&mut bytes).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
     async fn spawned_descendant_pid(pid_path: &Path) -> u32 {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -833,6 +1435,27 @@ mod tests {
         child.terminate_and_reap().await.unwrap();
 
         assert_process_tree_member_stopped(descendant).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn process_tree_explicit_termination_acknowledges_killed_descendants() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), child.terminate_and_reap())
+            .await
+            .expect("macOS process-group cleanup retained an inert zombie")
+            .unwrap();
+        assert!(
+            !child.tree_active,
+            "signalled process group must be disarmed"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1000,6 +1623,51 @@ mod tests {
         assert!(
             process_state(descendant).is_some_and(|state| state != 'Z'),
             "tree wait terminated a live background descendant"
+        );
+
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tree_wait_owns_and_terminates_descendant_after_setsid() {
+        assert!(find_executable("setsid").is_some(), "setsid is required");
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("setsid-descendant.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"setsid /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 60' detached "$1" </dev/null >/dev/null 2>&1 &"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+        let original_group = child.process_group;
+        let descendant = spawned_descendant_pid(&pid_path).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if child.try_wait_leader().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process-tree leader did not exit");
+        assert_ne!(
+            unsafe { libc::getpgid(descendant as i32) },
+            original_group,
+            "fixture descendant did not leave the original process group"
+        );
+        assert!(
+            child.try_wait_tree().unwrap().is_none(),
+            "setsid descendant escaped process-tree ownership"
         );
 
         child.terminate_and_reap().await.unwrap();

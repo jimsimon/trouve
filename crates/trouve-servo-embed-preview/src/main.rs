@@ -37,9 +37,9 @@ use servo::{
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use trouve_desktop_host::{
-    FrontendSource, HostLifecycleHandle, HostNativeActions, LocalFileAction,
-    MAX_NATIVE_ATTACHMENT_BYTES, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS,
-    NativeAttachment, NativeNotification,
+    FrontendSource, HostLifecycleHandle, HostNativeActions, MAX_NATIVE_ATTACHMENT_BYTES,
+    MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS, NativeAttachment,
+    NativeNotification,
 };
 use url::{Origin, Url};
 use web_preview_support::WebPreviewHost;
@@ -132,17 +132,8 @@ fn main() -> Result<()> {
                 .send_event(AppEvent::RequestAttention)
                 .map_err(|_| "embedded Servo event loop is unavailable".to_string())
         })
-        .with_local_file_handler(|file, action| {
-            let target = match action {
-                LocalFileAction::Open => file.as_path(),
-                LocalFileAction::Reveal => file
-                    .as_path()
-                    .parent()
-                    .ok_or_else(|| "session file has no parent directory".to_string())?,
-            };
-            system_opener::open(target);
-            Ok(())
-        })
+        // Session file open/reveal stays unadvertised until the native opener
+        // can consume a confined file handle instead of a racy pathname.
         .with_directory_picker(move || {
             let directory_proxy = directory_proxy.clone();
             async move {
@@ -173,8 +164,7 @@ fn main() -> Result<()> {
                 .map_err(|_| "embedded Servo clipboard worker was interrupted".to_string())?
         })
         .with_external_https_opener(|url| {
-            system_opener::open(url.as_url().as_str());
-            Ok(())
+            system_opener::open(url.as_url().as_str())
         });
     let frontend = FrontendSource::from_preview_environment(None, true)?;
     let host = WebPreviewHost::start(frontend, native_actions)?;

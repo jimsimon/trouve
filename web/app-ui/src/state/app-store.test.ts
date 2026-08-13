@@ -107,6 +107,9 @@ describe("AppStore", () => {
     const store = new AppStore();
     store.replaceSessionMetadata([metadata]);
     store.replaceSessionSummaries([summary]);
+    store.replaceThreadsForSession("se_1", [thread("th_1")]);
+    store.replaceThreadStatusesForSession("se_1", [threadStatus("th_1")]);
+    const cachedView = store.threadView("th_1");
 
     expect(
       store.applyServerEvent({
@@ -133,8 +136,163 @@ describe("AppStore", () => {
         session_id: "se_1",
         summary: null,
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(readSignal(store.sessions)).toEqual([]);
+    expect(store.threadsForSession("se_1")).toEqual([]);
+    expect(store.threadStatus("th_1")).toBeUndefined();
+    expect(store.threadView("th_1")).not.toBe(cachedView);
+  });
+
+  it("purges session state immediately on the deletion lifecycle event", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.replaceSessionSummaries([summary]);
+    store.replaceThreadsForSession("se_1", [thread("th_1")]);
+
+    expect(store.applyServerEvent({
+      cursor: 8,
+      scope: "server",
+      ts: "2026-08-01T12:03:00Z",
+      type: "session.deleted",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    })).toBe(false);
+    expect(readSignal(store.sessions)).toEqual([]);
+    expect(store.threadsForSession("se_1")).toEqual([]);
+  });
+
+  it("purges status-only thread state when its session is deleted", () => {
+    const store = new AppStore();
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_status_only", {
+        active: true,
+        outcome: "running",
+        latest_cursor: 8,
+      }),
+    ]);
+    const cachedView = store.threadView("th_status_only");
+    expect(store.thread("th_status_only")).toBeUndefined();
+    expect(store.threadStatus("th_status_only")).toBeDefined();
+
+    store.removeSession("se_1");
+
+    expect(store.threadStatus("th_status_only")).toBeUndefined();
+    expect(store.threadIndicatorState("th_status_only")).toEqual({
+      active: false,
+      attention: "none",
+      outcome: "idle",
+      unread: false,
+    });
+    expect(store.threadView("th_status_only")).not.toBe(cachedView);
+  });
+
+  it("removes status-only orphans when the authoritative thread list arrives", () => {
+    const store = new AppStore();
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_current"),
+      threadStatus("th_orphan"),
+    ]);
+    const orphanView = store.threadView("th_orphan");
+
+    store.replaceThreadsForSession("se_1", [thread("th_current")]);
+
+    expect(store.threadStatus("th_current")).toBeDefined();
+    expect(store.threadStatus("th_orphan")).toBeUndefined();
+    expect(store.threadView("th_orphan")).not.toBe(orphanView);
+  });
+
+  it("does not restore status-only orphans after an authoritative empty thread list", () => {
+    const store = new AppStore();
+    store.replaceThreadsForSession("se_1", []);
+
+    store.replaceThreadStatusesForSession("se_1", [threadStatus("th_orphan")]);
+
+    expect(store.threadStatus("th_orphan")).toBeUndefined();
+  });
+
+  it("keeps deletion tombstones across stale bulk snapshots until a newer creation", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.replaceSessionSummaries([summary], 5);
+    store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:03:00Z",
+      type: "session.deleted",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    });
+
+    store.replaceSessionMetadata([{ ...metadata, title: "Stale list" }]);
+    store.upsertSessionMetadata({ ...metadata, title: "Stale detail" });
+    store.replaceSessionSummaries([{ ...summary, latest_cursor: 8 }], 8);
+    store.applyServerEvent({
+      cursor: 10,
+      scope: "server",
+      ts: "2026-08-01T12:04:00Z",
+      type: "session.summary_updated",
+      session_id: "se_1",
+      summary: { ...summary, latest_cursor: 10 },
+    });
+    expect(store.isSessionTombstoned("se_1")).toBe(true);
+    expect(readSignal(store.sessions)).toEqual([]);
+
+    expect(store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:03:00Z",
+      type: "session.created",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    })).toBe(false);
+    expect(store.isSessionTombstoned("se_1")).toBe(true);
+
+    expect(store.applyServerEvent({
+      cursor: 11,
+      scope: "server",
+      ts: "2026-08-01T12:05:00Z",
+      type: "session.created",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    })).toBe(true);
+    store.replaceSessionMetadata([{ ...metadata, title: "Recreated" }]);
+    store.replaceSessionSummaries([{ ...summary, latest_cursor: 11 }], 11);
+    expect(store.isSessionTombstoned("se_1")).toBe(false);
+    expect(store.session("se_1")?.title).toBe("Recreated");
+  });
+
+  it("keeps a local tombstone unbounded until its durable delete edge arrives", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.removeSession("se_1");
+
+    expect(store.applyServerEvent({
+      cursor: 100,
+      scope: "server",
+      ts: "2026-08-01T12:05:00Z",
+      type: "session.created",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    })).toBe(false);
+    expect(store.isSessionTombstoned("se_1")).toBe(true);
+
+    store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:03:00Z",
+      type: "session.deleted",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    });
+    expect(store.applyServerEvent({
+      cursor: 10,
+      scope: "server",
+      ts: "2026-08-01T12:04:00Z",
+      type: "session.created",
+      session_id: "se_1",
+      workspace_id: "ws_1",
+    })).toBe(true);
+    expect(store.isSessionTombstoned("se_1")).toBe(false);
   });
 
   it("does not roll a refreshed projection backward with delayed SSE", () => {

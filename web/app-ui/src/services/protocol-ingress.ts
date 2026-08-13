@@ -66,6 +66,13 @@ const materializeSessionSnapshot = (
     summaries: sessions.map(fallbackSessionSummary),
   };
 
+const sessionTombstoneId = (envelope: ProtocolEventEnvelope): string | undefined =>
+  envelope.type === "session.deleted"
+    ? envelope.session_id
+    : envelope.type === "session.summary_updated" && envelope.summary === null
+      ? envelope.session_id
+      : undefined;
+
 type GithubSnapshotEnvelope = Extract<
   ProtocolEventEnvelope,
   { readonly type: "github.pull_requests_updated" }
@@ -144,7 +151,7 @@ export class ProtocolIngress {
   #metadataRefresh: Promise<void> | undefined;
   #metadataRefreshPending = false;
   #metadataRevision = 0;
-  readonly #threadRefreshes = new Map<string, boolean>();
+  readonly #threadRefreshes = new Map<string, { pending: boolean }>();
   #serverReplayTimer: unknown;
 
   constructor(
@@ -267,8 +274,7 @@ export class ProtocolIngress {
     const snapshot = materializeSessionSnapshot(boundary, sessions);
     this.#store.replaceServerInfo(info);
     this.#store.replaceSessionMetadata(sessions);
-    this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
-    this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
+    this.#replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
     this.#store.replaceWorkspaces(workspaces);
     if (projection.kind === "snapshot") {
       this.#store.replaceServerProjection(
@@ -360,6 +366,7 @@ export class ProtocolIngress {
       return;
     }
     for (const envelope of this.#serverReplay.take()) {
+      this.#invalidateThreadRefreshForTombstone(envelope);
       this.#store.applyServerEvent(envelope);
     }
   }
@@ -394,8 +401,7 @@ export class ProtocolIngress {
     const acceptedCursor =
       this.#stream === undefined ? 0 : readSignal(this.#stream.cursor);
     if (snapshot.cursor >= acceptedCursor) {
-      this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
-      this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
+      this.#replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
     }
     if (
       projection.kind === "snapshot"
@@ -418,8 +424,7 @@ export class ProtocolIngress {
     const acceptedCursor =
       this.#stream === undefined ? 0 : readSignal(this.#stream.cursor);
     if (snapshot.cursor < acceptedCursor) return false;
-    this.#store.replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
-    this.#onSessionSummaries(snapshot.summaries, snapshot.cursor);
+    this.#replaceSessionSummaries(snapshot.summaries, snapshot.cursor);
     return true;
   }
 
@@ -449,7 +454,13 @@ export class ProtocolIngress {
       return;
     }
     this.#onKnownEvent(event.envelope);
-    if (event.envelope.type === "thread.created" || event.envelope.type === "thread.updated") {
+    this.#invalidateThreadRefreshForTombstone(event.envelope);
+    const tombstone = sessionTombstoneId(event.envelope);
+    if (tombstone !== undefined) this.#metadataRevision += 1;
+    if (
+      (event.envelope.type === "thread.created" || event.envelope.type === "thread.updated")
+      && !this.#store.isSessionTombstoned(event.envelope.session_id)
+    ) {
       this.#scheduleThreadRefresh(event.envelope.session_id);
     }
     if (this.#store.applyServerEvent(event.envelope)) {
@@ -459,29 +470,59 @@ export class ProtocolIngress {
   }
 
   #scheduleThreadRefresh(sessionId: string): void {
-    const active = this.#threadRefreshes.has(sessionId);
-    this.#threadRefreshes.set(sessionId, active);
-    if (!active) void this.#refreshThreads(sessionId, this.#generation);
+    const active = this.#threadRefreshes.get(sessionId);
+    if (active !== undefined) {
+      active.pending = true;
+      return;
+    }
+    const state = { pending: false };
+    this.#threadRefreshes.set(sessionId, state);
+    void this.#refreshThreads(sessionId, this.#generation, state);
   }
 
-  async #refreshThreads(sessionId: string, generation: number): Promise<void> {
-    while (this.#isCurrentGeneration(generation)) {
-      this.#threadRefreshes.set(sessionId, false);
+  async #refreshThreads(
+    sessionId: string,
+    generation: number,
+    state: { pending: boolean },
+  ): Promise<void> {
+    while (
+      this.#isCurrentGeneration(generation)
+      && this.#threadRefreshes.get(sessionId) === state
+    ) {
+      state.pending = false;
       try {
         const threads = await this.#client.threads(sessionId);
-        if (!this.#isCurrentGeneration(generation)) return;
+        if (
+          !this.#isCurrentGeneration(generation)
+          || this.#store.isSessionTombstoned(sessionId)
+          || this.#threadRefreshes.get(sessionId) !== state
+        ) return;
         // A second lifecycle event landed while this request was in flight.
         // Discard its stale response and fetch the final authoritative list.
-        if (this.#threadRefreshes.get(sessionId)) continue;
+        if (state.pending) continue;
         this.#store.replaceThreadsForSession(sessionId, threads);
       } catch {
         // Route ingress and the next lifecycle event both retry. Keep the
         // currently rendered tabs intact when a metadata read is transiently
         // unavailable.
-        if (this.#threadRefreshes.get(sessionId)) continue;
+        if (state.pending) continue;
       }
-      this.#threadRefreshes.delete(sessionId);
+      if (this.#threadRefreshes.get(sessionId) === state) {
+        this.#threadRefreshes.delete(sessionId);
+      }
       return;
+    }
+  }
+
+  #invalidateThreadRefreshForTombstone(envelope: ProtocolEventEnvelope): void {
+    if (
+      envelope.type === "session.deleted"
+      || (envelope.type === "session.summary_updated" && envelope.summary === null)
+    ) {
+      // Deleting the identity token invalidates any request already awaiting a
+      // thread list. A later recreation gets a distinct state object, so the
+      // stale response cannot delete or overwrite its refresh.
+      this.#threadRefreshes.delete(envelope.session_id);
     }
   }
 
@@ -504,11 +545,16 @@ export class ProtocolIngress {
     while (this.#isCurrentGeneration(generation) && this.#metadataRefreshPending) {
       this.#metadataRefreshPending = false;
       try {
+        const metadataRevision = this.#metadataRevision;
         const [sessions, workspaces] = await Promise.all([
           this.#client.sessions(),
           this.#client.workspaces(),
         ]);
         if (!this.#isCurrentGeneration(generation)) return;
+        if (metadataRevision !== this.#metadataRevision) {
+          if (this.#metadataRefreshPending) continue;
+          return;
+        }
         if (this.#metadataRefreshPending) continue;
         this.#store.replaceSessionMetadata(sessions);
         this.#store.replaceWorkspaces(workspaces);
@@ -520,6 +566,17 @@ export class ProtocolIngress {
 
   #isCurrentGeneration(generation: number): boolean {
     return this.#started && generation === this.#generation;
+  }
+
+  #replaceSessionSummaries(
+    summaries: readonly ProtocolSessionSummary[],
+    cursor: number,
+  ): void {
+    const visible = summaries.filter(
+      ({ session_id }) => !this.#store.isSessionTombstoned(session_id),
+    );
+    this.#store.replaceSessionSummaries(visible, cursor);
+    this.#onSessionSummaries(visible, cursor);
   }
 
   #attachListeners(): void {

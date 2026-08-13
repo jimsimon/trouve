@@ -14,7 +14,6 @@ use trouve_client_core::{
 };
 use trouve_desktop_host::{
     FrontendSource, HostCapabilities, HostGateway, HostNativeActions, HostPreferences,
-    VerifiedSessionFile,
 };
 use trouve_protocol::PROTOCOL_VERSION;
 
@@ -50,29 +49,6 @@ impl WebPreviewHost {
             .with_context(|| format!("connecting embedded Servo preview to {upstream}"))?;
         ensure_compatible_protocol(&server_info.protocol_version, PROTOCOL_VERSION)
             .with_context(|| format!("connecting embedded Servo preview to {upstream}"))?;
-        let file_protocol = protocol.clone();
-        let native_actions =
-            native_actions.with_session_file_resolver(move |session_id, relative_path| {
-                let file_protocol = file_protocol.clone();
-                async move {
-                    let sessions = file_protocol
-                        .list_sessions()
-                        .await
-                        .map_err(|_| "session lookup failed".to_string())?;
-                    let worktree = sessions
-                        .into_iter()
-                        .find(|session| session.id == session_id)
-                        .map(|session| session.worktree_path)
-                        .ok_or_else(|| "session is unavailable".to_string())?;
-                    tokio::task::spawn_blocking(move || {
-                        VerifiedSessionFile::resolve(worktree, relative_path)
-                            .map_err(|_| "session file is unavailable".to_string())
-                    })
-                    .await
-                    .map_err(|_| "session file verification was interrupted".to_string())?
-                }
-            });
-
         let (gateway_address, gateway) =
             runtime.block_on(HostGateway::bind_loopback_with_actions(
                 "127.0.0.1:0"

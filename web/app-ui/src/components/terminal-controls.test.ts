@@ -30,6 +30,17 @@ describe("terminal control integration", () => {
     expect(view).toContain("if (this.#focusRequested)");
   });
 
+  it("replays retained output for terminals that have already exited", () => {
+    expect(panel).toContain("if (this.#streams.has(terminal.id)) return;");
+    expect(panel).not.toContain("if (terminal.exited || this.#streams.has(terminal.id)) return;");
+  });
+
+  it("distinguishes expired backlog from malformed terminal output", () => {
+    expect(panel).toContain('diagnostic.kind === "non-contiguous-offset"');
+    expect(panel).toContain("Some earlier terminal output is no longer available.");
+    expect(panel).toContain("Some terminal output could not be decoded.");
+  });
+
   it("enables the xterm API required by the Unicode 11 addon", () => {
     expect(view).toContain("allowProposedApi: true");
     expect(view).toContain("new unicode.Unicode11Addon()");

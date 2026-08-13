@@ -32,7 +32,7 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 use tokio::sync::{oneshot, watch};
 use trouve_desktop_host::{
-    CloseDecision, FrontendSource, HostLifecycleHandle, HostNativeActions, LocalFileAction,
+    CloseDecision, FrontendSource, HostLifecycleHandle, HostNativeActions,
     MAX_NATIVE_ATTACHMENT_BYTES, MAX_NATIVE_ATTACHMENT_TOTAL_BYTES, MAX_NATIVE_ATTACHMENTS,
     NativeAttachment, NativeNotification, WindowGeometry,
 };
@@ -172,6 +172,10 @@ fn control_flow_for_pending_deadlines(
         .unwrap_or(ControlFlow::Wait)
 }
 
+fn allow_unbundled_frontend(product_host: bool, debug_build: bool) -> bool {
+    !product_host || debug_build
+}
+
 #[allow(dead_code)] // Used only by the explicit `trouve-web-preview` target.
 fn main() -> anyhow::Result<()> {
     run(false)
@@ -185,7 +189,10 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
         .init();
 
     let bundled = WEB_ASSETS_BUNDLED.then(bundled_web_assets).transpose()?;
-    let frontend = FrontendSource::from_preview_environment(bundled, cfg!(debug_assertions))?;
+    let frontend = FrontendSource::from_preview_environment(
+        bundled,
+        allow_unbundled_frontend(product_host, cfg!(debug_assertions)),
+    )?;
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let directory_proxy = event_loop.create_proxy();
@@ -237,17 +244,8 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 .send_event(AppEvent::RequestAttention)
                 .map_err(|_| "desktop event loop is unavailable".to_string())
         })
-        .with_local_file_handler(|file, action| {
-            let target = match action {
-                LocalFileAction::Open => file.as_path(),
-                LocalFileAction::Reveal => file
-                    .as_path()
-                    .parent()
-                    .ok_or_else(|| "session file has no parent directory".to_string())?,
-            };
-            opener::open(target);
-            Ok(())
-        })
+        // Session file open/reveal stays unadvertised until the native opener
+        // can consume a confined file handle instead of a racy pathname.
         .with_directory_picker(move || {
             let directory_proxy = directory_proxy.clone();
             async move {
@@ -277,10 +275,7 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
                 .await
                 .map_err(|_| "desktop clipboard worker was interrupted".to_string())?
         })
-        .with_external_https_opener(|url| {
-            opener::open(url.as_url().as_str());
-            Ok(())
-        });
+        .with_external_https_opener(|url| opener::open(url.as_url().as_str()));
     let host = if product_host {
         WebPreviewHost::start_product_with_native_actions(frontend, native_actions)?
     } else {
@@ -291,7 +286,26 @@ pub(crate) fn run(product_host: bool) -> anyhow::Result<()> {
     let gateway_origin = host.gateway_origin().to_owned();
     let allowed_origin = gateway_origin.clone();
     let allowed_prefix = format!("{allowed_origin}/");
-    let restored_geometry = host.initial_preferences().geometry.clone();
+    let restored_geometry = host
+        .initial_preferences()
+        .geometry
+        .clone()
+        .and_then(|geometry| {
+            let monitors = event_loop
+                .available_monitors()
+                .map(|monitor| {
+                    let position = monitor.position();
+                    let size = monitor.size();
+                    MonitorBounds {
+                        x: position.x,
+                        y: position.y,
+                        width: size.width,
+                        height: size.height,
+                    }
+                })
+                .collect::<Vec<_>>();
+            restore_geometry_on_monitors(geometry, &monitors)
+        });
     let mut window_builder = WindowBuilder::new()
         .with_title(if product_host {
             "trouve"
@@ -545,6 +559,54 @@ fn capture_window_geometry(
     previous
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn restore_geometry_on_monitors(
+    mut geometry: WindowGeometry,
+    monitors: &[MonitorBounds],
+) -> Option<WindowGeometry> {
+    if monitors.is_empty() {
+        return None;
+    }
+    const MIN_TITLE_WIDTH: i64 = 128;
+    const TITLE_HEIGHT: i64 = 32;
+    let intersects = |geometry: &WindowGeometry, monitor: &MonitorBounds| {
+        let left = i64::from(geometry.x).max(i64::from(monitor.x));
+        let right = (i64::from(geometry.x) + i64::from(geometry.width))
+            .min(i64::from(monitor.x) + i64::from(monitor.width));
+        let title_top = i64::from(geometry.y).max(i64::from(monitor.y));
+        let title_bottom = (i64::from(geometry.y) + TITLE_HEIGHT)
+            .min(i64::from(monitor.y) + i64::from(monitor.height));
+        right - left >= MIN_TITLE_WIDTH && title_bottom - title_top >= TITLE_HEIGHT
+    };
+    if monitors
+        .iter()
+        .any(|monitor| intersects(&geometry, monitor))
+    {
+        return Some(geometry);
+    }
+
+    // Monitor topology changed. Preserve the saved size as far as practical,
+    // then place the window inside the first current monitor with a small
+    // inset so the title bar and resize affordances remain reachable.
+    let monitor = monitors[0];
+    geometry.width = geometry.width.min(monitor.width.max(320));
+    geometry.height = geometry.height.min(monitor.height.max(240));
+    let inset_x = i64::from(monitor.width.saturating_sub(geometry.width).min(32));
+    let inset_y = i64::from(monitor.height.saturating_sub(geometry.height).min(32));
+    geometry.x =
+        (i64::from(monitor.x) + inset_x).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    geometry.y =
+        (i64::from(monitor.y) + inset_y).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    Some(geometry)
+}
+
 fn show_native_notification(notification: NativeNotification, lifecycle: HostLifecycleHandle) {
     native_notification::show(
         notification.title().to_owned(),
@@ -650,6 +712,122 @@ fn read_clipboard_image_attachment() -> Result<Option<NativeAttachment>, String>
 #[cfg(test)]
 mod close_confirmation_tests {
     use super::*;
+
+    #[test]
+    fn optimized_qualification_hosts_allow_runtime_frontend_sources() {
+        assert!(allow_unbundled_frontend(false, false));
+        assert!(allow_unbundled_frontend(false, true));
+        assert!(allow_unbundled_frontend(true, true));
+        assert!(!allow_unbundled_frontend(true, false));
+    }
+
+    #[test]
+    fn restored_geometry_stays_when_visible_on_any_monitor() {
+        let geometry = WindowGeometry {
+            x: 2_000,
+            y: 100,
+            width: 1_200,
+            height: 800,
+            maximized: false,
+        };
+        let monitors = [
+            MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+            MonitorBounds {
+                x: 1_920,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+        ];
+        assert_eq!(
+            restore_geometry_on_monitors(geometry.clone(), &monitors),
+            Some(geometry)
+        );
+    }
+
+    #[test]
+    fn restored_geometry_moves_onto_remaining_monitor() {
+        let geometry = WindowGeometry {
+            x: 4_000,
+            y: 500,
+            width: 2_400,
+            height: 1_400,
+            maximized: true,
+        };
+        let monitors = [MonitorBounds {
+            x: -1_920,
+            y: 0,
+            width: 1_920,
+            height: 1_080,
+        }];
+        let restored = restore_geometry_on_monitors(geometry, &monitors).unwrap();
+        assert_eq!(restored.x, -1_920);
+        assert_eq!(restored.y, 0);
+        assert_eq!(restored.width, 1_920);
+        assert_eq!(restored.height, 1_080);
+        assert!(restored.maximized);
+    }
+
+    #[test]
+    fn restored_geometry_with_only_a_bottom_corner_visible_is_repositioned() {
+        let monitor = MonitorBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let geometry = WindowGeometry {
+            x: 1800,
+            y: 1016,
+            width: 1200,
+            height: 800,
+            maximized: false,
+        };
+
+        let restored = restore_geometry_on_monitors(geometry, &[monitor]).unwrap();
+        assert!(restored.x >= monitor.x);
+        assert!(restored.y >= monitor.y);
+        assert!(restored.x + 128 <= monitor.x + monitor.width as i32);
+        assert!(restored.y + 32 <= monitor.y + monitor.height as i32);
+    }
+
+    #[test]
+    fn restored_geometry_with_only_its_bottom_edge_visible_is_repositioned() {
+        let monitor = MonitorBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let geometry = WindowGeometry {
+            x: 200,
+            y: -736,
+            width: 1200,
+            height: 800,
+            maximized: false,
+        };
+
+        let restored = restore_geometry_on_monitors(geometry, &[monitor]).unwrap();
+        assert!(restored.y >= monitor.y);
+        assert!(restored.y + 32 <= monitor.y + monitor.height as i32);
+    }
+
+    #[test]
+    fn restored_geometry_falls_back_when_no_monitor_is_reported() {
+        let geometry = WindowGeometry {
+            x: 10,
+            y: 10,
+            width: 1_200,
+            height: 800,
+            maximized: false,
+        };
+        assert_eq!(restore_geometry_on_monitors(geometry, &[]), None);
+    }
 
     #[test]
     fn cancel_disarms_the_deadline_and_makes_the_next_close_fresh() {

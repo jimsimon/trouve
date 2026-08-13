@@ -148,6 +148,39 @@ describe("composer draft persistence", () => {
     expect(attachmentStorage.values.get("thread-a")).toEqual([persisted]);
   });
 
+  it("permanently discards late stage, persist, and hydrate work for a deleted thread", async () => {
+    const textStorage = new MemoryTextStorage();
+    textStorage.values.set("thread-a", { text: "stored", cursor: 6 });
+    const attachmentStorage = new MemoryAttachmentStorage();
+    const storedAttachment = attachment("stored.png");
+    let resolveLoad!: (attachments: readonly PendingAttachment[]) => void;
+    const pendingLoad = new Promise<readonly PendingAttachment[]>((resolve) => {
+      resolveLoad = resolve;
+    });
+    attachmentStorage.load = vi.fn(() => pendingLoad);
+    const controller = new ComposerDraftController({ textStorage, attachmentStorage });
+    const hydrate = controller.hydrate("thread-a");
+
+    const discard = controller.discard("thread-a");
+    expect(controller.stage("thread-a", {
+      text: "late text",
+      cursor: 9,
+      attachments: [attachment("late.png")],
+    })).toEqual({ text: "", cursor: 0, attachments: [] });
+    const latePersist = controller.persist("thread-a");
+    resolveLoad([storedAttachment]);
+    await Promise.all([discard, hydrate, latePersist]);
+
+    expect(controller.read("thread-a")).toEqual({ text: "", cursor: 0, attachments: [] });
+    expect(await controller.hydrate("thread-a")).toEqual({
+      text: "",
+      cursor: 0,
+      attachments: [],
+    });
+    expect(textStorage.values.has("thread-a")).toBe(false);
+    expect(attachmentStorage.values.has("thread-a")).toBe(false);
+  });
+
   it("uses bounded versioned browser text records and removes submitted drafts", () => {
     const values = new Map<string, string>();
     const storage = {

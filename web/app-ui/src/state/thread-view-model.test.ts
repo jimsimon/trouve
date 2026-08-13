@@ -404,6 +404,40 @@ describe("ThreadViewModel", () => {
     expect(view.totalItems).toBe(0);
   });
 
+  it("aborts an unmatched provider wait when its turn is cancelled", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "turn.started",
+      turn: 3,
+      mode: "code",
+      model: "test/model",
+    }, "2026-08-01T12:00:00.000Z"));
+    view.apply(envelope(2, {
+      type: "tool.requested",
+      turn: 3,
+      call_id: "wait",
+      tool: "collabAgentToolCall",
+      args: { tool: "wait" },
+      requires_approval: false,
+    }, "2026-08-01T12:00:00.010Z"));
+    view.apply(envelope(3, {
+      type: "tool.started",
+      call_id: "wait",
+    }, "2026-08-01T12:00:00.020Z"));
+    view.apply(envelope(4, {
+      type: "turn.cancelled",
+      turn: 3,
+    }, "2026-08-01T12:00:00.270Z"));
+
+    expect(view.turnRunning).toBe(false);
+    expect(view.items).toEqual([expect.objectContaining({
+      kind: "tool",
+      callId: "wait",
+      status: "aborted",
+      durationMs: 250,
+    })]);
+  });
+
   it("closes thinking at tool and steering causal boundaries", () => {
     const view = new ThreadViewModel();
     view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before tool" }));

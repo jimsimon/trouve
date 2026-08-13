@@ -221,6 +221,7 @@ The Lit frontend's npm inventory is generated separately in
 | foreign-types-macros | 0.2.4 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | foreign-types-shared | 0.3.1 | MIT/Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
+| fs4 | 0.13.1 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | fs_extra | 1.3.0 | MIT | registry+https://github.com/rust-lang/crates.io-index |
 | futures | 0.3.33 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |
 | futures-channel | 0.3.33 | MIT OR Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index |

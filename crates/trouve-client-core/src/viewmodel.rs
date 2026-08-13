@@ -477,6 +477,40 @@ impl ThreadViewModel {
         }
     }
 
+    /// Preserve unmatched provider control-plane calls in terminal history,
+    /// but never leave them looking active after their owning turn ends.
+    fn abort_open_tools(&mut self, ended: chrono::DateTime<chrono::Utc>) -> Option<usize> {
+        let mut last_changed = None;
+        for (idx, item) in self.items.iter_mut().enumerate() {
+            let ChatItem::ToolCall {
+                call_id,
+                status,
+                duration_ms,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if !matches!(
+                *status,
+                ToolCallStatus::Running | ToolCallStatus::AwaitingApproval
+            ) {
+                continue;
+            }
+            *status = ToolCallStatus::Aborted;
+            if duration_ms.is_none()
+                && let Some(started) = self.tool_started_at.remove(call_id)
+            {
+                *duration_ms = Some((ended - started).num_milliseconds().max(0) as u64);
+            } else {
+                self.tool_started_at.remove(call_id);
+            }
+            last_changed = Some(idx);
+        }
+        self.pending_approvals.clear();
+        last_changed
+    }
+
     fn active_turn(&self) -> Option<u64> {
         self.items.iter().rev().find_map(|item| match item {
             ChatItem::TurnStatus {
@@ -919,6 +953,7 @@ impl ThreadViewModel {
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
+                let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
                 self.last_usage = Some(usage.clone());
                 self.record_turn_duration(*turn, envelope.ts);
@@ -940,13 +975,14 @@ impl ThreadViewModel {
                         },
                     };
                 }
-                idx
+                idx.or(aborted_tool)
             }
             Event::TurnFailed { turn, error } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
+                let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
@@ -966,13 +1002,14 @@ impl ThreadViewModel {
                         },
                     };
                 }
-                idx
+                idx.or(aborted_tool)
             }
             Event::TurnCancelled { turn } => {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
                 self.finish_thinking();
+                let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
                 self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().position(|i| {
@@ -987,7 +1024,7 @@ impl ThreadViewModel {
                 if let Some(idx) = idx {
                     self.items.remove(idx);
                 }
-                idx
+                idx.or(aborted_tool)
             }
             // Session/server scope events don't render in the chat stream.
             _ => None,
@@ -1616,6 +1653,16 @@ mod tests {
             thinking_level: None,
             supports_steering: false,
         }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "wait".into(),
+            tool: "collabAgentToolCall".into(),
+            args: serde_json::json!({ "tool": "wait" }),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "wait".into(),
+        }));
         assert!(vm.turn_running);
         vm.apply(&env(Event::TurnCancelled { turn: 1 }));
         assert!(!vm.turn_running);
@@ -1625,6 +1672,14 @@ mod tests {
                 state: TurnState::Running,
                 ..
             }
+        )));
+        assert!(vm.items.iter().any(|item| matches!(
+            item,
+            ChatItem::ToolCall {
+                call_id,
+                status: ToolCallStatus::Aborted,
+                ..
+            } if call_id == "wait"
         )));
     }
 

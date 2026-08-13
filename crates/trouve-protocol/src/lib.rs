@@ -255,7 +255,11 @@ pub use requests::*;
 // 4.0: acknowledge that the 3.25/3.26 closed-enum additions were breaking for
 // generated clients. Clients now require an exact protocol version instead of
 // assuming that every newer same-major schema is forward-compatible.
-pub const PROTOCOL_VERSION: &str = "4.0";
+// 5.0: terminal output streams announce their absolute replay start with a
+// named, id-less `replay-start` SSE event before replay and live output;
+// approval and question resolution require the owning thread to prevent
+// vendor-local id collisions and delayed-response ambiguity.
+pub const PROTOCOL_VERSION: &str = "5.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 

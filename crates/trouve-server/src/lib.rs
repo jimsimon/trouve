@@ -45,11 +45,11 @@ use trouve_protocol::{
     SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
     SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SetMcpServerEnabledRequest,
     SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
-    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
-    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -301,6 +301,7 @@ impl IntoResponse for ApiError {
         OpenTerminalRequest,
         TerminalInfo,
         TerminalInputRequest,
+        TerminalReplayStart,
         TerminalResizeRequest,
         PrInfo,
         PrDetail,
@@ -945,6 +946,9 @@ pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
+    engine.reconcile_checkpoint_refs().await;
+    engine.retry_artifact_cleanup_jobs().await;
+    engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
@@ -1545,22 +1549,100 @@ async fn get_attachment(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
-    let (attachment, path) = engine.attachment(&id)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| ApiError::from(EngineError::NotFound(format!("attachment {id}: {e}"))))?;
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, attachment.mime),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{}\"", attachment.name.replace('"', "")),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    let (attachment, bytes) = engine.attachment(&id).await?;
+    let preview_mime = safe_attachment_preview_mime(&attachment.mime);
+    let disposition = attachment_content_disposition(&attachment.name, preview_mime.is_some());
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(preview_mime.unwrap_or("application/octet-stream")),
+    );
+    headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// Only browser-safe raster formats may render in the application origin.
+/// In particular, SVG and user-supplied text/HTML are downloads even when a
+/// legacy database row claims a renderable MIME type.
+fn safe_attachment_preview_mime(mime: &str) -> Option<&'static str> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn attachment_content_disposition(name: &str, inline: bool) -> axum::http::HeaderValue {
+    const MAX_FILENAME_BYTES: usize = 1024;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut fallback = String::new();
+    let mut encoded = String::new();
+    let mut source_bytes = 0;
+    for ch in name.chars() {
+        let char_bytes = ch.len_utf8();
+        if source_bytes + char_bytes > MAX_FILENAME_BYTES {
+            break;
+        }
+        source_bytes += char_bytes;
+
+        if fallback.len() < 150 {
+            fallback.push(
+                if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                },
+            );
+        }
+        let mut utf8 = [0; 4];
+        for &byte in ch.encode_utf8(&mut utf8).as_bytes() {
+            if byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+            {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    if fallback.trim().is_empty() {
+        fallback = "attachment".to_string();
+    }
+    if encoded.is_empty() {
+        encoded = "attachment".to_string();
+    }
+    let kind = if inline { "inline" } else { "attachment" };
+    axum::http::HeaderValue::try_from(format!(
+        "{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment"))
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/queue", params(("id" = String, Path,)),
@@ -1655,22 +1737,24 @@ async fn delete_queued_prompt(
 }
 
 #[utoipa::path(post, path = "/v1/approvals", request_body = ResolveApprovalRequest,
-    responses((status = 204), (status = 404, body = ErrorBody)))]
+    responses((status = 204), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
 async fn resolve_approval(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.resolve_approval(&req.call_id, req.decision)?;
+    engine.resolve_approval(&req.thread_id, &req.call_id, req.decision)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/questions", request_body = ResolveQuestionRequest,
-    responses((status = 204), (status = 404, body = ErrorBody)))]
+    responses((status = 204), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
 async fn resolve_question(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<ResolveQuestionRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.resolve_question(&req.request_id, req.answers)?;
+    engine.resolve_question(&req.thread_id, &req.request_id, req.answers)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2113,7 +2197,8 @@ async fn delete_mode(
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}/diff", params(("id" = String, Path,)),
-    responses((status = 200, body = SessionDiff), (status = 404, body = ErrorBody)))]
+    responses((status = 200, body = SessionDiff), (status = 404, body = ErrorBody),
+              (status = 413, body = ErrorBody)))]
 async fn session_diff(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
@@ -2238,7 +2323,7 @@ async fn kill_terminal(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.terminal_kill(&id)?;
+    engine.terminal_kill(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2254,7 +2339,7 @@ async fn terminal_input(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&req.data)
         .map_err(|e| EngineError::BadRequest(format!("bad base64 input: {e}")))?;
-    engine.terminal_input(&id, &bytes)?;
+    engine.terminal_input(&id, &bytes).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2266,17 +2351,18 @@ async fn terminal_resize(
     Path(id): Path<String>,
     Json(req): Json<TerminalResizeRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.terminal_resize(&id, req.cols, req.rows)?;
+    engine.terminal_resize(&id, req.cols, req.rows).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// PTY output as SSE: each event's `id` is the byte offset *after* the
-/// chunk, data is base64. `?after=` resumes from an offset (bytes older
-/// than the retained backlog are silently skipped). A final `exit` event
+/// PTY output as SSE. A named, id-less `replay-start` event first announces
+/// the absolute replay offset as JSON. Each following output event's `id` is
+/// the byte offset *after* its base64 data. `?after=` resumes from an offset
+/// (bytes older than the retained backlog are skipped). A final `exit` event
 /// marks shell exit. Ephemeral — not part of the persisted event log.
 #[utoipa::path(get, path = "/v1/terminals/{id}/output",
     params(("id" = String, Path,), ("after" = Option<u64>, Query, description = "Resume byte offset")),
-    responses((status = 200, description = "SSE stream of base64 output chunks"),
+    responses((status = 200, description = "SSE replay-start marker and base64 output chunks"),
               (status = 404, body = ErrorBody)))]
 async fn terminal_output(
     State(engine): State<Arc<Engine>>,
@@ -2285,11 +2371,19 @@ async fn terminal_output(
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let (start, replay, mut live, exited) = engine.terminal_subscribe(&id, q.after.unwrap_or(0))?;
+    let (start, replay, mut live, exited) =
+        engine.terminal_subscribe(&id, q.after.unwrap_or(0)).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
     tokio::spawn(async move {
         let mut offset = start;
+        let replay_start = TerminalReplayStart { offset: start };
+        let marker = SseEvent::default()
+            .event("replay-start")
+            .data(serde_json::to_string(&replay_start).expect("terminal replay marker serializes"));
+        if tx.send(marker).await.is_err() {
+            return;
+        }
         if !replay.is_empty() {
             offset += replay.len() as u64;
             let ev = SseEvent::default()
@@ -2727,4 +2821,42 @@ async fn code_review_job_events(
 ) -> impl IntoResponse {
     let after = resume_cursor(&headers, &q);
     event_stream(engine, Scope::CodeReviewJob(id), after)
+}
+
+#[cfg(test)]
+mod attachment_response_tests {
+    use super::{attachment_content_disposition, safe_attachment_preview_mime};
+
+    #[test]
+    fn only_safe_raster_mime_types_render_inline() {
+        assert_eq!(safe_attachment_preview_mime("image/png"), Some("image/png"));
+        assert_eq!(
+            safe_attachment_preview_mime("IMAGE/JPEG"),
+            Some("image/jpeg")
+        );
+        assert_eq!(safe_attachment_preview_mime("image/svg+xml"), None);
+        assert_eq!(safe_attachment_preview_mime("text/html"), None);
+        assert_eq!(
+            safe_attachment_preview_mime("image/png; charset=utf-8"),
+            None
+        );
+    }
+
+    #[test]
+    fn content_disposition_cannot_inject_headers() {
+        let value = attachment_content_disposition("bad\"\r\nX-Evil: yes.svg", false);
+        let value = value.to_str().expect("ASCII content-disposition");
+        assert!(value.starts_with("attachment; filename=\""));
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\n'));
+        assert!(value.contains("%22%0D%0AX-Evil%3A%20yes.svg"));
+    }
+
+    #[test]
+    fn content_disposition_preserves_unicode_via_rfc5987() {
+        let value = attachment_content_disposition("snowman-☃.png", true);
+        let value = value.to_str().expect("ASCII content-disposition");
+        assert!(value.starts_with("inline; filename=\"snowman-_.png\""));
+        assert!(value.contains("filename*=UTF-8''snowman-%E2%98%83.png"));
+    }
 }

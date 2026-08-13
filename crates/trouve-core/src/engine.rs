@@ -25,11 +25,15 @@ use trouve_protocol::{
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
-use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
-use crate::store::{CheckpointRow, Store};
+use crate::permissions::{
+    ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
+};
+use crate::store::{ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, Store};
 use crate::tools::{
-    BackgroundMutationLease, LocalToolExecutor, ToolCtx, ToolExecutor, ToolResult,
-    edit_strategy_for_model,
+    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
+    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
+    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
+    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, modes, new_id};
 
@@ -39,6 +43,11 @@ const MAX_ITERATIONS: usize = 32;
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
 const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+const MAX_ATTACHMENTS_PER_PROMPT: usize = 4;
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_NAME_BYTES: usize = 1024;
+const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 /// Production tools observe `ToolCtx::cancel` and clean up promptly. This
 /// bound prevents a third-party/custom executor that violates that contract
 /// from wedging the dispatcher forever.
@@ -49,22 +58,183 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
+fn attachment_mime_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_'
+        )
+}
+
+fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Validate the request envelope, including its exact decoded sizes, before
+/// allocating decoded buffers or creating any durable cleanup/file state.
+fn validate_attachment_uploads(
+    uploads: &[trouve_protocol::AttachmentUpload],
+) -> Result<(), EngineError> {
+    if uploads.len() > MAX_ATTACHMENTS_PER_PROMPT {
+        return Err(EngineError::BadRequest(format!(
+            "a prompt may contain at most {MAX_ATTACHMENTS_PER_PROMPT} attachments"
+        )));
+    }
+
+    let mut total_bytes = 0usize;
+    for upload in uploads {
+        if upload.name.is_empty()
+            || upload.name.trim().is_empty()
+            || upload.name.len() > MAX_ATTACHMENT_NAME_BYTES
+            || upload.name == "."
+            || upload.name == ".."
+            || upload
+                .name
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return Err(EngineError::BadRequest(
+                "attachment name must be a non-empty filename of at most 1024 bytes without controls or path separators"
+                    .into(),
+            ));
+        }
+        let Some((mime_type, mime_subtype)) = upload.mime.split_once('/') else {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} has an invalid MIME type",
+                upload.name
+            )));
+        };
+        if upload.mime.len() > MAX_ATTACHMENT_MIME_BYTES
+            || mime_type.is_empty()
+            || mime_subtype.is_empty()
+            || mime_subtype.contains('/')
+            || !mime_type.bytes().all(attachment_mime_token_byte)
+            || !mime_subtype.bytes().all(attachment_mime_token_byte)
+        {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} has an invalid MIME type",
+                upload.name
+            )));
+        }
+
+        let data = upload.data.as_bytes();
+        let padding = match data {
+            [.., b'=', b'='] => 2usize,
+            [.., b'='] => 1usize,
+            _ => 0usize,
+        };
+        let payload_len = data.len().saturating_sub(padding);
+        let canonical_tail = payload_len
+            .checked_sub(1)
+            .and_then(|index| data.get(index))
+            .and_then(|byte| base64_sextet(*byte))
+            .is_some_and(|sextet| match padding {
+                2 => sextet & 0x0f == 0,
+                1 => sextet & 0x03 == 0,
+                _ => true,
+            });
+        let valid_base64 = !data.is_empty()
+            && data.len() % 4 == 0
+            && data[..payload_len]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+            && data[payload_len..].iter().all(|byte| *byte == b'=')
+            && canonical_tail;
+        if !valid_base64 {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {}: invalid base64",
+                upload.name
+            )));
+        }
+        let decoded_bytes = data
+            .len()
+            .checked_div(4)
+            .and_then(|groups| groups.checked_mul(3))
+            .and_then(|bytes| bytes.checked_sub(padding))
+            .ok_or_else(|| EngineError::BadRequest("attachment size overflow".into()))?;
+        if decoded_bytes == 0 {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} is empty",
+                upload.name
+            )));
+        }
+        if decoded_bytes > MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::BadRequest(format!(
+                "attachment {} exceeds {} MB",
+                upload.name,
+                MAX_ATTACHMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(decoded_bytes)
+            .ok_or_else(|| EngineError::BadRequest("attachment size overflow".into()))?;
+        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+            return Err(EngineError::BadRequest(format!(
+                "attachments exceed {} MB in total",
+                MAX_ATTACHMENT_TOTAL_BYTES / (1024 * 1024)
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct PreparedAttachmentCleanup {
+    store: Store,
+    executor: Arc<dyn ToolExecutor>,
+    root: PathBuf,
     paths: Vec<PathBuf>,
+    claim: Option<ArtifactCleanupClaim>,
+    heartbeat_cancel: tokio_util::sync::CancellationToken,
+    ownership_lost: tokio_util::sync::CancellationToken,
     armed: bool,
 }
 
 impl PreparedAttachmentCleanup {
-    fn new(paths: Vec<PathBuf>) -> Self {
-        Self { paths, armed: true }
+    fn new(
+        store: Store,
+        executor: Arc<dyn ToolExecutor>,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        claim: Option<ArtifactCleanupClaim>,
+    ) -> Self {
+        let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+        let ownership_lost = tokio_util::sync::CancellationToken::new();
+        if let Some(claim) = claim.clone()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(maintain_artifact_cleanup_claim(
+                store.clone(),
+                claim,
+                heartbeat_cancel.clone(),
+                ownership_lost.clone(),
+            ));
+        }
+        Self {
+            store,
+            executor,
+            root,
+            paths,
+            claim,
+            heartbeat_cancel,
+            ownership_lost,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
+        self.heartbeat_cancel.cancel();
         self.armed = false;
     }
 
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
+    fn claim(&self) -> Option<ArtifactCleanupClaim> {
+        self.claim.clone()
     }
 }
 
@@ -73,8 +243,193 @@ impl Drop for PreparedAttachmentCleanup {
         if !self.armed {
             return;
         }
-        for path in &self.paths {
-            let _ = std::fs::remove_file(path);
+        self.heartbeat_cancel.cancel();
+        if self.ownership_lost.is_cancelled() {
+            if let Some(claim) = self.claim.as_ref() {
+                tracing::warn!(job_id = %claim.id, "staging cleanup claim was lost before rollback");
+            }
+            return;
+        }
+        if let Some(claim) = self.claim.as_ref() {
+            match self.store.renew_artifact_cleanup_claim(claim) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(job_id = %claim.id, "staging cleanup claim was lost before rollback");
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(job_id = %claim.id, %error, "could not verify staging cleanup ownership before rollback");
+                    return;
+                }
+            }
+        }
+        let cleanup = self
+            .executor
+            .rollback_attachment_files(&self.root, &self.paths);
+        if let Some(claim) = self.claim.as_ref() {
+            match cleanup {
+                Ok(()) => {
+                    if let Err(error) = self.store.complete_claimed_artifact_cleanup_job(claim) {
+                        tracing::error!(%error, job_id = %claim.id, "failed to retire rolled-back attachment job");
+                    }
+                }
+                Err(error) => {
+                    let _ = self.store.fail_claimed_artifact_cleanup_job(claim, &error);
+                    tracing::error!(%error, job_id = %claim.id, "failed to roll back staged attachment files");
+                }
+            }
+        } else if let Err(error) = cleanup {
+            tracing::error!(%error, "failed to roll back unstaged attachment files");
+        }
+    }
+}
+
+async fn maintain_artifact_cleanup_claim(
+    store: Store,
+    claim: ArtifactCleanupClaim,
+    cancel: tokio_util::sync::CancellationToken,
+    ownership_lost: tokio_util::sync::CancellationToken,
+) {
+    #[cfg(not(test))]
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    #[cfg(test)]
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                match store.renew_artifact_cleanup_claim(&claim) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(job_id = %claim.id, "artifact cleanup claim heartbeat lost ownership");
+                        ownership_lost.cancel();
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(job_id = %claim.id, %error, "artifact cleanup claim heartbeat failed");
+                        ownership_lost.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn execute_artifact_cleanup_job(
+    store: Store,
+    executor: Arc<dyn ToolExecutor>,
+    attachment_root: PathBuf,
+    managed_worktree_root: PathBuf,
+    job: ArtifactCleanupJob,
+    index_hooks: bool,
+) {
+    let Some(claim) = job.claim() else {
+        tracing::error!(job_id = %job.id, "refusing to execute an unclaimed artifact cleanup job");
+        return;
+    };
+    let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+    let ownership_lost = tokio_util::sync::CancellationToken::new();
+    let heartbeat = tokio::spawn(maintain_artifact_cleanup_claim(
+        store.clone(),
+        claim.clone(),
+        heartbeat_cancel.clone(),
+        ownership_lost.clone(),
+    ));
+    let repository_for_gc = job.repository_path.clone();
+    let mut result = if let Some(session_id) = job.session_id.as_deref() {
+        match store.session(session_id) {
+            Ok(Some(_)) => Err(format!(
+                "refusing cleanup because session {session_id} is live again"
+            )),
+            Err(error) => Err(format!(
+                "could not verify that session {session_id} remains deleted: {error:#}"
+            )),
+            Ok(None) => match store.list_sessions(None) {
+                Err(error) => Err(format!(
+                    "could not verify that deleted-session worktree has no live owner: {error:#}"
+                )),
+                Ok(sessions) => {
+                    match (job.worktree_path.as_deref(), job.repository_path.as_deref()) {
+                        (Some(worktree), Some(repository)) => {
+                            if let Some(owner) = sessions
+                                .iter()
+                                .find(|session| session.worktree_path == worktree)
+                            {
+                                Err(format!(
+                                    "refusing cleanup because worktree {worktree} is owned by live session {}",
+                                    owner.id
+                                ))
+                            } else {
+                                executor
+                                    .cleanup_deleted_session(&DeletedSessionCleanup {
+                                        managed_worktree_root,
+                                        worktree: PathBuf::from(worktree),
+                                        repository: PathBuf::from(repository),
+                                        session_id: session_id.to_string(),
+                                        attachment_root: attachment_root.clone(),
+                                        attachment_paths: job
+                                            .attachment_paths
+                                            .iter()
+                                            .map(PathBuf::from)
+                                            .collect(),
+                                        ownership_lost: ownership_lost.clone(),
+                                    })
+                                    .await
+                            }
+                        }
+                        _ => Err("deleted-session cleanup job is missing artifact paths".into()),
+                    }
+                }
+            },
+        }
+    } else {
+        executor
+            .cleanup_attachment_files(
+                &attachment_root,
+                job.attachment_paths.iter().map(PathBuf::from).collect(),
+                ownership_lost.clone(),
+            )
+            .await
+    };
+    if result.is_ok() {
+        result = match store.renew_artifact_cleanup_claim(&claim) {
+            Ok(true) if !ownership_lost.is_cancelled() => Ok(()),
+            Ok(_) => {
+                ownership_lost.cancel();
+                Err("artifact cleanup claim is no longer owned".into())
+            }
+            Err(error) => {
+                ownership_lost.cancel();
+                Err(format!(
+                    "could not verify artifact cleanup claim before completion: {error:#}"
+                ))
+            }
+        };
+    }
+    heartbeat_cancel.cancel();
+    let _ = heartbeat.await;
+
+    match result {
+        Ok(()) => {
+            if let Err(error) = store.complete_claimed_artifact_cleanup_job(&claim) {
+                tracing::warn!(job_id = %job.id, %error, "failed to retire artifact cleanup job");
+            }
+            if index_hooks && let Some(repository) = repository_for_gc {
+                crate::tools::gc_index_store_in_background(PathBuf::from(repository));
+            }
+        }
+        Err(error) => {
+            if let Err(store_error) = store.fail_claimed_artifact_cleanup_job(&claim, &error) {
+                tracing::error!(
+                    job_id = %job.id,
+                    %error,
+                    %store_error,
+                    "artifact cleanup failed and its durable retry could not be updated"
+                );
+            } else {
+                tracing::warn!(job_id = %job.id, %error, "artifact cleanup deferred for retry");
+            }
         }
     }
 }
@@ -83,6 +438,9 @@ impl Drop for PreparedAttachmentCleanup {
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
 const STREAM_EVENT_BATCH_MAX: usize = 64;
 const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Give an already-queued steer a deterministic turn even when a backend
+/// stream can produce output forever without yielding Pending.
+const MAX_BACKEND_EVENTS_BEFORE_STEER: usize = 32;
 
 /// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
 /// checkpoint is post-response bookkeeping, so briefly retry those transient
@@ -176,6 +534,7 @@ async fn flush_backend_event_batch(
 
 struct BackendCollaboratorProjection {
     thread: Thread,
+    mode: AgentMode,
     turn: u64,
     /// Whether the durable parent-rail link for this collaborator has been
     /// published. Child activity can arrive before the provider's formal
@@ -195,8 +554,23 @@ struct BackendCollaboratorProjection {
     /// to the canonical ToolExecutor lifecycle. Retain its ids only long
     /// enough to suppress output/completion after ownership is correlated.
     suppressed_bridge_calls: HashSet<String>,
+    /// Vendor-native mutations retain the session execution lane from
+    /// approval until the matching completion event.
+    mutation_permits: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
+    pending_approval: Option<PendingCollaboratorApproval>,
+    approval_cancels: HashMap<String, tokio_util::sync::CancellationToken>,
     persisted: Vec<Event>,
     terminal: bool,
+}
+
+struct PendingCollaboratorApproval {
+    thread: Thread,
+    turn: u64,
+    mode: AgentMode,
+    call_id: String,
+    tool: String,
+    args: serde_json::Value,
+    responder: tokio::sync::oneshot::Sender<bool>,
 }
 
 struct PendingCodexVendorOwner {
@@ -479,6 +853,7 @@ fn trouve_bridge_wrapper_call<'a>(
 }
 
 struct BackendApprovalOutcome {
+    owner_thread_id: Option<String>,
     call_id: String,
     responder: tokio::sync::oneshot::Sender<bool>,
     approved: Result<bool>,
@@ -486,6 +861,106 @@ struct BackendApprovalOutcome {
     /// the fallback confinement mechanism for vendor protocols that cannot
     /// replace their mutation tools with trouve's full MCP bridge.
     mutation_permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+struct PendingApprovalCleanup {
+    approvals: Arc<ApprovalHub>,
+    store: Store,
+    scope: Scope,
+    thread_id: String,
+    call_id: String,
+    armed: bool,
+    requested_persisted: bool,
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .approvals
+            .resolve(&self.thread_id, &self.call_id, ApprovalDecision::Deny);
+        if !self.requested_persisted {
+            return;
+        }
+        if let Err(error) = self.store.append_event(
+            self.scope.clone(),
+            Event::ApprovalResolved {
+                call_id: self.call_id.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        ) {
+            tracing::error!(
+                call_id = %self.call_id,
+                %error,
+                "failed to persist approval denial during backend cleanup"
+            );
+        }
+    }
+}
+
+struct PendingQuestionCleanup {
+    questions: Arc<QuestionHub>,
+    store: Store,
+    scope: Scope,
+    thread_id: String,
+    request_id: String,
+    armed: bool,
+    requested_persisted: bool,
+}
+
+impl Drop for PendingQuestionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .questions
+            .resolve(&self.thread_id, &self.request_id, None);
+        if !self.requested_persisted {
+            return;
+        }
+        if let Err(error) = self.store.append_event(
+            self.scope.clone(),
+            Event::QuestionResolved {
+                request_id: self.request_id.clone(),
+                answers: None,
+            },
+        ) {
+            tracing::error!(
+                request_id = %self.request_id,
+                %error,
+                "failed to persist skipped question during cleanup"
+            );
+        }
+    }
+}
+
+async fn deny_pending_backend_approvals(
+    pending: &mut futures::stream::FuturesUnordered<
+        futures::future::BoxFuture<'static, BackendApprovalOutcome>,
+    >,
+    root_cancels: &mut HashMap<String, tokio_util::sync::CancellationToken>,
+    collaborators: &mut HashMap<String, BackendCollaboratorProjection>,
+) {
+    for cancel in root_cancels.drain().map(|(_, cancel)| cancel) {
+        cancel.cancel();
+    }
+    for collaborator in collaborators.values_mut() {
+        for cancel in collaborator
+            .approval_cancels
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.cancel();
+        }
+    }
+    while let Some(outcome) = pending.next().await {
+        let _ = outcome.responder.send(false);
+        // Dropping the outcome releases any mutation permit acquired before
+        // cancellation won the cleanup race.
+    }
 }
 
 enum BackendLoopInput {
@@ -751,6 +1226,14 @@ pub enum EngineError {
     SessionDiffTooLarge(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+fn session_diff_executor_error(error: String) -> EngineError {
+    if error.contains("too large to render") {
+        EngineError::SessionDiffTooLarge(error)
+    } else {
+        EngineError::Internal(anyhow!(error))
+    }
 }
 
 const THINKING_OPTION_KEYS: [&str; 4] =
@@ -1067,6 +1550,8 @@ impl GithubPrDetailCache {
 struct SteerTurnCommand {
     content: String,
     attachments: Vec<trouve_protocol::Attachment>,
+    attachment_rows: Vec<(trouve_protocol::Attachment, String)>,
+    attachment_cleanup: PreparedAttachmentCleanup,
     response: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -1086,14 +1571,46 @@ struct ActiveTurnSteererGuard<'a> {
 
 async fn receive_steer_command(
     receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    pending: &mut Option<SteerTurnCommand>,
     backend_session_ready: bool,
 ) -> Option<SteerTurnCommand> {
     if !backend_session_ready {
         return std::future::pending().await;
     }
+    if pending.is_some() {
+        return pending.take();
+    }
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+fn reserve_ready_steer_after_event_budget<T>(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    pending: &mut Option<T>,
+    consecutive_events: &mut usize,
+) -> bool {
+    if pending.is_some() {
+        return true;
+    }
+    if *consecutive_events < MAX_BACKEND_EVENTS_BEFORE_STEER {
+        return false;
+    }
+    *consecutive_events = 0;
+    let Some(active_receiver) = receiver.as_mut() else {
+        return false;
+    };
+    match active_receiver.try_recv() {
+        Ok(command) => {
+            *pending = Some(command);
+            true
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            *receiver = None;
+            false
+        }
     }
 }
 
@@ -1119,6 +1636,17 @@ pub struct BridgeTicketClaims {
 struct ActiveBridgeTicket {
     root_thread_id: String,
     claims: BridgeTicketClaims,
+}
+
+struct DeletingSessionMarker<'a> {
+    sessions: &'a Mutex<std::collections::HashSet<String>>,
+    session_id: String,
+}
+
+impl Drop for DeletingSessionMarker<'_> {
+    fn drop(&mut self) {
+        self.sessions.lock().unwrap().remove(&self.session_id);
+    }
 }
 
 pub struct Engine {
@@ -1262,7 +1790,7 @@ pub struct Engine {
     /// runtime connections and settings health probes land in one place.
     mcp_logs: crate::mcp::McpLogStore,
     /// Interactive shells (one per session) for the client terminal panel.
-    terminals: crate::terminal::TerminalManager,
+    terminals: Arc<crate::terminal::TerminalManager>,
     /// Whether the server can reach the internet. Defaults to true; only a
     /// configured probe (`with_connectivity_probe`) or `set_online` ever
     /// flips it, so probe-less engines (tests, embedders) never go offline.
@@ -1609,7 +2137,7 @@ impl Engine {
             bridged_tool_owners: BridgedToolOwnerRouter::default(),
             index_hooks: false,
             mcp_logs,
-            terminals: crate::terminal::TerminalManager::default(),
+            terminals: Arc::new(crate::terminal::TerminalManager::default()),
             online: std::sync::atomic::AtomicBool::new(true),
             connectivity_probe: None,
         }
@@ -1621,6 +2149,116 @@ impl Engine {
     pub fn with_index_hooks(mut self) -> Self {
         self.index_hooks = true;
         self
+    }
+
+    /// Remove immutable checkpoint refs that have no durable row. Server
+    /// startup calls this before accepting requests so a crash between Git
+    /// anchoring and SQLite commit cannot leak objects indefinitely.
+    pub async fn reconcile_checkpoint_refs(&self) {
+        let sessions = match self.store.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "failed to list sessions for checkpoint reconciliation");
+                return;
+            }
+        };
+        for session in sessions {
+            let live = match self.store.checkpoint_ids(&session.id) {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %error,
+                        "failed to load durable checkpoints for reconciliation"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .executor
+                .reconcile_checkpoint_worktree_refs(
+                    Path::new(&session.worktree_path),
+                    &session.id,
+                    &live,
+                )
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session.id,
+                    %error,
+                    "failed to reconcile checkpoint refs at startup"
+                );
+            }
+        }
+    }
+
+    /// Retry every durable artifact-deletion intent before the server starts
+    /// accepting requests. Cleanup operations are idempotent, so a crash
+    /// after filesystem success but before row retirement is harmless.
+    pub async fn retry_artifact_cleanup_jobs(&self) {
+        loop {
+            let job = match self.store.claim_next_artifact_cleanup_job() {
+                Ok(Some(job)) => job,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to claim durable artifact cleanup job");
+                    break;
+                }
+            };
+            execute_artifact_cleanup_job(
+                self.store.clone(),
+                self.executor.clone(),
+                self.data_dir.join("attachments"),
+                self.data_dir.join("worktrees"),
+                job,
+                self.index_hooks,
+            )
+            .await;
+        }
+    }
+
+    /// Keep retrying failed cleanup intents while the process remains alive.
+    /// Atomic store claims prevent this worker from overlapping immediate
+    /// cleanup or another server instance sharing the database.
+    pub fn start_artifact_cleanup_worker(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                engine.retry_artifact_cleanup_jobs().await;
+            }
+        });
+    }
+
+    fn schedule_artifact_cleanup(&self, job: ArtifactCleanupJob) {
+        let store = self.store.clone();
+        let executor = self.executor.clone();
+        let attachment_root = self.data_dir.join("attachments");
+        let managed_worktree_root = self.data_dir.join("worktrees");
+        let index_hooks = self.index_hooks;
+        tokio::spawn(async move {
+            match store.claim_artifact_cleanup_job(&job.id) {
+                Ok(Some(job)) => {
+                    execute_artifact_cleanup_job(
+                        store,
+                        executor,
+                        attachment_root,
+                        managed_worktree_root,
+                        job,
+                        index_hooks,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "failed to claim immediate artifact cleanup"
+                ),
+            }
+        });
     }
 
     /// Enable internet-reachability monitoring with the given probe (the
@@ -4619,8 +5257,14 @@ impl Engine {
             env: req.env.clone(),
             disabled: !req.enabled.unwrap_or(true),
         };
-        crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)?;
-        self.executor.invalidate_mcp_server(name).await;
+        self.executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::Upsert(config),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         Ok(())
     }
 
@@ -4638,12 +5282,18 @@ impl Engine {
             ));
         }
         let path = self.mcp_config_path(&req.scope, req.workspace_id.as_deref())?;
-        let found = crate::mcp::set_server_enabled(&path, name, req.enabled)
-            .map_err(EngineError::Internal)?;
-        if !found {
+        let outcome = self
+            .executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::SetEnabled(req.enabled),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        if outcome == McpConfigMutationOutcome::NotFound {
             return Err(EngineError::NotFound(format!("MCP server {name}")));
         }
-        self.executor.invalidate_mcp_server(name).await;
         Ok(())
     }
 
@@ -4655,8 +5305,14 @@ impl Engine {
         workspace_id: Option<&str>,
     ) -> Result<(), EngineError> {
         let path = self.mcp_config_path(scope, workspace_id)?;
-        crate::mcp::remove_server(&path, name).map_err(EngineError::Internal)?;
-        self.executor.invalidate_mcp_server(name).await;
+        self.executor
+            .mutate_mcp_config(&McpConfigMutationRequest {
+                path,
+                name: name.to_string(),
+                mutation: McpConfigMutation::Remove,
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         Ok(())
     }
 
@@ -4851,23 +5507,28 @@ impl Engine {
         session_id: &str,
         req: &trouve_protocol::CreatePrRequest,
     ) -> Result<trouve_protocol::PrInfo, EngineError> {
-        let session = self.get_session(session_id)?;
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
         let github = self.github_for_session(&session)?;
-        let worktree = PathBuf::from(&session.worktree_path);
-        let branch = session.branch.clone();
-        let requested_base = req.base.clone();
-        let session_base = session.base_ref.clone();
-        let base = tokio::task::spawn_blocking(move || -> Result<String> {
-            let base = requested_base.unwrap_or_else(|| {
-                git::remote_branch_name(&worktree, &session_base)
-                    .unwrap_or_else(|| session_base.clone())
-            });
-            git::push_branch(&worktree, "origin", &branch)?;
-            Ok(base)
-        })
-        .await
-        .map_err(|e| EngineError::Internal(anyhow!(e)))?
-        .map_err(EngineError::Internal)?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let base = self
+            .executor
+            .push_session_branch(&SessionRepositoryPush {
+                managed_root: self.data_dir.join("worktrees"),
+                worktree: PathBuf::from(&session.worktree_path),
+                base_ref: session.base_ref.clone(),
+                requested_base: req.base.clone(),
+                branch: session.branch.clone(),
+                cancel,
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        drop(_execution);
         let mut pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
@@ -4904,19 +5565,25 @@ impl Engine {
 
     /// Unified diff of the session worktree against its base ref.
     pub async fn session_diff(&self, session_id: &str) -> Result<String, EngineError> {
-        let session = self.get_session(session_id)?;
-        let wt = PathBuf::from(&session.worktree_path);
-        let base = session.base_ref.clone();
-        let result = tokio::task::spawn_blocking(move || git::session_diff(&wt, &base))
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: None,
+            cancel,
+        };
+        self.executor
+            .session_diff(&request)
             .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-        match result {
-            Ok(diff) => Ok(diff),
-            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
-                Err(EngineError::SessionDiffTooLarge(error.to_string()))
-            }
-            Err(error) => Err(EngineError::Internal(error)),
-        }
+            .map_err(session_diff_executor_error)
     }
 
     /// Return only bounded changed-path metadata. Patch text is loaded through
@@ -4925,20 +5592,26 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> Result<SessionDiffSummary, EngineError> {
-        let session = self.get_session(session_id)?;
-        let worktree = PathBuf::from(&session.worktree_path);
-        let base = session.base_ref.clone();
-        let result =
-            tokio::task::spawn_blocking(move || git::session_diff_summary(&worktree, &base))
-                .await
-                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
-        let stats = match result {
-            Ok(stats) => stats,
-            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
-                return Err(EngineError::SessionDiffTooLarge(error.to_string()));
-            }
-            Err(error) => return Err(EngineError::Internal(error)),
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: None,
+            cancel,
         };
+        let stats = self
+            .executor
+            .session_diff_summary(&request)
+            .await
+            .map_err(session_diff_executor_error)?;
         let additions = stats.iter().map(|file| file.additions).sum();
         let deletions = stats.iter().map(|file| file.deletions).sum();
         Ok(SessionDiffSummary {
@@ -4979,36 +5652,31 @@ impl Engine {
                 "diff path must be worktree-relative".into(),
             ));
         }
-        if !self
-            .session_diff_summary(session_id)
-            .await?
-            .files
-            .iter()
-            .any(|file| file.path == path)
-        {
-            return Err(EngineError::NotFound(format!(
-                "path is not changed in this session: {path}"
-            )));
-        }
-        let session = self.get_session(session_id)?;
-        let worktree = PathBuf::from(&session.worktree_path);
-        let base = session.base_ref.clone();
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).read_owned().await;
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
         let selected_path = path.to_string();
-        let request_path = selected_path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            git::session_diff_path(&worktree, &base, &request_path)
-        })
-        .await
-        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
-        match result {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let request = SessionRepositoryDiff {
+            managed_root: self.data_dir.join("worktrees"),
+            worktree: PathBuf::from(&session.worktree_path),
+            base_ref: session.base_ref,
+            path: Some(selected_path.clone()),
+            cancel,
+        };
+        match self.executor.session_diff(&request).await {
             Ok(diff) => Ok(SessionFileDiff {
                 path: selected_path,
                 diff,
             }),
-            Err(error) if error.downcast_ref::<git::SessionDiffTooLarge>().is_some() => {
-                Err(EngineError::SessionDiffTooLarge(error.to_string()))
-            }
-            Err(error) => Err(EngineError::Internal(error)),
+            Err(error) if error.contains("not a changed file") => Err(EngineError::NotFound(
+                format!("path is not changed in this session: {path}"),
+            )),
+            Err(error) => Err(session_diff_executor_error(error)),
         }
     }
 
@@ -5098,7 +5766,23 @@ impl Engine {
 
     // --- integrated terminal --------------------------------------------
 
-    fn ensure_terminal_session_available(&self, session: &Session) -> Result<(), EngineError> {
+    fn ensure_terminal_session_available(
+        &self,
+        session_id: &str,
+    ) -> Result<(Session, std::sync::MutexGuard<'_, HashSet<String>>), EngineError> {
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {session_id} is being deleted"
+            )));
+        }
+        // Re-read under the deletion admission lock. A caller may have loaded
+        // the session before a concurrent delete committed and cleared its
+        // transient marker.
+        let session = self
+            .store
+            .session(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {session_id}")))?;
         if session.archived {
             return Err(EngineError::Conflict(format!(
                 "session {} is archived",
@@ -5111,7 +5795,7 @@ impl Engine {
                 session.workspace_id
             )));
         }
-        Ok(())
+        Ok((session, deleting))
     }
 
     /// The session's default interactive terminal, spawning a shell in its
@@ -5123,12 +5807,12 @@ impl Engine {
         cols: u16,
         rows: u16,
     ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
-        let session = self.get_session(session_id)?;
-        self.ensure_terminal_session_available(&session)?;
+        let (session, deleting) = self.ensure_terminal_session_available(session_id)?;
         let terminal = self
             .terminals
             .open_default(session_id, Path::new(&session.worktree_path), cols, rows)
             .map_err(EngineError::Internal)?;
+        drop(deleting);
         Ok(terminal_info(&terminal))
     }
 
@@ -5137,13 +5821,15 @@ impl Engine {
         &self,
         session_id: &str,
     ) -> Result<Vec<trouve_protocol::TerminalInfo>, EngineError> {
-        self.get_session(session_id)?;
-        Ok(self
+        let (_session, deleting) = self.ensure_terminal_session_available(session_id)?;
+        let terminals = self
             .terminals
             .list_session(session_id)
             .iter()
             .map(|terminal| terminal_info(terminal))
-            .collect())
+            .collect();
+        drop(deleting);
+        Ok(terminals)
     }
 
     /// Spawn another independent interactive terminal in the session worktree.
@@ -5153,24 +5839,37 @@ impl Engine {
         cols: u16,
         rows: u16,
     ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
-        let session = self.get_session(session_id)?;
-        self.ensure_terminal_session_available(&session)?;
+        let (session, deleting) = self.ensure_terminal_session_available(session_id)?;
         let terminal = self
             .terminals
             .create(session_id, Path::new(&session.worktree_path), cols, rows)
             .map_err(EngineError::Internal)?;
+        drop(deleting);
         Ok(terminal_info(&terminal))
     }
 
-    pub fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
+    pub async fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
         let terminal = self
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        terminal.write(bytes).map_err(EngineError::Internal)
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminal.write(&bytes)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?
+        .map_err(EngineError::Internal)
     }
 
-    pub fn terminal_resize(
+    pub async fn terminal_resize(
         &self,
         terminal_id: &str,
         cols: u16,
@@ -5180,22 +5879,48 @@ impl Engine {
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        terminal.resize(cols, rows).map_err(EngineError::Internal)
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminal.resize(cols, rows)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?
+        .map_err(EngineError::Internal)
     }
 
     /// Kill one terminal without disturbing the session's other terminals.
-    pub fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
+    pub async fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
         // get() first so unknown ids surface as 404 rather than a no-op.
-        self.terminals
+        let terminal = self
+            .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
-        self.terminals.remove(terminal_id);
+        let operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
+        let terminals = self.terminals.clone();
+        let terminal_id = terminal_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            terminals.remove(&terminal_id);
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         Ok(())
     }
 
     /// Attach to a terminal's output from byte offset `after`: the retained
     /// backlog from there plus a live receiver (empty chunk = shell exited).
-    pub fn terminal_subscribe(
+    pub async fn terminal_subscribe(
         &self,
         terminal_id: &str,
         after: u64,
@@ -5212,6 +5937,12 @@ impl Engine {
             .terminals
             .get(terminal_id)
             .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        let _operation = self.session_lock(&terminal.session_id).read_owned().await;
+        if self.store.session(&terminal.session_id)?.is_none()
+            || self.terminals.get(terminal_id).is_err()
+        {
+            return Err(EngineError::NotFound(format!("terminal {terminal_id}")));
+        }
         let (from, replay, rx) = terminal.subscribe(after);
         Ok((from, replay, rx, terminal.exited()))
     }
@@ -5508,54 +6239,32 @@ impl Engine {
 
     async fn rollback_failed_session_creation(
         &self,
-        repo: &Path,
+        worktree: &Path,
         session_id: &str,
-        creation: git::WorktreeCreation,
-        checkpoint_oid: Option<String>,
+        creation: crate::tools::SessionWorktreeCreation,
     ) {
-        match self.store.session(session_id) {
-            Ok(Some(_)) => {
-                if let Err(error) = self.store.delete_session(session_id) {
-                    tracing::error!(
-                        session_id,
-                        %error,
-                        "failed to roll back relational session state after creation error"
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(error) => tracing::error!(
+        if let Err(error) = self.executor.evict_worktree(worktree).await {
+            // The creation receipt is an independent ownership proof. Always
+            // exercise its rollback even when ephemeral cleanup could not be
+            // acknowledged; the receipt's compare-and-swap checks fail closed
+            // if an owned artifact changed in the meantime.
+            tracing::error!(
                 session_id,
                 %error,
-                "failed to inspect relational session state during creation rollback"
-            ),
+                "failed to evict worktree resources before session creation rollback"
+            );
         }
-        self.executor.evict_worktree(creation.worktree_path()).await;
 
-        let repo = repo.to_path_buf();
-        let session_id = session_id.to_string();
-        let cleanup_session_id = session_id.clone();
-        let cleanup = tokio::task::spawn_blocking(move || -> Result<()> {
-            git::rollback_worktree_creation(
-                &repo,
-                &creation,
-                checkpoint_oid
-                    .as_deref()
-                    .map(|oid| (cleanup_session_id.as_str(), 0, oid)),
-            )
-        })
-        .await;
+        let cleanup = self
+            .executor
+            .rollback_session_worktree(crate::tools::SessionWorktreeRollback { creation })
+            .await;
         match cleanup {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(
+            Ok(()) => {}
+            Err(error) => tracing::error!(
                 session_id,
                 %error,
                 "failed to roll back git artifacts after session creation error"
-            ),
-            Err(error) => tracing::error!(
-                session_id,
-                %error,
-                "session creation rollback task failed"
             ),
         }
     }
@@ -5568,86 +6277,41 @@ impl Engine {
         let repo = PathBuf::from(&ws.path);
         let title = req.title.unwrap_or_else(|| "New session".into());
         let session_id = new_id("se");
+        let checkpoint_id = new_id("cp");
         let branch = session_branch_name(
             &title,
             &session_id,
             self.title_model.derive_branch_name_from_session_title(),
         );
-        let base_ref = match req.base_ref {
-            Some(r) => r,
-            None => {
-                let repo = repo.clone();
-                tokio::task::spawn_blocking(move || git::head_ref(&repo))
-                    .await
-                    .map_err(|e| EngineError::Internal(anyhow!(e)))?
-                    .map_err(EngineError::Internal)?
-            }
-        };
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
         if self.store.session(&session_id)?.is_some() {
             return Err(EngineError::Conflict(format!(
                 "generated session id {session_id} already exists"
             )));
         }
-        {
-            let repo = repo.clone();
-            let worktree_path = worktree_path.clone();
-            let branch = branch.clone();
-            let session_id = session_id.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                if worktree_path.exists() {
-                    bail!(
-                        "generated worktree path already exists: {}",
-                        worktree_path.display()
-                    );
-                }
-                if git::local_branch_exists(&repo, &branch)? {
-                    bail!("generated session branch already exists: {branch}");
-                }
-                if git::checkpoint_ref_exists(&repo, &session_id, 0)? {
-                    bail!("generated session checkpoint ref already exists: {session_id}/0");
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|error| EngineError::Internal(anyhow!(error)))?
-            .map_err(EngineError::Internal)?;
-        }
-        let worktree_result = {
-            let repo = repo.clone();
-            let worktree_path = worktree_path.clone();
-            let branch = branch.clone();
-            let selected_base = base_ref.clone();
-            let fetch_latest = req.fetch_latest;
-            let checkout_ref = req.checkout_ref.clone();
-            tokio::task::spawn_blocking(move || -> Result<(String, git::WorktreeCreation)> {
-                let mut session_base = selected_base.clone();
-                let worktree_base = if fetch_latest {
-                    match git::fetch_upstream_base(&repo, &selected_base)? {
-                        Some(fetched) => {
-                            session_base = fetched.upstream_ref;
-                            fetched.commit
-                        }
-                        None => selected_base,
-                    }
-                } else {
-                    selected_base
-                };
-                let checkout_ref = checkout_ref.as_deref().unwrap_or(&worktree_base);
-                let creation = git::create_worktree(&repo, &worktree_path, &branch, checkout_ref)?;
-                Ok((session_base, creation))
-            })
-            .await
-            .map_err(|error| EngineError::Internal(anyhow!(error)))?
-            .map_err(EngineError::Internal)
+        let creation_request = crate::tools::SessionWorktreeCreate {
+            repository: repo,
+            worktree: worktree_path.clone(),
+            session_id: session_id.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            branch: branch.clone(),
+            base_ref: req.base_ref,
+            checkout_ref: req.checkout_ref,
+            fetch_latest: req.fetch_latest,
         };
-        let (base_ref, creation) = match worktree_result {
-            Ok(result) => result,
-            // create_worktree performs ownership-safe cleanup for artifacts it
-            // reserved. Without a receipt, generic rollback must not infer
-            // ownership from the earlier absence checks.
-            Err(error) => return Err(error),
-        };
+        // Creation runs in an engine-owned task. If the request future is
+        // cancelled after a custom executor has started mutating but before it
+        // returns its guard, this task continues; its eventual receipt is then
+        // dropped and synchronously rolls the attempt back.
+        let executor = self.executor.clone();
+        let mut creation =
+            tokio::spawn(async move { executor.create_session_worktree(&creation_request).await })
+                .await
+                .map_err(|error| {
+                    EngineError::Internal(anyhow!("session creation task failed: {error}"))
+                })?
+                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let base_ref = creation.base_ref.clone();
 
         let session = Session {
             id: session_id.clone(),
@@ -5661,20 +6325,10 @@ impl Engine {
             created_at: chrono::Utc::now(),
         };
 
-        // Checkpoint 0: pristine state, so the first turn can be undone.
-        let commit = match self
-            .executor
-            .checkpoint_worktree(&worktree_path, &session_id, 0, "trouve: session start")
-            .await
-        {
-            Ok(commit) => commit,
-            Err(error) => {
-                self.rollback_failed_session_creation(&repo, &session_id, creation, None)
-                    .await;
-                return Err(EngineError::Internal(anyhow!(error)));
-            }
-        };
-        let checkpoint_id = new_id("cp");
+        // Checkpoint 0 was created atomically with the executor-owned worktree
+        // receipt, so cancellation between those two mutations cannot leak
+        // either artifact.
+        let commit = creation.checkpoint_commit.clone();
         let checkpoint = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session_id.clone(),
@@ -5713,19 +6367,36 @@ impl Engine {
                 ),
             ],
         );
-        if let Err(error) = inserted {
-            self.rollback_failed_session_creation(&repo, &session_id, creation, Some(commit))
-                .await;
-            return Err(error.into());
-        }
-        match tokio::task::spawn_blocking(move || git::finalize_worktree_creation(&creation)).await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(session_id, %error, "failed to remove session creation marker");
+        match inserted {
+            Ok(_) => {
+                // Intentionally synchronous and immediately after commit.
+                creation.mark_durable();
             }
+            Err(error) => match self.store.session(&session_id) {
+                Ok(Some(_)) => {
+                    // The writer may have committed and then lost its reply.
+                    // The relational mutation and lifecycle events share that
+                    // transaction, so an existing row proves durability.
+                    tracing::warn!(session_id, %error, "session insert reply failed after durable commit");
+                    creation.mark_durable();
+                }
+                Ok(None) => {
+                    self.rollback_failed_session_creation(&worktree_path, &session_id, creation)
+                        .await;
+                    return Err(error.into());
+                }
+                Err(inspect_error) => {
+                    creation.preserve_for_recovery();
+                    return Err(EngineError::Internal(error.context(format!(
+                        "session insert outcome is ambiguous and its ownership marker was retained: {inspect_error:#}"
+                    ))));
+                }
+            },
+        }
+        match self.executor.finalize_session_worktree(creation).await {
+            Ok(()) => {}
             Err(error) => {
-                tracing::warn!(session_id, %error, "session creation marker cleanup task failed");
+                tracing::warn!(session_id, %error, "failed to remove session creation marker");
             }
         }
         if self.index_hooks {
@@ -5767,24 +6438,30 @@ impl Engine {
         id: &str,
         req: &UpdateSessionRequest,
     ) -> Result<Session, EngineError> {
-        let session = self.get_session(id)?;
+        self.get_session(id)?;
         if let Some(title) = req.title.as_deref()
             && title.trim().is_empty()
         {
             return Err(EngineError::BadRequest("title cannot be empty".into()));
         }
-        let newly_archived = req.archived == Some(true) && !session.archived;
-        let newly_unarchived = req.archived == Some(false) && session.archived;
-        {
+        let updated = {
             // Serialize mutation against delete's marker. Besides preserving
             // the session row, this prevents an unarchive from reopening the
             // terminal manager while deletion is tearing the session down.
+            let _activity_publication = self.session_activity_publication.lock().unwrap();
+            let active_threads = self.active_threads.lock().unwrap();
             let deleting = self.deleting_sessions.lock().unwrap();
             if deleting.contains(id) {
                 return Err(EngineError::Conflict(format!(
                     "session {id} is being deleted"
                 )));
             }
+            let mut session = self
+                .store
+                .session(id)?
+                .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
+            let newly_archived = req.archived == Some(true) && !session.archived;
+            let newly_unarchived = req.archived == Some(false) && session.archived;
             self.store.update_session_with_event(
                 id,
                 req.title.as_deref(),
@@ -5794,6 +6471,13 @@ impl Engine {
                     workspace_id: session.workspace_id.clone(),
                 },
             )?;
+            if let Some(title) = req.title.as_ref() {
+                session.title = title.clone();
+            }
+            if let Some(archived) = req.archived {
+                session.archived = archived;
+            }
+            session.active = active_threads.values().any(|owner| owner == id);
             if newly_archived {
                 self.terminals.remove_session(id);
             } else if newly_unarchived {
@@ -5805,12 +6489,13 @@ impl Engine {
             {
                 crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
             }
-        }
-        self.get_session(id)
+            session
+        };
+        Ok(updated)
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
-        let session = self.get_session(id)?;
+        self.get_session(id)?;
         {
             // Lock ordering is always activity publication -> active_threads
             // -> deleting_sessions; dispatch_queue uses the same order. This
@@ -5831,8 +6516,24 @@ impl Engine {
                 )));
             }
         }
+        // The marker must clear even if this future is aborted while waiting
+        // for the lifecycle lease or post-commit cleanup.
+        let _deleting_marker = DeletingSessionMarker {
+            sessions: &self.deleting_sessions,
+            session_id: id.to_string(),
+        };
+
+        // The marker rejects new lock-free mutations; the exclusive
+        // lifecycle lease waits out settings changes, restores, and any
+        // already-admitted turn before relational or filesystem teardown.
+        let lifecycle = self.session_lock(id);
+        let _lifecycle_guard = lifecycle.write().await;
 
         let result = async {
+            let session = self
+                .store
+                .session(id)?
+                .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
             let bridge_thread_ids = self
                 .store
                 .list_threads(id)?
@@ -5850,50 +6551,34 @@ impl Engine {
             // filesystem work. A database error must leave the session and
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
-            self.terminals.remove_session(id);
-            if let Err(error) = self.store.delete_session_with_event(
+            let cleanup_job = ArtifactCleanupJob::deleted_session(
+                id.to_string(),
+                session.worktree_path.clone(),
+                ws.path.clone(),
+                attachment_paths,
+            );
+            self.store.delete_session_with_event(
                 id,
+                cleanup_job.clone(),
                 Event::SessionDeleted {
                     session_id: id.to_string(),
                     workspace_id: session.workspace_id.clone(),
                 },
-            ) {
-                // Restore terminal access when the database transaction left
-                // a live, unarchived session behind.
-                if !session.archived {
-                    self.terminals.reopen_session(id);
-                }
-                return Err(error.into());
-            }
+            )?;
+            // Only kill ephemeral terminals after the durable deletion has
+            // committed. A database error therefore leaves live PTYs intact.
+            self.terminals.remove_session(id);
             for thread_id in bridge_thread_ids {
                 self.revoke_bridge_tickets(&thread_id);
                 self.bridged_tool_owners.clear_root(&thread_id);
             }
-            self.executor
-                .evict_worktree(Path::new(&session.worktree_path))
-                .await;
-            for path in attachment_paths {
-                let _ = std::fs::remove_file(&path);
-            }
-
-            let repo = PathBuf::from(&ws.path);
-            let wt = PathBuf::from(&session.worktree_path);
-            if wt.exists() {
-                let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
-                    .await
-                    .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-                if let Err(e) = res {
-                    tracing::warn!("failed to remove worktree for {id}: {e}");
-                }
-            }
-            if self.index_hooks {
-                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
-            }
+            // The cleanup job was committed with the tombstone. Scheduling is
+            // best effort here; startup retries any intent left behind by an
+            // aborted request or process crash.
+            self.schedule_artifact_cleanup(cleanup_job);
             Ok(())
         }
         .await;
-
-        self.deleting_sessions.lock().unwrap().remove(id);
         result
     }
 
@@ -5979,19 +6664,30 @@ impl Engine {
             spawned: spawn.is_some(),
             todos: Vec::new(),
         };
-        if let Some((parent, kind)) = spawn {
-            self.store
-                .insert_spawned_thread(&thread, &model_options, parent, kind)?;
-        } else {
-            self.store.insert_thread(&thread, &model_options)?;
+        // Hold the deletion marker lock through relational insertion and the
+        // source event. A delete that has not marked the session yet waits;
+        // once marked, no new thread can materialize behind its snapshot.
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
         }
-        self.store.append_event(
-            Scope::Server,
+        let live_session = self
+            .store
+            .session(&session.id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
+        self.store.insert_thread_with_event(
+            &thread,
+            &model_options,
+            spawn,
             Event::ThreadCreated {
                 thread_id: thread.id.clone(),
-                session_id: session.id,
+                session_id: live_session.id,
             },
         )?;
+        drop(deleting);
         Ok(thread)
     }
 
@@ -6200,6 +6896,21 @@ impl Engine {
         let _guard = lock.try_write().map_err(|_| {
             EngineError::Conflict("cannot change thread settings while a turn is running".into())
         })?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
+        }
+        let thread = self
+            .store
+            .thread(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {id}")))?;
+        let session = self
+            .store
+            .session(&thread.session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {}", thread.session_id)))?;
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
@@ -6215,20 +6926,18 @@ impl Engine {
                 "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
             )));
         }
-        self.store.update_thread(
+        self.store.update_thread_with_event(
             id,
             req.mode.as_deref(),
             req.model.as_deref(),
             req.model_options.as_ref(),
             req.permission_mode,
-        )?;
-        self.store.append_event(
-            Scope::Server,
             Event::ThreadUpdated {
                 thread_id: id.to_string(),
                 session_id: session.id,
             },
         )?;
+        drop(deleting);
         self.get_thread(id)
     }
 
@@ -6296,13 +7005,15 @@ impl Engine {
 
     pub fn resolve_approval(
         &self,
+        thread_id: &str,
         call_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), EngineError> {
-        if self.approvals.resolve(call_id, decision) {
-            Ok(())
-        } else {
-            Err(EngineError::NotFound(format!("pending approval {call_id}")))
+        match self.approvals.resolve(thread_id, call_id, decision) {
+            ApprovalResolution::Resolved => Ok(()),
+            ApprovalResolution::NotFound => {
+                Err(EngineError::NotFound(format!("pending approval {call_id}")))
+            }
         }
     }
 
@@ -6311,15 +7022,15 @@ impl Engine {
     /// Answer (or skip, `answers: None`) a pending `question.requested`.
     pub fn resolve_question(
         &self,
+        thread_id: &str,
         request_id: &str,
         answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
     ) -> Result<(), EngineError> {
-        if self.questions.resolve(request_id, answers) {
-            Ok(())
-        } else {
-            Err(EngineError::NotFound(format!(
+        match self.questions.resolve(thread_id, request_id, answers) {
+            QuestionResolution::Resolved => Ok(()),
+            QuestionResolution::NotFound => Err(EngineError::NotFound(format!(
                 "pending question {request_id}"
-            )))
+            ))),
         }
     }
 
@@ -6335,7 +7046,21 @@ impl Engine {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<Vec<trouve_protocol::QuestionAnswer>>> {
         let scope = Scope::Thread(thread_id.to_string());
-        let rx = self.questions.request(request_id);
+        let rx = self
+            .questions
+            .request(thread_id, request_id)
+            .with_context(|| {
+                format!("duplicate pending question {request_id} in thread {thread_id}")
+            })?;
+        let mut cleanup = PendingQuestionCleanup {
+            questions: self.questions.clone(),
+            store: self.store.clone(),
+            scope: scope.clone(),
+            thread_id: thread_id.to_string(),
+            request_id: request_id.to_string(),
+            armed: true,
+            requested_persisted: false,
+        };
         self.store.append_event(
             scope.clone(),
             Event::QuestionRequested {
@@ -6345,16 +7070,18 @@ impl Engine {
                 questions,
             },
         )?;
+        cleanup.requested_persisted = true;
         let answers = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 // Remove the pending sender so a late HTTP answer cannot
                 // target a turn that has already entered cleanup.
-                let _ = self.questions.resolve(request_id, None);
+                let _ = self.questions.resolve(thread_id, request_id, None);
                 None
             }
             answers = rx => answers.unwrap_or(None),
         };
+        let answers = if cancel.is_cancelled() { None } else { answers };
         self.store.append_event(
             scope,
             Event::QuestionResolved {
@@ -6362,6 +7089,7 @@ impl Engine {
                 answers: answers.clone(),
             },
         )?;
+        cleanup.armed = false;
         Ok(answers)
     }
 
@@ -6387,6 +7115,12 @@ impl Engine {
         let session = self.get_session(&cp.session_id)?;
         let lock = self.session_lock(&session.id);
         let _guard = lock.write().await;
+        if self.deleting_sessions.lock().unwrap().contains(&session.id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                session.id
+            )));
+        }
 
         let latest = self
             .store
@@ -6471,6 +7205,11 @@ impl Engine {
         let session = self.get_session(session_id)?;
         let lock = self.session_lock(session_id);
         let _guard = lock.write().await;
+        if self.deleting_sessions.lock().unwrap().contains(session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {session_id} is being deleted"
+            )));
+        }
 
         let latest = self
             .store
@@ -6643,31 +7382,45 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
             })?;
-        let attachments = self.save_attachments(thread_id, uploads)?;
+        let (prepared, attachment_cleanup) = self.prepare_attachments(uploads)?;
+        let attachments = prepared
+            .iter()
+            .map(|(attachment, _)| attachment.clone())
+            .collect::<Vec<_>>();
+        let attachment_rows = prepared
+            .iter()
+            .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+            .collect();
         let (response, accepted) = tokio::sync::oneshot::channel();
-        active
+        if active
             .sender
             .send(SteerTurnCommand {
                 content,
                 attachments,
+                attachment_rows,
+                attachment_cleanup,
                 response,
             })
             .await
-            .map_err(|_| {
-                EngineError::Conflict(format!(
-                    "turn {} finished before it could be steered",
-                    active.turn
-                ))
-            })?;
-        accepted
-            .await
-            .map_err(|_| {
-                EngineError::Conflict(format!(
+            .is_err()
+        {
+            return Err(EngineError::Conflict(format!(
+                "turn {} finished before it could be steered",
+                active.turn
+            )));
+        }
+        match accepted.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(EngineError::Conflict(error));
+            }
+            Err(_) => {
+                return Err(EngineError::Conflict(format!(
                     "turn {} finished before steering was acknowledged",
                     active.turn
-                ))
-            })?
-            .map_err(EngineError::Conflict)?;
+                )));
+            }
+        }
         Ok(trouve_protocol::SteerAccepted {
             thread_id: thread_id.to_string(),
             turn: active.turn,
@@ -6688,7 +7441,7 @@ impl Engine {
                 "this subagent uses a read-only exploration, audit, or review mode".into(),
             ));
         }
-        let prepared = self.prepare_attachments(uploads)?;
+        let (prepared, mut attachment_cleanup) = self.prepare_attachments(uploads)?;
         let attachments = prepared
             .iter()
             .map(|(attachment, _)| attachment.clone())
@@ -6697,9 +7450,6 @@ impl Engine {
             .iter()
             .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
             .collect::<Vec<_>>();
-        let mut attachment_cleanup =
-            PreparedAttachmentCleanup::new(prepared.iter().map(|(_, path)| path.clone()).collect());
-
         let activity_publication = self.session_activity_publication.lock().unwrap();
         let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
         let mut active = self.active_threads.lock().unwrap();
@@ -6748,6 +7498,7 @@ impl Engine {
                 attachment_rows,
                 None,
                 None,
+                attachment_cleanup.claim(),
                 vec![(
                     Scope::Thread(thread_id.to_string()),
                     Event::QueueUpdated {
@@ -6816,6 +7567,7 @@ impl Engine {
             attachment_rows,
             Some(started_prompt.id.clone()),
             Some(previous_turn),
+            attachment_cleanup.claim(),
             events,
         );
         if let Err(error) = accepted {
@@ -6837,41 +7589,22 @@ impl Engine {
         })
     }
 
-    /// Decode and persist prompt uploads under `data_dir/attachments`,
-    /// recording each in the store. Rejects the whole message on a bad or
-    /// oversized attachment — better than silently dropping a file the
-    /// prompt refers to.
-    fn save_attachments(
-        &self,
-        thread_id: &str,
-        uploads: Vec<trouve_protocol::AttachmentUpload>,
-    ) -> Result<Vec<trouve_protocol::Attachment>, EngineError> {
-        let prepared = self.prepare_attachments(uploads)?;
-        let mut out = Vec::with_capacity(prepared.len());
-        for (attachment, path) in prepared {
-            if let Err(error) =
-                self.store
-                    .add_attachment(thread_id, &attachment, &path.to_string_lossy())
-            {
-                let _ = std::fs::remove_file(&path);
-                return Err(error.into());
-            }
-            out.push(attachment);
-        }
-        Ok(out)
-    }
-
     /// Decode uploads and write their opaque files without touching SQLite.
     /// Ordinary sends pass these records to the event writer so attachment
     /// indexing and prompt acceptance share one durable transaction.
     fn prepare_attachments(
         &self,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
-    ) -> Result<Vec<(trouve_protocol::Attachment, PathBuf)>, EngineError> {
+    ) -> Result<
+        (
+            Vec<(trouve_protocol::Attachment, PathBuf)>,
+            PreparedAttachmentCleanup,
+        ),
+        EngineError,
+    > {
         use base64::Engine as _;
-        const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-        let mut out = Vec::new();
-        let mut cleanup = PreparedAttachmentCleanup::new(Vec::new());
+        validate_attachment_uploads(&uploads)?;
+        let mut decoded = Vec::new();
         let dir = self.data_dir.join("attachments");
         for up in uploads {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -6879,20 +7612,7 @@ impl Engine {
                 .map_err(|e| {
                     EngineError::BadRequest(format!("attachment {}: invalid base64: {e}", up.name))
                 })?;
-            if bytes.is_empty() {
-                return Err(EngineError::BadRequest(format!(
-                    "attachment {} is empty",
-                    up.name
-                )));
-            }
-            if bytes.len() > MAX_ATTACHMENT_BYTES {
-                return Err(EngineError::BadRequest(format!(
-                    "attachment {} exceeds {} MB",
-                    up.name,
-                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
-                )));
-            }
-            std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+            debug_assert!(!bytes.is_empty() && bytes.len() <= MAX_ATTACHMENT_BYTES);
             let id = format!("at_{}", uuid::Uuid::new_v4().simple());
             // Store under the opaque id; keep the (sanitized) extension so
             // tools and vendor CLIs sniff the type naturally.
@@ -6903,74 +7623,119 @@ impl Engine {
                 .map(|e| format!(".{}", e.to_ascii_lowercase()))
                 .unwrap_or_default();
             let path = dir.join(format!("{id}{ext}"));
-            std::fs::write(&path, &bytes).map_err(anyhow::Error::from)?;
-            cleanup.track(path.clone());
             let attachment = trouve_protocol::Attachment {
                 id,
                 name: up.name,
                 mime: up.mime,
                 size_bytes: bytes.len() as u64,
             };
-            out.push((attachment, path));
+            decoded.push((attachment, path, bytes));
         }
-        cleanup.disarm();
-        Ok(out)
+        let paths = decoded
+            .iter()
+            .map(|(_, path, _)| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // Record every intended path before the first write. If the process
+        // exits after creation but before prompt ownership commits, the
+        // durable job becomes retryable when its preparation lease expires.
+        let cleanup_job = self.store.stage_attachment_cleanup(paths)?;
+        let mut cleanup = PreparedAttachmentCleanup::new(
+            self.store.clone(),
+            self.executor.clone(),
+            dir.clone(),
+            decoded.iter().map(|(_, path, _)| path.clone()).collect(),
+            cleanup_job.and_then(|job| job.claim()),
+        );
+        for (_, path, bytes) in &decoded {
+            self.executor
+                .prepare_attachment_file(&dir, path, bytes)
+                .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        }
+        let prepared = decoded
+            .into_iter()
+            .map(|(attachment, path, _)| (attachment, path))
+            .collect();
+        // The caller disarms only after deleting the staging job in the same
+        // transaction that establishes durable attachment ownership.
+        cleanup.armed = true;
+        Ok((prepared, cleanup))
     }
 
-    /// Metadata and stored file for one attachment (serves
+    /// Metadata and verified bytes for one attachment (serves
     /// `GET /v1/attachments/{id}`).
-    pub fn attachment(
+    pub async fn attachment(
         &self,
         id: &str,
-    ) -> Result<(trouve_protocol::Attachment, PathBuf), EngineError> {
+    ) -> Result<(trouve_protocol::Attachment, Vec<u8>), EngineError> {
         let (attachment, path) = self
             .store
             .attachment(id)?
             .ok_or_else(|| EngineError::NotFound(format!("attachment {id}")))?;
-        Ok((attachment, PathBuf::from(path)))
+        let bytes = self
+            .executor
+            .read_attachment_file(
+                &self.data_dir.join("attachments"),
+                Path::new(&path),
+                attachment.size_bytes,
+            )
+            .await
+            .map_err(|error| EngineError::NotFound(format!("attachment {id}: {error}")))?;
+        Ok((attachment, bytes))
     }
 
-    /// Look up the stored file behind each attachment; rows that vanished
-    /// (e.g. a pruned data dir) are dropped with a warning rather than
-    /// failing the turn.
+    /// Resolve durable rows to executor inputs without inspecting or opening
+    /// the host filesystem in the engine.
     fn resolve_attachments(
         &self,
         attachments: &[trouve_protocol::Attachment],
-    ) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
+    ) -> Result<Vec<AttachmentMaterializationFile>, EngineError> {
         attachments
             .iter()
-            .filter_map(|a| match self.store.attachment(&a.id) {
-                Ok(Some((meta, path))) if Path::new(&path).exists() => {
-                    Some((meta, PathBuf::from(path)))
+            .map(|attachment| match self.store.attachment(&attachment.id)? {
+                Some((metadata, path)) if metadata == *attachment => {
+                    Ok(AttachmentMaterializationFile {
+                        attachment: metadata,
+                        source: PathBuf::from(path),
+                    })
                 }
-                _ => {
-                    tracing::warn!("attachment {} ({}) missing; skipped", a.id, a.name);
-                    None
-                }
+                Some(_) => Err(EngineError::Conflict(format!(
+                    "attachment {} metadata changed after prompt acceptance",
+                    attachment.id
+                ))),
+                None => Err(EngineError::NotFound(format!(
+                    "attachment {}",
+                    attachment.id
+                ))),
             })
             .collect()
     }
 
-    fn remove_committed_attachment_files(&self, paths: impl IntoIterator<Item = String>) {
-        let attachment_root = self.data_dir.join("attachments");
-        for stored_path in paths {
-            let path = PathBuf::from(&stored_path);
-            if !path.starts_with(&attachment_root) || path == attachment_root {
-                tracing::error!(
-                    path = stored_path,
-                    root = %attachment_root.display(),
-                    "refusing to remove detached attachment outside the attachment store"
-                );
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(path = stored_path, %error, "failed to remove detached attachment file");
-                }
-            }
+    async fn materialize_attachments_for_turn(
+        &self,
+        session: &Session,
+        attachments: &[trouve_protocol::Attachment],
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<MaterializedAttachment>, EngineError> {
+        let files = self.resolve_attachments(attachments)?;
+        if files.is_empty() {
+            return Ok(Vec::new());
         }
+        let lane = self.tool_execution_lock(&session.id);
+        let _mutation = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(EngineError::Conflict("turn cancelled".into())),
+            permit = lane.write_owned() => permit,
+        };
+        self.executor
+            .materialize_attachments(&AttachmentMaterialization {
+                source_root: self.data_dir.join("attachments"),
+                managed_worktree_root: self.data_dir.join("worktrees"),
+                worktree: PathBuf::from(&session.worktree_path),
+                files,
+                cancel: cancel.clone(),
+            })
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -7003,6 +7768,14 @@ impl Engine {
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
         let prompt = self
             .store
             .queued_prompts(&thread_id)?
@@ -7045,51 +7818,79 @@ impl Engine {
             .map(|attachment| attachment.id.clone())
             .collect::<Vec<_>>();
 
-        let prepared = self.prepare_attachments(request.attachments)?;
+        let (prepared, mut added_cleanup) = self.prepare_attachments(request.attachments)?;
         attachments.extend(prepared.iter().map(|(attachment, _)| attachment.clone()));
         let added_rows = prepared
             .iter()
             .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
             .collect::<Vec<_>>();
-        let mut added_cleanup =
-            PreparedAttachmentCleanup::new(prepared.iter().map(|(_, path)| path.clone()).collect());
-        let Some(removed_paths) = self.store.update_queued_prompt_attachments(
+        let Some(cleanup_job) = self.store.update_queued_prompt_attachments(
             prompt_id,
             &request.content,
             &attachments,
             &added_rows,
             &removed_ids,
+            added_cleanup.claim().as_ref(),
         )?
         else {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         };
         added_cleanup.disarm();
-        self.remove_committed_attachment_files(removed_paths);
-        self.emit_queue(&thread_id)
+        if let Some(cleanup_job) = cleanup_job {
+            self.schedule_artifact_cleanup(cleanup_job);
+        }
+        let result = self.emit_queue(&thread_id);
+        drop(deleting);
+        result
     }
 
     pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
         let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
-        let Some((thread_id, attachment_paths)) =
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
+        let Some((thread_id, cleanup_job)) =
             self.store.delete_queued_prompt_attachments(prompt_id)?
         else {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         };
-        self.remove_committed_attachment_files(attachment_paths);
-        self.emit_queue(&thread_id)
+        if let Some(cleanup_job) = cleanup_job {
+            self.schedule_artifact_cleanup(cleanup_job);
+        }
+        let result = self.emit_queue(&thread_id);
+        drop(deleting);
+        result
     }
 
     /// Apply a full new order for the thread's queue. `ids` must name every
     /// currently queued prompt exactly once.
     pub fn reorder_queue(&self, thread_id: &str, ids: &[String]) -> Result<(), EngineError> {
         let _queue_mutation = self.prompt_queue_mutations.lock().unwrap();
-        self.get_thread(thread_id)?;
+        let thread = self.get_thread(thread_id)?;
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if deleting.contains(&thread.session_id) {
+            return Err(EngineError::Conflict(format!(
+                "session {} is being deleted",
+                thread.session_id
+            )));
+        }
         if !self.store.reorder_queued_prompts(thread_id, ids)? {
             return Err(EngineError::Conflict(
                 "queue changed while reordering; refresh and retry".into(),
             ));
         }
-        self.emit_queue(thread_id)
+        let result = self.emit_queue(thread_id);
+        drop(deleting);
+        result
     }
 
     /// Prioritize one queued prompt and run it next. If a turn still owns the
@@ -7767,9 +8568,15 @@ impl Engine {
         // follow. Copy them into the worktree first: the file tools reject
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
-        let resolved = self.resolve_attachments(&attachments);
-        let materialized = materialize_attachments(&worktree, &resolved);
-        let content = annotate_attachments(content, &materialized);
+        let materialized = self
+            .materialize_attachments_for_turn(&session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let content = annotate_attachments(content, &prompt_files);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
@@ -9119,6 +9926,9 @@ impl Engine {
             .generate_subagent_title(name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
+        let collaborator_mode = modes::find_mode(&all_modes, &child_mode)
+            .cloned()
+            .unwrap_or_else(modes::fallback_mode);
         let child = collaborator_claims
             .create_claimed_thread(&session.id, || {
                 self.create_spawned_thread_for_session(
@@ -9141,6 +9951,7 @@ impl Engine {
         vendor_threads.insert(vendor_session_id.clone(), child.id.clone());
         let mut collaborator = BackendCollaboratorProjection {
             thread: child,
+            mode: collaborator_mode,
             turn: 0,
             spawn_link_published: false,
             vendor_turn_id: None,
@@ -9153,6 +9964,9 @@ impl Engine {
             tool_calls: HashMap::new(),
             tool_started_at: HashMap::new(),
             suppressed_bridge_calls: HashSet::new(),
+            mutation_permits: HashMap::new(),
+            pending_approval: None,
+            approval_cancels: HashMap::new(),
             persisted: Vec::new(),
             terminal: true,
         };
@@ -9255,6 +10069,17 @@ impl Engine {
     ) -> Result<()> {
         if collaborator.terminal {
             return Ok(());
+        }
+        // A terminal collaborator cannot emit a later completion event; drop
+        // every vendor-native mutation lease before persistence bookkeeping.
+        collaborator.mutation_permits.clear();
+        collaborator.pending_approval = None;
+        for cancel in collaborator
+            .approval_cancels
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.cancel();
         }
         if !collaborator.segment.is_empty() {
             collaborator.persisted.push(Event::AssistantMessage {
@@ -9359,11 +10184,11 @@ impl Engine {
     async fn persist_backend_collaborator_event(
         &self,
         session: &Session,
-        mode: &AgentMode,
+        _root_mode: &AgentMode,
         backend_id: &str,
         collaborator: &mut BackendCollaboratorProjection,
         event: BackendCollaboratorEvent,
-        cancel: &tokio_util::sync::CancellationToken,
+        _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         if collaborator.terminal {
             return Ok(());
@@ -9432,6 +10257,10 @@ impl Engine {
                 ok,
                 result,
             } => {
+                // Match the root backend path: the vendor has acknowledged
+                // tool completion, so release its exclusive worktree lane
+                // before event persistence and result-derived bookkeeping.
+                collaborator.mutation_permits.remove(&call_id);
                 flush_backend_event_batch(
                     &self.store,
                     &Scope::Thread(collaborator.thread.id.clone()),
@@ -9485,19 +10314,15 @@ impl Engine {
                     &mut collaborator.persisted,
                 )
                 .await?;
-                let approved = self
-                    .gate_backend_approval(
-                        session,
-                        &collaborator.thread,
-                        turn,
-                        mode,
-                        &call_id,
-                        &tool,
-                        &args,
-                        cancel,
-                    )
-                    .await?;
-                let _ = responder.send(approved);
+                collaborator.pending_approval = Some(PendingCollaboratorApproval {
+                    thread: collaborator.thread.clone(),
+                    turn,
+                    mode: collaborator.mode.clone(),
+                    call_id,
+                    tool,
+                    args,
+                    responder,
+                });
             }
             BackendCollaboratorEvent::TodosUpdated { todos } => {
                 flush_backend_event_batch(
@@ -9619,17 +10444,25 @@ impl Engine {
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
-        let resolved = self.resolve_attachments(&attachments);
-        let (images, files): (Vec<_>, Vec<_>) = resolved
+        let materialized = self
+            .materialize_attachments_for_turn(session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
-            .partition(|(a, _)| a.mime.starts_with("image/"));
-        let content = annotate_attachments(content, &files);
+            .partition(|file| file.attachment.mime.starts_with("image/"));
+        let prompt_files = files
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let content = annotate_attachments(content, &prompt_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
-            .map(|(a, path)| trouve_agents::TurnAttachment {
-                name: a.name,
-                mime: a.mime,
-                path,
+            .map(|file| trouve_agents::TurnAttachment {
+                name: file.attachment.name,
+                mime: file.attachment.mime,
+                bytes: file.bytes,
+                local_path: Some(file.absolute_path),
             })
             .collect();
         self.store.append_message(
@@ -9760,12 +10593,27 @@ impl Engine {
         let mut seen_tool_cards = HashSet::new();
         let mut suppressed_bridge_calls = HashSet::new();
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
+        let mut backend_approval_cancels =
+            HashMap::<String, tokio_util::sync::CancellationToken>::new();
         let mut backend_mutation_permits =
             HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut pending_steer = None;
+        let mut consecutive_backend_events = 0usize;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+            let steer_must_run = active_vendor_session.is_some()
+                && !cancel.is_cancelled()
+                && reserve_ready_steer_after_event_budget(
+                    &mut steer_rx,
+                    &mut pending_steer,
+                    &mut consecutive_backend_events,
+                );
             let input = tokio::select! {
                 biased;
+                // Persist vendor output that is already available before
+                // accepting simultaneously-ready steering. This preserves
+                // the causal order observed at the backend boundary.
+                event = stream.next(), if !steer_must_run => BackendLoopInput::Event(event),
                 _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
@@ -9774,6 +10622,7 @@ impl Engine {
                 }
                 steer = receive_steer_command(
                     &mut steer_rx,
+                    &mut pending_steer,
                     active_vendor_session.is_some(),
                 ), if !cancel.is_cancelled() => {
                     let Some(command) = steer else {
@@ -9782,19 +10631,90 @@ impl Engine {
                     };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
-                    let resolved = self.resolve_attachments(&command.attachments);
-                    let (images, files): (Vec<_>, Vec<_>) = resolved
+                    let SteerTurnCommand {
+                        content,
+                        attachments,
+                        attachment_rows,
+                        mut attachment_cleanup,
+                        response,
+                    } = command;
+                    let staged = attachment_rows
+                        .iter()
+                        .map(|(attachment, path)| AttachmentMaterializationFile {
+                            attachment: attachment.clone(),
+                            source: PathBuf::from(path),
+                        })
+                        .collect::<Vec<_>>();
+                    let lane = self.tool_execution_lock(&session.id);
+                    let _materialization_permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = response.send(Err("turn cancelled".into()));
+                            bail!("turn cancelled");
+                        }
+                        permit = lane.write_owned() => permit,
+                    };
+                    let materialized = match self.executor.materialize_attachments(
+                        &AttachmentMaterialization {
+                            source_root: self.data_dir.join("attachments"),
+                            managed_worktree_root: self.data_dir.join("worktrees"),
+                            worktree: PathBuf::from(&session.worktree_path),
+                            files: staged,
+                            cancel: cancel.clone(),
+                        },
+                    ).await {
+                        Ok(materialized) => materialized,
+                        Err(error) => {
+                            let _ = response.send(Err(error.clone()));
+                            bail!("steering attachment materialization failed: {error}");
+                        }
+                    };
+                    drop(_materialization_permit);
+                    let (images, files): (Vec<_>, Vec<_>) = materialized
                         .into_iter()
-                        .partition(|(attachment, _)| attachment.mime.starts_with("image/"));
-                    let backend_prompt = annotate_attachments(command.content.clone(), &files);
+                        .partition(|file| file.attachment.mime.starts_with("image/"));
+                    let prompt_files = files
+                        .iter()
+                        .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+                        .collect::<Vec<_>>();
+                    let backend_prompt = annotate_attachments(content.clone(), &prompt_files);
                     let backend_attachments = images
                         .into_iter()
-                        .map(|(attachment, path)| trouve_agents::TurnAttachment {
-                            name: attachment.name,
-                            mime: attachment.mime,
-                            path,
+                        .map(|file| trouve_agents::TurnAttachment {
+                            name: file.attachment.name,
+                            mime: file.attachment.mime,
+                            bytes: file.bytes,
+                            local_path: Some(file.absolute_path),
                         })
                         .collect();
+                    let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            let error = anyhow::Error::from(error);
+                            let _ = response.send(Err(error.to_string()));
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = self.store.append_event_with_message(
+                        scope.clone(),
+                        Event::TurnSteered {
+                            turn,
+                            content,
+                            attachments,
+                        },
+                        &thread.id,
+                        &payload,
+                        attachment_rows,
+                        attachment_cleanup.claim(),
+                    ) {
+                        let message = error.to_string();
+                        let _ = response.send(Err(message));
+                        return Err(error);
+                    }
+                    attachment_cleanup.disarm();
+                    // Durable transcript order is established before the
+                    // vendor sees the guidance. A rejection therefore fails
+                    // the owning turn instead of erasing accepted input.
                     let backend_result = backend
                         .steer_turn(BackendSteer {
                             cancel: cancel.clone(),
@@ -9806,34 +10726,12 @@ impl Engine {
                         })
                         .await;
                     if let Err(error) = backend_result {
-                        let _ = command.response.send(Err(error.to_string()));
-                        continue;
+                        let message = error.to_string();
+                        let _ = response.send(Err(message.clone()));
+                        bail!("backend rejected durable steering input: {message}");
                     }
-                    let persistence_result = (|| -> Result<()> {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::TurnSteered {
-                                turn,
-                                content: command.content,
-                                attachments: command.attachments,
-                            },
-                        )?;
-                        self.store.append_message(
-                            &thread.id,
-                            &serde_json::to_value(Message::User(backend_prompt))?,
-                        )?;
-                        Ok(())
-                    })();
-                    match persistence_result {
-                        Ok(()) => {
-                            let _ = command.response.send(Ok(()));
-                        }
-                        Err(error) => {
-                            let message = error.to_string();
-                            let _ = command.response.send(Err(message));
-                            return Err(error);
-                        }
-                    }
+                    let _ = response.send(Ok(()));
+                    consecutive_backend_events = 0;
                     continue;
                 }
                 approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
@@ -9841,17 +10739,53 @@ impl Engine {
                         approval.expect("non-empty approval queue must yield an outcome")
                     )
                 }
-                event = stream.next() => BackendLoopInput::Event(event),
             };
             let event = match input {
                 BackendLoopInput::Event(None) => break,
                 BackendLoopInput::Approval(outcome) => {
+                    consecutive_backend_events = 0;
                     let BackendApprovalOutcome {
+                        owner_thread_id,
                         call_id,
                         responder,
                         approved,
                         mutation_permit,
                     } = outcome;
+                    if let Some(owner_thread_id) = owner_thread_id {
+                        let Some(collaborator) = collaborators
+                            .values_mut()
+                            .find(|collaborator| collaborator.thread.id == owner_thread_id)
+                        else {
+                            let _ = responder.send(false);
+                            continue;
+                        };
+                        collaborator.approval_cancels.remove(&call_id);
+                        if collaborator.terminal {
+                            let _ = responder.send(false);
+                            continue;
+                        }
+                        let approved = match approved {
+                            Ok(approved) => approved,
+                            Err(error) => {
+                                let _ = responder.send(false);
+                                return Err(error);
+                            }
+                        };
+                        if approved {
+                            if let Some(permit) = mutation_permit {
+                                collaborator
+                                    .mutation_permits
+                                    .insert(call_id.clone(), permit);
+                            }
+                            if responder.send(true).is_err() {
+                                collaborator.mutation_permits.remove(&call_id);
+                            }
+                        } else {
+                            let _ = responder.send(false);
+                        }
+                        continue;
+                    }
+                    backend_approval_cancels.remove(&call_id);
                     let approved = match approved {
                         Ok(approved) => approved,
                         Err(error) => {
@@ -9872,7 +10806,10 @@ impl Engine {
                     continue;
                 }
                 BackendLoopInput::Event(Some(ev)) => match ev {
-                    Ok(event) => event,
+                    Ok(event) => {
+                        consecutive_backend_events = consecutive_backend_events.saturating_add(1);
+                        event
+                    }
                     Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
                     Err(error) => {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
@@ -9889,6 +10826,12 @@ impl Engine {
                             }
                             collaborator_claims.release(&collaborator.thread.id);
                         }
+                        deny_pending_backend_approvals(
+                            &mut pending_backend_approvals,
+                            &mut backend_approval_cancels,
+                            &mut collaborators,
+                        )
+                        .await;
                         return Err(anyhow!("backend stream error: {error}"));
                     }
                 },
@@ -10159,6 +11102,30 @@ impl Engine {
                                 )
                                 .await?;
                             }
+                            if let Some(approval) = collaborator.pending_approval.take() {
+                                let owner_thread_id = approval.thread.id.clone();
+                                let approval_call_id = approval.call_id.clone();
+                                let approval_cancel = cancel.child_token();
+                                collaborator
+                                    .approval_cancels
+                                    .insert(approval_call_id, approval_cancel.clone());
+                                pending_backend_approvals.push(self.pending_backend_approval(
+                                    session.clone(),
+                                    approval.thread,
+                                    approval.turn,
+                                    approval.mode,
+                                    approval.call_id,
+                                    approval.tool,
+                                    approval.args,
+                                    approval.responder,
+                                    approval_cancel,
+                                    // Full-bridge calls acquire the lane in
+                                    // handle_tool_call; vendor-native child
+                                    // mutations need it here.
+                                    !full_tool_bridge,
+                                    Some(owner_thread_id),
+                                ));
+                            }
                             collaborator
                                 .terminal
                                 .then(|| collaborator.thread.id.clone())
@@ -10178,13 +11145,15 @@ impl Engine {
                     ok,
                     result,
                 } => {
+                    // Release even for bridge calls whose duplicate vendor
+                    // lifecycle card is suppressed.
+                    backend_mutation_permits.remove(&call_id);
                     if suppressed_bridge_calls.remove(&call_id) {
                         continue;
                     }
                     // The vendor has finished touching the worktree. Release
                     // its exclusive lane before persistence/network-derived
                     // bookkeeping so the next approved mutation can start.
-                    backend_mutation_permits.remove(&call_id);
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
@@ -10251,6 +11220,8 @@ impl Engine {
                         });
                     }
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    let approval_cancel = cancel.child_token();
+                    backend_approval_cancels.insert(call_id.clone(), approval_cancel.clone());
                     pending_backend_approvals.push(self.pending_backend_approval(
                         session.clone(),
                         thread.clone(),
@@ -10260,12 +11231,13 @@ impl Engine {
                         tool,
                         args,
                         responder,
-                        cancel.clone(),
+                        approval_cancel,
                         // Full-bridge calls acquire the same lane inside
                         // handle_tool_call; pre-acquiring here would make the
                         // vendor wait on its own permit. Native Codex tools
                         // are read-only under the full-bridge sandbox.
                         !full_tool_bridge,
+                        None,
                     ));
                     continue;
                 }
@@ -10331,6 +11303,10 @@ impl Engine {
         // Adapters close only after cancellation cleanup has completed. The
         // stream can now be dropped without racing a replacement vendor turn.
         drop(stream);
+        // Vendors may omit ToolCompleted on cancellation or protocol failure.
+        // Never carry their mutation lease into flush, checkpoint, or terminal
+        // turn bookkeeping.
+        backend_mutation_permits.clear();
         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
 
@@ -10346,6 +11322,12 @@ impl Engine {
             }
             collaborator_claims.release(&collaborator.thread.id);
         }
+        deny_pending_backend_approvals(
+            &mut pending_backend_approvals,
+            &mut backend_approval_cancels,
+            &mut collaborators,
+        )
+        .await;
 
         if cancel.is_cancelled() {
             if !segment.is_empty() {
@@ -10454,6 +11436,7 @@ impl Engine {
         responder: tokio::sync::oneshot::Sender<bool>,
         cancel: tokio_util::sync::CancellationToken,
         acquire_mutation_permit: bool,
+        owner_thread_id: Option<String>,
     ) -> futures::future::BoxFuture<'static, BackendApprovalOutcome> {
         let engine = self.clone();
         async move {
@@ -10478,6 +11461,7 @@ impl Engine {
                 }
             }
             BackendApprovalOutcome {
+                owner_thread_id,
                 call_id,
                 responder,
                 approved,
@@ -10550,43 +11534,74 @@ impl Engine {
                         requires_approval: true,
                     });
                 }
-                let rx = self.approvals.request(call_id);
+                let rx = self
+                    .approvals
+                    .request(&thread.id, call_id)
+                    .with_context(|| {
+                        format!(
+                            "duplicate pending approval {call_id} in thread {}",
+                            thread.id
+                        )
+                    })?;
+                // Arm cleanup immediately after registration. There is no
+                // await before this guard exists, so dropping the future can
+                // never orphan a pending sender.
+                let mut cleanup = PendingApprovalCleanup {
+                    approvals: self.approvals.clone(),
+                    store: self.store.clone(),
+                    scope: scope.clone(),
+                    thread_id: thread.id.clone(),
+                    call_id: call_id.to_string(),
+                    armed: true,
+                    requested_persisted: false,
+                };
                 approval_events.push(Event::ApprovalRequested {
                     turn,
                     call_id: call_id.to_string(),
                 });
-                self.store
-                    .append_events_async(scope.clone(), approval_events)
-                    .await?;
+                self.store.append_events(scope.clone(), approval_events)?;
+                cleanup.requested_persisted = true;
                 // A cancelled turn must not hang on an unanswered approval.
                 let decision = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
                         // Remove the pending sender so a late HTTP approval
                         // cannot target a turn that has entered cleanup.
-                        let _ = self.approvals.resolve(call_id, ApprovalDecision::Deny);
+                        let _ = self.approvals.resolve(
+                            &thread.id,
+                            call_id,
+                            ApprovalDecision::Deny,
+                        );
                         ApprovalDecision::Deny
                     },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
-                self.store
-                    .append_event_async(
-                        scope,
-                        Event::ApprovalResolved {
-                            call_id: call_id.to_string(),
-                            decision,
-                        },
-                    )
-                    .await?;
+                // Cancellation owns the terminal outcome. A user response
+                // racing cleanup must not approve work or broaden policy.
+                let decision = if cancel.is_cancelled() {
+                    ApprovalDecision::Deny
+                } else {
+                    decision
+                };
+                self.store.append_event(
+                    scope,
+                    Event::ApprovalResolved {
+                        call_id: call_id.to_string(),
+                        decision,
+                    },
+                )?;
+                cleanup.armed = false;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
-                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                if !cancel.is_cancelled()
+                    && (decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server)
+                {
                     // MCP approval is first-use per server and session: a
                     // plain approval unlocks this server, matching native MCP
                     // calls without broadening approval to other servers.
                     self.approvals.extend_allow_list(&session.id, key);
                 }
-                Ok(decision != ApprovalDecision::Deny)
+                Ok(decision != ApprovalDecision::Deny && !cancel.is_cancelled())
             }
         }
     }
@@ -10731,30 +11746,80 @@ impl Engine {
         calls: Vec<trouve_providers::ToolCallRequest>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<(String, NativeToolCallResult)> {
-        let mut results =
-            futures::stream::iter(calls.into_iter().enumerate().map(|(index, call)| {
-                let engine = self.clone();
-                let session = session.clone();
-                let thread = thread.clone();
-                let mode = mode.clone();
-                let ctx = ctx.clone();
-                let cancel = cancel.clone();
-                async move {
-                    let call_id = call.id.clone();
-                    let result = engine
-                        .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
-                        .await;
-                    (index, call_id, result)
-                }
-            }))
-            .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
-            .collect::<Vec<_>>()
-            .await;
+        let mut results = Vec::with_capacity(calls.len());
+        let mut read_batch = Vec::new();
+        for (index, call) in calls.into_iter().enumerate() {
+            let definitely_read_only = call.name != "ask_question"
+                && self.executor.tool_mutates(&call.name) == Some(false);
+            if definitely_read_only {
+                read_batch.push((index, call));
+                continue;
+            }
+            if !read_batch.is_empty() {
+                results.extend(
+                    self.handle_native_tool_batch(
+                        session,
+                        thread,
+                        turn,
+                        mode,
+                        ctx,
+                        std::mem::take(&mut read_batch),
+                        cancel,
+                    )
+                    .await,
+                );
+            }
+            // Mutating, interactive, and unknown calls are FIFO barriers.
+            // Awaiting each one prevents a later mutation from acquiring the
+            // session lane first and prevents reads from crossing it.
+            let call_id = call.id.clone();
+            let result = self
+                .handle_tool_call(session, thread, turn, mode, ctx, &call, cancel)
+                .await;
+            results.push((index, call_id, result));
+        }
+        if !read_batch.is_empty() {
+            results.extend(
+                self.handle_native_tool_batch(session, thread, turn, mode, ctx, read_batch, cancel)
+                    .await,
+            );
+        }
         results.sort_unstable_by_key(|(index, _, _)| *index);
         results
             .into_iter()
             .map(|(_, call_id, result)| (call_id, result))
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_native_tool_batch(
+        self: &Arc<Self>,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        mode: &AgentMode,
+        ctx: &ToolCtx,
+        calls: Vec<(usize, trouve_providers::ToolCallRequest)>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Vec<(usize, String, NativeToolCallResult)> {
+        futures::stream::iter(calls.into_iter().map(|(index, call)| {
+            let engine = self.clone();
+            let session = session.clone();
+            let thread = thread.clone();
+            let mode = mode.clone();
+            let ctx = ctx.clone();
+            let cancel = cancel.clone();
+            async move {
+                let call_id = call.id.clone();
+                let result = engine
+                    .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
+                    .await;
+                (index, call_id, result)
+            }
+        }))
+        .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+        .collect::<Vec<_>>()
+        .await
     }
 
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
@@ -10907,18 +11972,17 @@ impl Engine {
         // UI diff can number its gutter. Stored/executed args stay pristine.
         let mut display_args = call.arguments.clone();
         annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-        self.store
-            .append_event_async(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: call.name.clone(),
-                    args: display_args,
-                    requires_approval: decision == Gate::NeedsApproval,
-                },
-            )
-            .await?;
+        let requested_event = Event::ToolRequested {
+            turn,
+            call_id: call_id.clone(),
+            tool: call.name.clone(),
+            args: display_args,
+            requires_approval: decision == Gate::NeedsApproval,
+        };
+        if decision != Gate::NeedsApproval {
+            self.store
+                .append_event(scope.clone(), requested_event.clone())?;
+        }
 
         let decision = match decision {
             Gate::Deny => {
@@ -10941,16 +12005,35 @@ impl Engine {
                 ));
             }
             Gate::NeedsApproval => {
-                let rx = self.approvals.request(&call_id);
-                self.store
-                    .append_event_async(
-                        scope.clone(),
+                let rx = self
+                    .approvals
+                    .request(&thread.id, &call_id)
+                    .with_context(|| {
+                        format!(
+                            "duplicate pending approval {call_id} in thread {}",
+                            thread.id
+                        )
+                    })?;
+                let mut cleanup = PendingApprovalCleanup {
+                    approvals: self.approvals.clone(),
+                    store: self.store.clone(),
+                    scope: scope.clone(),
+                    thread_id: thread.id.clone(),
+                    call_id: call_id.clone(),
+                    armed: true,
+                    requested_persisted: false,
+                };
+                self.store.append_events(
+                    scope.clone(),
+                    vec![
+                        requested_event,
                         Event::ApprovalRequested {
                             turn,
                             call_id: call_id.clone(),
                         },
-                    )
-                    .await?;
+                    ],
+                )?;
+                cleanup.requested_persisted = true;
                 // A cancelled turn must not hang on an unanswered approval:
                 // treat cancellation as a denial so the wait unblocks.
                 let decision = tokio::select! {
@@ -10958,25 +12041,33 @@ impl Engine {
                     _ = cancel.cancelled() => {
                         // Remove the pending sender so a late HTTP approval
                         // cannot target a turn that has entered cleanup.
-                        let _ = self
-                            .approvals
-                            .resolve(&call_id, ApprovalDecision::Deny);
+                        let _ = self.approvals.resolve(
+                            &thread.id,
+                            &call_id,
+                            ApprovalDecision::Deny,
+                        );
                         ApprovalDecision::Deny
                     },
                     d = rx => d.unwrap_or(ApprovalDecision::Deny),
                 };
-                self.store
-                    .append_event_async(
-                        scope.clone(),
-                        Event::ApprovalResolved {
-                            call_id: call_id.clone(),
-                            decision,
-                        },
-                    )
-                    .await?;
+                let decision = if cancel.is_cancelled() {
+                    ApprovalDecision::Deny
+                } else {
+                    decision
+                };
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ApprovalResolved {
+                        call_id: call_id.clone(),
+                        decision,
+                    },
+                )?;
+                cleanup.armed = false;
                 let unlocks_mcp_server =
                     decision == ApprovalDecision::Approve && key.starts_with("mcp:");
-                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                if !cancel.is_cancelled()
+                    && (decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server)
+                {
                     // MCP approval is per server per session (first use).
                     self.approvals.extend_allow_list(&session.id, key);
                 }
@@ -10985,7 +12076,7 @@ impl Engine {
             Gate::Allow => ApprovalDecision::Approve,
         };
 
-        if decision == ApprovalDecision::Deny {
+        if decision == ApprovalDecision::Deny || cancel.is_cancelled() {
             self.store
                 .append_event_async(
                     scope.clone(),
@@ -11637,15 +12728,15 @@ impl Engine {
         if !dirty {
             return Ok(None);
         }
-        let latest = match retry_checkpoint_sqlite(
+        let seq = match retry_checkpoint_sqlite(
             cancel,
-            "reading the latest checkpoint sequence",
+            "reading the next checkpoint sequence",
             &CHECKPOINT_SQLITE_RETRY_DELAYS,
-            || self.store.latest_checkpoint_seq(&session.id),
+            || self.store.next_checkpoint_seq(&session.id),
         )
         .await
         {
-            Ok(Some(latest)) => latest,
+            Ok(Some(seq)) => seq,
             Ok(None) => return Ok(None),
             Err(error) if is_transient_sqlite_contention(&error) => {
                 tracing::warn!(
@@ -11659,14 +12750,13 @@ impl Engine {
             }
             Err(error) => return Err(error),
         };
-        let seq = latest.unwrap_or(-1) + 1;
         let message = format!("trouve: turn {turn} of {}", thread.id);
+        let checkpoint_id = new_id("cp");
         let commit = self
             .executor
-            .checkpoint_worktree(&worktree, &session.id, seq, &message)
+            .checkpoint_worktree(&worktree, &session.id, &checkpoint_id, &message)
             .await
             .map_err(anyhow::Error::msg)?;
-        let checkpoint_id = new_id("cp");
         let row = CheckpointRow {
             id: checkpoint_id.clone(),
             session_id: session.id.clone(),
@@ -11696,10 +12786,28 @@ impl Engine {
         .await
         {
             Ok(Some(_)) => {}
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                self.executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                return Ok(None);
+            }
             Err(error) if is_transient_sqlite_contention(&error) => {
-                // The Git ref is harmless without its database row. A later
-                // checkpoint reuses this sequence and replaces the ref.
+                self.executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
                 tracing::warn!(
                     session_id = %session.id,
                     thread_id = %thread.id,
@@ -11709,7 +12817,35 @@ impl Engine {
                 );
                 return Ok(None);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let Err(rollback) = self
+                    .executor
+                    .rollback_checkpoint_worktree_ref(
+                        &worktree,
+                        &session.id,
+                        &checkpoint_id,
+                        &row.commit_hash,
+                    )
+                    .await
+                {
+                    return Err(error.context(format!(
+                        "checkpoint persistence failed and its Git anchor could not be restored: {rollback:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+        let live_checkpoint_ids = self.store.checkpoint_ids(&session.id)?;
+        if let Err(error) = self
+            .executor
+            .reconcile_checkpoint_worktree_refs(&worktree, &session.id, &live_checkpoint_ids)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "failed to reconcile checkpoint refs after persistence"
+            );
         }
         Ok(Some(checkpoint_id))
     }
@@ -11914,40 +13050,6 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
         at += 1;
     }
     at
-}
-
-/// Copy prompt attachments into the session worktree (under a gitignored
-/// `.trouve/attachments/` dir) so the native file tools — which only open
-/// worktree-relative paths — can read them. Returns each attachment paired
-/// with its worktree-relative path. Failures drop that attachment with a
-/// warning rather than failing the turn.
-fn materialize_attachments(
-    worktree: &Path,
-    files: &[(trouve_protocol::Attachment, PathBuf)],
-) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
-    if files.is_empty() {
-        return Vec::new();
-    }
-    let rel_dir = Path::new(".trouve").join("attachments");
-    let abs_dir = worktree.join(&rel_dir);
-    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
-        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
-        return Vec::new();
-    }
-    // Keep the staged files out of the user's diffs/commits.
-    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
-    let mut out = Vec::new();
-    for (meta, src) in files {
-        // Prefix with the id so distinct attachments with the same filename
-        // don't collide.
-        let file_name = format!("{}-{}", meta.id, meta.name);
-        let rel = rel_dir.join(&file_name);
-        match std::fs::copy(src, worktree.join(&rel)) {
-            Ok(_) => out.push((meta.clone(), rel)),
-            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
-        }
-    }
-    out
 }
 
 fn annotate_attachments(
@@ -13099,6 +14201,102 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {
+        trouve_protocol::AttachmentUpload {
+            name: name.into(),
+            mime: mime.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn attachment_upload_validation_rejects_hostile_envelopes_before_decode() {
+        let valid = upload("screen.png", "image/png", "aGVsbG8=".into());
+        validate_attachment_uploads(std::slice::from_ref(&valid)).unwrap();
+
+        let cases = [
+            upload("../escape.png", "image/png", "aGVsbG8=".into()),
+            upload("bad\nname.png", "image/png", "aGVsbG8=".into()),
+            upload("screen.png", "text/html; charset=utf-8", "aGVsbG8=".into()),
+            upload("screen.png", "image/", "aGVsbG8=".into()),
+            upload("screen.png", "image/png", "aGVsbG8".into()),
+            upload("screen.png", "image/png", "Zh==".into()),
+        ];
+        for hostile in cases {
+            assert!(
+                matches!(
+                    validate_attachment_uploads(&[hostile]),
+                    Err(EngineError::BadRequest(_))
+                ),
+                "hostile attachment envelope was accepted"
+            );
+        }
+
+        assert!(matches!(
+            validate_attachment_uploads(&vec![valid; MAX_ATTACHMENTS_PER_PROMPT + 1]),
+            Err(EngineError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn attachment_upload_validation_enforces_item_and_aggregate_limits() {
+        let oversized_bytes = MAX_ATTACHMENT_BYTES + (3 - MAX_ATTACHMENT_BYTES % 3);
+        let oversized = upload(
+            "large.bin",
+            "application/octet-stream",
+            "A".repeat(oversized_bytes / 3 * 4),
+        );
+        assert!(matches!(
+            validate_attachment_uploads(&[oversized]),
+            Err(EngineError::BadRequest(_))
+        ));
+
+        let seven_mib_divisible_by_three = 7 * 1024 * 1024 - 1;
+        let encoded = "A".repeat(seven_mib_divisible_by_three / 3 * 4);
+        let aggregate = (0..3)
+            .map(|index| {
+                upload(
+                    &format!("part-{index}.bin"),
+                    "application/octet-stream",
+                    encoded.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_attachment_uploads(&aggregate),
+            Err(EngineError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn continuously_ready_backend_stream_yields_to_queued_steer_at_budget() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send(7_u8).unwrap();
+        let mut receiver = Some(receiver);
+        let mut pending = None;
+        let mut consecutive_events = 0;
+
+        // The first simultaneous backend event keeps causal priority.
+        assert!(!reserve_ready_steer_after_event_budget(
+            &mut receiver,
+            &mut pending,
+            &mut consecutive_events,
+        ));
+        for _ in 0..MAX_BACKEND_EVENTS_BEFORE_STEER {
+            consecutive_events += 1;
+        }
+
+        // At the bound, the select disables its otherwise-continuously-ready
+        // event branch for one iteration and consumes this reserved steer.
+        assert!(reserve_ready_steer_after_event_budget(
+            &mut receiver,
+            &mut pending,
+            &mut consecutive_events,
+        ));
+        assert_eq!(pending, Some(7));
+        assert_eq!(consecutive_events, 0);
+    }
+
     fn init_engine_test_repo(path: &Path) {
         let run = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -13506,6 +14704,7 @@ mod tests {
         started: Arc<tokio::sync::Semaphore>,
         releases: Arc<tokio::sync::Semaphore>,
         names: Arc<Mutex<Vec<String>>>,
+        fail_after_commit: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -13527,8 +14726,35 @@ mod tests {
             ToolResult::error("not used")
         }
 
-        async fn invalidate_mcp_server(&self, name: &str) {
-            self.names.lock().unwrap().push(name.to_string());
+        async fn mutate_mcp_config(
+            &self,
+            request: &McpConfigMutationRequest,
+        ) -> Result<McpConfigMutationOutcome, String> {
+            let outcome = match &request.mutation {
+                McpConfigMutation::Upsert(config) => {
+                    crate::mcp::upsert_server(&request.path, &request.name, config)
+                        .map_err(|error| format!("{error:#}"))?;
+                    McpConfigMutationOutcome::Applied
+                }
+                McpConfigMutation::SetEnabled(enabled) => {
+                    if crate::mcp::set_server_enabled(&request.path, &request.name, *enabled)
+                        .map_err(|error| format!("{error:#}"))?
+                    {
+                        McpConfigMutationOutcome::Applied
+                    } else {
+                        McpConfigMutationOutcome::NotFound
+                    }
+                }
+                McpConfigMutation::Remove => {
+                    crate::mcp::remove_server(&request.path, &request.name)
+                        .map_err(|error| format!("{error:#}"))?;
+                    McpConfigMutationOutcome::Applied
+                }
+            };
+            if outcome == McpConfigMutationOutcome::NotFound {
+                return Ok(outcome);
+            }
+            self.names.lock().unwrap().push(request.name.clone());
             self.started.add_permits(1);
             self.releases
                 .clone()
@@ -13536,6 +14762,13 @@ mod tests {
                 .await
                 .unwrap()
                 .forget();
+            if self.fail_after_commit.swap(false, Ordering::SeqCst) {
+                tracing::warn!(
+                    server = %request.name,
+                    "injected post-commit MCP cleanup failure left the server quarantined"
+                );
+            }
+            Ok(outcome)
         }
     }
 
@@ -13591,10 +14824,10 @@ mod tests {
         cleanup_release: Arc<tokio::sync::Semaphore>,
     }
 
-    struct FailingCheckpointExecutor;
+    struct FailingSessionCreationExecutor(LocalToolExecutor);
 
     #[async_trait::async_trait]
-    impl ToolExecutor for FailingCheckpointExecutor {
+    impl ToolExecutor for FailingSessionCreationExecutor {
         async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
             Vec::new()
         }
@@ -13612,14 +14845,135 @@ mod tests {
             ToolResult::error("not used")
         }
 
-        async fn checkpoint_worktree(
+        async fn create_session_worktree(
             &self,
-            _worktree: &Path,
-            _session_id: &str,
-            _seq: i64,
-            _message: &str,
-        ) -> Result<String, String> {
+            request: &crate::tools::SessionWorktreeCreate,
+        ) -> Result<crate::tools::SessionWorktreeCreation, String> {
+            let creation =
+                <LocalToolExecutor as ToolExecutor>::create_session_worktree(&self.0, request)
+                    .await?;
+            drop(creation);
             Err("injected checkpoint failure".into())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SessionFinalizeBehavior {
+        Complete,
+        Block,
+        Fail,
+    }
+
+    struct SessionCreationProbeExecutor {
+        block_create: bool,
+        finalize_behavior: SessionFinalizeBehavior,
+        create_started: Arc<tokio::sync::Semaphore>,
+        create_release: Arc<tokio::sync::Semaphore>,
+        finalize_started: Arc<tokio::sync::Semaphore>,
+        finalize_release: Arc<tokio::sync::Semaphore>,
+        rollback_count: Arc<std::sync::atomic::AtomicUsize>,
+        finalize_count: Arc<std::sync::atomic::AtomicUsize>,
+        owned_artifact: Arc<std::sync::atomic::AtomicBool>,
+        requested_worktrees: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl SessionCreationProbeExecutor {
+        fn new(block_create: bool, finalize_behavior: SessionFinalizeBehavior) -> Self {
+            Self {
+                block_create,
+                finalize_behavior,
+                create_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                finalize_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                finalize_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                rollback_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                finalize_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                owned_artifact: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                requested_worktrees: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SessionCreationProbeExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+        async fn create_session_worktree(
+            &self,
+            request: &crate::tools::SessionWorktreeCreate,
+        ) -> Result<crate::tools::SessionWorktreeCreation, String> {
+            self.requested_worktrees
+                .lock()
+                .unwrap()
+                .push(request.worktree.clone());
+            self.owned_artifact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let rollback_count = self.rollback_count.clone();
+            let owned_artifact = self.owned_artifact.clone();
+            let finalize_count = self.finalize_count.clone();
+            let creation = crate::tools::SessionWorktreeCreation::guarded(
+                request
+                    .base_ref
+                    .clone()
+                    .unwrap_or_else(|| "probe-base".into()),
+                "0123456789abcdef0123456789abcdef01234567".into(),
+                move || {
+                    rollback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    owned_artifact.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                move || {
+                    finalize_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            if self.block_create {
+                self.create_started.add_permits(1);
+                self.create_release
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .forget();
+            }
+            Ok(creation)
+        }
+        async fn finalize_session_worktree(
+            &self,
+            creation: crate::tools::SessionWorktreeCreation,
+        ) -> Result<(), String> {
+            match self.finalize_behavior {
+                SessionFinalizeBehavior::Complete => creation.finalize(),
+                SessionFinalizeBehavior::Fail => Err("injected finalization failure".into()),
+                SessionFinalizeBehavior::Block => {
+                    self.finalize_started.add_permits(1);
+                    self.finalize_release
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .forget();
+                    creation.finalize()
+                }
+            }
+        }
+        async fn rollback_session_worktree(
+            &self,
+            request: crate::tools::SessionWorktreeRollback,
+        ) -> Result<(), String> {
+            request.creation.rollback()
         }
     }
 
@@ -13659,6 +15013,7 @@ mod tests {
         let started = Arc::new(tokio::sync::Semaphore::new(0));
         let releases = Arc::new(tokio::sync::Semaphore::new(0));
         let names = Arc::new(Mutex::new(Vec::new()));
+        let fail_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let config = Config {
             local_enabled: Some(false),
             ..Default::default()
@@ -13674,6 +15029,7 @@ mod tests {
                 started: started.clone(),
                 releases: releases.clone(),
                 names: names.clone(),
+                fail_after_commit: fail_after_commit.clone(),
             })),
         );
         let config_path = crate::mcp::user_config_path(&config_dir);
@@ -13699,6 +15055,36 @@ mod tests {
         assert!(!task.is_finished());
         releases.add_permits(1);
         task.await.unwrap().unwrap();
+
+        fail_after_commit.store(true, Ordering::SeqCst);
+        let task_engine = engine.clone();
+        let committed = tokio::spawn(async move {
+            task_engine
+                .upsert_mcp_server(
+                    "committed",
+                    &trouve_protocol::UpsertMcpServerRequest {
+                        scope: "user".into(),
+                        workspace_id: None,
+                        command: "committed-mcp".into(),
+                        args: Vec::new(),
+                        env: std::collections::BTreeMap::new(),
+                        enabled: Some(true),
+                    },
+                )
+                .await
+        });
+        started.clone().acquire_owned().await.unwrap().forget();
+        assert_eq!(
+            crate::mcp::read_servers(&config_path)["committed"].command,
+            "committed-mcp"
+        );
+        releases.add_permits(1);
+        committed.await.unwrap().unwrap();
+        assert_eq!(
+            crate::mcp::read_servers(&config_path)["committed"].command,
+            "committed-mcp",
+            "an invalidation failure must not retry or roll back the committed RMW"
+        );
 
         let task_engine = engine.clone();
         let task = tokio::spawn(async move {
@@ -13785,8 +15171,61 @@ mod tests {
         assert!(started.try_acquire().is_err());
         assert_eq!(
             names.lock().unwrap().as_slice(),
-            ["docs", "docs", "docs", "docs", "docs"]
+            ["docs", "committed", "docs", "docs", "docs", "docs"]
         );
+    }
+
+    struct RejectingMcpConfigExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RejectingMcpConfigExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error("not used")
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_executor_cannot_fall_through_to_host_mcp_config_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let config_path = crate::mcp::user_config_path(&config_dir);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir))
+        .with_executor(Arc::new(RejectingMcpConfigExecutor));
+
+        let error = engine
+            .upsert_mcp_server(
+                "docs",
+                &trouve_protocol::UpsertMcpServerRequest {
+                    scope: "user".into(),
+                    workspace_id: None,
+                    command: "docs-mcp".into(),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(!config_path.exists(), "engine bypassed the custom executor");
     }
 
     #[test]
@@ -13815,7 +15254,9 @@ mod tests {
         };
         store.insert_workspace(&workspace).unwrap();
         let engine = Engine::new(store.clone(), data_dir.clone(), &Config::default())
-            .with_executor(Arc::new(FailingCheckpointExecutor));
+            .with_executor(Arc::new(FailingSessionCreationExecutor(
+                LocalToolExecutor::default(),
+            )));
 
         let error = engine
             .create_session(CreateSessionRequest {
@@ -13849,6 +15290,174 @@ mod tests {
         assert!(
             refs.stdout.is_empty(),
             "failed creation left a checkpoint ref"
+        );
+    }
+
+    fn session_probe_engine(
+        probe: Arc<SessionCreationProbeExecutor>,
+    ) -> (tempfile::TempDir, Store, Workspace, Arc<Engine>) {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host-workspace");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::write(host.join("sentinel"), "unchanged").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_session_probe".into(),
+            name: "probe".into(),
+            path: host.to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Arc::new(
+            Engine::new(store.clone(), temp.path().join("data"), &Config::default())
+                .with_executor(probe),
+        );
+        (temp, store, workspace, engine)
+    }
+
+    fn session_probe_request(workspace: &Workspace) -> CreateSessionRequest {
+        CreateSessionRequest {
+            workspace_id: workspace.id.clone(),
+            title: Some("Executor boundary".into()),
+            base_ref: Some("main".into()),
+            checkout_ref: None,
+            fetch_latest: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_session_executor_never_mutates_the_host_workspace() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (temp, store, workspace, engine) = session_probe_engine(probe.clone());
+
+        let session = engine
+            .create_session(session_probe_request(&workspace))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("host-workspace/sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!Path::new(&session.worktree_path).exists());
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            probe
+                .finalize_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(probe.requested_worktrees.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_session_creation_before_receipt_delivery_cleans_late_receipt() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            true,
+            SessionFinalizeBehavior::Complete,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let request = session_probe_request(&workspace);
+            async move { engine.create_session(request).await }
+        });
+        probe
+            .create_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        assert!(
+            probe
+                .owned_artifact
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        probe.create_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while probe
+                .owned_artifact
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late session creation receipt was not cleaned");
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(store.list_sessions(Some(&workspace.id)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_session_finalization_preserves_the_durable_session() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Block,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let request = session_probe_request(&workspace);
+            async move { engine.create_session(request).await }
+        });
+        probe
+            .finalize_started
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap()
+            .forget();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            probe
+                .finalize_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(store.list_sessions(Some(&workspace.id)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_finalization_failure_cannot_roll_back_durable_state() {
+        let probe = Arc::new(SessionCreationProbeExecutor::new(
+            false,
+            SessionFinalizeBehavior::Fail,
+        ));
+        let (_temp, store, workspace, engine) = session_probe_engine(probe.clone());
+        let session = engine
+            .create_session(session_probe_request(&workspace))
+            .await
+            .unwrap();
+
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            probe
+                .rollback_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
     }
 
@@ -14301,7 +15910,7 @@ mod tests {
             None
         );
         assert!(matches!(
-            engine.resolve_question("question-cancelled", None),
+            engine.resolve_question(&thread.id, "question-cancelled", None),
             Err(EngineError::NotFound(_))
         ));
         assert!(
@@ -16619,6 +18228,7 @@ default_permission_mode = "ask"
             response,
             tokio_util::sync::CancellationToken::new(),
             true,
+            None,
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut approval)

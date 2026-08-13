@@ -173,6 +173,14 @@ export class HostClientError extends Error {
   }
 }
 
+interface PendingPreferenceWrite {
+  preferences: HostPreferences;
+  waiters: Array<{
+    resolve: (preferences: HostPreferences) => void;
+    reject: (reason: unknown) => void;
+  }>;
+}
+
 export const mapHostCapabilities = (
   wire: HostComponents["schemas"]["HostCapabilities"],
 ): HostCapabilities => {
@@ -211,6 +219,173 @@ export const mapHostCapabilities = (
   });
 };
 
+const samePreferenceValue = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left) === JSON.stringify(right);
+
+const rebasePreferenceLeaf = <T>(baseline: T, incoming: T, saved: T): T =>
+  samePreferenceValue(incoming, baseline) ? saved : incoming;
+
+const rebasePreferenceMap = <T>(
+  baseline: Readonly<Record<string, T>> | undefined,
+  incoming: Readonly<Record<string, T>> | undefined,
+  saved: Readonly<Record<string, T>> | undefined,
+): Record<string, T> => {
+  const merged: Record<string, T> = { ...saved };
+  for (const key of new Set([
+    ...Object.keys(baseline ?? {}),
+    ...Object.keys(incoming ?? {}),
+  ])) {
+    const before = baseline?.[key];
+    const next = incoming?.[key];
+    if (samePreferenceValue(next, before)) continue;
+    if (next === undefined) delete merged[key];
+    else merged[key] = next;
+  }
+  return merged;
+};
+
+const rebaseHostPreferenceChanges = (
+  baseline: HostPreferences,
+  incoming: HostPreferences,
+  saved: HostPreferences,
+): HostPreferences => {
+  const baselineResume = baseline.resume ?? {};
+  const incomingResume = incoming.resume ?? {};
+  const savedResume = saved.resume ?? {};
+  return {
+    ...saved,
+    appearance: {
+      theme: rebasePreferenceLeaf(
+        baseline.appearance.theme,
+        incoming.appearance.theme,
+        saved.appearance.theme,
+      ),
+      font_family: rebasePreferenceLeaf(
+        baseline.appearance.font_family,
+        incoming.appearance.font_family,
+        saved.appearance.font_family,
+      ),
+      font_size: rebasePreferenceLeaf(
+        baseline.appearance.font_size,
+        incoming.appearance.font_size,
+        saved.appearance.font_size,
+      ),
+      reduce_motion: rebasePreferenceLeaf(
+        baseline.appearance.reduce_motion,
+        incoming.appearance.reduce_motion,
+        saved.appearance.reduce_motion,
+      ),
+    },
+    general: {
+      ...saved.general,
+      prevent_sleep_while_running: rebasePreferenceLeaf(
+        baseline.general?.prevent_sleep_while_running ?? true,
+        incoming.general?.prevent_sleep_while_running ?? true,
+        saved.general?.prevent_sleep_while_running ?? true,
+      ),
+    },
+    chat: {
+      ...saved.chat,
+      collapse_sequential_tool_calls: rebasePreferenceLeaf(
+        baseline.chat?.collapse_sequential_tool_calls ?? true,
+        incoming.chat?.collapse_sequential_tool_calls ?? true,
+        saved.chat?.collapse_sequential_tool_calls ?? true,
+      ),
+      collapse_thinking_with_tools: rebasePreferenceLeaf(
+        baseline.chat?.collapse_thinking_with_tools ?? false,
+        incoming.chat?.collapse_thinking_with_tools ?? false,
+        saved.chat?.collapse_thinking_with_tools ?? false,
+      ),
+      collapse_compaction_with_tools: rebasePreferenceLeaf(
+        baseline.chat?.collapse_compaction_with_tools ?? false,
+        incoming.chat?.collapse_compaction_with_tools ?? false,
+        saved.chat?.collapse_compaction_with_tools ?? false,
+      ),
+      collapse_todo_updates_with_tools: rebasePreferenceLeaf(
+        baseline.chat?.collapse_todo_updates_with_tools ?? false,
+        incoming.chat?.collapse_todo_updates_with_tools ?? false,
+        saved.chat?.collapse_todo_updates_with_tools ?? false,
+      ),
+    },
+    notifications: {
+      ...saved.notifications,
+      enabled: rebasePreferenceLeaf(
+        baseline.notifications?.enabled ?? true,
+        incoming.notifications?.enabled ?? true,
+        saved.notifications?.enabled ?? true,
+      ),
+      on_finish: rebasePreferenceLeaf(
+        baseline.notifications?.on_finish ?? true,
+        incoming.notifications?.on_finish ?? true,
+        saved.notifications?.on_finish ?? true,
+      ),
+      on_fail: rebasePreferenceLeaf(
+        baseline.notifications?.on_fail ?? true,
+        incoming.notifications?.on_fail ?? true,
+        saved.notifications?.on_fail ?? true,
+      ),
+      on_attention: rebasePreferenceLeaf(
+        baseline.notifications?.on_attention ?? true,
+        incoming.notifications?.on_attention ?? true,
+        saved.notifications?.on_attention ?? true,
+      ),
+      sound: rebasePreferenceLeaf(
+        baseline.notifications?.sound ?? false,
+        incoming.notifications?.sound ?? false,
+        saved.notifications?.sound ?? false,
+      ),
+    },
+    workspace_order: rebasePreferenceLeaf(
+      baseline.workspace_order ?? [],
+      incoming.workspace_order ?? [],
+      saved.workspace_order ?? [],
+    ),
+    pull_request_group_order: rebasePreferenceLeaf(
+      baseline.pull_request_group_order ?? [],
+      incoming.pull_request_group_order ?? [],
+      saved.pull_request_group_order ?? [],
+    ),
+    resume: {
+      ...savedResume,
+      selected_session_id: rebasePreferenceLeaf(
+        baselineResume.selected_session_id ?? "",
+        incomingResume.selected_session_id ?? "",
+        savedResume.selected_session_id ?? "",
+      ),
+      session_threads: rebasePreferenceMap(
+        baselineResume.session_threads,
+        incomingResume.session_threads,
+        savedResume.session_threads,
+      ),
+      thread_scroll: rebasePreferenceMap(
+        baselineResume.thread_scroll,
+        incomingResume.thread_scroll,
+        savedResume.thread_scroll,
+      ),
+      closed_thread_tabs: rebasePreferenceLeaf(
+        baselineResume.closed_thread_tabs ?? [],
+        incomingResume.closed_thread_tabs ?? [],
+        savedResume.closed_thread_tabs ?? [],
+      ),
+      pinned_thread_tabs: rebasePreferenceLeaf(
+        baselineResume.pinned_thread_tabs ?? [],
+        incomingResume.pinned_thread_tabs ?? [],
+        savedResume.pinned_thread_tabs ?? [],
+      ),
+    },
+    navigation_width: rebasePreferenceLeaf(
+      baseline.navigation_width,
+      incoming.navigation_width,
+      saved.navigation_width,
+    ),
+    inspection_width: rebasePreferenceLeaf(
+      baseline.inspection_width,
+      incoming.inspection_width,
+      saved.inspection_width,
+    ),
+  };
+};
+
 export class HostClient {
   readonly #client: Client<HostPaths>;
   #csrfToken: string | undefined;
@@ -230,15 +405,7 @@ export class HostClient {
   #notificationSequence = 0;
   readonly #notificationActivations = new Map<string, () => void>();
   #preferenceWriteRunning = false;
-  #pendingPreferenceWrite:
-    | {
-        preferences: HostPreferences;
-        waiters: Array<{
-          resolve: (preferences: HostPreferences) => void;
-          reject: (reason: unknown) => void;
-        }>;
-      }
-    | undefined;
+  #pendingPreferenceWrite: PendingPreferenceWrite | undefined;
 
   constructor(baseUrl: string, fetchImplementation: typeof fetch = globalThis.fetch) {
     this.#client = createClient<HostPaths>({ baseUrl, fetch: fetchImplementation });
@@ -680,11 +847,42 @@ export class HostClient {
       try {
         const saved = await this.#putPreferencesNow(pending.preferences);
         for (const waiter of pending.waiters) waiter.resolve(saved);
+        const queued = this.#queuedPreferenceWrite();
+        if (queued !== undefined) {
+          queued.preferences = rebaseHostPreferenceChanges(
+            pending.preferences,
+            queued.preferences,
+            saved,
+          );
+        }
       } catch (error) {
         for (const waiter of pending.waiters) waiter.reject(error);
+        if (this.#queuedPreferenceWrite() !== undefined) {
+          try {
+            const latest = await this.getPreferences();
+            const queued = this.#queuedPreferenceWrite();
+            if (queued !== undefined) {
+              queued.preferences = rebaseHostPreferenceChanges(
+                pending.preferences,
+                queued.preferences,
+                latest,
+              );
+            }
+          } catch (refreshError) {
+            const queued = this.#queuedPreferenceWrite();
+            this.#pendingPreferenceWrite = undefined;
+            if (queued !== undefined) {
+              for (const waiter of queued.waiters) waiter.reject(refreshError);
+            }
+          }
+        }
       }
     }
     this.#preferenceWriteRunning = false;
+  }
+
+  #queuedPreferenceWrite(): PendingPreferenceWrite | undefined {
+    return this.#pendingPreferenceWrite;
   }
 
   async #putPreferencesNow(preferences: HostPreferences): Promise<HostPreferences> {

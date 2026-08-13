@@ -40,6 +40,15 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#scheduleSleepActivityReconciliation(shouldPreventSleep)");
   });
 
+  it("leaves a route when its session is deleted by another client", () => {
+    expect(source).toContain('route.kind === "session"');
+    expect(source).toContain("!sessions.some((session) => session.id === route.sessionId)");
+    expect(source).toContain('this.#router.navigate({ kind: "inbox" }, true)');
+    expect(source).toContain("this.#tombstoneSession(event.session_id)");
+    expect(source).toContain("this.#threadIngress.invalidateSession(sessionId)");
+    expect(source).toContain("this.#composerDrafts.discard(threadId)");
+  });
+
   it("renders new-session agent controls without waiting for catalog refreshes", () => {
     expect(source).toContain('name="mode"');
     expect(source).toContain('name="thinking"');

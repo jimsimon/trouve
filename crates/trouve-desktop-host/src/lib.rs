@@ -11,8 +11,8 @@ pub use gateway::{
     AttachmentPayload, CSRF_HEADER, CloseAcknowledgementRequest, CloseDecisionRequest,
     HOST_API_PREFIX, HostBootstrap, HostGateway, HostGatewayBindError, HostGatewayError,
     HostLifecycleBatch, HostPreferencesHandle, LocalFileActionRequest, NativeNotificationRequest,
-    OpenHttpsUrlRequest, PickDirectoryResponse, PickFilesResponse, ReadClipboardImageResponse,
-    SleepInhibitionRequest, host_openapi_json,
+    OpenHttpsUrlRequest, PickDirectoryResponse, PickFilesResponse, ProtocolUpstreamOwnership,
+    ReadClipboardImageResponse, SleepInhibitionRequest, host_openapi_json,
 };
 
 use std::collections::{BTreeMap, VecDeque};
@@ -1908,6 +1908,14 @@ mod tests {
             assert!(VerifiedSessionFile::resolve(&worktree, "src/link.txt").is_err());
         }
         std::fs::remove_dir_all(container).unwrap();
+    }
+
+    #[test]
+    fn session_file_resolver_without_a_safe_handler_is_not_advertised() {
+        let actions = HostNativeActions::default().with_session_file_resolver(|_, _| async {
+            Err::<VerifiedSessionFile, _>("unavailable".to_string())
+        });
+        assert!(!actions.can_open_session_files());
     }
 
     #[test]

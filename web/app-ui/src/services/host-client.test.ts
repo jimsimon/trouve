@@ -54,7 +54,7 @@ const imageAttachment = {
   size_bytes: 3,
 } as const;
 
-const preferences = {
+const preferences: HostPreferences = {
   appearance: {
     font_family: "",
     font_size: 13,
@@ -187,16 +187,117 @@ describe("HostClient", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(writes).toBe(1);
     releaseFirst();
-    await expect(Promise.all([first, second, third])).resolves.toEqual([
-      preferences,
-      thirdValue,
-      thirdValue,
-    ]);
+    const saved = await Promise.all([first, second, third]);
+    expect(saved[0]).toEqual(preferences);
+    expect(saved[1]).toMatchObject(thirdValue);
+    expect(saved[2]).toMatchObject(thirdValue);
     expect(writes).toBe(2);
     expect(writtenPreferences.map(({ navigation_width }) => navigation_width)).toEqual([
       preferences.navigation_width,
       320,
     ]);
+  });
+
+  it("rebases queued preference edits onto the active merged response", async () => {
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let writes = 0;
+    const written: HostPreferences[] = [];
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({ capabilities: validCapabilities, csrf_token: "r".repeat(64) });
+      }
+      writes += 1;
+      const value = await request.clone().json() as HostPreferences;
+      written.push(value);
+      if (writes === 1) {
+        await firstBlocked;
+        return Response.json({
+          ...value,
+          appearance: { ...value.appearance, font_size: 16 },
+          resume: {
+            ...value.resume,
+            session_threads: { "se-external": "th-external" },
+          },
+        });
+      }
+      return Response.json(value);
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    const first = client.putPreferences(preferences);
+    const queued = client.putPreferences({
+      ...preferences,
+      appearance: { ...preferences.appearance, theme: "light" },
+      resume: {
+        ...preferences.resume,
+        session_threads: { "se-local": "th-local" },
+      },
+      navigation_width: 320,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseFirst();
+    await Promise.all([first, queued]);
+
+    expect(written).toHaveLength(2);
+    expect(written[1]).toMatchObject({
+      appearance: { theme: "light", font_size: 16 },
+      resume: {
+        session_threads: {
+          "se-external": "th-external",
+          "se-local": "th-local",
+        },
+      },
+      navigation_width: 320,
+    });
+  });
+
+  it("refreshes and rebases queued intent after an ambiguous write failure", async () => {
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const written: HostPreferences[] = [];
+    let putCount = 0;
+    const latest: HostPreferences = {
+      ...preferences,
+      appearance: { ...preferences.appearance, font_size: 17 },
+    };
+    const fakeFetch = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.url.endsWith("/capabilities")) {
+        return Response.json({ capabilities: validCapabilities, csrf_token: "f".repeat(64) });
+      }
+      if (request.method === "GET") return Response.json(latest);
+      putCount += 1;
+      const value = await request.clone().json() as HostPreferences;
+      written.push(value);
+      if (putCount === 1) {
+        await firstBlocked;
+        return new Response(null, { status: 502 });
+      }
+      return Response.json(value);
+    });
+    const client = new HostClient("http://127.0.0.1:43127", fakeFetch);
+    await client.bootstrap();
+
+    const first = client.putPreferences(preferences);
+    const queued = client.putPreferences({ ...preferences, navigation_width: 333 });
+    releaseFirst();
+
+    await expect(first).rejects.toMatchObject({ kind: "request-failed" });
+    await expect(queued).resolves.toMatchObject({
+      appearance: { font_size: 17 },
+      navigation_width: 333,
+    });
+    expect(written[1]).toMatchObject({
+      appearance: { font_size: 17 },
+      navigation_width: 333,
+    });
   });
 
   it("opens only validated HTTPS URLs through the CSRF-protected host action", async () => {

@@ -561,11 +561,46 @@ impl ThreadProjection {
         self.snapshot.turn_running = false;
         self.fail_open_compaction(turn);
         self.finish_thinking();
+        self.abort_open_tools(ended);
         self.snapshot.pending_questions.clear();
         if let Some(started) = self.snapshot.turn_started_at.get(&turn) {
             let ms = (ended - *started).num_milliseconds().max(0) as u64;
             self.snapshot.turn_duration_ms.insert(turn, ms);
         }
+    }
+
+    /// A thread has at most one active turn, so every non-terminal tool row
+    /// belongs to the turn that is ending. Provider control-plane calls can
+    /// disappear without a matching tool.completed event when the provider
+    /// interrupts or closes a turn; never leave those rows looking active in
+    /// a replayed transcript.
+    fn abort_open_tools(&mut self, ended: chrono::DateTime<chrono::Utc>) {
+        for item in &mut self.snapshot.items {
+            let ThreadViewItem::ToolCall {
+                call_id,
+                status,
+                duration_ms,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if !matches!(
+                *status,
+                ThreadToolStatus::Running | ThreadToolStatus::AwaitingApproval
+            ) {
+                continue;
+            }
+            *status = ThreadToolStatus::Aborted;
+            if duration_ms.is_none()
+                && let Some(started) = self.tool_started_at.remove(call_id)
+            {
+                *duration_ms = Some((ended - started).num_milliseconds().max(0) as u64);
+            } else {
+                self.tool_started_at.remove(call_id);
+            }
+        }
+        self.snapshot.pending_approvals.clear();
     }
 
     fn ensure_indexes(&mut self) {
@@ -887,6 +922,52 @@ mod tests {
         ));
 
         assert_eq!(measured_duration(&projection), Some(7));
+    }
+
+    #[test]
+    fn terminal_turn_aborts_an_unmatched_running_tool() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 1,
+                mode: "code".into(),
+                model: "codex/model".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            10,
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "wait".into(),
+                tool: "collabAgentToolCall".into(),
+                args: serde_json::json!({ "tool": "wait" }),
+                requires_approval: false,
+            },
+        ));
+        projection.apply(&envelope(
+            3,
+            20,
+            Event::ToolStarted {
+                call_id: "wait".into(),
+            },
+        ));
+        projection.apply(&envelope(4, 270, Event::TurnCancelled { turn: 1 }));
+
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::ToolCall {
+                call_id,
+                status: ThreadToolStatus::Aborted,
+                duration_ms: Some(250),
+                ..
+            }) if call_id == "wait"
+        ));
+        assert!(!projection.snapshot.turn_running);
     }
 
     #[test]

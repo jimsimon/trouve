@@ -1,5 +1,6 @@
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 import type { TimerScheduler } from "./cursor-event-stream.js";
+import type { ProtocolTerminalReplayStart } from "./protocol-client.js";
 
 export type TerminalOutputState =
   | "idle"
@@ -14,7 +15,10 @@ export interface TerminalEventSourceLike {
   onopen: ((event: Event) => void) | null;
   onmessage: ((event: MessageEvent<string>) => void) | null;
   onerror: ((event: Event) => void) | null;
-  addEventListener(type: "exit", listener: (event: MessageEvent<string>) => void): void;
+  addEventListener(
+    type: "exit" | "replay-start",
+    listener: (event: MessageEvent<string>) => void,
+  ): void;
   close(): void;
 }
 
@@ -33,6 +37,20 @@ const terminalScheduler: TimerScheduler = {
 const decodeBase64 = (value: string): Uint8Array => {
   const binary = globalThis.atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+};
+
+const decodeReplayStart = (value: string): ProtocolTerminalReplayStart | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || !("offset" in parsed)) return undefined;
+    const offset = parsed.offset;
+    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
+      return undefined;
+    }
+    return { offset };
+  } catch {
+    return undefined;
+  }
 };
 
 /** Resume-capable adapter for ephemeral PTY byte SSE. A streaming UTF-8
@@ -59,6 +77,7 @@ export class TerminalOutputStream {
   #retry: unknown;
   #stableRetry: unknown;
   #attempt = 0;
+  #nextFrameOffset: number | undefined;
 
   constructor(options: {
     readonly path: string;
@@ -114,6 +133,7 @@ export class TerminalOutputStream {
     url.searchParams.set("after", String(this.#offset.get()));
     const source = this.#factory(url.href);
     this.#source = source;
+    this.#nextFrameOffset = undefined;
     source.onopen = () => {
       if (source === this.#source && this.#running) {
         this.#state.set("open");
@@ -128,6 +148,10 @@ export class TerminalOutputStream {
       if (source !== this.#source || !this.#running) return;
       this.#receive(message);
     };
+    source.addEventListener("replay-start", (message) => {
+      if (source !== this.#source || !this.#running) return;
+      this.#receiveReplayStart(message);
+    });
     source.addEventListener("exit", () => {
       if (source !== this.#source || !this.#running) return;
       const tail = this.#decoder.decode();
@@ -147,53 +171,102 @@ export class TerminalOutputStream {
     };
   }
 
+  #receiveReplayStart(message: MessageEvent<string>): void {
+    const marker = decodeReplayStart(message.data);
+    const previousOffset = this.#offset.get();
+    if (marker === undefined) {
+      this.#onDiagnostic({ kind: "invalid-offset", offset: previousOffset });
+      this.#reconnectFromLastGoodOffset();
+      return;
+    }
+
+    this.#nextFrameOffset = marker.offset;
+    if (marker.offset <= previousOffset) return;
+
+    // Bytes before the retained backlog can no longer complete any UTF-8
+    // scalar buffered by the previous connection. Discard that decoder tail
+    // and resume at the absolute start announced by the server.
+    this.#onDiagnostic({ kind: "non-contiguous-offset", offset: previousOffset });
+    void this.#decoder.decode();
+    this.#offset.set(marker.offset);
+  }
+
   #receive(message: MessageEvent<string>): void {
     const previousOffset = this.#offset.get();
-    let offset: number | undefined;
+    let eventEndOffset: number | undefined;
     if (message.lastEventId !== "") {
-      offset = Number(message.lastEventId);
-      if (!Number.isSafeInteger(offset) || offset < 0) {
+      eventEndOffset = Number(message.lastEventId);
+      if (!Number.isSafeInteger(eventEndOffset) || eventEndOffset < 0) {
         this.#onDiagnostic({ kind: "invalid-offset", offset: previousOffset });
+        this.#reconnectFromLastGoodOffset();
         return;
       }
-      if (offset <= previousOffset) return;
+      if (
+        eventEndOffset <= previousOffset &&
+        (this.#nextFrameOffset === undefined || this.#nextFrameOffset === previousOffset)
+      ) {
+        return;
+      }
     }
     let bytes: Uint8Array;
     try {
       bytes = decodeBase64(message.data);
     } catch {
       this.#onDiagnostic({ kind: "invalid-base64", offset: previousOffset });
+      this.#reconnectFromLastGoodOffset();
       return;
     }
-    if (
-      message.lastEventId !== "" &&
-      offset !== previousOffset + bytes.byteLength
-    ) {
-      // Flush and discard any partial scalar before resuming from the new
-      // frame. Keep the last accepted offset so the replacement stream can
-      // replay every missing byte instead of silently skipping the gap.
-      void this.#decoder.decode();
+
+    const frameOffset = this.#nextFrameOffset ?? previousOffset;
+    const expectedEndOffset = frameOffset + bytes.byteLength;
+    if (!Number.isSafeInteger(expectedEndOffset)) {
+      this.#onDiagnostic({ kind: "invalid-offset", offset: previousOffset });
+      this.#reconnectFromLastGoodOffset();
+      return;
+    }
+    if (eventEndOffset !== undefined && eventEndOffset !== expectedEndOffset) {
+      // EventSource may replay one already-delivered event without first
+      // repeating the replay marker. Ignore that stale duplicate, but never
+      // accept a forward gap without an explicit absolute start.
+      if (eventEndOffset <= previousOffset && this.#nextFrameOffset === undefined) return;
       this.#onDiagnostic({ kind: "non-contiguous-offset", offset: previousOffset });
-      const source = this.#source;
-      if (source !== undefined) {
-        this.#state.set("reconnecting");
-        this.#scheduleReconnect(source);
-      }
+      this.#reconnectFromLastGoodOffset();
       return;
     }
-    // Some embedded engines deliver the SSE data but leave lastEventId empty.
-    // Terminal events are contiguous byte chunks, so their decoded length is
-    // a safe forward offset when the engine omits the server-provided id.
-    offset ??= previousOffset + bytes.byteLength;
-    this.#offset.set(offset);
+
+    const endOffset = eventEndOffset ?? expectedEndOffset;
+    this.#nextFrameOffset = endOffset;
+    if (endOffset <= previousOffset) return;
+    if (frameOffset > previousOffset) {
+      this.#onDiagnostic({ kind: "non-contiguous-offset", offset: previousOffset });
+      this.#reconnectFromLastGoodOffset();
+      return;
+    }
+
+    // An automatic EventSource reconnect may replay bytes that precede the
+    // last delivered offset. Trim that overlap using the announced absolute
+    // start, including when the embedding omits MessageEvent.lastEventId.
+    const overlap = previousOffset - frameOffset;
+    bytes = bytes.subarray(overlap);
+    this.#offset.set(endOffset);
     const text = this.#decoder.decode(bytes, { stream: true });
     if (text !== "") this.#onData(text);
+  }
+
+  #reconnectFromLastGoodOffset(): void {
+    const source = this.#source;
+    if (source === undefined) return;
+    this.#state.set("reconnecting");
+    this.#scheduleReconnect(source);
   }
 
   #scheduleReconnect(source: TerminalEventSourceLike): void {
     if (this.#retry !== undefined) return;
     this.#clearStableRetry();
     source.close();
+    // Retire the malformed/closed source immediately. Its queued `exit` or
+    // message callbacks must not terminate the replacement connection.
+    if (source === this.#source) this.#source = undefined;
     const delay = Math.min(
       this.#baseDelayMs * 2 ** this.#attempt,
       this.#maxDelayMs,
@@ -201,7 +274,6 @@ export class TerminalOutputStream {
     this.#attempt += 1;
     this.#retry = this.#scheduler.set(delay, () => {
       this.#retry = undefined;
-      if (source === this.#source) this.#source = undefined;
       this.#open("reconnecting");
     });
   }

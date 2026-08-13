@@ -379,11 +379,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       await services.protocol.deleteSession(sessionId);
-      store.removeSession(sessionId);
-      const route = readSignal(services.router.route);
-      if (route.kind === "session" && route.sessionId === sessionId) {
-        services.router.navigate({ kind: "inbox" }, true);
-      }
+      services.tombstoneSession(sessionId);
       this.#closeActions();
     } catch {
       this.#requestError = "Session could not be deleted.";

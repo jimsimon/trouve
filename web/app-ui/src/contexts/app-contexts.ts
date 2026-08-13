@@ -96,6 +96,9 @@ export interface AppServices {
     patch: Partial<ChatPreferences>,
   ) => void;
   readonly composerDrafts: ComposerDraftController;
+  /** Synchronously invalidate active ingress and permanently discard every
+   * known draft before a deleted session's store projections disappear. */
+  readonly tombstoneSession: (sessionId: string) => void;
   readonly resumePreferences: ReadonlySignal<ResumePreferences>;
   readonly setThreadTabClosed: (threadId: string, closed: boolean) => void;
   readonly setThreadTabPinned: (threadId: string, pinned: boolean) => void;

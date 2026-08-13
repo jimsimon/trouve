@@ -320,6 +320,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     setChatPreferences: (patch: Partial<ChatPreferences>) =>
       this.#updateChatPreferences(patch),
     composerDrafts: this.#composerDrafts,
+    tombstoneSession: (sessionId: string) => this.#tombstoneSession(sessionId),
     resumePreferences: this.#resume.current,
     setThreadTabClosed: (threadId: string, closed: boolean) =>
       this.#setThreadTabClosed(threadId, closed),
@@ -345,6 +346,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   );
   readonly #threadIngress = createBrowserThreadIngress(this.#protocolClient, this.#store);
   #hostPreferences: HostPreferences | undefined;
+  #hostPreferenceWriteGeneration = 0;
   #browserFontFamilies: Promise<readonly string[]> | undefined;
   #hostLoadStarted = false;
   #hostError = false;
@@ -620,6 +622,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   readonly #receiveKnownServerEvent = (event: ProtocolEventEnvelope): void => {
     this.#sessionNotifications.receive(event);
+    if (
+      event.type === "session.deleted"
+      || (event.type === "session.summary_updated" && event.summary === null)
+    ) {
+      this.#tombstoneSession(event.session_id);
+      return;
+    }
     if (event.type === "session.summary_updated") {
       // ProtocolIngress invokes this hook immediately before folding the
       // replacement summary. Defer one microtask so a focused visible session
@@ -660,6 +669,23 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     this.requestUpdate();
   };
+
+  #tombstoneSession(sessionId: string): void {
+    const threadIds = new Set(this.#store.sessionThreadIds(sessionId));
+    const route = readSignal(this.#router.route);
+    if (route.kind === "session" && route.sessionId === sessionId) {
+      if (route.threadId !== undefined) threadIds.add(route.threadId);
+      // Invalidate every route await and live callback synchronously, before
+      // the store loses the session/thread association used for draft cleanup.
+      this.#threadIngress.invalidateSession(sessionId);
+      this.#loadedRouteKey = "";
+      this.#router.navigate({ kind: "inbox" }, true);
+    }
+    this.#store.removeSession(sessionId);
+    for (const threadId of threadIds) {
+      void this.#composerDrafts.discard(threadId).catch(() => undefined);
+    }
+  }
 
   readonly #retryProtocolAfterVisibility = (): void => {
     if (globalThis.document?.visibilityState !== "visible") return;
@@ -805,8 +831,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         reduce_motion: appearance.reduceMotion,
       },
     };
-    this.#hostPreferences = next;
-    void host.putPreferences(next).catch(() => undefined);
+    this.#persistHostPreferences(next, false);
   }
 
   #updateGeneralPreferences(patch: Partial<GeneralPreferences>): void {
@@ -839,11 +864,24 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.requestUpdate();
   }
 
-  #persistHostPreferences(preferences: HostPreferences): void {
+  #persistHostPreferences(preferences: HostPreferences, reportError = true): void {
     const host = this.#hostClient;
     if (host === undefined) return;
     this.#hostPreferences = preferences;
-    void host.putPreferences(preferences).catch(() => {
+    const generation = ++this.#hostPreferenceWriteGeneration;
+    void host.putPreferences(preferences).then((saved) => {
+      // HostClient coalesces queued writes, so only the newest caller may
+      // adopt its response. An older request can finish after a newer local
+      // edit was submitted; applying that response would erase the edit.
+      if (generation !== this.#hostPreferenceWriteGeneration) return;
+      this.#hostPreferences = saved;
+      this.#applyHostPreferences(saved);
+      if (isThemePreference(saved.appearance.theme)) {
+        this.#theme.setPreference(saved.appearance.theme);
+      }
+      this.requestUpdate();
+    }).catch(() => {
+      if (generation !== this.#hostPreferenceWriteGeneration || !reportError) return;
       this.#shellNotice = "Desktop preferences could not be saved.";
       this.requestUpdate();
     });
@@ -1094,8 +1132,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       navigation_width: this.#navigationWidth,
       inspection_width: this.#inspectionWidth,
     };
-    this.#hostPreferences = next;
-    void host.putPreferences(next).catch(() => undefined);
+    this.#persistHostPreferences(next, false);
   }
 
   #selectTheme(event: Event): void {
@@ -1113,11 +1150,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ...current,
       appearance: { ...current.appearance, theme: preference },
     };
-    this.#hostPreferences = next;
     this.#applyHostPreferences(next);
-    void host.putPreferences(next).catch(() => {
-      // The in-memory selection remains usable; diagnostics stay payload-free.
-    });
+    this.#persistHostPreferences(next, false);
   }
 
   protected override updated(): void {
@@ -1155,6 +1189,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     const sessions = readSignal(this.#store.sessions);
     const resume = readSignal(this.#resume.current);
+    if (
+      this.#protocolReady
+      && route.kind === "session"
+      && !sessions.some((session) => session.id === route.sessionId)
+    ) {
+      this.#router.navigate({ kind: "inbox" }, true);
+      return;
+    }
     const recoverySession = sessions.find(
       (session) => session.id === resume.selectedSessionId,
     ) ?? inboxRecoverySession(sessions);

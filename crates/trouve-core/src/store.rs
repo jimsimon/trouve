@@ -35,7 +35,9 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // applies the same explicit-boundary rule when steering interleaves with them.
 // v8 retains hidden turn boundaries after cancellation removes the visible
 // status row, keeping turn-aligned pages bounded across cancelled histories.
-const THREAD_VIEW_SCHEMA_VERSION: i64 = 8;
+// v9 terminalizes unmatched provider control-plane tool rows when their turn
+// ends, so interrupted collaboration waits cannot replay as active forever.
+const THREAD_VIEW_SCHEMA_VERSION: i64 = 9;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -121,6 +123,24 @@ CREATE TABLE IF NOT EXISTS attachments (
   mime TEXT NOT NULL,
   size_bytes INTEGER NOT NULL,
   path TEXT NOT NULL,         -- stored file, absolute
+  created_at TEXT NOT NULL
+);
+-- Durable intents for artifact deletion. These rows deliberately have no
+-- foreign keys: session/attachment metadata is removed in the same
+-- transaction, while the cleanup intent must survive until the executor
+-- confirms the filesystem work.
+CREATE TABLE IF NOT EXISTS artifact_cleanup_jobs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  session_id TEXT,
+  worktree_path TEXT,
+  repository_path TEXT,
+  attachment_paths TEXT NOT NULL DEFAULT '[]',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  next_attempt_at TEXT,
+  claim_until TEXT,
+  claim_token TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -437,6 +457,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
+    "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
@@ -1050,37 +1073,45 @@ fn project_session_summary(
         }
         Event::ApprovalRequested { call_id, .. } => {
             if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, call_id);
                 conn.execute(
                     "INSERT OR REPLACE INTO session_summary_attention
                        (kind, item_id, session_id, thread_id)
                      VALUES ('approval', ?1, ?2, ?3)",
-                    params![call_id, session_id, thread_id],
+                    params![item_id, session_id, thread_id],
                 )?;
             }
         }
         Event::ApprovalResolved { call_id, .. } | Event::ToolCompleted { call_id, .. } => {
-            conn.execute(
-                "DELETE FROM session_summary_attention
-                 WHERE kind = 'approval' AND item_id = ?1 AND session_id = ?2",
-                params![call_id, session_id],
-            )?;
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, call_id);
+                conn.execute(
+                    "DELETE FROM session_summary_attention
+                     WHERE kind = 'approval' AND item_id = ?1 AND session_id = ?2",
+                    params![item_id, session_id],
+                )?;
+            }
         }
         Event::QuestionRequested { request_id, .. } => {
             if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, request_id);
                 conn.execute(
                     "INSERT OR REPLACE INTO session_summary_attention
                        (kind, item_id, session_id, thread_id)
                      VALUES ('question', ?1, ?2, ?3)",
-                    params![request_id, session_id, thread_id],
+                    params![item_id, session_id, thread_id],
                 )?;
             }
         }
         Event::QuestionResolved { request_id, .. } => {
-            conn.execute(
-                "DELETE FROM session_summary_attention
-                 WHERE kind = 'question' AND item_id = ?1 AND session_id = ?2",
-                params![request_id, session_id],
-            )?;
+            if let Some(thread_id) = thread_id.as_deref() {
+                let item_id = scoped_attention_item_id(thread_id, request_id);
+                conn.execute(
+                    "DELETE FROM session_summary_attention
+                     WHERE kind = 'question' AND item_id = ?1 AND session_id = ?2",
+                    params![item_id, session_id],
+                )?;
+            }
         }
         _ => {}
     }
@@ -1094,6 +1125,12 @@ fn project_session_summary(
             notification,
         }),
     )
+}
+
+fn scoped_attention_item_id(thread_id: &str, vendor_id: &str) -> String {
+    // JSON string escaping makes the tuple unambiguous even if either vendor
+    // identifier contains a delimiter chosen by a backend.
+    serde_json::to_string(&(thread_id, vendor_id)).expect("string tuple serializes")
 }
 
 fn ensure_thread_status(conn: &Connection, thread_id: &str) -> Result<bool> {
@@ -2318,6 +2355,145 @@ pub struct Store {
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCleanupJob {
+    pub id: String,
+    pub claim_token: Option<String>,
+    pub session_id: Option<String>,
+    pub worktree_path: Option<String>,
+    pub repository_path: Option<String>,
+    pub attachment_paths: Vec<String>,
+}
+
+impl ArtifactCleanupJob {
+    pub(crate) fn deleted_session(
+        session_id: String,
+        worktree_path: String,
+        repository_path: String,
+        attachment_paths: Vec<String>,
+    ) -> Self {
+        Self {
+            id: format!("acj_{}", uuid::Uuid::new_v4().simple()),
+            claim_token: None,
+            session_id: Some(session_id),
+            worktree_path: Some(worktree_path),
+            repository_path: Some(repository_path),
+            attachment_paths,
+        }
+    }
+
+    fn attachments(attachment_paths: Vec<String>) -> Self {
+        Self {
+            id: format!("acj_{}", uuid::Uuid::new_v4().simple()),
+            claim_token: None,
+            session_id: None,
+            worktree_path: None,
+            repository_path: None,
+            attachment_paths,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.session_id.is_some() {
+            "deleted_session"
+        } else {
+            "attachments"
+        }
+    }
+}
+
+const ARTIFACT_CLEANUP_CLAIM_MINUTES: i64 = 5;
+const MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM: usize = 64;
+const MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES: usize = 1024 * 1024;
+const MAX_ARTIFACT_CLEANUP_PATHS: usize = 4096;
+const MAX_ARTIFACT_CLEANUP_PATH_BYTES: usize = 32 * 1024;
+const MAX_ARTIFACT_CLEANUP_METADATA_BYTES: usize = 32 * 1024;
+const MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES: usize = 64;
+
+type RawArtifactCleanupJob = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+fn raw_artifact_cleanup_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawArtifactCleanupJob> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get::<_, i64>(7)? != 0,
+    ))
+}
+
+fn decode_artifact_cleanup_job(
+    id: String,
+    kind: String,
+    session_id: Option<String>,
+    worktree_path: Option<String>,
+    repository_path: Option<String>,
+    paths_json: String,
+) -> Result<ArtifactCleanupJob> {
+    anyhow::ensure!(
+        paths_json.len() <= MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES,
+        "artifact cleanup job {id} attachment paths exceed the decode limit"
+    );
+    let attachment_paths: Vec<String> = serde_json::from_str(&paths_json)
+        .with_context(|| format!("artifact cleanup job {id} has invalid attachment paths"))?;
+    anyhow::ensure!(
+        attachment_paths.len() <= MAX_ARTIFACT_CLEANUP_PATHS,
+        "artifact cleanup job {id} has too many attachment paths"
+    );
+    anyhow::ensure!(
+        attachment_paths
+            .iter()
+            .all(|path| !path.is_empty() && path.len() <= MAX_ARTIFACT_CLEANUP_PATH_BYTES),
+        "artifact cleanup job {id} contains an invalid attachment path length"
+    );
+    match kind.as_str() {
+        "attachments" => anyhow::ensure!(
+            session_id.is_none() && worktree_path.is_none() && repository_path.is_none(),
+            "attachment cleanup job {id} has unexpected session fields"
+        ),
+        "deleted_session" => anyhow::ensure!(
+            session_id.is_some() && worktree_path.is_some() && repository_path.is_some(),
+            "deleted-session cleanup job {id} is missing required fields"
+        ),
+        _ => anyhow::bail!("artifact cleanup job {id} has unknown kind {kind:?}"),
+    }
+    Ok(ArtifactCleanupJob {
+        id,
+        claim_token: None,
+        session_id,
+        worktree_path,
+        repository_path,
+        attachment_paths,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactCleanupClaim {
+    pub id: String,
+    pub token: String,
+}
+
+impl ArtifactCleanupJob {
+    pub(crate) fn claim(&self) -> Option<ArtifactCleanupClaim> {
+        self.claim_token.as_ref().map(|token| ArtifactCleanupClaim {
+            id: self.id.clone(),
+            token: token.clone(),
+        })
+    }
+}
+
 /// One serialized event, in flight to the writer thread.
 struct PendingEvent {
     scope: Scope,
@@ -2341,8 +2517,21 @@ enum StoreMutation {
         title: Option<String>,
         archived: Option<bool>,
     },
+    UpdateThread {
+        id: String,
+        mode: Option<String>,
+        model: Option<String>,
+        model_options: Option<serde_json::Map<String, serde_json::Value>>,
+        permission_mode: Option<PermissionMode>,
+    },
+    InsertThread {
+        thread: Box<Thread>,
+        model_options: serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(String, String)>,
+    },
     Delete {
         id: String,
+        cleanup: Box<ArtifactCleanupJob>,
     },
     AcceptPrompt {
         prompt: Box<trouve_protocol::QueuedPrompt>,
@@ -2350,9 +2539,16 @@ enum StoreMutation {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         claim_prompt_id: Option<String>,
         expected_previous_turn: Option<u64>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     },
     AppendCheckpoint {
         checkpoint: Box<CheckpointRow>,
+    },
+    AppendMessage {
+        thread_id: String,
+        payload: String,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     },
 }
 
@@ -2689,18 +2885,36 @@ fn update_session_row(
     title: Option<&str>,
     archived: Option<bool>,
 ) -> Result<()> {
-    if let Some(title) = title {
-        conn.execute(
-            "UPDATE sessions SET title = ?2 WHERE id = ?1",
-            params![id, title],
-        )?;
-    }
-    if let Some(archived) = archived {
-        conn.execute(
-            "UPDATE sessions SET archived = ?2 WHERE id = ?1",
-            params![id, archived],
-        )?;
-    }
+    let updated = conn.execute(
+        "UPDATE sessions
+         SET title = COALESCE(?2, title), archived = COALESCE(?3, archived)
+         WHERE id = ?1",
+        params![id, title, archived],
+    )?;
+    anyhow::ensure!(updated == 1, "session {id} no longer exists");
+    Ok(())
+}
+
+fn update_thread_row(
+    conn: &Connection,
+    id: &str,
+    mode: Option<&str>,
+    model: Option<&str>,
+    model_options: Option<&serde_json::Map<String, serde_json::Value>>,
+    permission_mode: Option<PermissionMode>,
+) -> Result<()> {
+    let model_options = model_options.map(serde_json::to_string).transpose()?;
+    let permission_mode = permission_mode.map(permission_mode_str);
+    let updated = conn.execute(
+        "UPDATE threads
+         SET mode = COALESCE(?2, mode),
+             model = COALESCE(?3, model),
+             model_options = COALESCE(?4, model_options),
+             permission_mode = COALESCE(?5, permission_mode)
+         WHERE id = ?1",
+        params![id, mode, model, model_options, permission_mode],
+    )?;
+    anyhow::ensure!(updated == 1, "thread {id} no longer exists");
     Ok(())
 }
 
@@ -2740,7 +2954,31 @@ fn delete_session_rows(conn: &Connection, id: &str) -> Result<()> {
         params![id],
     )?;
     conn.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
-    conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    let deleted = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    anyhow::ensure!(deleted == 1, "session {id} no longer exists");
+    Ok(())
+}
+
+fn insert_artifact_cleanup_job(
+    conn: &Connection,
+    job: &ArtifactCleanupJob,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO artifact_cleanup_jobs
+           (id, kind, session_id, worktree_path, repository_path,
+            attachment_paths, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            job.id,
+            job.kind(),
+            job.session_id,
+            job.worktree_path,
+            job.repository_path,
+            serde_json::to_string(&job.attachment_paths)?,
+            timestamp.to_rfc3339(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -2762,13 +3000,69 @@ fn apply_store_mutation(
             title,
             archived,
         } => update_session_row(conn, id, title.as_deref(), *archived)?,
-        StoreMutation::Delete { id } => delete_session_rows(conn, id)?,
+        StoreMutation::UpdateThread {
+            id,
+            mode,
+            model,
+            model_options,
+            permission_mode,
+        } => update_thread_row(
+            conn,
+            id,
+            mode.as_deref(),
+            model.as_deref(),
+            model_options.as_ref(),
+            *permission_mode,
+        )?,
+        StoreMutation::InsertThread {
+            thread,
+            model_options,
+            spawn,
+        } => {
+            // Validate the owner in this transaction so a stale engine
+            // snapshot cannot surface an FK error after session deletion.
+            let session_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                params![thread.session_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            anyhow::ensure!(
+                session_exists,
+                "session {} no longer exists",
+                thread.session_id
+            );
+            insert_thread_row(conn, thread, model_options)?;
+            if let Some((parent, kind)) = spawn {
+                let parent_session = conn
+                    .query_row(
+                        "SELECT session_id FROM threads WHERE id = ?1",
+                        params![parent],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                anyhow::ensure!(
+                    parent_session.as_deref() == Some(thread.session_id.as_str()),
+                    "spawn parent {parent} does not belong to session {}",
+                    thread.session_id
+                );
+                conn.execute(
+                    "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
+                     VALUES (?1, ?2, ?3)",
+                    params![thread.id, parent, kind],
+                )?;
+            }
+        }
+        StoreMutation::Delete { id, cleanup } => {
+            insert_artifact_cleanup_job(conn, cleanup, timestamp)?;
+            delete_session_rows(conn, id)?;
+        }
         StoreMutation::AcceptPrompt {
             prompt,
             tools_enabled,
             attachments,
             claim_prompt_id,
             expected_previous_turn,
+            staging_cleanup_claim,
         } => {
             for (attachment, path) in attachments {
                 conn.execute(
@@ -2819,9 +3113,63 @@ fn apply_store_mutation(
                 )?;
                 anyhow::ensure!(updated == 1, "turn changed while accepting message");
             }
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
         }
         StoreMutation::AppendCheckpoint { checkpoint } => {
             append_checkpoint_row(conn, checkpoint, timestamp)?;
+        }
+        StoreMutation::AppendMessage {
+            thread_id,
+            payload,
+            attachments,
+            staging_cleanup_claim,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO messages (thread_id, seq, payload)
+                 VALUES (
+                     ?1,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE thread_id = ?1),
+                     ?2
+                 )",
+                params![thread_id, payload],
+            )?;
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
         }
     }
     Ok(())
@@ -3312,6 +3660,16 @@ impl Store {
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
         let mut envelopes = self.append_pending_events(serialize_events(scope, vec![event])?)?;
         Ok(envelopes.pop().expect("single append returns one event"))
+    }
+
+    /// Persist a same-scope batch synchronously. Use this for cancellation
+    /// guards whose lifecycle must not be split after enqueue by dropping an
+    /// async future.
+    pub fn append_events(&self, scope: Scope, events: Vec<Event>) -> Result<Vec<EventEnvelope>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.append_pending_events(serialize_events(scope, events)?)
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
@@ -3998,16 +4356,315 @@ impl Store {
     pub(crate) fn delete_session_with_event(
         &self,
         id: &str,
+        cleanup: ArtifactCleanupJob,
         event: Event,
     ) -> Result<EventEnvelope> {
         let pending = serialize_lifecycle_events(
             vec![(Scope::Server, event)],
-            StoreMutation::Delete { id: id.to_string() },
+            StoreMutation::Delete {
+                id: id.to_string(),
+                cleanup: Box::new(cleanup),
+            },
         )?;
         Ok(self
             .append_pending_events(pending)?
             .pop()
             .expect("one lifecycle event returns one envelope"))
+    }
+
+    pub(crate) fn stage_attachment_cleanup(
+        &self,
+        attachment_paths: Vec<String>,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        if attachment_paths.is_empty() {
+            return Ok(None);
+        }
+        let mut job = ArtifactCleanupJob::attachments(attachment_paths);
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+        // The preparing request owns this job. A crashed request releases it
+        // automatically when the bounded lease expires.
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES))
+        .to_rfc3339();
+        let claim_token = uuid::Uuid::new_v4().simple().to_string();
+        tx.execute(
+            "UPDATE artifact_cleanup_jobs
+             SET claim_until = ?2, claim_token = ?3 WHERE id = ?1",
+            params![job.id, claim_until, claim_token],
+        )?;
+        tx.commit()?;
+        job.claim_token = Some(claim_token);
+        Ok(Some(job))
+    }
+
+    pub(crate) fn claim_artifact_cleanup_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        self.claim_artifact_cleanup_job_where(Some(id))
+    }
+
+    pub(crate) fn claim_next_artifact_cleanup_job(&self) -> Result<Option<ArtifactCleanupJob>> {
+        self.claim_artifact_cleanup_job_where(None)
+    }
+
+    fn claim_artifact_cleanup_job_where(
+        &self,
+        requested_id: Option<&str>,
+    ) -> Result<Option<ArtifactCleanupJob>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
+        for _ in 0..MAX_POISONED_ARTIFACT_CLEANUP_ROWS_PER_CLAIM {
+            let raw: Option<RawArtifactCleanupJob> = if let Some(id) = requested_id {
+                tx.query_row(
+                    "SELECT rowid,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128 THEN id END,
+                            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3 THEN kind END,
+                            CASE WHEN session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?3) THEN session_id END,
+                            CASE WHEN worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?3) THEN worktree_path END,
+                            CASE WHEN repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?3) THEN repository_path END,
+                            CASE WHEN typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?4 THEN attachment_paths END,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128
+                                   AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3
+                                   AND (session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?3))
+                                   AND (worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?3))
+                                   AND (repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?3))
+                                   AND typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?4
+                                   AND typeof(attempts) = 'integer' AND attempts >= 0
+                                   AND (claim_until IS NULL OR (typeof(claim_until) = 'text'
+                                        AND length(CAST(claim_until AS BLOB)) <= ?5
+                                        AND instr(claim_until, 'T') = 11
+                                        AND julianday(claim_until) IS NOT NULL))
+                                   AND (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'
+                                        AND length(CAST(next_attempt_at AS BLOB)) <= ?5
+                                        AND instr(next_attempt_at, 'T') = 11
+                                        AND julianday(next_attempt_at) IS NOT NULL))
+                                 THEN 1 ELSE 0 END
+                     FROM artifact_cleanup_jobs
+                     WHERE id = ?1
+                       AND (claim_until IS NULL
+                            OR typeof(claim_until) != 'text'
+                            OR length(CAST(claim_until AS BLOB)) > ?5
+                            OR instr(claim_until, 'T') != 11
+                            OR julianday(claim_until) IS NULL
+                            OR julianday(claim_until) <= julianday(?2))
+                       AND (next_attempt_at IS NULL
+                            OR typeof(next_attempt_at) != 'text'
+                            OR length(CAST(next_attempt_at AS BLOB)) > ?5
+                            OR instr(next_attempt_at, 'T') != 11
+                            OR julianday(next_attempt_at) IS NULL
+                            OR julianday(next_attempt_at) <= julianday(?2))",
+                    params![id, now, MAX_ARTIFACT_CLEANUP_METADATA_BYTES as i64, MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES as i64, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+                    raw_artifact_cleanup_job,
+                )
+                .optional()?
+            } else {
+                tx.query_row(
+                    "SELECT rowid,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128 THEN id END,
+                            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?2 THEN kind END,
+                            CASE WHEN session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?2) THEN session_id END,
+                            CASE WHEN worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?2) THEN worktree_path END,
+                            CASE WHEN repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?2) THEN repository_path END,
+                            CASE WHEN typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?3 THEN attachment_paths END,
+                            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= 128
+                                   AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?2
+                                   AND (session_id IS NULL OR (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) <= ?2))
+                                   AND (worktree_path IS NULL OR (typeof(worktree_path) = 'text' AND length(CAST(worktree_path AS BLOB)) <= ?2))
+                                   AND (repository_path IS NULL OR (typeof(repository_path) = 'text' AND length(CAST(repository_path AS BLOB)) <= ?2))
+                                   AND typeof(attachment_paths) = 'text' AND length(CAST(attachment_paths AS BLOB)) <= ?3
+                                   AND typeof(attempts) = 'integer' AND attempts >= 0
+                                   AND (claim_until IS NULL OR (typeof(claim_until) = 'text'
+                                        AND length(CAST(claim_until AS BLOB)) <= ?4
+                                        AND instr(claim_until, 'T') = 11
+                                        AND julianday(claim_until) IS NOT NULL))
+                                   AND (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'
+                                        AND length(CAST(next_attempt_at AS BLOB)) <= ?4
+                                        AND instr(next_attempt_at, 'T') = 11
+                                        AND julianday(next_attempt_at) IS NOT NULL))
+                                 THEN 1 ELSE 0 END
+                     FROM artifact_cleanup_jobs
+                     WHERE (claim_until IS NULL
+                            OR typeof(claim_until) != 'text'
+                            OR length(CAST(claim_until AS BLOB)) > ?4
+                            OR instr(claim_until, 'T') != 11
+                            OR julianday(claim_until) IS NULL
+                            OR julianday(claim_until) <= julianday(?1))
+                       AND (next_attempt_at IS NULL
+                            OR typeof(next_attempt_at) != 'text'
+                            OR length(CAST(next_attempt_at AS BLOB)) > ?4
+                            OR instr(next_attempt_at, 'T') != 11
+                            OR julianday(next_attempt_at) IS NULL
+                            OR julianday(next_attempt_at) <= julianday(?1))
+                     ORDER BY created_at, id LIMIT 1",
+                    params![now, MAX_ARTIFACT_CLEANUP_METADATA_BYTES as i64, MAX_ARTIFACT_CLEANUP_PATHS_JSON_BYTES as i64, MAX_ARTIFACT_CLEANUP_TIMESTAMP_BYTES as i64],
+                    raw_artifact_cleanup_job,
+                )
+                .optional()?
+            };
+            let Some((
+                rowid,
+                id,
+                kind,
+                session_id,
+                worktree_path,
+                repository_path,
+                paths_json,
+                metadata_is_valid,
+            )) = raw
+            else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let decoded = if metadata_is_valid {
+                id.zip(kind)
+                    .zip(paths_json)
+                    .ok_or_else(|| anyhow::anyhow!("cleanup metadata exceeds its decode limit"))
+                    .and_then(|((id, kind), paths_json)| {
+                        decode_artifact_cleanup_job(
+                            id,
+                            kind,
+                            session_id,
+                            worktree_path,
+                            repository_path,
+                            paths_json,
+                        )
+                    })
+            } else {
+                Err(anyhow::anyhow!(
+                    "cleanup metadata has an invalid SQLite type or exceeds its decode limit"
+                ))
+            };
+            let mut job = match decoded {
+                Ok(job) => job,
+                Err(error) => {
+                    let error = format!("malformed durable cleanup intent: {error:#}");
+                    let next_attempt_at = (now_at + chrono::Duration::minutes(10)).to_rfc3339();
+                    tx.execute(
+                        "UPDATE artifact_cleanup_jobs
+                         SET attempts = CASE
+                               WHEN typeof(attempts) = 'integer'
+                                    AND attempts >= 0
+                                    AND attempts < 9223372036854775807
+                                 THEN attempts + 1 ELSE 1 END,
+                             last_error = ?2,
+                             next_attempt_at = ?3, claim_until = NULL, claim_token = NULL
+                         WHERE rowid = ?1",
+                        params![rowid, error, next_attempt_at],
+                    )?;
+                    tracing::warn!(cleanup_rowid = rowid, %error, "quarantined malformed artifact cleanup job");
+                    if requested_id.is_some() {
+                        tx.commit()?;
+                        return Ok(None);
+                    }
+                    continue;
+                }
+            };
+            let claim_until =
+                (now_at + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES)).to_rfc3339();
+            let claim_token = uuid::Uuid::new_v4().simple().to_string();
+            let claimed = tx.execute(
+                "UPDATE artifact_cleanup_jobs
+                 SET claim_until = ?2, claim_token = ?3
+                 WHERE id = ?1
+                   AND (claim_until IS NULL OR julianday(claim_until) <= julianday(?4))
+                   AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?4))",
+                params![&job.id, claim_until, claim_token, now],
+            )?;
+            if claimed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            job.claim_token = Some(claim_token);
+            tx.commit()?;
+            return Ok(Some(job));
+        }
+        tx.commit()?;
+        Ok(None)
+    }
+
+    pub(crate) fn renew_artifact_cleanup_claim(
+        &self,
+        claim: &ArtifactCleanupClaim,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let claim_until = (chrono::Utc::now()
+            + chrono::Duration::minutes(ARTIFACT_CLEANUP_CLAIM_MINUTES))
+        .to_rfc3339();
+        Ok(conn.execute(
+            "UPDATE artifact_cleanup_jobs SET claim_until = ?3
+             WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, claim_until],
+        )? == 1)
+    }
+
+    pub(crate) fn complete_claimed_artifact_cleanup_job(
+        &self,
+        claim: &ArtifactCleanupClaim,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "artifact cleanup claim {} is no longer owned",
+            claim.id
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fail_claimed_artifact_cleanup_job(
+        &self,
+        claim: &ArtifactCleanupClaim,
+        error: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let attempts = conn
+            .query_row(
+                "SELECT CASE
+                          WHEN typeof(attempts) = 'integer' AND attempts >= 0
+                            THEN attempts END
+                   FROM artifact_cleanup_jobs
+                 WHERE id = ?1 AND claim_token = ?2",
+                params![claim.id, claim.token],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .context("artifact cleanup claim is no longer owned")?
+            .unwrap_or(0);
+        let delay_seconds = match attempts {
+            0 => 1,
+            1 => 5,
+            2 => 30,
+            3 => 120,
+            _ => 600,
+        };
+        let next_attempt_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
+        let updated = conn.execute(
+            "UPDATE artifact_cleanup_jobs
+             SET attempts = CASE
+                   WHEN typeof(attempts) = 'integer'
+                        AND attempts >= 0
+                        AND attempts < 9223372036854775807
+                     THEN attempts + 1 ELSE 1 END,
+                 last_error = ?3,
+                 next_attempt_at = ?4, claim_until = NULL, claim_token = NULL
+             WHERE id = ?1 AND claim_token = ?2",
+            params![claim.id, claim.token, error, next_attempt_at],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "artifact cleanup claim {} is no longer owned",
+            claim.id
+        );
+        Ok(())
     }
 
     // --- threads ------------------------------------------------------------
@@ -4018,6 +4675,29 @@ impl Store {
         model_options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         insert_thread_row(&self.conn.lock().unwrap(), t, model_options)
+    }
+
+    /// Insert a thread (and optional spawn edge) together with its durable
+    /// creation edge. Parent ownership is validated in the same transaction.
+    pub(crate) fn insert_thread_with_event(
+        &self,
+        thread: &Thread,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        spawn: Option<(&str, &str)>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::InsertThread {
+                thread: Box::new(thread.clone()),
+                model_options: model_options.clone(),
+                spawn: spawn.map(|(parent, kind)| (parent.to_string(), kind.to_string())),
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     /// Insert a spawned thread and its parent edge in one transaction. A
@@ -4089,32 +4769,39 @@ impl Store {
         model_options: Option<&serde_json::Map<String, serde_json::Value>>,
         permission_mode: Option<PermissionMode>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(mode) = mode {
-            conn.execute(
-                "UPDATE threads SET mode = ?2 WHERE id = ?1",
-                params![id, mode],
-            )?;
-        }
-        if let Some(model) = model {
-            conn.execute(
-                "UPDATE threads SET model = ?2 WHERE id = ?1",
-                params![id, model],
-            )?;
-        }
-        if let Some(options) = model_options {
-            conn.execute(
-                "UPDATE threads SET model_options = ?2 WHERE id = ?1",
-                params![id, serde_json::to_string(options)?],
-            )?;
-        }
-        if let Some(pm) = permission_mode {
-            conn.execute(
-                "UPDATE threads SET permission_mode = ?2 WHERE id = ?1",
-                params![id, permission_mode_str(pm)],
-            )?;
-        }
-        Ok(())
+        update_thread_row(
+            &self.conn.lock().unwrap(),
+            id,
+            mode,
+            model,
+            model_options,
+            permission_mode,
+        )
+    }
+
+    pub(crate) fn update_thread_with_event(
+        &self,
+        id: &str,
+        mode: Option<&str>,
+        model: Option<&str>,
+        model_options: Option<&serde_json::Map<String, serde_json::Value>>,
+        permission_mode: Option<PermissionMode>,
+        event: Event,
+    ) -> Result<EventEnvelope> {
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::UpdateThread {
+                id: id.to_string(),
+                mode: mode.map(str::to_owned),
+                model: model.map(str::to_owned),
+                model_options: model_options.cloned(),
+                permission_mode,
+            },
+        )?;
+        Ok(self
+            .append_pending_events(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
     }
 
     /// Replace the current todo snapshot for exactly one thread.
@@ -4271,6 +4958,7 @@ impl Store {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         claim_prompt_id: Option<String>,
         expected_previous_turn: Option<u64>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
         let pending = serialize_lifecycle_events(
@@ -4281,6 +4969,7 @@ impl Store {
                 attachments,
                 claim_prompt_id,
                 expected_previous_turn,
+                staging_cleanup_claim,
             },
         )?;
         self.append_pending_events(pending)
@@ -4418,7 +5107,8 @@ impl Store {
         attachments: &[trouve_protocol::Attachment],
         added: &[(trouve_protocol::Attachment, String)],
         removed_ids: &[String],
-    ) -> Result<Option<Vec<String>>> {
+        staging_cleanup_claim: Option<&ArtifactCleanupClaim>,
+    ) -> Result<Option<Option<ArtifactCleanupJob>>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let Some(thread_id) = tx
@@ -4470,8 +5160,26 @@ impl Store {
                 removed_paths.push(path);
             }
         }
+        if let Some(claim) = staging_cleanup_claim {
+            let deleted = tx.execute(
+                "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                params![claim.id, claim.token],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "attachment staging claim {} is no longer owned",
+                claim.id
+            );
+        }
+        let cleanup = if removed_paths.is_empty() {
+            None
+        } else {
+            let job = ArtifactCleanupJob::attachments(removed_paths);
+            insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+            Some(job)
+        };
         tx.commit()?;
-        Ok(Some(removed_paths))
+        Ok(Some(cleanup))
     }
 
     pub fn delete_queued_prompt(&self, id: &str) -> Result<bool> {
@@ -4489,7 +5197,7 @@ impl Store {
     pub(crate) fn delete_queued_prompt_attachments(
         &self,
         id: &str,
-    ) -> Result<Option<(String, Vec<String>)>> {
+    ) -> Result<Option<(String, Option<ArtifactCleanupJob>)>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let Some((thread_id, attachments_json)) = tx
@@ -4525,8 +5233,15 @@ impl Store {
             "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 0",
             params![id],
         )?;
+        let cleanup = if paths.is_empty() {
+            None
+        } else {
+            let job = ArtifactCleanupJob::attachments(paths);
+            insert_artifact_cleanup_job(&tx, &job, chrono::Utc::now())?;
+            Some(job)
+        };
         tx.commit()?;
-        Ok(Some((thread_id, paths)))
+        Ok(Some((thread_id, cleanup)))
     }
 
     /// Apply a full new order. `ids` must be exactly the thread's current
@@ -4700,6 +5415,37 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Remove steering attachments that were indexed before the backend
+    /// accepted the steering command. Restrict every id to the owning thread
+    /// so a malformed rollback cannot detach another prompt's upload.
+    pub fn remove_attachments(
+        &self,
+        thread_id: &str,
+        attachment_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let mut paths = Vec::with_capacity(attachment_ids.len());
+        for attachment_id in attachment_ids {
+            let path = tx
+                .query_row(
+                    "SELECT path FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                tx.execute(
+                    "DELETE FROM attachments WHERE id = ?1 AND thread_id = ?2",
+                    params![attachment_id, thread_id],
+                )?;
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(paths)
     }
 
     /// On-disk paths of every attachment belonging to a session's threads
@@ -7825,6 +8571,28 @@ impl Store {
             .expect("one checkpoint event returns one envelope"))
     }
 
+    pub(crate) fn append_event_with_message(
+        &self,
+        scope: Scope,
+        event: Event,
+        thread_id: &str,
+        payload: &serde_json::Value,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    ) -> Result<()> {
+        let pending = serialize_lifecycle_events(
+            vec![(scope, event)],
+            StoreMutation::AppendMessage {
+                thread_id: thread_id.to_string(),
+                payload: payload.to_string(),
+                attachments,
+                staging_cleanup_claim,
+            },
+        )?;
+        self.append_pending_events(pending)?;
+        Ok(())
+    }
+
     pub fn checkpoint_at(&self, session_id: &str, seq: i64) -> Result<Option<CheckpointRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -7849,6 +8617,15 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn checkpoint_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement =
+            conn.prepare("SELECT id FROM checkpoints WHERE session_id = ?1 ORDER BY seq")?;
+        let rows = statement.query_map(params![session_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn latest_checkpoint_seq(&self, session_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
@@ -7856,6 +8633,20 @@ impl Store {
             params![session_id],
             |r| r.get::<_, Option<i64>>(0),
         )?)
+    }
+
+    /// Sequence the next checkpoint at the tip of the currently selected
+    /// undo branch. After an undo this deliberately reuses the first redo
+    /// sequence; the append transaction truncates that stale redo tail.
+    pub fn next_checkpoint_seq(&self, session_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let (latest, undo_pos) = conn.query_row(
+            "SELECT (SELECT MAX(seq) FROM checkpoints WHERE session_id = ?1), undo_pos
+             FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        Ok(undo_pos.unwrap_or(latest.unwrap_or(-1)) + 1)
     }
 
     pub fn undo_pos(&self, session_id: &str) -> Result<Option<i64>> {
@@ -7985,6 +8776,197 @@ mod tests {
             event_writer_sqlite_error_code(&error),
             Some(rusqlite::ErrorCode::DatabaseLocked)
         );
+    }
+
+    #[test]
+    fn artifact_cleanup_claim_tokens_fence_stale_workers() {
+        let store = Store::open_in_memory().unwrap();
+        let staged = store
+            .stage_attachment_cleanup(vec!["/tmp/attachment".into()])
+            .unwrap()
+            .unwrap();
+        let staging_claim = staged.claim().unwrap();
+        assert!(store.renew_artifact_cleanup_claim(&staging_claim).unwrap());
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE artifact_cleanup_jobs SET claim_until = ?2 WHERE id = ?1",
+                params![staged.id, "1970-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        let reclaimed = store
+            .claim_artifact_cleanup_job(&staged.id)
+            .unwrap()
+            .unwrap();
+        let current_claim = reclaimed.claim().unwrap();
+        assert_ne!(current_claim.token, staging_claim.token);
+        assert!(!store.renew_artifact_cleanup_claim(&staging_claim).unwrap());
+        assert!(
+            store
+                .complete_claimed_artifact_cleanup_job(&staging_claim)
+                .is_err()
+        );
+        assert!(
+            store
+                .fail_claimed_artifact_cleanup_job(&staging_claim, "stale")
+                .is_err()
+        );
+        store
+            .complete_claimed_artifact_cleanup_job(&current_claim)
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_cleanup_row_does_not_starve_later_valid_job() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_json', 'attachments', '{not-json', '2000-01-01T00:00:00Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_blob', CAST(X'80' AS BLOB), '[]', '2000-01-01T00:00:01Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, created_at)
+             VALUES ('acj_poison_integer', 42, 7, '2000-01-01T00:00:02Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, claim_until, created_at)
+             VALUES ('acj_poison_claim', 'attachments', '[]', CAST(X'80' AS BLOB),
+                     '2000-01-01T00:00:03Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, next_attempt_at, created_at)
+             VALUES ('acj_poison_backoff', 'attachments', '[]', 'not-a-timestamp',
+                     '2000-01-01T00:00:04Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, attempts, created_at)
+             VALUES ('acj_poison_attempts', 'attachments', '[]', CAST(X'80' AS BLOB),
+                     '2000-01-01T00:00:05Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, claim_until, created_at)
+             VALUES ('acj_future_claim', 'attachments', '[]', '2999-01-01T00:00:00Z',
+                     '2000-01-01T00:00:06Z');
+             INSERT INTO artifact_cleanup_jobs
+               (id, kind, attachment_paths, next_attempt_at, created_at)
+             VALUES ('acj_future_backoff', 'attachments', '[]', '2999-01-01T00:00:00Z',
+                     '2000-01-01T00:00:07Z');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT typeof(kind) FROM artifact_cleanup_jobs WHERE id = 'acj_poison_blob'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "blob"
+        );
+        drop(conn);
+        let valid = ArtifactCleanupJob::attachments(vec!["/tmp/valid".into()]);
+        insert_artifact_cleanup_job(&store.conn.lock().unwrap(), &valid, chrono::Utc::now())
+            .unwrap();
+
+        let claimed = store.claim_next_artifact_cleanup_job().unwrap().unwrap();
+        assert_eq!(claimed.id, valid.id);
+        assert!(claimed.claim_token.is_some());
+        for id in [
+            "acj_poison_json",
+            "acj_poison_blob",
+            "acj_poison_integer",
+            "acj_poison_claim",
+            "acj_poison_backoff",
+            "acj_poison_attempts",
+        ] {
+            let (attempts, last_error, next_attempt_at): (i64, Option<String>, Option<String>) =
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT attempts, last_error, next_attempt_at
+                     FROM artifact_cleanup_jobs WHERE id = ?1",
+                        params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(attempts, 1, "poisoned cleanup row {id} was not quarantined");
+            assert!(
+                last_error
+                    .unwrap()
+                    .contains("malformed durable cleanup intent")
+            );
+            assert!(next_attempt_at.is_some());
+        }
+        for id in ["acj_future_claim", "acj_future_backoff"] {
+            let (attempts, last_error): (i64, Option<String>) = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attempts, last_error FROM artifact_cleanup_jobs WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(attempts, 0, "valid future cleanup job {id} was modified");
+            assert!(last_error.is_none());
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_repairs_malformed_attempt_count() {
+        let store = Store::open_in_memory().unwrap();
+        let job = ArtifactCleanupJob::attachments(vec!["/tmp/retry".into()]);
+        insert_artifact_cleanup_job(&store.conn.lock().unwrap(), &job, chrono::Utc::now()).unwrap();
+        let claimed = store.claim_artifact_cleanup_job(&job.id).unwrap().unwrap();
+        let claim = claimed.claim().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE artifact_cleanup_jobs SET attempts = CAST(X'80' AS BLOB) WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        store
+            .fail_claimed_artifact_cleanup_job(&claim, "retry cleanup")
+            .unwrap();
+
+        let (attempt_type, attempts, claim_until, claim_token, next_attempt_at): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT typeof(attempts), attempts, claim_until, claim_token, next_attempt_at
+                   FROM artifact_cleanup_jobs WHERE id = ?1",
+                params![job.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(attempt_type, "integer");
+        assert_eq!(attempts, 1);
+        assert!(claim_until.is_none());
+        assert!(claim_token.is_none());
+        assert!(next_attempt_at.is_some());
     }
 
     #[test]
@@ -8860,6 +9842,12 @@ mod tests {
         store
             .delete_session_with_event(
                 "se_q",
+                ArtifactCleanupJob::deleted_session(
+                    "se_q".into(),
+                    "/tmp/se_q".into(),
+                    "/tmp/repo".into(),
+                    Vec::new(),
+                ),
                 Event::SessionDeleted {
                     session_id: "se_q".into(),
                     workspace_id: "ws_q".into(),
@@ -10078,6 +11066,7 @@ mod tests {
                 vec![(attachment.clone(), "/tmp/at_accept.png".into())],
                 Some(prompt.id.clone()),
                 Some(0),
+                None,
                 events,
             )
             .unwrap();
@@ -10130,6 +11119,7 @@ mod tests {
             vec![(attachment.clone(), "/tmp/at_accept_rollback.txt".into())],
             Some("qp_accept_rollback".into()),
             Some(99),
+            None,
             vec![(
                 Scope::Thread("th_accept_rollback".into()),
                 Event::QueueUpdated {
@@ -10241,10 +11231,11 @@ mod tests {
                 std::slice::from_ref(&new),
                 &[(new.clone(), "/tmp/at_new".into())],
                 std::slice::from_ref(&old.id),
+                None,
             )
             .unwrap()
             .unwrap();
-        assert_eq!(removed, ["/tmp/at_old"]);
+        assert_eq!(removed.unwrap().attachment_paths, ["/tmp/at_old"]);
         assert!(store.attachment(&old.id).unwrap().is_none());
         assert!(store.attachment(&new.id).unwrap().is_some());
         assert_eq!(
@@ -10257,7 +11248,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(thread_id, "th_attachment_cleanup");
-        assert_eq!(removed, ["/tmp/at_new"]);
+        assert_eq!(removed.unwrap().attachment_paths, ["/tmp/at_new"]);
         assert!(store.attachment(&new.id).unwrap().is_none());
         assert!(
             store
@@ -10265,6 +11256,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn steering_attachment_rollback_is_thread_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_attachment_cleanup");
+        seed_thread(&store, "th_attachment_other");
+        let owned = trouve_protocol::Attachment {
+            id: "at_owned".into(),
+            name: "owned.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        let other = trouve_protocol::Attachment {
+            id: "at_other".into(),
+            name: "other.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 3,
+        };
+        store
+            .add_attachment("th_attachment_cleanup", &owned, "/tmp/at_owned")
+            .unwrap();
+        store
+            .add_attachment("th_attachment_other", &other, "/tmp/at_other")
+            .unwrap();
+
+        let removed = store
+            .remove_attachments(
+                "th_attachment_cleanup",
+                &[owned.id.clone(), other.id.clone()],
+            )
+            .unwrap();
+        assert_eq!(removed, ["/tmp/at_owned"]);
+        assert!(store.attachment(&owned.id).unwrap().is_none());
+        assert!(store.attachment(&other.id).unwrap().is_some());
     }
 
     #[test]
@@ -10525,8 +11551,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.latest_checkpoint_seq("se_1").unwrap(), Some(2));
+        assert_eq!(store.next_checkpoint_seq("se_1").unwrap(), 3);
         // Simulate undo to seq 0, then a new checkpoint: seq 1-2 replaced.
         store.set_undo_pos("se_1", Some(0)).unwrap();
+        assert_eq!(store.next_checkpoint_seq("se_1").unwrap(), 1);
         let replacement = CheckpointRow {
             id: "cp_new".into(),
             session_id: "se_1".into(),

@@ -20,6 +20,34 @@ const MAX_JOB_BYTES: usize = 1024 * 1024;
 /// Hard lifetime cap for a background job; runaway processes die with it.
 const MAX_JOB_SECS: u64 = 3600;
 const MAX_JOBS: usize = 16;
+const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct CleanupController {
+    #[cfg(test)]
+    injected_failures: AtomicU64,
+}
+
+impl CleanupController {
+    async fn terminate_and_reap(
+        &self,
+        child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(test)]
+        if self
+            .injected_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::other(
+                "injected shell process-tree cleanup failure",
+            ));
+        }
+        child.lock().await.terminate_and_reap().await
+    }
+}
 
 struct CapturedOutput {
     bytes: Vec<u8>,
@@ -59,27 +87,20 @@ struct JobOutput {
 #[derive(Default)]
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, Job>>,
+    cleanup: Arc<CleanupController>,
 }
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
-async fn terminate_and_reap(
-    child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
-) -> std::io::Result<std::process::ExitStatus> {
-    child.lock().await.terminate_and_reap().await
-}
-
 async fn terminate_background_job(
+    cleanup: &CleanupController,
     child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     output: &Arc<Mutex<JobOutput>>,
 ) -> std::io::Result<()> {
-    output.lock().unwrap().killed = true;
-    let status = terminate_and_reap(child).await?;
-    output
-        .lock()
-        .unwrap()
-        .exit_code
-        .get_or_insert(status.code().unwrap_or(-1));
+    let status = cleanup.terminate_and_reap(child).await?;
+    let mut output = output.lock().unwrap();
+    output.killed = true;
+    output.exit_code.get_or_insert(status.code().unwrap_or(-1));
     Ok(())
 }
 
@@ -107,17 +128,28 @@ impl JobRegistry {
     }
 
     /// Stop every running job belonging to a worktree being removed.
-    pub async fn kill_worktree(&self, worktree: &std::path::Path) {
+    pub async fn kill_worktree(&self, worktree: &std::path::Path) -> Result<(), String> {
         let jobs: Vec<_> = {
             let jobs = self.jobs.lock().unwrap();
-            jobs.values()
-                .filter(|job| job.worktree == worktree)
-                .filter(|job| job.output.lock().unwrap().exit_code.is_none())
-                .map(|job| (job.child.clone(), job.output.clone()))
+            jobs.iter()
+                .filter(|(_, job)| job.worktree == worktree)
+                .filter(|(_, job)| job.output.lock().unwrap().exit_code.is_none())
+                .map(|(id, job)| (id.clone(), job.child.clone(), job.output.clone()))
                 .collect()
         };
-        for (child, output) in jobs {
-            let _ = terminate_background_job(&child, &output).await;
+        let mut failures = Vec::new();
+        for (id, child, output) in jobs {
+            if let Err(error) = terminate_background_job(&self.cleanup, &child, &output).await {
+                failures.push(format!("{id}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "background shell cleanup was not acknowledged: {}",
+                failures.join("; ")
+            ))
         }
     }
 }
@@ -251,19 +283,46 @@ impl Tool for Shell {
         tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
-                let _ = terminate_and_reap(&child).await;
+                let cleanup_failure = self
+                    .cleanup_foreground_until_acknowledged(&child)
+                    .await;
                 stdout_task.abort();
                 stderr_task.abort();
-                ToolResult::error("command cancelled")
+                match cleanup_failure {
+                    Some(error) => ToolResult::error(format!(
+                        "command cancelled; process-tree cleanup required a retry after: {error}"
+                    )),
+                    None => ToolResult::error("command cancelled"),
+                }
             }
             outcome = tokio::time::timeout(timeout, wait) => match outcome {
             Err(_) => {
-                let _ = terminate_and_reap(&child).await;
+                let cleanup_failure = self
+                    .cleanup_foreground_until_acknowledged(&child)
+                    .await;
                 stdout_task.abort();
                 stderr_task.abort();
-                ToolResult::error(format!("command timed out after {}s", timeout.as_secs()))
+                let timeout_message = format!("command timed out after {}s", timeout.as_secs());
+                match cleanup_failure {
+                    Some(error) => ToolResult::error(format!(
+                        "{timeout_message}; process-tree cleanup required a retry after: {error}"
+                    )),
+                    None => ToolResult::error(timeout_message),
+                }
             }
-            Ok(Err(e)) => ToolResult::error(format!("shell failed: {e}")),
+            Ok(Err(error)) => {
+                let cleanup_failure = self
+                    .cleanup_foreground_until_acknowledged(&child)
+                    .await;
+                stdout_task.abort();
+                stderr_task.abort();
+                match cleanup_failure {
+                    Some(cleanup_error) => ToolResult::error(format!(
+                        "shell failed: {error}; process-tree cleanup required a retry after: {cleanup_error}"
+                    )),
+                    None => ToolResult::error(format!("shell failed: {error}")),
+                }
+            }
             Ok(Ok(status)) => {
                 let stdout = stdout_task
                     .await
@@ -296,6 +355,30 @@ impl Tool for Shell {
 }
 
 impl Shell {
+    pub(super) fn new(jobs: Arc<JobRegistry>) -> Self {
+        Self { jobs }
+    }
+
+    /// Retry process-tree cleanup without returning control to the engine.
+    /// The engine owns the session mutation lane while this future is live;
+    /// keeping the future pending therefore quarantines the lane if cleanup
+    /// cannot be acknowledged.
+    async fn cleanup_foreground_until_acknowledged(
+        &self,
+        child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+    ) -> Option<String> {
+        let mut first_failure = None;
+        loop {
+            match self.jobs.cleanup.terminate_and_reap(child).await {
+                Ok(_) => return first_failure,
+                Err(error) => {
+                    first_failure.get_or_insert_with(|| error.to_string());
+                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
     async fn spawn_background(&self, ctx: &ToolCtx, command: &str) -> ToolResult {
         self.spawn_background_with_lifetime(ctx, command, Duration::from_secs(MAX_JOB_SECS))
             .await
@@ -340,6 +423,7 @@ impl Shell {
         {
             let child = child.clone();
             let output = output.clone();
+            let cleanup = self.jobs.cleanup.clone();
             tokio::spawn(async move {
                 let _mutation_lease = mutation_lease;
                 loop {
@@ -358,7 +442,10 @@ impl Shell {
                             // A liveness-query failure must not release the
                             // mutation lane while an untracked descendant may
                             // still be running.
-                            if terminate_background_job(&child, &output).await.is_ok() {
+                            if terminate_background_job(&cleanup, &child, &output)
+                                .await
+                                .is_ok()
+                            {
                                 output.lock().unwrap().exit_code.get_or_insert(-1);
                                 break;
                             }
@@ -373,10 +460,16 @@ impl Shell {
         {
             let child = child.clone();
             let output = output.clone();
+            let cleanup = self.jobs.cleanup.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(lifetime).await;
                 if output.lock().unwrap().exit_code.is_none() {
-                    let _ = terminate_background_job(&child, &output).await;
+                    while terminate_background_job(&cleanup, &child, &output)
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+                    }
                 }
             });
         }
@@ -388,8 +481,14 @@ impl Shell {
                 // Over the cap: don't leak the process we just started.
                 let child = child.clone();
                 let output = output.clone();
+                let cleanup = self.jobs.cleanup.clone();
                 tokio::spawn(async move {
-                    let _ = terminate_background_job(&child, &output).await;
+                    while terminate_background_job(&cleanup, &child, &output)
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+                    }
                 });
                 return ToolResult::error(e);
             }
@@ -568,7 +667,7 @@ impl Tool for ShellKill {
                 "already_finished": true,
             }));
         }
-        if let Err(e) = terminate_background_job(&child, &output).await {
+        if let Err(e) = terminate_background_job(&self.jobs.cleanup, &child, &output).await {
             return ToolResult::error(format!("cannot kill {id}: {e}"));
         }
         ToolResult::ok(json!({
@@ -586,7 +685,7 @@ mod tests {
     fn tools() -> (Shell, ShellOutput, ShellKill) {
         let jobs = Arc::new(JobRegistry::default());
         (
-            Shell { jobs: jobs.clone() },
+            Shell::new(jobs.clone()),
             ShellOutput { jobs: jobs.clone() },
             ShellKill { jobs },
         )
@@ -643,6 +742,69 @@ mod tests {
             .run(&ctx, &json!({"command": "sleep 5", "timeout_secs": 1}))
             .await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_cleanup_failure_only_after_a_retry_is_acknowledged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        shell
+            .jobs
+            .cleanup
+            .injected_failures
+            .store(1, Ordering::SeqCst);
+
+        let res = shell
+            .run(&ctx, &json!({"command": "sleep 5", "timeout_secs": 0}))
+            .await;
+
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            res.result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("injected shell process-tree cleanup failure")),
+            "the discarded cleanup failure was not propagated: {:?}",
+            res.result
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_reports_cleanup_failure_only_after_a_retry_is_acknowledged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolCtx {
+            cancel: cancel.clone(),
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        shell
+            .jobs
+            .cleanup
+            .injected_failures
+            .store(1, Ordering::SeqCst);
+        let running =
+            tokio::spawn(async move { shell.run(&ctx, &json!({"command": "sleep 60"})).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("cleanup retry should eventually be acknowledged")
+            .unwrap();
+
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            res.result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("injected shell process-tree cleanup failure")),
+            "the discarded cleanup failure was not propagated: {:?}",
+            res.result
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -809,6 +971,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_eviction_attempts_every_job_and_aggregates_cleanup_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let first = shell
+            .run(
+                &ctx,
+                &json!({"command": "sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let second = shell
+            .run(
+                &ctx,
+                &json!({"command": "sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let first_id = first.result["job_id"].as_str().unwrap();
+        let second_id = second.result["job_id"].as_str().unwrap();
+        shell
+            .jobs
+            .cleanup
+            .injected_failures
+            .store(2, Ordering::SeqCst);
+
+        let error = shell.jobs.kill_worktree(tmp.path()).await.unwrap_err();
+
+        assert!(
+            error.contains(first_id),
+            "first job was not attempted: {error}"
+        );
+        assert!(
+            error.contains(second_id),
+            "second job was not attempted: {error}"
+        );
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn background_job_holds_transferred_mutation_lease_until_reaped() {
         let tmp = tempfile::tempdir().unwrap();
         let lane = Arc::new(tokio::sync::RwLock::new(()));
@@ -921,6 +1124,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
             .await
             .expect("shell_kill did not release the daemonized descendant's lease");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shell_kill_owns_setsid_descendant_after_leader_exit() {
+        assert!(
+            trouve_agents::process_env::find_executable("setsid").is_some(),
+            "setsid is required"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let lane = Arc::new(tokio::sync::RwLock::new(()));
+        let guard = lane.clone().write_owned().await;
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
+                guard,
+            ))),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let launched = shell
+            .run(
+                &ctx,
+                &json!({
+                    "command": "setsid sh -c 'echo $$ > child.pid; exec sleep 60' </dev/null >/dev/null 2>&1 &",
+                    "run_in_background": true
+                }),
+            )
+            .await;
+        let id = launched.result["job_id"].as_str().unwrap().to_string();
+        let leader_pid = launched.result["pid"].as_u64().unwrap() as u32;
+        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        wait_for_process_exit(leader_pid).await;
+
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
+                .await
+                .is_err(),
+            "setsid descendant released the session mutation lease"
+        );
+
+        let killed = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(killed.status, trouve_protocol::ToolStatus::Ok);
+        wait_for_process_exit(child_pid).await;
+        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
+            .await
+            .expect("shell_kill did not release the setsid descendant's lease");
     }
 
     #[cfg(target_os = "linux")]

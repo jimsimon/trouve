@@ -180,7 +180,9 @@ def generate(
     return "\n".join(lines)
 
 
-def generate_sbom(metadata: dict[str, object]) -> str:
+def generate_sbom(
+    metadata: dict[str, object], product_name: str = "trouve"
+) -> str:
     packages = [
         package for package in metadata["packages"] if package.get("source")
     ]
@@ -218,7 +220,7 @@ def generate_sbom(metadata: dict[str, object]) -> str:
             + ", ".join(sorted(product_versions))
         )
     product_version = product_versions.pop()
-    product_purl = f"pkg:cargo/trouve@{product_version}"
+    product_purl = f"pkg:cargo/{product_name}@{product_version}"
     document = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
@@ -227,7 +229,7 @@ def generate_sbom(metadata: dict[str, object]) -> str:
             "component": {
                 "type": "application",
                 "bom-ref": product_purl,
-                "name": "trouve",
+                "name": product_name,
                 "version": product_version,
                 "purl": product_purl,
             }
@@ -235,6 +237,32 @@ def generate_sbom(metadata: dict[str, object]) -> str:
         "components": components,
     }
     return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def sbom_product_name(
+    metadata: dict[str, object], manifest_path: Path | None
+) -> str:
+    if manifest_path is None:
+        return "trouve"
+    selected_manifest = manifest_path.resolve()
+    for package in metadata["packages"]:
+        package_manifest = package.get("manifest_path")
+        if (
+            isinstance(package_manifest, str)
+            and Path(package_manifest).resolve() == selected_manifest
+        ):
+            return str(package["name"])
+    member_ids = set(metadata.get("workspace_members", []))
+    members = [
+        str(package["name"])
+        for package in metadata["packages"]
+        if package.get("id") in member_ids
+    ]
+    if len(members) == 1:
+        return members[0]
+    raise SystemExit(
+        f"cannot identify the SBOM component for manifest {manifest_path}"
+    )
 
 
 def main() -> None:
@@ -268,7 +296,9 @@ def main() -> None:
     if args.sbom is not None:
         output = args.sbom if args.sbom.is_absolute() else ROOT / args.sbom
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(generate_sbom(metadata))
+        output.write_text(
+            generate_sbom(metadata, sbom_product_name(metadata, manifest_path))
+        )
 
 
 if __name__ == "__main__":

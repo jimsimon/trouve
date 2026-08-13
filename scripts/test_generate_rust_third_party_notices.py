@@ -20,6 +20,7 @@ def metadata(license_name: str = "Apache-2.0 / MIT") -> dict[str, object]:
                 "name": "trouve-app",
                 "version": "3.7.0",
                 "source": None,
+                "manifest_path": "/repo/app/Cargo.toml",
             },
             {
                 "id": "registry+example#dependency@1.0.0",
@@ -66,6 +67,16 @@ class RustSbomTests(unittest.TestCase):
             document["components"][0]["licenses"],
             [{"expression": "Apache-2.0 OR MIT"}],
         )
+
+    def test_nested_sbom_uses_the_selected_workspace_package_identity(self):
+        nested = metadata()
+        manifest = pathlib.Path("/repo/app/Cargo.toml")
+        product_name = rust_notices.sbom_product_name(nested, manifest)
+        document = json.loads(rust_notices.generate_sbom(nested, product_name))
+
+        product = document["metadata"]["component"]
+        self.assertEqual(product["name"], "trouve-app")
+        self.assertEqual(product["purl"], "pkg:cargo/trouve-app@3.7.0")
 
     def test_workspace_version_must_be_unambiguous(self):
         broken = metadata()

@@ -21,17 +21,17 @@ mod tests {
 
     #[test]
     fn accepts_the_exact_required_protocol() {
-        ensure_compatible_protocol("4.0", "4.0").unwrap();
+        ensure_compatible_protocol("5.0", "5.0").unwrap();
     }
 
     #[test]
     fn rejects_older_newer_other_major_and_malformed_protocols() {
-        for server in ["3.36", "4.1", "5.0", "unknown", "4.0.1"] {
-            let error = ensure_compatible_protocol(server, "4.0")
+        for server in ["3.36", "4.0", "4.2", "5.1", "unknown", "5.0.1"] {
+            let error = ensure_compatible_protocol(server, "5.0")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(server));
-            assert!(error.contains("expected exactly 4.0"));
+            assert!(error.contains("expected exactly 5.0"));
         }
     }
 }

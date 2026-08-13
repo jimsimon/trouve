@@ -86,7 +86,24 @@ jobs:
         with:
           tool: cargo-audit
       - name: Audit isolated Servo lockfile
-        run: cargo audit --file crates/trouve-servo-embed-preview/Cargo.lock --deny warnings
+        # This disposable qualification harness follows Servo's pinned source
+        # graph. These advisories are currently unavoidable in that upstream
+        # graph; keep each exception explicit so every new advisory still
+        # fails the build and Servo upgrades can remove waivers deliberately.
+        run: >-
+          cargo audit
+          --file crates/trouve-servo-embed-preview/Cargo.lock
+          --deny warnings
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2025-0075
+          --ignore RUSTSEC-2025-0080
+          --ignore RUSTSEC-2025-0081
+          --ignore RUSTSEC-2025-0098
+          --ignore RUSTSEC-2025-0100
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2026-0173
+          --ignore RUSTSEC-2026-0192
       - name: Format isolated Servo workspace
         run: >-
           cargo fmt --manifest-path crates/trouve-servo-embed-preview/Cargo.toml

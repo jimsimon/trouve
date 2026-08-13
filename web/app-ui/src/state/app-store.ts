@@ -194,6 +194,7 @@ export class AppStore {
   readonly #maxThreadViews: number;
   readonly #revision = createSignal(0);
   readonly #sessionMetadata = new Map<string, ProtocolSession>();
+  readonly #deletedSessions = new Map<string, number | undefined>();
   readonly #sessionSummaries = new Map<string, ProtocolSessionSummary>();
   readonly #seenSessionCursors = new Map<string, number>();
   #sessionSummaryCursor = 0;
@@ -202,6 +203,7 @@ export class AppStore {
   readonly #threads = new Map<string, ProtocolThread>();
   readonly #threadStatuses = new Map<string, ProtocolThreadStatus>();
   readonly #seenThreadCursors = new Map<string, number>();
+  readonly #initializedThreadSessions = new Set<string>();
   readonly #initializedThreadStatusSessions = new Set<string>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
@@ -266,11 +268,15 @@ export class AppStore {
 
   replaceSessionMetadata(sessions: readonly ProtocolSession[]): void {
     this.#sessionMetadata.clear();
-    for (const session of sessions) this.#sessionMetadata.set(session.id, session);
+    for (const session of sessions) {
+      if (this.#deletedSessions.has(session.id)) continue;
+      this.#sessionMetadata.set(session.id, session);
+    }
     this.#touch();
   }
 
   upsertSessionMetadata(session: ProtocolSession): void {
+    if (this.#deletedSessions.has(session.id)) return;
     this.#sessionMetadata.set(session.id, session);
     const summary = this.#sessionSummaries.get(session.id);
     if (summary !== undefined && session.archived !== undefined) {
@@ -282,7 +288,17 @@ export class AppStore {
     this.#touch();
   }
 
-  removeSession(sessionId: string): void {
+  removeSession(sessionId: string, cursor?: number): void {
+    const hadTombstone = this.#deletedSessions.has(sessionId);
+    const previous = this.#deletedSessions.get(sessionId);
+    if (!hadTombstone) {
+      this.#deletedSessions.set(sessionId, cursor);
+    } else if (cursor !== undefined && (previous === undefined || cursor > previous)) {
+      // A local HTTP deletion starts as an unbounded tombstone. Its later
+      // durable delete edge supplies the ordering cursor that can eventually
+      // prove a same-id `session.created` event is genuinely newer.
+      this.#deletedSessions.set(sessionId, cursor);
+    }
     this.#sessionMetadata.delete(sessionId);
     this.#sessionSummaries.delete(sessionId);
     this.#seenSessionCursors.delete(sessionId);
@@ -292,8 +308,22 @@ export class AppStore {
         this.#threads.delete(threadId);
         this.#threadViews.delete(threadId);
         this.#threadTodoEvents.delete(threadId);
+        this.#threadStatuses.delete(threadId);
+        this.#seenThreadCursors.delete(threadId);
       }
     }
+    // Status snapshots can arrive before (or without) thread metadata. Purge
+    // those tombstoned IDs independently so they cannot retain unread state,
+    // folded views, or todo projections after the session is gone.
+    for (const [threadId, status] of this.#threadStatuses) {
+      if (status.session_id !== sessionId) continue;
+      this.#threadStatuses.delete(threadId);
+      this.#seenThreadCursors.delete(threadId);
+      this.#threadViews.delete(threadId);
+      this.#threadTodoEvents.delete(threadId);
+    }
+    this.#initializedThreadSessions.delete(sessionId);
+    this.#initializedThreadStatusSessions.delete(sessionId);
     this.#touch();
   }
 
@@ -342,6 +372,7 @@ export class AppStore {
 
     this.#sessionPullRequests.clear();
     for (const session of projection.session_pull_requests) {
+      if (this.#deletedSessions.has(session.session_id)) continue;
       this.#sessionPullRequests.set(
         session.session_id,
         Object.freeze([...session.prs]),
@@ -356,6 +387,8 @@ export class AppStore {
     sessionId: string,
     threads: readonly ProtocolThread[],
   ): void {
+    if (this.#deletedSessions.has(sessionId)) return;
+    this.#initializedThreadSessions.add(sessionId);
     const nextThreadIds = new Set(threads.map((thread) => thread.id));
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
@@ -368,11 +401,22 @@ export class AppStore {
         }
       }
     }
+    // Status snapshots are independent from thread metadata and can arrive
+    // first. Once the authoritative thread list arrives, remove status-only
+    // orphans that the metadata loop above could not discover.
+    for (const [threadId, status] of this.#threadStatuses) {
+      if (status.session_id !== sessionId || nextThreadIds.has(threadId)) continue;
+      this.#threadStatuses.delete(threadId);
+      this.#seenThreadCursors.delete(threadId);
+      this.#threadViews.delete(threadId);
+      this.#threadTodoEvents.delete(threadId);
+    }
     for (const thread of threads) this.#storeThreadSnapshot(thread);
     this.#touch();
   }
 
   upsertThread(thread: ProtocolThread): void {
+    if (this.#deletedSessions.has(thread.session_id)) return;
     this.#storeThreadSnapshot(thread);
     this.#touch();
   }
@@ -381,11 +425,22 @@ export class AppStore {
     sessionId: string,
     statuses: readonly ProtocolThreadStatus[],
   ): void {
+    if (this.#deletedSessions.has(sessionId)) return;
     const firstSnapshot = !this.#initializedThreadStatusSessions.has(sessionId);
+    const threadListInitialized = this.#initializedThreadSessions.has(sessionId);
+    const knownThreadIds = new Set(
+      [...this.#threads.values()]
+        .filter((thread) => thread.session_id === sessionId)
+        .map((thread) => thread.id),
+    );
     // A list response has no collection cursor. It cannot prove that a status
     // received from newer SSE traffic was deleted; thread-list replacement is
     // the authoritative place that removes status for deleted threads.
     for (const status of statuses) {
+      if (
+        status.session_id !== sessionId
+        || (threadListInitialized && !knownThreadIds.has(status.thread_id))
+      ) continue;
       const current = this.#threadStatuses.get(status.thread_id);
       if (current !== undefined && current.latest_cursor > status.latest_cursor) continue;
       this.#threadStatuses.set(status.thread_id, status);
@@ -410,6 +465,21 @@ export class AppStore {
         (left, right) =>
           left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id),
       );
+  }
+
+  /** Every thread identity currently associated with a session, including a
+   * status that arrived before its metadata. Session deletion uses this
+   * synchronous snapshot before purging the projections. */
+  sessionThreadIds(sessionId: string): readonly string[] {
+    this.#revision.get();
+    const ids = new Set<string>();
+    for (const thread of this.#threads.values()) {
+      if (thread.session_id === sessionId) ids.add(thread.id);
+    }
+    for (const status of this.#threadStatuses.values()) {
+      if (status.session_id === sessionId) ids.add(status.thread_id);
+    }
+    return Object.freeze([...ids]);
   }
 
   thread(threadId: string): ProtocolThread | undefined {
@@ -462,6 +532,11 @@ export class AppStore {
     return this.#sessionMetadata.get(sessionId);
   }
 
+  isSessionTombstoned(sessionId: string): boolean {
+    this.#revision.get();
+    return this.#deletedSessions.has(sessionId);
+  }
+
   /** Shared session PR selector used by the right pane and navigation badge.
    * Account snapshots supply live status while per-session results preserve
    * associations the account feed cannot infer from branch identity alone. */
@@ -480,6 +555,7 @@ export class AppStore {
     sessionId: string,
     pullRequests: readonly ProtocolPrInfo[],
   ): void {
+    if (this.#deletedSessions.has(sessionId)) return;
     this.#sessionPullRequests.set(sessionId, Object.freeze([...pullRequests]));
     this.#touch();
   }
@@ -619,12 +695,15 @@ export class AppStore {
   ): void {
     if (cursor < this.#sessionSummaryCursor) return;
     const firstSnapshot = !this.#sessionSummaryInitialized;
-    const nextIds = new Set(summaries.map(({ session_id }) => session_id));
+    const visibleSummaries = summaries.filter(
+      ({ session_id }) => !this.#deletedSessions.has(session_id),
+    );
+    const nextIds = new Set(visibleSummaries.map(({ session_id }) => session_id));
     for (const sessionId of this.#seenSessionCursors.keys()) {
       if (!nextIds.has(sessionId)) this.#seenSessionCursors.delete(sessionId);
     }
     this.#sessionSummaries.clear();
-    for (const summary of summaries) {
+    for (const summary of visibleSummaries) {
       this.#sessionSummaries.set(summary.session_id, summary);
       if (firstSnapshot) {
         this.#seenSessionCursors.set(summary.session_id, summary.latest_cursor);
@@ -650,6 +729,7 @@ export class AppStore {
         // newer servers immediately supersede this compatibility projection
         // with the adjacent session.summary_updated event.
         if (envelope.cursor <= this.#sessionSummaryCursor) return false;
+        if (this.#deletedSessions.has(envelope.session_id)) return false;
         const metadata = this.#sessionMetadata.get(envelope.session_id);
         const previous = this.#sessionSummaries.get(envelope.session_id)
           ?? (metadata === undefined ? undefined : fallbackSessionSummary(metadata));
@@ -671,9 +751,11 @@ export class AppStore {
         if (envelope.cursor <= this.#sessionSummaryCursor) return false;
         this.#sessionSummaryCursor = envelope.cursor;
         if (envelope.summary === null) {
-          this.#sessionSummaries.delete(envelope.session_id);
-          this.#seenSessionCursors.delete(envelope.session_id);
-          this.#sessionMetadata.delete(envelope.session_id);
+          this.removeSession(envelope.session_id, envelope.cursor);
+          return false;
+        }
+        if (this.#deletedSessions.has(envelope.session_id)) {
+          return false;
         } else {
           const previous = this.#sessionSummaries.get(envelope.session_id);
           if (!this.#seenSessionCursors.has(envelope.session_id)) {
@@ -702,6 +784,7 @@ export class AppStore {
       }
       case "thread.status_updated": {
         const next = envelope.status;
+        if (this.#deletedSessions.has(next.session_id)) return false;
         const previous = this.#threadStatuses.get(next.thread_id);
         if (previous !== undefined && previous.latest_cursor >= next.latest_cursor) return false;
         this.#initializedThreadStatusSessions.add(next.session_id);
@@ -723,12 +806,24 @@ export class AppStore {
         this.#touch();
         return false;
       }
-      case "session.created":
+      case "session.created": {
+        const deletedAt = this.#deletedSessions.get(envelope.session_id);
+        if (this.#deletedSessions.has(envelope.session_id)) {
+          if (deletedAt === undefined || envelope.cursor <= deletedAt) return false;
+          this.#deletedSessions.delete(envelope.session_id);
+          this.#touch();
+        }
+        return true;
+      }
       case "session.updated":
-      case "session.deleted":
+        if (this.#deletedSessions.has(envelope.session_id)) return false;
+        return true;
       case "workspace.registered":
       case "workspace.closed":
         return true;
+      case "session.deleted":
+        this.removeSession(envelope.session_id, envelope.cursor);
+        return false;
       case "github.pull_requests_updated": {
         const host = envelope.pull_requests.host;
         const current = this.#githubPullRequests.get(host);
@@ -810,6 +905,7 @@ export class AppStore {
   }
 
   #storeThreadSnapshot(thread: ProtocolThread): void {
+    if (this.#deletedSessions.has(thread.session_id)) return;
     const todoEvent = this.#threadTodoEvents.get(thread.id);
     const todos = todoEvent ?? thread.todos;
     const stored = todos === undefined

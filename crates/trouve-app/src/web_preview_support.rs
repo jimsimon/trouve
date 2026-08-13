@@ -17,7 +17,7 @@ use trouve_client_core::{
 };
 use trouve_desktop_host::{
     FrontendSource, HostCapabilities, HostGateway, HostNativeActions, HostPreferences,
-    HostPreferencesHandle, VerifiedSessionFile,
+    HostPreferencesHandle, ProtocolUpstreamOwnership, VerifiedSessionFile,
 };
 use trouve_protocol::PROTOCOL_VERSION;
 
@@ -104,6 +104,7 @@ impl WebPreviewHost {
 
         let configured_upstream =
             configured_server_url(std::env::var(SERVER_URL_ENV).ok(), allow_embedded_server)?;
+        let upstream_ownership = configured_upstream_ownership(configured_upstream.as_deref());
         let (upstream, embedded_server_task) = match configured_upstream {
             Some(upstream) => (upstream, None),
             None => {
@@ -133,11 +134,11 @@ impl WebPreviewHost {
             .with_context(|| format!("connecting desktop host to {upstream}"))?;
         ensure_compatible_protocol(&server_info.protocol_version, PROTOCOL_VERSION)
             .with_context(|| format!("connecting desktop host to {upstream}"))?;
-        // Resolve a requested file through the public protocol on every
-        // action, then canonicalize it beneath that session's worktree. The
-        // gateway advertises this adapter only for a loopback protocol server.
-        let file_protocol = protocol.clone();
-        let native_actions =
+        // Resolve local paths only for the app-owned embedded/elected server,
+        // whose session worktrees are known to share this filesystem. An
+        // explicit URL can be a loopback tunnel or container port-forward.
+        let native_actions = if upstream_ownership == ProtocolUpstreamOwnership::AppOwned {
+            let file_protocol = protocol.clone();
             native_actions.with_session_file_resolver(move |session_id, relative_path| {
                 let file_protocol = file_protocol.clone();
                 async move {
@@ -157,12 +158,15 @@ impl WebPreviewHost {
                     .await
                     .map_err(|_| "session file verification was interrupted".to_string())?
                 }
-            });
+            })
+        } else {
+            native_actions
+        };
 
         let preference_path = dirs::config_dir()
             .map(|directory| directory.join("trouve").join("web-preferences.json"));
-        let (gateway_address, gateway, preferences) =
-            runtime.block_on(HostGateway::bind_loopback_with_actions_and_preferences(
+        let (gateway_address, gateway, preferences) = runtime.block_on(
+            HostGateway::bind_loopback_with_protocol_ownership_and_preferences(
                 "127.0.0.1:0"
                     .parse()
                     .expect("static loopback address parses"),
@@ -170,9 +174,11 @@ impl WebPreviewHost {
                 HostCapabilities::desktop(),
                 HostPreferences::default(),
                 Some(&upstream),
+                upstream_ownership,
                 preference_path,
                 native_actions,
-            ))?;
+            ),
+        )?;
         let initial_preferences = runtime.block_on(preferences.snapshot());
         let gateway_task = runtime.spawn(async move {
             if let Err(error) = gateway.await {
@@ -262,10 +268,8 @@ async fn wait_for_server_info(protocol: &ProtocolClient) -> Result<trouve_protoc
 }
 
 fn native_actions() -> HostNativeActions {
-    HostNativeActions::default().with_external_https_opener(|url| {
-        super::opener::open(url.as_url().as_str());
-        Ok(())
-    })
+    HostNativeActions::default()
+        .with_external_https_opener(|url| super::opener::open(url.as_url().as_str()))
 }
 
 impl Drop for WebPreviewHost {
@@ -290,6 +294,13 @@ fn configured_server_url(value: Option<String>, allow_embedded: bool) -> Result<
     Ok(Some(value.to_owned()))
 }
 
+fn configured_upstream_ownership(value: Option<&str>) -> ProtocolUpstreamOwnership {
+    match value {
+        Some(_) => ProtocolUpstreamOwnership::Explicit,
+        None => ProtocolUpstreamOwnership::AppOwned,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +315,10 @@ mod tests {
     #[test]
     fn product_uses_an_embedded_server_by_default() {
         assert_eq!(configured_server_url(None, true).unwrap(), None);
+        assert_eq!(
+            configured_upstream_ownership(None),
+            ProtocolUpstreamOwnership::AppOwned
+        );
     }
 
     #[test]
@@ -319,6 +334,10 @@ mod tests {
         assert_eq!(
             configured_server_url(Some("  http://127.0.0.1:7433  ".into()), true).unwrap(),
             Some("http://127.0.0.1:7433".into())
+        );
+        assert_eq!(
+            configured_upstream_ownership(Some("http://127.0.0.1:7433")),
+            ProtocolUpstreamOwnership::Explicit
         );
     }
 }

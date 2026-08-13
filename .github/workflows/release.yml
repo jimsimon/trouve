@@ -70,7 +70,7 @@ jobs:
           npm run build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: trouve-app-ui-desktop
+          name: desktop-ui-build
           path: web/app-ui/dist/desktop
           if-no-files-found: error
 
@@ -163,7 +163,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         if: matrix.app
         with:
-          name: trouve-app-ui-desktop
+          name: desktop-ui-build
           path: web/app-ui/dist/desktop
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -220,18 +220,35 @@ jobs:
       - name: Package trouve (unix)
         if: matrix.app && runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
+          release_dir="target/${{ matrix.target }}/release"
           if [ "$RUNNER_OS" = Linux ]; then
-            cat > TROUVE-LINUX-README.txt <<'EOF'
+            package_root="$release_dir/trouve-linux-package"
+            mkdir -p \
+              "$package_root/bin" \
+              "$package_root/share/applications" \
+              "$package_root/share/icons/hicolor/512x512/apps"
+            install -m 0755 "$release_dir/trouve" "$package_root/bin/trouve"
+            install -m 0644 packaging/linux/trouve.desktop \
+              "$package_root/share/applications/trouve.desktop"
+            install -m 0644 crates/trouve-app/assets/trouve.png \
+              "$package_root/share/icons/hicolor/512x512/apps/trouve.png"
+            cat > "$package_root/TROUVE-LINUX-README.txt" <<'EOF'
           Trouve's Linux desktop uses the system GTK 3 and WebKitGTK 4.1 runtime.
           Debian/Ubuntu users should install the accompanying .deb package, which
           declares these dependencies. For the tar archive, install:
             libwebkit2gtk-4.1-0 libgtk-3-0 libdbus-1-3 libfontconfig1
+          The archive's share/ directory contains the desktop entry and icon for
+          installation below /usr/local or another XDG data prefix. Extract the
+          archive into that prefix so bin/trouve is available on PATH:
+            sudo tar -C /usr/local -xzf trouve-vX.Y.Z-<target>.tar.gz
           EOF
-            tar czf "trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
-              trouve TROUVE-LINUX-README.txt
+            tar -C "$package_root" -czf \
+              "$GITHUB_WORKSPACE/$release_dir/trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
+              bin TROUVE-LINUX-README.txt share
           else
-            tar czf "trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve
+            tar -C "$release_dir" -czf \
+              "$GITHUB_WORKSPACE/$release_dir/trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
+              trouve
           fi
       - name: Package trouve for Debian-compatible Linux
         if: matrix.app && runner.os == 'Linux'
@@ -243,9 +260,17 @@ jobs:
             *) echo "unsupported Debian target: ${{ matrix.target }}" >&2; exit 1 ;;
           esac
           package_root="target/${{ matrix.target }}/release/debian-package"
-          mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin"
+          mkdir -p \
+            "$package_root/DEBIAN" \
+            "$package_root/usr/bin" \
+            "$package_root/usr/share/applications" \
+            "$package_root/usr/share/icons/hicolor/512x512/apps"
           install -m 0755 "target/${{ matrix.target }}/release/trouve" \
             "$package_root/usr/bin/trouve"
+          install -m 0644 packaging/linux/trouve.desktop \
+            "$package_root/usr/share/applications/trouve.desktop"
+          install -m 0644 crates/trouve-app/assets/trouve.png \
+            "$package_root/usr/share/icons/hicolor/512x512/apps/trouve.png"
           cat > "$package_root/DEBIAN/control" <<EOF
           Package: trouve
           Version: ${RELEASE_TAG#v}
@@ -302,8 +327,15 @@ jobs:
       # softprops/action-gh-release uploads assets to the repository release.
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: Download compliance artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          name: release-compliance
+          path: artifacts
+      - name: Download binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: trouve-*
           path: artifacts
           merge-multiple: true
       - name: Download existing search assets for backfill checksums
@@ -326,10 +358,14 @@ jobs:
           checksum_file="$(mktemp)"
           (
             cd artifacts
-            sha256sum *
+            find . -maxdepth 1 -type f -printf '%P\0' \
+              | sort -z \
+              | xargs -0 -r sha256sum
             if [ -d ../existing-artifacts ]; then
               cd ../existing-artifacts
-              sha256sum *
+              find . -maxdepth 1 -type f -printf '%P\0' \
+                | sort -z \
+                | xargs -0 -r sha256sum
             fi
           ) | sort -k2 > "$checksum_file"
           mv "$checksum_file" artifacts/SHA256SUMS

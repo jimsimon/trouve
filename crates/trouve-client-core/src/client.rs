@@ -396,11 +396,17 @@ impl ProtocolClient {
             .await
     }
 
-    pub async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Result<()> {
+    pub async fn resolve_thread_approval(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
         let resp = self
             .http
             .post(format!("{}/approvals", self.base))
             .json(&ResolveApprovalRequest {
+                thread_id: thread_id.to_string(),
                 call_id: call_id.into(),
                 decision,
             })
@@ -412,9 +418,9 @@ impl ProtocolClient {
         Ok(())
     }
 
-    /// Answer (or skip, `answers: None`) a pending question request.
-    pub async fn resolve_question(
+    pub async fn resolve_thread_question(
         &self,
+        thread_id: &str,
         request_id: &str,
         answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
     ) -> Result<()> {
@@ -422,6 +428,7 @@ impl ProtocolClient {
             .http
             .post(format!("{}/questions", self.base))
             .json(&trouve_protocol::ResolveQuestionRequest {
+                thread_id: thread_id.to_string(),
                 request_id: request_id.into(),
                 answers,
             })
@@ -863,7 +870,6 @@ impl ProtocolClient {
         after: u64,
         mut on_chunk: impl FnMut(u64, Vec<u8>) -> std::ops::ControlFlow<()>,
     ) -> Result<(u64, bool)> {
-        use base64::Engine as _;
         let resp = self
             .http
             .get(format!(
@@ -890,8 +896,7 @@ impl ProtocolClient {
                 } else if line == "event: lagged" {
                     return Ok((last, false));
                 } else if let Some(data) = line.strip_prefix("data:") {
-                    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim())
-                    else {
+                    let Some(bytes) = decode_terminal_output_data(data) else {
                         continue;
                     };
                     if let Some(end) = id.take() {
@@ -1344,6 +1349,14 @@ impl LineBuffer {
     }
 }
 
+fn decode_terminal_output_data(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()
+}
+
 fn urlencode(s: &str) -> String {
     let mut encoded = String::with_capacity(s.len());
     for byte in s.as_bytes() {
@@ -1429,8 +1442,15 @@ fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyh
 #[cfg(test)]
 mod tests {
     use super::{
-        ProtocolClient, ProtocolResponseError, response_error, urlencode, urlencode_path_segment,
+        ProtocolClient, ProtocolResponseError, decode_terminal_output_data, response_error,
+        urlencode, urlencode_path_segment,
     };
+
+    #[test]
+    fn legacy_terminal_decoder_ignores_json_replay_marker_data() {
+        assert_eq!(decode_terminal_output_data(r#"{"offset":7}"#), None);
+        assert_eq!(decode_terminal_output_data("b2s="), Some(b"ok".to_vec()));
+    }
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {

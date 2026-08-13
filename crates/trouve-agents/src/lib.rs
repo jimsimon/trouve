@@ -95,25 +95,27 @@ pub struct BackendSteer {
     pub attachments: Vec<TurnAttachment>,
 }
 
-/// One prompt attachment, resolved to a stored file the backend process can
-/// read (the server and vendor CLIs share a filesystem).
+/// One prompt attachment whose bytes were verified and copied through the
+/// engine's trusted filesystem boundary before entering vendor code.
 #[derive(Debug, Clone)]
 pub struct TurnAttachment {
     /// Display name from the upload ("screenshot.png").
     pub name: String,
     /// MIME type ("image/png").
     pub mime: String,
-    /// Absolute path of the stored bytes.
-    pub path: PathBuf,
+    /// Owned bytes for protocols that embed image data.
+    pub bytes: Arc<[u8]>,
+    /// Opaque, worktree-local path for vendors that require a local-image
+    /// filename. This never names the durable attachment store.
+    pub local_path: Option<std::path::PathBuf>,
 }
 
 impl TurnAttachment {
     /// The file's bytes as standard base64, for protocols that embed image
     /// data instead of referencing paths.
-    pub fn read_base64(&self) -> std::io::Result<String> {
+    pub fn base64(&self) -> String {
         use base64::Engine as _;
-        let bytes = std::fs::read(&self.path)?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        base64::engine::general_purpose::STANDARD.encode(&self.bytes)
     }
 }
 

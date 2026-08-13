@@ -143,6 +143,7 @@ export class ThreadIngress {
   #stream: ThreadStream | undefined;
   #replayBatcher: ThreadReplayBatcher | undefined;
   #generation = 0;
+  #activeSessionId: string | undefined;
   #listenersAttached = false;
 
   constructor(
@@ -175,14 +176,20 @@ export class ThreadIngress {
     closedThreadIds: readonly string[] = [],
   ): Promise<string | undefined> {
     const generation = ++this.#generation;
+    this.#activeSessionId = sessionId;
     this.#state.set("loading");
+    if (this.#store.isSessionTombstoned(sessionId)) {
+      this.#activeSessionId = undefined;
+      this.#state.set("idle");
+      return undefined;
+    }
     try {
       const [threads, statuses] = await Promise.all([
         this.#client.threads(sessionId),
         this.#client.threadStatuses?.(sessionId).catch(() => undefined)
           ?? Promise.resolve(undefined),
       ]);
-      if (generation !== this.#generation) return undefined;
+      if (!this.#isCurrentSession(sessionId, generation)) return undefined;
       this.#store.replaceThreadsForSession(sessionId, threads);
       if (statuses !== undefined) {
         this.#store.replaceThreadStatusesForSession(sessionId, statuses);
@@ -204,21 +211,39 @@ export class ThreadIngress {
         this.#state.set("open");
         return undefined;
       }
-      await this.#openThread(selected.id, generation);
-      return generation === this.#generation ? selected.id : undefined;
+      const opened = await this.#openThread(sessionId, selected.id, generation);
+      return opened && this.#isCurrentSession(sessionId, generation)
+        ? selected.id
+        : undefined;
     } catch (error) {
-      if (generation === this.#generation) this.#state.set("error");
+      if (!this.#isCurrentSession(sessionId, generation)) return undefined;
+      this.#state.set("error");
       throw error;
     }
   }
 
-  close(): void {
+  /** Invalidate every pending await and live callback for one deleted session
+   * before its store projections and composer drafts are purged. */
+  invalidateSession(sessionId: string): void {
+    if (this.#activeSessionId !== sessionId) return;
     this.#generation += 1;
+    this.#activeSessionId = undefined;
     this.#closeStream();
     this.#state.set("idle");
   }
 
-  async #openThread(threadId: string, generation: number): Promise<void> {
+  close(): void {
+    this.#generation += 1;
+    this.#activeSessionId = undefined;
+    this.#closeStream();
+    this.#state.set("idle");
+  }
+
+  async #openThread(
+    sessionId: string,
+    threadId: string,
+    generation: number,
+  ): Promise<boolean> {
     // `openSession` advances the generation before resolving the thread list.
     // Reusing a same-thread stream here would leave its callbacks captured to
     // the previous generation, causing every subsequent event to be dropped.
@@ -226,7 +251,7 @@ export class ThreadIngress {
     // always agree.
     this.#closeStream();
     const snapshot = await this.#client.threadView(threadId);
-    if (generation !== this.#generation) return;
+    if (!this.#isCurrentSession(sessionId, generation)) return false;
     this.#store.replaceThreadViewSnapshot(
       threadId,
       snapshot.cursor,
@@ -235,7 +260,7 @@ export class ThreadIngress {
     const view = this.#store.threadView(threadId);
     const replayBatcher = new ThreadReplayBatcher(
       (events) => {
-        if (generation !== this.#generation) return;
+        if (!this.#isCurrentSession(sessionId, generation)) return;
         this.#store.applyThreadEvents(threadId, events);
       },
       {
@@ -247,7 +272,7 @@ export class ThreadIngress {
     const stream = await this.#client.threadEvents(threadId, {
       after: view.cursor,
       onEvent: (event) => {
-        if (generation !== this.#generation) return;
+        if (!this.#isCurrentSession(sessionId, generation)) return;
         if (event.kind === "unknown") {
           this.#onUnknownEvent(event.type);
           return;
@@ -255,19 +280,28 @@ export class ThreadIngress {
         replayBatcher.receive(event.envelope);
       },
       onOpen: () => {
-        if (generation === this.#generation) this.#state.set("open");
+        if (this.#isCurrentSession(sessionId, generation)) this.#state.set("open");
       },
-      onDiagnostic: this.#onDiagnostic,
+      onDiagnostic: (diagnostic) => {
+        if (this.#isCurrentSession(sessionId, generation)) this.#onDiagnostic(diagnostic);
+      },
     });
-    if (generation !== this.#generation) {
+    if (!this.#isCurrentSession(sessionId, generation)) {
       replayBatcher.dispose();
       stream.close();
-      return;
+      return false;
     }
     this.#stream = stream;
     this.#replayBatcher = replayBatcher;
     this.#attachListeners();
     stream.start();
+    return true;
+  }
+
+  #isCurrentSession(sessionId: string, generation: number): boolean {
+    return generation === this.#generation
+      && this.#activeSessionId === sessionId
+      && !this.#store.isSessionTombstoned(sessionId);
   }
 
   #closeStream(): void {
