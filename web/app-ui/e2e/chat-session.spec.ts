@@ -3056,7 +3056,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 1 command", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Running command…");
+  await expect(transientActivity).toContainText("Running commands…");
   await group.evaluate((element) => {
     element.setAttribute("data-stability-probe", "true");
   });
@@ -3080,10 +3080,11 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Running command…");
+  await expect(transientActivity).toContainText("Running commands…");
   await expect(page.locator(".agent-turn-card").last().locator(
     ":scope > .turn-timeline > :last-child",
   )).toHaveClass(/turn-transient-activity/u);
+  await expect(transientActivity).toContainText("Running commands…");
 
   await emitBatch(page, [
     threadEvent(23, {
@@ -3111,7 +3112,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(group).toHaveClass(/active/u);
-  await expect(transientActivity).toContainText("Running command…");
+  await expect(transientActivity).toContainText("Running commands…");
 
   await group.locator(":scope > summary").click();
   await expect(group.locator(".tool-card")).toHaveCount(3);
@@ -3605,12 +3606,12 @@ test("thought completion clears stale activity while standalone and grouped tool
     '.thinking-output.running [data-font-awesome-icon="brain"]',
   )).toBeVisible();
   await expect(agent.locator(".thinking-output.running .trouve-icon-spin")).toHaveCount(0);
-  await expect(transientActivity).toHaveCount(0);
+  await expect(transientActivity).toContainText("Thinking…");
   await emit(page, threadEvent(74, {
     type: "assistant.thinking_completed",
     turn: 14,
   }));
-  await expect(transientActivity).toContainText("Processing…");
+  await expect(transientActivity).toContainText("Waiting for gpt-5.6-sol…");
   await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
     .toBeVisible();
   await expect(agent.locator(
@@ -3687,7 +3688,7 @@ test("thought completion clears stale activity while standalone and grouped tool
   await expect(timeline.locator(":scope > .activity-group").last())
     .toContainText("3 commands");
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Running command…");
+  await expect(transientActivity).toContainText("Running commands…");
 });
 
 test("a progress stream replaces the transient spinner with its message icon", async ({ page }) => {
@@ -5534,7 +5535,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Cancel");
   const activeAgent = page.locator(".agent-turn-card").last();
   await expect(activeAgent.locator(".turn-transient-activity"))
-    .toContainText("Processing…");
+    .toContainText("Waiting for model…");
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
