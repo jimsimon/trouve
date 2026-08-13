@@ -682,7 +682,15 @@ fn reject_macos_extended_acl(path: &Path) -> std::io::Result<()> {
     })?;
     let acl = unsafe { acl_get_file(encoded.as_ptr(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            // Darwin also uses ENOENT when an existing file has no extended
+            // ACL. Recheck the path so a genuinely missing source still
+            // fails and the later metadata validation can detect replacement.
+            std::fs::metadata(path)?;
+            return Ok(());
+        }
+        return Err(error);
     }
     let mut entry = std::ptr::null_mut();
     let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
@@ -3501,6 +3509,17 @@ for line in sys.stdin:
         std::fs::write(&path, "{}").unwrap();
 
         reject_macos_extended_acl(&path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_config_is_not_mistaken_for_an_acl_free_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing.json");
+
+        let error = reject_macos_extended_acl(&path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "hurd"))]
