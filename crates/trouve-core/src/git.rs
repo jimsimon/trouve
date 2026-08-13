@@ -2929,7 +2929,11 @@ mod tests {
             .err()
             .unwrap();
 
-        assert!(error.to_string().contains("timed out after 0.1s"));
+        let message = error.to_string();
+        assert!(
+            message.contains("git fetch") && message.contains("timed out"),
+            "unexpected fetch timeout error: {message}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
