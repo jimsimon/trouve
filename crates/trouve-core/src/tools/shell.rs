@@ -207,6 +207,37 @@ async fn read_capped(
     Ok(CapturedOutput { bytes, truncated })
 }
 
+async fn foreground_result(
+    status: std::process::ExitStatus,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<CapturedOutput>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<CapturedOutput>>,
+) -> ToolResult {
+    let stdout = stdout_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(CapturedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        });
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(CapturedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        });
+    let (stdout, stdout_truncated) = stdout.into_string();
+    let (stderr, stderr_truncated) = stderr.into_string();
+    ToolResult::ok(json!({
+        "exit_code": status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": stdout_truncated || stderr_truncated,
+    }))
+}
+
 pub struct Shell {
     pub jobs: Arc<JobRegistry>,
 }
@@ -283,7 +314,7 @@ impl Tool for Shell {
         tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
-                let cleanup_failure = self
+                let (_, cleanup_failure) = self
                     .cleanup_foreground_until_acknowledged(&child)
                     .await;
                 stdout_task.abort();
@@ -297,7 +328,7 @@ impl Tool for Shell {
             }
             outcome = tokio::time::timeout(timeout, wait) => match outcome {
             Err(_) => {
-                let cleanup_failure = self
+                let (_, cleanup_failure) = self
                     .cleanup_foreground_until_acknowledged(&child)
                     .await;
                 stdout_task.abort();
@@ -311,44 +342,30 @@ impl Tool for Shell {
                 }
             }
             Ok(Err(error)) => {
-                let cleanup_failure = self
+                let completed_status = child.lock().await.leader_status();
+                let (cleanup_status, cleanup_failure) = self
                     .cleanup_foreground_until_acknowledged(&child)
                     .await;
+                if let Some(status) = completed_status {
+                    tracing::warn!(
+                        %error,
+                        retry_error = cleanup_failure.as_deref(),
+                        "shell process completed before a transient cleanup acknowledgement failure"
+                    );
+                    return foreground_result(status, stdout_task, stderr_task).await;
+                }
                 stdout_task.abort();
                 stderr_task.abort();
                 match cleanup_failure {
                     Some(cleanup_error) => ToolResult::error(format!(
                         "shell failed: {error}; process-tree cleanup required a retry after: {cleanup_error}"
                     )),
-                    None => ToolResult::error(format!("shell failed: {error}")),
+                    None => ToolResult::error(format!(
+                        "shell failed: {error}; cleanup exit status: {cleanup_status}"
+                    )),
                 }
             }
-            Ok(Ok(status)) => {
-                let stdout = stdout_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(CapturedOutput {
-                        bytes: Vec::new(),
-                        truncated: false,
-                    });
-                let stderr = stderr_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(CapturedOutput {
-                        bytes: Vec::new(),
-                        truncated: false,
-                    });
-                let (stdout, stdout_truncated) = stdout.into_string();
-                let (stderr, stderr_truncated) = stderr.into_string();
-                ToolResult::ok(json!({
-                    "exit_code": status.code(),
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "truncated": stdout_truncated || stderr_truncated,
-                }))
-            }
+            Ok(Ok(status)) => foreground_result(status, stdout_task, stderr_task).await,
             },
         }
     }
@@ -366,11 +383,11 @@ impl Shell {
     async fn cleanup_foreground_until_acknowledged(
         &self,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
-    ) -> Option<String> {
+    ) -> (std::process::ExitStatus, Option<String>) {
         let mut first_failure = None;
         loop {
             match self.jobs.cleanup.terminate_and_reap(child).await {
-                Ok(_) => return first_failure,
+                Ok(status) => return (status, first_failure),
                 Err(error) => {
                     first_failure.get_or_insert_with(|| error.to_string());
                     tokio::time::sleep(CLEANUP_RETRY_DELAY).await;

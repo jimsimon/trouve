@@ -38,6 +38,11 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // v9 terminalizes unmatched provider control-plane tool rows when their turn
 // ends, so interrupted collaboration waits cannot replay as active forever.
 const THREAD_VIEW_SCHEMA_VERSION: i64 = 9;
+// A snapshot folds events without holding the SQLite connection. A terminal
+// event can therefore advance the materialized cache before the snapshot
+// reacquires the connection. Rebuild from that newer cache instead of mixing
+// the stale in-memory projection with newer materialized rows.
+const THREAD_VIEW_CACHE_RACE_RETRIES: usize = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -3767,6 +3772,23 @@ impl Store {
         limit: usize,
         turn_aligned: bool,
     ) -> Result<(u64, ThreadViewSnapshot)> {
+        self.thread_view_snapshot_with_retries(
+            thread_id,
+            before,
+            limit,
+            turn_aligned,
+            THREAD_VIEW_CACHE_RACE_RETRIES,
+        )
+    }
+
+    fn thread_view_snapshot_with_retries(
+        &self,
+        thread_id: &str,
+        before: Option<u64>,
+        limit: usize,
+        turn_aligned: bool,
+        retries_remaining: usize,
+    ) -> Result<(u64, ThreadViewSnapshot)> {
         let (mut projection, cache_valid, observed_cache, rows) = {
             let conn = self.conn.lock().unwrap();
             let cached = conn
@@ -3867,34 +3889,47 @@ impl Store {
                     cursor > projection.cursor
                         || (cursor == projection.cursor && version == THREAD_VIEW_SCHEMA_VERSION)
                 });
-            if !cache_advanced {
-                if !cache_valid {
-                    tx.execute(
-                        "DELETE FROM thread_view_items WHERE thread_id = ?1",
-                        params![thread_id],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM thread_tool_details WHERE thread_id = ?1",
-                        params![thread_id],
-                    )?;
-                }
-                persist_materialized_thread_items(&tx, thread_id, item_start, completed_items)?;
+            if cache_advanced {
+                tx.commit()?;
+                drop(conn);
+                anyhow::ensure!(
+                    retries_remaining > 0,
+                    "thread-view cache kept advancing while building snapshot"
+                );
+                return self.thread_view_snapshot_with_retries(
+                    thread_id,
+                    before,
+                    limit,
+                    turn_aligned,
+                    retries_remaining - 1,
+                );
+            }
+            if !cache_valid {
                 tx.execute(
-                    "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(thread_id) DO UPDATE SET
-                       cursor = excluded.cursor,
-                       schema_version = excluded.schema_version,
-                       state = excluded.state
-                     WHERE thread_view_cache.cursor <= excluded.cursor",
-                    params![
-                        thread_id,
-                        projection.cursor as i64,
-                        THREAD_VIEW_SCHEMA_VERSION,
-                        state
-                    ],
+                    "DELETE FROM thread_view_items WHERE thread_id = ?1",
+                    params![thread_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM thread_tool_details WHERE thread_id = ?1",
+                    params![thread_id],
                 )?;
             }
+            persist_materialized_thread_items(&tx, thread_id, item_start, completed_items)?;
+            tx.execute(
+                "INSERT INTO thread_view_cache (thread_id, cursor, schema_version, state)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                   cursor = excluded.cursor,
+                   schema_version = excluded.schema_version,
+                   state = excluded.state
+                 WHERE thread_view_cache.cursor <= excluded.cursor",
+                params![
+                    thread_id,
+                    projection.cursor as i64,
+                    THREAD_VIEW_SCHEMA_VERSION,
+                    state
+                ],
+            )?;
             tx.commit()?;
         }
         let cursor = projection.cursor;

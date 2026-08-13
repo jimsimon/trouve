@@ -252,6 +252,14 @@ impl ProcessTreeChild {
         self.child.id()
     }
 
+    /// Return the direct child's terminal status once it has been observed.
+    ///
+    /// Callers can use this to distinguish a command failure from a cleanup
+    /// acknowledgement failure that happened after the command completed.
+    pub fn leader_status(&self) -> Option<std::process::ExitStatus> {
+        self.leader_status
+    }
+
     /// Reap the tree leader without terminating descendants.
     ///
     /// Most protocol subprocesses should continue using [`Self::try_wait`],
