@@ -332,7 +332,9 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
-  publication_accepted INTEGER NOT NULL DEFAULT 0
+  publication_accepted INTEGER NOT NULL DEFAULT 0,
+  publication_generation INTEGER NOT NULL DEFAULT 0,
+  review_published INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -406,6 +408,9 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   github_comment_url TEXT NOT NULL DEFAULT '',
   github_publication_status TEXT NOT NULL DEFAULT 'pending',
   github_thread_id TEXT,
+  github_thread_resolved INTEGER,
+  github_thread_generation INTEGER NOT NULL DEFAULT 0,
+  github_thread_recheck_pending INTEGER NOT NULL DEFAULT 0,
   resolved_at TEXT,
   collapse_pending INTEGER NOT NULL DEFAULT 0,
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
@@ -455,6 +460,17 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   lifecycle_comment_id INTEGER,
   lifecycle_comment_url TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
+);
+CREATE TABLE IF NOT EXISTS code_review_thread_rechecks (
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  state_key TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (repository, pull_number, head_sha, state_key)
 );
 CREATE TABLE IF NOT EXISTS code_review_manual_requests (
   repository TEXT NOT NULL,
@@ -543,6 +559,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_accepted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
@@ -576,6 +594,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
     "ALTER TABLE code_review_findings ADD COLUMN title TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_candidate_rejections ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_resolved INTEGER",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN github_thread_recheck_pending INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS code_review_jobs_pull_revision_status ON code_review_jobs (repository, pull_number, head_sha, status, publication_generation)",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -587,6 +609,14 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    let had_review_published = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info('code_review_jobs')
+           WHERE name = 'review_published'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -596,6 +626,15 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
     backfill_code_review_watermarks(conn)?;
+    if !had_review_published {
+        // Before this column existed, a succeeded job was the durable signal
+        // that its GitHub review had been published. Preserve that history;
+        // subsequent jobs record publication before reaching a terminal state.
+        conn.execute(
+            "UPDATE code_review_jobs SET review_published = 1 WHERE status = 'succeeded'",
+            [],
+        )?;
+    }
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     migrate_general_persona_reviewer_references(conn)?;
@@ -1998,6 +2037,7 @@ pub struct CodeReviewJobRecord {
     pub prompt_for_agents: String,
     pub publication_claimed: bool,
     pub publication_accepted: bool,
+    pub review_published: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2109,6 +2149,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         prompt_for_agents: r.get(37)?,
         publication_claimed: r.get(38)?,
         publication_accepted: r.get(52)?,
+        review_published: r.get(53)?,
     })
 }
 
@@ -2120,7 +2161,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
      included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
-     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted";
+     coordinator_thinking_level, review_watermark_sha, review_batch_digest, publication_accepted, \
+     review_published";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -2447,6 +2489,14 @@ pub struct NewCodeReviewFinding {
     pub body: String,
     pub prompt_for_agents: String,
     pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodeReviewFindingThreadState {
+    pub finding: trouve_protocol::CodeReviewFinding,
+    pub is_resolved: Option<bool>,
+    pub generation: u64,
+    pub recheck_pending: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6696,13 +6746,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn enqueue_code_review_job(
-        &self,
+    fn enqueue_code_review_job_conn(
+        conn: &Connection,
         new_job: &NewCodeReviewJob,
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
         let reviewers = serde_json::to_string(&new_job.reviewers)?;
         let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
         let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
@@ -6711,12 +6760,16 @@ impl Store {
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
                      pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
                      identities, config_hash, created_at, review_base_sha, review_scope,
-                     retry_of, total_reviewers, routing_mode, semantic_routing,
+                     retry_of, total_reviewers, publication_generation,
+                     routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
                      review_watermark_sha)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                     (SELECT COALESCE(MAX(publication_generation), 0) + 1
+                      FROM code_review_jobs
+                      WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
                      ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17)",
             params![
                 id,
@@ -6759,6 +6812,123 @@ impl Store {
             )?
             .job,
         ))
+    }
+
+    pub fn enqueue_code_review_job(
+        &self,
+        new_job: &NewCodeReviewJob,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        Self::enqueue_code_review_job_conn(&conn, new_job)
+    }
+
+    pub(crate) fn enqueue_code_review_thread_recheck(
+        &self,
+        new_job: &NewCodeReviewJob,
+        state_key: &str,
+        finding_ids: &[&str],
+        allow_new_state: bool,
+        max_attempts: u64,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT r.attempt_count, j.status
+                 FROM code_review_thread_rechecks r
+                 JOIN code_review_jobs j ON j.id = r.last_job_id
+                 WHERE r.repository = ?1 AND r.pull_number = ?2
+                   AND r.head_sha = ?3 AND r.state_key = ?4",
+                params![
+                    new_job.repository,
+                    new_job.pull_number as i64,
+                    new_job.head_sha,
+                    state_key
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let used_attempts: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(attempt_count), 0)
+             FROM code_review_thread_rechecks
+             WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha
+            ],
+            |row| row.get(0),
+        )?;
+        let terminal_retry = current
+            .as_ref()
+            .is_some_and(|(_, status)| matches!(status.as_str(), "failed" | "cancelled" | "stale"));
+        let already_consumed = current.as_ref().is_some_and(|(_, status)| {
+            matches!(status.as_str(), "queued" | "running" | "succeeded")
+        });
+        if current.is_none() && !allow_new_state {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if already_consumed
+            || used_attempts >= max_attempts as i64
+            || (current.is_some() && !terminal_retry)
+        {
+            for finding_id in finding_ids {
+                tx.execute(
+                    "UPDATE code_review_findings
+                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                    params![finding_id],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let attempt = current.as_ref().map_or(1, |(count, _)| count + 1);
+        let mut request = new_job.clone();
+        request.dedupe_key = format!("{}:{state_key}:attempt:{attempt}", request.dedupe_key);
+        let inserted = Self::enqueue_code_review_job_conn(&tx, &request)?;
+        let job = if let Some(job) = inserted.as_ref() {
+            job.clone()
+        } else {
+            tx.query_row(
+                &format!(
+                    "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE dedupe_key = ?1"
+                ),
+                params![request.dedupe_key],
+                row_to_code_review_job,
+            )?
+            .job
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO code_review_thread_rechecks
+                    (repository, pull_number, head_sha, state_key, attempt_count,
+                     last_job_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(repository, pull_number, head_sha, state_key) DO UPDATE SET
+               attempt_count = excluded.attempt_count,
+               last_job_id = excluded.last_job_id,
+               updated_at = excluded.updated_at",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha,
+                state_key,
+                attempt,
+                job.id,
+                now
+            ],
+        )?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_thread_recheck_pending = 0 WHERE id = ?1",
+                params![finding_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     pub fn supersede_code_review_jobs(
@@ -6855,6 +7025,24 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    pub fn code_review_pull_has_active_job(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND status IN ('queued', 'running')
+                 LIMIT 1
+             )",
+            params![repository, pull_number as i64, head_sha],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn list_code_review_jobs(
@@ -8370,7 +8558,8 @@ impl Store {
                 "SELECT DISTINCT f.job_id
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
-                 WHERE j.repository = ?1 AND j.pull_number = ?2 AND f.status = 'open'
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1 AND f.status = 'open'
                  ORDER BY j.completed_at, f.job_id",
             )?;
             stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
@@ -8385,6 +8574,112 @@ impl Store {
             );
         }
         Ok(findings)
+    }
+
+    pub(crate) fn reconcilable_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<CodeReviewFindingThreadState>> {
+        let job_ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT f.job_id
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2
+                   AND j.review_published = 1
+                   AND f.status IN ('open', 'dismissed')
+                 ORDER BY j.completed_at, f.job_id",
+            )?;
+            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut findings = Vec::new();
+        for job_id in job_ids {
+            for finding in self
+                .code_review_findings(&job_id)?
+                .into_iter()
+                .filter(|finding| matches!(finding.status.as_str(), "open" | "dismissed"))
+            {
+                let (is_resolved, generation, recheck_pending) =
+                    self.conn.lock().unwrap().query_row(
+                        "SELECT github_thread_resolved, github_thread_generation,
+                                github_thread_recheck_pending
+                         FROM code_review_findings WHERE id = ?1",
+                        params![finding.id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<bool>>(0)?,
+                                row.get::<_, i64>(1)? as u64,
+                                row.get(2)?,
+                            ))
+                        },
+                    )?;
+                findings.push(CodeReviewFindingThreadState {
+                    finding,
+                    is_resolved,
+                    generation,
+                    recheck_pending,
+                });
+            }
+        }
+        Ok(findings)
+    }
+
+    pub(crate) fn record_code_review_thread_state(
+        &self,
+        finding_id: &str,
+        thread_id: &str,
+        is_resolved: bool,
+    ) -> Result<(bool, u64)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let previous: Option<(Option<bool>, i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT github_thread_resolved, github_thread_generation, status,
+                        github_thread_id
+                 FROM code_review_findings WHERE id = ?1",
+                params![finding_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((previous_resolved, generation, status, previous_thread_id)) = previous else {
+            tx.commit()?;
+            return Ok((false, 0));
+        };
+        let state_changed = previous_resolved != Some(is_resolved);
+        let reopened_legacy_dismissal = status == "dismissed";
+        let recheck_pending =
+            reopened_legacy_dismissal || (previous_resolved == Some(true) && !is_resolved);
+        let changed = state_changed
+            || reopened_legacy_dismissal
+            || previous_thread_id.as_deref() != Some(thread_id);
+        let generation = generation + i64::from(state_changed || reopened_legacy_dismissal);
+        if changed {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET github_thread_id = ?2, github_thread_resolved = ?3,
+                     github_thread_generation = ?4,
+                     github_thread_recheck_pending =
+                       CASE WHEN ?5 THEN 1 ELSE github_thread_recheck_pending END,
+                     status = CASE WHEN status = 'dismissed' THEN 'open' ELSE status END,
+                     resolved_at = CASE WHEN status = 'dismissed' THEN NULL ELSE resolved_at END
+                 WHERE id = ?1",
+                params![
+                    finding_id,
+                    thread_id,
+                    is_resolved,
+                    generation,
+                    recheck_pending
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok((
+            state_changed || reopened_legacy_dismissal,
+            generation as u64,
+        ))
     }
 
     pub fn code_review_job_detail(
@@ -9039,7 +9334,21 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET publication_claimed = 1
              WHERE id = ?1 AND status = 'running'
-               AND cancel_requested = 0 AND publication_claimed = 0",
+               AND cancel_requested = 0 AND publication_claimed = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
             params![id],
         )? > 0)
     }
@@ -9088,10 +9397,26 @@ impl Store {
                      ELSE error
                  END,
                  review_url = ?2,
-                 publication_accepted = 1
+                 publication_accepted = 1,
+                 review_published = 1
              WHERE id = ?1 AND publication_claimed != 0",
             params![id, review_url],
         )?;
+        if updated > 0 {
+            tx.execute(
+                "INSERT INTO code_review_pr_state
+                        (repository, pull_number, last_reviewed_head_sha,
+                         last_reviewed_base_sha, last_reviewed_at)
+                 SELECT repository, pull_number, head_sha, base_ref, ?2
+                 FROM code_review_jobs
+                 WHERE id = ?1
+                 ON CONFLICT(repository, pull_number) DO UPDATE SET
+                   last_reviewed_head_sha = excluded.last_reviewed_head_sha,
+                   last_reviewed_base_sha = excluded.last_reviewed_base_sha,
+                   last_reviewed_at = excluded.last_reviewed_at",
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
         tx.commit()?;
         Ok(updated > 0)
     }
@@ -9259,6 +9584,47 @@ impl Store {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn record_code_review_publication(
+        &self,
+        id: &str,
+        repository: &str,
+        pull_number: u64,
+        base_sha: &str,
+        head_sha: &str,
+        review_url: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET review_published = 1, review_url = ?2
+             WHERE id = ?1 AND status = 'running'",
+            params![id, review_url],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("review job changed before GitHub publication was recorded");
+        }
+        tx.execute(
+            "INSERT INTO code_review_pr_state
+                    (repository, pull_number, last_reviewed_head_sha,
+                     last_reviewed_base_sha, last_reviewed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repository, pull_number) DO UPDATE SET
+               last_reviewed_head_sha = excluded.last_reviewed_head_sha,
+               last_reviewed_base_sha = excluded.last_reviewed_base_sha,
+               last_reviewed_at = excluded.last_reviewed_at",
+            params![
+                repository,
+                pull_number as i64,
+                head_sha,
+                base_sha,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -10626,6 +10992,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(redundant_indexes, 0);
+    }
+
+    #[test]
+    fn code_review_publication_queries_have_a_revision_status_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'code_review_jobs_pull_revision_status'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized
+                .contains("(repository, pull_number, head_sha, status, publication_generation)")
+        );
+    }
+
+    #[test]
+    fn existing_review_database_adds_publication_columns_before_revision_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO code_review_jobs
+                        (id, dedupe_key, installation_id, repository, pull_number,
+                         pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
+                         status, created_at)
+                 VALUES ('review-1', 'dedupe-1', 7, 'acme/widgets', 42,
+                         'Widgets', 'https://example.test/pull/42', 'head', 'base',
+                         'branch', 'automatic', 'succeeded', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE code_review_jobs DROP COLUMN review_published;
+                 ALTER TABLE code_review_jobs DROP COLUMN publication_generation;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('code_review_jobs')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "publication_generation")
+        );
+        assert!(columns.iter().any(|column| column == "review_published"));
+        let published: bool = conn
+            .query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'review-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(published);
     }
 
     #[test]
