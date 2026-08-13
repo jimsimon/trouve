@@ -14,13 +14,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
 use trouve_agents::{
     AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
-    BackendPermission, BackendSteer, BackendTurn,
+    BackendPermission, BackendStartupActivity, BackendSteer, BackendTurn,
 };
 use trouve_protocol::{
     AgentPersona, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -559,6 +559,29 @@ async fn flush_backend_event_batch(
             .await?;
     }
     Ok(())
+}
+
+fn backend_event_name(event: &BackendEvent) -> &'static str {
+    match event {
+        BackendEvent::SessionStarted { .. } => "session_started",
+        BackendEvent::TextDelta(_) => "text_delta",
+        BackendEvent::ThinkingDelta(_) => "thinking_delta",
+        BackendEvent::ThinkingCompleted => "thinking_completed",
+        BackendEvent::ToolStarted { .. } => "tool_started",
+        BackendEvent::ToolOutput { .. } => "tool_output",
+        BackendEvent::ToolCompleted { .. } => "tool_completed",
+        BackendEvent::ApprovalNeeded { .. } => "approval_needed",
+        BackendEvent::QuestionsNeeded { .. } => "questions_needed",
+        BackendEvent::CommandsUpdated { .. } => "commands_updated",
+        BackendEvent::TodosUpdated { .. } => "todos_updated",
+        BackendEvent::UsageUpdated { .. } => "usage_updated",
+        BackendEvent::CompactionStarted => "compaction_started",
+        BackendEvent::CompactionCompleted => "compaction_completed",
+        BackendEvent::CompactionFailed => "compaction_failed",
+        BackendEvent::CollaboratorStarted { .. } => "collaborator_started",
+        BackendEvent::CollaboratorEvent { .. } => "collaborator_event",
+        BackendEvent::Completed { .. } => "completed",
+    }
 }
 
 struct BackendCollaboratorProjection {
@@ -7514,6 +7537,7 @@ impl Engine {
     }
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
+        let create_started = Instant::now();
         let ws = self
             .store
             .open_workspace(&req.workspace_id)?
@@ -7528,6 +7552,7 @@ impl Engine {
             self.title_model.derive_branch_name_from_session_title(),
         );
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
+        let fetch_latest = req.fetch_latest;
         if self.store.session(&session_id)?.is_some() {
             return Err(EngineError::Conflict(format!(
                 "generated session id {session_id} already exists"
@@ -7548,6 +7573,7 @@ impl Engine {
         // returns its guard, this task continues; its eventual receipt is then
         // dropped and synchronously rolls the attempt back.
         let executor = self.executor.clone();
+        let worktree_started = Instant::now();
         let mut creation =
             tokio::spawn(async move { executor.create_session_worktree(&creation_request).await })
                 .await
@@ -7555,6 +7581,12 @@ impl Engine {
                     EngineError::Internal(anyhow!("session creation task failed: {error}"))
                 })?
                 .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        tracing::info!(
+            %session_id,
+            fetch_latest,
+            elapsed_ms = worktree_started.elapsed().as_millis(),
+            "session startup timing: worktree and initial checkpoint ready"
+        );
         let base_ref = creation.base_ref.clone();
 
         let session = Session {
@@ -7646,6 +7678,11 @@ impl Engine {
         if self.index_hooks {
             crate::tools::warm_index_in_background(worktree_path);
         }
+        tracing::info!(
+            %session_id,
+            elapsed_ms = create_started.elapsed().as_millis(),
+            "session startup timing: session created"
+        );
         Ok(session)
     }
 
@@ -11723,13 +11760,22 @@ impl Engine {
         queued_prompt_id: &str,
         tools_enabled: bool,
     ) -> Result<()> {
+        let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
         let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let model_catalog_started = Instant::now();
         let model_catalog = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
             models = backend.list_models() => models,
         };
+        tracing::info!(
+            thread_id = %thread.id,
+            turn,
+            backend = %backend_id,
+            elapsed_ms = model_catalog_started.elapsed().as_millis(),
+            "agent startup timing: model catalog resolved"
+        );
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let supports_steering = tools_enabled && backend.supports_steering();
@@ -11866,11 +11912,46 @@ impl Engine {
             mcp_servers,
         };
 
+        let startup_activity = backend.startup_activity(&backend_turn).await;
+        if matches!(
+            startup_activity,
+            Some(BackendStartupActivity::ConnectingTools)
+        ) {
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::TurnPhaseChanged {
+                        turn,
+                        phase: TurnPhase::ConnectingTools,
+                    },
+                )
+                .await?;
+        }
+        let backend_turn_started = Instant::now();
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
             Err(error) => return Err(anyhow!("backend error: {error}")),
         };
+        if startup_activity.is_some() {
+            self.store
+                .append_event_async(
+                    scope.clone(),
+                    Event::TurnPhaseChanged {
+                        turn,
+                        phase: TurnPhase::Processing,
+                    },
+                )
+                .await?;
+        }
+        tracing::info!(
+            thread_id = %thread.id,
+            turn,
+            backend = %backend_id,
+            elapsed_ms = backend_turn_started.elapsed().as_millis(),
+            since_turn_started_ms = startup_started.elapsed().as_millis(),
+            "agent startup timing: vendor turn accepted"
+        );
 
         let mut steer_rx = None;
         let (steer_mutation_lane_state, _) =
@@ -11944,6 +12025,7 @@ impl Engine {
         let mut pending_steer_lane = None;
         let mut pending_steer_permit = None;
         let mut consecutive_backend_events = 0usize;
+        let mut first_substantive_event = true;
         loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let steer_reserved = active_vendor_session.is_some()
@@ -12265,6 +12347,17 @@ impl Engine {
                     }
                 },
             };
+            if first_substantive_event && !matches!(&event, BackendEvent::SessionStarted { .. }) {
+                first_substantive_event = false;
+                tracing::info!(
+                    thread_id = %thread.id,
+                    turn,
+                    backend = %backend_id,
+                    event = backend_event_name(&event),
+                    since_turn_started_ms = startup_started.elapsed().as_millis(),
+                    "agent startup timing: first vendor event"
+                );
+            }
             match event {
                 BackendEvent::SessionStarted { session_id } => {
                     active_vendor_session = Some(session_id.clone());

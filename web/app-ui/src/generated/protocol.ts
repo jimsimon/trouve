@@ -2640,6 +2640,12 @@ export interface components {
             /** @enum {string} */
             type: "turn.started";
         } | {
+            phase: components["schemas"]["TurnPhase"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.phase_changed";
+        } | {
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
@@ -4594,6 +4600,7 @@ export interface components {
             turn_models?: {
                 [key: string]: string;
             };
+            turn_phase?: null | components["schemas"]["TurnPhase"];
             turn_running?: boolean;
             turn_started_at?: {
                 [key: string]: string;
@@ -4666,6 +4673,11 @@ export interface components {
             /** Format: int64 */
             turn: number;
         };
+        /**
+         * @description Current user-visible startup activity for a running turn.
+         * @enum {string}
+         */
+        TurnPhase: "processing" | "connecting_tools";
         UpdateCodeReviewRepositoryRequest: {
             coordinator_thinking_level?: string | null;
             /** @description Omitted by older clients to preserve existing forced exclusions. */

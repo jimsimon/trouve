@@ -1465,7 +1465,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         turnLabels,
         view?.turnModels ?? new Map<number, string>(),
         view?.turnDurationMs ?? new Map<number, number>(),
-        turnControls.activityLabel,
+        turnControls.activityLabel
+          ?? (view?.turnPhase === "connecting_tools" ? "Connecting tools…" : undefined),
         view?.hasOlder ?? false,
       )}
 

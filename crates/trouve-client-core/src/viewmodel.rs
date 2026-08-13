@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use trouve_protocol::{
     ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ThreadCompactionState,
     ThreadTodoState, ThreadToolStatus, ThreadTurnState, ThreadViewItem, ThreadViewSnapshot,
-    TodoItem, TodoStatus, ToolStatus, Usage,
+    TodoItem, TodoStatus, ToolStatus, TurnPhase, Usage,
 };
 
 fn accumulate_live_usage(total: &mut Option<Usage>, latest: &Usage) {
@@ -282,6 +282,8 @@ pub struct ThreadViewModel {
     /// True while the model is streaming thinking and nothing has followed
     /// it yet (the "Thinking…" activity label takes priority over tools).
     pub thinking: bool,
+    /// Current transient startup activity for the running turn.
+    pub turn_phase: Option<TurnPhase>,
     /// The model that ran each turn ("cursor/claude-fable-5"), from
     /// turn.started — shown in the agent card header.
     pub turn_models: HashMap<u64, String>,
@@ -324,6 +326,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
+            turn_phase: snapshot.turn_phase,
             turn_models: snapshot.turn_models.into_iter().collect(),
             turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
             turn_steerable: snapshot.turn_steerable.into_iter().collect(),
@@ -626,6 +629,7 @@ impl ThreadViewModel {
             } => {
                 self.turn_running = true;
                 self.running_usage = None;
+                self.turn_phase = Some(TurnPhase::Processing);
                 self.turn_models.insert(*turn, model.clone());
                 if let Some(thinking_level) = thinking_level {
                     self.turn_thinking_levels
@@ -640,6 +644,18 @@ impl ThreadViewModel {
                 };
                 self.items.push(ChatItem::TurnStatus { turn: *turn, state });
                 Some(self.items.len() - 1)
+            }
+            Event::TurnPhaseChanged { phase, .. } => {
+                self.turn_phase = Some(*phase);
+                self.items.iter().rposition(|item| {
+                    matches!(
+                        item,
+                        ChatItem::TurnStatus {
+                            state: TurnState::Running | TurnState::WaitingForCapacity,
+                            ..
+                        }
+                    )
+                })
             }
             Event::CompactionStarted { turn } => {
                 self.compacting = true;
@@ -1053,6 +1069,7 @@ impl ThreadViewModel {
                 self.turn_running = false;
                 let usage = usage_with_live_context(usage.clone(), self.running_usage.as_ref());
                 self.running_usage = None;
+                self.turn_phase = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1086,6 +1103,7 @@ impl ThreadViewModel {
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
+                self.turn_phase = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1116,6 +1134,7 @@ impl ThreadViewModel {
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
+                self.turn_phase = None;
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 self.finish_thinking();
@@ -1314,6 +1333,33 @@ mod tests {
                 state: TurnState::Running,
             })
         ));
+    }
+
+    #[test]
+    fn turn_phase_updates_activity_without_adding_a_chat_item() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        let item_count = vm.items.len();
+        assert_eq!(vm.turn_phase, Some(TurnPhase::Processing));
+
+        assert!(
+            vm.apply(&env(Event::TurnPhaseChanged {
+                turn: 1,
+                phase: TurnPhase::ConnectingTools,
+            }))
+            .is_some()
+        );
+        assert_eq!(vm.turn_phase, Some(TurnPhase::ConnectingTools));
+        assert_eq!(vm.items.len(), item_count);
+
+        vm.apply(&env(Event::TurnCancelled { turn: 1 }));
+        assert_eq!(vm.turn_phase, None);
     }
 
     #[test]

@@ -407,6 +407,12 @@ pub struct BackendStatus {
     pub installed: bool,
     pub has_credentials: bool,
 }
+/// Optional provider startup work worth distinguishing from generic model
+/// processing in clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendStartupActivity {
+    ConnectingTools,
+}
 
 /// A vendor login flow in progress. `done` resolves when the vendor CLI
 /// exits (successfully or not).
@@ -453,6 +459,13 @@ pub trait AgentBackend: Send + Sync {
     /// RPC (using the CLI's stored login). `None` means the vendor shares
     /// nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        None
+    }
+    /// Report startup work the backend expects before it can accept this
+    /// turn. The default keeps other adapters on the generic processing
+    /// activity. This is advisory; the backend remains authoritative for
+    /// whether a thread must actually be loaded.
+    async fn startup_activity(&self, _turn: &BackendTurn) -> Option<BackendStartupActivity> {
         None
     }
 

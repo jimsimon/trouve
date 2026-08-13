@@ -2147,6 +2147,7 @@ fn project_session_summary(
             thread_id,
         } => (session_id.clone(), Some(thread_id.clone())),
         Event::TurnStarted { .. }
+        | Event::TurnPhaseChanged { .. }
         | Event::TurnCompleted { .. }
         | Event::TurnFailed { .. }
         | Event::TurnCancelled { .. }
@@ -2437,6 +2438,7 @@ fn project_thread_status(
     let thread_id = match event {
         Event::ThreadCreated { thread_id, .. } => thread_id.clone(),
         Event::TurnStarted { .. }
+        | Event::TurnPhaseChanged { .. }
         | Event::TurnCompleted { .. }
         | Event::TurnFailed { .. }
         | Event::TurnCancelled { .. }

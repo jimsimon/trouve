@@ -33,8 +33,8 @@ use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendCollaboratorAccess, BackendCollaboratorEvent, BackendError, BackendEvent,
-    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendSteer, BackendTurn,
-    async_stream, binary_on_path, format_reset,
+    BackendEventStream, BackendLogin, BackendPermission, BackendStartupActivity, BackendStatus,
+    BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -177,7 +177,13 @@ impl CodexBackend {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return Err(BackendError::Cancelled);
         }
+        let spawn_started = std::time::Instant::now();
         let s = Arc::new(AppServer::spawn(&self.command).await?);
+        tracing::info!(
+            elapsed_ms = spawn_started.elapsed().as_millis(),
+            "codex startup timing: app-server process spawned"
+        );
+        let handshake_started = std::time::Instant::now();
         let handshake = match cancel {
             Some(cancel) => tokio::select! {
                 biased;
@@ -199,6 +205,10 @@ impl CodexBackend {
             }
             return Err(error);
         }
+        tracing::info!(
+            elapsed_ms = handshake_started.elapsed().as_millis(),
+            "codex startup timing: app-server handshake completed"
+        );
         *guard = Some(s.clone());
         Ok(s)
     }
@@ -254,6 +264,21 @@ impl AgentBackend for CodexBackend {
         true
     }
 
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        let mcp_config = thread_mcp_config(&codex_config_override(turn));
+        if mcp_config.is_null() {
+            return None;
+        }
+        let guard = self.server.lock().await;
+        let needs_load = match (guard.as_ref(), turn.session.as_deref()) {
+            (Some(server), Some(thread_id)) if !server.is_closed() => {
+                !server.thread_config_matches(thread_id, &mcp_config).await
+            }
+            _ => true,
+        };
+        needs_load.then_some(BackendStartupActivity::ConnectingTools)
+    }
+
     async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
         let cancel = steer.cancel.clone();
         let server = self.server_cancellable(&cancel).await?;
@@ -278,6 +303,7 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        let trouve_thread_id = turn.thread_id.clone();
         let cancel = turn.cancel.clone();
         let mut server = self.server_cancellable(&cancel).await?;
 
@@ -312,6 +338,7 @@ impl AgentBackend for CodexBackend {
         // importantly, the ToolExecutor bridge guidance after an app restart
         // or vendor-side compaction.
         let config_override = codex_config_override(&turn);
+        let mcp_config = thread_mcp_config(&config_override);
         let with_thread_settings = |mut params: Value| {
             params["config"] = config_override.clone();
             if let Some(instructions) = &turn.instructions {
@@ -330,9 +357,15 @@ impl AgentBackend for CodexBackend {
         if !model_name.is_empty() {
             start_params["model"] = json!(model_name);
         }
+        let needs_load = match turn.session.as_deref() {
+            Some(thread_id) => !server.thread_config_matches(thread_id, &mcp_config).await,
+            None => true,
+        };
         let mut fresh_session = false;
-        let codex_thread_id = match &turn.session {
-            Some(sid) => {
+        let thread_request_started = std::time::Instant::now();
+        let codex_thread_id = match (&turn.session, needs_load) {
+            (Some(sid), false) => sid.clone(),
+            (Some(sid), true) => {
                 let resumed = server
                     .request_effect_cancellable(
                         "thread/resume",
@@ -364,7 +397,7 @@ impl AgentBackend for CodexBackend {
                     }
                 }
             }
-            None => {
+            (None, _) => {
                 fresh_session = true;
                 let v = server
                     .request_effect_cancellable("thread/start", start_params.clone(), &cancel)
@@ -372,6 +405,18 @@ impl AgentBackend for CodexBackend {
                 server.validated_thread_id("thread/start", &v, None).await?
             }
         };
+        if needs_load {
+            server
+                .mark_thread_loaded(&codex_thread_id, mcp_config)
+                .await;
+        }
+        tracing::info!(
+            thread_id = %trouve_thread_id,
+            fresh_session,
+            loaded_thread = needs_load,
+            elapsed_ms = thread_request_started.elapsed().as_millis(),
+            "codex startup timing: thread ready"
+        );
 
         // A cancelled trouve stream may still have a live vendor turn if the
         // app-server was blocked in a model or tool request when its consumer
@@ -449,6 +494,7 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
+        let turn_request_started = std::time::Instant::now();
         let (codex_turn_id, cleanup) = match server
             .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle, &cancel)
             .await
@@ -461,6 +507,12 @@ impl AgentBackend for CodexBackend {
         if let Some(instructions) = &turn.instructions {
             server.remember_thread_instructions(&codex_thread_id, instructions);
         }
+        tracing::info!(
+            thread_id = %trouve_thread_id,
+            codex_thread_id = %codex_thread_id,
+            elapsed_ms = turn_request_started.elapsed().as_millis(),
+            "codex startup timing: turn/start accepted"
+        );
 
         let stream = turn_stream(
             server.clone(),
@@ -505,6 +557,22 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         config["mcp_servers"] = Value::Object(servers);
     }
     config
+}
+
+/// Only MCP configuration determines whether a loaded Codex thread needs to
+/// be resumed. Other per-turn settings travel on `turn/start` or the prompt.
+fn thread_mcp_config(config: &Value) -> Value {
+    config.get("mcp_servers").cloned().unwrap_or(Value::Null)
+}
+
+fn loaded_thread_config_matches(
+    loaded_threads: &HashMap<String, Value>,
+    thread_id: &str,
+    mcp_config: &Value,
+) -> bool {
+    loaded_threads
+        .get(thread_id)
+        .is_some_and(|loaded| loaded == mcp_config)
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -3307,6 +3375,9 @@ struct AppServer {
     /// Per-thread guards serializing interruption through replacement
     /// registration.
     turn_lifecycles: TurnLifecycles,
+    /// MCP configuration attached to each thread loaded in this app-server
+    /// process. A newly spawned process starts empty.
+    loaded_threads: Mutex<HashMap<String, Value>>,
     /// Instruction set known to have reached at least one turn in this
     /// app-server process. This is intentionally process-local: an empty map
     /// after restart is what activates the cold-resume prompt fallback.
@@ -3368,6 +3439,7 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             completed_turns: Arc::new(Mutex::new(CompletedTurnState::default())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            loaded_threads: Mutex::new(HashMap::new()),
             thread_instructions: std::sync::Mutex::new(HashMap::new()),
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
@@ -3381,6 +3453,18 @@ impl AppServer {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    async fn thread_config_matches(&self, thread_id: &str, mcp_config: &Value) -> bool {
+        let loaded_threads = self.loaded_threads.lock().await;
+        loaded_thread_config_matches(&loaded_threads, thread_id, mcp_config)
+    }
+
+    async fn mark_thread_loaded(&self, thread_id: &str, mcp_config: Value) {
+        self.loaded_threads
+            .lock()
+            .await
+            .insert(thread_id.to_string(), mcp_config);
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
@@ -7281,6 +7365,17 @@ cat > /dev/null
         let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn loaded_threads_are_reused_until_their_mcp_config_changes() {
+        let first = json!({ "trouve": { "url": "http://127.0.0.1/thread-1" } });
+        let changed = json!({ "trouve": { "url": "http://127.0.0.1/thread-1?tools=1" } });
+        let loaded = HashMap::from([("thread-1".to_string(), first.clone())]);
+
+        assert!(loaded_thread_config_matches(&loaded, "thread-1", &first));
+        assert!(!loaded_thread_config_matches(&loaded, "thread-1", &changed));
+        assert!(!loaded_thread_config_matches(&loaded, "thread-2", &first));
     }
 
     #[test]

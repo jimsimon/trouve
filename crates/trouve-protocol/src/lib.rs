@@ -287,7 +287,9 @@ pub use requests::*;
 // durable root-cause theme membership, and immutable resolution provenance;
 // review details, PR projections, and statistics expose recurrence and churn
 // controls (additive).
-pub const PROTOCOL_VERSION: &str = "7.7";
+// 7.8: running turns expose an additive phase event/snapshot field so clients
+// can distinguish thread-scoped tool connection from generic processing.
+pub const PROTOCOL_VERSION: &str = "7.8";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

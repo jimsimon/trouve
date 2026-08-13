@@ -422,7 +422,7 @@ export class ProtocolClientError extends Error {
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.7";
+export const SUPPORTED_PROTOCOL_VERSION = "7.8";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {

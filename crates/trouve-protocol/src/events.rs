@@ -199,6 +199,14 @@ pub enum ToolStatus {
     Aborted,
 }
 
+/// Current user-visible startup activity for a running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    Processing,
+    ConnectingTools,
+}
+
 /// Every event type in the log. Serialized with a `type` tag using
 /// dot-namespaced names, per the event-log design doc.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -227,6 +235,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         supports_steering: bool,
     },
+    /// The transient activity label for a running turn changed. This updates
+    /// the existing activity row; it is not a transcript or tool-rail item.
+    #[serde(rename = "turn.phase_changed")]
+    TurnPhaseChanged { turn: u64, phase: TurnPhase },
     /// Live usage from the most recently completed model request in a running
     /// turn. Thread snapshots add its billing counters to `active_usage` while
     /// replacing only the context fields. `last_usage` remains unchanged until

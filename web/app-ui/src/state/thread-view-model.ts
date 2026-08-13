@@ -17,6 +17,7 @@ type QuestionAnswer = ProtocolComponents["schemas"]["QuestionAnswer"];
 export type QueuedPrompt = ProtocolComponents["schemas"]["QueuedPrompt"];
 export type TodoItem = ProtocolComponents["schemas"]["TodoItem"];
 type Usage = ProtocolComponents["schemas"]["Usage"];
+type TurnPhase = ProtocolComponents["schemas"]["TurnPhase"];
 type ThreadViewItem = ProtocolThreadViewSnapshot["items"][number];
 
 const accumulateLiveUsage = (
@@ -270,6 +271,7 @@ export class ThreadViewModel {
   lastUsageCursor = 0;
   compacting = false;
   turnRunning = false;
+  turnPhase: TurnPhase | undefined;
   thinking = false;
   commands: readonly CommandInfo[] = [];
   queue: readonly QueuedPrompt[] = [];
@@ -324,6 +326,7 @@ export class ThreadViewModel {
     this.lastUsageCursor = this.lastUsage === undefined ? 0 : cursor;
     this.compacting = snapshot.compacting ?? false;
     this.turnRunning = snapshot.turn_running ?? false;
+    this.turnPhase = snapshot.turn_phase ?? undefined;
     if (this.turnRunning) {
       const activeTurn = this.#findLast(
         (item) =>
@@ -582,6 +585,7 @@ export class ThreadViewModel {
       case "turn.started":
         this.turnRunning = true;
         this.#activeTurnUsage = undefined;
+        this.turnPhase = "processing";
         this.turnModels.set(envelope.turn, envelope.model);
         if (envelope.thinking_level == null) {
           this.turnThinkingLevels.delete(envelope.turn);
@@ -599,6 +603,9 @@ export class ThreadViewModel {
             ? { kind: "running", startedAt: envelope.ts }
             : { kind: "waiting-for-capacity", startedAt: envelope.ts },
         });
+        return true;
+      case "turn.phase_changed":
+        this.turnPhase = envelope.phase;
         return true;
       case "thread.compaction_started":
         this.compacting = true;
@@ -903,6 +910,7 @@ export class ThreadViewModel {
       case "turn.completed": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
+        this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         this.finishThinking();
@@ -930,6 +938,7 @@ export class ThreadViewModel {
       case "turn.failed": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
+        this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         this.finishThinking();
@@ -947,6 +956,7 @@ export class ThreadViewModel {
       case "turn.cancelled": {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
+        this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         this.finishThinking();

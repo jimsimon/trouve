@@ -540,6 +540,9 @@ pub struct ThreadViewSnapshot {
     pub turn_running: bool,
     #[serde(default)]
     pub thinking: bool,
+    /// Current transient activity for the running turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_phase: Option<crate::TurnPhase>,
     #[serde(default)]
     pub turn_models: std::collections::BTreeMap<u64, String>,
     #[serde(default)]
