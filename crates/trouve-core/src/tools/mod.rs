@@ -1248,9 +1248,6 @@ const REVIEW_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const REVIEW_GIT_CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const REVIEW_GIT_DRAIN_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_REVIEW_GIT_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_REVIEW_DIFF_FILES: usize = 250;
-const MAX_REVIEW_DIFF_CHANGED_LINES: u64 = 20_000;
-const MAX_REVIEW_DIFF_BYTES: usize = 16 * 1024 * 1024;
 
 fn validate_review_repository_name(repository: &str) -> Result<[&str; 2], String> {
     let parts = repository.split('/').collect::<Vec<_>>();
@@ -3049,13 +3046,7 @@ impl ToolExecutor for LocalToolExecutor {
                     .map(|name| format!("refs/remotes/origin/{name}"))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let repository_lock = {
-            let mut locks = self.review_repository_locks.lock().unwrap();
-            locks
-                .entry(repository_path.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
+        let repository_lock = self.review_repository_lock(&repository_path);
         let repository_guard =
             tokio::time::timeout(REVIEW_HISTORY_CLEANUP_TIMEOUT, repository_lock.lock_owned())
                 .await
@@ -4209,6 +4200,7 @@ mod tests {
                 head_sha: head.clone(),
                 optional_shas: vec![head],
                 token: "test-token".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
             })
             .await
             .unwrap();

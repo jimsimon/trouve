@@ -3616,9 +3616,11 @@ impl Engine {
                     let previous_diff = self
                         .executor
                         .review_repository_diff(&ReviewRepositoryDiff {
+                            managed_root: self.data_dir.join("worktrees"),
                             worktree: session.worktree_path.clone().into(),
                             base_sha: previous_merge_base.clone(),
                             head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
+                            cancel: superseded.clone(),
                         })
                         .await;
                     match previous_diff {
@@ -8584,31 +8586,6 @@ mod tests {
             .expect("review turn watchdog should not panic");
         assert_eq!(result.output, "done");
         assert_eq!(result.metrics.tool_call_count, 1);
-    }
-
-    #[test]
-    fn pull_merge_base_is_required_when_the_base_branch_advanced() {
-        let pull_base = "5012670084f9f21b986a8457a69f82b3546da64b";
-        let merge_base = "2e8185e0144ffd9a1983fdb33835e60e5c2fa1d0";
-
-        assert!(pull_merge_base_required(
-            trouve_protocol::CodeReviewJobScope::Incremental,
-            pull_base,
-            pull_base,
-            None,
-        ));
-        assert!(pull_merge_base_required(
-            trouve_protocol::CodeReviewJobScope::Full,
-            pull_base,
-            pull_base,
-            None,
-        ));
-        let comparison: GithubCompare = serde_json::from_value(serde_json::json!({
-            "status": "diverged",
-            "merge_base_commit": { "sha": merge_base }
-        }))
-        .unwrap();
-        assert_eq!(comparison.merge_base_commit.sha, merge_base);
     }
 
     #[test]

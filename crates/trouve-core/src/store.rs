@@ -962,7 +962,7 @@ fn recover_interrupted_session_summaries(conn: &Connection) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let _ = insert_event_batch(conn, events.iter(), events.len())?;
+    let _ = insert_event_batch(conn, events.iter(), events.len(), std::iter::empty())?;
     Ok(())
 }
 
@@ -6816,6 +6816,7 @@ impl Store {
                 events: serialize_events(Scope::CodeReviewJob(job_id.to_owned()), events)?,
                 code_review_outbox_ids: ids,
                 reply: AppendReply::Async(reply),
+                queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
         reply_rx

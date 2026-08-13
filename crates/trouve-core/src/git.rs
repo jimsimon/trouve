@@ -121,6 +121,19 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_result(dir, args, out.status, out.stdout, out.stderr)
 }
 
+fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
+    if !out.status.success() {
+        return git_result(dir, args, out.status, out.stdout, out.stderr);
+    }
+    String::from_utf8(out.stdout).context("git output is not UTF-8")
+}
+
 enum GitCommandInput {
     Bytes(Vec<u8>),
 }
