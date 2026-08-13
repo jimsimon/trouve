@@ -339,7 +339,7 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   await expect(permission).toHaveValue("yolo");
 });
 
-test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
+test("session navigation shows configured branch names", async ({ page }, testInfo) => {
   await page.goto("/");
   if (testInfo.project.name.startsWith("mobile")) {
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
@@ -347,9 +347,8 @@ test("session navigation uses compact one-line rows without branch names", async
 
   const row = page.locator(".session-row").filter({ hasText: "Protocol ingress" });
   await expect(row).toBeVisible();
-  await expect(row).not.toContainText("feature");
-  await expect(row.locator(".session-copy small")).toHaveCount(0);
-  await expect(row).toHaveCSS("height", "34px");
+  await expect(row.locator(".session-branch")).toHaveText("feature");
+  await expect(row).toHaveCSS("height", "46px");
   await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
   const wrapper = row.locator("..");
   const age = row.locator(".session-age");
