@@ -1171,8 +1171,10 @@ trouve-command-palette { display: contents; }
   .thread-tabs { --thread-tab-width: 128px; height: 42px; }
   .thread-tab-item { height: 42px; }
   .thread-tab-item > .thread-tab-close { inset-block: 10px; }
-  .thread-tab-header > .new-thread-tab, .thread-switcher-toggle { height: 42px; }
+  .thread-tab-header > .new-thread-tab, .thread-tab-header > .chat-find-toggle, .thread-switcher-toggle { height: 42px; }
+  .thread-switcher-toggle { width: 30px; justify-content: center; padding-inline: 0; }
   .thread-switcher-toggle-label { display: none; }
+  .thread-switcher-total { display: none; }
   .thread-switcher-panel { position: fixed; z-index: 40; inset: auto max(8px, env(safe-area-inset-right)) calc(58px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); width: auto; max-height: min(72dvh, 600px); border-radius: var(--trouve-radius) var(--trouve-radius) 0 0; }
   .thread-switcher-panel-header { padding: 10px; }
   .thread-switcher-search { height: 40px; font-size: 16px; }
