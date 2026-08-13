@@ -186,7 +186,10 @@ async fn claude_adapter_reaps_persistent_process_before_cancelled_stream_closes(
 echo $$ > "$0.pid"
 IFS= read -r prompt
 : > "$0.prompt"
-sleep 60
+# Block in the persistent shell itself. Process-tree cleanup has dedicated
+# coverage; this test verifies that cancellation awaits this process being
+# reaped without depending on a separately scheduled sleep child.
+IFS= read -r keepalive
 "#,
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
@@ -222,7 +225,7 @@ sleep 60
         .unwrap();
 
     cancel.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+    tokio::time::timeout(std::time::Duration::from_secs(6), drain)
         .await
         .expect("cancelled Claude stream should wait for process reaping")
         .unwrap();

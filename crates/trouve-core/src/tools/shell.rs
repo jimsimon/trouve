@@ -1014,6 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn background_job_holds_transferred_mutation_lease_until_reaped() {
         let tmp = tempfile::tempdir().unwrap();
+        let started = tmp.path().join("started");
         let lane = Arc::new(tokio::sync::RwLock::new(()));
         let guard = lane.clone().write_owned().await;
         let ctx = ToolCtx {
@@ -1027,10 +1028,21 @@ mod tests {
         let launched = shell
             .run(
                 &ctx,
-                &json!({"command": "sleep 60", "run_in_background": true}),
+                &json!({
+                    "command": "touch started; sleep 60",
+                    "run_in_background": true
+                }),
             )
             .await;
         let id = launched.result["job_id"].as_str().unwrap().to_string();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background shell did not reach its blocking command");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
