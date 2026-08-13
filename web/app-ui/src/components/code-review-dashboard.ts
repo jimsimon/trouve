@@ -9,6 +9,7 @@ import type {
 } from "../services/protocol-client.js";
 import {
   canCancelCodeReviewJob,
+  canRetryFinalEditor,
   canRetryCodeReviewJob,
   CODE_REVIEW_STATUS_FILTERS,
   codeReviewSettingsDraft,
@@ -639,6 +640,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
 
   #renderJob(job: ProtocolCodeReviewJob) {
     const active = canCancelCodeReviewJob(job.status);
+    const finalEditorRetryable = canRetryFinalEditor(job);
     const progress = job.progress;
     const percent = Math.max(0, Math.min(100, progress?.percent ?? (active ? 0 : 100)));
     const pending = this.#pendingAction?.jobId === job.id ? this.#pendingAction : undefined;
@@ -684,7 +686,12 @@ export class TrouveCodeReviewDashboard extends LitElement {
                   <button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>Cancel & retry</button>
                 `
               : canRetryCodeReviewJob(job.status)
-                ? html`<button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry"}</button>`
+                ? html`
+                    ${finalEditorRetryable
+                      ? html`<button class="compact" type="button" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "final-editor")}>${busy ? "Retrying…" : "Retry final editor"}</button>`
+                      : nothing}
+                    <button class="compact" type="button" title="Starts a replacement review with current repository settings" ?disabled=${this.#busyJobId !== ""} @click=${() => this.#confirmJobAction(job, "retry")}>${busy ? "Retrying…" : "Retry whole review"}</button>
+                  `
                 : nothing}
           </div>
         </footer>
@@ -692,15 +699,17 @@ export class TrouveCodeReviewDashboard extends LitElement {
         ${pending === undefined
           ? nothing
           : html`
-              <div class="confirmation" role="alertdialog" aria-label=${`${pending.action === "cancel" ? "Cancel" : "Retry"} code review confirmation`}>
+              <div class="confirmation" role="alertdialog" aria-label=${`${pending.action === "cancel" ? "Cancel" : pending.action === "final-editor" ? "Retry final editor" : "Retry"} code review confirmation`}>
                 <p>${pending.action === "cancel"
                   ? `Cancel the review for PR #${job.pull_number}? Completed output remains in review history.`
+                  : pending.action === "final-editor"
+                    ? `Retry only the final review editor for PR #${job.pull_number}? Successful reviewer output will be retained.`
                   : active
                     ? `Cancel current work and queue a replacement for PR #${job.pull_number} using current repository settings? Every currently selected reviewer persona will run again.`
                     : `Queue a replacement for PR #${job.pull_number} using current repository settings? Every currently selected reviewer persona will run again.`}</p>
                 <div class="actions">
                   <button class="compact" type="button" @click=${this.#dismissConfirmation}>Keep current job</button>
-                  <button class="compact ${pending.action === "cancel" ? "danger" : "primary"}" type="button" @click=${() => this.#runJobAction(job, pending.action)}>Confirm ${pending.action === "cancel" ? "cancel" : "retry"}</button>
+                  <button class="compact ${pending.action === "cancel" ? "danger" : "primary"}" type="button" @click=${() => this.#runJobAction(job, pending.action)}>Confirm ${pending.action === "cancel" ? "cancel" : pending.action === "final-editor" ? "final-editor retry" : "whole-review retry"}</button>
                 </div>
               </div>
             `}
@@ -950,17 +959,30 @@ export class TrouveCodeReviewDashboard extends LitElement {
     this.#pendingAction = undefined;
     this.#busyJobId = job.id;
     this.#error = "";
-    this.#liveStatus = action === "cancel" ? "Cancelling review…" : "Retrying review…";
+    this.#liveStatus = action === "cancel"
+      ? "Cancelling review…"
+      : action === "final-editor"
+        ? "Retrying final review editor…"
+        : "Retrying whole review…";
     this.requestUpdate();
 
     let updated: ProtocolCodeReviewJob;
     try {
       updated = action === "cancel"
         ? await services.protocol.cancelCodeReviewJob(job.id)
-        : await services.protocol.retryCodeReviewJob(job.id);
+        : action === "final-editor"
+          ? await services.protocol.retryCodeReviewFinalEditor(job.id)
+          : await services.protocol.retryCodeReviewJob(job.id);
     } catch (cause) {
       if (!this.isConnected) return;
-      this.#error = errorMessage(cause, `The review could not be ${action === "cancel" ? "cancelled" : "retried"}.`);
+      this.#error = errorMessage(
+        cause,
+        action === "cancel"
+          ? "The review could not be cancelled."
+          : action === "final-editor"
+            ? "The final review editor could not be retried."
+            : "The whole review could not be retried.",
+      );
       this.#liveStatus = this.#error;
       this.#busyJobId = "";
       this.requestUpdate();
@@ -971,9 +993,11 @@ export class TrouveCodeReviewDashboard extends LitElement {
     this.#upsertJob(updated);
     this.#liveStatus = action === "cancel"
       ? "Review cancelled."
-      : updated.id === job.id
-        ? "Review publication had already started; the existing review was reconciled instead of retried."
-        : `Replacement review ${updated.id} queued; all currently selected reviewer personas will run again.`;
+      : action === "final-editor"
+        ? "Final review editor retry queued."
+        : updated.id === job.id
+          ? "Review publication had already started; the existing review was reconciled instead of retried."
+          : `Replacement review ${updated.id} queued; all currently selected reviewer personas will run again.`;
     try {
       this.#replaceDashboard(await services.protocol.codeReviewDashboard());
     } catch {

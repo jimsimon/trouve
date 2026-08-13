@@ -14,7 +14,15 @@ export const CODE_REVIEW_STATUS_FILTERS = [
 ] as const;
 
 export type CodeReviewStatusFilter = (typeof CODE_REVIEW_STATUS_FILTERS)[number];
-export type CodeReviewJobAction = "cancel" | "retry";
+export type CodeReviewJobAction = "cancel" | "retry" | "final-editor";
+
+export interface FinalEditorRetrySummary {
+  readonly status: string;
+  readonly progress?: {
+    readonly completed_reviewers: number;
+    readonly total_reviewers: number;
+  };
+}
 
 export interface ReviewJobSummary {
   readonly id: string;
@@ -250,6 +258,11 @@ export const canCancelCodeReviewJob = (status: string): boolean =>
 
 export const canRetryCodeReviewJob = (status: string): boolean =>
   !canCancelCodeReviewJob(status);
+
+export const canRetryFinalEditor = (job: FinalEditorRetrySummary): boolean =>
+  (job.status === "failed" || job.status === "cancelled")
+  && job.progress !== undefined
+  && job.progress.completed_reviewers >= job.progress.total_reviewers;
 
 export const codeReviewSettingsDraft = (
   settings: ProtocolCodeReviewSettings,
