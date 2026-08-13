@@ -640,7 +640,7 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await modelPicker
     .getByRole("option", { name: "codex/gpt-5.6-sol", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", { name: "Thinking", exact: true });
+  const thinking = page.getByRole("combobox", { name: "Reasoning effort", exact: true });
   await expect(thinking).toBeEnabled();
   await thinking.selectOption("max");
   await page.getByRole("button", { name: "Create", exact: true }).click();
@@ -648,23 +648,25 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await expect.poll(() => requests.length).toBe(1);
   expect(requests[0]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "max",
+    thinking_level: null,
+    model_options: { reasoning_effort: "max" },
   });
 
   await page.reload();
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "Automation model" }))
     .toContainText("codex/gpt-5.6-sol");
-  await expect(page.getByRole("combobox", { name: "Thinking", exact: true }))
+  await expect(page.getByRole("combobox", { name: "Reasoning effort", exact: true }))
     .toHaveValue("max");
-  await page.getByRole("combobox", { name: "Thinking", exact: true })
+  await page.getByRole("combobox", { name: "Reasoning effort", exact: true })
     .selectOption("ultra");
   await page.getByRole("button", { name: "Save", exact: true }).click();
 
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[1]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "ultra",
+    thinking_level: null,
+    model_options: { reasoning_effort: "ultra" },
   });
 });
 

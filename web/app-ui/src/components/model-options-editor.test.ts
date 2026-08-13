@@ -17,4 +17,10 @@ describe("model options editor", () => {
     expect(source).toContain("input.setCustomValidity(");
     expect(source).toContain("input.reportValidity();");
   });
+
+  it("preserves scalar choice values and selected state", () => {
+    expect(source).toContain("value=${String(choice.value)}");
+    expect(source).toContain(".selected=${index === control.selectedIndex}");
+    expect(source).toContain('dataset["choiceIndex"]');
+  });
 });
