@@ -7,7 +7,6 @@ import { preferredSessionThreadId } from "../services/resume-preferences.js";
 import type { SessionListItem } from "../state/app-store.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
-  groupWorkspaceSessions,
   sessionAgePresentation,
   sessionStatusText,
 } from "../state/session-inbox-model.js";
@@ -16,6 +15,14 @@ import {
   visibleSessionPullRequestBadge,
 } from "./session-pull-request-badge.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import {
+  organizeWorkspaceSessions,
+  pullRequestKind,
+  type WorkspaceSessionGrouping,
+  type WorkspaceSessionListFields,
+  type WorkspaceSessionOrdering,
+  type WorkspaceSessionSection,
+} from "./workspace-session-list-model.js";
 
 let nextArchivedListId = 0;
 
@@ -25,10 +32,22 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   static override properties = {
     workspaceId: { type: String, attribute: "workspace-id" },
     showArchived: { type: Boolean, attribute: "show-archived" },
+    grouping: { type: String },
+    ordering: { type: String },
+    showBranches: { type: Boolean, attribute: "show-branches" },
+    showStatus: { type: Boolean, attribute: "show-status" },
+    statusFilter: { type: Number, attribute: "status-filter" },
+    pullRequestFilter: { type: Number, attribute: "pull-request-filter" },
   };
 
   workspaceId = "";
   showArchived = false;
+  grouping: WorkspaceSessionGrouping = "repository";
+  ordering: WorkspaceSessionOrdering = "updated";
+  showBranches = true;
+  showStatus = true;
+  statusFilter = 0b1_1111;
+  pullRequestFilter = 0b1_1111;
   #menuSessionId = "";
   #editingSessionId = "";
   #deleteSessionId = "";
@@ -36,6 +55,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   #busySessionId = "";
   #requestError = "";
   readonly #expandedArchivedWorkspaceIds = new Set<string>();
+  readonly #collapsedSessionSections = new Set<string>();
   readonly #instanceId = ++nextArchivedListId;
   readonly #archivedListId = `archived-sessions-${this.#instanceId}`;
   readonly #modalTitleId = `session-modal-title-${this.#instanceId}`;
@@ -94,26 +114,32 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const selectedSessionId =
       currentRoute?.kind === "session" ? currentRoute.sessionId : undefined;
     const now = Date.now();
-    const groups = groupWorkspaceSessions(sessions, {
+    const organizedSessions: readonly (SessionListItem & WorkspaceSessionListFields)[] =
+      sessions.map((session) => ({
+        ...session,
+        createdAt: store.sessionMetadata(session.id)?.created_at ?? session.updatedAt,
+        pullRequestKind: pullRequestKind(store.sessionPullRequests(session.id)),
+      }));
+    const groups = organizeWorkspaceSessions(organizedSessions, {
       workspaceId: this.workspaceId,
-      selectedSessionId,
-      archivedExpanded: this.#expandedArchivedWorkspaceIds.has(this.workspaceId),
+      grouping: this.grouping,
+      ordering: this.ordering,
+      statusFilter: this.statusFilter,
+      pullRequestFilter: this.pullRequestFilter,
+      now,
     });
-    if (groups.active.length === 0 && groups.archived.length === 0) {
-      return html`<p class="context-placeholder">No sessions</p>`;
+    const selectedArchived = groups.archived.some(({ id }) => id === selectedSessionId);
+    const archivedExpanded = groups.archived.length > 0 && (
+      this.#expandedArchivedWorkspaceIds.has(this.workspaceId) || selectedArchived
+    );
+    if (groups.sections.length === 0 && groups.archived.length === 0) {
+      return html`<p class="context-placeholder">No matching sessions</p>`;
     }
     return html`
-      ${groups.active.length === 0
+      ${groups.sections.length === 0
         ? html`<p class="context-placeholder session-list-empty">No active sessions</p>`
-        : html`
-            <ol class="session-list active-session-list" aria-label="Active sessions">
-              ${repeat(
-                groups.active,
-                (session) => session.id,
-                (session) => this.#renderSession(session, selectedSessionId, now),
-              )}
-            </ol>
-          `}
+        : groups.sections.map((section) =>
+            this.#renderSection(section, selectedSessionId, now))}
       ${groups.archived.length === 0 || !this.showArchived
         ? nothing
         : html`
@@ -121,11 +147,11 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
               <button
                 type="button"
                 class="archived-session-toggle"
-                aria-expanded=${groups.archivedExpanded}
+                aria-expanded=${archivedExpanded}
                 aria-controls=${this.#archivedListId}
-                @click=${() => this.#toggleArchived(groups.archivedExpanded)}
+                @click=${() => this.#toggleArchived(archivedExpanded)}
               >
-                ${fontAwesomeIcon(groups.archivedExpanded ? "caret-down" : "caret-right", {
+                ${fontAwesomeIcon(archivedExpanded ? "caret-down" : "caret-right", {
                   className: "archived-session-chevron",
                 })}
                 <span>Archived (${groups.archived.length})</span>
@@ -133,7 +159,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
               <ol
                 id=${this.#archivedListId}
                 class="session-list archived-session-list"
-                ?hidden=${!groups.archivedExpanded}
+                ?hidden=${!archivedExpanded}
               >
                 ${repeat(
                   groups.archived,
@@ -182,6 +208,42 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     `;
   }
 
+  #renderSection(
+    section: WorkspaceSessionSection<SessionListItem & WorkspaceSessionListFields>,
+    selectedSessionId: string | undefined,
+    now: number,
+  ) {
+    const sectionKey = `${this.workspaceId}:${this.grouping}:${section.key}`;
+    const collapsed = section.label !== "" && this.#collapsedSessionSections.has(sectionKey);
+    const listId = `session-section-${this.#instanceId}-${section.key}`;
+    return html`
+      ${section.label === ""
+        ? nothing
+        : html`<button
+            type="button"
+            class="session-section-toggle"
+            aria-expanded=${collapsed ? "false" : "true"}
+            aria-controls=${listId}
+            @click=${() => this.#toggleSection(sectionKey)}
+          >
+            ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
+            <span>${section.label} (${section.sessions.length})</span>
+          </button>`}
+      <ol
+        id=${listId}
+        class="session-list active-session-list"
+        aria-label=${section.label === "" ? "Active sessions" : `${section.label} sessions`}
+        ?hidden=${collapsed}
+      >
+        ${repeat(
+          section.sessions,
+          (session) => session.id,
+          (session) => this.#renderSession(session, selectedSessionId, now),
+        )}
+      </ol>
+    `;
+  }
+
   #renderSession(
     session: SessionListItem,
     selectedSessionId: string | undefined,
@@ -197,27 +259,36 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     return html`
       <li class="session-entry">
         <div
-          class="session-row-wrap ${selected ? "selected" : ""}"
+          class="session-row-wrap ${selected ? "selected" : ""} ${
+            this.showBranches ? "with-branch" : ""
+          }"
           data-actions-open=${this.#menuSessionId === session.id}
         >
                 <button
                   type="button"
-                  class="session-row ${selected ? "selected" : ""}"
+                  class="session-row ${selected ? "selected" : ""} ${
+                    this.showBranches ? "with-branch" : ""
+                  } ${this.showStatus ? "" : "without-status"}"
                   aria-current=${selected ? "page" : "false"}
                   @click=${() => this.#open(session)}
                 >
-                  <span
-                    class="session-indicator ${indicator.kind}"
-                    title=${indicator.tooltip === "" ? nothing : indicator.tooltip}
-                    aria-hidden="true"
-                  >${indicator.icon === undefined
-                    ? nothing
-                    : fontAwesomeIcon(indicator.icon)}</span>
+                  ${!this.showStatus
+                    ? html`<span class="session-indicator session-indicator-hidden" aria-hidden="true"></span>`
+                    : html`<span
+                        class="session-indicator ${indicator.kind}"
+                        title=${indicator.tooltip === "" ? nothing : indicator.tooltip}
+                        aria-hidden="true"
+                      >${indicator.icon === undefined
+                        ? nothing
+                        : fontAwesomeIcon(indicator.icon)}</span>`}
                   <span class="session-copy">
                     <strong>${session.title}</strong>
+                    ${this.showBranches
+                      ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`
+                      : nothing}
                     <span class="session-status-text visually-hidden">Status: ${sessionStatusText(session)}</span>
                   </span>
-                  ${pullRequestBadge === undefined
+                  ${!this.showStatus || pullRequestBadge === undefined
                     ? nothing
                     : html`<span
                         class="session-pr-badge ${pullRequestBadge.tone}"
@@ -259,6 +330,13 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
       this.#expandedArchivedWorkspaceIds.delete(this.workspaceId);
     } else {
       this.#expandedArchivedWorkspaceIds.add(this.workspaceId);
+    }
+    this.requestUpdate();
+  }
+
+  #toggleSection(sectionKey: string): void {
+    if (!this.#collapsedSessionSections.delete(sectionKey)) {
+      this.#collapsedSessionSections.add(sectionKey);
     }
     this.requestUpdate();
   }

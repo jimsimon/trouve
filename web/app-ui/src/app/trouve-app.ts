@@ -44,6 +44,11 @@ import {
 } from "../services/chat-preferences.js";
 import { createBrowserComposerDraftController } from "../services/composer-drafts.js";
 import { createBrowserWorkspaceOrderController } from "../services/workspace-order.js";
+import {
+  createBrowserWorkspaceListPreferencesController,
+  type WorkspaceListGrouping,
+  type WorkspaceListOrdering,
+} from "../services/workspace-list-preferences.js";
 import { createBrowserPullRequestGroupOrderController } from "../services/pull-request-group-order.js";
 import {
   appearanceFontFamilyCssValue,
@@ -172,6 +177,10 @@ import { pickAndRegisterWorkspace } from "../components/workspace-settings-model
 import { modelHealthPresentations } from "../components/model-health.js";
 import { modelOptionLabel } from "../components/model-option-controls.js";
 import {
+  WORKSPACE_PULL_REQUEST_FILTERS,
+  WORKSPACE_STATUS_FILTERS,
+} from "../components/workspace-session-list-model.js";
+import {
   fontAwesomeIcon,
   type FontAwesomeIconName,
 } from "../components/font-awesome-icon.js";
@@ -240,6 +249,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #workspaceOrder = createBrowserWorkspaceOrderController(
     deployment !== "desktop",
   );
+  // This is frontend-only presentation state. Keep a same-origin mirror in
+  // desktop WebViews as well as browser/PWA deployments so it survives reloads
+  // without adding sidebar concerns to the harness protocol.
+  readonly #workspaceListPreferences = createBrowserWorkspaceListPreferencesController();
   readonly #pullRequestGroupOrder = createBrowserPullRequestGroupOrderController(
     deployment !== "desktop",
   );
@@ -434,6 +447,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #collapsedWorkspaceIds = new Set<string>();
   #showArchivedWorkspaceIds = new Set<string>();
   #workspaceActionMenuId = "";
+  #workspaceListOptionsOpen = false;
   #workspaceClosePendingId = "";
   #workspaceOrderStatus = "";
   #draggedWorkspaceId = "";
@@ -1541,9 +1555,59 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #toggleWorkspaceActions(workspaceId: string): void {
+    this.#workspaceListOptionsOpen = false;
     this.#workspaceActionMenuId = this.#workspaceActionMenuId === workspaceId
       ? ""
       : workspaceId;
+    this.requestUpdate();
+  }
+
+  readonly #toggleWorkspaceListOptions = (): void => {
+    this.#workspaceActionMenuId = "";
+    this.#workspaceListOptionsOpen = !this.#workspaceListOptionsOpen;
+    this.requestUpdate();
+  };
+
+  #setWorkspaceListGrouping(event: Event): void {
+    const grouping = (event.currentTarget as HTMLSelectElement).value as WorkspaceListGrouping;
+    this.#workspaceListPreferences.update({ grouping });
+    this.requestUpdate();
+  }
+
+  #setWorkspaceListOrdering(event: Event): void {
+    const ordering = (event.currentTarget as HTMLSelectElement).value as WorkspaceListOrdering;
+    this.#workspaceListPreferences.update({ ordering });
+    this.requestUpdate();
+  }
+
+  #toggleWorkspaceListShow(option: "showBranches" | "showStatus"): void {
+    const current = readSignal(this.#workspaceListPreferences.current);
+    this.#workspaceListPreferences.update({ [option]: !current[option] });
+    this.requestUpdate();
+  }
+
+  #toggleWorkspaceListFilter(
+    workspaceId: string,
+    category: "status" | "pullRequest",
+    index: number,
+  ): void {
+    this.#workspaceListPreferences.toggleFilter(workspaceId, category, index);
+    this.requestUpdate();
+  }
+
+  #collapseWorkspaceFromMenu(workspaceId: string): void {
+    const collapsed = new Set(this.#collapsedWorkspaceIds);
+    collapsed.add(workspaceId);
+    this.#collapsedWorkspaceIds = collapsed;
+    this.#workspaceActionMenuId = "";
+    this.requestUpdate();
+  }
+
+  #markWorkspaceRead(workspaceId: string): void {
+    for (const session of readSignal(this.#store.sessions)) {
+      if (session.workspaceId === workspaceId) this.#store.markSessionRead(session.id);
+    }
+    this.#workspaceActionMenuId = "";
     this.requestUpdate();
   }
 
@@ -1573,6 +1637,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       const showArchived = new Set(this.#showArchivedWorkspaceIds);
       showArchived.delete(workspaceId);
       this.#showArchivedWorkspaceIds = showArchived;
+      this.#workspaceListPreferences.removeWorkspace(workspaceId);
       const route = readSignal(this.#router.route);
       if (route.kind === "session" && route.workspaceId === workspaceId) {
         this.#router.navigate({ kind: "inbox" }, true);
@@ -2683,6 +2748,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const knownWorkspaces = readSignal(this.#store.workspaces);
     readSignal(this.#workspaceOrder.order);
     const orderedWorkspaces = this.#workspaceOrder.ordered(knownWorkspaces);
+    const workspaceListPreferences = readSignal(this.#workspaceListPreferences.current);
     const capabilities = readSignal(this.#capabilities.current);
     const directoryPickerAvailable =
       capabilities.directoryPicker &&
@@ -2792,6 +2858,66 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           </div>
           <div class="workspace-list-heading">
             <strong>Workspaces</strong>
+            <span class="workspace-list-options-wrap">
+              <button
+                class="workspace-list-options-button"
+                type="button"
+                aria-label="Workspace list options"
+                title="Workspace list options"
+                aria-haspopup="dialog"
+                aria-expanded=${this.#workspaceListOptionsOpen ? "true" : "false"}
+                @click=${this.#toggleWorkspaceListOptions}
+              >${fontAwesomeIcon("ellipsis")}</button>
+              ${this.#workspaceListOptionsOpen
+                ? html`<span
+                    class="workspace-list-options-menu"
+                    role="dialog"
+                    aria-label="Workspace list options"
+                  >
+                    <label>
+                      <span>Grouping</span>
+                      <select
+                        aria-label="Group sessions by"
+                        .value=${workspaceListPreferences.grouping}
+                        @change=${(event: Event) => this.#setWorkspaceListGrouping(event)}
+                      >
+                        <option value="repository">Repository</option>
+                        <option value="workspace">Workspace</option>
+                        <option value="updated">Updated</option>
+                        <option value="status">Status</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Ordering</span>
+                      <select
+                        aria-label="Order sessions by"
+                        .value=${workspaceListPreferences.ordering}
+                        @change=${(event: Event) => this.#setWorkspaceListOrdering(event)}
+                      >
+                        <option value="updated">Updated</option>
+                        <option value="status">Status</option>
+                        <option value="created">Created</option>
+                      </select>
+                    </label>
+                    <label class="workspace-list-show-option">
+                      <input
+                        type="checkbox"
+                        .checked=${workspaceListPreferences.showBranches}
+                        @change=${() => this.#toggleWorkspaceListShow("showBranches")}
+                      />
+                      <span>Branch names</span>
+                    </label>
+                    <label class="workspace-list-show-option">
+                      <input
+                        type="checkbox"
+                        .checked=${workspaceListPreferences.showStatus}
+                        @change=${() => this.#toggleWorkspaceListShow("showStatus")}
+                      />
+                      <span>Status indicators</span>
+                    </label>
+                  </span>`
+                : nothing}
+            </span>
             <button
               class="command-palette-compact"
               type="button"
@@ -2817,6 +2943,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           ${orderedWorkspaces.map(
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
+              const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspace.id);
               const dropTarget = this.#workspaceDropTarget === workspace.id;
               const placeholder = html`<div
                 class="workspace-drop-placeholder"
@@ -2884,7 +3011,50 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                               aria-checked=${this.#showArchivedWorkspaceIds.has(workspace.id) ? "true" : "false"}
                               @click=${() => this.#toggleArchivedWorkspaceSessions(workspace.id)}
                             ><span>Archived</span><span>${this.#showArchivedWorkspaceIds.has(workspace.id) ? fontAwesomeIcon("check") : nothing}</span></button>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Status filters">
+                              <strong>Status</strong>
+                              ${WORKSPACE_STATUS_FILTERS.map(([, label], filterIndex) => html`<button
+                                type="button"
+                                role="menuitemcheckbox"
+                                aria-checked=${(workspaceFilters.status & (1 << filterIndex)) !== 0 ? "true" : "false"}
+                                @click=${() => this.#toggleWorkspaceListFilter(
+                                  workspace.id,
+                                  "status",
+                                  filterIndex,
+                                )}
+                              ><span>${label}</span><span>${(workspaceFilters.status & (1 << filterIndex)) !== 0
+                                  ? fontAwesomeIcon("check")
+                                  : nothing}</span></button>`)}
+                            </span>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Pull request filters">
+                              <strong>Pull request</strong>
+                              ${WORKSPACE_PULL_REQUEST_FILTERS.map(([, label], filterIndex) => html`<button
+                                type="button"
+                                role="menuitemcheckbox"
+                                aria-checked=${(workspaceFilters.pullRequest & (1 << filterIndex)) !== 0 ? "true" : "false"}
+                                @click=${() => this.#toggleWorkspaceListFilter(
+                                  workspace.id,
+                                  "pullRequest",
+                                  filterIndex,
+                                )}
+                              ><span>${label}</span><span>${(workspaceFilters.pullRequest & (1 << filterIndex)) !== 0
+                                  ? fontAwesomeIcon("check")
+                                  : nothing}</span></button>`)}
+                            </span>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Workspace commands">
+                              <button
+                                type="button"
+                                role="menuitem"
+                                @click=${() => this.#collapseWorkspaceFromMenu(workspace.id)}
+                              ><span>Collapse workspace</span></button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                @click=${() => this.#markWorkspaceRead(workspace.id)}
+                              ><span>Mark all as read</span></button>
+                            </span>
                             <button
+                              class="danger"
                               type="button"
                               role="menuitem"
                               ?disabled=${this.#workspaceClosePendingId !== ""}
@@ -2905,6 +3075,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     id=${`workspace-sessions-${index}`}
                     workspace-id=${workspace.id}
                     .showArchived=${this.#showArchivedWorkspaceIds.has(workspace.id)}
+                    .grouping=${workspaceListPreferences.grouping}
+                    .ordering=${workspaceListPreferences.ordering}
+                    .showBranches=${workspaceListPreferences.showBranches}
+                    .showStatus=${workspaceListPreferences.showStatus}
+                    .statusFilter=${workspaceFilters.status}
+                    .pullRequestFilter=${workspaceFilters.pullRequest}
                     ?hidden=${collapsed}
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>
@@ -2936,6 +3112,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   <trouve-session-list
                     id=${`workspace-orphan-sessions-${index}`}
                     workspace-id=${workspaceId}
+                    .grouping=${workspaceListPreferences.grouping}
+                    .ordering=${workspaceListPreferences.ordering}
+                    .showBranches=${workspaceListPreferences.showBranches}
+                    .showStatus=${workspaceListPreferences.showStatus}
                     ?hidden=${collapsed}
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>
