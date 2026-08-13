@@ -74,7 +74,7 @@ jobs:
         run: >-
           cargo metadata
           --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
-          --locked --no-deps --format-version 1 > /dev/null
+          --locked --format-version 1 > /dev/null
       - name: Verify Servo dependency licenses and notices
         run: >-
           python3 scripts/generate_rust_third_party_notices.py

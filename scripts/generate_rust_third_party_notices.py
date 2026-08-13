@@ -95,10 +95,15 @@ def cargo_metadata(manifest_path: Path | None = None) -> dict[str, object]:
     result = subprocess.run(
         command,
         cwd=ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if result.returncode:
+        details = result.stderr.strip() or result.stdout.strip()
+        if not details:
+            details = f"cargo exited with status {result.returncode}"
+        raise SystemExit(f"{shlex.join(command)} failed:\n{details}")
     return json.loads(result.stdout)
 
 

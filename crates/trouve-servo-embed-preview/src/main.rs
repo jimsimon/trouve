@@ -163,9 +163,7 @@ fn main() -> Result<()> {
                 .await
                 .map_err(|_| "embedded Servo clipboard worker was interrupted".to_string())?
         })
-        .with_external_https_opener(|url| {
-            system_opener::open(url.as_url().as_str())
-        });
+        .with_external_https_opener(|url| system_opener::open(url.as_url().as_str()));
     let frontend = FrontendSource::from_preview_environment(None, true)?;
     let host = WebPreviewHost::start(frontend, native_actions)?;
     let gateway_url = Url::parse(host.gateway_origin())

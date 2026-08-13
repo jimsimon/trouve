@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import pathlib
+import subprocess
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("generate_rust_third_party_notices.py")
@@ -34,6 +36,21 @@ def metadata(license_name: str = "Apache-2.0 / MIT") -> dict[str, object]:
 
 
 class RustSbomTests(unittest.TestCase):
+    @mock.patch.object(rust_notices.subprocess, "run")
+    def test_cargo_metadata_surfaces_cargo_stderr(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            args=["cargo", "metadata"],
+            returncode=101,
+            stdout="",
+            stderr="error: the lock file needs to be updated\n",
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "(?s)cargo metadata .* failed:.*lock file needs to be updated",
+        ):
+            rust_notices.cargo_metadata(pathlib.Path("nested/Cargo.toml"))
+
     def test_nested_notice_commands_and_frontend_link_target_the_nested_graph(self):
         manifest = pathlib.Path("crates/trouve-servo-embed-preview/Cargo.toml")
         notice = pathlib.Path(
