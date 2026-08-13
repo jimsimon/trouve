@@ -118,18 +118,24 @@ export class TrouveModelOptionsEditor extends LitElement {
               aria-label=${control.label}
               aria-describedby=${descriptionId}
               ?disabled=${this.disabled}
-              .value=${control.selectedIndex < 0 ? "" : String(control.selectedIndex)}
               @change=${(event: Event) => {
-                const index = Number((event.currentTarget as HTMLSelectElement).value);
-                const choice = Number.isInteger(index) ? control.choices[index] : undefined;
+                const select = event.currentTarget as HTMLSelectElement;
+                const choiceIndex = Number(select.selectedOptions[0]?.dataset["choiceIndex"]);
+                const choice = Number.isInteger(choiceIndex)
+                  ? control.choices[choiceIndex]
+                  : undefined;
                 if (choice !== undefined) this.#emit(control.key, choice.value);
               }}
             >
               ${control.selectedIndex < 0
-                ? html`<option value="">Select…</option>`
+                ? html`<option value="" .selected=${true}>Select…</option>`
                 : nothing}
               ${control.choices.map((choice, index) =>
-                html`<option value=${String(index)}>${choice.label}</option>`
+                html`<option
+                  value=${String(choice.value)}
+                  data-choice-index=${String(index)}
+                  .selected=${index === control.selectedIndex}
+                >${choice.label}</option>`
               )}
             </select>
             ${control.description === ""
