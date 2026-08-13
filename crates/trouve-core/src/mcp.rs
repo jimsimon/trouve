@@ -688,23 +688,14 @@ fn reject_macos_extended_acl(path: &Path) -> std::io::Result<()> {
     let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
     let _ = unsafe { acl_free(acl) };
     match result {
-        // Darwin differs from the POSIX-style contract used by several
-        // other ACL implementations: zero means that an entry was returned,
-        // while an empty ACL reports EINVAL for ACL_FIRST_ENTRY.  Reversing
-        // those meanings rejects ordinary files and permits the extended ACL
-        // that this atomic replacement cannot preserve.
+        // Darwin's acl_get_entry returns zero when an entry was obtained,
+        // one when the ACL contains no more entries, and -1 on error.
         0 => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "MCP config has an extended ACL that cannot be preserved atomically",
         )),
-        _ => {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
+        1 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
     }
 }
 

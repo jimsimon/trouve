@@ -217,7 +217,7 @@ impl<'a> GitOperation<'a> {
             bail!("{} cancelled", self.label);
         }
         if Instant::now() >= self.deadline {
-            bail!("{} timed out after {}s", self.label, self.timeout.as_secs());
+            bail!("{} timed out after {}s", self.label, self.timeout.as_secs_f32());
         }
         Ok(())
     }
@@ -302,7 +302,7 @@ fn run_git_bounded(
         bail!(
             "{} timed out after {}s",
             operation.label,
-            operation.timeout.as_secs()
+            operation.timeout.as_secs_f32()
         );
     }
     let mut command = Command::new("git");
@@ -402,7 +402,7 @@ fn run_git_bounded(
             bail!(
                 "git {} timed out after {}s in {}",
                 args.join(" "),
-                operation.timeout.as_secs(),
+                operation.timeout.as_secs_f32(),
                 dir.display()
             );
         }
