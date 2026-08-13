@@ -1,9 +1,11 @@
 import type { CommandPaletteItem } from "../components/command-palette-model.js";
-import type {
-  ComposerCompletionCandidate,
-  RankedComposerCompletion,
+import {
+  rankComposerCompletions,
+  type ComposerCompletionCandidate,
+  type RankedComposerCompletion,
 } from "../components/composer-completion.js";
 import type { ParsedDiffFile } from "../components/diff-parser.js";
+import { filterFuzzyTextItems } from "./fuzzy-ranking.js";
 import {
   type ContentWorkerRequest,
   ContentWorkerResponse,
@@ -236,8 +238,7 @@ export const rankComposerCompletionsOffThread = (
 ): Promise<readonly RankedComposerCompletion[]> =>
   contentWorker.request(
     (id) => ({ id, type: "composer-fuzzy", candidates, query, limit }),
-    async () => (await import("../components/composer-completion.js"))
-      .rankComposerCompletions(candidates, query, limit),
+    async () => rankComposerCompletions(candidates, query, limit),
   );
 
 export const filterCommandPaletteItemsOffThread = (
@@ -246,8 +247,7 @@ export const filterCommandPaletteItemsOffThread = (
 ): Promise<readonly CommandPaletteItem[]> =>
   contentWorker.request(
     (id) => ({ id, type: "palette-fuzzy", items, query }),
-    async () => (await import("./fuzzy-ranking.js"))
-      .filterFuzzyTextItems(items, query),
+    async () => filterFuzzyTextItems(items, query),
   );
 
 export const highlightSourceOffThread = (
