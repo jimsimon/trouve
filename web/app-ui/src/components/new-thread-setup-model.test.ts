@@ -18,8 +18,8 @@ import {
   createNewThreadSetupSubmission,
   effectiveNewThreadModel,
   newThreadAttachmentLimitMessage,
+  newThreadModelOptionControls,
   newThreadSetupControls,
-  newThreadThinkingOption,
   reconcileNewThreadDraft,
   selectNewThreadMode,
   selectNewThreadModel,
@@ -90,7 +90,7 @@ describe("new thread setup model", () => {
     expect(draft).toMatchObject({
       modeId: "code",
       modelId: "provider/global",
-      thinking: "medium",
+      modelOptions: {},
       permissionMode: "ask",
       inheritedThinking: "medium",
       inheritedPermissionMode: "ask",
@@ -98,9 +98,10 @@ describe("new thread setup model", () => {
       attachments: [],
     });
     expect(effectiveNewThreadModel(draft, catalog)?.id).toBe("provider/global");
-    expect(newThreadThinkingOption(draft, catalog)).toMatchObject({
+    expect(newThreadModelOptionControls(draft, catalog)[0]).toMatchObject({
+      kind: "choice",
       key: "reasoning_effort",
-      values: ["low", "medium", "high"],
+      selectedIndex: 1,
     });
   });
 
@@ -134,12 +135,13 @@ describe("new thread setup model", () => {
     const inherited = createInitialNewThreadDraft(fixedCatalog);
     expect(inherited).toMatchObject({
       modelId: fixedModel.id,
-      thinking: "16384",
       inheritedThinking: "16384",
+      modelOptions: {},
     });
-    expect(newThreadThinkingOption(inherited, fixedCatalog)).toMatchObject({
+    expect(newThreadModelOptionControls(inherited, fixedCatalog)[0]).toMatchObject({
       key: "thinking_budget_tokens",
-      budget: { minimum: 1024, maximum: 32768 },
+      kind: "scalar",
+      text: "16384",
     });
 
     const detail = createNewThreadSetupSubmission({
@@ -147,7 +149,7 @@ describe("new thread setup model", () => {
       sessionId: "se-main",
       draft: {
         ...inherited,
-        thinking: "8192",
+        modelOptions: { thinking_budget_tokens: 8192 },
         inheritedThinking: undefined,
       },
       catalog: fixedCatalog,
@@ -170,25 +172,37 @@ describe("new thread setup model", () => {
     });
   });
 
-  it("applies mode model defaults and resets thinking when the effective model changes", () => {
-    const initial = createInitialNewThreadDraft(catalog);
+  it("applies mode model defaults and resets options when the effective model changes", () => {
+    const initial = {
+      ...createInitialNewThreadDraft(catalog),
+      modelOptions: { reasoning_effort: "high" },
+    };
     const reviewed = selectNewThreadMode(initial, "review", catalog);
     expect(reviewed).toMatchObject({
       modeId: "review",
       modelId: "provider/review",
-      thinking: "high",
+      modelOptions: {},
     });
-    expect(newThreadThinkingOption(reviewed, catalog)?.key).toBe("effort");
+    expect(newThreadModelOptionControls(reviewed, catalog)[0]).toMatchObject({
+      key: "effort",
+      selectedIndex: 1,
+    });
 
-    const inherited = selectNewThreadModel(reviewed, "", catalog);
-    expect(inherited).toMatchObject({ modelId: "provider/review", thinking: "high" });
+    const inherited = selectNewThreadModel({
+      ...reviewed,
+      modelOptions: { effort: "low" },
+    }, "", catalog);
+    expect(inherited).toMatchObject({
+      modelId: "provider/review",
+      modelOptions: { effort: "low" },
+    });
     expect(effectiveNewThreadModel(inherited, catalog)?.id).toBe("provider/review");
 
     const plan = selectNewThreadMode(inherited, "plan", catalog);
     expect(plan).toMatchObject({
       modeId: "plan",
       modelId: "provider/global",
-      thinking: "medium",
+      modelOptions: {},
       permissionMode: "ask",
     });
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
@@ -222,7 +236,7 @@ describe("new thread setup model", () => {
       refreshedCatalog,
       createNewThreadSetupEdits(),
     )).toMatchObject({
-      thinking: "high",
+      modelOptions: {},
       inheritedThinking: "high",
       permissionMode: "yolo",
       inheritedPermissionMode: "yolo",
@@ -240,7 +254,7 @@ describe("new thread setup model", () => {
     };
     const draft = {
       ...createInitialNewThreadDraft(catalog),
-      thinking: "low",
+      modelOptions: { reasoning_effort: "low" },
       permissionMode: "allow_list" as const,
       inheritedThinking: undefined,
       inheritedPermissionMode: undefined,
@@ -251,7 +265,7 @@ describe("new thread setup model", () => {
       thinking: true,
       permission: true,
     })).toMatchObject({
-      thinking: "low",
+      modelOptions: { reasoning_effort: "low" },
       inheritedThinking: undefined,
       permissionMode: "allow_list",
       inheritedPermissionMode: undefined,
@@ -264,7 +278,7 @@ describe("new thread setup model", () => {
       ...createInitialNewThreadDraft(catalog),
       modeId: "review",
       modelId: "provider/review",
-      thinking: "low",
+      modelOptions: { effort: "low" },
       permissionMode: "allow_list",
       prompt: "  Review this change.  ",
       attachments: [upload],
@@ -317,7 +331,7 @@ describe("new thread setup model", () => {
     expect(attachmentOnly.request.title).toBe("New thread");
   });
 
-  it("drops tampered mode/model/thinking selections instead of inventing request fields", () => {
+  it("drops tampered mode, model, and option selections instead of inventing request fields", () => {
     const detail = createNewThreadSetupSubmission({
       workspaceId: "ws-main",
       sessionId: "se-main",
@@ -325,7 +339,7 @@ describe("new thread setup model", () => {
         ...createInitialNewThreadDraft(catalog),
         modeId: "unknown-mode",
         modelId: "unknown-model",
-        thinking: "unadvertised",
+        modelOptions: { effort: "unadvertised", fast: true },
         permissionMode: "",
       },
       catalog,

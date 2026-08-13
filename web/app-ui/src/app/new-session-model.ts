@@ -4,6 +4,7 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { sanitizeModelOptions } from "../components/model-option-controls.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
@@ -219,6 +220,7 @@ export interface NewSessionOptionLoadState {
 
 export interface NewSessionSubmissionSnapshotInput {
   readonly selections: NewThreadOptionSelections;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly edits: NewThreadOptionEdits;
   readonly modes: readonly ProtocolAgentPersona[];
   readonly providers: ProtocolProvidersResponse | null | undefined;
@@ -230,6 +232,7 @@ export interface NewSessionSubmissionSnapshotInput {
 
 export interface NewSessionSubmissionSnapshot extends NewThreadOptionSelections {
   readonly edits: NewThreadOptionEdits;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly inheritedThinking: string | undefined;
   readonly inheritedPermissionMode: string | undefined;
   readonly modelInfo: ProtocolModelInfo | undefined;
@@ -247,6 +250,8 @@ export interface NewSessionThreadRequestInput {
   /** Effective inherited values shown by the form. Matching selections stay server-inherited. */
   readonly inheritedPermissionMode?: string | null;
   readonly inheritedThinking?: string | null;
+  /** Schema-driven scalar model overrides selected by the setup form. */
+  readonly modelOptions?: Readonly<Record<string, unknown>> | null;
   /** Metadata for the effective model whose thinking option is being overridden. */
   readonly modelInfo?: ProtocolModelInfo | null;
 }
@@ -598,12 +603,16 @@ export const snapshotNewSessionSubmission = (
     selectedMode,
     input.providers,
   );
+  const modelInfo = input.selectableModels.find((model) => model.id === effectiveModel);
   return Object.freeze({
     ...input.selections,
     edits: Object.freeze({ ...input.edits }),
+    modelOptions: Object.freeze({
+      ...sanitizeModelOptions(modelInfo, input.modelOptions),
+    }),
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
-    modelInfo: input.selectableModels.find((model) => model.id === effectiveModel),
+    modelInfo,
     optionsAuthoritative: input.optionsAuthoritative,
   });
 };
@@ -711,20 +720,23 @@ export const createNewSessionThreadRequest = (
   const inheritedPermission = validPermissionMode(input.inheritedPermissionMode);
   const permissionOverride = validPermission && permissionMode !== inheritedPermission;
 
-  const advertisedThinking = model === undefined || input.modelInfo?.id === model
-    ? thinkingOption(input.modelInfo)
-    : undefined;
+  const modelInfoMatches = model === undefined || input.modelInfo?.id === model;
+  const advertisedThinking = modelInfoMatches ? thinkingOption(input.modelInfo) : undefined;
   const thinking = nonEmpty(input.thinking);
   const inheritedThinking = nonEmpty(input.inheritedThinking);
-  const modelOptions = thinking !== undefined
+  const modelOptions: Record<string, unknown> = modelInfoMatches
+    ? { ...sanitizeModelOptions(input.modelInfo, input.modelOptions ?? undefined) }
+    : {};
+  if (
+    thinking !== undefined
     && thinking !== inheritedThinking
     && advertisedThinking !== undefined
     && thinkingSelectionIsValid(advertisedThinking, thinking)
-    ? {
-        [advertisedThinking.key]:
-          advertisedThinking.budget === undefined ? thinking : Number(thinking),
-      }
-    : undefined;
+    && modelOptions[advertisedThinking.key] === undefined
+  ) {
+    modelOptions[advertisedThinking.key] =
+      advertisedThinking.budget === undefined ? thinking : Number(thinking);
+  }
 
   return {
     session_id: sessionId,
@@ -732,7 +744,7 @@ export const createNewSessionThreadRequest = (
     ...(mode === undefined ? {} : { mode }),
     ...(model === undefined ? {} : { model }),
     ...(permissionOverride ? { permission_mode: permissionMode } : {}),
-    ...(modelOptions === undefined ? {} : { model_options: modelOptions }),
+    ...(Object.keys(modelOptions).length === 0 ? {} : { model_options: modelOptions }),
   };
 };
 
@@ -763,6 +775,7 @@ export const createNewSessionThreadRequestFromSnapshot = (input: {
     ...(includeModel ? { model: snapshot.modelId } : {}),
     ...(includePermission ? { permissionMode: snapshot.permissionMode } : {}),
     ...(includeThinking ? { thinking: snapshot.thinking } : {}),
+    modelOptions: snapshot.modelOptions,
     ...(snapshot.optionsAuthoritative
         && snapshot.inheritedPermissionMode !== undefined
       ? { inheritedPermissionMode: snapshot.inheritedPermissionMode }

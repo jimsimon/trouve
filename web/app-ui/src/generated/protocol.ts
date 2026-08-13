@@ -1799,6 +1799,14 @@ export interface components {
             mode?: string | null;
             /** @description Model for the runs (None = the persona's default). */
             model?: string | null;
+            /**
+             * @description Model-specific values selected from the model's `options_schema`.
+             *     `thinking_level` remains as a compatibility shorthand; values in this
+             *     object take precedence when both select the same model capability.
+             */
+            model_options?: {
+                [key: string]: unknown;
+            };
             name: string;
             /** @description Next fire time (RFC3339), when enabled. */
             next_run_at?: string | null;
@@ -4756,6 +4764,10 @@ export interface components {
             enabled: boolean;
             mode?: string | null;
             model?: string | null;
+            /** @description Model-specific values selected from the model's `options_schema`. */
+            model_options?: {
+                [key: string]: unknown;
+            };
             name: string;
             /**
              * @description Permission policy for each fresh automation session. Omitted by older

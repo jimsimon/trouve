@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
 import {
+  changeModelOption,
   modelOptionControls,
   modelOptionLabel,
   modelSelectorLabel,
+  sanitizeModelOptions,
 } from "./model-option-controls.js";
 
 const model = (properties: Record<string, unknown>): ProtocolModelInfo => ({
@@ -16,46 +18,188 @@ const model = (properties: Record<string, unknown>): ProtocolModelInfo => ({
 });
 
 describe("model option controls", () => {
-  it("derives thinking, context, and fast from the advertised schema", () => {
-    expect(modelOptionControls(model({
+  it("derives every supported scalar control from the advertised schema", () => {
+    const controls = modelOptionControls(model({
       reasoning_effort: {
         type: "string",
         enum: ["low", "high", "xhigh"],
         default: "high",
       },
-      context: { type: "string", enum: ["300k", "1m"], default: "300k" },
+      context: {
+        oneOf: [
+          { const: "300k", title: "Standard" },
+          { const: "1m", title: "Extended" },
+        ],
+        default: "300k",
+      },
       fast: { type: "boolean", default: true },
+      temperature: {
+        type: "number",
+        title: "Temperature",
+        description: "Sampling temperature",
+        minimum: 0,
+        maximum: 2,
+        default: 0.5,
+      },
+      seed: { type: "integer", default: 7 },
+      instructions: { type: ["string", "null"], examples: ["Be concise"] },
     }), {
       reasoning_effort: "xhigh",
       context: "1m",
       fast: false,
-    })).toEqual({
-      thinking: {
-        key: "reasoning_effort",
-        values: ["low", "high", "xhigh"],
-        selected: "xhigh",
-      },
-      context: { key: "context", values: ["300k", "1m"], selected: "1m" },
-      fast: { key: "fast", selected: false },
+      temperature: 0.8,
     });
+
+    expect(controls).toEqual([
+      {
+        kind: "choice",
+        key: "reasoning_effort",
+        label: "Reasoning effort",
+        description: "",
+        choices: [
+          { label: "Low", value: "low" },
+          { label: "High", value: "high" },
+          { label: "Extra High", value: "xhigh" },
+        ],
+        selectedIndex: 2,
+      },
+      {
+        kind: "choice",
+        key: "context",
+        label: "Context",
+        description: "",
+        choices: [
+          { label: "Standard", value: "300k" },
+          { label: "Extended", value: "1m" },
+        ],
+        selectedIndex: 1,
+      },
+      {
+        kind: "boolean",
+        key: "fast",
+        label: "Fast",
+        description: "",
+        selected: false,
+      },
+      {
+        kind: "text",
+        key: "temperature",
+        label: "Temperature",
+        description: "Sampling temperature",
+        scalarType: "number",
+        text: "0.8",
+        hint: "0 – 2",
+        minimum: 0,
+        maximum: 2,
+      },
+      {
+        kind: "text",
+        key: "seed",
+        label: "Seed",
+        description: "",
+        scalarType: "integer",
+        text: "7",
+        hint: "value",
+      },
+      {
+        kind: "text",
+        key: "instructions",
+        label: "Instructions",
+        description: "",
+        scalarType: "string",
+        text: "",
+        hint: "Be concise",
+      },
+    ]);
   });
 
-  it("uses valid schema defaults and the legacy thinking key", () => {
+  it("uses schema defaults for display and translates the legacy thinking key", () => {
     const controls = modelOptionControls(model({
       effort: { enum: ["low", "high"], default: "high" },
       context: { enum: ["300k", "1m"], default: "1m" },
       fast: { type: "boolean", default: true },
     }), { thinking_level: "low" });
-    expect(controls.thinking?.selected).toBe("low");
-    expect(controls.context?.selected).toBe("1m");
-    expect(controls.fast?.selected).toBe(true);
+    expect(controls).toMatchObject([
+      { kind: "choice", selectedIndex: 0 },
+      { kind: "choice", selectedIndex: 1 },
+      { kind: "boolean", selected: true },
+    ]);
+    expect(sanitizeModelOptions(model({
+      effort: { enum: ["low", "high"] },
+    }), { thinking_level: "high" })).toEqual({ effort: "high" });
+    expect(modelOptionControls(model({
+      reasoning_effort: { enum: ["low", "high"], default: "low" },
+    }), { thinking_level: "high", reasoning_effort: "invalid" })[0]).toMatchObject({
+      selectedIndex: 0,
+    });
+    expect(sanitizeModelOptions(model({
+      reasoning_effort: { enum: ["low", "high"] },
+    }), { thinking_level: "high", reasoning_effort: "invalid" })).toEqual({
+      reasoning_effort: "high",
+    });
   });
 
-  it("ignores malformed and single-choice controls", () => {
+  it("sanitizes values and ignores malformed or non-editable controls", () => {
     expect(modelOptionControls(model({
       thinking_level: { enum: ["high"] },
       context: { enum: ["300k", 1] },
-    }), {})).toEqual({});
+      fixed: { const: "locked" },
+      output: { type: "string", readOnly: true },
+      nested: { type: "object" },
+      broken: { type: "string", enum: ["valid", { nested: true }] },
+      incomplete: { type: "string", oneOf: [{ const: "only" }] },
+    }), {})).toEqual([{
+      kind: "choice",
+      key: "context",
+      label: "Context",
+      description: "",
+      choices: [
+        { label: "300K", value: "300k" },
+        { label: "1", value: 1 },
+      ],
+      selectedIndex: -1,
+    }]);
+
+    const advertised = model({
+      effort: { enum: ["low", "high"] },
+      fast: { type: "boolean" },
+      temperature: { type: "number", minimum: 0, maximum: 1 },
+    });
+    expect(sanitizeModelOptions(advertised, {
+      effort: "missing",
+      fast: true,
+      temperature: 2,
+      unknown: "value",
+    })).toEqual({ fast: true });
+  });
+
+  it("applies and removes overrides without retaining a duplicate legacy key", () => {
+    expect(changeModelOption(
+      { thinking_level: "low", fast: true },
+      { key: "reasoning_effort", value: "high" },
+    )).toEqual({ reasoning_effort: "high", fast: true });
+    expect(changeModelOption(
+      { reasoning_effort: "high", fast: true },
+      { key: "fast", value: undefined },
+    )).toEqual({ reasoning_effort: "high" });
+    const budgetModel = model({
+      thinking_budget_tokens: {
+        type: "integer",
+        minimum: 1024,
+        maximum: 32768,
+      },
+    });
+    expect(sanitizeModelOptions(budgetModel, {
+      thinking_budget_tokens: 8192,
+      thinking_level: "16384",
+    })).toEqual({ thinking_budget_tokens: 8192 });
+    expect(sanitizeModelOptions(budgetModel, {
+      thinking_level: "16384",
+    })).toEqual({ thinking_budget_tokens: 16384 });
+    expect(changeModelOption(
+      { thinking_level: "16384" },
+      { key: "thinking_budget_tokens", value: 8192 },
+    )).toEqual({ thinking_budget_tokens: 8192 });
   });
 
   it("uses the same human labels as the desktop controls", () => {

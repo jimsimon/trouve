@@ -1947,7 +1947,7 @@ async fn create_automation(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.create_automation(req)?))
+    Ok(Json(engine.create_automation(req).await?))
 }
 
 #[utoipa::path(put, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -1959,7 +1959,7 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.update_automation(&id, req)?))
+    Ok(Json(engine.update_automation(&id, req).await?))
 }
 
 #[utoipa::path(delete, path = "/v1/automations/{id}", params(("id" = String, Path,)),

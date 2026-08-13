@@ -424,7 +424,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.10";
+export const SUPPORTED_PROTOCOL_VERSION = "7.11";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {

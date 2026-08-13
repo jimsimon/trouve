@@ -997,9 +997,8 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .new-session-screen .dialog-option-grid { order: 5; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
 .new-session-mode { grid-column: 1; grid-row: 1; }
 .new-session-model { grid-column: 2; grid-row: 1; }
-.new-session-thinking { grid-column: 1; grid-row: 2; }
-.new-session-permission { grid-column: 2; grid-row: 2; }
-.new-session-screen .dialog-option-grid.no-thinking .new-session-permission { grid-column: 1 / -1; }
+.new-session-permission { grid-column: 1 / -1; }
+.new-session-model-options { grid-column: 1 / -1; }
 .new-session-options-warning { order: 6; }
 .new-session-options-status { order: 6; margin: 0; color: var(--trouve-text-dim); }
 .new-session-yolo-warning { order: 6; display: grid; gap: 4px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); padding: 10px; color: var(--trouve-err-soft); background: var(--trouve-err-bg); font-size: 11px; }

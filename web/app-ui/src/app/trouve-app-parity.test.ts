@@ -51,7 +51,9 @@ describe("root shell parity wiring", () => {
 
   it("renders new-session agent controls while catalog refreshes", () => {
     expect(source).toContain('name="mode"');
-    expect(source).toContain('name="thinking"');
+    expect(source).toContain("<trouve-model-options-editor");
+    expect(source).toContain(".controls=${newSessionModelOptions}");
+    expect(source).toContain("changeModelOption(\n                        this.#newSessionModelOptions,");
     expect(source).toContain('name="permission_mode"');
     expect(source).toContain(
       'this.#newSessionSubscriptionHealth = readSignal(this.#subscriptionHealth.current)',
@@ -111,5 +113,18 @@ describe("root shell parity wiring", () => {
     expect(source).toContain('routeKey(readSignal(this.#router.route))');
     expect(source).toContain('if (!restoringDraft) void this.#loadNewSessionBranches');
     expect(source).toContain('this.querySelector<HTMLElement>("main.app-shell")?.focus()');
+  });
+
+  it("drops workspace-specific new-session options before asynchronous reloads", () => {
+    const handler = source.slice(
+      source.indexOf("readonly #selectNewSessionWorkspace"),
+      source.indexOf("readonly #closeNewSession"),
+    );
+    expect(handler).toContain('this.#newSessionModeId = "";');
+    expect(handler).toContain('this.#newSessionModelId = "";');
+    expect(handler).toContain("this.#newSessionModelOptions = {};");
+    expect(handler.indexOf("this.#newSessionModelOptions = {};")).toBeLessThan(
+      handler.indexOf("void this.#loadNewSessionOptions(workspaceId);"),
+    );
   });
 });

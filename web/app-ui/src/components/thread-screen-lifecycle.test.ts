@@ -159,4 +159,14 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(currentScope).toContain('route?.kind === "session"');
     expect(currentScope).toContain('(route.threadId ?? "") === threadId');
   });
+
+  it("applies a mode's default model and clears incompatible options atomically", () => {
+    const composer = section(
+      '<label class="composer-option mode-option">',
+      '<div class="composer-option model-option">',
+    );
+    expect(composer).toContain("mode?.default_model");
+    expect(composer).toContain("{ model: mode.default_model }");
+    expect(composer).toContain("model_options: {}");
+  });
 });
