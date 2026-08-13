@@ -25,15 +25,15 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The locked Vite/Rolldown graph emits 3,172,115 B after the evidence-backed
-// review-history, churn-metrics, durable turn-phase, and conditional-title
-// protocol additions. Keep about 5 kB of headroom above that artifact; entry,
-// worker, and largest-chunk budgets below still prevent one bundle from hiding
-// in the aggregate.
-const totalJavaScriptLimit = 3_177_000;
-// The same clean baseline emitted 178,918 B of CSS (178,933 B here), already
-// above the old 175,000 B ceiling. Preserve only about 1 kB of headroom.
-const totalStyleLimit = 180_000;
+// The locked Vite/Rolldown graph emits 3,177,133 B after the evidence-backed
+// review-history, churn-metrics, durable turn-phase, conditional-title, and
+// version-check UI additions. Keep about 5 kB of headroom above that artifact;
+// entry, worker, and largest-chunk budgets below still prevent one bundle from
+// hiding in the aggregate.
+const totalJavaScriptLimit = 3_182_000;
+// The version-check UI brings the clean baseline to 180,450 B of CSS. Keep
+// less than 2 kB of headroom while retaining a regression-sensitive ceiling.
+const totalStyleLimit = 182_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,
