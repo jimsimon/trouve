@@ -10301,6 +10301,24 @@ impl Engine {
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         if collaborator.terminal {
+            // Codex may have to recover a collaborator's initial prompt with
+            // an asynchronous thread/turns/list request. A short-lived child
+            // can finish before that lookup returns; dropping the late user
+            // event leaves the durable transcript with Thought as its first
+            // chat node. Preserve the one missing initial prompt even after
+            // the vendor turn is terminal. The Lit turn layout promotes a
+            // same-turn prompt ahead of already-persisted activity/status.
+            if let BackendCollaboratorEvent::UserMessage(content) = event
+                && collaborator.last_user_message.is_none()
+            {
+                self.record_backend_collaborator_input(collaborator, content)?;
+                flush_backend_event_batch(
+                    &self.store,
+                    &Scope::Thread(collaborator.thread.id.clone()),
+                    &mut collaborator.persisted,
+                )
+                .await?;
+            }
             return Ok(());
         }
         let turn = collaborator.turn;
@@ -16734,6 +16752,102 @@ default_permission_mode = "ask"
             }
         )));
         claims.release(&child.id);
+
+        // Codex recovers prompts asynchronously when a collaborator
+        // announcement only names the child thread. A fast child can finish
+        // before that lookup returns; the recovered prompt must still become
+        // the turn's durable Prompt node instead of being dropped because the
+        // collaborator is already terminal.
+        engine
+            .start_backend_collaborator(
+                &session,
+                &parent,
+                "codex",
+                "vendor-late-prompt".into(),
+                "vendor-root",
+                None,
+                BackendCollaboratorAccess::Inherit,
+                None,
+                None,
+                None,
+                &mut vendor_threads,
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let late_prompt_child_id = vendor_threads["vendor-late-prompt"].clone();
+        {
+            let projection = collaborators.get_mut("vendor-late-prompt").unwrap();
+            engine
+                .persist_backend_collaborator_event(
+                    &session,
+                    &mode,
+                    "codex",
+                    projection,
+                    BackendCollaboratorEvent::ThinkingDelta("Finishing quickly.".into()),
+                    &root_cancel,
+                )
+                .await
+                .unwrap();
+            engine
+                .persist_backend_collaborator_event(
+                    &session,
+                    &mode,
+                    "codex",
+                    projection,
+                    BackendCollaboratorEvent::Completed {
+                        usage: Usage::default(),
+                    },
+                    &root_cancel,
+                )
+                .await
+                .unwrap();
+            assert!(projection.terminal);
+            engine
+                .persist_backend_collaborator_event(
+                    &session,
+                    &mode,
+                    "codex",
+                    projection,
+                    BackendCollaboratorEvent::UserMessage("Recovered after completion.".into()),
+                    &root_cancel,
+                )
+                .await
+                .unwrap();
+            // A repeated recovery notification remains idempotent.
+            engine
+                .persist_backend_collaborator_event(
+                    &session,
+                    &mode,
+                    "codex",
+                    projection,
+                    BackendCollaboratorEvent::UserMessage("Recovered after completion.".into()),
+                    &root_cancel,
+                )
+                .await
+                .unwrap();
+        }
+        let late_prompt_events = store
+            .events_after(&Scope::Thread(late_prompt_child_id), 0)
+            .unwrap();
+        let completed_cursor = late_prompt_events
+            .iter()
+            .find_map(|event| {
+                matches!(event.event, Event::TurnCompleted { turn: 1, .. }).then_some(event.cursor)
+            })
+            .unwrap();
+        let recovered_prompts = late_prompt_events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Event::UserMessage {
+                    turn: 1, content, ..
+                } => Some((event.cursor, content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_prompts.len(), 1);
+        assert_eq!(recovered_prompts[0].1, "Recovered after completion.");
+        assert!(recovered_prompts[0].0 > completed_cursor);
 
         engine
             .start_backend_collaborator(
