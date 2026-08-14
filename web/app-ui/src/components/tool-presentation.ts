@@ -1011,6 +1011,29 @@ export const presentToolDetail = (
     };
   }
 
+  if (firstParty && normalized === "websearch" && resultRecord !== undefined && typeof resultRecord.content === "string") {
+    const cache = record(resultRecord.cache);
+    const cacheHit = booleanValue(cache?.hit);
+    const cacheAge = numberValue(cache?.age_seconds);
+    return {
+      kind: "document",
+      inputs: [
+        detailField("Query", effective.args.query),
+        detailField("Results", effective.args.max_results ?? 8),
+        detailField("Provider", resultRecord.provider),
+        detailField(
+          "Cache",
+          cacheHit
+            ? `Hit${cacheAge === undefined ? "" : ` (${String(cacheAge)}s old)`}`
+            : cacheHit === false ? "Miss" : undefined,
+        ),
+      ].filter((field): field is ToolDetailField => field !== undefined),
+      content: resultRecord.content,
+      language: "markdown",
+      truncated: booleanValue(resultRecord.truncated),
+    };
+  }
+
   if (firstParty && normalized === "gitdiff" && resultRecord !== undefined && typeof resultRecord.diff === "string") {
     const nextOffset = numberValue(resultRecord.next_offset);
     const totalBytes = numberValue(resultRecord.total_bytes);

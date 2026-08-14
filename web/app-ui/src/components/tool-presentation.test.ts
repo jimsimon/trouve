@@ -232,6 +232,28 @@ describe("tool presentation", () => {
     });
   });
 
+  it("presents native web search results as a sourced document", () => {
+    expect(presentToolDetail("web_search", {
+      query: "latest Rust release",
+      max_results: 5,
+    }, {
+      provider: "parallel",
+      content: "Rust 1.x — https://www.rust-lang.org/",
+      cache: { hit: true, age_seconds: 12, ttl_seconds: 1800 },
+    })).toEqual({
+      kind: "document",
+      inputs: [
+        { label: "Query", value: "latest Rust release" },
+        { label: "Results", value: "5" },
+        { label: "Provider", value: "parallel" },
+        { label: "Cache", value: "Hit (12s old)" },
+      ],
+      content: "Rust 1.x — https://www.rust-lang.org/",
+      language: "markdown",
+      truncated: false,
+    });
+  });
+
   it("presents transcript matches and generic MCP content without JSON wrappers", () => {
     expect(presentToolDetail("search_transcript", { query: "checkpoint", scope: "session" }, {
       query: "checkpoint",

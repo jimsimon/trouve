@@ -16,6 +16,7 @@ mod search;
 mod shell;
 mod todo;
 mod web;
+mod web_search;
 
 pub use search::{
     VENDOR_SEARCH_GUIDANCE, VENDOR_TOOL_BRIDGE_GUIDANCE, gc_index_store_in_background,
@@ -1711,6 +1712,7 @@ impl LocalToolExecutor {
             Arc::new(shell::ShellKill { jobs: jobs.clone() }),
             Arc::new(grep::Grep),
             Arc::new(web::WebFetch::default()),
+            Arc::new(web_search::WebSearch::default()),
             Arc::new(todo::TodoWrite),
             Arc::new(search::Search {
                 cache: search_cache.clone(),
