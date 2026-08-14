@@ -107,6 +107,15 @@ describe("session pull-request workspace", () => {
     expect(source).toContain("this.#clearPrStateForSetup()");
   });
 
+  it("pauses detail retries until missing GitHub permissions are re-authorized", () => {
+    expect(source).toContain('cause.code === "github_reauthentication_required"');
+    expect(source).toContain("this.#githubReauthenticationRequired = true");
+    expect(source).toContain("Re-authenticate GitHub");
+    expect(source).toContain(
+      "this.#detailRetryTimer !== undefined || this.#githubReauthenticationRequired",
+    );
+  });
+
   it("keeps account sign-in separate from workspace repository setup", () => {
     expect(source).toContain(
       "Connect this workspace to a GitHub repository",

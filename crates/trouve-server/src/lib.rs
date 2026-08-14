@@ -32,7 +32,8 @@ use trouve_protocol::{
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
+    CreateSessionRequest, CreateThreadRequest, DirEntry,
+    ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
     EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
     GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
     GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
@@ -81,6 +82,10 @@ impl IntoResponse for ApiError {
             EngineError::SessionDiffTooLarge(_) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ERROR_CODE_SESSION_DIFF_TOO_LARGE,
+            ),
+            EngineError::AuthenticationRequired(_) => (
+                StatusCode::UNAUTHORIZED,
+                ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED,
             ),
             EngineError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
@@ -2484,6 +2489,7 @@ struct PrDetailQuery {
     responses(
         (status = 200, body = PrDetail),
         (status = 400, body = ErrorBody),
+        (status = 401, body = ErrorBody, description = "GitHub OAuth permissions must be renewed"),
         (status = 404, body = ErrorBody)
     ))]
 async fn get_session_pr_detail(

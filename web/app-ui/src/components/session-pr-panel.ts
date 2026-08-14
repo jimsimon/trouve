@@ -367,6 +367,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
   #loadError = false;
   #githubConfigured: boolean | undefined;
   #repositorySetupRequired = false;
+  #githubReauthenticationRequired = false;
   #selectedPrNumber: number | undefined;
   #loadedPrProjectionKey = "";
   #loadedDetailSections = new Set<ProtocolPrDetailSection>();
@@ -554,6 +555,9 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
         aria-live="polite"
       >
         <span>${this.#notice}</span>
+        ${this.#githubReauthenticationRequired
+          ? html`<button type="button" @click=${this.#openIntegrationsSettings}>Re-authenticate GitHub</button>`
+          : nothing}
       </div>
     `;
   }
@@ -1422,6 +1426,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     const services = this.#services.value;
     const sessionId = this.#effectiveSessionId;
     if (services === undefined || sessionId === "") return;
+    if (this.#githubReauthenticationRequired) return;
     const generation = ++this.#detailGeneration;
     if (this.#detailRetryTimer !== undefined) {
       globalThis.clearTimeout(this.#detailRetryTimer);
@@ -1448,8 +1453,16 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     } catch (cause) {
       if (generation !== this.#detailGeneration || sessionId !== this.#effectiveSessionId) return;
       this.#detail = undefined;
-      this.#setNotice(cause instanceof Error ? cause.message : "Pull request detail could not be loaded.", true);
-      this.#scheduleDetailRetry(number, section);
+      if (
+        cause instanceof ProtocolClientError
+        && cause.code === "github_reauthentication_required"
+      ) {
+        this.#githubReauthenticationRequired = true;
+        this.#setNotice(cause.message, true);
+      } else {
+        this.#setNotice(cause instanceof Error ? cause.message : "Pull request detail could not be loaded.", true);
+        this.#scheduleDetailRetry(number, section);
+      }
     } finally {
       if (generation === this.#detailGeneration && sessionId === this.#effectiveSessionId) {
         this.#detailLoading = false;
@@ -1749,7 +1762,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
   }
 
   #scheduleDetailRetry(number: number, section: ProtocolPrDetailSection): void {
-    if (this.#detailRetryTimer !== undefined) return;
+    if (this.#detailRetryTimer !== undefined || this.#githubReauthenticationRequired) return;
     this.#detailRetryTimer = globalThis.setTimeout(() => {
       this.#detailRetryTimer = undefined;
       if (!this.isConnected || number !== this.#selectedPrNumber) return;
@@ -1819,6 +1832,7 @@ export class TrouveSessionPrPanel extends withSignalTracking(LitElement) {
     this.#loadError = false;
     this.#githubConfigured = undefined;
     this.#repositorySetupRequired = false;
+    this.#githubReauthenticationRequired = false;
   }
 
   #clearPrStateForSetup(): void {

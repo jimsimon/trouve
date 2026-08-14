@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "5.0"
+    "version": "5.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -3510,6 +3510,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "GitHub OAuth permissions must be renewed",
             "content": {
               "application/json": {
                 "schema": {

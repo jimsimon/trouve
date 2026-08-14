@@ -1226,8 +1226,31 @@ pub enum EngineError {
     Conflict(String),
     #[error("{0}")]
     SessionDiffTooLarge(String),
+    #[error("{0}")]
+    AuthenticationRequired(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+fn github_engine_error(error: anyhow::Error) -> EngineError {
+    let chain = format!("{error:#}").to_ascii_lowercase();
+    if [
+        "resource not accessible by integration",
+        "required scopes",
+        "insufficient scope",
+        "insufficient oauth scope",
+        "bad credentials",
+    ]
+    .iter()
+    .any(|needle| chain.contains(needle))
+    {
+        EngineError::AuthenticationRequired(
+            "GitHub permissions are missing or expired. Re-authenticate under Settings → Integrations to grant the required repository and organization-read permissions."
+                .into(),
+        )
+    } else {
+        EngineError::Internal(error)
+    }
 }
 
 fn session_diff_executor_error(error: String) -> EngineError {
@@ -4812,7 +4835,7 @@ impl Engine {
             .github_for_session(session)?
             .pr_detail(pr.number, &missing, existing)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         detail.info.workspace_id = pr.workspace_id.clone();
         detail.info.trouve_review = pr.trouve_review.clone();
         Ok(self
@@ -14239,6 +14262,28 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_permission_failures_require_reauthentication() {
+        for message in [
+            "Resource not accessible by integration",
+            "The token has insufficient OAuth scope",
+            "Bad credentials",
+        ] {
+            assert!(matches!(
+                github_engine_error(anyhow!(message).context("loading GraphQL response")),
+                EngineError::AuthenticationRequired(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn unrelated_github_failures_remain_internal() {
+        assert!(matches!(
+            github_engine_error(anyhow!("connection timed out")),
+            EngineError::Internal(_)
+        ));
+    }
 
     fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {
         trouve_protocol::AttachmentUpload {

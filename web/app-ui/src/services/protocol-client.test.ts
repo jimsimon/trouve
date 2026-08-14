@@ -208,6 +208,22 @@ describe("ProtocolClient", () => {
     expect(String(error)).not.toContain("repository secret");
   });
 
+  it("preserves a bounded GitHub re-authentication error", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
+      code: "github_reauthentication_required",
+      message: "Re-authenticate GitHub under Settings → Integrations.",
+    }, { status: 401 }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.sessionPrDetail("se_1", 42).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).status).toBe(401);
+    expect((error as ProtocolClientError).code).toBe("github_reauthentication_required");
+    expect(String(error)).toContain("Re-authenticate GitHub");
+  });
+
   it("rejects malformed lazy pull-request file content without exposing it", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
       path: "secret.txt",
@@ -980,11 +996,11 @@ describe("ProtocolClient", () => {
 
 describe("protocol compatibility", () => {
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("5.0")).not.toThrow();
+    expect(() => assertProtocolCompatibility("5.1")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["3.36", "4.0", "4.2", "5.1", "unknown", ""]) {
+    for (const version of ["3.36", "4.0", "5.0", "5.2", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );
