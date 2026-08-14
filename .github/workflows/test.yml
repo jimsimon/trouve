@@ -114,7 +114,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Restore the main test job's cache instead of consuming quota with
+          # another job- and PR-scoped copy of the same dependency graph.
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
       - name: Cache embedding model
         uses: actions/cache@v6
         with:
@@ -135,7 +144,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"

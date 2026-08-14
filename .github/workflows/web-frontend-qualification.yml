@@ -70,6 +70,10 @@ jobs:
         with:
           workspaces: crates/trouve-servo-embed-preview -> target
           cache-on-failure: true
+          # Servo's target cache is about 4 GB. PR-scoped copies are invisible
+          # to other PRs and evict the reusable main cache from the 10 GB
+          # repository quota, so only main/scheduled runs seed it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify isolated dependency graph
         run: >-
           cargo metadata
