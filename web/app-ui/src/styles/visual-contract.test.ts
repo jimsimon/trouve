@@ -669,6 +669,11 @@ describe("Trouve visual contract", () => {
     expect(sessionIndicators).toContain('kind: "busy", icon: undefined');
     expect(sessionIndicators).toContain('kind: "none", icon: undefined');
     expect(sessionList).toContain('class="session-pr-badge ${pullRequestBadge.tone}"');
+    expect(sessionList).toMatch(
+      /class="session-copy"[\s\S]*class="session-pr-badge[\s\S]*class="session-age"/,
+    );
+    expect(app).toContain("grid-template-columns: 26px minmax(0,1fr) 26px 34px");
+    expect(app).toContain(".session-age { grid-column: 4;");
     expect(app).toMatch(
       /\.session-indicator\.approval,[^}]*color:\s*var\(--trouve-warn\)[^}]*font-size:\s*16px/s,
     );

@@ -208,23 +208,24 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                   aria-current=${selected ? "page" : "false"}
                   @click=${() => this.#open(session)}
                 >
-                  ${pullRequestBadge !== undefined
-                    ? html`<span
-                        class="session-pr-badge ${pullRequestBadge.tone}"
-                        title=${pullRequestBadge.tooltip}
-                        aria-label=${pullRequestBadge.tooltip.replaceAll("\n", ". ")}
-                      >${fontAwesomeIcon("code-pull-request")}</span>`
-                    : html`<span
-                        class="session-indicator ${indicator.kind}"
-                        title=${indicator.tooltip === "" ? nothing : indicator.tooltip}
-                        aria-hidden="true"
-                      >${indicator.icon === undefined
-                        ? nothing
-                        : fontAwesomeIcon(indicator.icon)}</span>`}
+                  <span
+                    class="session-indicator ${indicator.kind}"
+                    title=${indicator.tooltip === "" ? nothing : indicator.tooltip}
+                    aria-hidden="true"
+                  >${indicator.icon === undefined
+                    ? nothing
+                    : fontAwesomeIcon(indicator.icon)}</span>
                   <span class="session-copy">
                     <strong>${session.title}</strong>
                     <span class="session-status-text visually-hidden">Status: ${sessionStatusText(session)}</span>
                   </span>
+                  ${pullRequestBadge === undefined
+                    ? nothing
+                    : html`<span
+                        class="session-pr-badge ${pullRequestBadge.tone}"
+                        title=${pullRequestBadge.tooltip}
+                        aria-label=${pullRequestBadge.tooltip.replaceAll("\n", ". ")}
+                      >${fontAwesomeIcon("code-pull-request")}</span>`}
                   ${age === undefined
                     ? nothing
                     : html`<time
