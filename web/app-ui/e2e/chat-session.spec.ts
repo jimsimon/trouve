@@ -3055,6 +3055,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group).toHaveAttribute("data-chat-anchor-id", "activity:tool:call_group_1");
   await expect(group.getByText("Ran 1 command", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
   await expect(transientActivity).toContainText("Running command…");
   await group.evaluate((element) => {
     element.setAttribute("data-stability-probe", "true");
