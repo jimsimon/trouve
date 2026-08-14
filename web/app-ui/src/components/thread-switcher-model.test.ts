@@ -120,4 +120,26 @@ describe("threadWorkingSet", () => {
       3,
     )).toEqual(["two", "three", "four"]);
   });
+
+  it("does not reorder tabs when selecting within the working set", () => {
+    expect(threadWorkingSet(
+      ["one", "two", "three", "four"],
+      "two",
+      [],
+      ["two", "one", "three"],
+      3,
+      ["one", "two", "three"],
+    )).toEqual(["one", "two", "three"]);
+  });
+
+  it("replaces an evicted tab in place when selecting a hidden thread", () => {
+    expect(threadWorkingSet(
+      ["one", "two", "three", "four"],
+      "four",
+      [],
+      ["four", "three", "one"],
+      3,
+      ["one", "two", "three"],
+    )).toEqual(["one", "four", "three"]);
+  });
 });

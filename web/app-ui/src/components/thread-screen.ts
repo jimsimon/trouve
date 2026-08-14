@@ -491,6 +491,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #threadSwitcherFilter: ThreadSwitcherFilter = "all";
   #threadTabCapacity = 4;
   #recentThreadIds: readonly string[] = [];
+  #workingThreadIds: readonly string[] = [];
   #threadTabResizeObserver: ResizeObserver | undefined;
   #observedThreadTabs: HTMLElement | undefined;
   #pendingThreadTabFocus = "";
@@ -536,6 +537,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#threadSwitcherQuery = "";
       this.#threadSwitcherFilter = "all";
       this.#recentThreadIds = [];
+      this.#workingThreadIds = [];
       this.#sessionProvider.setValue({ sessionId: this.sessionId });
       this.#newThreadSetupOpen = false;
       this.#newThreadBusy = false;
@@ -1036,7 +1038,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       resumePreferences.pinnedThreadTabs,
       this.#recentThreadIds,
       durableThreadTabCapacity(this.#threadTabCapacity, newThreadSetupOpen),
+      this.#workingThreadIds,
     );
+    this.#workingThreadIds = workingThreadIds;
     const workingThreadIdSet = new Set(workingThreadIds);
     const sessionThreadById = new Map(sessionThreads.map((candidate) => [candidate.id, candidate]));
     const workingThreads = workingThreadIds
