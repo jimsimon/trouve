@@ -973,7 +973,7 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .new-session-screen .dialog-field { min-width: 0; display: grid; gap: 6px; color: var(--trouve-text-mid); font-size: 12px; font-weight: 700; }
 .new-session-screen select,
 .new-session-screen textarea { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
-.new-session-screen textarea { height: 34px; min-height: 34px; max-height: 144px; resize: vertical; }
+.new-session-screen textarea { height: 34px; min-height: 34px; max-height: 162px; resize: none; overflow-y: hidden; line-height: 1.45; }
 .new-session-workspace { order: 1; }
 .new-session-branch { order: 2; }
 .new-session-branch-warning { order: 3; }

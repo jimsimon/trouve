@@ -113,10 +113,16 @@ import { createSignal, readSignal, withSignalTracking } from "../state/reactivit
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
   createNewSessionThreadRequest,
+  resolveNewSessionBaseRef,
   resolveNewSessionModel,
+  resolveNewThreadDefaults,
   sessionTitleFallback,
   thinkingOption,
 } from "./new-session-model.js";
+import {
+  composerTextareaLayout,
+  isComposerCompositionKey,
+} from "../components/composer-input-model.js";
 import {
   nextHorizontalTabIndex,
   rovingTabIndex,
@@ -388,6 +394,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionOptionsError = "";
   #newSessionOptionsGeneration = 0;
   #newSessionPrompt = "";
+  #newSessionPromptComposing = false;
   #newSessionAttachments: PendingAttachment[] = [];
   #newSessionAttachmentPending = false;
   #pullRequestActionPending = false;
@@ -1341,18 +1348,28 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     if (workspace === undefined) return;
     this.#newSessionError = "";
     this.#newSessionPrompt = "";
+    this.#newSessionPromptComposing = false;
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
-    this.#newSessionModeId = "";
-    this.#newSessionModelId = "";
-    this.#newSessionPermissionMode = "";
-    this.#newSessionThinking = "";
+    const defaults = resolveNewThreadDefaults(
+      this.#newSessionModes,
+      this.#availableNewSessionModels(),
+      this.#newSessionProviders,
+    );
+    this.#newSessionModeId = defaults.modeId;
+    this.#newSessionModelId = defaults.modelId;
+    this.#newSessionPermissionMode = defaults.permissionMode;
+    this.#newSessionThinking = defaults.thinking;
     this.#newSessionWorkspaceId = workspace.id;
     this.#newSessionPreferredBaseRef = preferredBaseRef;
     this.#newSessionOpen = true;
     this.requestUpdate();
     void this.updateComplete.then(() => {
-      this.querySelector<HTMLTextAreaElement>("#new-session-screen textarea[name=prompt]")?.focus();
+      const textarea = this.querySelector<HTMLTextAreaElement>(
+        "#new-session-screen textarea[name=prompt]",
+      );
+      textarea?.focus();
+      this.#resizeNewSessionPrompt(textarea);
     });
     void this.#loadNewSessionBranches(workspace.id);
     void this.#loadNewSessionOptions(workspace.id);
@@ -1613,22 +1630,22 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionBranchesPending = true;
     this.#newSessionBranchError = "";
     this.#newSessionBranches = [];
-    this.#newSessionBaseRef = "";
+    this.#newSessionBaseRef = "HEAD";
     this.requestUpdate();
     try {
       const result = await this.#protocolClient.workspaceBranches(workspaceId);
       if (generation !== this.#newSessionBranchGeneration) return;
-      this.#newSessionBranches = result.branches.includes(result.head)
-        ? result.branches
-        : [result.head, ...result.branches].filter((branch) => branch !== "");
-      this.#newSessionBaseRef = this.#newSessionPreferredBaseRef !== "" &&
-        this.#newSessionBranches.includes(this.#newSessionPreferredBaseRef)
-        ? this.#newSessionPreferredBaseRef
-        : result.head;
+      this.#newSessionBranches = [...new Set([...result.branches, "HEAD"])];
+      this.#newSessionBaseRef = resolveNewSessionBaseRef(
+        result.branches,
+        this.#newSessionPreferredBaseRef,
+      );
     } catch {
       if (generation !== this.#newSessionBranchGeneration) return;
       this.#newSessionBranchError =
-        "Branches could not be loaded. The workspace HEAD will be used.";
+        "Branches could not be loaded. HEAD will be used.";
+      this.#newSessionBranches = ["HEAD"];
+      this.#newSessionBaseRef = "HEAD";
     } finally {
       if (generation === this.#newSessionBranchGeneration) {
         this.#newSessionBranchesPending = false;
@@ -1665,21 +1682,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
-      if (!modes.some((mode) => mode.id === this.#newSessionModeId)) {
-        this.#newSessionModeId = "";
-      }
-      if (!models.some((model) => model.id === this.#newSessionModelId)) {
-        this.#newSessionModelId = "";
-      }
-      const thinking = thinkingOption(models.find((model) =>
-        model.id === resolveNewSessionModel(
-          this.#newSessionModelId,
-          modes.find((mode) => mode.id === this.#newSessionModeId),
-          providers,
-        )));
-      if (thinking?.values.includes(this.#newSessionThinking) !== true) {
-        this.#newSessionThinking = "";
-      }
+      const defaults = resolveNewThreadDefaults(modes, models, providers);
+      this.#newSessionModeId = defaults.modeId;
+      this.#newSessionModelId = defaults.modelId;
+      this.#newSessionThinking = defaults.thinking;
+      this.#newSessionPermissionMode = defaults.permissionMode;
     } catch {
       if (generation !== this.#newSessionOptionsGeneration) return;
       this.#newSessionOptionsError =
@@ -1733,9 +1740,50 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentPending = false;
     this.#newSessionPrompt = "";
+    this.#newSessionPromptComposing = false;
     this.#newSessionPermissionMode = "";
     this.#newSessionPreferredBaseRef = "";
     this.requestUpdate();
+  };
+
+  #resizeNewSessionPrompt(
+    textarea = this.querySelector<HTMLTextAreaElement>(
+      "#new-session-screen textarea[name=prompt]",
+    ),
+  ): void {
+    if (textarea === null) return;
+    textarea.style.height = "auto";
+    const layout = composerTextareaLayout(textarea.scrollHeight, textarea.value.length > 0);
+    textarea.style.height = `${layout.height}px`;
+    textarea.style.overflowY = layout.overflowY;
+  }
+
+  readonly #newSessionPromptChanged = (event: InputEvent): void => {
+    const textarea = event.currentTarget as HTMLTextAreaElement;
+    this.#resizeNewSessionPrompt(textarea);
+    this.#newSessionPrompt = textarea.value;
+    this.requestUpdate();
+  };
+
+  readonly #newSessionPromptCompositionStarted = (): void => {
+    this.#newSessionPromptComposing = true;
+  };
+
+  readonly #newSessionPromptCompositionEnded = (event: CompositionEvent): void => {
+    this.#newSessionPromptComposing = false;
+    this.#resizeNewSessionPrompt(event.currentTarget as HTMLTextAreaElement);
+  };
+
+  readonly #newSessionPromptKeydown = (event: KeyboardEvent): void => {
+    if (isComposerCompositionKey({
+      key: event.key,
+      keyCode: event.keyCode,
+      isComposing: event.isComposing,
+      compositionActive: this.#newSessionPromptComposing,
+    })) return;
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
   };
 
   readonly #newSessionFilesSelected = (event: Event): void => {
@@ -2720,7 +2768,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 }}
                 ?disabled=${this.#newSessionPending || this.#newSessionBranchesPending}
               >
-                <option value="">${this.#newSessionBranchesPending ? "Loading branches…" : "Workspace HEAD"}</option>
+                ${this.#newSessionBranchesPending
+                  ? html`<option value="">Loading branches…</option>`
+                  : nothing}
                 ${this.#newSessionBranches.map(
                   (branch) => html`<option value=${branch}>${branch}</option>`,
                 )}
@@ -2771,10 +2821,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 placeholder="What should the agent do?  (Shift+Enter for a new line)"
                 .value=${this.#newSessionPrompt}
                 ?disabled=${this.#newSessionPending}
-                @input=${(event: Event) => {
-                  this.#newSessionPrompt = (event.currentTarget as HTMLTextAreaElement).value;
-                  this.requestUpdate();
-                }}
+                @input=${this.#newSessionPromptChanged}
+                @keydown=${this.#newSessionPromptKeydown}
+                @compositionstart=${this.#newSessionPromptCompositionStarted}
+                @compositionend=${this.#newSessionPromptCompositionEnded}
                 @paste=${this.#newSessionPaste}
               ></textarea>
             </label>
@@ -2800,15 +2850,24 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${this.#newSessionModeId}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
-                    this.#newSessionModeId = (event.currentTarget as HTMLSelectElement).value;
-                    this.#newSessionThinking = "";
+                    const defaults = resolveNewThreadDefaults(
+                      this.#newSessionModes,
+                      newSessionModels,
+                      this.#newSessionProviders,
+                      { modeId: (event.currentTarget as HTMLSelectElement).value },
+                    );
+                    this.#newSessionModeId = defaults.modeId;
+                    this.#newSessionModelId = defaults.modelId;
+                    this.#newSessionThinking = defaults.thinking;
+                    this.#newSessionPermissionMode = defaults.permissionMode;
                     this.requestUpdate();
                   }}
                 >
-                  <option value="">Default mode</option>
-                  ${this.#newSessionModes.map(
-                    (mode) => html`<option value=${mode.id}>${mode.display_name}</option>`,
-                  )}
+                  ${this.#newSessionModes.length === 0
+                    ? html`<option value="code">Code</option>`
+                    : this.#newSessionModes.map(
+                        (mode) => html`<option value=${mode.id}>${mode.display_name}</option>`,
+                      )}
                 </select>
               </label>
               <div class="dialog-field new-session-model">
@@ -2816,15 +2875,26 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 <trouve-model-picker
                   accessible-label="Model"
                   placement="down"
-                  placeholder=${`Mode or server default${this.#newSessionProviders?.default_model ? ` · ${this.#newSessionProviders.default_model}` : ""}`}
-                  empty-label=${`Mode or server default${this.#newSessionProviders?.default_model ? ` · ${this.#newSessionProviders.default_model}` : ""}`}
+                  placeholder=${this.#newSessionOptionsPending
+                    ? "Loading models…"
+                    : "No model available"}
+                  empty-label=""
                   .value=${this.#newSessionModelId}
                   .models=${newSessionModels}
                   .health=${newSessionModelHealth}
                   .disabled=${this.#newSessionPending}
                   @trouve-model-picked=${(event: CustomEvent<{ readonly modelId: string }>) => {
-                    this.#newSessionModelId = event.detail.modelId;
-                    this.#newSessionThinking = "";
+                    const defaults = resolveNewThreadDefaults(
+                      this.#newSessionModes,
+                      newSessionModels,
+                      this.#newSessionProviders,
+                      {
+                        modeId: this.#newSessionModeId,
+                        modelId: event.detail.modelId,
+                      },
+                    );
+                    this.#newSessionModelId = defaults.modelId;
+                    this.#newSessionThinking = defaults.thinking;
                     this.requestUpdate();
                   }}
                 ></trouve-model-picker>
@@ -2837,11 +2907,20 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${this.#newSessionPermissionMode}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
-                    this.#newSessionPermissionMode = (event.currentTarget as HTMLSelectElement).value;
+                    const value = (event.currentTarget as HTMLSelectElement).value;
+                    this.#newSessionPermissionMode = value === "ask"
+                        || value === "allow_list"
+                        || value === "yolo"
+                      ? value
+                      : resolveNewThreadDefaults(
+                          this.#newSessionModes,
+                          newSessionModels,
+                          this.#newSessionProviders,
+                          { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
+                        ).permissionMode;
                     this.requestUpdate();
                   }}
                 >
-                  <option value="">Mode or server default</option>
                   <option value="ask">Ask</option>
                   <option value="allow_list">Allow list</option>
                   <option value="yolo">Yolo</option>
@@ -2854,13 +2933,21 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
                   ?disabled=${this.#newSessionPending}
                   @change=${(event: Event) => {
-                    this.#newSessionThinking = (event.currentTarget as HTMLSelectElement).value;
+                    const value = (event.currentTarget as HTMLSelectElement).value;
+                    this.#newSessionThinking = value || resolveNewThreadDefaults(
+                      this.#newSessionModes,
+                      newSessionModels,
+                      this.#newSessionProviders,
+                      { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
+                    ).thinking;
+                    this.requestUpdate();
                   }}
                 >
-                  <option value="">Model default</option>
-                  ${(newSessionThinkingOption?.values ?? []).map(
-                    (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
-                  )}
+                  ${newSessionThinkingOption === undefined
+                    ? html`<option value="">Not supported</option>`
+                    : newSessionThinkingOption.values.map(
+                        (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                      )}
                 </select>
               </label>
             </div>

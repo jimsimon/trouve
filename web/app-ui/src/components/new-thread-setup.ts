@@ -17,6 +17,10 @@ import { readSignal } from "../state/reactivity.js";
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import { modelHealthPresentations } from "./model-health.js";
 import { modelOptionLabel } from "./model-option-controls.js";
+import {
+  composerTextareaLayout,
+  isComposerCompositionKey,
+} from "./composer-input-model.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   appendNewThreadAttachment,
@@ -137,7 +141,7 @@ export class TrouveNewThreadSetup extends LitElement {
     .model-health-dot.tone-error { background: var(--trouve-err); }
     .tone-warning { color: var(--trouve-warn) !important; }
     .tone-error { color: var(--trouve-err) !important; }
-    textarea { height: 34px; min-height: 34px; max-height: 144px; resize: vertical; line-height: 1.45; }
+    textarea { height: 34px; min-height: 34px; max-height: 162px; resize: none; overflow-y: hidden; line-height: 1.45; }
     textarea::placeholder { color: var(--trouve-text-faint); }
     .permission-yolo > span, select.permission-yolo { color: var(--trouve-err); }
     select.permission-yolo { border-color: var(--trouve-err); font-weight: 700; }
@@ -262,6 +266,7 @@ export class TrouveNewThreadSetup extends LitElement {
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
   #optionsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #optionsTouched = false;
+  #promptComposing = false;
 
   readonly #services = new ContextConsumer(this, {
     context: appServicesContext,
@@ -324,6 +329,7 @@ export class TrouveNewThreadSetup extends LitElement {
   }
 
   protected override updated(): void {
+    this.#resizePrompt();
     const workspaceId = this.#effectiveWorkspaceId;
     if (workspaceId !== "" && this.#loadedWorkspaceId !== workspaceId) {
       void this.#loadOptions();
@@ -350,12 +356,6 @@ export class TrouveNewThreadSetup extends LitElement {
         ? ""
         : "new-thread-error",
     ].filter((id) => id !== "").join(" ");
-    const selectedMode = this.#catalog.modes.find(
-      (mode) => mode.id === this.#draft.modeId,
-    );
-    const modelDefault = selectedMode?.default_model
-      ?? this.#catalog.providers?.default_model
-      ?? "";
     const modelHealth = modelHealthPresentations(
       this.#catalog.models,
       this.#subscriptionHealth,
@@ -388,10 +388,11 @@ export class TrouveNewThreadSetup extends LitElement {
               ?disabled=${controls.optionControlsDisabled}
               @change=${this.#modeChanged}
             >
-              <option value="">Default mode</option>
-              ${this.#catalog.modes.map(
-                (mode) => html`<option value=${mode.id}>${mode.display_name || mode.id}</option>`,
-              )}
+              ${this.#catalog.modes.length === 0
+                ? html`<option value="code">Code</option>`
+                : this.#catalog.modes.map(
+                    (mode) => html`<option value=${mode.id}>${mode.display_name || mode.id}</option>`,
+                  )}
             </select>
           </label>
           <div class="field-label">
@@ -399,8 +400,8 @@ export class TrouveNewThreadSetup extends LitElement {
             <trouve-model-picker
               accessible-label="Model"
               placement="down"
-              placeholder=${`Mode or server default${modelDefault === "" ? "" : ` · ${modelDefault}`}`}
-              empty-label=${`Mode or server default${modelDefault === "" ? "" : ` · ${modelDefault}`}`}
+              placeholder=${this.#optionsLoading ? "Loading models…" : "No model available"}
+              empty-label=""
               .value=${this.#draft.modelId}
               .models=${this.#catalog.models}
               .health=${modelHealth}
@@ -416,10 +417,11 @@ export class TrouveNewThreadSetup extends LitElement {
               ?disabled=${controls.optionControlsDisabled}
               @change=${this.#thinkingChanged}
             >
-              <option value="">Model default</option>
-              ${(thinking?.values ?? []).map(
-                (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
-              )}
+              ${thinking === undefined
+                ? html`<option value="">Not supported</option>`
+                : thinking.values.map(
+                    (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                  )}
             </select>
           </label>
           <label class=${`permission-field ${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}`}>
@@ -433,7 +435,6 @@ export class TrouveNewThreadSetup extends LitElement {
               ?disabled=${controls.optionControlsDisabled}
               @change=${this.#permissionChanged}
             >
-              <option value="">Mode or server default</option>
               <option value="ask">Ask</option>
               <option value="allow_list">Allow list</option>
               <option value="yolo">Yolo</option>
@@ -461,6 +462,9 @@ export class TrouveNewThreadSetup extends LitElement {
             ?disabled=${controls.formDisabled}
             placeholder="What should the agent do?  (Shift+Enter for a new line)"
             @input=${this.#promptChanged}
+            @keydown=${this.#promptKeydown}
+            @compositionstart=${this.#promptCompositionStarted}
+            @compositionend=${this.#promptCompositionEnded}
             @paste=${this.#promptPaste}
           ></textarea>
         </label>
@@ -588,25 +592,27 @@ export class TrouveNewThreadSetup extends LitElement {
     const draft = this.#draft;
     this.#catalog = catalog;
     const refreshedInitial = createInitialNewThreadDraft(catalog);
-    this.#draft = this.#optionsTouched
-      ? {
-          ...draft,
-          modeId: catalog.modes.some((mode) => mode.id === draft.modeId)
-            ? draft.modeId
-            : "",
-          modelId: catalog.models.some((model) => model.id === draft.modelId)
-            ? draft.modelId
-            : "",
-          thinking: newThreadThinkingOption(draft, catalog)?.values.includes(draft.thinking)
-            ? draft.thinking
-            : "",
-        }
-      : {
-          ...refreshedInitial,
-          permissionMode: draft.permissionMode,
-          prompt: draft.prompt,
-          attachments: draft.attachments,
-        };
+    if (!this.#optionsTouched) {
+      this.#draft = {
+        ...refreshedInitial,
+        prompt: draft.prompt,
+        attachments: draft.attachments,
+      };
+      return;
+    }
+    const modeDefaults = selectNewThreadMode(draft, draft.modeId, catalog);
+    const repaired = catalog.models.some((model) => model.id === draft.modelId)
+      ? selectNewThreadModel(modeDefaults, draft.modelId, catalog)
+      : modeDefaults;
+    this.#draft = {
+      ...draft,
+      modeId: repaired.modeId,
+      modelId: repaired.modelId,
+      thinking: newThreadThinkingOption(repaired, catalog)?.values.includes(draft.thinking)
+        ? draft.thinking
+        : repaired.thinking,
+      permissionMode: draft.permissionMode || repaired.permissionMode,
+    };
   }
 
   #scheduleOptionsRetry(): void {
@@ -646,9 +652,14 @@ export class TrouveNewThreadSetup extends LitElement {
 
   readonly #thinkingChanged = (event: Event): void => {
     this.#optionsTouched = true;
+    const value = (event.currentTarget as HTMLSelectElement).value;
     this.#draft = {
       ...this.#draft,
-      thinking: (event.currentTarget as HTMLSelectElement).value,
+      thinking: value || selectNewThreadModel(
+        this.#draft,
+        this.#draft.modelId,
+        this.#catalog,
+      ).thinking,
     };
     this.requestUpdate();
   };
@@ -657,17 +668,56 @@ export class TrouveNewThreadSetup extends LitElement {
     this.#optionsTouched = true;
     const value = (event.currentTarget as HTMLSelectElement).value;
     const permissionMode: NewThreadPermissionSelection =
-      value === "ask" || value === "allow_list" || value === "yolo" ? value : "";
+      value === "ask" || value === "allow_list" || value === "yolo"
+        ? value
+        : selectNewThreadMode(
+            this.#draft,
+            this.#draft.modeId,
+            this.#catalog,
+          ).permissionMode;
     this.#draft = { ...this.#draft, permissionMode };
     this.requestUpdate();
   };
 
   readonly #promptChanged = (event: InputEvent): void => {
+    const textarea = event.currentTarget as HTMLTextAreaElement;
+    this.#resizePrompt(textarea);
     this.#draft = {
       ...this.#draft,
-      prompt: (event.currentTarget as HTMLTextAreaElement).value,
+      prompt: textarea.value,
     };
     this.requestUpdate();
+  };
+
+  #resizePrompt(
+    textarea = this.renderRoot.querySelector<HTMLTextAreaElement>('textarea[name="prompt"]'),
+  ): void {
+    if (textarea === null) return;
+    textarea.style.height = "auto";
+    const layout = composerTextareaLayout(textarea.scrollHeight, textarea.value.length > 0);
+    textarea.style.height = `${layout.height}px`;
+    textarea.style.overflowY = layout.overflowY;
+  }
+
+  readonly #promptCompositionStarted = (): void => {
+    this.#promptComposing = true;
+  };
+
+  readonly #promptCompositionEnded = (event: CompositionEvent): void => {
+    this.#promptComposing = false;
+    this.#resizePrompt(event.currentTarget as HTMLTextAreaElement);
+  };
+
+  readonly #promptKeydown = (event: KeyboardEvent): void => {
+    if (isComposerCompositionKey({
+      key: event.key,
+      keyCode: event.keyCode,
+      isComposing: event.isComposing,
+      compositionActive: this.#promptComposing,
+    })) return;
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
   };
 
   readonly #filesSelected = (event: Event): void => {

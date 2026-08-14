@@ -10,7 +10,9 @@ import {
   NEW_SESSION_TITLE_FALLBACK,
   NEW_SESSION_TITLE_MAX_LENGTH,
   NEW_THREAD_TITLE_FALLBACK,
+  resolveNewSessionBaseRef,
   resolveNewSessionModel,
+  resolveNewThreadDefaults,
   sessionTitleFallback,
   thinkingOption,
   threadTitleFallback,
@@ -131,6 +133,42 @@ describe("new session model", () => {
     expect(resolveNewSessionModel(undefined, mode(null), providers(" global/model ")))
       .toBe("global/model");
     expect(resolveNewSessionModel(undefined, undefined, providers(" "))).toBeUndefined();
+  });
+
+  it("resolves concrete mode, model, thinking, and permission defaults", () => {
+    const codeMode: ProtocolAgentMode = {
+      ...mode(),
+      default_permission_mode: "allow_list",
+      default_thinking_level: "high",
+    };
+    const globalProviders: ProtocolProvidersResponse = {
+      ...providers("provider/global"),
+      default_permission_mode: "ask",
+      default_thinking_level: "medium",
+    };
+    const models = [model({
+      properties: {
+        thinking_level: {
+          type: "string",
+          enum: ["low", "medium", "high"],
+          default: "low",
+        },
+      },
+    }, "provider/global")];
+    expect(resolveNewThreadDefaults([codeMode], models, globalProviders)).toEqual({
+      modeId: "code",
+      modelId: "provider/global",
+      thinking: "high",
+      permissionMode: "allow_list",
+    });
+  });
+
+  it("chooses main, master, then literal HEAD for a new session base", () => {
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"])).toBe("main");
+    expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");
+    expect(resolveNewSessionBaseRef(["feature"])).toBe("HEAD");
+    expect(resolveNewSessionBaseRef(["main", "release"], "release")).toBe("release");
+    expect(resolveNewSessionBaseRef(["main"], "missing")).toBe("main");
   });
 
   it("composes a complete request with an advertised thinking override", () => {

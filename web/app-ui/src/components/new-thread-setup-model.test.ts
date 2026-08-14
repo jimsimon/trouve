@@ -87,13 +87,13 @@ describe("new thread setup model", () => {
     const draft = createInitialNewThreadDraft(catalog);
     expect(draft).toMatchObject({
       modeId: "code",
-      modelId: "provider/first",
+      modelId: "provider/global",
       thinking: "medium",
-      permissionMode: "",
+      permissionMode: "ask",
       prompt: "",
       attachments: [],
     });
-    expect(effectiveNewThreadModel(draft, catalog)?.id).toBe("provider/first");
+    expect(effectiveNewThreadModel(draft, catalog)?.id).toBe("provider/global");
     expect(newThreadThinkingOption(draft, catalog)).toMatchObject({
       key: "thinking_level",
       values: ["low", "medium", "high"],
@@ -111,11 +111,16 @@ describe("new thread setup model", () => {
     expect(newThreadThinkingOption(reviewed, catalog)?.key).toBe("effort");
 
     const inherited = selectNewThreadModel(reviewed, "", catalog);
-    expect(inherited).toMatchObject({ modelId: "", thinking: "high" });
+    expect(inherited).toMatchObject({ modelId: "provider/review", thinking: "high" });
     expect(effectiveNewThreadModel(inherited, catalog)?.id).toBe("provider/review");
 
     const plan = selectNewThreadMode(inherited, "plan", catalog);
-    expect(plan).toMatchObject({ modeId: "plan", modelId: "", thinking: "medium" });
+    expect(plan).toMatchObject({
+      modeId: "plan",
+      modelId: "provider/global",
+      thinking: "medium",
+      permissionMode: "ask",
+    });
     expect(effectiveNewThreadModel(plan, catalog)?.id).toBe("provider/global");
   });
 
