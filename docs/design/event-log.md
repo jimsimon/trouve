@@ -17,8 +17,9 @@ are protocol changes.
 - Events are **immutable**. Corrections are new events (e.g.
   `message.aborted`), never rewrites.
 - Streaming deltas are events like everything else. Adjacent transport
-  fragments (`assistant.delta`, thinking, and same-call `tool.output`) may be
-  losslessly concatenated for a short bounded window before persistence;
+  fragments (`assistant.delta`, `assistant.progress`, thinking, and same-call
+  `tool.output`) may be losslessly concatenated for a short bounded window
+  before persistence;
   chunk boundaries and per-fragment timestamps are not semantic. Replay must
   reproduce the exact concatenated content and control-event ordering. A
   future compaction pass may fold deltas older than the last checkpoint into

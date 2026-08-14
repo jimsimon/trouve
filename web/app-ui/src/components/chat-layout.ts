@@ -135,6 +135,7 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
         item.kind === "assistant"
         || item.kind === "steered"
         || item.kind === "subagent"
+        || item.kind === "progress"
         || item.kind === "thinking"
         || item.kind === "compaction"
         || item.kind === "todo"

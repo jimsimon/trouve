@@ -1484,6 +1484,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_progress_completion_closes_after_projection_restore() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantProgress {
+                turn: 4,
+                text: "Checking the adapter.".into(),
+            },
+        ));
+
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        projection.apply(&envelope(
+            2,
+            25,
+            Event::AssistantProgressCompleted { turn: 4 },
+        ));
+
+        assert_eq!(projection.snapshot.items.len(), 1);
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Progress {
+                content,
+                complete: true,
+                ..
+            }) if content == "Checking the adapter."
+        ));
+    }
+
+    #[test]
     fn explicit_thinking_completion_closes_without_followup_output() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
