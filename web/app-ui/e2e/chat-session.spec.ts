@@ -3056,6 +3056,9 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 1 command", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(transientActivity).toContainText("Running command…");
+  await group.evaluate((element) => {
+    element.setAttribute("data-stability-probe", "true");
+  });
 
   await emitBatch(page, [
     threadEvent(21, {
@@ -3070,7 +3073,8 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   ]);
 
   await expect(group).toBeVisible();
-  await expect(group).toHaveAttribute("data-chat-anchor-id", "activity:tool:call_group_1");
+  await expect(group).toHaveAttribute("data-stability-probe", "true");
+  await expect(group).toHaveAttribute("data-chat-anchor-id", "activity:tool:call_group_2");
   await expect(group).toHaveClass(/active/u);
   await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
