@@ -941,8 +941,9 @@ fn turn_stream(
         let mut usage = Usage::default();
         // Message phase is carried by item/started, not by the corresponding
         // delta. Remember commentary item ids so interim model-authored
-        // progress is displayed as thinking rather than appended to the final
-        // answer. Missing phases retain the legacy final-answer behavior.
+        // commentary is emitted through the progress stream rather than
+        // displayed as thinking or appended to the final answer. Missing
+        // phases retain the legacy final-answer behavior.
         let mut commentary_messages = HashSet::new();
         // Some providers only populate raw reasoning on the completed item.
         // Track streamed raw items so the completion fallback does not repeat
