@@ -37,15 +37,6 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
     if !crate::binary_on_path(command) {
         return Err(BackendError::NotInstalled(command.to_string()));
     }
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(pty_error)?;
-
     let executable = crate::process_env::find_executable(command)
         .unwrap_or_else(|| std::path::PathBuf::from(command));
     let mut cmd = CommandBuilder::new(executable);
@@ -57,8 +48,18 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
     // The review client opens the captured URL in the user's browser.
     #[cfg(unix)]
     cmd.env("BROWSER", "true");
-    let mut child =
-        trouve_process::with_spawn_lock(|| pair.slave.spawn_command(cmd)).map_err(pty_error)?;
+    let (pair, mut child) = trouve_process::with_spawn_lock(|| {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(pty_error)?;
+        let child = pair.slave.spawn_command(cmd).map_err(pty_error)?;
+        Ok::<_, BackendError>((pair, child))
+    })?;
     drop(pair.slave);
 
     let reader = match pair.master.try_clone_reader() {

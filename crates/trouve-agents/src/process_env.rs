@@ -355,6 +355,19 @@ impl ProcessTreeChild {
         tree_result.and(child_result)
     }
 
+    /// Once the leader has exited, signal the remaining process-tree boundary
+    /// again. A child can fork in the brief interval after the first signal was
+    /// sent but before the leader actually exits; this closes that race without
+    /// repeatedly signalling a stale process-group id while an escaped child
+    /// keeps the descendant sentinel open.
+    pub fn retry_termination_after_leader_exit(&mut self) -> std::io::Result<bool> {
+        if self.try_wait_leader()?.is_none() {
+            return Ok(false);
+        }
+        terminate_platform_process_tree(self)?;
+        Ok(true)
+    }
+
     /// Terminate the complete tree and reap its leader before returning.
     pub async fn terminate_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.terminate_and_reap_until(tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT)
@@ -376,11 +389,15 @@ impl ProcessTreeChild {
                     "timed out reaping terminated child process",
                 )
             })??;
+        let retry_result = self.retry_termination_after_leader_exit().map(|_| ());
         let empty_result = wait_for_platform_process_tree_exit_until(self, deadline).await;
         if empty_result.is_ok() {
             self.tree_active = false;
         }
-        terminate_result.and(empty_result).map(|()| status)
+        terminate_result
+            .and(retry_result)
+            .and(empty_result)
+            .map(|()| status)
     }
 
     async fn wait_for_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
