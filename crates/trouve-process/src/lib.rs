@@ -30,10 +30,20 @@ pub fn spawn(command: &mut std::process::Command) -> std::io::Result<std::proces
     with_spawn_lock(|| command.spawn())
 }
 
-/// Spawn a command with both output streams captured, then wait without
-/// retaining the launch lock for the lifetime of the child.
+/// Spawn a command with closed stdin and both output streams captured, matching
+/// [`std::process::Command::output`]. The launch lock is released before waiting.
 #[inline]
 pub fn output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    command.stdin(std::process::Stdio::null());
+    output_with_stdin(command)
+}
+
+/// Spawn a command with its configured stdin and both output streams captured.
+/// Use this only when a caller intentionally supplies inherited or piped input.
+#[inline]
+pub fn output_with_stdin(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -47,8 +57,39 @@ pub fn status(command: &mut std::process::Command) -> std::io::Result<std::proce
     spawn(command)?.wait()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn output_closes_configured_stdin_by_default() {
+        let input = std::fs::File::open("/etc/hosts").unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "cat"])
+            .stdin(std::process::Stdio::from(input));
+
+        let output = super::output(&mut command).unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_with_stdin_preserves_explicit_input() {
+        let input = std::fs::File::open("/etc/hosts").unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "cat"])
+            .stdin(std::process::Stdio::from(input));
+
+        let output = super::output_with_stdin(&mut command).unwrap();
+
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn spawn_lock_serializes_launch_sections() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -62,9 +103,12 @@ mod tests {
         entered_rx.recv().unwrap();
 
         let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let (second_ready_tx, second_ready_rx) = std::sync::mpsc::channel();
         let second = std::thread::spawn(move || {
+            second_ready_tx.send(()).unwrap();
             super::with_spawn_lock(|| second_tx.send(()).unwrap());
         });
+        second_ready_rx.recv().unwrap();
         assert!(
             second_rx
                 .recv_timeout(std::time::Duration::from_millis(100))

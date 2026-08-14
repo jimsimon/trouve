@@ -166,24 +166,28 @@ impl TerminalManager {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<Terminal>> {
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: rows.max(2),
-                cols: cols.max(2),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| anyhow!("openpty: {e}"))?;
-
         let shell = default_shell();
         let mut cmd = CommandBuilder::new(&shell);
         cmd.args(shell_args(&shell));
         cmd.cwd(worktree);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        let child = trouve_process::with_spawn_lock(|| pair.slave.spawn_command(cmd))
-            .map_err(|e| anyhow!("spawning shell: {e}"))?;
+        let (pair, child) = trouve_process::with_spawn_lock(|| {
+            let pty = native_pty_system();
+            let pair = pty
+                .openpty(PtySize {
+                    rows: rows.max(2),
+                    cols: cols.max(2),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| anyhow!("openpty: {e}"))?;
+            let child = pair
+                .slave
+                .spawn_command(cmd)
+                .map_err(|e| anyhow!("spawning shell: {e}"))?;
+            Ok::<_, anyhow::Error>((pair, child))
+        })?;
         drop(pair.slave);
 
         let reader = pair
@@ -456,6 +460,41 @@ mod tests {
         assert!(mgr.create("s1", dir.path(), 80, 24).is_err());
         mgr.reopen_session("s1");
         assert!(mgr.create("s1", dir.path(), 80, 24).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pty_creation_is_serialized_with_guarded_launches() {
+        const ITERATIONS: usize = 32;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let launch_barrier = barrier.clone();
+        let launcher = std::thread::spawn(move || {
+            for _ in 0..ITERATIONS {
+                launch_barrier.wait();
+                let mut command = std::process::Command::new("/bin/sleep");
+                command.arg("0.01");
+                assert!(trouve_process::status(&mut command).unwrap().success());
+            }
+        });
+
+        let manager = TerminalManager::default();
+        let dir = tempfile::tempdir().unwrap();
+        for iteration in 0..ITERATIONS {
+            barrier.wait();
+            let terminal = manager
+                .create(&format!("stress-{iteration}"), dir.path(), 80, 24)
+                .unwrap();
+            terminal.write(b"exit\r").unwrap();
+            for _ in 0..200 {
+                if terminal.exited() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(terminal.exited(), "terminal {iteration} did not exit");
+            manager.remove(&terminal.id);
+        }
+        launcher.join().unwrap();
     }
 
     #[test]
