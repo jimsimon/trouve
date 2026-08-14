@@ -1515,8 +1515,8 @@ impl From<AssetManifest> for FrontendSource {
 impl FrontendSource {
     /// Apply the common preview environment policy used by Wry hosts.
     ///
-    /// `allow_unbundled` is true for debug product previews and disposable
-    /// qualification harnesses. Shipping product builds pass false and can
+    /// `allow_unbundled` is true for debug product previews and comparison
+    /// hosts. Shipping product builds pass false and can
     /// therefore select only their compile-time packaged manifest.
     pub fn from_preview_environment(
         bundled: Option<AssetManifest>,
