@@ -259,9 +259,12 @@ pub use requests::*;
 // named, id-less `replay-start` SSE event before replay and live output;
 // approval and question resolution require the owning thread to prevent
 // vendor-local id collisions and delayed-response ambiguity.
-pub const PROTOCOL_VERSION: &str = "5.0";
+// 5.1: GitHub endpoints report OAuth credentials that need renewed scopes as
+// an explicit authentication-required error instead of an internal failure.
+pub const PROTOCOL_VERSION: &str = "5.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
+pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

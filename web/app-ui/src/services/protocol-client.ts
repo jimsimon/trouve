@@ -411,6 +411,7 @@ export class ProtocolClientError extends Error {
     readonly kind: "request-failed" | "invalid-response" | "incompatible-protocol",
     message: string,
     readonly status?: number,
+    readonly code?: string,
   ) {
     super(message);
     this.name = "ProtocolClientError";
@@ -421,7 +422,7 @@ export class ProtocolClientError extends Error {
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "5.0";
+export const SUPPORTED_PROTOCOL_VERSION = "5.1";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -855,10 +856,25 @@ export class ProtocolClient {
       throw new ProtocolClientError("request-failed", "pull request detail request failed");
     }
     if (!response.ok) {
+      let code: string | undefined;
+      let message = "pull request detail request failed";
+      try {
+        const error: unknown = await response.json();
+        if (typeof error === "object" && error !== null) {
+          const record = error as Record<string, unknown>;
+          if (typeof record["code"] === "string") code = record["code"];
+          if (typeof record["message"] === "string" && record["message"].trim() !== "") {
+            message = record["message"];
+          }
+        }
+      } catch {
+        // Preserve the bounded generic message for malformed error responses.
+      }
       throw new ProtocolClientError(
         "request-failed",
-        "pull request detail request failed",
+        message,
         response.status,
+        code,
       );
     }
     return this.#parsePrDetail(response);

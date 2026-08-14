@@ -1226,8 +1226,79 @@ pub enum EngineError {
     Conflict(String),
     #[error("{0}")]
     SessionDiffTooLarge(String),
+    #[error("{0}")]
+    AuthenticationRequired(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+fn github_engine_error(error: anyhow::Error) -> EngineError {
+    let authentication_required = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<octocrab::Error>()
+            .is_some_and(octocrab_error_requires_reauthentication)
+    });
+    if authentication_required {
+        EngineError::AuthenticationRequired(
+            "GitHub permissions are missing or expired. Re-authenticate under Settings → Integrations to grant the required repository and organization-read permissions."
+                .into(),
+        )
+    } else {
+        EngineError::Internal(error)
+    }
+}
+
+fn octocrab_error_requires_reauthentication(error: &octocrab::Error) -> bool {
+    match error {
+        octocrab::Error::Graphql { source, .. } => {
+            source.0.iter().any(graphql_error_requires_reauthentication)
+        }
+        octocrab::Error::GitHub { source, .. } => {
+            source.status_code.as_u16() == 401 || github_authentication_message(&source.message)
+        }
+        _ => false,
+    }
+}
+
+fn graphql_error_requires_reauthentication(error: &octocrab::GraphqlError) -> bool {
+    if github_authentication_message(&error.message) {
+        return true;
+    }
+    let Some(extensions) = error
+        .extensions
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let authentication_code = ["type", "code"].iter().any(|key| {
+        extensions
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_uppercase().as_str(),
+                    "BAD_CREDENTIALS" | "INSUFFICIENT_SCOPES" | "UNAUTHORIZED"
+                )
+            })
+    });
+    authentication_code
+        || ["scopes", "requiredScopes", "required_scopes"]
+            .iter()
+            .any(|key| extensions.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+fn github_authentication_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "resource not accessible by integration",
+        "required scopes",
+        "insufficient scope",
+        "insufficient oauth scope",
+        "bad credentials",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn session_diff_executor_error(error: String) -> EngineError {
@@ -4812,7 +4883,7 @@ impl Engine {
             .github_for_session(session)?
             .pr_detail(pr.number, &missing, existing)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         detail.info.workspace_id = pr.workspace_id.clone();
         detail.info.trouve_review = pr.trouve_review.clone();
         Ok(self
@@ -14239,6 +14310,36 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_permission_failures_require_reauthentication() {
+        for message in [
+            "Resource not accessible by integration",
+            "The token has insufficient OAuth scope",
+            "Bad credentials",
+        ] {
+            assert!(github_authentication_message(message));
+        }
+
+        let structured = octocrab::GraphqlError {
+            message: "The operation was denied".into(),
+            locations: None,
+            path: None,
+            extensions: Some(serde_json::json!({ "type": "INSUFFICIENT_SCOPES" })),
+        };
+        assert!(graphql_error_requires_reauthentication(&structured));
+    }
+
+    #[test]
+    fn github_error_context_cannot_trigger_reauthentication() {
+        assert!(matches!(
+            github_engine_error(
+                anyhow!("connection timed out")
+                    .context("bad credentials were reported by an unrelated earlier request")
+            ),
+            EngineError::Internal(_)
+        ));
+    }
 
     fn upload(name: &str, mime: &str, data: String) -> trouve_protocol::AttachmentUpload {
         trouve_protocol::AttachmentUpload {
