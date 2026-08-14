@@ -1160,6 +1160,8 @@ cat > /dev/null
 
     let mut thinking = Vec::new();
     let mut thinking_completed = 0;
+    let mut progress = Vec::new();
+    let mut progress_completed = 0;
     let mut saw_text = false;
     let mut saw_tool_started = false;
     let mut saw_tool_output = false;
@@ -1175,6 +1177,8 @@ cat > /dev/null
             BackendEvent::SessionStarted { session_id } => sessions.push(session_id),
             BackendEvent::ThinkingDelta(t) => thinking.push(t),
             BackendEvent::ThinkingCompleted => thinking_completed += 1,
+            BackendEvent::ProgressDelta(t) => progress.push(t),
+            BackendEvent::ProgressCompleted => progress_completed += 1,
             BackendEvent::TextDelta(t) => saw_text |= t == "Hello",
             BackendEvent::ToolStarted { call_id, .. } => saw_tool_started |= call_id == "c1",
             BackendEvent::ToolOutput { call_id, .. } => saw_tool_output |= call_id == "c1",
@@ -1206,12 +1210,9 @@ cat > /dev/null
     }
 
     assert_eq!(sessions, vec!["thr-1"]);
-    assert!(
-        thinking
-            .iter()
-            .any(|text| text == "Checking the workspace.")
-    );
-    assert_eq!(thinking_completed, 2);
+    assert_eq!(progress, ["Checking the workspace."]);
+    assert_eq!(progress_completed, 1);
+    assert_eq!(thinking_completed, 1);
     assert_eq!(
         thinking
             .iter()

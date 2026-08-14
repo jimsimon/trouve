@@ -50,6 +50,32 @@ describe("buildChatLayout", () => {
     });
   });
 
+  it("keeps paged progress separate from a later-turn prompt", () => {
+    const items: ThreadChatItem[] = [
+      {
+        id: "p4",
+        kind: "progress",
+        turn: 4,
+        content: "Checking the adapter",
+        complete: true,
+      },
+      { id: "u5", kind: "user", turn: 5, content: "Continue", attachments: [] },
+    ];
+
+    const layout = buildChatLayout(items);
+    expect(layout.units).toHaveLength(2);
+    expect(layout.units[0]).toMatchObject({
+      turn: 4,
+      prompt: undefined,
+      items: [{ id: "p4", kind: "progress" }],
+    });
+    expect(layout.units[1]).toMatchObject({
+      turn: 5,
+      prompt: { id: "u5" },
+      items: [],
+    });
+  });
+
   it("keeps compaction between adjacent work runs in the same agent card", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 4, content: "Continue", attachments: [] },
@@ -376,7 +402,7 @@ describe("activityGroupSummary", () => {
       { id: "x1", kind: "thinking", turn: 1, content: "hmm", complete: true },
     ];
     expect(activityGroupSummary(items)).toBe(
-      "Edited 1 file, read 1 file, ran 1 command, thought 1 time",
+      "Edited 1 file, read 1 file, ran 1 command, reasoned 1 time",
     );
   });
 

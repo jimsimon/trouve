@@ -379,6 +379,13 @@ pub enum ThreadViewItem {
         content: String,
         complete: bool,
     },
+    /// User-facing progress authored by the agent harness rather than model
+    /// reasoning or final answer text.
+    Progress {
+        turn: u64,
+        content: String,
+        complete: bool,
+    },
     Thinking {
         turn: u64,
         content: String,

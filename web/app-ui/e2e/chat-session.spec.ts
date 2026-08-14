@@ -2384,9 +2384,9 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await expect(activityGroup.locator(".tool-card")).toHaveCount(0);
 
   const visibleThought = page.locator(".thinking-output");
-  await expect(visibleThought.getByText("Thought", { exact: true })).toBeVisible();
+  await expect(visibleThought.getByText("Reasoning", { exact: true })).toBeVisible();
   await expect(visibleThought.locator(".thinking-body")).toContainText("Compare both frontends");
-  await expect(visibleThought.getByRole("button", { name: /thought process/i })).toHaveCount(1);
+  await expect(visibleThought.getByRole("button", { name: /reasoning/i })).toHaveCount(1);
   await expect(visibleThought.locator(
     '.thinking-rail-icon [data-font-awesome-icon="brain"]',
   )).toHaveCount(1);
@@ -2401,7 +2401,7 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
     );
   });
   expect(visibleThoughtAlignment).toBeLessThanOrEqual(0.75);
-  await expect(page.getByRole("button", { name: "Collapse thought process" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Collapse reasoning" })).toHaveCount(0);
   await expect(page.locator(".thinking-card")).toHaveCount(0);
 
   await agentCard.getByRole("button", { name: "Collapse turn 7" }).click();
@@ -2513,7 +2513,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
 
   const historicalAgent = page.locator(".agent-turn-card").first();
   const thoughtGroup = historicalAgent.locator(".activity-group").filter({
-    hasText: "Thought 1 time",
+    hasText: "Reasoned 1 time",
   });
   await expect(thoughtGroup.locator(":scope > .activity-group-body")).toHaveCount(0);
   await thoughtGroup.locator(":scope > summary").click();
@@ -2521,7 +2521,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
   await expect(historicalThought.locator(".thinking-body"))
     .toContainText("Compare both frontends");
   await expect(historicalThought.getByRole("button", {
-    name: /^(?:Collapse|Expand) thought process$/u,
+    name: /^(?:Collapse|Expand) reasoning$/u,
   }))
     .toHaveCount(0);
   await expect(thoughtGroup.locator(".thinking-card")).toHaveCount(0);
@@ -2594,7 +2594,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
   );
   const combinedGroup = combinedTimeline.locator(":scope > .activity-group");
   await expect(combinedGroup.getByText(
-    "Ran 2 commands, thought 1 time",
+    "Ran 2 commands, reasoned 1 time",
     { exact: true },
   )).toBeVisible();
   await expect(combinedGroup).toHaveClass(/warning/u);
@@ -2643,7 +2643,7 @@ test("the Chat preference adds one disclosure around the standard activity timel
   await expect(combinedGroup.locator(".thinking-output .thinking-body"))
     .toContainText("Inspect the grouped activity geometry");
   await expect(combinedGroup.getByRole("button", {
-    name: /^(?:Collapse|Expand) thought process$/u,
+    name: /^(?:Collapse|Expand) reasoning$/u,
   }))
     .toHaveCount(0);
   await page.mouse.move(0, 0);
@@ -3587,9 +3587,10 @@ test("thought completion clears stale activity while standalone and grouped tool
     type: "assistant.thinking_completed",
     turn: 14,
   }));
-  await expect(transientActivity).toContainText("Processing…");
-  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
+  await expect(transientActivity).toContainText("Progress");
+  await expect(transientActivity.locator('[data-font-awesome-icon="message"]'))
     .toBeVisible();
+  await expect(transientActivity.locator(".trouve-icon-spin")).toHaveCount(0);
 
   await emitBatch(page, [
     threadEvent(75, {
@@ -5447,7 +5448,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Cancel");
   const activeAgent = page.locator(".agent-turn-card").last();
   await expect(activeAgent.locator(".turn-transient-activity"))
-    .toContainText("Processing…");
+    .toContainText("Progress");
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
@@ -5468,9 +5469,11 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await page.locator("trouve-app").evaluate((element) => {
     element.setAttribute("data-reduce-motion", "");
   });
-  await expect.poll(() => activeAgent.locator(".turn-transient-spinner").evaluate(
-    (element) => getComputedStyle(element).animationName,
-  )).toBe("none");
+  await expect(activeAgent.locator(
+    '.turn-transient-activity [data-font-awesome-icon="message"]',
+  )).toBeVisible();
+  await expect(activeAgent.locator(".turn-transient-activity .trouve-icon-spin"))
+    .toHaveCount(0);
   await expect(page.locator('[data-virtual-id="ephemeral:activity"]')).toHaveCount(0);
   await expect(submit).toHaveText("Cancel");
   await submit.click();

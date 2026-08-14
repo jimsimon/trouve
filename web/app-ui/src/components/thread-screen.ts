@@ -2475,7 +2475,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || `${unit.prompt.attachments.length} attachment${unit.prompt.attachments.length === 1 ? "" : "s"}`;
     const preview = promptPreview || collapsedChatPreview(joined) || `Turn ${unit.turn}`;
     const activityRunning = unit.items.some((item) =>
-      (item.kind === "assistant" || item.kind === "thinking") && !item.complete
+      (item.kind === "assistant" || item.kind === "progress" || item.kind === "thinking")
+        && !item.complete
       || item.kind === "compaction" && item.state.kind === "running"
       || item.kind === "tool" && (
         item.status === "running" || item.status === "awaiting-approval"
@@ -2678,6 +2679,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #renderTransientActivityNode(label: string) {
+    const categoryIcon = label === "Reasoning"
+      ? "brain"
+      : label === "Progress"
+        ? "message"
+        : undefined;
     return html`
       <section
         class="turn-rail-node turn-transient-activity"
@@ -2686,10 +2692,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-label=${label}
       >
         <span class="turn-rail-marker transient" aria-hidden="true">
-          ${fontAwesomeIcon("spinner", {
-            className: "turn-transient-spinner",
-            spin: true,
-          })}
+          ${categoryIcon === undefined
+            ? fontAwesomeIcon("spinner", {
+                className: "turn-transient-spinner",
+                spin: true,
+              })
+            : fontAwesomeIcon(categoryIcon)}
         </span>
         <header class="turn-node-header"><strong>${label}</strong></header>
       </section>
@@ -2820,7 +2828,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         const candidate = unit.items[cursor];
         if (candidate === undefined) return false;
         if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
-        return candidate.kind === "thinking"
+        return candidate.kind === "progress"
+          || candidate.kind === "thinking"
           || candidate.kind === "todo"
           || candidate.kind === "tool";
       }
@@ -2869,7 +2878,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           rows.push(html`<section
             class=${`turn-rail-node turn-response-node agent-text-block ${tone}`}
             data-chat-anchor-id=${`assistant:${anchor}`}
-            aria-label=${response ? "Response" : "Agent update"}
+            aria-label=${response ? "Response" : "Agent progress"}
             @pointerdown=${this.#captureMarkdownContextMenuSelection}
             @mousedown=${this.#captureMarkdownContextMenuSelection}
             @contextmenu=${(event: MouseEvent) =>
@@ -2879,13 +2888,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ${fontAwesomeIcon("message")}
             </span>
             <header class="turn-node-header">
-              <strong>${response ? "Response" : "Update"}</strong>
+              <strong>${response ? "Response" : "Progress"}</strong>
               <span class="thinking-header-spacer"></span>
               <span class="agent-copy-action">
                 ${this.#renderCopyButton(
                   `agent:${unit.id}:${anchor}`,
                   assistantCopyText(content),
-                  response ? "Copy assistant response" : "Copy assistant update",
+                  response ? "Copy assistant response" : "Copy assistant progress",
                 )}
               </span>
             </header>
@@ -2895,6 +2904,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             ></trouve-markdown-view>
           </section>`);
         }
+        continue;
+      }
+      if (item.kind === "progress") {
+        activityRows.push({
+          content: this.#renderVisibleProgress(item),
+          expandedGroup: false,
+          endsWithExpandedToolGroup: false,
+        });
+        index += 1;
         continue;
       }
       if (item.kind === "questions") {
@@ -2998,6 +3016,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           || candidate.kind === "assistant"
           || candidate.kind === "steered"
           || candidate.kind === "questions"
+          || candidate.kind === "progress"
           || (!collapseCompactionWithTools && candidate.kind === "compaction")
           || (!collapseCompactionWithTools
             && candidate.kind === "tool"
@@ -3069,15 +3088,46 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ${fontAwesomeIcon("brain")}
         </span>
         <header class="thinking-header">
-          <strong>${item.complete ? "Thought" : "Thinking"}</strong>
+          <strong>Reasoning</strong>
           <span class="thinking-header-spacer"></span>
           ${this.#renderCopyButton(
             `message:${item.id}`,
             item.content,
-            "Copy thought process",
+            "Copy reasoning",
           )}
         </header>
         <div class="thinking-body">
+          <trouve-markdown-view
+            .content=${item.content}
+            .streaming=${!item.complete}
+          ></trouve-markdown-view>
+        </div>
+      </article>
+    `;
+  }
+
+  #renderVisibleProgress(
+    item: Extract<ThreadChatItem, { readonly kind: "progress" }>,
+  ) {
+    this.#ensureMarkdown();
+    return html`
+      <article
+        class=${`message thinking-output progress-output ${item.complete ? "complete" : "running"}`}
+        data-chat-anchor-id=${`item:${item.id}`}
+      >
+        <span class="thinking-rail-icon progress-rail-icon" aria-hidden="true">
+          ${fontAwesomeIcon("message")}
+        </span>
+        <header class="thinking-header progress-header">
+          <strong>Progress</strong>
+          <span class="thinking-header-spacer"></span>
+          ${this.#renderCopyButton(
+            `message:${item.id}`,
+            item.content,
+            "Copy progress",
+          )}
+        </header>
+        <div class="thinking-body progress-body">
           <trouve-markdown-view
             .content=${item.content}
             .streaming=${!item.complete}
@@ -4163,6 +4213,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     switch (item.kind) {
       case "subagent":
         return this.#renderSubagentNode(item);
+      case "progress":
+        return this.#renderVisibleProgress(item);
       case "thinking": {
         this.#ensureMarkdown();
         const defaultOpen = item.turn === presentation.latestTurn;
@@ -4181,13 +4233,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 class="message-disclosure"
                 type="button"
                 aria-expanded=${open ? "true" : "false"}
-                aria-label=${open ? "Collapse thought process" : "Expand thought process"}
+                aria-label=${open ? "Collapse reasoning" : "Expand reasoning"}
                 @click=${() => this.#toggleMessageDisclosure(item.id, defaultOpen)}
               >
                 ${fontAwesomeIcon(open ? "caret-down" : "caret-right", {
                   className: "disclosure-icon",
                 })}
-                <strong>${item.complete ? "Thought" : "Thinking"}</strong>
+                <strong>Reasoning</strong>
                 ${open
                   ? nothing
                   : html`<small class="message-collapsed-preview">${preview}</small>`}
@@ -4195,7 +4247,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ${this.#renderCopyButton(
                 `message:${item.id}`,
                 item.content,
-                "Copy thought process",
+                "Copy reasoning",
               )}
             </header>
             ${open

@@ -137,6 +137,12 @@ pub enum ChatItem {
         content: String,
         complete: bool,
     },
+    /// User-facing progress authored by the agent harness.
+    Progress {
+        turn: u64,
+        content: String,
+        complete: bool,
+    },
     /// Model reasoning ("thinking") text; closed when other output arrives.
     Thinking {
         turn: u64,
@@ -335,6 +341,15 @@ impl From<ThreadViewItem> for ChatItem {
                 content,
                 complete,
             },
+            ThreadViewItem::Progress {
+                turn,
+                content,
+                complete,
+            } => Self::Progress {
+                turn,
+                content,
+                complete,
+            },
             ThreadViewItem::Thinking {
                 turn,
                 content,
@@ -445,6 +460,22 @@ impl ThreadViewModel {
             )
         })?;
         if let ChatItem::Thinking { complete, .. } = &mut self.items[idx] {
+            *complete = true;
+        }
+        Some(idx)
+    }
+
+    fn finish_progress(&mut self) -> Option<usize> {
+        let idx = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Progress {
+                    complete: false,
+                    ..
+                }
+            )
+        })?;
+        if let ChatItem::Progress { complete, .. } = &mut self.items[idx] {
             *complete = true;
         }
         Some(idx)
@@ -664,6 +695,7 @@ impl ThreadViewModel {
                 content,
                 attachments,
             } => {
+                self.finish_progress();
                 self.finish_thinking();
                 self.items.push(ChatItem::Steered {
                     turn: *turn,
@@ -681,6 +713,7 @@ impl ThreadViewModel {
                 call_id,
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 self.items.push(ChatItem::Subagent {
                     turn: *turn,
@@ -692,8 +725,29 @@ impl ThreadViewModel {
                 });
                 Some(self.items.len() - 1)
             }
+            Event::AssistantProgress { turn, text } => {
+                self.fail_open_compaction(*turn);
+                self.finish_thinking();
+                if let Some(idx) = self.items.iter().rposition(|i| {
+                    matches!(i, ChatItem::Progress { turn: t, complete: false, .. } if t == turn)
+                }) {
+                    if let ChatItem::Progress { content, .. } = &mut self.items[idx] {
+                        content.push_str(text);
+                    }
+                    Some(idx)
+                } else {
+                    self.items.push(ChatItem::Progress {
+                        turn: *turn,
+                        content: text.clone(),
+                        complete: false,
+                    });
+                    Some(self.items.len() - 1)
+                }
+            }
+            Event::AssistantProgressCompleted { .. } => self.finish_progress(),
             Event::AssistantThinking { turn, text } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.thinking = true;
                 // Grow the trailing open thinking item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
@@ -715,6 +769,7 @@ impl ThreadViewModel {
             Event::AssistantThinkingCompleted { .. } => self.finish_thinking(),
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 // Grow the trailing incomplete assistant item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
@@ -735,6 +790,7 @@ impl ThreadViewModel {
             }
             Event::AssistantMessage { turn, content } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Assistant { turn: t, complete: false, .. } if t == turn)
@@ -763,6 +819,7 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
@@ -913,6 +970,7 @@ impl ThreadViewModel {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 if !self.pending_questions.contains(request_id) {
                     self.pending_questions.push(request_id.clone());
@@ -952,6 +1010,7 @@ impl ThreadViewModel {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
@@ -981,6 +1040,7 @@ impl ThreadViewModel {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
@@ -1008,6 +1068,7 @@ impl ThreadViewModel {
                 self.capacity_acquired_before_start.remove(turn);
                 self.turn_running = false;
                 self.fail_open_compaction(*turn);
+                self.finish_progress();
                 self.finish_thinking();
                 let aborted_tool = self.abort_open_tools(envelope.ts);
                 self.pending_questions.clear();
@@ -1055,6 +1116,7 @@ mod tests {
                 ChatItem::Steered { .. } => "steered",
                 ChatItem::Subagent { .. } => "subagent",
                 ChatItem::Assistant { .. } => "assistant",
+                ChatItem::Progress { .. } => "progress",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",
                 ChatItem::TodoUpdate { .. } => "todo",

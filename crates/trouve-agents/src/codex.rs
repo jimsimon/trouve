@@ -517,9 +517,9 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Commentary messages, rather than reasoning summaries, drive trouve's
-/// thinking blocks. Disable summaries so their heading-like text is not
-/// generated alongside the richer commentary stream.
+/// Commentary messages drive trouve's progress blocks. Disable reasoning
+/// summaries so their heading-like text is not generated alongside the
+/// richer commentary stream.
 fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
     params["summary"] = json!("none");
     if let Some(effort) = effort {
@@ -536,7 +536,7 @@ fn agent_message_delta(
         .as_str()
         .is_some_and(|id| commentary_messages.contains(id))
     {
-        Some(BackendEvent::ThinkingDelta(delta.into()))
+        Some(BackendEvent::ProgressDelta(delta.into()))
     } else {
         Some(BackendEvent::TextDelta(delta.into()))
     }
@@ -698,7 +698,7 @@ fn collaborator_notification(
                 .as_str()
                 .is_some_and(|id| state.commentary_messages.contains(id))
             {
-                events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+                events.push(BackendCollaboratorEvent::ProgressDelta(delta.into()));
             } else {
                 events.push(BackendCollaboratorEvent::TextDelta(delta.into()));
             }
@@ -781,8 +781,11 @@ fn collaborator_notification(
                 && item["id"]
                     .as_str()
                     .is_some_and(|id| state.commentary_messages.remove(id));
-            if thinking_emitted || commentary_completed {
+            if thinking_emitted {
                 events.push(BackendCollaboratorEvent::ThinkingCompleted);
+            }
+            if commentary_completed {
+                events.push(BackendCollaboratorEvent::ProgressCompleted);
             }
             if kind == "contextCompaction" {
                 events.push(if item["status"].as_str() == Some("failed") {
@@ -938,8 +941,9 @@ fn turn_stream(
         let mut usage = Usage::default();
         // Message phase is carried by item/started, not by the corresponding
         // delta. Remember commentary item ids so interim model-authored
-        // progress is displayed as thinking rather than appended to the final
-        // answer. Missing phases retain the legacy final-answer behavior.
+        // commentary is emitted through the progress stream rather than
+        // displayed as thinking or appended to the final answer. Missing
+        // phases retain the legacy final-answer behavior.
         let mut commentary_messages = HashSet::new();
         // Some providers only populate raw reasoning on the completed item.
         // Track streamed raw items so the completion fallback does not repeat
@@ -1237,8 +1241,11 @@ fn turn_stream(
                                     && item["id"]
                                         .as_str()
                                         .is_some_and(|id| commentary_messages.remove(id));
-                                if thinking_emitted || commentary_completed {
+                                if thinking_emitted {
                                     let _ = tx.send(Ok(BackendEvent::ThinkingCompleted)).await;
+                                }
+                                if commentary_completed {
+                                    let _ = tx.send(Ok(BackendEvent::ProgressCompleted)).await;
                                 }
                                 if ty == "contextCompaction" {
                                     let event = if item["status"].as_str() == Some("failed") {
@@ -5117,12 +5124,12 @@ mod tests {
     }
 
     #[test]
-    fn routes_codex_commentary_as_thinking() {
+    fn routes_codex_commentary_as_progress() {
         let commentary = HashSet::from(["commentary-1".to_string()]);
         let params = json!({ "itemId": "commentary-1", "delta": "Checking the parser." });
         assert!(matches!(
             agent_message_delta(&params, &commentary),
-            Some(BackendEvent::ThinkingDelta(text)) if text == "Checking the parser."
+            Some(BackendEvent::ProgressDelta(text)) if text == "Checking the parser."
         ));
 
         let final_params = json!({ "itemId": "final-1", "delta": "Done." });
@@ -5442,7 +5449,18 @@ mod tests {
                 &mut state,
             )
             .as_slice(),
-            [BackendCollaboratorEvent::ThinkingDelta(text)] if text == "Checking."
+            [BackendCollaboratorEvent::ProgressDelta(text)] if text == "Checking."
+        ));
+        assert!(matches!(
+            collaborator_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": "thought", "type": "agentMessage", "phase": "commentary" }
+                }),
+                &mut state,
+            )
+            .as_slice(),
+            [BackendCollaboratorEvent::ProgressCompleted]
         ));
         assert!(matches!(
             collaborator_notification(

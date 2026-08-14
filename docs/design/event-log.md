@@ -17,8 +17,9 @@ are protocol changes.
 - Events are **immutable**. Corrections are new events (e.g.
   `message.aborted`), never rewrites.
 - Streaming deltas are events like everything else. Adjacent transport
-  fragments (`assistant.delta`, thinking, and same-call `tool.output`) may be
-  losslessly concatenated for a short bounded window before persistence;
+  fragments (`assistant.delta`, `assistant.progress`, thinking, and same-call
+  `tool.output`) may be losslessly concatenated for a short bounded window
+  before persistence;
   chunk boundaries and per-fragment timestamps are not semantic. Replay must
   reproduce the exact concatenated content and control-event ordering. A
   future compaction pass may fold deltas older than the last checkpoint into
@@ -156,6 +157,9 @@ Thread scope:
   a separately navigable child-agent transcript was attached to the parent
   turn; the optional call id identifies a redundant trouve spawn tool row
 - `assistant.delta` `{turn, text}` — streamed model output
+- `assistant.progress` `{turn, text}` — streamed user-facing progress authored
+  by the agent harness / `assistant.progress_completed` `{turn}` — the harness
+  explicitly closed the current progress item
 - `assistant.thinking` `{turn, text}` — streamed display-only model reasoning /
   `assistant.thinking_completed` `{turn}` — the provider explicitly closed
   the current thinking item, even when no visible output follows immediately

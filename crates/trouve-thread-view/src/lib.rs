@@ -42,6 +42,7 @@ pub struct ThreadProjection {
 struct ProjectionIndexes {
     ready: bool,
     open_assistant: HashMap<u64, usize>,
+    open_progress: HashMap<u64, usize>,
     open_thinking: HashMap<u64, usize>,
     tools: HashMap<String, usize>,
     turns: HashMap<u64, usize>,
@@ -170,6 +171,7 @@ impl ThreadProjection {
                 content,
                 attachments,
             } => {
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 self.push(ThreadViewItem::Steered {
                     turn: *turn,
@@ -186,6 +188,7 @@ impl ThreadProjection {
                 call_id,
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 self.push(ThreadViewItem::Subagent {
                     turn: *turn,
@@ -196,8 +199,29 @@ impl ThreadProjection {
                     call_id: call_id.clone(),
                 });
             }
+            Event::AssistantProgress { turn, text } => {
+                self.fail_open_compaction(*turn);
+                self.finish_thinking();
+                if let Some(&idx) = self.indexes.open_progress.get(turn) {
+                    if let ThreadViewItem::Progress { content, .. } = &mut self.snapshot.items[idx]
+                    {
+                        content.push_str(text);
+                    }
+                } else {
+                    let idx = self.push(ThreadViewItem::Progress {
+                        turn: *turn,
+                        content: text.clone(),
+                        complete: false,
+                    });
+                    self.indexes.open_progress.insert(*turn, idx);
+                }
+            }
+            Event::AssistantProgressCompleted { turn } => {
+                self.finish_progress(*turn);
+            }
             Event::AssistantThinking { turn, text } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.snapshot.thinking = true;
                 if let Some(&idx) = self.indexes.open_thinking.get(turn) {
                     if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx]
@@ -219,6 +243,7 @@ impl ThreadProjection {
             }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 if let Some(&idx) = self.indexes.open_assistant.get(turn) {
                     if let ThreadViewItem::Assistant { content, .. } = &mut self.snapshot.items[idx]
@@ -236,6 +261,7 @@ impl ThreadProjection {
             }
             Event::AssistantMessage { turn, content } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 if let Some(idx) = self.indexes.open_assistant.remove(turn) {
                     self.snapshot.items[idx] = ThreadViewItem::Assistant {
@@ -260,6 +286,7 @@ impl ThreadProjection {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
@@ -367,6 +394,7 @@ impl ThreadProjection {
                 ..
             } => {
                 self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
                 self.finish_thinking();
                 if !self.snapshot.pending_questions.contains(request_id) {
                     self.snapshot.pending_questions.push(request_id.clone());
@@ -546,6 +574,15 @@ impl ThreadProjection {
         }
     }
 
+    fn finish_progress(&mut self, turn: u64) {
+        if let Some(idx) = self.indexes.open_progress.remove(&turn)
+            && let Some(ThreadViewItem::Progress { complete, .. }) =
+                self.snapshot.items.get_mut(idx)
+        {
+            *complete = true;
+        }
+    }
+
     fn fail_open_compaction(&mut self, turn: u64) -> Option<usize> {
         self.snapshot.compacting = false;
         let idx = self.indexes.open_compactions.remove(&turn)?;
@@ -560,6 +597,7 @@ impl ThreadProjection {
         self.capacity_acquired_before_start.remove(&turn);
         self.snapshot.turn_running = false;
         self.fail_open_compaction(turn);
+        self.finish_progress(turn);
         self.finish_thinking();
         self.abort_open_tools(ended);
         self.snapshot.pending_questions.clear();
@@ -619,6 +657,11 @@ impl ThreadProjection {
                     ..
                 } => {
                     self.indexes.open_assistant.insert(*turn, idx);
+                }
+                ThreadViewItem::Progress { turn, complete, .. } => {
+                    if !complete {
+                        self.indexes.open_progress.insert(*turn, idx);
+                    }
                 }
                 ThreadViewItem::Thinking { turn, complete, .. } => {
                     if !complete {
@@ -1395,6 +1438,142 @@ mod tests {
         assert_eq!(second_turn.len(), 2);
         assert!(projection.snapshot.items.is_empty());
         assert_eq!(projection.total_items(), 4);
+    }
+
+    #[test]
+    fn progress_and_reasoning_remain_distinct_folded_items() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::AssistantProgress {
+                turn: 4,
+                text: "Checking the adapter.".into(),
+            },
+            Event::AssistantProgressCompleted { turn: 4 },
+            Event::AssistantThinking {
+                turn: 4,
+                text: "The provider emits a separate reasoning stream.".into(),
+            },
+            Event::AssistantThinkingCompleted { turn: 4 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Progress {
+                    content: progress,
+                    complete: true,
+                    ..
+                },
+                ThreadViewItem::Thinking {
+                    content: reasoning,
+                    complete: true,
+                    ..
+                },
+            ] if progress == "Checking the adapter."
+                && reasoning == "The provider emits a separate reasoning stream."
+        ));
+    }
+
+    #[test]
+    fn explicit_progress_completion_closes_after_projection_restore() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantProgress {
+                turn: 4,
+                text: "Checking the adapter.".into(),
+            },
+        ));
+
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+        projection.apply(&envelope(
+            2,
+            25,
+            Event::AssistantProgressCompleted { turn: 4 },
+        ));
+
+        assert_eq!(projection.snapshot.items.len(), 1);
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Progress {
+                content,
+                complete: true,
+                ..
+            }) if content == "Checking the adapter."
+        ));
+    }
+
+    #[test]
+    fn progress_completion_and_boundaries_are_scoped_to_their_turn() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::AssistantProgress {
+                turn: 1,
+                text: "First turn".into(),
+            },
+            Event::AssistantProgress {
+                turn: 2,
+                text: "Second turn".into(),
+            },
+            Event::AssistantProgressCompleted { turn: 1 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        let progress_states = |projection: &ThreadProjection| {
+            projection
+                .snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    ThreadViewItem::Progress { turn, complete, .. } => Some((*turn, *complete)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(progress_states(&projection), vec![(1, true), (2, false)]);
+
+        projection.apply(&envelope(
+            4,
+            3,
+            Event::AssistantProgress {
+                turn: 1,
+                text: "More first-turn work".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            5,
+            4,
+            Event::AssistantDelta {
+                turn: 1,
+                text: "First-turn answer".into(),
+            },
+        ));
+        assert_eq!(
+            progress_states(&projection),
+            vec![(1, true), (2, false), (1, true)]
+        );
+
+        projection.apply(&envelope(
+            6,
+            5,
+            Event::AssistantProgressCompleted { turn: 2 },
+        ));
+        assert!(
+            progress_states(&projection)
+                .into_iter()
+                .all(|(_, complete)| complete)
+        );
     }
 
     #[test]
