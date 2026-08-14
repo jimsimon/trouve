@@ -1383,10 +1383,17 @@ mod tests {
             .trim()
             .parse::<u32>()
             .unwrap();
-        let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-            .and_then(|tail| tail.chars().next());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let state = loop {
+            let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
+                .and_then(|tail| tail.chars().next());
+            if state.is_none() || state == Some('Z') || Instant::now() >= deadline {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert!(
             state.is_none() || state == Some('Z'),
             "login-shell descendant survived timeout cleanup in state {state:?}"
