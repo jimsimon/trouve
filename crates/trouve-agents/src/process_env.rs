@@ -20,6 +20,12 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+// Darwin has no `pipe2(O_CLOEXEC)`, so creating the descendant sentinel and
+// marking both ends close-on-exec is not atomic. Serialize our process-tree
+// spawns across that window: otherwise a concurrent spawn can inherit another
+// tree's writer and make its cleanup wait for an unrelated process.
+#[cfg(target_os = "macos")]
+static MACOS_PROCESS_TREE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
 const WINDOWS_PROCESS_TREE_CREATION_FLAGS: u32 =
     windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -407,6 +413,11 @@ pub fn spawn_process_tree(
 ) -> std::io::Result<ProcessTreeChild> {
     command.kill_on_drop(true);
 
+    #[cfg(target_os = "macos")]
+    let _spawn_guard = MACOS_PROCESS_TREE_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -479,6 +490,11 @@ pub fn spawn_process_tree(
 pub fn spawn_blocking_process_tree(
     command: &mut std::process::Command,
 ) -> std::io::Result<BlockingProcessTreeChild> {
+    #[cfg(target_os = "macos")]
+    let _spawn_guard = MACOS_PROCESS_TREE_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -556,17 +572,11 @@ fn install_unix_descendant_sentinel(
     let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    for descriptor in [&reader, &writer] {
-        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1
-            || unsafe {
-                libc::fcntl(
-                    descriptor.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags | libc::FD_CLOEXEC,
-                )
-            } == -1
-        {
+    for descriptor in [&writer, &reader] {
+        // Fresh pipe descriptors have no descriptor flags. Mark the writer
+        // first and use one syscall per end to minimize the unavoidable
+        // `pipe`/`fcntl` gap for non-`pipe2` Unix platforms.
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -1529,6 +1539,39 @@ mod tests {
             !child.tree_active,
             "signalled process group must be disarmed"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_process_tree_spawns_keep_sentinels_isolated() {
+        const CHILD_COUNT: usize = 24;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CHILD_COUNT));
+        let mut spawns = Vec::with_capacity(CHILD_COUNT);
+        for _ in 0..CHILD_COUNT {
+            let barrier = barrier.clone();
+            spawns.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", "sleep 60"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                spawn_process_tree(&mut command).unwrap()
+            }));
+        }
+
+        let mut children = Vec::with_capacity(CHILD_COUNT);
+        for spawn in spawns {
+            children.push(spawn.await.unwrap());
+        }
+        for child in &mut children {
+            tokio::time::timeout(Duration::from_secs(2), child.terminate_and_reap())
+                .await
+                .expect("concurrent macOS spawn leaked a foreign sentinel writer")
+                .unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
