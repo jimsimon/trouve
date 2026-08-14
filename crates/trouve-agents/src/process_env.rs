@@ -1385,10 +1385,7 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let state = loop {
-            let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
-                .ok()
-                .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-                .and_then(|tail| tail.chars().next());
+            let state = process_state(descendant).unwrap();
             if state.is_none() || state == Some('Z') || Instant::now() >= deadline {
                 break state;
             }
@@ -1489,18 +1486,29 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_state(pid: u32) -> Option<char> {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-            .and_then(|tail| tail.chars().next())
+    fn process_state(pid: u32) -> std::io::Result<Option<char>> {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, tail)| tail.chars().next())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed /proc/{pid}/stat"),
+                )
+            })?;
+        Ok(Some(state))
     }
 
     #[cfg(target_os = "linux")]
     async fn assert_process_tree_member_stopped(pid: u32) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let state = process_state(pid);
+                let state = process_state(pid).unwrap();
                 if state.is_none() || state == Some('Z') {
                     break;
                 }
@@ -1777,7 +1785,9 @@ mod tests {
         assert!(child.try_wait_tree().unwrap().is_none());
         assert!(child.tree_active);
         assert!(
-            process_state(descendant).is_some_and(|state| state != 'Z'),
+            process_state(descendant)
+                .unwrap()
+                .is_some_and(|state| state != 'Z'),
             "tree wait terminated a live background descendant"
         );
 
