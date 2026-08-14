@@ -1,0 +1,27 @@
+[
+  {
+    "name": "tool-permissions",
+    "intent": "permission checks performed before a tool executes",
+    "pattern": "PermissionMode|PermissionDecision|check_permission"
+  },
+  {
+    "name": "tool-execution",
+    "intent": "the central tool execution chokepoint",
+    "pattern": "ToolExecutor|execute_tool"
+  },
+  {
+    "name": "provider-costs",
+    "intent": "provider token usage and cost accounting",
+    "pattern": "input_tokens|cached_input_tokens|cost_usd"
+  },
+  {
+    "name": "event-replay",
+    "intent": "append durable events and replay them from a cursor",
+    "pattern": "append_event|EventCursor|event_cursor"
+  },
+  {
+    "name": "desktop-server",
+    "intent": "start the embedded protocol server and expose its URL to the desktop host",
+    "pattern": "bind_local|embedded_server|server_url"
+  }
+]
