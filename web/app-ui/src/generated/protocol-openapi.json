@@ -8757,7 +8757,7 @@
       },
       "GithubPrList": {
         "type": "object",
-        "description": "Pull requests relevant to the authenticated account on one GitHub host,\nspanning every repository visible to that account. Includes open PRs the\naccount authored, was asked to review, or participated in, plus recently\nmerged relevant PRs.",
+        "description": "Pull requests relevant to the authenticated account on one GitHub host,\nspanning every repository visible to that account. Includes open PRs the\naccount authored, was asked to review, or participated in, plus recently\nmerged or closed relevant PRs.",
         "required": [
           "host",
           "prs"

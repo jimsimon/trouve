@@ -35,9 +35,10 @@ query TrouveViewer {
 
 const DASHBOARD_SEARCH_QUERY: &str = r#"
 query TrouvePullRequestSearch(
-  $openQuery: String!, $reviewQuery: String!, $mergedQuery: String!,
-  $openAfter: String, $reviewAfter: String, $mergedAfter: String,
-  $includeOpen: Boolean!, $includeReview: Boolean!, $includeMerged: Boolean!
+  $openQuery: String!, $reviewQuery: String!, $mergedQuery: String!, $closedQuery: String!,
+  $openAfter: String, $reviewAfter: String, $mergedAfter: String, $closedAfter: String,
+  $includeOpen: Boolean!, $includeReview: Boolean!, $includeMerged: Boolean!,
+  $includeClosed: Boolean!
 ) {
   open: search(query: $openQuery, type: ISSUE, first: 100, after: $openAfter)
     @include(if: $includeOpen) {
@@ -51,6 +52,11 @@ query TrouvePullRequestSearch(
   }
   merged: search(query: $mergedQuery, type: ISSUE, first: 100, after: $mergedAfter)
     @include(if: $includeMerged) {
+    nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
+    pageInfo { hasNextPage endCursor }
+  }
+  closed: search(query: $closedQuery, type: ISSUE, first: 100, after: $closedAfter)
+    @include(if: $includeClosed) {
     nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
     pageInfo { hasNextPage endCursor }
   }
@@ -934,8 +940,29 @@ struct GraphqlSearchData {
     review: Option<GraphqlSearchConnection>,
     #[serde(default)]
     merged: Option<GraphqlSearchConnection>,
+    #[serde(default)]
+    closed: Option<GraphqlSearchConnection>,
     #[serde(rename = "rateLimit")]
     rate_limit: GraphqlRateLimit,
+}
+
+struct DashboardSearchQueries {
+    open: String,
+    review: String,
+    merged: String,
+    closed: String,
+}
+
+fn dashboard_search_queries(viewer: &str, terminal_since: DateTime<Utc>) -> DashboardSearchQueries {
+    let day = terminal_since.format("%Y-%m-%d");
+    DashboardSearchQueries {
+        open: format!("is:pr is:open involves:{viewer}"),
+        review: format!("is:pr is:open review-requested:{viewer}"),
+        merged: format!("is:pr is:merged merged:>={day} involves:{viewer}"),
+        // Closed, unmerged PRs are not actionable dashboard rows, but keeping
+        // their terminal summaries lets associated sessions render red badges.
+        closed: format!("is:pr is:closed is:unmerged closed:>={day} involves:{viewer}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1775,19 +1802,19 @@ impl GitHubGraphql {
 
     async fn dashboard_prs(
         &self,
-        merged_since: DateTime<Utc>,
+        terminal_since: DateTime<Utc>,
         cache: &mut GitHubDashboardCache,
     ) -> Result<(String, Vec<PrInfo>)> {
         let viewer = self.viewer().await?;
         cache.begin_viewer(&viewer);
-        let day = merged_since.format("%Y-%m-%d");
-        let mut open = SearchCursor::new(format!("is:pr is:open involves:{viewer}"));
-        let mut review = SearchCursor::new(format!("is:pr is:open review-requested:{viewer}"));
-        let mut merged =
-            SearchCursor::new(format!("is:pr is:merged merged:>={day} involves:{viewer}"));
+        let queries = dashboard_search_queries(&viewer, terminal_since);
+        let mut open = SearchCursor::new(queries.open);
+        let mut review = SearchCursor::new(queries.review);
+        let mut merged = SearchCursor::new(queries.merged);
+        let mut closed = SearchCursor::new(queries.closed);
         let mut probes = BTreeMap::new();
 
-        while open.active || review.active || merged.active {
+        while open.active || review.active || merged.active || closed.active {
             let response: GraphqlSearchData = self
                 .client
                 .graphql(&serde_json::json!({
@@ -1796,12 +1823,15 @@ impl GitHubGraphql {
                         "openQuery": open.query,
                         "reviewQuery": review.query,
                         "mergedQuery": merged.query,
+                        "closedQuery": closed.query,
                         "openAfter": open.after,
                         "reviewAfter": review.after,
                         "mergedAfter": merged.after,
+                        "closedAfter": closed.after,
                         "includeOpen": open.active,
                         "includeReview": review.active,
                         "includeMerged": merged.active,
+                        "includeClosed": closed.active,
                     }
                 }))
                 .await
@@ -1810,6 +1840,7 @@ impl GitHubGraphql {
             consume_search_page(response.open, &mut open, &mut probes);
             consume_search_page(response.review, &mut review, &mut probes);
             consume_search_page(response.merged, &mut merged, &mut probes);
+            consume_search_page(response.closed, &mut closed, &mut probes);
         }
 
         let refresh_ids = probes
@@ -3117,10 +3148,10 @@ impl GitHubAccount {
 
     pub async fn dashboard_prs(
         &self,
-        merged_since: DateTime<Utc>,
+        terminal_since: DateTime<Utc>,
         cache: &mut GitHubDashboardCache,
     ) -> Result<(String, Vec<PrInfo>)> {
-        self.graphql.dashboard_prs(merged_since, cache).await
+        self.graphql.dashboard_prs(terminal_since, cache).await
     }
 }
 
@@ -3938,6 +3969,24 @@ mod tests {
     fn github_oauth_requests_repository_and_team_read_scopes() {
         let config = oauth_config("github.com", "client-id");
         assert_eq!(config.scopes, ["repo", "read:org"]);
+    }
+
+    #[test]
+    fn dashboard_queries_include_recent_closed_unmerged_pull_requests() {
+        let queries = dashboard_search_queries("alice", "2026-07-20T12:00:00Z".parse().unwrap());
+
+        assert_eq!(queries.open, "is:pr is:open involves:alice");
+        assert_eq!(queries.review, "is:pr is:open review-requested:alice");
+        assert_eq!(
+            queries.merged,
+            "is:pr is:merged merged:>=2026-07-20 involves:alice"
+        );
+        assert_eq!(
+            queries.closed,
+            "is:pr is:closed is:unmerged closed:>=2026-07-20 involves:alice"
+        );
+        assert!(DASHBOARD_SEARCH_QUERY.contains("closed: search"));
+        assert!(DASHBOARD_SEARCH_QUERY.contains("@include(if: $includeClosed)"));
     }
 
     #[test]

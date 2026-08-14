@@ -6180,7 +6180,7 @@ impl Engine {
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
     pub async fn refresh_github_prs(&self, force: bool) -> Result<(), EngineError> {
         let request_started = Instant::now();
-        let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
+        let terminal_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
         let workspace_repositories = tokio::task::spawn_blocking(move || {
             workspaces
@@ -6219,7 +6219,7 @@ impl Engine {
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
             let refresh = tokio::time::timeout(
                 GITHUB_DASHBOARD_REFRESH_TIMEOUT,
-                account.dashboard_prs(merged_since, &mut cache),
+                account.dashboard_prs(terminal_since, &mut cache),
             )
             .await;
             let (viewer, mut prs) = match refresh {
