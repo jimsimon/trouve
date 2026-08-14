@@ -60,6 +60,8 @@ const rustEventToWire = {
   ApprovalResolved: "approval.resolved",
   AssistantDelta: "assistant.delta",
   AssistantMessage: "assistant.message",
+  AssistantProgress: "assistant.progress",
+  AssistantProgressCompleted: "assistant.progress_completed",
   AssistantThinking: "assistant.thinking",
   AssistantThinkingCompleted: "assistant.thinking_completed",
   CommandsUpdated: "thread.commands_updated",

@@ -156,6 +156,9 @@ Thread scope:
   a separately navigable child-agent transcript was attached to the parent
   turn; the optional call id identifies a redundant trouve spawn tool row
 - `assistant.delta` `{turn, text}` — streamed model output
+- `assistant.progress` `{turn, text}` — streamed user-facing progress authored
+  by the agent harness / `assistant.progress_completed` `{turn}` — the harness
+  explicitly closed the current progress item
 - `assistant.thinking` `{turn, text}` — streamed display-only model reasoning /
   `assistant.thinking_completed` `{turn}` — the provider explicitly closed
   the current thinking item, even when no visible output follows immediately

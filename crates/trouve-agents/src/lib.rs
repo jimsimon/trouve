@@ -154,6 +154,10 @@ pub enum BackendEvent {
         session_id: String,
     },
     TextDelta(String),
+    /// User-facing progress authored by the vendor harness.
+    ProgressDelta(String),
+    /// The vendor harness explicitly closed its current progress item.
+    ProgressCompleted,
     /// Reasoning ("thinking") text, where the vendor harness exposes it.
     ThinkingDelta(String),
     /// The vendor harness explicitly closed its current thinking item.
@@ -257,6 +261,8 @@ pub enum BackendCollaboratorEvent {
     TurnStarted,
     UserMessage(String),
     TextDelta(String),
+    ProgressDelta(String),
+    ProgressCompleted,
     ThinkingDelta(String),
     ThinkingCompleted,
     ToolStarted {
@@ -302,6 +308,8 @@ impl std::fmt::Debug for BackendCollaboratorEvent {
             Self::TurnStarted => f.write_str("TurnStarted"),
             Self::UserMessage(text) => write!(f, "UserMessage({text:?})"),
             Self::TextDelta(text) => write!(f, "TextDelta({text:?})"),
+            Self::ProgressDelta(text) => write!(f, "ProgressDelta({text:?})"),
+            Self::ProgressCompleted => f.write_str("ProgressCompleted"),
             Self::ThinkingDelta(text) => write!(f, "ThinkingDelta({text:?})"),
             Self::ThinkingCompleted => f.write_str("ThinkingCompleted"),
             Self::ToolStarted { call_id, tool, .. } => {
@@ -332,6 +340,8 @@ impl std::fmt::Debug for BackendEvent {
                 write!(f, "SessionStarted({session_id})")
             }
             Self::TextDelta(t) => write!(f, "TextDelta({t:?})"),
+            Self::ProgressDelta(t) => write!(f, "ProgressDelta({t:?})"),
+            Self::ProgressCompleted => f.write_str("ProgressCompleted"),
             Self::ThinkingDelta(t) => write!(f, "ThinkingDelta({t:?})"),
             Self::ThinkingCompleted => f.write_str("ThinkingCompleted"),
             Self::ToolStarted { call_id, tool, .. } => {
@@ -681,6 +691,13 @@ fn merge_backend_event(
             current.push_str(&next);
             BackendMerge::Merged(added)
         }
+        (Ok(BackendEvent::ProgressDelta(current)), Ok(BackendEvent::ProgressDelta(next)))
+            if current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
         (Ok(BackendEvent::ThinkingDelta(current)), Ok(BackendEvent::ThinkingDelta(next)))
             if current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
         {
@@ -714,6 +731,25 @@ fn merge_backend_event(
                 session_id: next_session,
                 turn_id: next_turn,
                 event: BackendCollaboratorEvent::TextDelta(next),
+            }),
+        ) if current_session == &next_session
+            && current_turn == &next_turn
+            && current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: current_session,
+                turn_id: current_turn,
+                event: BackendCollaboratorEvent::ProgressDelta(current),
+            }),
+            Ok(BackendEvent::CollaboratorEvent {
+                session_id: next_session,
+                turn_id: next_turn,
+                event: BackendCollaboratorEvent::ProgressDelta(next),
             }),
         ) if current_session == &next_session
             && current_turn == &next_turn
@@ -776,17 +812,18 @@ fn merge_backend_event(
 
 fn backend_event_window(event: &Result<BackendEvent, BackendError>) -> Option<Duration> {
     match event {
-        Ok(BackendEvent::TextDelta(text) | BackendEvent::ThinkingDelta(text))
-            if text.len() < COALESCED_CHUNK_MAX_BYTES =>
-        {
-            Some(TEXT_COALESCE_WINDOW)
-        }
+        Ok(
+            BackendEvent::TextDelta(text)
+            | BackendEvent::ProgressDelta(text)
+            | BackendEvent::ThinkingDelta(text),
+        ) if text.len() < COALESCED_CHUNK_MAX_BYTES => Some(TEXT_COALESCE_WINDOW),
         Ok(BackendEvent::ToolOutput { chunk, .. }) if chunk.len() < COALESCED_CHUNK_MAX_BYTES => {
             Some(TOOL_OUTPUT_COALESCE_WINDOW)
         }
         Ok(BackendEvent::CollaboratorEvent {
             event:
                 BackendCollaboratorEvent::TextDelta(text)
+                | BackendCollaboratorEvent::ProgressDelta(text)
                 | BackendCollaboratorEvent::ThinkingDelta(text),
             ..
         }) if text.len() < COALESCED_CHUNK_MAX_BYTES => Some(TEXT_COALESCE_WINDOW),
@@ -803,8 +840,10 @@ fn backend_collaborator_event_size(event: &BackendCollaboratorEvent) -> usize {
         BackendCollaboratorEvent::TurnStarted => 0,
         BackendCollaboratorEvent::UserMessage(text)
         | BackendCollaboratorEvent::TextDelta(text)
+        | BackendCollaboratorEvent::ProgressDelta(text)
         | BackendCollaboratorEvent::ThinkingDelta(text) => text.len(),
-        BackendCollaboratorEvent::ThinkingCompleted
+        BackendCollaboratorEvent::ProgressCompleted
+        | BackendCollaboratorEvent::ThinkingCompleted
         | BackendCollaboratorEvent::CompactionStarted
         | BackendCollaboratorEvent::CompactionCompleted
         | BackendCollaboratorEvent::CompactionFailed => 0,
@@ -835,7 +874,11 @@ fn backend_collaborator_event_size(event: &BackendCollaboratorEvent) -> usize {
 fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
     match event {
         Ok(BackendEvent::SessionStarted { session_id }) => session_id.len(),
-        Ok(BackendEvent::TextDelta(text) | BackendEvent::ThinkingDelta(text)) => text.len(),
+        Ok(
+            BackendEvent::TextDelta(text)
+            | BackendEvent::ProgressDelta(text)
+            | BackendEvent::ThinkingDelta(text),
+        ) => text.len(),
         Ok(BackendEvent::ToolStarted {
             call_id,
             tool,
@@ -896,7 +939,8 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
                 + backend_collaborator_event_size(event)
         }
         Ok(
-            BackendEvent::ThinkingCompleted
+            BackendEvent::ProgressCompleted
+            | BackendEvent::ThinkingCompleted
             | BackendEvent::CompactionStarted
             | BackendEvent::CompactionCompleted
             | BackendEvent::CompactionFailed,

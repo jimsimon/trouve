@@ -10316,6 +10316,20 @@ impl Engine {
                     .persisted
                     .push(Event::AssistantDelta { turn, text: delta });
             }
+            BackendCollaboratorEvent::ProgressDelta(delta) => {
+                if !collaborator.segment.is_empty() {
+                    collaborator.persisted.push(Event::AssistantMessage {
+                        turn,
+                        content: std::mem::take(&mut collaborator.segment),
+                    });
+                }
+                collaborator
+                    .persisted
+                    .push(Event::AssistantProgress { turn, text: delta });
+            }
+            BackendCollaboratorEvent::ProgressCompleted => collaborator
+                .persisted
+                .push(Event::AssistantProgressCompleted { turn }),
             BackendCollaboratorEvent::ThinkingDelta(delta) => {
                 if !collaborator.segment.is_empty() {
                     collaborator.persisted.push(Event::AssistantMessage {
@@ -10963,6 +10977,20 @@ impl Engine {
                     text.push_str(&delta);
                     segment.push_str(&delta);
                     persisted.push(Event::AssistantDelta { turn, text: delta });
+                }
+                BackendEvent::ProgressDelta(delta) => {
+                    // Progress is a block boundary like reasoning and tools:
+                    // keep answer text on either side in separate bubbles.
+                    if !segment.is_empty() {
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
+                    }
+                    persisted.push(Event::AssistantProgress { turn, text: delta });
+                }
+                BackendEvent::ProgressCompleted => {
+                    persisted.push(Event::AssistantProgressCompleted { turn });
                 }
                 BackendEvent::ThinkingDelta(delta) => {
                     // Thinking is a block boundary like a tool call:

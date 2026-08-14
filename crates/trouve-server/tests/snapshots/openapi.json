@@ -7293,6 +7293,52 @@
           },
           {
             "type": "object",
+            "description": "Streamed user-facing progress authored by the agent harness. Progress\nis distinct from both model reasoning and answer text.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The harness explicitly closed the current progress item.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.progress_completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.",
             "required": [
               "turn",
@@ -12369,6 +12415,35 @@
                 "type": "string",
                 "enum": [
                   "assistant"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "User-facing progress authored by the agent harness rather than model\nreasoning or final answer text.",
+            "required": [
+              "turn",
+              "content",
+              "complete",
+              "kind"
+            ],
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "progress"
                 ]
               },
               "turn": {

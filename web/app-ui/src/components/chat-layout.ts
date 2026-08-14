@@ -7,7 +7,7 @@ import {
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "subagent" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
+  { readonly kind: "assistant" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -47,6 +47,7 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
   || item.kind === "steered"
   || item.kind === "subagent"
+  || item.kind === "progress"
   || item.kind === "thinking"
   || item.kind === "compaction"
   || item.kind === "todo"
@@ -266,7 +267,7 @@ export const activityGroupSummary = (items: readonly AgentActivityItem[]): strin
   }
   if (commands > 0) parts.push(`ran ${plural(commands, "command", "commands")}`);
   if (tools > 0) parts.push(`called ${plural(tools, "tool", "tools")}`);
-  if (thoughts > 0) parts.push(`thought ${plural(thoughts, "time", "times")}`);
+  if (thoughts > 0) parts.push(`reasoned ${plural(thoughts, "time", "times")}`);
   if (compactions > 0) {
     parts.push(compactions === 1 ? "compacted context" : `compacted context ${compactions} times`);
   }

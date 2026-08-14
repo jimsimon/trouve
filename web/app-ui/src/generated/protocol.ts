@@ -2615,6 +2615,17 @@ export interface components {
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
+            type: "assistant.progress";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "assistant.progress_completed";
+        } | {
+            text: string;
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
             type: "assistant.thinking";
         } | {
             /** Format: int64 */
@@ -4353,6 +4364,13 @@ export interface components {
             content: string;
             /** @enum {string} */
             kind: "assistant";
+            /** Format: int64 */
+            turn: number;
+        } | {
+            complete: boolean;
+            content: string;
+            /** @enum {string} */
+            kind: "progress";
             /** Format: int64 */
             turn: number;
         } | {

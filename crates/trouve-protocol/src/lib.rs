@@ -261,7 +261,9 @@ pub use requests::*;
 // vendor-local id collisions and delayed-response ambiguity.
 // 5.1: GitHub endpoints report OAuth credentials that need renewed scopes as
 // an explicit authentication-required error instead of an internal failure.
-pub const PROTOCOL_VERSION: &str = "5.1";
+// 5.2: assistant.progress / assistant.progress_completed events and folded
+// Progress thread items distinguish authored agent updates from reasoning.
+pub const PROTOCOL_VERSION: &str = "5.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

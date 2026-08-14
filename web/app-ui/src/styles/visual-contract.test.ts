@@ -627,7 +627,7 @@ describe("Trouve visual contract", () => {
     expect(statusPosition).toBeLessThan(durationPosition);
     expect(thread).not.toContain('class="turn-markdown"');
     expect(thread).toContain('class="agent-copy-action"');
-    expect(thread).toContain('response ? "Copy assistant response" : "Copy assistant update"');
+    expect(thread).toContain('response ? "Copy assistant response" : "Copy assistant progress"');
     expect(markdown).not.toContain(":host(.turn-markdown)");
     expect(thread).toContain('candidate.spawned === true');
     expect(thread).toContain('fontAwesomeIcon("code-branch")');

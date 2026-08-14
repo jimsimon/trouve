@@ -285,6 +285,13 @@ pub enum Event {
     /// final message exactly.
     #[serde(rename = "assistant.delta")]
     AssistantDelta { turn: u64, text: String },
+    /// Streamed user-facing progress authored by the agent harness. Progress
+    /// is distinct from both model reasoning and answer text.
+    #[serde(rename = "assistant.progress")]
+    AssistantProgress { turn: u64, text: String },
+    /// The harness explicitly closed the current progress item.
+    #[serde(rename = "assistant.progress_completed")]
+    AssistantProgressCompleted { turn: u64 },
     /// Streamed model reasoning ("thinking") text, where the provider
     /// exposes it. Display-only: never part of the provider transcript.
     #[serde(rename = "assistant.thinking")]

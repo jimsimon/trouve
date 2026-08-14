@@ -337,13 +337,14 @@ export const runningActivityLabel = (
       && (item.status === "running" || item.status === "awaiting-approval")
     ) return undefined;
     if (item.kind === "thinking" && item.complete === false) return undefined;
+    if (item.kind === "progress" && item.complete === false) return undefined;
     if (item.kind === "assistant" && item.complete === false) return undefined;
     if (item.kind === "compaction" && record(item.state)?.kind === "running") {
       return undefined;
     }
     if (item.kind === "questions" && item.answers === undefined) return undefined;
   }
-  return thinking ? "Thinking…" : "Processing…";
+  return thinking ? "Reasoning" : "Progress";
 };
 
 const diffLine = (

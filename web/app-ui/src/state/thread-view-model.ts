@@ -92,6 +92,13 @@ export type ThreadChatItem =
     }
   | {
       readonly id: string;
+      readonly kind: "progress";
+      readonly turn: number;
+      content: string;
+      complete: boolean;
+    }
+  | {
+      readonly id: string;
       readonly kind: "thinking";
       readonly turn: number;
       content: string;
@@ -382,6 +389,14 @@ export class ThreadViewModel {
           content: item.content,
           complete: item.complete,
         };
+      case "progress":
+        return {
+          id,
+          kind: "progress",
+          turn: item.turn,
+          content: item.content,
+          complete: item.complete,
+        };
       case "thinking":
         return {
           id,
@@ -610,6 +625,7 @@ export class ThreadViewModel {
         });
         return true;
       case "turn.steered":
+        this.finishProgress();
         this.finishThinking();
         this.appendItem({
           id: `steered:${envelope.turn}:${envelope.cursor}`,
@@ -621,6 +637,7 @@ export class ThreadViewModel {
         return true;
       case "subagent.spawned":
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         this.appendItem({
           id: `subagent:${envelope.thread_id}:${envelope.cursor}`,
@@ -633,8 +650,27 @@ export class ThreadViewModel {
           ...(envelope.call_id == null ? {} : { callId: envelope.call_id }),
         });
         return true;
+      case "assistant.progress": {
+        this.failOpenCompaction(envelope.turn);
+        this.finishThinking();
+        const current = this.findTrailingOpen("progress", envelope.turn);
+        if (current?.kind === "progress") current.content += envelope.text;
+        else {
+          this.appendItem({
+            id: this.nextItemId(`progress:${envelope.turn}`),
+            kind: "progress",
+            turn: envelope.turn,
+            content: envelope.text,
+            complete: false,
+          });
+        }
+        return true;
+      }
+      case "assistant.progress_completed":
+        return this.finishProgress();
       case "assistant.thinking": {
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.thinking = true;
         const current = this.findTrailingOpen("thinking", envelope.turn);
         if (current?.kind === "thinking") current.content += envelope.text;
@@ -653,6 +689,7 @@ export class ThreadViewModel {
         return this.finishThinking();
       case "assistant.delta": {
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         const current = this.findTrailingOpen("assistant", envelope.turn);
         if (current?.kind === "assistant") current.content += envelope.text;
@@ -669,6 +706,7 @@ export class ThreadViewModel {
       }
       case "assistant.message": {
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         const current = this.findTrailingOpen("assistant", envelope.turn);
         if (current?.kind === "assistant") {
@@ -687,6 +725,7 @@ export class ThreadViewModel {
       }
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
@@ -764,6 +803,7 @@ export class ThreadViewModel {
       }
       case "question.requested":
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         if (!this.pendingQuestions.includes(envelope.request_id)) {
           this.pendingQuestions.push(envelope.request_id);
@@ -801,6 +841,7 @@ export class ThreadViewModel {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
@@ -819,6 +860,7 @@ export class ThreadViewModel {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
@@ -832,6 +874,7 @@ export class ThreadViewModel {
         this.#capacityAcquiredBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
         this.finishThinking();
         const toolsChanged = this.abortOpenTools(envelope.ts);
         this.pendingQuestions.length = 0;
@@ -930,7 +973,7 @@ export class ThreadViewModel {
   }
 
   private findTrailingOpen(
-    kind: "assistant" | "thinking",
+    kind: "assistant" | "progress" | "thinking",
     turn: number,
   ): ThreadChatItem | undefined {
     return this.#findLast(
@@ -945,6 +988,15 @@ export class ThreadViewModel {
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
     if (item?.kind !== "thinking") return wasThinking;
+    item.complete = true;
+    return true;
+  }
+
+  private finishProgress(): boolean {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "progress" && !candidate.complete,
+    );
+    if (item?.kind !== "progress") return false;
     item.complete = true;
     return true;
   }

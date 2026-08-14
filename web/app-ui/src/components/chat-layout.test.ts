@@ -376,7 +376,7 @@ describe("activityGroupSummary", () => {
       { id: "x1", kind: "thinking", turn: 1, content: "hmm", complete: true },
     ];
     expect(activityGroupSummary(items)).toBe(
-      "Edited 1 file, read 1 file, ran 1 command, thought 1 time",
+      "Edited 1 file, read 1 file, ran 1 command, reasoned 1 time",
     );
   });
 
