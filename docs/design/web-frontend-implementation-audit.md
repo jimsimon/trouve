@@ -7,6 +7,10 @@ implementation to the sole product frontend and removed the Slint rollback,
 widget crates, build inputs, and attribution. The traceability tables below
 preserve the evidence and gate status at the time of the audit.
 
+**Servo retirement update (2026-08-14):** ADR 0039 removed the Servo
+qualification implementations and CI. Servo references below describe the
+repository at the audit date and are not current implementation claims.
+
 **Plan:** [Web frontend migration implementation plan](web-frontend-migration-plan.md)
 
 **Surface ledger:** [Web frontend parity and qualification ledger](web-frontend-parity-ledger.md)
@@ -29,8 +33,8 @@ screen/callback inventory alone could not expose.
 
 At the audit date, platform and rollout qualification remained open. The
 subsequent Wry rollout, daily-use fixes, memory investigation, and retirement
-decision are recorded by ADRs 0027 and 0028. PWA deployment and Servo
-qualification remain independent work; neither requires a second product UI.
+decisions are recorded by ADRs 0027, 0028, and 0039. PWA deployment remains
+independent work and does not require a second product UI.
 
 One repository-visible decision also remains unapproved: the implementation
 uses self-hosted WebAwesome Free for selected ordinary/brand controls while

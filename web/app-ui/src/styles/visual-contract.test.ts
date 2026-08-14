@@ -721,10 +721,10 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.mobile-nav button \{[^}]*min-height:\s*44px/);
   });
 
-  it("keeps load-bearing styles compatible with the pinned Servo preview", () => {
-    const servoStyles = [tokens, app, newThread, automations, review].join("\n");
-    expect(servoStyles).not.toContain(":has(");
-    expect(servoStyles).not.toContain("color-mix(");
+  it("keeps load-bearing styles compatible with supported system webviews", () => {
+    const desktopStyles = [tokens, app, newThread, automations, review].join("\n");
+    expect(desktopStyles).not.toContain(":has(");
+    expect(desktopStyles).not.toContain("color-mix(");
     expect(app).toContain(".attachment-button:focus-within");
     expect(app).toContain(".attachment-button.disabled");
     expect(automations).toContain(".day-option.selected");

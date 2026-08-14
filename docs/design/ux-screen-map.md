@@ -2,10 +2,9 @@
 
 The shared information architecture and screen inventory for every trouve
 client. The Lit/Wry desktop is the product frontend, and the same Lit
-application supplies the initial mobile PWA. The Servo-first embedder remains
-a qualification preview, not a second product UI. `trouve-client-core` and
-protocol fixtures define shared semantics while rendering layers adapt layout
-without redesigning the experience (ADR 0028).
+application supplies the initial mobile PWA. `trouve-client-core` and protocol
+fixtures define shared semantics while rendering layers adapt layout without
+redesigning the experience (ADRs 0028 and 0039).
 
 ## Design principles
 
@@ -132,17 +131,17 @@ capability evidence; they are not a prerequisite for the initial delivery.
 ## Lit functional port and remaining gates
 
 The Lit application now implements the named screens and the existing Slint
-`AppWindow` callback contract across the exact-nightly Servo embedder, the
-default system-webview host, and the responsive PWA. The desktop hosts
-expose the versioned typed capability boundary for preferences, pickers,
+`AppWindow` callback contract across the default system-webview host and the
+responsive PWA. The desktop host exposes the versioned typed capability
+boundary for preferences, pickers,
 clipboard, validated local-file and HTTPS opening, notifications, attention,
 sleep, and window/lifecycle state. The PWA uses browser capability adapters
 and retains explicit fallbacks or explanations where the browser cannot
 provide the equivalent operation.
 
-ADR 0028 subsequently made Wry/Lit the sole shipping desktop frontend. This is
-not a claim that every hardening or alternative-engine qualification is
-complete. Native and browser notification paths are
+ADR 0028 subsequently made Wry/Lit the sole shipping desktop frontend, and ADR
+0039 retired the alternative Servo qualification paths. Native and browser
+notification paths are
 wired, including preference gating, event-derived summaries, focused-session
 suppression, activation routing, and a user-initiated test; dependable PWA
 background delivery remains a publication gate. Promotion still requires the

@@ -1,12 +1,10 @@
-//! Shared bootstrap and lifecycle for desktop Wry and qualification hosts.
+//! Shared bootstrap and lifecycle for desktop Wry hosts.
 //!
 //! The first product host owns one embedded `trouve-server`; later product
 //! windows attach to that elected owner unless `TROUVE_SERVER_URL` explicitly
-//! selects another process. Qualification hosts always require that explicit
+//! selects another process. Comparison hosts always require that explicit
 //! URL so they cannot silently become an owner of the default database.
 
-use std::future::Future;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -40,34 +38,6 @@ pub struct WebPreviewHost {
 }
 
 impl WebPreviewHost {
-    /// Connect to the explicitly configured protocol server, verify it is
-    /// responsive, and serve the packaged frontend through the desktop
-    /// gateway. No protocol server or durable store is opened here.
-    // Used by the external Servo qualification binary; this sibling module is
-    // also compiled independently for the Wry binary.
-    #[allow(dead_code)]
-    pub fn start(frontend: FrontendSource) -> Result<Self> {
-        Self::start_with_actions(frontend, native_actions(), false)
-    }
-
-    /// Start the gateway with an application-owned, event-loop-backed
-    /// directory picker. The callback itself is async and never blocks the
-    /// gateway runtime while the operating system dialog is open.
-    // Used by the Wry qualification binary; this sibling module is also
-    // compiled independently for the external Servo runner.
-    #[allow(dead_code)]
-    pub fn start_with_directory_picker<F, Fut>(frontend: FrontendSource, picker: F) -> Result<Self>
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Option<PathBuf>, String>> + Send + 'static,
-    {
-        Self::start_with_actions(
-            frontend,
-            native_actions().with_directory_picker(picker),
-            false,
-        )
-    }
-
     /// Start with the complete, explicitly app-owned native action set.
     #[allow(dead_code)]
     pub fn start_with_native_actions(
@@ -79,7 +49,7 @@ impl WebPreviewHost {
 
     /// Start the shipping desktop host. With no configured upstream, this
     /// process claims the local server/database or attaches to their owner.
-    // The shared support module is also compiled into qualification binaries.
+    // The shared support module is also compiled into the comparison binary.
     #[allow(dead_code)]
     pub fn start_product_with_native_actions(
         frontend: FrontendSource,
@@ -265,11 +235,6 @@ async fn wait_for_server_info(protocol: &ProtocolClient) -> Result<trouve_protoc
     })
     .await
     .context("timed out after 5 seconds")?
-}
-
-fn native_actions() -> HostNativeActions {
-    HostNativeActions::default()
-        .with_external_https_opener(|url| super::opener::open(url.as_url().as_str()))
 }
 
 impl Drop for WebPreviewHost {

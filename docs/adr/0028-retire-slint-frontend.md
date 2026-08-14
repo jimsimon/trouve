@@ -1,6 +1,6 @@
 # ADR 0028: Retire the Slint frontend
 
-Status: Accepted (2026-08)
+Status: Partially superseded by ADR 0039 (2026-08)
 
 ## Context
 

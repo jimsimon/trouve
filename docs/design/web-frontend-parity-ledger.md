@@ -5,9 +5,13 @@ frontend and removed the Slint rollback. Slint comparisons below are retained
 as historical migration evidence; current visual authority lives in Trouve's
 CSS themes, component gallery, and browser regression suite.
 
-**Status:** Historical migration complete under ADR 0028; ongoing Wry and Servo qualification remains tracked
+**Servo retirement update (2026-08-14):** ADR 0039 removed both Servo
+qualification hosts and their CI. Servo entries below are historical evidence,
+not current gates or runbooks.
 
-**Last updated:** 2026-08-07
+**Status:** Historical migration complete under ADRs 0028 and 0039
+
+**Last updated:** 2026-08-14
 
 **Migration plan:** [Web frontend migration implementation plan](web-frontend-migration-plan.md)
 
@@ -30,8 +34,8 @@ inventories the remaining Rust desktop-host boundary and mechanically rejects
 an unreviewed native source or Rust/TypeScript thread-event reducer mismatch.
 
 This remains an implementation and evidence ledger. ADR 0028 subsequently
-made Wry/Lit the sole product frontend; open qualification entries now track
-hardening and Servo evaluation rather than gating a Slint rollback.
+made Wry/Lit the sole product frontend. ADR 0039 later retired Servo
+evaluation; remaining open entries concern shipping Wry/PWA hardening.
 
 The current labels describe how much of a workflow can be exercised in the
 feature-gated preview:

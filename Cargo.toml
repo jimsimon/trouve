@@ -10,12 +10,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# The pinned Servo nightly and trouve-server use incompatible libsqlite3-sys
-# link versions.
-# Keep the disposable embedding qualification harness in a nested workspace
-# with its own lockfile so the exact pinned engine can be tested without
-# changing the product server's database dependency.
-exclude = ["crates/trouve-servo-embed-preview"]
 
 [workspace.package]
 version = "3.7.0"
@@ -30,7 +24,6 @@ async-trait = "0.1"
 bytes = "1"
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
 futures = "0.3"
 fontdb = "0.23.0"

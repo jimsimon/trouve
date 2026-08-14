@@ -87,11 +87,10 @@ fn generate_web_assets() {
             .expect("writing generated source");
         }
     } else {
-        let desktop_preview_enabled = std::env::var_os("CARGO_FEATURE_WEB_PREVIEW").is_some()
-            || std::env::var_os("CARGO_FEATURE_SERVO_PREVIEW").is_some();
+        let desktop_preview_enabled = std::env::var_os("CARGO_FEATURE_WEB_PREVIEW").is_some();
         if desktop_preview_enabled {
             println!(
-                "cargo:warning=no frontend assets were embedded; qualification targets may load TROUVE_APP_UI_DIST at runtime or proxy TROUVE_APP_UI_DEV_URL, while the product target will refuse to start"
+                "cargo:warning=no frontend assets were embedded; preview targets may load TROUVE_APP_UI_DIST at runtime or proxy TROUVE_APP_UI_DEV_URL, while the product target will refuse to start"
             );
         }
         source.push_str(

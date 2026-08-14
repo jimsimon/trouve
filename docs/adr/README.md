@@ -32,12 +32,12 @@ sequentially.
 | [0020](0020-canonical-model-catalog-with-availability-overlays.md) | Canonical model catalog with availability overlays | Accepted |
 | [0021](0021-derived-thread-view-snapshots.md) | Derived thread-view snapshots | Accepted |
 | [0022](0022-bounded-thread-view-pages.md) | Bounded thread-view pages | Superseded by 0033 |
-| [0023](0023-lit-web-frontend-and-webview-host.md) | Lit web frontend and gated webview host | Partially superseded by 0028 |
-| [0024](0024-isolated-servo-embedding-qualification-workspace.md) | Isolated Servo embedding qualification workspace | Accepted |
-| [0025](0025-pin-servo-qualification-to-nightly-revision.md) | Pin Servo qualification to a nightly revision | Accepted |
+| [0023](0023-lit-web-frontend-and-webview-host.md) | Lit web frontend and gated webview host | Partially superseded by 0028 and 0039 |
+| [0024](0024-isolated-servo-embedding-qualification-workspace.md) | Isolated Servo embedding qualification workspace | Superseded by 0039 |
+| [0025](0025-pin-servo-qualification-to-nightly-revision.md) | Pin Servo qualification to a nightly revision | Superseded by 0039 |
 | [0026](0026-desktop-frontend-asset-sources.md) | Desktop frontend asset sources | Accepted |
 | [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Superseded by 0028 |
-| [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Accepted |
+| [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Partially superseded by 0039 |
 | [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |
 | [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Accepted |
 | [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |
@@ -48,3 +48,4 @@ sequentially.
 | [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |
 | [0037](0037-capability-scoped-external-read-roots.md) | Capability-scoped external read roots | Accepted |
 | [0038](0038-process-wide-child-launch-synchronization.md) | Process-wide child-launch synchronization | Accepted |
+| [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |

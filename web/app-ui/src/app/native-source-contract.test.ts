@@ -11,7 +11,6 @@ const sourceRoots = [
   "crates/trouve-client-core/src",
   "crates/trouve-desktop-host/src",
   "crates/trouve-desktop-host/tests",
-  "crates/trouve-servo-embed-preview/src",
 ] as const;
 
 /** Every native frontend-host source. Keep this explicit so native UI logic
@@ -20,7 +19,6 @@ const auditedSources = [
   "crates/trouve-app/build.rs",
   "crates/trouve-app/src/native_notification.rs",
   "crates/trouve-app/src/opener.rs",
-  "crates/trouve-app/src/servo_preview.rs",
   "crates/trouve-app/src/sleep.rs",
   "crates/trouve-app/src/web_preview.rs",
   "crates/trouve-app/src/web_preview_support.rs",
@@ -32,10 +30,6 @@ const auditedSources = [
   "crates/trouve-desktop-host/src/gateway.rs",
   "crates/trouve-desktop-host/src/lib.rs",
   "crates/trouve-desktop-host/tests/openapi_snapshot.rs",
-  "crates/trouve-servo-embed-preview/src/main.rs",
-  "crates/trouve-servo-embed-preview/src/native_notification.rs",
-  "crates/trouve-servo-embed-preview/src/system_opener.rs",
-  "crates/trouve-servo-embed-preview/src/web_preview_support.rs",
 ] as const;
 
 const collectFrontendSources = (path: string): readonly string[] => {

@@ -427,7 +427,7 @@ export const createBrowserComposerDraftController = (): ComposerDraftController 
       attachmentStorage = browserComposerDraftAttachmentStorage(globalThis.indexedDB);
     }
   } catch {
-    // Servo or a restricted browser may not expose IndexedDB.
+    // A restricted browser may not expose IndexedDB.
   }
   return new ComposerDraftController({
     ...(textStorage === undefined ? {} : { textStorage }),
