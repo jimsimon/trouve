@@ -2679,6 +2679,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   }
 
   #renderTransientActivityNode(label: string) {
+    const categoryIcon = label === "Reasoning"
+      ? "brain"
+      : label === "Progress"
+        ? "message"
+        : undefined;
     return html`
       <section
         class="turn-rail-node turn-transient-activity"
@@ -2687,10 +2692,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         aria-label=${label}
       >
         <span class="turn-rail-marker transient" aria-hidden="true">
-          ${fontAwesomeIcon("spinner", {
-            className: "turn-transient-spinner",
-            spin: true,
-          })}
+          ${categoryIcon === undefined
+            ? fontAwesomeIcon("spinner", {
+                className: "turn-transient-spinner",
+                spin: true,
+              })
+            : fontAwesomeIcon(categoryIcon)}
         </span>
         <header class="turn-node-header"><strong>${label}</strong></header>
       </section>

@@ -603,6 +603,10 @@ describe("Trouve visual contract", () => {
     expect(thread).toContain("message-body turn-body-stream agent-body-stream turn-timeline");
     expect(thread).not.toContain("turn-activity-footer");
     expect(thread).toContain('class="turn-rail-node turn-transient-activity"');
+    expect(thread).toMatch(
+      /const categoryIcon = label === "Reasoning"\s+\? "brain"\s+: label === "Progress"\s+\? "message"/s,
+    );
+    expect(thread).toContain("fontAwesomeIcon(categoryIcon)");
     expect(thread).toContain('className: "turn-transient-spinner"');
     expect(thread).toContain('this.#renderContextUsage(turnContextUsage, "turn-context-usage")');
     expect(thread).toContain('class="turn-node-body user-body-stream"');
