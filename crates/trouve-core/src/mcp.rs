@@ -3281,7 +3281,7 @@ for line in sys.stdin:
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            command.spawn().unwrap()
+            trouve_process::spawn(&mut command).unwrap()
         };
 
         let mut first = spawn_helper("hold");

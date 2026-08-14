@@ -68,6 +68,7 @@ trouve-server = { path = "crates/trouve-server", version = "3.7.0" }
 trouve-client-core = { path = "crates/trouve-client-core", version = "3.7.0" }
 trouve-thread-view = { path = "crates/trouve-thread-view", version = "3.7.0" }
 trouve-desktop-host = { path = "crates/trouve-desktop-host", version = "3.7.0" }
+trouve-process = { path = "crates/trouve-process", version = "3.7.0" }
 
 [profile.release]
 lto = "thin"

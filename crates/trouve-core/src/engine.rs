@@ -14338,12 +14338,9 @@ mod tests {
 
     fn init_engine_test_repo(path: &Path) {
         let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(args)
-                .output()
-                .unwrap();
+            let mut command = std::process::Command::new("git");
+            command.arg("-C").arg(path).args(args);
+            let output = trouve_process::output(&mut command).unwrap();
             assert!(
                 output.status.success(),
                 "git {args:?} failed: {}",
@@ -15332,16 +15329,13 @@ mod tests {
             !worktree_root.exists() || std::fs::read_dir(worktree_root).unwrap().next().is_none(),
             "failed creation left a worktree directory"
         );
-        let refs = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/trouve/checkpoints/",
-            ])
-            .output()
-            .unwrap();
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(&repo).args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/trouve/checkpoints/",
+        ]);
+        let refs = trouve_process::output(&mut command).unwrap();
         assert!(refs.status.success());
         assert!(
             refs.stdout.is_empty(),
@@ -17412,11 +17406,10 @@ default_permission_mode = "ask"
     #[test]
     fn archive_and_workspace_close_tear_down_terminals_until_reopened() {
         let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("git");
+        command.args(["init", "-b", "main"]).arg(dir.path());
         assert!(
-            std::process::Command::new("git")
-                .args(["init", "-b", "main"])
-                .arg(dir.path())
-                .output()
+            trouve_process::output(&mut command)
                 .unwrap()
                 .status
                 .success()

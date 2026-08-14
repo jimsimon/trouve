@@ -34,7 +34,7 @@ fn start_worker() -> Option<SyncSender<OsString>> {
         .name("trouve-opener".into())
         .spawn(move || {
             while let Ok(path) = receiver.recv() {
-                if let Err(error) = open::that(&path) {
+                if let Err(error) = trouve_process::with_spawn_lock(|| open::that(&path)) {
                     tracing::warn!(
                         %error,
                         path = %path.to_string_lossy(),

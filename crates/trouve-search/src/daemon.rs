@@ -277,7 +277,7 @@ mod unix {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn()?;
+        let mut child = trouve_process::spawn(&mut cmd)?;
         // Reap in the background; the child exits quickly when another
         // daemon already holds the lock.
         std::thread::spawn(move || {

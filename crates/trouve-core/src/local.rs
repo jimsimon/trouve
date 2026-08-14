@@ -602,12 +602,12 @@ pub fn probe_hardware() -> Hardware {
     }
 
     // NVIDIA via nvidia-smi (present wherever the proprietary driver is).
-    if let Ok(out) = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
+    let mut nvidia_smi = std::process::Command::new("nvidia-smi");
+    nvidia_smi.args([
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    if let Ok(out) = trouve_process::output(&mut nvidia_smi)
         && out.status.success()
     {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -643,10 +643,9 @@ fn probe_ram() -> Option<u64> {
             Some(kb * 1024)
         }
         "macos" => {
-            let out = std::process::Command::new("sysctl")
-                .args(["-n", "hw.memsize"])
-                .output()
-                .ok()?;
+            let mut command = std::process::Command::new("sysctl");
+            command.args(["-n", "hw.memsize"]);
+            let out = trouve_process::output(&mut command).ok()?;
             String::from_utf8_lossy(&out.stdout).trim().parse().ok()
         }
         _ => None,
@@ -769,10 +768,9 @@ fn process_cmdline(pid: u32) -> Option<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let out = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("ps");
+        command.args(["-p", &pid.to_string(), "-o", "command="]);
+        let out = trouve_process::output(&mut command).ok()?;
         let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (out.status.success() && !cmd.is_empty()).then_some(cmd)
     }
@@ -780,13 +778,17 @@ fn process_cmdline(pid: u32) -> Option<String> {
 
 fn kill_pid(pid: u32) {
     #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status();
+    {
+        let mut command = std::process::Command::new("kill");
+        command.args(["-9", &pid.to_string()]);
+        let _ = trouve_process::status(&mut command);
+    }
     #[cfg(not(unix))]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .status();
+    {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/F", "/PID", &pid.to_string()]);
+        let _ = trouve_process::status(&mut command);
+    }
 }
 
 struct Running {
@@ -1160,8 +1162,7 @@ impl LlamaManager {
             }
             cmd.env(key, val);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = trouve_process::with_spawn_lock(|| cmd.spawn())
             .with_context(|| format!("spawning {}", bin.display()))?;
         // Into the pidfile before anything can go wrong: a crash during the
         // multi-minute model load must still leave a trail to reap. (Capture
@@ -1620,10 +1621,9 @@ mod tests {
         // pids get recycled, and killing an innocent process is the one
         // unforgivable failure mode here.
         let tmp = tempfile::tempdir().unwrap();
-        let mut bystander = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let mut bystander = trouve_process::spawn(&mut command).unwrap();
         let path = pids_path(tmp.path());
         write_pids(&path, &[bystander.id()]);
 

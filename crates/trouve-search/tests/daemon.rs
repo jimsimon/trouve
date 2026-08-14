@@ -26,16 +26,16 @@ impl McpSession {
     /// toy model, and a short daemon idle timeout so leftover daemons from
     /// a test run exit promptly.
     fn spawn(cache: &str, model: &str, daemon: bool) -> McpSession {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_trouve-search"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_trouve-search"));
+        command
             .env("TROUVE_CACHE_LOCATION", cache)
             .env("TROUVE_MODEL_NAME", model)
             .env("TROUVE_DAEMON", if daemon { "1" } else { "0" })
             .env("TROUVE_DAEMON_IDLE_SECONDS", "2")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn trouve-search");
+            .stderr(Stdio::null());
+        let mut child = trouve_process::spawn(&mut command).expect("spawn trouve-search");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         McpSession {
@@ -152,16 +152,16 @@ fn concurrent_sessions_share_one_daemon() {
 
 /// Spawn a foreground `trouve-search daemon` and wait for its socket.
 fn spawn_daemon(cache: &str, model: &str) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_trouve-search"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trouve-search"));
+    command
         .arg("daemon")
         .env("TROUVE_CACHE_LOCATION", cache)
         .env("TROUVE_MODEL_NAME", model)
         .env("TROUVE_DAEMON_IDLE_SECONDS", "30")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn trouve-search daemon");
+        .stderr(Stdio::null());
+    let child = trouve_process::spawn(&mut command).expect("spawn trouve-search daemon");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while socket_count(cache) == 0 {
         assert!(

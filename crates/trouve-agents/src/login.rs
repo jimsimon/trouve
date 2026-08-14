@@ -57,7 +57,8 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
     // The review client opens the captured URL in the user's browser.
     #[cfg(unix)]
     cmd.env("BROWSER", "true");
-    let mut child = pair.slave.spawn_command(cmd).map_err(pty_error)?;
+    let mut child =
+        trouve_process::with_spawn_lock(|| pair.slave.spawn_command(cmd)).map_err(pty_error)?;
     drop(pair.slave);
 
     let reader = match pair.master.try_clone_reader() {
@@ -142,10 +143,11 @@ async fn spawn_login_inner(
     // (xdg-open / open).
     #[cfg(unix)]
     cmd.env("BROWSER", "true");
-    let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
-        _ => BackendError::Io(e),
-    })?;
+    let mut child =
+        trouve_process::with_spawn_lock(|| cmd.spawn()).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
+            _ => BackendError::Io(e),
+        })?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");

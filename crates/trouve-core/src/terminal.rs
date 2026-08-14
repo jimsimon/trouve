@@ -182,9 +182,7 @@ impl TerminalManager {
         cmd.cwd(worktree);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        let child = pair
-            .slave
-            .spawn_command(cmd)
+        let child = trouve_process::with_spawn_lock(|| pair.slave.spawn_command(cmd))
             .map_err(|e| anyhow!("spawning shell: {e}"))?;
         drop(pair.slave);
 

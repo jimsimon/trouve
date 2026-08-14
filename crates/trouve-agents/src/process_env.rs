@@ -20,12 +20,6 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-// Darwin has no `pipe2(O_CLOEXEC)`, so creating the descendant sentinel and
-// marking both ends close-on-exec is not atomic. Serialize our process-tree
-// spawns across that window: otherwise a concurrent spawn can inherit another
-// tree's writer and make its cleanup wait for an unrelated process.
-#[cfg(target_os = "macos")]
-static MACOS_PROCESS_TREE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
 const WINDOWS_PROCESS_TREE_CREATION_FLAGS: u32 =
     windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -411,12 +405,13 @@ impl Drop for ProcessTreeChild {
 pub fn spawn_process_tree(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<ProcessTreeChild> {
-    command.kill_on_drop(true);
+    trouve_process::with_spawn_lock(|| spawn_process_tree_locked(command))
+}
 
-    #[cfg(target_os = "macos")]
-    let _spawn_guard = MACOS_PROCESS_TREE_SPAWN_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn spawn_process_tree_locked(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<ProcessTreeChild> {
+    command.kill_on_drop(true);
 
     #[cfg(unix)]
     {
@@ -490,11 +485,12 @@ pub fn spawn_process_tree(
 pub fn spawn_blocking_process_tree(
     command: &mut std::process::Command,
 ) -> std::io::Result<BlockingProcessTreeChild> {
-    #[cfg(target_os = "macos")]
-    let _spawn_guard = MACOS_PROCESS_TREE_SPAWN_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    trouve_process::with_spawn_lock(|| spawn_blocking_process_tree_locked(command))
+}
 
+fn spawn_blocking_process_tree_locked(
+    command: &mut std::process::Command,
+) -> std::io::Result<BlockingProcessTreeChild> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1131,7 +1127,7 @@ fn capture_shell_path(shell: &Path) -> Option<OsString> {
     isolate_process_group(&mut command);
     let mut output = tempfile::tempfile().ok()?;
     command.stdout(Stdio::from(output.try_clone().ok()?));
-    let mut child = command.spawn().ok()?;
+    let mut child = trouve_process::spawn(&mut command).ok()?;
     let status = wait_for_capture(&mut child, PATH_CAPTURE_TIMEOUT);
     status?.success().then_some(())?;
     output.rewind().ok()?;
@@ -1359,7 +1355,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         isolate_process_group(&mut command);
-        let mut child = command.spawn().unwrap();
+        let mut child = trouve_process::spawn(&mut command).unwrap();
 
         assert!(
             wait_for_capture(&mut child, Duration::from_millis(100)).is_none(),
@@ -1437,7 +1433,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut unrelated = unrelated.spawn().unwrap();
+        let mut unrelated = trouve_process::spawn(&mut unrelated).unwrap();
         drop(writer);
         assert!(unix_descendant_sentinel_active(&sentinel).unwrap());
 
@@ -1543,14 +1539,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_process_tree_spawns_keep_sentinels_isolated() {
+    async fn concurrent_guarded_spawns_keep_sentinels_isolated() {
         const CHILD_COUNT: usize = 24;
 
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CHILD_COUNT));
-        let mut spawns = Vec::with_capacity(CHILD_COUNT);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CHILD_COUNT * 2));
+        let mut tree_spawns = Vec::with_capacity(CHILD_COUNT);
+        let mut direct_spawns = Vec::with_capacity(CHILD_COUNT);
         for _ in 0..CHILD_COUNT {
             let barrier = barrier.clone();
-            spawns.push(tokio::spawn(async move {
+            tree_spawns.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let mut command = tokio::process::Command::new("/bin/sh");
                 command
@@ -1560,17 +1557,36 @@ mod tests {
                     .stderr(Stdio::null());
                 spawn_process_tree(&mut command).unwrap()
             }));
+            let barrier = barrier.clone();
+            direct_spawns.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut command = tokio::process::Command::new("/bin/sleep");
+                command
+                    .arg("60")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                trouve_process::with_spawn_lock(|| command.spawn()).unwrap()
+            }));
         }
 
         let mut children = Vec::with_capacity(CHILD_COUNT);
-        for spawn in spawns {
+        for spawn in tree_spawns {
             children.push(spawn.await.unwrap());
+        }
+        let mut direct_children = Vec::with_capacity(CHILD_COUNT);
+        for spawn in direct_spawns {
+            direct_children.push(spawn.await.unwrap());
         }
         for child in &mut children {
             tokio::time::timeout(Duration::from_secs(2), child.terminate_and_reap())
                 .await
-                .expect("concurrent macOS spawn leaked a foreign sentinel writer")
+                .expect("concurrent macOS launch leaked a foreign sentinel writer")
                 .unwrap();
+        }
+        for child in &mut direct_children {
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
         }
     }
 
@@ -1671,7 +1687,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         member_command.process_group(child.process_group);
-        let mut member = member_command.spawn().unwrap();
+        let mut member = trouve_process::with_spawn_lock(|| member_command.spawn()).unwrap();
 
         assert_eq!(unsafe { libc::kill(leader as i32, libc::SIGKILL) }, 0);
         tokio::time::timeout(Duration::from_secs(2), async {

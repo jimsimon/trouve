@@ -111,12 +111,10 @@ impl Provider for ScriptedProvider {
 
 fn init_repo(dir: &Path) {
     let run = |args: &[&str]| {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(dir).args(args);
         assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
+            trouve_process::output(&mut command)
                 .unwrap()
                 .status
                 .success(),
@@ -279,24 +277,18 @@ async fn session_diff_manifest_and_selected_file_patch_are_independent() {
     init_repo(&repo);
     std::fs::create_dir(repo.join("docs")).unwrap();
     std::fs::write(repo.join("docs/setup guide.md"), "old guide\n").unwrap();
-    assert!(
-        Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["add", "docs/setup guide.md"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["commit", "-m", "add guide"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(&repo)
+        .args(["add", "docs/setup guide.md"]);
+    assert!(trouve_process::status(&mut command).unwrap().success());
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-m", "add guide"]);
+    assert!(trouve_process::status(&mut command).unwrap().success());
 
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
