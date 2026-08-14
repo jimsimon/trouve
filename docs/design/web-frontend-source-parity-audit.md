@@ -17,6 +17,9 @@ keeps the remaining Rust host boundary explicit, and
 preserves executable evidence for the established application actions. Paths
 in the historical matrices below are available through version control.
 
+**Servo retirement update (2026-08-14):** ADR 0039 also removed the audited
+Servo sources. Their entries below remain historical source-parity evidence.
+
 ## Verdict
 
 Every retained Rust or Slint frontend source is accounted for below. The audit

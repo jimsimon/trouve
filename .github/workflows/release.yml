@@ -93,13 +93,7 @@ jobs:
           mkdir -p target/release-compliance
           python3 scripts/generate_rust_third_party_notices.py \
             --check --sbom target/release-compliance/rust-sbom.cdx.json
-          python3 scripts/generate_rust_third_party_notices.py \
-            --manifest-path crates/trouve-servo-embed-preview/Cargo.toml \
-            --notice crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md \
-            --check --sbom target/release-compliance/servo-rust-sbom.cdx.json
           cp THIRD_PARTY_NOTICES.md target/release-compliance/THIRD_PARTY_NOTICES-RUST.md
-          cp crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md \
-            target/release-compliance/THIRD_PARTY_NOTICES-SERVO.md
       - name: Generate frontend compliance artifacts
         working-directory: web/app-ui
         run: |

@@ -1,7 +1,8 @@
 # Web frontend migration implementation plan
 
-**Status:** Completed; Wry/Lit promoted and Slint retired by ADR 0028
-**Last updated:** 2026-08-07
+**Status:** Historical; Wry/Lit promoted by ADR 0028 and Servo qualification
+retired by ADR 0039
+**Last updated:** 2026-08-14
 **Source analysis:** <https://chatgpt.com/s/cd_6a6e636d63f48191bfed1ce04ae4bac6>
 
 **Qualification ledger:** [Web frontend parity and qualification ledger](web-frontend-parity-ledger.md)
@@ -9,9 +10,9 @@
 **Implementation audit:** [Web frontend implementation audit](web-frontend-implementation-audit.md)
 
 > This document preserves the migration plan and its original gates. ADR 0028
-> records their final disposition: Wry/Lit is the sole product frontend, the
-> Slint rollback and widget crates have been removed, and Servo remains a
-> qualification host for the same Lit application.
+> records their product-frontend disposition, and ADR 0039 retires the Servo
+> qualification paths. Servo references below preserve the original plan and
+> are not current implementation guidance.
 
 ## Outcome
 

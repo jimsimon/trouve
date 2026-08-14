@@ -2592,7 +2592,11 @@ for line in sys.stdin:
 
         let directory = tempfile::tempdir().unwrap();
         let script_path = directory.path().join("fake-cursor-agent");
-        std::fs::write(&script_path, "#!/bin/sh\nIFS= read -r request\nsleep 60\n").unwrap();
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nIFS= read -r request\nIFS= read -r block\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let server = AcpServer::spawn(&script_path.to_string_lossy(), None, directory.path())
             .await

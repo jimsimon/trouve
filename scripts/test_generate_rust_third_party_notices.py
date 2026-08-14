@@ -52,10 +52,8 @@ class RustSbomTests(unittest.TestCase):
             rust_notices.cargo_metadata(pathlib.Path("nested/Cargo.toml"))
 
     def test_nested_notice_commands_and_frontend_link_target_the_nested_graph(self):
-        manifest = pathlib.Path("crates/trouve-servo-embed-preview/Cargo.toml")
-        notice = pathlib.Path(
-            "crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md"
-        )
+        manifest = pathlib.Path("crates/trouve-isolated-preview/Cargo.toml")
+        notice = pathlib.Path("crates/trouve-isolated-preview/THIRD_PARTY_NOTICES.md")
         generated = rust_notices.generate(
             metadata(),
             str(manifest),
@@ -65,8 +63,8 @@ class RustSbomTests(unittest.TestCase):
 
         command = (
             "python3 scripts/generate_rust_third_party_notices.py "
-            "--manifest-path crates/trouve-servo-embed-preview/Cargo.toml "
-            "--notice crates/trouve-servo-embed-preview/THIRD_PARTY_NOTICES.md"
+            "--manifest-path crates/trouve-isolated-preview/Cargo.toml "
+            "--notice crates/trouve-isolated-preview/THIRD_PARTY_NOTICES.md"
         )
         self.assertIn(f"`{command}`", generated)
         self.assertIn(f"`{command} --check`", generated)

@@ -1,6 +1,6 @@
 # ADR 0025: Pin Servo qualification to a nightly revision
 
-Status: Accepted (2026-08)
+Status: Superseded by ADR 0039
 
 ## Context
 

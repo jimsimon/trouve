@@ -171,11 +171,6 @@ jobs:
             echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
             exit 1
           fi
-      - name: Servo nested-workspace dependency graph
-        run: >-
-          cargo metadata
-          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
-          --locked --no-deps --format-version 1 > /dev/null
       - name: Upload Rust compliance evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

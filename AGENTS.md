@@ -24,9 +24,6 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   capability boundary, and replaceable desktop webview host.
 - `crates/trouve-app` — main desktop application; ships the Lit frontend in
   Wry and embeds the protocol server for local use.
-- `crates/trouve-servo-embed-preview` — disposable, chrome-free Servo
-  embedding qualification harness. It is an excluded nested Cargo workspace
-  with its own lockfile, not the shipping desktop host (ADR 0024).
 - `web/app-ui` — Lit application shared by the desktop webview and mobile PWA.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
   design docs (event log schema, UX screen map).
@@ -75,11 +72,6 @@ These are load-bearing. Do not violate them without a new ADR.
    plugin manifest, internal package pin, and release artifact uses root
    `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
    0012). Protocol and storage-format compatibility versions remain separate.
-   `crates/trouve-servo-embed-preview` is the sole Cargo-membership and
-   lockfile exception: its resolver graph is isolated because the pinned Servo
-   nightly and the product server require incompatible native SQLite link
-   versions, but its first-party version and internal pins are still
-   synchronized to the root version (ADRs 0024 and 0025).
 9. **The web host is not a second client protocol.** Wry/Lit is the shipping
    desktop frontend (ADR 0028). The desktop gateway may
    serve assets, proxy HTTP/SSE, and expose narrowly typed native capabilities
@@ -92,8 +84,8 @@ These are load-bearing. Do not violate them without a new ADR.
    enabled by shipping product hosts (ADR 0026). The first default Wry process
    owns one embedded server through `trouve_server::bind_local`; additional
    default windows attach to that elected owner and never open a second Engine
-   or database connection (ADR 0032). Comparison and Servo qualification hosts
-   require an explicit server URL and never open the default database.
+   or database connection (ADR 0032). Comparison hosts require an explicit
+   server URL and never open the default database.
 10. **Child launches share one synchronization boundary.** Every
     trouve-owned child-process launch — including standard and Tokio commands,
     PTYs, daemons, probes, and system-opener libraries — goes through

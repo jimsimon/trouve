@@ -7289,8 +7289,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "trouve-protocol",
  "trouve-process",
+ "trouve-protocol",
  "trouve-providers",
  "windows-sys 0.61.2",
 ]
@@ -7314,8 +7314,8 @@ dependencies = [
  "tracing-subscriber",
  "trouve-client-core",
  "trouve-desktop-host",
- "trouve-protocol",
  "trouve-process",
+ "trouve-protocol",
  "trouve-server",
  "wry",
 ]
@@ -7372,8 +7372,8 @@ dependencies = [
  "toml 1.1.3+spec-1.1.0",
  "tracing",
  "trouve-agents",
- "trouve-protocol",
  "trouve-process",
+ "trouve-protocol",
  "trouve-providers",
  "trouve-search",
  "trouve-thread-view",
@@ -7404,6 +7404,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trouve-process"
+version = "3.7.0"
+
+[[package]]
 name = "trouve-protocol"
 version = "3.7.0"
 dependencies = [
@@ -7425,7 +7429,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "dirs",
  "futures",
  "gcp_auth",
  "getrandom 0.4.3",
@@ -7441,10 +7444,6 @@ dependencies = [
  "tracing",
  "trouve-protocol",
 ]
-
-[[package]]
-name = "trouve-process"
-version = "3.7.0"
 
 [[package]]
 name = "trouve-search"
@@ -7533,7 +7532,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "chrono",
  "futures",
  "reqwest",
  "rustls 0.23.42",
@@ -7546,8 +7544,8 @@ dependencies = [
  "tracing-subscriber",
  "trouve-agents",
  "trouve-core",
- "trouve-protocol",
  "trouve-process",
+ "trouve-protocol",
  "trouve-providers",
  "utoipa",
  "uuid",
