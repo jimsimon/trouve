@@ -535,17 +535,69 @@ test("Settings reopens the last screen until the app restarts", async ({ page })
   await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
 });
 
-test("Modes & Models uses provider-qualified model labels", async ({ page }) => {
+test("Modes & Models saves global defaults on change and keeps mode editing focused", async ({ page }) => {
+  let providers = {
+    default_model: "codex/gpt-5.6-sol",
+    default_permission_mode: "ask",
+    default_thinking_level: "medium" as string | null,
+    providers: [],
+  };
+  const modelDefaults: Array<Record<string, unknown>> = [];
+  const permissionDefaults: Array<Record<string, unknown>> = [];
+  await page.route("**/v1/providers", async (route) => {
+    await route.fulfill({ json: providers });
+  });
   await page.route("**/v1/models", async (route) => {
     await route.fulfill({
-      json: [{
-        id: "codex/gpt-5.6-sol",
-        display_name: "GPT-5.6 Sol",
-        context_window: 500_000,
-        supports_tools: true,
-        options_schema: {},
-      }],
+      json: [
+        {
+          id: "codex/gpt-5.6-sol",
+          display_name: "GPT-5.6 Sol",
+          context_window: 500_000,
+          supports_tools: true,
+          options_schema: {
+            type: "object",
+            properties: {
+              reasoning_effort: {
+                type: "string",
+                enum: ["low", "medium", "high"],
+                default: "medium",
+              },
+            },
+          },
+        },
+        {
+          id: "codex/gpt-5.6-terra",
+          display_name: "GPT-5.6 Terra",
+          context_window: 250_000,
+          supports_tools: true,
+          options_schema: {},
+        },
+      ],
     });
+  });
+  await page.route("**/v1/config/default-model", async (route) => {
+    const request = route.request().postDataJSON() as Record<string, unknown>;
+    modelDefaults.push(request);
+    providers = { ...providers, default_model: String(request["model"]) };
+    if ("default_thinking_level" in request) {
+      providers = {
+        ...providers,
+        default_thinking_level: typeof request["default_thinking_level"] === "string"
+          ? request["default_thinking_level"]
+          : null,
+      };
+    }
+    await route.fulfill({ status: 204 });
+  });
+  await page.route("**/v1/config/default-permission-mode", async (route) => {
+    const request = route.request().postDataJSON() as Record<string, unknown>;
+    permissionDefaults.push(request);
+    providers = {
+      ...providers,
+      default_permission_mode: String(request["permission_mode"]),
+    };
+    await route.fulfill({ status: 204 });
   });
   await page.goto("/settings/modes");
 
@@ -555,6 +607,31 @@ test("Modes & Models uses provider-qualified model labels", async ({ page }) => 
     .toHaveCount(4);
   await expect(page.getByRole("option", { name: "GPT-5.6 Sol", exact: true }))
     .toHaveCount(0);
+  await expect(page.getByLabel("Global Default Thinking"))
+    .toHaveValue("medium");
+  await expect(page.getByText("Implement the user's request by editing files.", { exact: true }))
+    .toHaveCount(0);
+
+  await page.getByLabel("Global Default Thinking").selectOption("high");
+  await expect.poll(() => modelDefaults).toEqual([{
+    model: "codex/gpt-5.6-sol",
+    default_thinking_level: "high",
+  }]);
+  await page.getByLabel("Global Default Model").selectOption("codex/gpt-5.6-terra");
+  await expect.poll(() => modelDefaults).toEqual([{
+    model: "codex/gpt-5.6-sol",
+    default_thinking_level: "high",
+  }, {
+    model: "codex/gpt-5.6-terra",
+  }]);
+  await expect(page.getByLabel("Global Default Thinking")).toBeDisabled();
+  await page.getByLabel("Global Default Permissions").selectOption("yolo");
+  await expect.poll(() => permissionDefaults).toEqual([{ permission_mode: "yolo" }]);
+
+  await page.getByRole("button", { name: "Edit Code", exact: true }).click();
+  const editor = page.locator("form.mode-editor");
+  await expect(editor.getByText("Default model", { exact: true })).toHaveCount(0);
+  await expect(editor.getByText("Default permissions", { exact: true })).toHaveCount(0);
 });
 
 test("automation create and edit preserve model and thinking choices", async ({ page }) => {
