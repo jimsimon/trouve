@@ -31,3 +31,4 @@ reqwest.workspace = true
 tempfile.workspace = true
 trouve-agents.workspace = true
 trouve-providers.workspace = true
+trouve-process.workspace = true

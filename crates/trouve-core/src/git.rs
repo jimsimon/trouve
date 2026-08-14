@@ -114,11 +114,9 @@ impl TemporaryCheckpointIndex {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    let out = trouve_process::output(&mut command)
         .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
     git_result(dir, args, out.status, out.stdout, out.stderr)
 }
@@ -565,12 +563,13 @@ fn bounded_session_diff_path(
 }
 
 fn git_with_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_INDEX_FILE", index)
-        .output()
+        .env("GIT_INDEX_FILE", index);
+    let out = trouve_process::output(&mut command)
         .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
     git_result(dir, args, out.status, out.stdout, out.stderr)
 }
@@ -1472,7 +1471,8 @@ fn with_session_snapshot_index<T>(
 }
 
 fn git_as_checkpoint_identity(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1481,8 +1481,8 @@ fn git_as_checkpoint_identity(dir: &Path, args: &[&str]) -> Result<String> {
         .env("GIT_AUTHOR_NAME", CHECKPOINT_IDENTITY_NAME)
         .env("GIT_AUTHOR_EMAIL", CHECKPOINT_IDENTITY_EMAIL)
         .env("GIT_COMMITTER_NAME", CHECKPOINT_IDENTITY_NAME)
-        .env("GIT_COMMITTER_EMAIL", CHECKPOINT_IDENTITY_EMAIL)
-        .output()
+        .env("GIT_COMMITTER_EMAIL", CHECKPOINT_IDENTITY_EMAIL);
+    let out = trouve_process::output(&mut command)
         .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
     git_result(dir, args, out.status, out.stdout, out.stderr)
 }
@@ -1897,11 +1897,12 @@ pub fn finalize_worktree_creation(creation: &WorktreeCreation) -> Result<()> {
 
 fn ref_exists(repo: &Path, reference: &str) -> Result<bool> {
     ensure_safe_ref(reference)?;
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
-        .args(["show-ref", "--verify", "--quiet", reference])
-        .status()
+        .args(["show-ref", "--verify", "--quiet", reference]);
+    let status = trouve_process::status(&mut command)
         .with_context(|| format!("checking git ref {reference} in {}", repo.display()))?;
     match status.code() {
         Some(0) => Ok(true),
@@ -1986,8 +1987,7 @@ pub fn common_directory(repo: &Path) -> Result<PathBuf> {
         .arg(repo)
         .args(["rev-parse", "--git-common-dir"]);
     clear_inherited_git_process_controls(&mut command);
-    let output = command
-        .output()
+    let output = trouve_process::output(&mut command)
         .with_context(|| format!("resolving git common directory in {}", repo.display()))?;
     let common = git_result(
         repo,
@@ -2497,12 +2497,9 @@ mod tests {
     use super::*;
 
     fn run(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
+        let mut command = Command::new("git");
+        command.arg("-C").arg(dir).args(args);
+        let out = trouve_process::output(&mut command).unwrap();
         assert!(
             out.status.success(),
             "git {args:?} failed in {}: {}",

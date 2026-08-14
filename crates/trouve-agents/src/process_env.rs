@@ -355,6 +355,19 @@ impl ProcessTreeChild {
         tree_result.and(child_result)
     }
 
+    /// Once the leader has exited, signal the remaining process-tree boundary
+    /// again. A child can fork in the brief interval after the first signal was
+    /// sent but before the leader actually exits; this closes that race without
+    /// repeatedly signalling a stale process-group id while an escaped child
+    /// keeps the descendant sentinel open.
+    pub fn retry_termination_after_leader_exit(&mut self) -> std::io::Result<bool> {
+        if self.try_wait_leader()?.is_none() {
+            return Ok(false);
+        }
+        terminate_platform_process_tree(self)?;
+        Ok(true)
+    }
+
     /// Terminate the complete tree and reap its leader before returning.
     pub async fn terminate_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.terminate_and_reap_until(tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT)
@@ -376,11 +389,15 @@ impl ProcessTreeChild {
                     "timed out reaping terminated child process",
                 )
             })??;
+        let retry_result = self.retry_termination_after_leader_exit().map(|_| ());
         let empty_result = wait_for_platform_process_tree_exit_until(self, deadline).await;
         if empty_result.is_ok() {
             self.tree_active = false;
         }
-        terminate_result.and(empty_result).map(|()| status)
+        terminate_result
+            .and(retry_result)
+            .and(empty_result)
+            .map(|()| status)
     }
 
     async fn wait_for_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -403,6 +420,12 @@ impl Drop for ProcessTreeChild {
 
 /// Spawn a directly configured command inside an owned process tree.
 pub fn spawn_process_tree(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<ProcessTreeChild> {
+    trouve_process::with_spawn_lock(|| spawn_process_tree_locked(command))
+}
+
+fn spawn_process_tree_locked(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<ProcessTreeChild> {
     command.kill_on_drop(true);
@@ -477,6 +500,12 @@ pub fn spawn_process_tree(
 /// Spawn a standard-library command inside an owned process group / Windows
 /// Job Object. This is the blocking counterpart to [`spawn_process_tree`].
 pub fn spawn_blocking_process_tree(
+    command: &mut std::process::Command,
+) -> std::io::Result<BlockingProcessTreeChild> {
+    trouve_process::with_spawn_lock(|| spawn_blocking_process_tree_locked(command))
+}
+
+fn spawn_blocking_process_tree_locked(
     command: &mut std::process::Command,
 ) -> std::io::Result<BlockingProcessTreeChild> {
     #[cfg(unix)]
@@ -556,17 +585,11 @@ fn install_unix_descendant_sentinel(
     let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    for descriptor in [&reader, &writer] {
-        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1
-            || unsafe {
-                libc::fcntl(
-                    descriptor.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags | libc::FD_CLOEXEC,
-                )
-            } == -1
-        {
+    for descriptor in [&writer, &reader] {
+        // Fresh pipe descriptors have no descriptor flags. Mark the writer
+        // first and use one syscall per end to minimize the unavoidable
+        // `pipe`/`fcntl` gap for non-`pipe2` Unix platforms.
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -1121,7 +1144,7 @@ fn capture_shell_path(shell: &Path) -> Option<OsString> {
     isolate_process_group(&mut command);
     let mut output = tempfile::tempfile().ok()?;
     command.stdout(Stdio::from(output.try_clone().ok()?));
-    let mut child = command.spawn().ok()?;
+    let mut child = trouve_process::spawn(&mut command).ok()?;
     let status = wait_for_capture(&mut child, PATH_CAPTURE_TIMEOUT);
     status?.success().then_some(())?;
     output.rewind().ok()?;
@@ -1349,7 +1372,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         isolate_process_group(&mut command);
-        let mut child = command.spawn().unwrap();
+        let mut child = trouve_process::spawn(&mut command).unwrap();
 
         assert!(
             wait_for_capture(&mut child, Duration::from_millis(100)).is_none(),
@@ -1427,7 +1450,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut unrelated = unrelated.spawn().unwrap();
+        let mut unrelated = trouve_process::spawn(&mut unrelated).unwrap();
         drop(writer);
         assert!(unix_descendant_sentinel_active(&sentinel).unwrap());
 
@@ -1531,6 +1554,59 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_guarded_spawns_keep_sentinels_isolated() {
+        const CHILD_COUNT: usize = 24;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CHILD_COUNT * 2));
+        let mut tree_spawns = Vec::with_capacity(CHILD_COUNT);
+        let mut direct_spawns = Vec::with_capacity(CHILD_COUNT);
+        for _ in 0..CHILD_COUNT {
+            let tree_barrier = barrier.clone();
+            tree_spawns.push(tokio::spawn(async move {
+                tree_barrier.wait().await;
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", "sleep 60"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                spawn_process_tree(&mut command).unwrap()
+            }));
+            let direct_barrier = barrier.clone();
+            direct_spawns.push(tokio::spawn(async move {
+                direct_barrier.wait().await;
+                let mut command = tokio::process::Command::new("/bin/sleep");
+                command
+                    .arg("60")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                trouve_process::with_spawn_lock(|| command.spawn()).unwrap()
+            }));
+        }
+
+        let mut children = Vec::with_capacity(CHILD_COUNT);
+        for spawn in tree_spawns {
+            children.push(spawn.await.unwrap());
+        }
+        let mut direct_children = Vec::with_capacity(CHILD_COUNT);
+        for spawn in direct_spawns {
+            direct_children.push(spawn.await.unwrap());
+        }
+        for child in &mut children {
+            tokio::time::timeout(Duration::from_secs(2), child.terminate_and_reap())
+                .await
+                .expect("concurrent macOS launch leaked a foreign sentinel writer")
+                .unwrap();
+        }
+        for child in &mut direct_children {
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_tree_drop_terminates_descendants() {
@@ -1628,7 +1704,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         member_command.process_group(child.process_group);
-        let mut member = member_command.spawn().unwrap();
+        let mut member = trouve_process::with_spawn_lock(|| member_command.spawn()).unwrap();
 
         assert_eq!(unsafe { libc::kill(leader as i32, libc::SIGKILL) }, 0);
         tokio::time::timeout(Duration::from_secs(2), async {

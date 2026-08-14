@@ -47,12 +47,9 @@ impl RepoIdentity {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    let out = trouve_process::output(&mut command).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -337,7 +334,7 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let status = git_command(root, args).output().unwrap();
+        let status = trouve_process::output(&mut git_command(root, args)).unwrap();
         assert!(status.status.success(), "git {args:?} failed");
     }
 
@@ -484,7 +481,7 @@ mod tests {
         // The merge fails with a conflict, leaving stage-1/2/3 index entries.
         // Committer identity must be set or git refuses to even start the
         // merge on hosts without a global config.
-        let out = git_command(root, &["merge", "side"]).output().unwrap();
+        let out = trouve_process::output(&mut git_command(root, &["merge", "side"])).unwrap();
         assert!(!out.status.success(), "merge should conflict");
         let unmerged = run_git(root, &["ls-files", "-u"]).unwrap_or_default();
         assert!(!unmerged.is_empty(), "expected unmerged index entries");

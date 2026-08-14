@@ -7446,11 +7446,9 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let worktree = data.path().join("worktree");
         std::fs::create_dir(&worktree).unwrap();
-        let initialized = std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .arg(&worktree)
-            .status()
-            .unwrap();
+        let mut command = std::process::Command::new("git");
+        command.args(["init", "-b", "main"]).arg(&worktree);
+        let initialized = trouve_process::status(&mut command).unwrap();
         assert!(initialized.success());
 
         let store = crate::store::Store::open_in_memory().unwrap();

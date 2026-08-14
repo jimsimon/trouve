@@ -41,6 +41,7 @@ toml.workspace = true
 tracing.workspace = true
 trouve-agents.workspace = true
 trouve-protocol.workspace = true
+trouve-process.workspace = true
 trouve-providers.workspace = true
 trouve-thread-view.workspace = true
 # Native semantic code search (invariant: search is a first-class harness

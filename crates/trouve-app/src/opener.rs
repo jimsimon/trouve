@@ -34,7 +34,7 @@ fn start_worker() -> Option<SyncSender<OsString>> {
         .name("trouve-opener".into())
         .spawn(move || {
             while let Ok(path) = receiver.recv() {
-                if let Err(error) = open::that(&path) {
+                if let Err(error) = open_and_reap(&path) {
                     tracing::warn!(
                         %error,
                         path = %path.to_string_lossy(),
@@ -49,4 +49,29 @@ fn start_worker() -> Option<SyncSender<OsString>> {
             None
         }
     }
+}
+
+fn open_and_reap(path: &OsStr) -> std::io::Result<()> {
+    let mut last_error = None;
+    for mut command in open::commands(path) {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match trouve_process::status(&mut command) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                return Err(std::io::Error::other(format!(
+                    "launcher {command:?} failed with {status:?}"
+                )));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no system launcher is available",
+        )
+    }))
 }

@@ -285,7 +285,13 @@ fn llama_platform() -> Result<String, InstallError> {
 /// Whether libvulkan is available on this Linux system (via ldconfig's
 /// cache or the usual lib directories).
 fn linux_has_vulkan_loader() -> bool {
-    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output()
+    let mut command = std::process::Command::new("ldconfig");
+    command
+        .arg("-p")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Ok(out) =
+        trouve_process::spawn(&mut command).and_then(std::process::Child::wait_with_output)
         && String::from_utf8_lossy(&out.stdout).contains("libvulkan.so.1")
     {
         return true;
@@ -618,13 +624,16 @@ pub fn find_on_path(command: &str) -> Option<PathBuf> {
 /// Best-effort `<bin> --version` (first line, trimmed), for reporting the
 /// version of CLIs found on PATH.
 pub async fn binary_version(command: &str) -> Option<String> {
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        crate::process_env::tokio_command(command)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output(),
-    )
+    let mut command = crate::process_env::tokio_command(command);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let child = trouve_process::with_spawn_lock(|| command.spawn())?;
+        child.wait_with_output().await
+    })
     .await
     .ok()?
     .ok()?;

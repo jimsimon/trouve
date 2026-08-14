@@ -27,6 +27,7 @@ tokio.workspace = true
 tokio-util = "0.7"
 tracing.workspace = true
 trouve-protocol.workspace = true
+trouve-process.workspace = true
 trouve-providers.workspace = true
 
 [target.'cfg(windows)'.dependencies]

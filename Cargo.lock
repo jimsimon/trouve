@@ -7290,6 +7290,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "trouve-protocol",
+ "trouve-process",
  "trouve-providers",
  "windows-sys 0.61.2",
 ]
@@ -7314,6 +7315,7 @@ dependencies = [
  "trouve-client-core",
  "trouve-desktop-host",
  "trouve-protocol",
+ "trouve-process",
  "trouve-server",
  "wry",
 ]
@@ -7371,6 +7373,7 @@ dependencies = [
  "tracing",
  "trouve-agents",
  "trouve-protocol",
+ "trouve-process",
  "trouve-providers",
  "trouve-search",
  "trouve-thread-view",
@@ -7438,6 +7441,10 @@ dependencies = [
  "tracing",
  "trouve-protocol",
 ]
+
+[[package]]
+name = "trouve-process"
+version = "3.7.0"
 
 [[package]]
 name = "trouve-search"
@@ -7515,6 +7522,7 @@ dependencies = [
  "tree-sitter-xml",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "trouve-process",
 ]
 
 [[package]]
@@ -7539,6 +7547,7 @@ dependencies = [
  "trouve-agents",
  "trouve-core",
  "trouve-protocol",
+ "trouve-process",
  "trouve-providers",
  "utoipa",
  "uuid",

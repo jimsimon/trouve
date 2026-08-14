@@ -94,6 +94,12 @@ These are load-bearing. Do not violate them without a new ADR.
    default windows attach to that elected owner and never open a second Engine
    or database connection (ADR 0032). Comparison and Servo qualification hosts
    require an explicit server URL and never open the default database.
+10. **Child launches share one synchronization boundary.** Every
+    trouve-owned child-process launch — including standard and Tokio commands,
+    PTYs, daemons, probes, and system-opener libraries — goes through
+    `trouve-process`. Process-tree creation holds that shared macOS boundary
+    from sentinel setup through spawn; ordinary callers release it immediately
+    after creating the child and wait outside it (ADR 0038).
 
 ## Conventions
 

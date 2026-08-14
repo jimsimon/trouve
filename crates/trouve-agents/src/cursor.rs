@@ -1484,15 +1484,26 @@ fn cleanup_cursor_transport_blocking(
     pending.blocking_lock().clear();
     routes.blocking_lock().clear();
     let mut child = child.blocking_lock();
-    let terminate_error = child.terminate_now().err();
+    let mut terminate_error = child.terminate_now().err();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut retried_after_leader_exit = false;
     loop {
         match child.try_wait_tree() {
             Ok(Some(_)) => return Ok(()),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
             Ok(None) => {
+                if !retried_after_leader_exit {
+                    match child.retry_termination_after_leader_exit() {
+                        Ok(retried) => retried_after_leader_exit = retried,
+                        Err(error) => {
+                            retried_after_leader_exit = true;
+                            terminate_error.get_or_insert(error);
+                        }
+                    }
+                }
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 return Err(terminate_error.unwrap_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::TimedOut,

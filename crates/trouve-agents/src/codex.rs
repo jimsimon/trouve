@@ -3066,18 +3066,32 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
         tracing::warn!("codex: app-server process lock is poisoned");
         return Err(std::io::Error::other("app-server process lock is poisoned"));
     };
-    let terminate_error = child.terminate_now().err();
+    let mut terminate_error = child.terminate_now().err();
     if let Some(error) = terminate_error.as_ref() {
         tracing::warn!("codex: failed to terminate unusable app-server tree: {error}");
     }
     let deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
+    let mut retried_after_leader_exit = false;
     loop {
         match child.try_wait_tree() {
             Ok(Some(_)) => return Ok(()),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
             Ok(None) => {
+                if !retried_after_leader_exit {
+                    match child.retry_termination_after_leader_exit() {
+                        Ok(retried) => retried_after_leader_exit = retried,
+                        Err(error) => {
+                            retried_after_leader_exit = true;
+                            tracing::warn!(
+                                "codex: failed to terminate late app-server descendants: {error}"
+                            );
+                            terminate_error.get_or_insert(error);
+                        }
+                    }
+                }
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
                 tracing::warn!(
                     "codex: app-server did not exit within {}s",
                     CHILD_REAP_TIMEOUT.as_secs()

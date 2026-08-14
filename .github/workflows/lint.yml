@@ -8,91 +8,82 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# The lint job only checks out and reads code.
+# Every job only checks out, builds, checks, and caches.
 permissions:
   contents: read
 
+# Lint used to be one long serial job. Cancel superseded PR runs so its
+# independent lanes do not keep consuming runners or contend on cache saves.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  lint:
+  # Keep formatting dependency-light so it reports quickly and does not wait
+  # for native packages, dependency compilation, or an npm install.
+  format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - name: Install Linux native build dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+      - name: Rust formatting
         run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: docs
-        run: cargo doc --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: version sync tests
-        run: python3 -m unittest scripts/test_sync_versions.py
-      - name: versions in sync
-        run: python3 scripts/sync_versions.py --check
-      - name: Rust dependency licenses, notices, and SBOM
-        run: >-
-          python3 scripts/generate_rust_third_party_notices.py
-          --check --sbom target/compliance/rust-sbom.cdx.json
-      - name: Rust notice and SBOM generator tests
-        run: python3 -m unittest scripts/test_generate_rust_third_party_notices.py
-      - name: benchmark gate tests
-        run: python3 -m unittest benchmarks/test_compare_benchmarks.py
-      - name: hashline analyzer tests
-        working-directory: benchmarks/hashline
-        run: python3 -m unittest test_analyze.py
-      # The test-with-model job in test.yml runs ignored tests from these two
-      # crates, so an #[ignore]d test anywhere else would silently never run.
-      # Keep them there, or widen that job's scope on purpose.
-      # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
-      # or string that happens to match fails loudly here, which is cheap to
-      # fix, unlike a silently skipped test.
-      - name: ignored tests are covered by the gated job
-        run: |
-          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core)/'; then
-            echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
-            exit 1
-          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: App UI formatting
+        working-directory: web/app-ui
+        run: npm run format:check
+
+  # Build the frontend and its compliance evidence in parallel with the cheap
+  # repository checks. The desktop bundle is reused by the Rust lint lane.
+  app-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: |
-            npm/package-lock.json
-            web/app-ui/package-lock.json
-      - name: review UI tests
-        working-directory: web/review-ui
-        run: npm test
-      - name: app UI install
+          cache-dependency-path: web/app-ui/package-lock.json
+      - name: Install app UI dependencies
         working-directory: web/app-ui
         run: npm ci
-      - name: app UI checks
+      - name: Generated protocol is current
         working-directory: web/app-ui
         run: |
           npm run generate:protocol
           git diff --exit-code -- src/generated
-          npm run format:check
+      - name: App UI lint, types, and unit tests
+        working-directory: web/app-ui
+        run: |
           npm run lint
           npm run typecheck
           npm test
+      - name: App UI compliance
+        working-directory: web/app-ui
+        run: |
           npm run verify:notices
+          npm run generate:sbom
+      - name: Build desktop and PWA bundles
+        working-directory: web/app-ui
+        run: |
           npm run build
           npm run build:pwa
           npm run verify:build-modes
-          npm run generate:sbom
-      - name: Install Playwright browsers
-        working-directory: web/app-ui
-        run: ./node_modules/.bin/playwright install --with-deps chromium firefox webkit
-      - name: App UI browser, accessibility, and visual checks
-        working-directory: web/app-ui
-        run: npm run test:browser
+      - name: Upload desktop UI for Rust checks
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lint-desktop-ui-build
+          path: web/app-ui/dist/desktop
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload frontend compliance evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -100,19 +91,153 @@ jobs:
           path: |
             web/app-ui/THIRD_PARTY_NOTICES.md
             web/app-ui/dist/npm-sbom.cdx.json
-            target/compliance/rust-sbom.cdx.json
           if-no-files-found: error
+
+  # Playwright projects are independent. Each shard installs only its browser
+  # and runs one project, avoiding serial desktop/mobile work on the same runner.
+  app-ui-browser:
+    name: App UI browser (${{ matrix.project }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: chromium
+            project: desktop-chromium
+          - engine: chromium
+            project: mobile-chromium
+          - engine: firefox
+            project: desktop-firefox
+          - engine: webkit
+            project: desktop-webkit
+          - engine: webkit
+            project: mobile-webkit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/app-ui/package-lock.json
+      - name: Install app UI dependencies
+        working-directory: web/app-ui
+        run: npm ci
+      - name: Install ${{ matrix.engine }}
+        working-directory: web/app-ui
+        run: ./node_modules/.bin/playwright install --with-deps ${{ matrix.engine }}
+      - name: Browser, accessibility, and visual checks
+        working-directory: web/app-ui
+        run: npm run test:browser -- --project=${{ matrix.project }}
+
+  repository-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Version sync tests
+        run: python3 -m unittest scripts/test_sync_versions.py
+      - name: Versions in sync
+        run: python3 scripts/sync_versions.py --check
+      - name: Rust dependency licenses, notices, and SBOM
+        run: >-
+          python3 scripts/generate_rust_third_party_notices.py
+          --check --sbom target/compliance/rust-sbom.cdx.json
+      - name: Rust notice and SBOM generator tests
+        run: python3 -m unittest scripts/test_generate_rust_third_party_notices.py
+      - name: Benchmark gate tests
+        run: python3 -m unittest benchmarks/test_compare_benchmarks.py
+      - name: Hashline analyzer tests
+        working-directory: benchmarks/hashline
+        run: python3 -m unittest test_analyze.py
+      - name: Review UI tests
+        working-directory: web/review-ui
+        run: npm test
+      # The test-with-model job in test.yml runs ignored tests from these two
+      # crates, so an #[ignore]d test anywhere else would silently never run.
+      # Keep them there, or widen that job's scope on purpose.
+      # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
+      # or string that happens to match fails loudly here, which is cheap to
+      # fix, unlike a silently skipped test.
+      - name: Ignored tests are covered by the gated job
+        run: |
+          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core)/'; then
+            echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
+            exit 1
+          fi
+      - name: Servo nested-workspace dependency graph
+        run: >-
+          cargo metadata
+          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
+          --locked --no-deps --format-version 1 > /dev/null
+      - name: Upload Rust compliance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-compliance
+          path: target/compliance/rust-sbom.cdx.json
+          if-no-files-found: error
+
+  # Clippy, rustdoc, and the Wry target checks share one target directory on a
+  # single runner. This avoids paying for another native setup, cache download,
+  # and workspace compilation just to move two quick checks off this lane.
+  rust-lint:
+    needs: app-ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux native build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: lint-desktop-ui-build
+          path: web/app-ui/dist/desktop
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # The main test job owns this cache. Restoring it here shares the
+          # expensive dependency build without creating a PR-scoped 500 MB
+          # cache that competes with the release caches for repository quota.
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Rustdoc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Wry product and comparison targets
         run: |
           cargo check -p trouve-app --bin trouve
           cargo check -p trouve-app --features web-preview --bin trouve-web-preview
         env:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
-      - name: Servo nested-workspace dependency graph
-        run: >-
-          cargo metadata
-          --manifest-path crates/trouve-servo-embed-preview/Cargo.toml
-          --locked --no-deps --format-version 1 > /dev/null
+
+  npm-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
       # npm/ is an npm workspace; one install links the local packages
       # (search-plugin -> search-core) and installs all dev dependencies.
       - name: npm typecheck
@@ -120,3 +245,39 @@ jobs:
         run: |
           npm ci
           npm run typecheck
+
+  # Preserve the historical `Lint / lint` required-check context while the
+  # work fans out above. This job is intentionally tiny and runs even when a
+  # dependency fails so branch protection gets one unambiguous final result.
+  lint:
+    if: ${{ always() }}
+    needs:
+      - format
+      - app-ui
+      - app-ui-browser
+      - repository-checks
+      - rust-lint
+      - npm-packages
+    runs-on: ubuntu-latest
+    env:
+      FORMAT_RESULT: ${{ needs.format.result }}
+      APP_UI_RESULT: ${{ needs['app-ui'].result }}
+      BROWSER_RESULT: ${{ needs['app-ui-browser'].result }}
+      REPOSITORY_RESULT: ${{ needs['repository-checks'].result }}
+      RUST_RESULT: ${{ needs['rust-lint'].result }}
+      NPM_RESULT: ${{ needs['npm-packages'].result }}
+    steps:
+      - name: Require every lint lane to pass
+        run: |
+          for result in \
+            "$FORMAT_RESULT" \
+            "$APP_UI_RESULT" \
+            "$BROWSER_RESULT" \
+            "$REPOSITORY_RESULT" \
+            "$RUST_RESULT" \
+            "$NPM_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "At least one lint lane did not succeed." >&2
+              exit 1
+            fi
+          done

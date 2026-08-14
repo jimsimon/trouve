@@ -89,11 +89,14 @@ fn auth_status_is_logged_in(output: &[u8]) -> bool {
 }
 
 fn claude_is_logged_in(command: &str) -> bool {
-    crate::process_env::std_command(command)
+    let mut command = crate::process_env::std_command(command);
+    command
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
+        .stdout(Stdio::piped());
+    trouve_process::spawn(&mut command)
+        .and_then(std::process::Child::wait_with_output)
         .map(|output| output.status.success() && auth_status_is_logged_in(&output.stdout))
         .unwrap_or(false)
 }

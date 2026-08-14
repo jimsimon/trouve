@@ -92,9 +92,13 @@ fn required_servo_binary(value: Option<std::ffi::OsString>) -> Result<PathBuf> {
 }
 
 fn verify_servo_version(binary: &Path) -> Result<()> {
-    let output = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .arg("--version")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = trouve_process::spawn(&mut command)
+        .and_then(std::process::Child::wait_with_output)
         .with_context(|| format!("running {} --version", binary.display()))?;
     let actual = combined_output(&output.stdout, &output.stderr);
 
@@ -173,8 +177,7 @@ async fn run_servoshell_async(binary: &Path, gateway_origin: &str) -> Result<()>
             "Servo 0.4.0's native Wayland window is unresponsive on the qualification host; using the X11/XWayland fallback (native Wayland remains unqualified)"
         );
     }
-    let mut child = command
-        .spawn()
+    let mut child = trouve_process::with_spawn_lock(|| command.spawn())
         .with_context(|| format!("launching Servo from {}", binary.display()))?;
 
     tokio::select! {

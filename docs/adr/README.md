@@ -47,3 +47,4 @@ sequentially.
 | [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |
 | [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |
 | [0037](0037-capability-scoped-external-read-roots.md) | Capability-scoped external read roots | Accepted |
+| [0038](0038-process-wide-child-launch-synchronization.md) | Process-wide child-launch synchronization | Accepted |

@@ -260,16 +260,16 @@ pub fn test_env() -> &'static str {
 
 /// Initialise a git repo with deterministic author info.
 pub fn git(root: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(args)
         .env("GIT_AUTHOR_NAME", "test")
         .env("GIT_AUTHOR_EMAIL", "test@test")
         .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@test")
-        .output()
-        .expect("git not available");
+        .env("GIT_COMMITTER_EMAIL", "test@test");
+    let out = trouve_process::output(&mut command).expect("git not available");
     assert!(
         out.status.success(),
         "git {:?} failed: {}",

@@ -43,6 +43,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 trouve-client-core.workspace = true
 trouve-protocol.workspace = true
+trouve-process.workspace = true
 # Embedded local server (ADR 0008): the app calls one bootstrap entry point
 # and speaks HTTP/SSE to it over loopback. Engine internals stay out of
 # reach — trouve-core is deliberately NOT a dependency (invariant 1).

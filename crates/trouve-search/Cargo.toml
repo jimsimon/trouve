@@ -85,6 +85,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-xml = "0.7.0"
 tree-sitter-yaml = "0.7.2"
 tree-sitter-zig = "1.1.2"
+trouve-process.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"

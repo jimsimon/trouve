@@ -38,7 +38,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
       - name: Run candidate criterion benchmarks
         # Clear stale criterion state (rust-cache persists ./target) so the
         # converter only sees estimates from this run.
@@ -148,7 +155,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
       - name: Install hyperfine
         run: sudo apt-get update && sudo apt-get install -y hyperfine
       - name: Cache embedding model
