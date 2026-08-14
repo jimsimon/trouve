@@ -333,11 +333,11 @@ const toolStatusIcon = (
     aborted: "xmark",
   } as const)[status];
 
-const activeToolCall = (
+const toolCallNeedsApproval = (
   item: AgentActivityItem,
 ): boolean =>
   item.kind === "tool"
-  && (item.status === "running" || item.status === "awaiting-approval");
+  && item.status === "awaiting-approval";
 
 type ActivityGroupStatus = "awaiting-approval" | "running" | "ok" | "mixed" | "error";
 
@@ -2986,10 +2986,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index = nextIndex;
         continue;
       }
-      // A live tool is the current activity, not history. Keep it as a direct
-      // rail node until its terminal event arrives; the next render can then
-      // fold it into the stable completed run without changing the group key.
-      if (activeToolCall(item)) {
+      // Approval controls must remain directly reachable. Running calls can
+      // join the same collapsed activity run as soon as they are requested;
+      // the transient tail describes the current action without adding a
+      // shifting top-level tool node for each parallel call.
+      if (toolCallNeedsApproval(item)) {
         activityRows.push({
           content: this.#renderItem(item, presentation),
           expandedGroup: false,
@@ -3023,7 +3024,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             && isContextCompactionTool(candidate))
           || (!collapseThinkingWithTools && candidate.kind === "thinking")
           || (!collapseTodoUpdatesWithTools && candidate.kind === "todo")
-          || (candidate.kind === "tool" && activeToolCall(candidate))
+          || (candidate.kind === "tool" && toolCallNeedsApproval(candidate))
         ) break;
         if (
           hasNativeCompaction
@@ -3045,7 +3046,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           || (only?.kind === "tool" && isContextCompactionTool(only))
         ))
       );
-      if (run.length < 2 && !groupSinglePreferenceBoundary) {
+      const groupSingleActiveTurnTool = run.length === 1
+        && only?.kind === "tool"
+        && unit.status?.state.kind === "running";
+      if (
+        run.length < 2
+        && !groupSinglePreferenceBoundary
+        && !groupSingleActiveTurnTool
+      ) {
         if (only !== undefined) {
           activityRows.push({
             content: this.#renderItem(only, presentation),

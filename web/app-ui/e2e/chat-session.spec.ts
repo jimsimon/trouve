@@ -3008,7 +3008,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
   expect(connection.afterBranchEndsAtDisclosure).toBeLessThanOrEqual(0.25);
 });
 
-test("active tools stay on the rail and join stable groups only after completion", async ({
+test("active tools join stable collapsed groups behind a transient tail", async ({
   page,
 }) => {
   await installProtocolFixtures(page);
@@ -3042,13 +3042,23 @@ test("active tools stay on the rail and join stable groups only after completion
       requires_approval: false,
     }),
     threadEvent(20, { type: "tool.started", call_id: "call_group_1" }),
+  ]);
+
+  const timeline = page.locator(".agent-turn-card").last().locator(
+    ":scope > .turn-timeline > .agent-activity-timeline",
+  );
+  const group = page.locator(".activity-group").last();
+  const transientActivity = page.locator(".agent-turn-card").last().locator(
+    ".turn-transient-activity",
+  );
+  await expect(group).toBeVisible();
+  await expect(group).toHaveAttribute("data-chat-anchor-id", "activity:tool:call_group_1");
+  await expect(group.getByText("Ran 1 command", { exact: true })).toBeVisible();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(transientActivity).toContainText("Running command…");
+
+  await emitBatch(page, [
     threadEvent(21, {
-      type: "tool.completed",
-      call_id: "call_group_1",
-      status: "ok",
-      result: { exit_code: 0 },
-    }),
-    threadEvent(22, {
       type: "tool.requested",
       turn: 8,
       call_id: "call_group_2",
@@ -3056,21 +3066,27 @@ test("active tools stay on the rail and join stable groups only after completion
       args: { command: "second" },
       requires_approval: false,
     }),
-    threadEvent(23, { type: "tool.started", call_id: "call_group_2" }),
+    threadEvent(22, { type: "tool.started", call_id: "call_group_2" }),
   ]);
 
-  const timeline = page.locator(".agent-turn-card").last().locator(
-    ":scope > .turn-timeline > .agent-activity-timeline",
-  );
-  await expect(timeline.locator(":scope > .activity-group")).toHaveCount(0);
-  await expect(timeline.locator(
-    ':scope > .tool-card.tool-running[data-call-id="call_group_2"]',
-  )).toBeVisible();
+  await expect(group).toBeVisible();
+  await expect(group).toHaveAttribute("data-chat-anchor-id", "activity:tool:call_group_1");
+  await expect(group).toHaveClass(/active/u);
+  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".activity-group-body")).toHaveCount(0);
+  await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
+  await expect(transientActivity).toContainText("Running command…");
   await expect(page.locator(".agent-turn-card").last().locator(
-    ".turn-transient-activity",
-  )).toHaveCount(0);
+    ":scope > .turn-timeline > :last-child",
+  )).toHaveClass(/turn-transient-activity/u);
 
   await emitBatch(page, [
+    threadEvent(23, {
+      type: "tool.completed",
+      call_id: "call_group_1",
+      status: "ok",
+      result: { exit_code: 0 },
+    }),
     threadEvent(24, {
       type: "tool.completed",
       call_id: "call_group_2",
@@ -3087,16 +3103,13 @@ test("active tools stay on the rail and join stable groups only after completion
     }),
     threadEvent(26, { type: "tool.started", call_id: "call_group_3" }),
   ]);
-  const group = page.locator(".activity-group").last();
-  await expect(group).toBeVisible();
-  await expect(group.getByText("Ran 2 commands", { exact: true })).toBeVisible();
+  await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
-  await expect(timeline.locator(
-    ':scope > .tool-card.tool-running[data-call-id="call_group_3"]',
-  )).toBeVisible();
+  await expect(group).toHaveClass(/active/u);
+  await expect(transientActivity).toContainText("Running command…");
 
   await group.locator(":scope > summary").click();
-  await expect(group.locator(".tool-card")).toHaveCount(2);
+  await expect(group.locator(".tool-card")).toHaveCount(3);
   await emitBatch(page, [
     threadEvent(27, {
       type: "tool.completed",
@@ -3114,10 +3127,10 @@ test("active tools stay on the rail and join stable groups only after completion
     }),
     threadEvent(29, { type: "tool.started", call_id: "call_group_4" }),
   ]);
-  await expect(group.getByText("Ran 3 commands", { exact: true })).toBeVisible();
-  await expect(group.locator(".tool-card")).toHaveCount(3);
-  await expect(timeline.locator(
-    ':scope > .tool-card.tool-running[data-call-id="call_group_4"]',
+  await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
+  await expect(group.locator(".tool-card")).toHaveCount(4);
+  await expect(group.locator(
+    '.tool-card.tool-running[data-call-id="call_group_4"]',
   )).toBeVisible();
 
   await group.locator(":scope > summary").click();
@@ -3131,6 +3144,7 @@ test("active tools stay on the rail and join stable groups only after completion
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
+  await expect(transientActivity).toContainText("Processing…");
 });
 
 test("context compaction is an animated durable boundary between tool groups", async ({
@@ -3657,14 +3671,12 @@ test("thought completion clears stale activity while standalone and grouped tool
 
   const timeline = agent.locator(":scope > .message-body > .agent-activity-timeline");
   await expect(timeline).toHaveCount(1);
-  await expect(timeline.locator(
-    ':scope > .tool-card[data-call-id="before_group"]',
-  )).toBeVisible();
-  await expect(timeline.locator(":scope > .activity-group")).toContainText("2 commands");
-  await expect(timeline.locator(
-    ':scope > .tool-card.tool-running[data-call-id="group_three"]',
-  )).toBeVisible();
-  await expect(transientActivity).toHaveCount(0);
+  await expect(timeline.locator(":scope > .activity-group").first())
+    .toContainText("1 command");
+  await expect(timeline.locator(":scope > .activity-group").last())
+    .toContainText("3 commands");
+  await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
+  await expect(transientActivity).toContainText("Running command…");
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
