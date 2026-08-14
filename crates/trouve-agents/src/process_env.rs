@@ -1546,9 +1546,9 @@ mod tests {
         let mut tree_spawns = Vec::with_capacity(CHILD_COUNT);
         let mut direct_spawns = Vec::with_capacity(CHILD_COUNT);
         for _ in 0..CHILD_COUNT {
-            let barrier = barrier.clone();
+            let tree_barrier = barrier.clone();
             tree_spawns.push(tokio::spawn(async move {
-                barrier.wait().await;
+                tree_barrier.wait().await;
                 let mut command = tokio::process::Command::new("/bin/sh");
                 command
                     .args(["-c", "sleep 60"])
@@ -1557,9 +1557,9 @@ mod tests {
                     .stderr(Stdio::null());
                 spawn_process_tree(&mut command).unwrap()
             }));
-            let barrier = barrier.clone();
+            let direct_barrier = barrier.clone();
             direct_spawns.push(tokio::spawn(async move {
-                barrier.wait().await;
+                direct_barrier.wait().await;
                 let mut command = tokio::process::Command::new("/bin/sleep");
                 command
                     .arg("60")
