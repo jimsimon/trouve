@@ -76,8 +76,8 @@ jobs:
           TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
 
   # Windows-only dependencies and trait impls must be compiled on Windows.
-  # Pull requests get a fast check; trusted main pushes build the exact release
-  # package set and seed the cache used by a tag at the same commit.
+  # Pull requests check the release profile so they can reuse the dependency
+  # artifacts seeded by trusted main pushes and release tags.
   windows-check:
     runs-on: windows-latest
     steps:
@@ -95,7 +95,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check Windows desktop app
         if: github.event_name == 'pull_request'
-        run: cargo check --package trouve-app --target x86_64-pc-windows-msvc
+        run: >-
+          cargo check --release --package trouve-app
+          --target x86_64-pc-windows-msvc
       - name: Build and cache Windows release artifacts
         if: github.ref == 'refs/heads/main'
         run: >-

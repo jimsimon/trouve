@@ -93,20 +93,24 @@ jobs:
             web/app-ui/dist/npm-sbom.cdx.json
           if-no-files-found: error
 
-  # Playwright projects are independent. Each shard installs only its browser,
-  # avoiding both the old serial five-project run and unused browser downloads.
+  # Playwright projects are independent. Each shard installs only its browser
+  # and runs one project, avoiding serial desktop/mobile work on the same runner.
   app-ui-browser:
-    name: App UI browser (${{ matrix.engine }})
+    name: App UI browser (${{ matrix.project }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - engine: chromium
-            projects: --project=desktop-chromium --project=mobile-chromium
+            project: desktop-chromium
+          - engine: chromium
+            project: mobile-chromium
           - engine: firefox
-            projects: --project=desktop-firefox
+            project: desktop-firefox
           - engine: webkit
-            projects: --project=desktop-webkit --project=mobile-webkit
+            project: desktop-webkit
+          - engine: webkit
+            project: mobile-webkit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -125,7 +129,7 @@ jobs:
         run: ./node_modules/.bin/playwright install --with-deps ${{ matrix.engine }}
       - name: Browser, accessibility, and visual checks
         working-directory: web/app-ui
-        run: npm run test:browser -- ${{ matrix.projects }}
+        run: npm run test:browser -- --project=${{ matrix.project }}
 
   repository-checks:
     runs-on: ubuntu-latest
@@ -179,11 +183,9 @@ jobs:
           path: target/compliance/rust-sbom.cdx.json
           if-no-files-found: error
 
-  # Clippy, rustdoc, and the Wry target checks share one target directory on a
-  # single runner. This avoids the repeated Rust compilation test sharding
-  # would introduce while still moving unrelated frontend work off this lane.
+  # Clippy and rustdoc share one target directory, but can start immediately;
+  # neither needs the frontend artifact used by the Wry product checks.
   rust-lint:
-    needs: app-ui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -193,10 +195,6 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y
           libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: lint-desktop-ui-build
-          path: web/app-ui/dist/desktop
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
@@ -216,6 +214,33 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Product target checks need the bundled frontend. Keep them independent so
+  # frontend work does not hold up Clippy and rustdoc.
+  wry-check:
+    needs: app-ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux native build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libfontconfig1-dev libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: lint-desktop-ui-build
+          path: web/app-ui/dist/desktop
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-target-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          cache-bin: false
+          save-if: false
       - name: Wry product and comparison targets
         run: |
           cargo check -p trouve-app --bin trouve
@@ -253,6 +278,7 @@ jobs:
       - app-ui-browser
       - repository-checks
       - rust-lint
+      - wry-check
       - npm-packages
     runs-on: ubuntu-latest
     env:
@@ -261,6 +287,7 @@ jobs:
       BROWSER_RESULT: ${{ needs['app-ui-browser'].result }}
       REPOSITORY_RESULT: ${{ needs['repository-checks'].result }}
       RUST_RESULT: ${{ needs['rust-lint'].result }}
+      WRY_RESULT: ${{ needs['wry-check'].result }}
       NPM_RESULT: ${{ needs['npm-packages'].result }}
     steps:
       - name: Require every lint lane to pass
@@ -271,6 +298,7 @@ jobs:
             "$BROWSER_RESULT" \
             "$REPOSITORY_RESULT" \
             "$RUST_RESULT" \
+            "$WRY_RESULT" \
             "$NPM_RESULT"; do
             if [ "$result" != "success" ]; then
               echo "At least one lint lane did not succeed." >&2
