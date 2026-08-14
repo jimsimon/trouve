@@ -639,8 +639,8 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
           <trouve-model-picker
             accessible-label="Automation model"
             placement="down"
-            placeholder="Mode or server default"
-            empty-label="Mode or server default"
+            placeholder="Persona or server default"
+            empty-label="Persona or server default"
             .value=${this.#draft.model}
             .models=${models}
             .disabled=${busy || this.#modelsLoading}

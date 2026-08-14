@@ -28,7 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
+    AddLocalModelRequest, AgentPersona, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
@@ -37,9 +37,9 @@ use trouve_protocol::{
     EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
     GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
     GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo, ProviderInfo,
-    ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PersonaInfo, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo,
+    ProviderInfo, ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
     ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
@@ -49,8 +49,7 @@ use trouve_protocol::{
     TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails,
     ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
     UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    UpsertMcpServerRequest, UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -144,10 +143,10 @@ impl IntoResponse for ApiError {
         resolve_question,
         list_models,
         refresh_models,
-        list_modes,
-        list_mode_infos,
-        upsert_mode,
-        delete_mode,
+        list_personas,
+        list_persona_infos,
+        upsert_persona,
+        delete_persona,
         list_providers,
         known_providers,
         upsert_provider,
@@ -226,8 +225,6 @@ impl IntoResponse for ApiError {
         retry_code_review_persona,
         code_review_stats,
         configure_github_review_app,
-        upsert_reviewer_profile,
-        delete_reviewer_profile,
         update_code_review_repository,
         refresh_code_reviews,
     ),
@@ -380,7 +377,6 @@ impl IntoResponse for ApiError {
         trouve_protocol::CodeReviewMode,
         GithubAppStatus,
         ConfigureGithubAppRequest,
-        UpsertReviewerProfileRequest,
         UpdateCodeReviewRepositoryRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
@@ -391,9 +387,9 @@ impl IntoResponse for ApiError {
         trouve_protocol::ApprovalDecision,
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
-        trouve_protocol::AgentMode,
-        ModeInfo,
-        UpsertModeRequest,
+        trouve_protocol::AgentPersona,
+        PersonaInfo,
+        UpsertPersonaRequest,
     ))
 )]
 struct ApiDoc;
@@ -607,11 +603,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", get(refresh_models))
-        .route("/v1/modes", get(list_modes))
-        .route("/v1/mode-infos", get(list_mode_infos))
+        .route("/v1/personas", get(list_personas))
+        .route("/v1/persona-infos", get(list_persona_infos))
         .route(
-            "/v1/modes/{id}",
-            axum::routing::put(upsert_mode).delete(delete_mode),
+            "/v1/personas/{id}",
+            axum::routing::put(upsert_persona).delete(delete_persona),
         )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/known", get(known_providers))
@@ -672,14 +668,6 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/code-review/github-app",
             axum::routing::put(configure_github_review_app),
-        )
-        .route(
-            "/v1/code-review/reviewer",
-            axum::routing::put(upsert_reviewer_profile),
-        )
-        .route(
-            "/v1/code-review/reviewer/{id}",
-            axum::routing::delete(delete_reviewer_profile),
         )
         .route(
             "/v1/code-review/repository",
@@ -1147,27 +1135,6 @@ async fn configure_github_review_app(
     Json(request): Json<ConfigureGithubAppRequest>,
 ) -> Result<Json<GithubAppStatus>, ApiError> {
     Ok(Json(engine.configure_github_review_app(request).await?))
-}
-
-#[utoipa::path(put, path = "/v1/code-review/reviewer",
-    request_body = UpsertReviewerProfileRequest,
-    responses((status = 200, body = ReviewerProfile), (status = 400, body = ErrorBody)))]
-async fn upsert_reviewer_profile(
-    State(engine): State<Arc<Engine>>,
-    Json(request): Json<UpsertReviewerProfileRequest>,
-) -> Result<Json<ReviewerProfile>, ApiError> {
-    Ok(Json(engine.upsert_reviewer_profile(request)?))
-}
-
-#[utoipa::path(delete, path = "/v1/code-review/reviewer/{id}",
-    params(("id" = String, Path, description = "Custom reviewer profile id")),
-    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
-async fn delete_reviewer_profile(
-    State(engine): State<Arc<Engine>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    engine.delete_reviewer_profile(&id)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(put, path = "/v1/code-review/repository",
@@ -2159,45 +2126,45 @@ struct ListModesQuery {
     workspace_id: Option<String>,
 }
 
-#[utoipa::path(get, path = "/v1/modes",
+#[utoipa::path(get, path = "/v1/personas",
     params(("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents modes")),
-    responses((status = 200, body = [AgentMode])))]
-async fn list_modes(
+    responses((status = 200, body = [AgentPersona])))]
+async fn list_personas(
     State(engine): State<Arc<Engine>>,
     Query(q): Query<ListModesQuery>,
-) -> Result<Json<Vec<AgentMode>>, ApiError> {
-    Ok(Json(engine.list_modes(q.workspace_id.as_deref())?))
+) -> Result<Json<Vec<AgentPersona>>, ApiError> {
+    Ok(Json(engine.list_personas(q.workspace_id.as_deref())?))
 }
 
-#[utoipa::path(get, path = "/v1/mode-infos",
+#[utoipa::path(get, path = "/v1/persona-infos",
     params(("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents modes")),
-    responses((status = 200, body = [ModeInfo])))]
-async fn list_mode_infos(
+    responses((status = 200, body = [PersonaInfo])))]
+async fn list_persona_infos(
     State(engine): State<Arc<Engine>>,
     Query(q): Query<ListModesQuery>,
-) -> Result<Json<Vec<ModeInfo>>, ApiError> {
-    Ok(Json(engine.list_mode_infos(q.workspace_id.as_deref())?))
+) -> Result<Json<Vec<PersonaInfo>>, ApiError> {
+    Ok(Json(engine.list_persona_infos(q.workspace_id.as_deref())?))
 }
 
-#[utoipa::path(put, path = "/v1/modes/{id}", params(("id" = String, Path,)),
-    request_body = UpsertModeRequest,
+#[utoipa::path(put, path = "/v1/personas/{id}", params(("id" = String, Path,)),
+    request_body = UpsertPersonaRequest,
     responses((status = 204), (status = 400, body = ErrorBody)))]
-async fn upsert_mode(
+async fn upsert_persona(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
-    Json(req): Json<UpsertModeRequest>,
+    Json(req): Json<UpsertPersonaRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.upsert_mode(&id, req)?;
+    engine.upsert_persona(&id, req)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(delete, path = "/v1/modes/{id}", params(("id" = String, Path,)),
+#[utoipa::path(delete, path = "/v1/personas/{id}", params(("id" = String, Path,)),
     responses((status = 204), (status = 400, body = ErrorBody)))]
-async fn delete_mode(
+async fn delete_persona(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.delete_mode(&id)?;
+    engine.delete_persona(&id)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

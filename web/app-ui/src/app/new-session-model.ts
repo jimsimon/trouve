@@ -1,5 +1,5 @@
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolCreateThreadRequest,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
@@ -131,7 +131,7 @@ export const thinkingOption = (
 /** Resolves the model shown for a new session in protocol precedence order. */
 export const resolveNewSessionModel = (
   explicitModel: string | null | undefined,
-  selectedMode: ProtocolAgentMode | null | undefined,
+  selectedMode: ProtocolAgentPersona | null | undefined,
   providers: ProtocolProvidersResponse | null | undefined,
 ): string | undefined =>
   nonEmpty(explicitModel)

@@ -536,12 +536,12 @@ const installProtocolFixtures = async (
           },
         },
       }],
-      "GET /v1/modes": [{
+      "GET /v1/personas": [{
         id: "code",
         display_name: "Code",
         system_prompt: "Implement the request.",
       }],
-      "GET /v1/mode-infos": [{
+      "GET /v1/persona-infos": [{
         origin: "builtin",
         mode: {
           id: "code",

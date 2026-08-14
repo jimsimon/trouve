@@ -384,7 +384,7 @@ export interface Model {
   options_schema?: unknown;
 }
 
-export interface AgentMode {
+export interface AgentPersona {
   id: string;
   display_name: string;
   system_prompt: string;
@@ -395,8 +395,8 @@ export interface AgentMode {
   default_thinking_level?: string;
 }
 
-export interface ModeInfo {
-  mode: AgentMode;
+export interface PersonaInfo {
+  persona: AgentPersona;
   origin: "builtin" | "customized" | "custom" | "workspace";
 }
 

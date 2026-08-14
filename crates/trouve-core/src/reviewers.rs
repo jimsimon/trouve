@@ -1,4 +1,4 @@
-use trouve_protocol::ReviewerProfile;
+use trouve_protocol::{AgentPersona, PermissionMode, ReviewerProfile};
 
 pub const DEFAULT_REVIEWER_IDS: &[&str] = &[
     "correctness",
@@ -86,6 +86,45 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
             "Check logging, metrics, tracing, health behavior, configuration, deployment, rate limiting, backpressure, alertability, and operational failure modes. Flag changes that make incidents harder to detect, diagnose, contain, or recover from.",
         ),
     ]
+}
+
+/// Expose a review persona through the general agent-persona catalog. Review
+/// personas are deliberately read-only and receive the same inspection tools
+/// as the built-in Review persona when selected for an interactive thread.
+pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
+    AgentPersona {
+        id: reviewer.id.clone(),
+        display_name: reviewer.name.clone(),
+        system_prompt: reviewer.prompt.clone(),
+        allowed_tools: vec![
+            "read_file".into(),
+            "list_dir".into(),
+            "glob".into(),
+            "grep".into(),
+            "search".into(),
+            "find_related".into(),
+            "git_diff".into(),
+            "web_fetch".into(),
+            "todo_write".into(),
+            "spawn_thread".into(),
+            "spawn_output".into(),
+        ],
+        read_only: true,
+        default_permission_mode: Some(PermissionMode::Ask),
+        default_model: reviewer.model.clone(),
+        default_thinking_level: reviewer.default_thinking_level.clone(),
+    }
+}
+
+pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerProfile {
+    ReviewerProfile {
+        id: persona.id.clone(),
+        name: persona.display_name.clone(),
+        prompt: persona.system_prompt.clone(),
+        model: persona.default_model.clone(),
+        default_thinking_level: persona.default_thinking_level.clone(),
+        built_in,
+    }
 }
 
 pub fn default_reviewer_ids() -> Vec<String> {

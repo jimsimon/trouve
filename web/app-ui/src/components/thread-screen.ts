@@ -20,7 +20,7 @@ import {
   type PendingAttachment,
 } from "../services/attachments.js";
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolAttachment,
   ProtocolModelInfo,
   ProtocolResolveApprovalRequest,
@@ -433,7 +433,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #pendingAttachments: PendingAttachment[] = [];
   #attachmentPending = false;
   #attachmentGeneration = 0;
-  #modes: readonly ProtocolAgentMode[] = [];
+  #modes: readonly ProtocolAgentPersona[] = [];
   #models: readonly ProtocolModelInfo[] = [];
   #subscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
   #observedSubscriptionUsageCursor = 0;
@@ -1662,9 +1662,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             ? nothing
             : html`
                 <label class="composer-option mode-option">
-                  <span>Mode</span>
+                  <span>Persona</span>
                   <select
-                    aria-label="Mode"
+                    aria-label="Persona"
                     .value=${thread.mode}
                     ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
                     @change=${(event: Event) => this.#updateThreadSetting(
@@ -5206,7 +5206,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }).catch(() => undefined);
     try {
       const [modes, models] = await Promise.all([
-        services.protocol.modes(workspaceId),
+        services.protocol.personas(workspaceId),
         services.modelCatalog.refresh("if-stale"),
       ]);
       const currentCatalogKey = this.#threadOptionCatalogKey(this.workspaceId);
@@ -5219,7 +5219,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         this.workspaceId === workspaceId
         && this.#threadOptionCatalogKey(this.workspaceId) === catalogKey
       ) {
-        this.#requestError = "Mode and model options could not be loaded.";
+        this.#requestError = "Persona and model options could not be loaded.";
         this.requestUpdate();
       }
     }

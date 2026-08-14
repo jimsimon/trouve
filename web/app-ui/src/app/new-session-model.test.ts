@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
@@ -29,7 +29,7 @@ const model = (
   options_schema: optionsSchema,
 });
 
-const mode = (defaultModel?: string | null): ProtocolAgentMode => ({
+const mode = (defaultModel?: string | null): ProtocolAgentPersona => ({
   id: "code",
   display_name: "Code",
   system_prompt: "Write code.",

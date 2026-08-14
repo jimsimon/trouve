@@ -105,7 +105,7 @@ describe("Trouve visual contract", () => {
       read("../components/markdown-view.ts"),
       read("../components/terminal-view.ts"),
       read("../components/management-settings-panels.ts"),
-      read("../components/mode-settings-panel.ts"),
+      read("../components/persona-settings-panel.ts"),
     ].join("\n");
     const used = new Set(
       [...visualSources.matchAll(/var\((--trouve-[a-z0-9-]+)/g)].map(
@@ -261,7 +261,7 @@ describe("Trouve visual contract", () => {
       '"general"',
       '"chat"',
       '"providers"',
-      '"modes"',
+      '"personas"',
       '"mcp"',
       '"integrations"',
       '"appearance"',
@@ -270,7 +270,7 @@ describe("Trouve visual contract", () => {
     ]) {
       expect(settings).toContain(section);
     }
-    expect(settings).toContain("Modes & Models");
+    expect(settings).toContain("Personas & Models");
     expect(settings).toContain("Sessions & Chat");
     expect(settings).not.toContain('return "Git & Worktrees"');
     expect(settings).toContain("MCP Servers");
@@ -288,7 +288,7 @@ describe("Trouve visual contract", () => {
   });
 
   it("keeps mode rows compact on desktop and touch-safe when stacked", () => {
-    const modes = read("../components/mode-settings-panel.ts");
+    const modes = read("../components/persona-settings-panel.ts");
     expect(modes).toMatch(
       /\.mode-row \{[^}]*box-sizing:\s*border-box[^}]*height:\s*52px[^}]*padding:\s*0 6px 0 10px/s,
     );

@@ -2865,9 +2865,9 @@ return errors === 0;
 }
 validate108.evaluated = {"props":{"author":true,"base":true,"checks":true,"comments":true,"draft":true,"head":true,"head_sha":true,"host":true,"last_comment_at":true,"merge_state_status":true,"mergeable":true,"merged_at":true,"number":true,"repository":true,"requested_reviewers":true,"reviews":true,"state":true,"title":true,"trouve_review":true,"url":true,"workspace_id":true},"dynamicProps":false,"dynamicItems":false};
 
-export const modes = validate123;
-const schema53 = {"$id":"urn:trouve:protocol-validator:modes","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/AgentMode"}};
-const schema54 = {"type":"object","description":"A data-driven agent mode: prompt + tool policy + model/permission defaults.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).","required":["id","display_name","system_prompt"],"properties":{"allowed_tools":{"type":"array","items":{"type":"string"},"description":"Tool names this mode may use; empty means all registered tools."},"default_model":{"type":["string","null"],"description":"Preferred model for threads started in this mode (\"provider/model\").\nNone falls back to the global default model."},"default_permission_mode":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/PermissionMode","description":"Permission mode for threads started in this mode. None falls back to\nthe global default permission mode."}]},"default_thinking_level":{"type":["string","null"],"description":"Preferred thinking setting for threads started in this mode. The value\nis a model-advertised enum token (for example \"medium\" or \"high\") or\na decimal token budget for fixed-thinking models.\nNone falls back to the global default thinking level."},"display_name":{"type":"string"},"id":{"type":"string","description":"Stable identifier, e.g. \"code\", \"plan\", \"review\"."},"read_only":{"type":"boolean","description":"When true the mode can never mutate the worktree regardless of the\nthread's permission mode (e.g. plan/question modes)."},"system_prompt":{"type":"string","description":"Appended to the base system prompt."}}};
+export const personas = validate123;
+const schema53 = {"$id":"urn:trouve:protocol-validator:personas","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/AgentPersona"}};
+const schema54 = {"type":"object","description":"A data-driven agent persona: prompt + tool policy + model/permission defaults.\nAdding a persona is configuration, not code (AGENTS.md invariant 6).","required":["id","display_name","system_prompt"],"properties":{"allowed_tools":{"type":"array","items":{"type":"string"},"description":"Tool names this persona may use; empty means all registered tools."},"default_model":{"type":["string","null"],"description":"Preferred model for threads started with this persona (\"provider/model\").\nNone falls back to the global default model."},"default_permission_mode":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/PermissionMode","description":"Permission policy for threads started with this persona. None falls back to\nthe global default permission mode."}]},"default_thinking_level":{"type":["string","null"],"description":"Preferred thinking setting for threads started with this persona. The value\nis a model-advertised enum token (for example \"medium\" or \"high\") or\na decimal token budget for fixed-thinking models.\nNone falls back to the global default thinking level."},"display_name":{"type":"string"},"id":{"type":"string","description":"Stable identifier, e.g. \"code\", \"plan\", \"review\"."},"read_only":{"type":"boolean","description":"When true the persona can never mutate the worktree regardless of the\nthread's permission policy (e.g. plan/question personas)."},"system_prompt":{"type":"string","description":"Appended to the base system prompt."}}};
 
 function validate124(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -3078,7 +3078,7 @@ validate124.evaluated = {"props":{"allowed_tools":true,"default_model":true,"def
 
 
 function validate123(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
-/*# sourceURL="urn:trouve:protocol-validator:modes" */;
+/*# sourceURL="urn:trouve:protocol-validator:personas" */;
 let vErrors = null;
 let errors = 0;
 const evaluated0 = validate123.evaluated;
@@ -3114,9 +3114,9 @@ return errors === 0;
 }
 validate123.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false};
 
-export const modeInfos = validate127;
-const schema55 = {"$id":"urn:trouve:protocol-validator:modeInfos","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/ModeInfo"}};
-const schema56 = {"type":"object","description":"A mode plus where it came from, for the settings UI.","required":["mode","origin"],"properties":{"mode":{"$ref":"#/components/schemas/AgentMode"},"origin":{"type":"string","description":"\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/modes — file-managed, read-only in settings)."}}};
+export const personaInfos = validate127;
+const schema55 = {"$id":"urn:trouve:protocol-validator:personaInfos","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/PersonaInfo"}};
+const schema56 = {"type":"object","description":"A persona plus where it came from, for the settings UI.","required":["persona","origin"],"properties":{"origin":{"type":"string","description":"\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/personas — file-managed, read-only in settings)."},"persona":{"$ref":"#/components/schemas/AgentPersona"}}};
 
 function validate129(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -3339,16 +3339,16 @@ evaluated0.items = undefined;
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing0;
-if(((data.mode === undefined) && (missing0 = "mode")) || ((data.origin === undefined) && (missing0 = "origin"))){
+if(((data.persona === undefined) && (missing0 = "persona")) || ((data.origin === undefined) && (missing0 = "origin"))){
 validate128.errors = [{instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: missing0},message:"must have required property '"+missing0+"'"}];
 return false;
 }
 else {
-if(data.mode !== undefined){
+if(data.origin !== undefined){
 const _errs1 = errors;
-if(!(validate129(data.mode, {instancePath:instancePath+"/mode",parentData:data,parentDataProperty:"mode",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate129.errors : vErrors.concat(validate129.errors);
-errors = vErrors.length;
+if(typeof data.origin !== "string"){
+validate128.errors = [{instancePath:instancePath+"/origin",schemaPath:"#/properties/origin/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
 }
 var valid0 = _errs1 === errors;
 }
@@ -3356,13 +3356,13 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.origin !== undefined){
-const _errs2 = errors;
-if(typeof data.origin !== "string"){
-validate128.errors = [{instancePath:instancePath+"/origin",schemaPath:"#/properties/origin/type",keyword:"type",params:{type: "string"},message:"must be string"}];
-return false;
+if(data.persona !== undefined){
+const _errs3 = errors;
+if(!(validate129(data.persona, {instancePath:instancePath+"/persona",parentData:data,parentDataProperty:"persona",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate129.errors : vErrors.concat(validate129.errors);
+errors = vErrors.length;
 }
-var valid0 = _errs2 === errors;
+var valid0 = _errs3 === errors;
 }
 else {
 var valid0 = true;
@@ -3378,11 +3378,11 @@ return false;
 validate128.errors = vErrors;
 return errors === 0;
 }
-validate128.evaluated = {"props":{"mode":true,"origin":true},"dynamicProps":false,"dynamicItems":false};
+validate128.evaluated = {"props":{"origin":true,"persona":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate127(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
-/*# sourceURL="urn:trouve:protocol-validator:modeInfos" */;
+/*# sourceURL="urn:trouve:protocol-validator:personaInfos" */;
 let vErrors = null;
 let errors = 0;
 const evaluated0 = validate127.evaluated;
@@ -8995,7 +8995,7 @@ validate248.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const automation = validate253;
 const schema117 = {"$id":"urn:trouve:protocol-validator:automation","$ref":"urn:trouve:protocol-openapi#/components/schemas/Automation"};
-const schema118 = {"type":"object","description":"A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured mode/model, and sends the\nprompt — exactly as if the user had typed it.","required":["id","name","prompt","workspace_id","schedule","enabled","created_at"],"properties":{"created_at":{"type":"string"},"enabled":{"type":"boolean"},"id":{"type":"string"},"last_error":{"type":"string","description":"Why the last run failed (\"\" = it didn't)."},"last_run_at":{"type":["string","null"],"description":"Last fire time (RFC3339)."},"last_session_id":{"type":["string","null"],"description":"Session created by the last run."},"mode":{"type":["string","null"],"description":"Agent mode for the runs (None = the default mode)."},"model":{"type":["string","null"],"description":"Model for the runs (None = the mode's default)."},"name":{"type":"string"},"next_run_at":{"type":["string","null"],"description":"Next fire time (RFC3339), when enabled."},"permission_mode":{"$ref":"#/components/schemas/PermissionMode","description":"Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."},"prompt":{"type":"string"},"schedule":{"$ref":"#/components/schemas/AutomationSchedule"},"thinking_level":{"type":["string","null"],"description":"Thinking level for the runs (None = the selected model/mode/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."},"workspace_id":{"$ref":"#/components/schemas/String"}}};
+const schema118 = {"type":"object","description":"A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured persona/model, and sends the\nprompt — exactly as if the user had typed it.","required":["id","name","prompt","workspace_id","schedule","enabled","created_at"],"properties":{"created_at":{"type":"string"},"enabled":{"type":"boolean"},"id":{"type":"string"},"last_error":{"type":"string","description":"Why the last run failed (\"\" = it didn't)."},"last_run_at":{"type":["string","null"],"description":"Last fire time (RFC3339)."},"last_session_id":{"type":["string","null"],"description":"Session created by the last run."},"mode":{"type":["string","null"],"description":"Agent persona for the runs (None = the default persona)."},"model":{"type":["string","null"],"description":"Model for the runs (None = the persona's default)."},"name":{"type":"string"},"next_run_at":{"type":["string","null"],"description":"Next fire time (RFC3339), when enabled."},"permission_mode":{"$ref":"#/components/schemas/PermissionMode","description":"Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."},"prompt":{"type":"string"},"schedule":{"$ref":"#/components/schemas/AutomationSchedule"},"thinking_level":{"type":["string","null"],"description":"Thinking level for the runs (None = the selected model/persona/global\ndefault). The engine maps this canonical value to the model's\nadvertised option key when the turn starts."},"workspace_id":{"$ref":"#/components/schemas/String"}}};
 const schema119 = {"type":"object","description":"When an automation fires. Times are the server's local time zone.","required":["kind"],"properties":{"days":{"type":"array","items":{"type":"integer","format":"int32","minimum":0},"description":"Weekly: days it fires (0 = Monday … 6 = Sunday); at least one."},"kind":{"type":"string","description":"\"hourly\", \"daily\", or \"weekly\"."},"minute":{"type":"integer","format":"int32","description":"Hourly: minute of the hour (0-59).","minimum":0},"time":{"type":"string","description":"Daily/weekly: time of day as \"HH:MM\" (24h)."}}};
 
 function validate256(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

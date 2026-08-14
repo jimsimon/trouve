@@ -17,7 +17,7 @@ use trouve_agents::{
     BackendPermission, BackendSteer, BackendTurn,
 };
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
+    AgentPersona, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
@@ -37,7 +37,7 @@ use crate::tools::{
     McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
     SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
-use crate::{context, git, modes, new_id};
+use crate::{context, git, new_id, personas};
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
@@ -536,7 +536,7 @@ async fn flush_backend_event_batch(
 
 struct BackendCollaboratorProjection {
     thread: Thread,
-    mode: AgentMode,
+    mode: AgentPersona,
     turn: u64,
     /// Whether the durable parent-rail link for this collaborator has been
     /// published. Child activity can arrive before the provider's formal
@@ -568,7 +568,7 @@ struct BackendCollaboratorProjection {
 struct PendingCollaboratorApproval {
     thread: Thread,
     turn: u64,
-    mode: AgentMode,
+    mode: AgentPersona,
     call_id: String,
     tool: String,
     args: serde_json::Value,
@@ -1725,7 +1725,7 @@ impl Drop for DeletingSessionMarker<'_> {
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
-    config_dir: Option<PathBuf>,
+    pub(crate) config_dir: Option<PathBuf>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute models the catalog cannot represent (notably Cursor).
@@ -4458,8 +4458,12 @@ impl Engine {
             .usage_summary(crate::store::UsageScope::Session(session_id))?)
     }
 
-    /// Agent modes visible for a workspace (built-ins + config + `.agents`).
-    pub fn list_modes(&self, workspace_id: Option<&str>) -> Result<Vec<AgentMode>, EngineError> {
+    /// Agent personas visible for a workspace. This is the unified catalog:
+    /// interactive personas plus the focused code-review personas.
+    pub fn list_personas(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<AgentPersona>, EngineError> {
         let root = match workspace_id {
             Some(id) => {
                 let ws = self
@@ -4470,18 +4474,15 @@ impl Engine {
             }
             None => None,
         };
-        Ok(modes::resolve_modes(
-            self.config_dir.as_deref(),
-            root.as_deref(),
-        ))
+        self.resolve_personas(root.as_deref())
     }
 
     /// Modes with provenance (builtin / customized / custom / workspace)
     /// for the settings screen.
-    pub fn list_mode_infos(
+    pub fn list_persona_infos(
         &self,
         workspace_id: Option<&str>,
-    ) -> Result<Vec<trouve_protocol::ModeInfo>, EngineError> {
+    ) -> Result<Vec<trouve_protocol::PersonaInfo>, EngineError> {
         let root = match workspace_id {
             Some(id) => {
                 let ws = self
@@ -4492,18 +4493,57 @@ impl Engine {
             }
             None => None,
         };
-        Ok(modes::resolve_mode_infos(
-            self.config_dir.as_deref(),
-            root.as_deref(),
-        ))
+        let mut infos =
+            personas::resolve_persona_infos(self.config_dir.as_deref(), root.as_deref());
+        let review_builtin_ids: std::collections::HashSet<_> =
+            crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .map(|reviewer| reviewer.id)
+                .collect();
+        for info in &mut infos {
+            if review_builtin_ids.contains(&info.persona.id) && info.origin == "custom" {
+                info.origin = "customized".into();
+            }
+        }
+        for reviewer in self.code_review_reviewer_catalog()? {
+            if infos.iter().any(|info| info.persona.id == reviewer.id) {
+                continue;
+            }
+            infos.push(trouve_protocol::PersonaInfo {
+                persona: crate::reviewers::reviewer_as_persona(&reviewer),
+                origin: if reviewer.built_in {
+                    "builtin"
+                } else {
+                    "custom"
+                }
+                .into(),
+            });
+        }
+        Ok(infos)
     }
 
-    /// Create or update a user-level mode. Saving under a built-in id
-    /// customizes that built-in; the file lands in `<config>/modes/`.
-    pub fn upsert_mode(
+    fn resolve_personas(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> Result<Vec<AgentPersona>, EngineError> {
+        let mut personas: Vec<_> = self
+            .code_review_reviewer_catalog()?
+            .iter()
+            .map(crate::reviewers::reviewer_as_persona)
+            .collect();
+        for persona in personas::resolve_personas(self.config_dir.as_deref(), workspace_root) {
+            personas.retain(|candidate| candidate.id != persona.id);
+            personas.push(persona);
+        }
+        Ok(personas)
+    }
+
+    /// Create or update a user-level persona. Saving under a built-in id
+    /// customizes that built-in; the file lands in `<config>/personas/`.
+    pub fn upsert_persona(
         &self,
         id: &str,
-        req: trouve_protocol::UpsertModeRequest,
+        req: trouve_protocol::UpsertPersonaRequest,
     ) -> Result<(), EngineError> {
         let config_dir = self
             .config_dir
@@ -4517,7 +4557,7 @@ impl Engine {
             )));
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
-        let mode = AgentMode {
+        let persona = AgentPersona {
             id: id.to_string(),
             display_name: req.display_name,
             system_prompt: req.system_prompt,
@@ -4527,19 +4567,19 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
-        modes::upsert_user_mode(config_dir, &mode)
+        personas::upsert_user_persona(config_dir, &persona)
             .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
     }
 
-    /// Remove a user-level mode file: deletes a custom mode, or resets a
+    /// Remove a user-level persona file: deletes a custom persona, or resets a
     /// customized built-in to its defaults.
-    pub fn delete_mode(&self, id: &str) -> Result<(), EngineError> {
+    pub fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
         let config_dir = self
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        modes::delete_user_mode(config_dir, id)
-            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+        personas::delete_user_persona(config_dir, id)
+            .map_err(|error| EngineError::BadRequest(format!("{error:#}")))
     }
 
     /// GitHub repository named by the session's origin remote. Routes to
@@ -6725,9 +6765,9 @@ impl Engine {
     ) -> Result<Thread, EngineError> {
         debug_assert_eq!(session.id, req.session_id);
         let ws = self.store.workspace(&session.workspace_id)?.unwrap();
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
         let mode_id = req.mode.unwrap_or_else(|| "code".into());
-        let mode = modes::find_mode(&all_modes, &mode_id)
+        let mode = personas::find_persona(&all_modes, &mode_id)
             .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
         // Provider availability is validated when a message is sent, not
         // here: a thread must be creatable before any provider is configured.
@@ -6815,9 +6855,8 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        Ok(modes::find_mode(&modes, &thread.mode)
+        let modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        Ok(personas::find_persona(&modes, &thread.mode)
             .map(|mode| mode.read_only)
             .unwrap_or(true))
     }
@@ -6832,9 +6871,8 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let inherited = modes::find_mode(&modes, &inherited_thread.mode);
+        let modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let inherited = personas::find_persona(&modes, &inherited_thread.mode);
         // Provider metadata may reduce a collaborator's authority, but it is
         // never an authorization source that can widen the parent's mode.
         // Unknown parent modes fail closed just like turn execution does.
@@ -6865,7 +6903,9 @@ impl Engine {
         };
         preferred
             .iter()
-            .find_map(|id| modes::find_mode(&modes, id).filter(|mode| mode.read_only == read_only))
+            .find_map(|id| {
+                personas::find_persona(&modes, id).filter(|mode| mode.read_only == read_only)
+            })
             .or_else(|| modes.iter().find(|mode| mode.read_only == read_only))
             .map(|mode| mode.id.clone())
             .ok_or_else(|| {
@@ -7020,9 +7060,8 @@ impl Engine {
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
-            let all_modes =
-                modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-            modes::find_mode(&all_modes, mode_id)
+            let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+            personas::find_persona(&all_modes, mode_id)
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
         }
         if let Some(model) = req.model.as_deref()
@@ -8589,10 +8628,10 @@ impl Engine {
             background_mutation_lease: None,
         };
 
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+        let mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         // A turn owns only a shared session lifecycle lease. Sibling turns in
         // the same worktree may reason and invoke tools concurrently; the
         // narrower tool-execution lane is the authority that serializes
@@ -8713,7 +8752,7 @@ impl Engine {
             specs.push(search_transcript_spec());
         }
         // Recursive spawn tools remain bounded by the durable tree depth and
-        // also respect the mode policy, so restrictive/read-only modes that
+        // also respect the mode policy, so restrictive/read-only personas that
         // do not list them cannot create child agents.
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
@@ -9708,7 +9747,7 @@ impl Engine {
     fn bridged_context(
         &self,
         thread_id: &str,
-    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+    ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
         self.bridged_context_with_cancel(thread_id, cancel)
     }
@@ -9740,7 +9779,7 @@ impl Engine {
         &self,
         thread_id: &str,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<(Session, Thread, AgentMode, ToolCtx), EngineError> {
+    ) -> Result<(Session, Thread, AgentPersona, ToolCtx), EngineError> {
         let thread = self.get_thread(thread_id)?;
         let session = self.get_session(&thread.session_id)?;
         let ws = self
@@ -9748,10 +9787,10 @@ impl Engine {
             .workspace(&session.workspace_id)
             .map_err(EngineError::Internal)?
             .ok_or_else(|| EngineError::NotFound("workspace".into()))?;
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
+        let mode = personas::find_persona(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         let worktree = PathBuf::from(&session.worktree_path);
         let canonical_worktree = worktree
             .canonicalize()
@@ -9962,11 +10001,10 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .ok_or_else(|| anyhow!("workspace {} not found", session.workspace_id))?;
-        let all_modes =
-            modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
-        let inherited_mode = modes::find_mode(&all_modes, &inherited_thread.mode)
+        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let inherited_mode = personas::find_persona(&all_modes, &inherited_thread.mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         if !inherited_mode.allowed_tools.is_empty()
             && !inherited_mode
                 .allowed_tools
@@ -10036,9 +10074,9 @@ impl Engine {
             .generate_subagent_title(name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
-        let collaborator_mode = modes::find_mode(&all_modes, &child_mode)
+        let collaborator_mode = personas::find_persona(&all_modes, &child_mode)
             .cloned()
-            .unwrap_or_else(modes::fallback_mode);
+            .unwrap_or_else(personas::fallback_persona);
         let child = collaborator_claims
             .create_claimed_thread(&session.id, || {
                 self.create_spawned_thread_for_session(
@@ -10304,7 +10342,7 @@ impl Engine {
     async fn persist_backend_collaborator_event(
         &self,
         session: &Session,
-        _root_mode: &AgentMode,
+        _root_mode: &AgentPersona,
         backend_id: &str,
         collaborator: &mut BackendCollaboratorProjection,
         event: BackendCollaboratorEvent,
@@ -10548,7 +10586,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
@@ -11668,7 +11706,7 @@ impl Engine {
     }
 
     /// Gate one backend approval request through trouve's permission layer:
-    /// allow-list hits auto-approve, read-only modes deny, otherwise ask the
+    /// allow-list hits auto-approve, read-only personas deny, otherwise ask the
     /// user through the ApprovalHub (same endpoints as native tool calls).
     #[allow(clippy::too_many_arguments)]
     async fn gate_backend_approval(
@@ -11937,7 +11975,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         calls: Vec<trouve_providers::ToolCallRequest>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -11993,7 +12031,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         calls: Vec<(usize, trouve_providers::ToolCallRequest)>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12026,7 +12064,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12040,7 +12078,7 @@ impl Engine {
 
         // ask_question is engine-served (it blocks on the QuestionHub, which
         // tools can't reach) and never gated — asking is how the agent defers
-        // to the user, so it works even in read-only modes. No tool card is
+        // to the user, so it works even in read-only personas. No tool card is
         // emitted: the question wizard is its representation in the UI.
         if call.name == "ask_question" {
             let result = match parse_question_args(&call.arguments) {
@@ -12445,7 +12483,7 @@ impl Engine {
         self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
-        mode: &AgentMode,
+        mode: &AgentPersona,
         name: &str,
         args: &serde_json::Value,
         cancel: &tokio_util::sync::CancellationToken,
@@ -12489,7 +12527,7 @@ impl Engine {
         let tree_lock = self.subagent_tree_lock(&root_thread_id);
         let _tree_spawn = tree_lock.lock().await;
 
-        // Respect the mode's tool policy: a restrictive/read-only mode that
+        // Respect the mode's tool policy: a restrictive/read-only persona that
         // doesn't list the spawn tool can't create branches or child agents
         // (the specs are already filtered, but a model may still emit the
         // call — deny it here too).
@@ -12530,7 +12568,7 @@ impl Engine {
         // A read-only parent must not launch an agent that can do what it
         // itself cannot.
         if mode.read_only && child_mode != thread.mode {
-            bail!("read-only modes can only spawn children in the same mode");
+            bail!("read-only personas can only spawn children in the same mode");
         }
         let child_model = args
             .get("model")
@@ -13850,11 +13888,11 @@ pub fn spawn_thread_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Agent mode id for the child (default: your mode). Use a read-only mode like \"plan\" for concurrent research."
+                    "description": "Agent persona id for the child (default: your persona). Use a read-only persona like \"plan\" for concurrent research."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Provider-qualified model for the child (default: your model)."
+                    "description": "Provider-qualified model for the child (default: your personal)."
                 }
             },
             "required": ["prompt"]
@@ -13892,11 +13930,11 @@ pub fn spawn_session_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Agent mode id for the child (default: your mode)."
+                    "description": "Agent persona id for the child (default: your persona)."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Provider-qualified model for the child (default: your model)."
+                    "description": "Provider-qualified model for the child (default: your personal)."
                 }
             },
             "required": ["prompt"]
@@ -15767,7 +15805,7 @@ mod tests {
             engine.handle_spawn_tool(
                 &session,
                 &parent,
-                &modes::fallback_mode(),
+                &personas::fallback_persona(),
                 "spawn_output",
                 &serde_json::json!({"thread_id": child.id, "wait_ms": 180_000}),
                 &cancel,
@@ -16370,10 +16408,10 @@ mod tests {
         assert!(accepted.queued);
         assert_eq!(store.queued_prompts(&child.id).unwrap().len(), 1);
 
-        let workspace_modes = data.path().join(".agents/modes");
-        std::fs::create_dir_all(&workspace_modes).unwrap();
+        let workspace_personas = data.path().join(".agents/personas");
+        std::fs::create_dir_all(&workspace_personas).unwrap();
         std::fs::write(
-            workspace_modes.join("plan.toml"),
+            workspace_personas.join("plan.toml"),
             r#"
 id = "plan"
 display_name = "Interactive Plan Override"
@@ -16445,7 +16483,7 @@ default_permission_mode = "ask"
         ));
         assert!(store.queued_prompts(&audit_child.id).unwrap().is_empty());
 
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         std::fs::write(data.path().join("bridge-owner.txt"), "owned by the child").unwrap();
@@ -17951,7 +17989,7 @@ default_permission_mode = "ask"
                 &session,
                 &thread,
                 1,
-                &modes::fallback_mode(),
+                &personas::fallback_persona(),
                 &ctx,
                 &call,
                 &tokio_util::sync::CancellationToken::new(),
@@ -18023,7 +18061,7 @@ default_permission_mode = "ask"
             thread_id: thread.id.clone(),
             ..Default::default()
         };
-        let mode = modes::fallback_mode();
+        let mode = personas::fallback_persona();
         for (turn, call) in [
             (
                 2,
@@ -18616,7 +18654,7 @@ default_permission_mode = "ask"
             spawned: false,
             todos: Vec::new(),
         };
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let tools_enabled = false;
@@ -18762,7 +18800,7 @@ default_permission_mode = "ask"
                 },
             )),
         );
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -18839,7 +18877,7 @@ default_permission_mode = "ask"
             name: "write_test".into(),
             arguments: serde_json::json!({}),
         };
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let execution = tokio::spawn({
@@ -18935,7 +18973,7 @@ default_permission_mode = "ask"
                 },
             )),
         );
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+        let mode = personas::find_persona(&personas::builtin_personas(), "code")
             .unwrap()
             .clone();
         let ctx = ToolCtx {

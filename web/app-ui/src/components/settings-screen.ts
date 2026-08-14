@@ -20,14 +20,14 @@ import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import "./cli-settings.js";
 import "./local-model-settings.js";
 import "./management-settings-panels.js";
-import "./mode-settings-panel.js";
+import "./persona-settings-panel.js";
 import "./provider-settings.js";
 
 const SETTINGS_SECTIONS = [
   "general",
   "chat",
   "providers",
-  "modes",
+  "personas",
   "mcp",
   "integrations",
   "appearance",
@@ -40,7 +40,7 @@ const SETTINGS_ALIASES: Readonly<Record<string, SettingsSection>> = {
   clis: "providers",
   "local-models": "providers",
   "provider-api": "providers",
-  "modes-models": "modes",
+  "personas-models": "personas",
   "git-worktrees": "chat",
   workspaces: "chat",
   "mcp-servers": "mcp",
@@ -54,7 +54,7 @@ const settingsSection = (value: string): SettingsSection =>
 
 const sectionLabel = (section: SettingsSection): string => {
   if (section === "chat") return "Sessions & Chat";
-  if (section === "modes") return "Modes & Models";
+  if (section === "personas") return "Personas & Models";
   if (section === "mcp") return "MCP Servers";
   return `${section[0]?.toUpperCase()}${section.slice(1)}`;
 };
@@ -360,8 +360,8 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                         <trouve-git-worktree-settings></trouve-git-worktree-settings>
                       </div>
                     `
-                : active === "modes"
-                  ? html`<trouve-mode-settings></trouve-mode-settings>`
+                : active === "personas"
+                  ? html`<trouve-persona-settings></trouve-persona-settings>`
                 : active === "mcp"
                   ? html`<trouve-mcp-settings></trouve-mcp-settings>`
                 : active === "integrations"

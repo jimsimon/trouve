@@ -73,7 +73,7 @@ pub fn gate(
     allow_list: &HashSet<String>,
     key: &str,
 ) -> Gate {
-    // Yolo is opt-in full trust: no approval prompts. Read-only agent modes
+    // Yolo is opt-in full trust: no approval prompts. Read-only agent personas
     // still deny mutating tools.
     if mode == PermissionMode::Yolo {
         return if mode_read_only && tool_mutates {

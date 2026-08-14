@@ -43,10 +43,10 @@ export type ProtocolPrActionRequest =
   ProtocolComponents["schemas"]["PrActionRequest"];
 export type ProtocolCreatePrRequest =
   ProtocolComponents["schemas"]["CreatePrRequest"];
-export type ProtocolAgentMode = ProtocolComponents["schemas"]["AgentMode"];
-export type ProtocolModeInfo = ProtocolComponents["schemas"]["ModeInfo"];
-export type ProtocolUpsertModeRequest =
-  ProtocolComponents["schemas"]["UpsertModeRequest"];
+export type ProtocolAgentPersona = ProtocolComponents["schemas"]["AgentPersona"];
+export type ProtocolPersonaInfo = ProtocolComponents["schemas"]["PersonaInfo"];
+export type ProtocolUpsertPersonaRequest =
+  ProtocolComponents["schemas"]["UpsertPersonaRequest"];
 export type ProtocolSetDefaultModelRequest =
   ProtocolComponents["schemas"]["SetDefaultModelRequest"];
 export type ProtocolSetDefaultPermissionModeRequest =
@@ -137,8 +137,6 @@ export type ProtocolConfigureGithubAppRequest =
   ProtocolComponents["schemas"]["ConfigureGithubAppRequest"];
 export type ProtocolReviewerProfile =
   ProtocolComponents["schemas"]["ReviewerProfile"];
-export type ProtocolUpsertReviewerProfileRequest =
-  ProtocolComponents["schemas"]["UpsertReviewerProfileRequest"];
 export type ProtocolCodeReviewRepository =
   ProtocolComponents["schemas"]["CodeReviewRepository"];
 export type ProtocolUpdateCodeReviewRepositoryRequest =
@@ -195,8 +193,8 @@ interface ProtocolValidators {
   readonly workspaces: ValidateFunction;
   readonly branchList: ValidateFunction;
   readonly prInfo: ValidateFunction;
-  readonly modes: ValidateFunction;
-  readonly modeInfos: ValidateFunction;
+  readonly personas: ValidateFunction;
+  readonly personaInfos: ValidateFunction;
   readonly models: ValidateFunction;
   readonly thread: ValidateFunction;
   readonly threads: ValidateFunction;
@@ -324,8 +322,8 @@ const validateResponse = async <T>(
     | "BranchList"
     | "PrInfo"
     | "PrInfo[]"
-    | "AgentMode[]"
-    | "ModeInfo[]"
+    | "AgentPersona[]"
+    | "PersonaInfo[]"
     | "ModelInfo[]"
     | "Thread"
     | "Thread[]"
@@ -422,7 +420,7 @@ export class ProtocolClientError extends Error {
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "5.3";
+export const SUPPORTED_PROTOCOL_VERSION = "6.0";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -920,50 +918,50 @@ export class ProtocolClient {
     return this.#parsePrDetail(response);
   }
 
-  async modes(workspaceId?: string): Promise<readonly ProtocolAgentMode[]> {
+  async personas(workspaceId?: string): Promise<readonly ProtocolAgentPersona[]> {
     let result;
     try {
-      result = await this.#client.GET("/v1/modes", {
+      result = await this.#client.GET("/v1/personas", {
         params: { query: workspaceId === undefined ? {} : { workspace_id: workspaceId } },
       });
     } catch {
-      throw new ProtocolClientError("request-failed", "mode request failed");
+      throw new ProtocolClientError("request-failed", "persona request failed");
     }
     if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "mode request failed");
+      throw new ProtocolClientError("request-failed", "persona request failed");
     }
-    return validateResponse<readonly ProtocolAgentMode[]>(
-      "AgentMode[]",
+    return validateResponse<readonly ProtocolAgentPersona[]>(
+      "AgentPersona[]",
       result.data,
-      (loaded) => loaded.modes,
+      (loaded) => loaded.personas,
     );
   }
 
-  async modeInfos(workspaceId?: string): Promise<readonly ProtocolModeInfo[]> {
+  async personaInfos(workspaceId?: string): Promise<readonly ProtocolPersonaInfo[]> {
     const parameters = new URLSearchParams();
     if (workspaceId !== undefined) parameters.set("workspace_id", workspaceId);
     const suffix = parameters.size === 0 ? "" : `?${parameters.toString()}`;
     return this.#validatedJson(
-      `/v1/mode-infos${suffix}`,
-      "mode information",
-      "ModeInfo[]",
-      (loaded) => loaded.modeInfos,
+      `/v1/persona-infos${suffix}`,
+      "persona information",
+      "PersonaInfo[]",
+      (loaded) => loaded.personaInfos,
     );
   }
 
-  async upsertMode(modeId: string, request: ProtocolUpsertModeRequest): Promise<void> {
+  async upsertPersona(personaId: string, request: ProtocolUpsertPersonaRequest): Promise<void> {
     await this.#mutation(
-      `/v1/modes/${encodeURIComponent(modeId)}`,
-      "save mode",
+      `/v1/personas/${encodeURIComponent(personaId)}`,
+      "save persona",
       "PUT",
       request,
     );
   }
 
-  async deleteMode(modeId: string): Promise<void> {
+  async deletePersona(personaId: string): Promise<void> {
     await this.#mutation(
-      `/v1/modes/${encodeURIComponent(modeId)}`,
-      "reset mode",
+      `/v1/personas/${encodeURIComponent(personaId)}`,
+      "reset persona",
       "DELETE",
     );
   }
@@ -1297,27 +1295,6 @@ export class ProtocolClient {
       "GithubAppStatus",
       (loaded) => loaded.githubAppStatus,
       request,
-    );
-  }
-
-  async upsertCodeReviewReviewer(
-    request: ProtocolUpsertReviewerProfileRequest,
-  ): Promise<ProtocolReviewerProfile> {
-    return this.#validatedMutation(
-      "/v1/code-review/reviewer",
-      "save code review persona",
-      "PUT",
-      "ReviewerProfile",
-      (loaded) => loaded.reviewerProfile,
-      request,
-    );
-  }
-
-  async deleteCodeReviewReviewer(reviewerId: string): Promise<void> {
-    await this.#mutation(
-      `/v1/code-review/reviewer/${encodeURIComponent(reviewerId)}`,
-      "delete code review persona",
-      "DELETE",
     );
   }
 

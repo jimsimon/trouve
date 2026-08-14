@@ -9,7 +9,6 @@ import {
   repositoryDraft,
   repositoryUpdateRequest,
   reviewerDraft,
-  reviewerUpsertRequest,
   sanitizeGithubAppStatus,
   type RepositoryDraft,
 } from "./code-review-configuration-model.js";
@@ -139,59 +138,6 @@ describe("code-review repository requests", () => {
       routingMode: "manual",
       reviewerIds: [],
     }).model).toBeNull();
-  });
-});
-
-describe("code-review reviewer requests", () => {
-  const builtIn: ProtocolReviewerProfile = {
-    id: "security",
-    name: "Security",
-    prompt: "Find exploitable security defects.",
-    model: "provider/old",
-    default_thinking_level: "low",
-    built_in: true,
-  };
-
-  it("keeps built-in identity immutable and resends both editable defaults", () => {
-    expect(reviewerUpsertRequest(builtIn, {
-      name: "Renamed",
-      prompt: "Replaced prompt",
-      model: " provider/new ",
-      thinkingLevel: "",
-    })).toEqual({
-      id: "security",
-      name: "Security",
-      prompt: "Find exploitable security defects.",
-      model: "provider/new",
-      default_thinking_level: null,
-    });
-  });
-
-  it("creates and updates custom reviewers with full-replace defaults", () => {
-    expect(reviewerUpsertRequest(undefined, {
-      name: "  API contracts ",
-      prompt: " Check compatibility. ",
-      model: "",
-      thinkingLevel: "high",
-    })).toEqual({
-      name: "API contracts",
-      prompt: " Check compatibility. ",
-      model: null,
-      default_thinking_level: "high",
-    });
-
-    expect(reviewerDraft(builtIn)).toEqual({
-      name: "Security",
-      prompt: "Find exploitable security defects.",
-      model: "provider/old",
-      thinkingLevel: "low",
-    });
-    expect(() => reviewerUpsertRequest(undefined, {
-      name: "",
-      prompt: "Prompt",
-      model: "",
-      thinkingLevel: "",
-    })).toThrow("reviewer name required");
   });
 });
 

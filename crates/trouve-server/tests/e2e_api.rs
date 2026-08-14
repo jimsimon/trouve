@@ -5860,7 +5860,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
         Engine::new(store, tmp.path().join("data"), &Config::default())
-            .with_config_dir(None)
+            .with_config_dir(Some(tmp.path().join("config")))
             .with_provider("anthropic", Arc::new(ReviewRouterProvider)),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5891,44 +5891,36 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
 
-    let built_in_defaults: serde_json::Value = client
-        .put(format!("{base}/reviewer"))
+    let response = client
+        .put(format!("http://{addr}/v1/personas/correctness"))
         .json(&serde_json::json!({
-            "id": "correctness",
-            "name": "stale client label",
-            "prompt": "stale client prompt",
-            "model": "anthropic/claude",
+            "display_name": "Correctness",
+            "system_prompt": "Check correctness.",
+            "allowed_tools": [],
+            "read_only": true,
+            "default_model": "anthropic/claude",
             "default_thinking_level": "high"
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    assert_eq!(built_in_defaults["built_in"], true);
-    assert_ne!(built_in_defaults["name"], "stale client label");
-    assert_eq!(built_in_defaults["model"], "anthropic/claude");
-    assert_eq!(built_in_defaults["default_thinking_level"], "high");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let custom: serde_json::Value = client
-        .put(format!("{base}/reviewer"))
+    let custom_id = "widget-invariants";
+    let response = client
+        .put(format!("http://{addr}/v1/personas/{custom_id}"))
         .json(&serde_json::json!({
-            "name": "Widget invariants",
-            "prompt": "Check every widget state transition.",
-            "model": "openai/gpt-5",
+            "display_name": "Widget invariants",
+            "system_prompt": "Check every widget state transition.",
+            "allowed_tools": [],
+            "read_only": true,
+            "default_model": "openai/gpt-5",
             "default_thinking_level": "medium"
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let custom_id = custom["id"].as_str().unwrap();
-    assert!(custom_id.starts_with("custom:"));
-    assert_eq!(custom["built_in"], false);
-    assert_eq!(custom["default_thinking_level"], "medium");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
 
     let response = client
         .put(format!("{base}/repository"))
@@ -6026,18 +6018,18 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     );
 
     let deleted = client
-        .delete(format!("{base}/reviewer/{custom_id}"))
+        .delete(format!("http://{addr}/v1/personas/{custom_id}"))
         .send()
         .await
         .unwrap();
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let built_in = client
-        .delete(format!("{base}/reviewer/correctness"))
+    let reset_built_in = client
+        .delete(format!("http://{addr}/v1/personas/correctness"))
         .send()
         .await
         .unwrap();
-    assert_eq!(built_in.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(reset_built_in.status(), reqwest::StatusCode::NO_CONTENT);
 
     let dashboard: serde_json::Value = client
         .get(&base)
@@ -6049,18 +6041,18 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .unwrap();
     assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
-        serde_json::json!(["correctness"])
+        serde_json::json!(["correctness", custom_id])
     );
     assert_eq!(
         dashboard["repositories"][0]["included_reviewer_ids"],
-        serde_json::json!(["reliability"])
+        serde_json::json!([custom_id, "reliability"])
     );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"]
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
 }
 

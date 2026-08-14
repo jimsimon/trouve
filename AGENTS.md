@@ -62,7 +62,7 @@ These are load-bearing. Do not violate them without a new ADR.
    deliberately with a version bump. Generated clients require an exact
    protocol-version match because closed wire enums and unions are not
    automatically forward-compatible (ADR 0036).
-6. **Agent modes are data.** Modes (plan/code/review/…) are prompt + tool
+6. **Agent personas are data.** Personas (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a mode must not require new Rust
    control flow.
 7. **One product frontend.** `web/app-ui` is the shared Lit application for

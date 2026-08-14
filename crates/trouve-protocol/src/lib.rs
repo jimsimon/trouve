@@ -55,11 +55,11 @@ pub use requests::*;
 // 0.19: connectivity — the server.connectivity_changed event and
 // ServerInfo.online report internet reachability; while offline
 // GET /v1/models lists only models that run without internet (additive).
-// 0.20: global default permission mode — AgentMode.default_permission_mode
+// 0.20: global default permission mode — AgentPersona.default_permission_mode
 // is now optional (absent = global default), GET /v1/providers reports
 // default_permission_mode, and PUT /v1/config/default-permission-mode sets it.
 // 0.21: global and per-mode default thinking levels — additive fields on
-// AgentMode, UpsertModeRequest, ProvidersResponse, and SetDefaultModelRequest.
+// AgentPersona, UpsertPersonaRequest, ProvidersResponse, and SetDefaultModelRequest.
 // 0.22: PR dashboard — PrInfo gains review and comment metadata;
 // workspace.pull_requests_updated persists each workspace snapshot, and
 // POST /v1/workspaces/{id}/prs/refresh triggers a refresh without returning
@@ -265,7 +265,9 @@ pub use requests::*;
 // Progress thread items distinguish authored agent updates from reasoning.
 // 5.3: account GitHub projections include recently closed, unmerged pull
 // requests so session navigators can render their terminal PR state.
-pub const PROTOCOL_VERSION: &str = "5.3";
+// 6.0: interactive and code-review personas become one Persona catalog;
+// AgentPersona/PersonaInfo and /v1/personas replace the former split names.
+pub const PROTOCOL_VERSION: &str = "6.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

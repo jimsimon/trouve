@@ -298,7 +298,7 @@ xterm input/resize are examples.
 | 12 | General and appearance | All five themes, system preference, font scale, reduced motion, semantic preview, layout preference persistence, keep-awake/sleep preference, and capability-aware PWA/desktop explanations. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [appearance preferences](../../web/app-ui/src/services/appearance-preferences.ts), [general preferences](../../web/app-ui/src/services/general-preferences.ts) | Five-theme paired captures, forced colors/zoom, persistence/restart, OS sleep behavior, and supported-device matrix. |
 | 13 | Notifications | Preference toggles, permission/capability state, user-initiated test, exact durable approval/question/completion/failure edges, repeated attention requests, compact failure/question detail, focused-session suppression, activation routing, desktop attention/sound, and unsupported/reliability explanations. | [notification preferences](../../web/app-ui/src/services/notification-preferences.ts), [session notifications](../../web/app-ui/src/services/session-notifications.ts), [desktop host coordinator](../../web/app-ui/src/services/desktop-host-coordinator.ts) | Real OS/browser permission matrices, background/suspend reliability, activation routes, quiet/offline and PWA publication evidence. |
 | 14 | Providers and onboarding | Provider presets and custom endpoints, secret entry, reset/validation, health and models, API-key and OAuth/device/callback login, polling, cancellation, failure/expiry, delete, and vendor CLI install/update/cancel/uninstall lifecycle. | [provider settings](../../web/app-ui/src/components/provider-settings.ts), [CLI settings](../../web/app-ui/src/components/cli-settings.ts) | Live provider matrices, secret redaction audit, OAuth interruption/expiry, onboarding screenshots, keyboard/mobile/AT evidence. |
-| 15 | Modes and models | Data-driven modes, per-mode provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [mode settings](../../web/app-ui/src/components/mode-settings-panel.ts), [model picker](../../web/app-ui/src/components/model-picker.ts), [model option controls](../../web/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
+| 15 | Personas and models | Data-driven personas, per-persona provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [mode settings](../../web/app-ui/src/components/persona-settings-panel.ts), [model picker](../../web/app-ui/src/components/model-picker.ts), [model option controls](../../web/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
 | 16 | Local models | Enabled/status/hardware state, llama.cpp runtime install/update/cancel/uninstall, server start/stop/restart controls, installed model management, download progress/cancel/delete, catalog search, GPU/CPU/too-large fit filters, and manual model addition. | [local model settings](../../web/app-ui/src/components/local-model-settings.ts) | Live runtime/download/disk/concurrency failures, remote-host wording on devices, progress screenshots, memory and AT evidence. |
 | 17 | Session naming | Short or title-derived branch naming plus title-model status, resource/install progress, cancellation, warnings, and protocol-backed configuration. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
 | 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
@@ -938,7 +938,7 @@ or platform gate is recorded.
 
 **Qualification state:** Unqualified.
 
-### 15. Modes and models — functional-preview
+### 15. Personas and models — functional-preview
 
 **Current functional preview coverage**
 
@@ -949,7 +949,7 @@ or platform gate is recorded.
 
 **Primary Lit evidence**
 
-- [mode settings panel](../../web/app-ui/src/components/mode-settings-panel.ts)
+- [mode settings panel](../../web/app-ui/src/components/persona-settings-panel.ts)
 - [settings screen](../../web/app-ui/src/components/settings-screen.ts)
 - [thread controls](../../web/app-ui/src/components/thread-screen.ts)
 

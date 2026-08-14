@@ -1,19 +1,19 @@
-//! Data-driven agent modes (invariant 6): a mode is a prompt, a tool policy,
-//! and model/permission defaults. Built-ins ship as data; users add
-//! or override modes with TOML files in `<config>/modes/` or a workspace's
-//! `.agents/modes/`.
+//! Data-driven agent personas (invariant 6): a persona is a prompt, a tool
+//! policy, and model/permission defaults. Built-ins ship as data; users add
+//! or override personas with TOML files in `<config>/personas/` or a
+//! workspace's `.agents/personas/`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use trouve_protocol::{AgentMode, ModeInfo};
+use trouve_protocol::{AgentPersona, PersonaInfo};
 
-pub fn builtin_modes() -> Vec<AgentMode> {
+pub fn builtin_personas() -> Vec<AgentPersona> {
     vec![
-        AgentMode {
+        AgentPersona {
             id: "code".into(),
             display_name: "Code".into(),
-            system_prompt: "You are in code mode: implement the user's request by editing \
+            system_prompt: "You are in code persona: implement the user's request by editing \
                             files in the workspace. Prefer small verifiable steps; run tests \
                             or builds when they exist. Report what you changed when done."
                 .into(),
@@ -23,10 +23,10 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             default_model: None,
             default_thinking_level: None,
         },
-        AgentMode {
+        AgentPersona {
             id: "plan".into(),
             display_name: "Plan".into(),
-            system_prompt: "You are in plan mode: explore the workspace and produce a concrete \
+            system_prompt: "You are in plan persona: explore the workspace and produce a concrete \
                             implementation plan. Do not modify any files; your deliverable is \
                             the plan itself."
                 .into(),
@@ -45,7 +45,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "todo_write".into(),
                 // Delegation is orchestration rather than a worktree
                 // mutation. Read-only children may fan out only into the
-                // same read-only mode; `handle_spawn_tool` enforces that
+                // same read-only persona; `handle_spawn_tool` enforces that
                 // invariant and intentionally withholds `spawn_session`.
                 "spawn_thread".into(),
                 "spawn_output".into(),
@@ -55,15 +55,15 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             default_model: None,
             default_thinking_level: None,
         },
-        AgentMode {
+        AgentPersona {
             id: "review".into(),
             display_name: "Review".into(),
-            system_prompt: "You are in review mode: examine the changes in this workspace and \
+            system_prompt: "You are in review persona: examine the changes in this workspace and \
                             report problems — bugs, missed edge cases, style violations — with \
                             file and line references. Do not modify files."
                 .into(),
             // No shell here: review is read_only, and the gate denies every
-            // mutating tool (shell included) in read-only modes, so listing
+            // mutating tool (shell included) in read-only personas, so listing
             // them would only tempt the model into a guaranteed-deny loop.
             allowed_tools: vec![
                 "read_file".into(),
@@ -87,10 +87,10 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             // still move narrower work up or down.
             default_thinking_level: Some("medium".into()),
         },
-        AgentMode {
+        AgentPersona {
             id: "architect".into(),
             display_name: "Architect".into(),
-            system_prompt: "You are in architect mode: reason about structure, boundaries, and \
+            system_prompt: "You are in architect persona: reason about structure, boundaries, and \
                             trade-offs. Propose designs and ADR-style records rather than \
                             direct code changes; only touch documentation files."
                 .into(),
@@ -100,10 +100,10 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             default_model: None,
             default_thinking_level: None,
         },
-        AgentMode {
+        AgentPersona {
             id: "question".into(),
             display_name: "Question".into(),
-            system_prompt: "You are in question mode: answer questions about the workspace. \
+            system_prompt: "You are in question persona: answer questions about the workspace. \
                             Read whatever you need; never modify anything."
                 .into(),
             allowed_tools: vec![
@@ -126,16 +126,16 @@ pub fn builtin_modes() -> Vec<AgentMode> {
     ]
 }
 
-/// The mode to run when a thread references one that no longer resolves
+/// The persona to run when a thread references one that no longer resolves
 /// (its TOML was deleted or became invalid). Locked down and read-only: a
 /// thread the user believed was restricted must not silently gain write
-/// access by falling back to the permissive `code` mode.
-pub fn fallback_mode() -> AgentMode {
-    AgentMode {
+/// access by falling back to the permissive `code` persona.
+pub fn fallback_persona() -> AgentPersona {
+    AgentPersona {
         id: "restricted".into(),
         display_name: "Restricted".into(),
-        system_prompt: "The configured mode is unavailable. Operating in a restricted, \
-                        read-only mode: inspect the workspace and report, but do not modify \
+        system_prompt: "The configured persona is unavailable. Operating in a restricted, \
+                        read-only persona: inspect the workspace and report, but do not modify \
                         anything."
             .into(),
         allowed_tools: vec![
@@ -155,7 +155,7 @@ pub fn fallback_mode() -> AgentMode {
     }
 }
 
-fn load_dir(dir: &Path, modes: &mut Vec<AgentMode>) {
+fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -167,67 +167,70 @@ fn load_dir(dir: &Path, modes: &mut Vec<AgentMode>) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        match toml::from_str::<AgentMode>(&text) {
-            Ok(mode) => {
+        match toml::from_str::<AgentPersona>(&text) {
+            Ok(persona) => {
                 // Later layers override earlier ones by id.
-                modes.retain(|m| m.id != mode.id);
-                modes.push(mode);
+                personas.retain(|m| m.id != persona.id);
+                personas.push(persona);
             }
-            Err(e) => tracing::warn!("ignoring invalid mode file {}: {e}", path.display()),
+            Err(e) => tracing::warn!("ignoring invalid persona file {}: {e}", path.display()),
         }
     }
 }
 
-/// Built-ins, overlaid by `<config>/modes/*.toml`, overlaid by the
-/// workspace's `.agents/modes/*.toml`.
-pub fn resolve_modes(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<AgentMode> {
-    let mut modes = builtin_modes();
-    if let Some(dir) = config_dir {
-        load_dir(&dir.join("modes"), &mut modes);
-    }
-    if let Some(root) = workspace_root {
-        load_dir(&root.join(".agents").join("modes"), &mut modes);
-    }
-    modes
-}
-
-pub fn find_mode<'a>(modes: &'a [AgentMode], id: &str) -> Option<&'a AgentMode> {
-    modes.iter().find(|m| m.id == id)
-}
-
-/// Modes with provenance for the settings UI. Same layering as
-/// [`resolve_modes`]; each entry is tagged with where its effective
-/// definition came from.
-pub fn resolve_mode_infos(
+/// Built-ins, overlaid by `<config>/personas/*.toml`, overlaid by the
+/// workspace's `.agents/personas/*.toml`.
+pub fn resolve_personas(
     config_dir: Option<&Path>,
     workspace_root: Option<&Path>,
-) -> Vec<ModeInfo> {
-    let builtin_ids: Vec<String> = builtin_modes().iter().map(|m| m.id.clone()).collect();
-    let mut infos: Vec<ModeInfo> = builtin_modes()
+) -> Vec<AgentPersona> {
+    let mut personas = builtin_personas();
+    if let Some(dir) = config_dir {
+        load_dir(&dir.join("personas"), &mut personas);
+    }
+    if let Some(root) = workspace_root {
+        load_dir(&root.join(".agents").join("personas"), &mut personas);
+    }
+    personas
+}
+
+pub fn find_persona<'a>(personas: &'a [AgentPersona], id: &str) -> Option<&'a AgentPersona> {
+    personas.iter().find(|m| m.id == id)
+}
+
+/// Personas with provenance for the settings UI. Same layering as
+/// [`resolve_personas`]; each entry is tagged with where its effective
+/// definition came from.
+pub fn resolve_persona_infos(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> Vec<PersonaInfo> {
+    let builtin_ids: Vec<String> = builtin_personas().iter().map(|m| m.id.clone()).collect();
+    let mut infos: Vec<PersonaInfo> = builtin_personas()
         .into_iter()
-        .map(|mode| ModeInfo {
-            mode,
+        .map(|persona| PersonaInfo {
+            persona,
             origin: "builtin".into(),
         })
         .collect();
     let mut overlay = |dir: &Path, origin_over_builtin: &str, origin_new: &str| {
-        let mut modes = Vec::new();
-        load_dir(dir, &mut modes);
-        for mode in modes {
-            let origin = if builtin_ids.contains(&mode.id) {
+        let mut personas = Vec::new();
+        load_dir(dir, &mut personas);
+        for persona in personas {
+            let origin = if builtin_ids.contains(&persona.id) {
                 origin_over_builtin.to_string()
             } else {
                 origin_new.to_string()
             };
-            infos.retain(|i| i.mode.id != mode.id);
-            infos.push(ModeInfo { mode, origin });
+            infos.retain(|i| i.persona.id != persona.id);
+            infos.push(PersonaInfo { persona, origin });
         }
     };
     if let Some(dir) = config_dir {
-        overlay(&dir.join("modes"), "customized", "custom");
+        overlay(&dir.join("personas"), "customized", "custom");
     }
     if let Some(root) = workspace_root {
-        let dir = root.join(".agents").join("modes");
+        let dir = root.join(".agents").join("personas");
         overlay(&dir, "workspace", "workspace");
     }
     // Stable order: built-ins first in their canonical order, then the rest
@@ -236,18 +239,18 @@ pub fn resolve_mode_infos(
         (
             builtin_ids
                 .iter()
-                .position(|id| *id == i.mode.id)
+                .position(|id| *id == i.persona.id)
                 .unwrap_or(usize::MAX),
-            i.mode.id.clone(),
+            i.persona.id.clone(),
         )
     });
     infos
 }
 
-/// The user-level mode file defining `id`, if any. Prefers `<id>.toml` but
+/// The user-level persona file defining `id`, if any. Prefers `<id>.toml` but
 /// falls back to scanning (files may be named freely).
-fn user_mode_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
-    let dir = config_dir.join("modes");
+fn user_persona_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
+    let dir = config_dir.join("personas");
     let canonical = dir.join(format!("{id}.toml"));
     if canonical.exists() {
         return Some(canonical);
@@ -260,8 +263,8 @@ fn user_mode_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if let Ok(mode) = toml::from_str::<AgentMode>(&text)
-            && mode.id == id
+        if let Ok(persona) = toml::from_str::<AgentPersona>(&text)
+            && persona.id == id
         {
             return Some(path);
         }
@@ -269,36 +272,39 @@ fn user_mode_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Write (create or replace) the user-level TOML file for a mode. Saving
+/// Write (create or replace) the user-level TOML file for a persona. Saving
 /// under a built-in id customizes that built-in.
-pub fn upsert_user_mode(config_dir: &Path, mode: &AgentMode) -> Result<()> {
-    if mode.id.is_empty()
-        || !mode
+pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<()> {
+    if persona.id.is_empty()
+        || !persona
             .id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        bail!("mode id must be non-empty and [a-zA-Z0-9_-] only");
+        bail!("persona id must be non-empty and [a-zA-Z0-9_-] only");
     }
-    let path = user_mode_file(config_dir, &mode.id)
-        .unwrap_or_else(|| config_dir.join("modes").join(format!("{}.toml", mode.id)));
+    let path = user_persona_file(config_dir, &persona.id).unwrap_or_else(|| {
+        config_dir
+            .join("personas")
+            .join(format!("{}.toml", persona.id))
+    });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let text = toml::to_string_pretty(mode).context("serializing mode")?;
+    let text = toml::to_string_pretty(persona).context("serializing persona")?;
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
-/// Remove the user-level file for a mode: deletes a custom mode outright,
+/// Remove the user-level file for a persona: deletes a custom persona outright,
 /// or resets a customized built-in back to its defaults.
-pub fn delete_user_mode(config_dir: &Path, id: &str) -> Result<()> {
-    let Some(path) = user_mode_file(config_dir, id) else {
-        if builtin_modes().iter().any(|m| m.id == id) {
-            bail!("mode '{id}' is a built-in with no user override to remove");
+pub fn delete_user_persona(config_dir: &Path, id: &str) -> Result<()> {
+    let Some(path) = user_persona_file(config_dir, id) else {
+        if builtin_personas().iter().any(|m| m.id == id) {
+            bail!("persona '{id}' is a built-in with no user override to remove");
         }
-        bail!("no user-level mode '{id}'");
+        bail!("no user-level persona '{id}'");
     };
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     Ok(())
@@ -309,17 +315,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_mode_defaults_to_medium_thinking_without_changing_plan_mode() {
-        let modes = builtin_modes();
+    fn review_persona_defaults_to_medium_thinking_without_changing_plan_persona() {
+        let personas = builtin_personas();
         assert_eq!(
-            find_mode(&modes, "review")
+            find_persona(&personas, "review")
                 .unwrap()
                 .default_thinking_level
                 .as_deref(),
             Some("medium")
         );
         assert!(
-            find_mode(&modes, "plan")
+            find_persona(&personas, "plan")
                 .unwrap()
                 .default_thinking_level
                 .is_none()
@@ -327,16 +333,26 @@ mod tests {
     }
 
     #[test]
-    fn read_only_builtin_modes_can_delegate_without_spawning_sessions() {
-        let modes = builtin_modes();
+    fn read_only_builtin_personas_can_delegate_without_spawning_sessions() {
+        let personas = builtin_personas();
         for id in ["plan", "review", "question"] {
-            let mode = find_mode(&modes, id).unwrap();
-            assert!(mode.read_only);
-            assert!(mode.allowed_tools.iter().any(|tool| tool == "web_fetch"));
-            assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_thread"));
-            assert!(mode.allowed_tools.iter().any(|tool| tool == "spawn_output"));
+            let persona = find_persona(&personas, id).unwrap();
+            assert!(persona.read_only);
+            assert!(persona.allowed_tools.iter().any(|tool| tool == "web_fetch"));
             assert!(
-                !mode
+                persona
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "spawn_thread")
+            );
+            assert!(
+                persona
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| tool == "spawn_output")
+            );
+            assert!(
+                !persona
                     .allowed_tools
                     .iter()
                     .any(|tool| tool == "spawn_session")
@@ -345,12 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mode_overrides_builtin() {
+    fn workspace_persona_overrides_builtin() {
         let tmp = tempfile::tempdir().unwrap();
-        let modes_dir = tmp.path().join(".agents/modes");
-        std::fs::create_dir_all(&modes_dir).unwrap();
+        let personas_dir = tmp.path().join(".agents/personas");
+        std::fs::create_dir_all(&personas_dir).unwrap();
         std::fs::write(
-            modes_dir.join("plan.toml"),
+            personas_dir.join("plan.toml"),
             r#"
 id = "plan"
 display_name = "Custom Plan"
@@ -361,33 +377,33 @@ default_permission_mode = "ask"
 "#,
         )
         .unwrap();
-        let modes = resolve_modes(None, Some(tmp.path()));
-        let plan = find_mode(&modes, "plan").unwrap();
+        let personas = resolve_personas(None, Some(tmp.path()));
+        let plan = find_persona(&personas, "plan").unwrap();
         assert_eq!(plan.display_name, "Custom Plan");
         // Built-ins that weren't overridden are still present.
-        assert!(find_mode(&modes, "code").is_some());
+        assert!(find_persona(&personas, "code").is_some());
     }
 
     #[test]
-    fn mode_infos_track_origin_and_crud_round_trips() {
+    fn persona_infos_track_origin_and_crud_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path();
 
         // Pristine: all built-ins.
-        let infos = resolve_mode_infos(Some(config), None);
+        let infos = resolve_persona_infos(Some(config), None);
         assert!(infos.iter().all(|i| i.origin == "builtin"));
-        assert_eq!(infos[0].mode.id, "code");
+        assert_eq!(infos[0].persona.id, "code");
 
-        // Customize a built-in and add a custom mode.
-        let mut plan = builtin_modes()
+        // Customize a built-in and add a custom persona.
+        let mut plan = builtin_personas()
             .into_iter()
             .find(|m| m.id == "plan")
             .unwrap();
         plan.display_name = "My Plan".into();
         plan.default_model = Some("openai/gpt-4.1-mini".into());
         plan.default_thinking_level = Some("high".into());
-        upsert_user_mode(config, &plan).unwrap();
-        let custom = AgentMode {
+        upsert_user_persona(config, &plan).unwrap();
+        let custom = AgentPersona {
             id: "docs".into(),
             display_name: "Docs".into(),
             system_prompt: "write docs".into(),
@@ -397,42 +413,42 @@ default_permission_mode = "ask"
             default_model: None,
             default_thinking_level: None,
         };
-        upsert_user_mode(config, &custom).unwrap();
+        upsert_user_persona(config, &custom).unwrap();
 
-        let infos = resolve_mode_infos(Some(config), None);
-        let by_id = |id: &str| infos.iter().find(|i| i.mode.id == id).unwrap();
+        let infos = resolve_persona_infos(Some(config), None);
+        let by_id = |id: &str| infos.iter().find(|i| i.persona.id == id).unwrap();
         assert_eq!(by_id("plan").origin, "customized");
-        assert_eq!(by_id("plan").mode.display_name, "My Plan");
+        assert_eq!(by_id("plan").persona.display_name, "My Plan");
         assert_eq!(
-            by_id("plan").mode.default_model.as_deref(),
+            by_id("plan").persona.default_model.as_deref(),
             Some("openai/gpt-4.1-mini")
         );
         assert_eq!(
-            by_id("plan").mode.default_thinking_level.as_deref(),
+            by_id("plan").persona.default_thinking_level.as_deref(),
             Some("high")
         );
         assert_eq!(by_id("docs").origin, "custom");
         assert_eq!(by_id("code").origin, "builtin");
         // Built-ins keep canonical order; customs sort after.
-        assert_eq!(infos.last().unwrap().mode.id, "docs");
+        assert_eq!(infos.last().unwrap().persona.id, "docs");
 
-        // Reset the built-in; remove the custom mode.
-        delete_user_mode(config, "plan").unwrap();
-        delete_user_mode(config, "docs").unwrap();
-        let infos = resolve_mode_infos(Some(config), None);
+        // Reset the built-in; remove the custom persona.
+        delete_user_persona(config, "plan").unwrap();
+        delete_user_persona(config, "docs").unwrap();
+        let infos = resolve_persona_infos(Some(config), None);
         assert!(infos.iter().all(|i| i.origin == "builtin"));
         // Nothing left to delete.
-        assert!(delete_user_mode(config, "plan").is_err());
-        assert!(delete_user_mode(config, "docs").is_err());
+        assert!(delete_user_persona(config, "plan").is_err());
+        assert!(delete_user_persona(config, "docs").is_err());
     }
 
     #[test]
-    fn invalid_mode_ids_are_rejected() {
+    fn invalid_persona_ids_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mode = builtin_modes().remove(0);
-        mode.id = "../evil".into();
-        assert!(upsert_user_mode(tmp.path(), &mode).is_err());
-        mode.id = "".into();
-        assert!(upsert_user_mode(tmp.path(), &mode).is_err());
+        let mut persona = builtin_personas().remove(0);
+        persona.id = "../evil".into();
+        assert!(upsert_user_persona(tmp.path(), &persona).is_err());
+        persona.id = "".into();
+        assert!(upsert_user_persona(tmp.path(), &persona).is_err());
     }
 }

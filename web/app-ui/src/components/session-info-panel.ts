@@ -9,7 +9,7 @@ import {
   type AppServices,
 } from "../contexts/app-contexts.js";
 import {
-  type ProtocolAgentMode,
+  type ProtocolAgentPersona,
   type ProtocolMcpServerInfo,
   type ProtocolPrInfo,
   type ProtocolThread,
@@ -257,7 +257,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
   #diffOverview: SessionDiffOverview | undefined;
   #diffManifest = "";
   #mcpServers: readonly ProtocolMcpServerInfo[] = [];
-  #modes: readonly ProtocolAgentMode[] = [];
+  #modes: readonly ProtocolAgentPersona[] = [];
   #subagents: readonly ProtocolThread[] = [];
   #diffError = "";
   #mcpError = "";
@@ -795,7 +795,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
           ),
       this.#modes.length > 0
         ? Promise.resolve({ status: "fulfilled" as const, value: this.#modes })
-        : Promise.resolve(services.protocol.modes(workspaceId)).then(
+        : Promise.resolve(services.protocol.personas(workspaceId)).then(
             (value) => ({ status: "fulfilled" as const, value }),
             (reason: unknown) => ({ status: "rejected" as const, reason }),
           ),

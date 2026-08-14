@@ -24,7 +24,7 @@ use trouve_protocol::{
     ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest,
     DEFAULT_MAX_PARALLEL_REVIEWS, Event, GithubAppStatus, MAX_PARALLEL_REVIEWS, PermissionMode,
     ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope, SetCodeReviewSettingsRequest,
-    UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
+    UpdateCodeReviewRepositoryRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
@@ -2043,18 +2043,31 @@ impl Engine {
         Ok(job)
     }
 
-    fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
+    pub(crate) fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
         let mut reviewers = crate::reviewers::built_in_reviewers();
-        for defaults in self.store.list_built_in_reviewer_defaults()? {
-            if let Some(reviewer) = reviewers
-                .iter_mut()
-                .find(|reviewer| reviewer.id == defaults.id)
-            {
-                reviewer.model = defaults.model;
-                reviewer.default_thinking_level = defaults.default_thinking_level;
-            }
+        // Pre-unification reviewer records are retained as system personas. They
+        // can be customized through the persona catalog, but never deleted.
+        for mut reviewer in self
+            .store
+            .list_built_in_reviewer_defaults()?
+            .into_iter()
+            .chain(self.store.list_custom_reviewer_profiles()?)
+        {
+            reviewer.built_in = true;
+            reviewers.retain(|candidate| candidate.id != reviewer.id);
+            reviewers.push(reviewer);
         }
-        reviewers.extend(self.store.list_custom_reviewer_profiles()?);
+        // Code review consumes the canonical persona catalog directly.
+        for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None) {
+            let built_in = reviewers
+                .iter()
+                .any(|candidate| candidate.id == persona.id && candidate.built_in)
+                || crate::personas::builtin_personas()
+                    .iter()
+                    .any(|candidate| candidate.id == persona.id);
+            reviewers.retain(|reviewer| reviewer.id != persona.id);
+            reviewers.push(crate::reviewers::persona_as_reviewer(&persona, built_in));
+        }
         Ok(reviewers)
     }
 
@@ -2223,88 +2236,6 @@ impl Engine {
             });
         }
         Ok(normalized)
-    }
-
-    pub fn upsert_reviewer_profile(
-        &self,
-        request: UpsertReviewerProfileRequest,
-    ) -> Result<ReviewerProfile, EngineError> {
-        let model = request
-            .model
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty());
-        if model.as_deref().is_some_and(|model| !model.contains('/')) {
-            return Err(EngineError::BadRequest(
-                "reviewer model must be provider-qualified".into(),
-            ));
-        }
-        let default_thinking_level = request
-            .default_thinking_level
-            .map(|level| level.trim().to_string())
-            .filter(|level| !level.is_empty());
-        let updating = request.id.is_some();
-        let id = request
-            .id
-            .unwrap_or_else(|| format!("custom:{}", crate::new_id("rp")));
-        if id.len() > 150 {
-            return Err(EngineError::BadRequest("reviewer id is too long".into()));
-        }
-        let (name, prompt, built_in) = if id.starts_with("custom:") {
-            let name = request.name.trim();
-            let prompt = request.prompt.trim();
-            if name.is_empty() || name.len() > 100 {
-                return Err(EngineError::BadRequest(
-                    "reviewer name must contain 1 to 100 bytes".into(),
-                ));
-            }
-            if prompt.is_empty() || prompt.len() > 16_000 {
-                return Err(EngineError::BadRequest(
-                    "reviewer prompt must contain 1 to 16000 bytes".into(),
-                ));
-            }
-            if updating
-                && !self
-                    .store
-                    .list_custom_reviewer_profiles()?
-                    .iter()
-                    .any(|reviewer| reviewer.id == id)
-            {
-                return Err(EngineError::NotFound(format!("reviewer profile {id}")));
-            }
-            (name.to_string(), prompt.to_string(), false)
-        } else {
-            let reviewer = crate::reviewers::built_in_reviewers()
-                .into_iter()
-                .find(|reviewer| reviewer.id == id)
-                .ok_or_else(|| EngineError::NotFound(format!("reviewer profile {id}")))?;
-            (reviewer.name, reviewer.prompt, true)
-        };
-        let reviewer = ReviewerProfile {
-            id,
-            name,
-            prompt,
-            model,
-            default_thinking_level,
-            built_in,
-        };
-        self.store.upsert_reviewer_profile(&reviewer)?;
-        self.code_review.poll_wake.notify_one();
-        self.emit_code_review_updated(None)?;
-        Ok(reviewer)
-    }
-
-    pub fn delete_reviewer_profile(&self, id: &str) -> Result<(), EngineError> {
-        if !id.starts_with("custom:") {
-            return Err(EngineError::BadRequest(
-                "built-in reviewers cannot be deleted".into(),
-            ));
-        }
-        if !self.store.delete_custom_reviewer_profile(id)? {
-            return Err(EngineError::NotFound(format!("reviewer profile {id}")));
-        }
-        self.code_review.poll_wake.notify_one();
-        self.emit_code_review_updated(None)?;
-        Ok(())
     }
 
     async fn validate_code_review_thinking_level(
@@ -10715,41 +10646,6 @@ mod tests {
             reviewer_model_options(&reviewer).get("thinking_level"),
             Some(&serde_json::json!("high"))
         );
-    }
-
-    #[test]
-    fn built_in_reviewer_model_and_thinking_defaults_can_be_customized() {
-        let data = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let engine = Engine::new(
-            store,
-            data.path().to_path_buf(),
-            &crate::config::Config::default(),
-        );
-        let saved = engine
-            .upsert_reviewer_profile(UpsertReviewerProfileRequest {
-                id: Some("security".into()),
-                // Built-in content remains canonical even if a client sends
-                // stale display data while changing its defaults.
-                name: "stale".into(),
-                prompt: "stale".into(),
-                model: Some("anthropic/claude-sonnet".into()),
-                default_thinking_level: Some("high".into()),
-            })
-            .unwrap();
-
-        assert!(saved.built_in);
-        assert_eq!(saved.name, "Security & Privacy");
-        assert_ne!(saved.prompt, "stale");
-        assert_eq!(saved.model.as_deref(), Some("anthropic/claude-sonnet"));
-        assert_eq!(saved.default_thinking_level.as_deref(), Some("high"));
-
-        let catalog = engine.code_review_reviewer_catalog().unwrap();
-        let security = catalog
-            .iter()
-            .find(|reviewer| reviewer.id == "security")
-            .unwrap();
-        assert_eq!(security, &saved);
     }
 
     #[test]

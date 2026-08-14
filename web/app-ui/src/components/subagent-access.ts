@@ -1,9 +1,9 @@
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolThread,
 } from "../services/protocol-client.js";
 
-type SubagentMode = Pick<ProtocolAgentMode, "id" | "read_only">;
+type SubagentMode = Pick<ProtocolAgentPersona, "id" | "read_only">;
 type SubagentThread = Pick<ProtocolThread, "mode" | "spawned">;
 
 /**

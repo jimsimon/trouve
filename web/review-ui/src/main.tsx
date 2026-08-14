@@ -15,7 +15,7 @@ import {
   getJob,
   getJobs,
   getKnownProviders,
-  getModeInfos,
+  getPersonaInfos,
   getModels,
   getProviders,
   getReviewSettings,
@@ -80,7 +80,7 @@ import type {
   KnownProvider,
   LoginStarted,
   Model,
-  ModeInfo,
+  PersonaInfo,
   PersonaResult,
   Provider,
   ProvidersResponse,
@@ -322,7 +322,7 @@ function App() {
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
   const [reviewSettings, setReviewSettings] = useState<CodeReviewSettings | null>(null);
   const [models, setModels] = useState<Model[]>([]);
-  const [modeInfos, setModeInfos] = useState<ModeInfo[]>([]);
+  const [modeInfos, setPersonaInfos] = useState<PersonaInfo[]>([]);
   const [dashboardError, setDashboardError] = useState("");
   const [configurationError, setConfigurationError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -376,7 +376,7 @@ function App() {
         getProviders().then(setProviders),
         getReviewSettings().then(setReviewSettings),
         getModels().then(setModels),
-        getModeInfos().then(setModeInfos),
+        getPersonaInfos().then(setPersonaInfos),
       ]);
       const errors = results
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -482,7 +482,7 @@ function App() {
           providers={providers}
           reviewSettings={reviewSettings}
           models={models}
-          reviewModeInfo={modeInfos.find(({ mode }) => mode.id === "review")}
+          reviewPersonaInfo={modeInfos.find(({ persona }) => persona.id === "review")}
           onChanged={() => {
             void loadDashboard(true);
             void loadConfiguration();
@@ -2781,14 +2781,14 @@ function SettingsPage({
   providers,
   reviewSettings,
   models,
-  reviewModeInfo,
+  reviewPersonaInfo,
   onChanged,
 }: {
   app: GithubAppStatus;
   providers: ProvidersResponse | null;
   reviewSettings: CodeReviewSettings | null;
   models: Model[];
-  reviewModeInfo?: ModeInfo;
+  reviewPersonaInfo?: PersonaInfo;
   onChanged: () => void;
 }) {
   return (
@@ -2799,7 +2799,7 @@ function SettingsPage({
         description="Review execution defaults, GitHub App health, and model-provider authentication."
       />
       <ReviewModeSettings
-        modeInfo={reviewModeInfo}
+        modeInfo={reviewPersonaInfo}
         models={models}
         globalModel={providers?.default_model}
         globalThinking={providers?.default_thinking_level}
@@ -2947,13 +2947,13 @@ function ReviewModeSettings({
   globalThinking,
   onChanged,
 }: {
-  modeInfo?: ModeInfo;
+  modeInfo?: PersonaInfo;
   models: Model[];
   globalModel?: string;
   globalThinking?: string;
   onChanged: () => void;
 }) {
-  const mode = modeInfo?.mode;
+  const mode = modeInfo?.persona;
   const [model, setModel] = useState(mode?.default_model ?? "");
   const [thinking, setThinking] = useState(mode?.default_thinking_level ?? "");
   const [busy, setBusy] = useState(false);

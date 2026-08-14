@@ -7,7 +7,7 @@ import {
   type PendingAttachment,
 } from "../services/attachments.js";
 import type {
-  ProtocolAgentMode,
+  ProtocolAgentPersona,
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
@@ -28,7 +28,7 @@ import {
 const mode = (
   id: string,
   defaultModel?: string,
-): ProtocolAgentMode => ({
+): ProtocolAgentPersona => ({
   id,
   display_name: id[0]?.toUpperCase() + id.slice(1),
   system_prompt: `${id} instructions`,
