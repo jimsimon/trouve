@@ -99,4 +99,11 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("var(--trouve-accent)");
     expect(component).toContain("var(--trouve-err)");
   });
+
+  it("clears a stale submission error after a model option changes", () => {
+    const start = component.indexOf("readonly #modelOptionChanged");
+    const handler = component.slice(start, component.indexOf("readonly #permissionChanged", start));
+    expect(handler).toContain("changeModelOption(this.#draft.modelOptions, event.detail)");
+    expect(handler).toContain('this.#internalError = "";');
+  });
 });

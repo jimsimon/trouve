@@ -211,8 +211,9 @@ describe("thread screen asynchronous lifecycle guards", () => {
       '<label class="composer-option mode-option">',
       '<div class="composer-option model-option">',
     );
-    expect(composer).toContain("mode?.default_model");
-    expect(composer).toContain("{ model: mode.default_model }");
+    expect(composer).toContain('const defaultModel = mode?.default_model?.trim() ?? "";');
+    expect(composer).toContain('defaultModel === ""');
+    expect(composer).toContain("{ model: defaultModel }");
     expect(composer).toContain("model_options: {}");
   });
 });

@@ -353,6 +353,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #modesLoading = false;
   #modesError = "";
   #modesGeneration = 0;
+  #modesWorkspaceId = "";
   #modelsLoading = true;
   #modelsError = "";
   #selectedId = "";
@@ -385,10 +386,17 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   async #loadModes(workspaceId: string): Promise<void> {
     const services = this.#services.value;
     if (services === undefined || workspaceId === "") {
+      this.#modesGeneration += 1;
       this.#modes = [];
+      this.#modesWorkspaceId = "";
+      this.#modesLoading = false;
       return;
     }
     const generation = ++this.#modesGeneration;
+    if (workspaceId !== this.#modesWorkspaceId) {
+      this.#modes = [];
+      this.#modesWorkspaceId = workspaceId;
+    }
     this.#modesLoading = true;
     this.#modesError = "";
     this.requestUpdate();
@@ -396,12 +404,17 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       const modes = await services.protocol.modes(workspaceId);
       if (
         generation !== this.#modesGeneration
-        || workspaceId !== this.#draft.workspaceId
+        || workspaceId !== this.#modesWorkspaceId
         || !this.isConnected
       ) return;
       this.#modes = modes;
     } catch {
-      if (generation !== this.#modesGeneration || !this.isConnected) return;
+      if (
+        generation !== this.#modesGeneration
+        || workspaceId !== this.#modesWorkspaceId
+        || !this.isConnected
+      ) return;
+      this.#modes = [];
       this.#modesError = "Mode choices could not be loaded. The saved value is preserved.";
     } finally {
       if (generation === this.#modesGeneration) {
@@ -657,8 +670,9 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   #renderEditor() {
     const models = this.#availableModels();
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
     const editing = this.#editorMode === "edit";
-    const selectedModel = this.#effectiveAutomationModel();
+    const selectedModel = this.#effectiveAutomationModel(this.#draft, modes);
     const effectiveModelId = selectedModel?.id
       ?? this.#draft.model
       ?? "";
@@ -691,10 +705,10 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
             @change=${this.#modeChanged}
           >
             <option value="">Server default</option>
-            ${this.#draft.mode !== "" && !this.#modes.some((mode) => mode.id === this.#draft.mode)
+            ${this.#draft.mode !== "" && !modes.some((mode) => mode.id === this.#draft.mode)
               ? html`<option value=${this.#draft.mode}>${this.#draft.mode}</option>`
               : nothing}
-            ${this.#modes.map(
+            ${modes.map(
               (mode) => html`<option value=${mode.id}>${mode.display_name || mode.id}</option>`,
             )}
           </select>
@@ -848,9 +862,11 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#notice = "";
     this.requestUpdate();
     try {
+      const model = await this.#modelForMutation(this.#draft);
+      if (model === undefined) return;
       const request = automationRequestFromDraft(
         this.#draft,
-        this.#effectiveAutomationModel(),
+        model,
       );
       const automation = editing
         ? await services.protocol.updateAutomation(this.#selectedId, request)
@@ -878,10 +894,12 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     try {
       const draft = { ...automationDraftFrom(automation), enabled };
+      const model = await this.#modelForMutation(draft);
+      if (model === undefined) return;
       this.#replaceAutomation(
         await services.protocol.updateAutomation(
           automation.id,
-          automationRequestFromDraft(draft, this.#effectiveAutomationModel(draft)),
+          automationRequestFromDraft(draft, model),
         ),
       );
       this.#notice = enabled ? "Automation enabled." : "Automation paused.";
@@ -997,13 +1015,47 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
         );
   }
 
-  #effectiveAutomationModel(draft: AutomationDraft = this.#draft): ProtocolModelInfo | undefined {
-    const mode = this.#modes.find((candidate) => candidate.id === (draft.mode || "code"));
-    const modelId = draft.model
-      || mode?.default_model
-      || this.#providers?.default_model
+  #effectiveAutomationModel(
+    draft: AutomationDraft = this.#draft,
+    modes: readonly ProtocolAgentMode[] = this.#modesWorkspaceId === draft.workspaceId
+      ? this.#modes
+      : [],
+    models: readonly ProtocolModelInfo[] = this.#availableModels(),
+    providers: ProtocolProvidersResponse | undefined = this.#providers,
+  ): ProtocolModelInfo | undefined {
+    const mode = modes.find((candidate) => candidate.id === (draft.mode || "code"));
+    const modelId = draft.model.trim()
+      || mode?.default_model?.trim()
+      || providers?.default_model.trim()
       || "";
-    return this.#availableModels().find((model) => model.id === modelId);
+    return models.find((model) => model.id === modelId);
+  }
+
+  async #modelForMutation(draft: AutomationDraft): Promise<ProtocolModelInfo | undefined> {
+    const services = this.#services.value;
+    if (services === undefined || draft.workspaceId === "") {
+      this.#actionError = "Mode and model metadata are unavailable. No changes were saved.";
+      this.requestUpdate();
+      return undefined;
+    }
+    try {
+      const [modes, models, providers] = await Promise.all([
+        services.protocol.modes(draft.workspaceId),
+        services.modelCatalog.refresh("if-stale"),
+        services.protocol.providers(),
+      ]);
+      const modeId = draft.mode || "code";
+      if (!modes.some((mode) => mode.id === modeId)) {
+        throw new Error(`mode ${modeId} is unavailable`);
+      }
+      const model = this.#effectiveAutomationModel(draft, modes, models, providers);
+      if (model === undefined) throw new Error("effective model metadata is unavailable");
+      return model;
+    } catch {
+      this.#actionError = "Mode and model metadata could not be loaded. No changes were saved.";
+      this.requestUpdate();
+      return undefined;
+    }
   }
 
   #scheduleLoadRetry(): void {

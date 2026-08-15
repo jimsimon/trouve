@@ -1389,12 +1389,15 @@ fn session_diff_executor_error(error: String) -> EngineError {
     }
 }
 
+const LEGACY_THINKING_OPTION_KEYS: [&str; 4] =
+    ["thinking_level", "reasoning_effort", "effort", "reasoning"];
+const THINKING_BUDGET_OPTION_KEY: &str = "thinking_budget_tokens";
 const THINKING_OPTION_KEYS: [&str; 5] = [
-    "thinking_level",
-    "reasoning_effort",
-    "effort",
-    "reasoning",
-    "thinking_budget_tokens",
+    LEGACY_THINKING_OPTION_KEYS[0],
+    LEGACY_THINKING_OPTION_KEYS[1],
+    LEGACY_THINKING_OPTION_KEYS[2],
+    LEGACY_THINKING_OPTION_KEYS[3],
+    THINKING_BUDGET_OPTION_KEY,
 ];
 
 fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
@@ -1555,9 +1558,9 @@ fn validate_model_options(
             _ => false,
         };
         let valid_type = if schema_scalar_type(property).is_some() {
-            typed && (choice_values.is_none() || matches_choice)
+            typed
         } else {
-            matches_choice
+            choice_values.is_some()
         };
         if !valid_type {
             return Err(EngineError::BadRequest(format!(
@@ -1613,7 +1616,7 @@ fn inherit_thinking_option(
 fn thinking_option_property(
     model: &trouve_protocol::ModelInfo,
 ) -> Option<(&'static str, &serde_json::Value, &[serde_json::Value])> {
-    THINKING_OPTION_KEYS[..4].iter().find_map(|key| {
+    LEGACY_THINKING_OPTION_KEYS.iter().find_map(|key| {
         let property = model
             .options_schema
             .pointer(&format!("/properties/{key}"))?;
@@ -1638,7 +1641,7 @@ pub(crate) fn advertised_thinking_budget(
 ) -> Option<(u64, Option<u64>)> {
     let property = model
         .options_schema
-        .pointer("/properties/thinking_budget_tokens")?;
+        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}"))?;
     matches!(property["type"].as_str(), Some("integer" | "number")).then(|| {
         (
             property["minimum"].as_u64().unwrap_or(1),
@@ -1709,7 +1712,7 @@ fn normalize_thinking_option(
     let Some(canonical) = options.get("thinking_level").cloned() else {
         return;
     };
-    if options.contains_key("thinking_budget_tokens") {
+    if options.contains_key(THINKING_BUDGET_OPTION_KEY) {
         options.remove("thinking_level");
         return;
     }
@@ -1731,13 +1734,13 @@ fn normalize_thinking_option(
                 .or_else(|| {
                     model
                         .options_schema
-                        .pointer("/properties/thinking_budget_tokens/default")
+                        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}/default"))
                         .and_then(serde_json::Value::as_u64)
                 });
             options.remove("thinking_level");
             if let Some(selected) = selected {
                 options.insert(
-                    "thinking_budget_tokens".into(),
+                    THINKING_BUDGET_OPTION_KEY.into(),
                     serde_json::Value::Number(selected.into()),
                 );
             }
@@ -1781,12 +1784,12 @@ fn resolved_thinking_level(
     options: &serde_json::Map<String, serde_json::Value>,
     model: Option<&trouve_protocol::ModelInfo>,
 ) -> Option<String> {
-    THINKING_OPTION_KEYS[..4]
+    LEGACY_THINKING_OPTION_KEYS
         .iter()
         .find_map(|key| options.get(*key).and_then(thinking_value))
         .or_else(|| {
             options
-                .get("thinking_budget_tokens")
+                .get(THINKING_BUDGET_OPTION_KEY)
                 .and_then(thinking_value)
         })
         .or_else(|| {
@@ -1800,7 +1803,7 @@ fn resolved_thinking_level(
                 .and_then(|model| {
                     model
                         .options_schema
-                        .pointer("/properties/thinking_budget_tokens/default")
+                        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}/default"))
                 })
                 .and_then(thinking_value)
         })
@@ -4487,14 +4490,7 @@ impl Engine {
                 EngineError::NotFound(format!("workspace {}", automation.workspace_id))
             })?;
         let model_options = self
-            .validated_automation_model_options(
-                &workspace,
-                automation.mode.as_deref(),
-                automation.model.as_deref(),
-                automation.thinking_level.as_deref(),
-                &automation.model_options,
-                true,
-            )
+            .automation_model_options_for_fire(&workspace, automation)
             .await?;
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
@@ -4528,6 +4524,44 @@ impl Engine {
             )));
         }
         Ok((session.id, thread.id, accepted.turn))
+    }
+
+    async fn automation_model_options_for_fire(
+        &self,
+        workspace: &trouve_protocol::Workspace,
+        automation: &trouve_protocol::Automation,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+        match self
+            .validated_automation_model_options(
+                workspace,
+                automation.mode.as_deref(),
+                automation.model.as_deref(),
+                automation.thinking_level.as_deref(),
+                &automation.model_options,
+                true,
+            )
+            .await
+        {
+            Ok(options) => Ok(options),
+            Err(error) if automation.model_options.is_empty() => {
+                tracing::warn!(
+                    automation_id = %automation.id,
+                    %error,
+                    "deferring legacy automation thinking validation until its turn"
+                );
+                Ok(automation
+                    .thinking_level
+                    .as_ref()
+                    .map(|level| {
+                        serde_json::Map::from_iter([(
+                            "thinking_level".into(),
+                            serde_json::Value::String(level.clone()),
+                        )])
+                    })
+                    .unwrap_or_default())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn monitor_automation_turn(
@@ -25146,6 +25180,7 @@ default_permission_mode = "ask"
                             {"title": "missing const"}
                         ]
                     },
+                    "missing_schema": {"description": "No scalar contract"},
                     "locked": {"type": "string", "readOnly": true},
                     "constant": {"type": "string", "const": "owned"}
                 }
@@ -25160,6 +25195,17 @@ default_permission_mode = "ask"
         ]);
         assert!(validate_model_options(&valid, &model).is_ok());
 
+        let wrong_choice = serde_json::json!({"effort": "medium"});
+        let wrong_choice_error = validate_model_options(wrong_choice.as_object().unwrap(), &model)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_choice_error.contains("is not one of its advertised values"));
+        let wrong_type = serde_json::json!({"fast": "yes"});
+        let wrong_type_error = validate_model_options(wrong_type.as_object().unwrap(), &model)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type_error.contains("has the wrong scalar type"));
+
         for invalid in [
             serde_json::json!({"removed": true}),
             serde_json::json!({"fast": "yes"}),
@@ -25167,6 +25213,7 @@ default_permission_mode = "ask"
             serde_json::json!({"conflicting": 1}),
             serde_json::json!({"malformed_enum": "valid"}),
             serde_json::json!({"malformed_one_of": "valid"}),
+            serde_json::json!({"missing_schema": "anything"}),
             serde_json::json!({"effort": "medium"}),
             serde_json::json!({"budget": 4.5}),
             serde_json::json!({"budget": 3}),
@@ -25211,6 +25258,65 @@ default_permission_mode = "ask"
                 .await
                 .unwrap(),
             serde_json::Map::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_automation_thinking_defers_transient_model_resolution_failures() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        )
+        .with_config_dir(None)
+        .with_default_model("unconfigured/model");
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_legacy_automation".into(),
+            name: "legacy".into(),
+            path: data.path().display().to_string(),
+        };
+        let mut automation = trouve_protocol::Automation {
+            id: "auto_legacy_thinking".into(),
+            name: "Legacy thinking".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: None,
+            thinking_level: Some("high".into()),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        assert_eq!(
+            engine
+                .automation_model_options_for_fire(&workspace, &automation)
+                .await
+                .unwrap(),
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
+        );
+
+        automation
+            .model_options
+            .insert("fast".into(), serde_json::json!(true));
+        assert!(
+            engine
+                .automation_model_options_for_fire(&workspace, &automation)
+                .await
+                .is_err(),
+            "explicit persisted options must remain strict when model metadata is unavailable"
         );
     }
 
