@@ -16839,6 +16839,101 @@ mod tests {
     }
 
     #[test]
+    fn automation_model_options_migrate_and_round_trip_from_legacy_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy-automations.db");
+        let schedule = trouve_protocol::AutomationSchedule {
+            kind: "daily".into(),
+            minute: 0,
+            time: "09:00".into(),
+            days: Vec::new(),
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE automations (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   prompt TEXT NOT NULL,
+                   workspace_id TEXT NOT NULL,
+                   mode TEXT,
+                   model TEXT,
+                   thinking_level TEXT,
+                   permission_mode TEXT NOT NULL DEFAULT 'ask',
+                   schedule TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 1,
+                   next_run_at TEXT,
+                   last_run_at TEXT,
+                   last_session_id TEXT,
+                   last_error TEXT NOT NULL DEFAULT '',
+                   created_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO automations
+                    (id, name, prompt, workspace_id, mode, model, thinking_level,
+                     permission_mode, schedule, enabled, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    "auto_legacy",
+                    "Legacy",
+                    "Run it",
+                    "ws_legacy",
+                    "code",
+                    Option::<String>::None,
+                    "high",
+                    "ask",
+                    serde_json::to_string(&schedule).unwrap(),
+                    1,
+                    "2026-01-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let mut legacy = store.automation("auto_legacy").unwrap().unwrap();
+        assert!(legacy.model_options.is_empty());
+        legacy
+            .model_options
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        assert!(store.update_automation(&legacy).unwrap());
+
+        let inserted = trouve_protocol::Automation {
+            id: "auto_after_migration".into(),
+            name: "After migration".into(),
+            prompt: "Run this too".into(),
+            model_options: serde_json::Map::from_iter([(
+                "thinking_budget_tokens".into(),
+                serde_json::json!(8192),
+            )]),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            ..legacy.clone()
+        };
+        store.insert_automation(&inserted).unwrap();
+
+        let listed = store.list_automations().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed
+                .iter()
+                .find(|automation| automation.id == legacy.id)
+                .unwrap()
+                .model_options,
+            legacy.model_options
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|automation| automation.id == inserted.id)
+                .unwrap()
+                .model_options,
+            inserted.model_options
+        );
+    }
+
+    #[test]
     fn automations_round_trip_and_record_runs() {
         let store = Store::open_in_memory().unwrap();
         store

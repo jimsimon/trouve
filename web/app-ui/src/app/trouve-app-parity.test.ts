@@ -127,4 +127,12 @@ describe("root shell parity wiring", () => {
       handler.indexOf("void this.#loadNewSessionOptions(workspaceId);"),
     );
   });
+
+  it("preserves new-session model options when a mode keeps the effective model", () => {
+    const start = source.indexOf(".value=${this.#newSessionModeId}");
+    const handler = source.slice(start, source.indexOf("</select>", start));
+    expect(handler).toContain("const previousModel = resolveNewSessionModel(");
+    expect(handler).toContain("const nextModel = resolveNewSessionModel(");
+    expect(handler).toContain("if (nextModel !== previousModel) this.#newSessionModelOptions = {};");
+  });
 });

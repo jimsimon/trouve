@@ -1674,13 +1674,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     @change=${(event: Event) => {
                       const modeId = (event.currentTarget as HTMLSelectElement).value;
                       const mode = this.#modes.find((candidate) => candidate.id === modeId);
-                      const nextModel = mode?.default_model ?? thread.model;
+                      const defaultModel = mode?.default_model?.trim() ?? "";
+                      const nextModel = defaultModel || thread.model;
                       return this.#updateThreadSetting(
                         {
                           mode: modeId,
-                          ...(mode?.default_model == null
+                          ...(defaultModel === ""
                             ? {}
-                            : { model: mode.default_model }),
+                            : { model: defaultModel }),
                           ...(nextModel === thread.model ? {} : { model_options: {} }),
                         },
                         "Mode could not be changed.",
