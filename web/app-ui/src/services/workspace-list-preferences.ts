@@ -1,7 +1,10 @@
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
+import {
+  WORKSPACE_PULL_REQUEST_FILTERS,
+  WORKSPACE_STATUS_FILTERS,
+} from "../components/workspace-session-list-model.js";
 
 const STORAGE_KEY = "trouve.workspace-list-preferences.v1";
-const ALL_FILTERS = 0b1_1111;
 
 export type WorkspaceListGrouping = "repository" | "workspace" | "updated" | "status";
 export type WorkspaceListOrdering = "updated" | "status" | "created";
@@ -10,6 +13,16 @@ export interface WorkspaceListFilterPreferences {
   readonly status: number;
   readonly pullRequest: number;
 }
+
+const FILTER_COUNTS = Object.freeze({
+  status: Math.min(WORKSPACE_STATUS_FILTERS.length, 31),
+  pullRequest: Math.min(WORKSPACE_PULL_REQUEST_FILTERS.length, 31),
+}) satisfies Readonly<Record<keyof WorkspaceListFilterPreferences, number>>;
+
+const ALL_FILTERS = Object.freeze({
+  status: 2 ** FILTER_COUNTS.status - 1,
+  pullRequest: 2 ** FILTER_COUNTS.pullRequest - 1,
+}) satisfies Readonly<Record<keyof WorkspaceListFilterPreferences, number>>;
 
 export interface WorkspaceListPreferences {
   readonly grouping: WorkspaceListGrouping;
@@ -40,10 +53,13 @@ const grouping = (value: unknown): WorkspaceListGrouping =>
 const ordering = (value: unknown): WorkspaceListOrdering =>
   value === "status" || value === "created" ? value : "updated";
 
-const mask = (value: unknown): number =>
+const mask = (
+  category: keyof WorkspaceListFilterPreferences,
+  value: unknown,
+): number =>
   typeof value === "number" && Number.isInteger(value)
-    ? value & ALL_FILTERS
-    : ALL_FILTERS;
+    ? value & ALL_FILTERS[category]
+    : ALL_FILTERS[category];
 
 export const normalizeWorkspaceListPreferences = (
   value: unknown,
@@ -54,15 +70,15 @@ export const normalizeWorkspaceListPreferences = (
   const rawFilters = source["filters"] !== null && typeof source["filters"] === "object"
     ? source["filters"] as Record<string, unknown>
     : {};
-  const filters: Record<string, WorkspaceListFilterPreferences> = {};
+  const filters = Object.create(null) as Record<string, WorkspaceListFilterPreferences>;
   for (const [workspaceId, raw] of Object.entries(rawFilters).slice(0, 1_000)) {
     if (workspaceId === "" || workspaceId.length > 256 || raw === null || typeof raw !== "object") {
       continue;
     }
     const entry = raw as Record<string, unknown>;
     filters[workspaceId] = Object.freeze({
-      status: mask(entry["status"]),
-      pullRequest: mask(entry["pullRequest"]),
+      status: mask("status", entry["status"]),
+      pullRequest: mask("pullRequest", entry["pullRequest"]),
     });
   }
   return Object.freeze({
@@ -114,7 +130,10 @@ export class WorkspaceListPreferencesController {
 
   filtersFor(workspaceId: string): WorkspaceListFilterPreferences {
     return this.#current.get().filters[workspaceId]
-      ?? Object.freeze({ status: ALL_FILTERS, pullRequest: ALL_FILTERS });
+      ?? Object.freeze({
+        status: ALL_FILTERS.status,
+        pullRequest: ALL_FILTERS.pullRequest,
+      });
   }
 
   toggleFilter(
@@ -122,7 +141,12 @@ export class WorkspaceListPreferencesController {
     category: keyof WorkspaceListFilterPreferences,
     index: number,
   ): void {
-    if (workspaceId === "" || index < 0 || index > 4) return;
+    if (
+      workspaceId === ""
+      || !Number.isInteger(index)
+      || index < 0
+      || index >= FILTER_COUNTS[category]
+    ) return;
     const current = this.#current.get();
     const workspace = this.filtersFor(workspaceId);
     const nextWorkspace = Object.freeze({

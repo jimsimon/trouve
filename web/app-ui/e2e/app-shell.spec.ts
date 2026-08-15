@@ -384,6 +384,26 @@ test("session navigation shows configured branch names", async ({ page }, testIn
   }
 });
 
+test("workspace list options dismiss with Escape and an outside pointer", async ({ page }, testInfo) => {
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  const toggle = page.getByRole("button", { name: "Workspace list options" });
+  const options = page.getByRole("group", { name: "Workspace list options" });
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(options).toHaveCount(0);
+  await expect(toggle).toBeFocused();
+
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.locator(".primary-links").click({ position: { x: 2, y: 2 } });
+  await expect(options).toHaveCount(0);
+});
+
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
   test.skip(
     testInfo.project.name.startsWith("mobile"),

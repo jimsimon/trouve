@@ -554,6 +554,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       "visibilitychange",
       this.#retryProtocolAfterVisibility,
     );
+    globalThis.document?.addEventListener(
+      "pointerdown",
+      this.#dismissWorkspaceListOptionsFromPointer,
+      true,
+    );
+    globalThis.document?.addEventListener(
+      "keydown",
+      this.#dismissWorkspaceListOptionsFromKeyboard,
+      true,
+    );
     this.#browserWakeLock?.start();
     if (this.#hostClient !== undefined) {
       if (!this.#hostLoadStarted) {
@@ -588,6 +598,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
       this.#newSessionOptionsLifecycle,
+    );
+    globalThis.document?.removeEventListener(
+      "pointerdown",
+      this.#dismissWorkspaceListOptionsFromPointer,
+      true,
+    );
+    globalThis.document?.removeEventListener(
+      "keydown",
+      this.#dismissWorkspaceListOptionsFromKeyboard,
+      true,
     );
     this.#protocolIngress.stop();
     this.#threadIngress.close();
@@ -1581,6 +1601,32 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#workspaceActionMenuId = "";
     this.#workspaceListOptionsOpen = !this.#workspaceListOptionsOpen;
     this.requestUpdate();
+  };
+
+  #closeWorkspaceListOptions(restoreFocus: boolean): void {
+    if (!this.#workspaceListOptionsOpen) return;
+    this.#workspaceListOptionsOpen = false;
+    this.requestUpdate();
+    if (!restoreFocus) return;
+    void this.updateComplete.then(() => {
+      if (!this.isConnected) return;
+      this.querySelector<HTMLButtonElement>(".workspace-list-options-button")?.focus();
+    });
+  }
+
+  readonly #dismissWorkspaceListOptionsFromPointer = (event: PointerEvent): void => {
+    if (!this.#workspaceListOptionsOpen) return;
+    if (event.composedPath().some((target) =>
+      target instanceof Element && target.closest(".workspace-list-options-wrap") !== null
+    )) return;
+    this.#closeWorkspaceListOptions(false);
+  };
+
+  readonly #dismissWorkspaceListOptionsFromKeyboard = (event: KeyboardEvent): void => {
+    if (!this.#workspaceListOptionsOpen || event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.#closeWorkspaceListOptions(true);
   };
 
   #setWorkspaceListGrouping(event: Event): void {
@@ -3035,14 +3081,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 type="button"
                 aria-label="Workspace list options"
                 title="Workspace list options"
-                aria-haspopup="dialog"
                 aria-expanded=${this.#workspaceListOptionsOpen ? "true" : "false"}
                 @click=${this.#toggleWorkspaceListOptions}
               >${fontAwesomeIcon("ellipsis")}</button>
               ${this.#workspaceListOptionsOpen
                 ? html`<span
                     class="workspace-list-options-menu"
-                    role="dialog"
+                    role="group"
                     aria-label="Workspace list options"
                   >
                     <label>
