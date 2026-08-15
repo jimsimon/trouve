@@ -14,8 +14,8 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
     vec![
         AgentPersona {
             id: "code".into(),
-            display_name: "Code".into(),
-            system_prompt: "You are in code persona: implement the user's request by editing \
+            display_name: "Engineer".into(),
+            system_prompt: "You are the Engineer persona: implement the user's request by editing \
                             files in the workspace. Prefer small verifiable steps; run tests \
                             or builds when they exist. Report what you changed when done."
                 .into(),
@@ -27,11 +27,12 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         },
         AgentPersona {
             id: "plan".into(),
-            display_name: "Plan".into(),
-            system_prompt: "You are in plan persona: explore the workspace and produce a concrete \
+            display_name: "Planner".into(),
+            system_prompt:
+                "You are the Planner persona: explore the workspace and produce a concrete \
                             implementation plan. Do not modify any files; your deliverable is \
                             the plan itself."
-                .into(),
+                    .into(),
             allowed_tools: vec![
                 "read_file".into(),
                 "list_dir".into(),
@@ -59,11 +60,12 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         },
         AgentPersona {
             id: REVIEW_PERSONA_ID.into(),
-            display_name: "Review".into(),
-            system_prompt: "You are in review persona: examine the changes in this workspace and \
+            display_name: "Reviewer".into(),
+            system_prompt:
+                "You are the Reviewer persona: examine the changes in this workspace and \
                             report problems — bugs, missed edge cases, style violations — with \
                             file and line references. Do not modify files."
-                .into(),
+                    .into(),
             // No shell here: review is read_only, and the gate denies every
             // mutating tool (shell included) in read-only personas, so listing
             // them would only tempt the model into a guaranteed-deny loop.
@@ -92,10 +94,11 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: "architect".into(),
             display_name: "Architect".into(),
-            system_prompt: "You are in architect persona: reason about structure, boundaries, and \
+            system_prompt:
+                "You are the Architect persona: reason about structure, boundaries, and \
                             trade-offs. Propose designs and ADR-style records rather than \
                             direct code changes; only touch documentation files."
-                .into(),
+                    .into(),
             allowed_tools: vec![],
             read_only: false,
             default_permission_mode: None,
@@ -104,8 +107,8 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         },
         AgentPersona {
             id: "question".into(),
-            display_name: "Question".into(),
-            system_prompt: "You are in question persona: answer questions about the workspace. \
+            display_name: "Researcher".into(),
+            system_prompt: "You are the Researcher persona: answer questions about the workspace. \
                             Read whatever you need; never modify anything."
                 .into(),
             allowed_tools: vec![
@@ -315,6 +318,23 @@ pub fn delete_user_persona(config_dir: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_persona_names_describe_person_roles() {
+        let personas = builtin_personas();
+        for (id, display_name) in [
+            ("code", "Engineer"),
+            ("plan", "Planner"),
+            ("review", "Reviewer"),
+            ("architect", "Architect"),
+            ("question", "Researcher"),
+        ] {
+            assert_eq!(
+                find_persona(&personas, id).unwrap().display_name,
+                display_name
+            );
+        }
+    }
 
     #[test]
     fn review_persona_defaults_to_medium_thinking_without_changing_plan_persona() {

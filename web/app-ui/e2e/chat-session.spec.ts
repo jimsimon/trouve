@@ -538,14 +538,14 @@ const installProtocolFixtures = async (
       }],
       "GET /v1/personas": [{
         id: "code",
-        display_name: "Code",
+        display_name: "Engineer",
         system_prompt: "Implement the request.",
       }],
       "GET /v1/persona-infos": [{
         origin: "builtin",
         persona: {
           id: "code",
-          display_name: "Code",
+          display_name: "Engineer",
           system_prompt: "Implement the request.",
         },
       }],

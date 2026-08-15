@@ -349,7 +349,7 @@ describe("ProtocolClient", () => {
   it("loads workspace modes/models and validates a confirmed thread update", async () => {
     const mode = {
       id: "code",
-      display_name: "Code",
+      display_name: "Engineer",
       system_prompt: "Implement the requested change.",
     };
     const model = {

@@ -31,7 +31,7 @@ const model = (
 
 const mode = (defaultModel?: string | null): ProtocolAgentPersona => ({
   id: "code",
-  display_name: "Code",
+  display_name: "Engineer",
   system_prompt: "Write code.",
   ...(defaultModel === undefined ? {} : { default_model: defaultModel }),
 });
