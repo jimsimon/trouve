@@ -337,6 +337,7 @@ const runningToolActivityLabel = (tool: string, args: unknown): string => {
   }
   if (normalized === "search" || normalized === "findrelated") return "Searching code…";
   if (normalized === "searchtranscript") return "Searching transcript…";
+  if (normalized === "websearch") return "Searching the web…";
   if (["shell", "bash", "execute", "commandexecution"].includes(normalized)) {
     return "Running command…";
   }

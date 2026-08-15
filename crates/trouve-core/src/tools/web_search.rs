@@ -459,10 +459,15 @@ mod tests {
 
     use super::*;
 
-    async fn mock_server(status: &'static str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    async fn mock_server_with_delay(
+        status: &'static str,
+        body: impl Into<String>,
+        response_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let body = body.into();
         tokio::spawn({
             let calls = calls.clone();
             async move {
@@ -470,6 +475,7 @@ mod tests {
                     calls.fetch_add(1, Ordering::SeqCst);
                     let mut request = vec![0; 16 * 1024];
                     let _ = socket.read(&mut request).await;
+                    tokio::time::sleep(response_delay).await;
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -479,6 +485,13 @@ mod tests {
             }
         });
         (format!("http://{address}/mcp"), calls)
+    }
+
+    async fn mock_server(
+        status: &'static str,
+        body: impl Into<String>,
+    ) -> (String, Arc<AtomicUsize>) {
+        mock_server_with_delay(status, body, Duration::ZERO).await
     }
 
     #[test]
@@ -573,6 +586,90 @@ mod tests {
         assert_eq!(result.result["provider"], "exa");
         assert_eq!(parallel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(exa_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_searches_before_and_during_provider_io() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"late result"}]}}"#;
+        let (endpoint, calls) =
+            mock_server_with_delay("200 OK", body, Duration::from_secs(30)).await;
+        let tool = Arc::new(WebSearch::new(
+            vec![SearchProvider::parallel(endpoint)],
+            Duration::ZERO,
+        ));
+
+        let pre_cancelled = ToolCtx::default();
+        pre_cancelled.cancel.cancel();
+        let result = tool
+            .run(&pre_cancelled, &json!({"query": "cancel before request"}))
+            .await;
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(result.result["error"], "search cancelled");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let ctx = ToolCtx::default();
+        let cancel = ctx.cancel.clone();
+        let running = tokio::spawn({
+            let tool = tool.clone();
+            async move { tool.run(&ctx, &json!({"query": "cancel in flight"})).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
+        assert_eq!(result.result["error"], "search cancelled");
+    }
+
+    #[tokio::test]
+    async fn enforces_response_size_and_reports_result_truncation() {
+        let (endpoint, _) = mock_server("200 OK", "x".repeat(MAX_RESPONSE_BYTES + 1)).await;
+        let oversized = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO)
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "oversized provider response"}),
+            )
+            .await;
+        assert_eq!(oversized.status, trouve_protocol::ToolStatus::Error);
+        assert!(
+            oversized.result["error"]
+                .as_str()
+                .unwrap()
+                .contains("response exceeded 1 MiB")
+        );
+
+        let content = "x".repeat(MAX_RETURN_CHARS + 1);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": content}]},
+        })
+        .to_string();
+        let (endpoint, _) = mock_server("200 OK", body).await;
+        let truncated = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO)
+            .run(
+                &ToolCtx::default(),
+                &json!({"query": "accepted oversized result"}),
+            )
+            .await;
+        assert_eq!(truncated.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(truncated.result["truncated"], true);
+        assert_eq!(
+            truncated.result["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_RETURN_CHARS
+        );
     }
 
     #[tokio::test]

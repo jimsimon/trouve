@@ -269,6 +269,19 @@ describe("tool presentation", () => {
       language: "json",
       truncated: false,
     });
+
+    expect(presentToolDetail("web_search", { query: "fresh result" }, {
+      provider: "parallel",
+      content: "Fresh result",
+      cache: { hit: false, ttl_seconds: 1800 },
+    })).toMatchObject({
+      inputs: [
+        { label: "Query", value: "fresh result" },
+        { label: "Results", value: "8" },
+        { label: "Provider", value: "parallel" },
+        { label: "Cache", value: "Miss" },
+      ],
+    });
   });
 
   it("presents transcript matches and generic MCP content without JSON wrappers", () => {
@@ -531,6 +544,10 @@ describe("tool presentation", () => {
       { kind: "turn-status", state: { kind: "running" } },
       { kind: "tool", tool: "search_transcript", args: { query: "checkpoint" }, status: "running" },
     ], false)).toBe("Searching transcript…");
+    expect(runningActivityLabel([
+      { kind: "turn-status", state: { kind: "running" } },
+      { kind: "tool", tool: "web_search", args: { query: "latest release" }, status: "running" },
+    ], false)).toBe("Searching the web…");
     expect(runningActivityLabel([
       { kind: "turn-status", state: { kind: "running" } },
       {
