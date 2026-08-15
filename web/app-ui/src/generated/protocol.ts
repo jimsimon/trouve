@@ -6392,7 +6392,7 @@ export interface operations {
     list_persona_infos: {
         parameters: {
             query?: {
-                /** @description Include the workspace's .agents modes */
+                /** @description Include personas from the workspace's .agents/personas configuration */
                 workspace_id?: string;
             };
             header?: never;
@@ -6414,7 +6414,7 @@ export interface operations {
     list_personas: {
         parameters: {
             query?: {
-                /** @description Include the workspace's .agents modes */
+                /** @description Include personas from the workspace's .agents/personas configuration */
                 workspace_id?: string;
             };
             header?: never;

@@ -4495,17 +4495,23 @@ impl Engine {
         };
         let mut infos =
             personas::resolve_persona_infos(self.config_dir.as_deref(), root.as_deref());
-        let review_builtin_ids: std::collections::HashSet<_> =
-            crate::reviewers::built_in_reviewers()
-                .into_iter()
-                .map(|reviewer| reviewer.id)
-                .collect();
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let mut builtin_ids: std::collections::HashSet<_> = personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .collect();
+        builtin_ids.extend(
+            reviewer_catalog
+                .iter()
+                .filter(|reviewer| reviewer.built_in)
+                .map(|reviewer| reviewer.id.clone()),
+        );
         for info in &mut infos {
-            if review_builtin_ids.contains(&info.persona.id) && info.origin == "custom" {
+            if builtin_ids.contains(&info.persona.id) && info.origin == "custom" {
                 info.origin = "customized".into();
             }
         }
-        for reviewer in self.code_review_reviewer_catalog()? {
+        for reviewer in reviewer_catalog {
             if infos.iter().any(|info| info.persona.id == reviewer.id) {
                 continue;
             }
@@ -4519,6 +4525,12 @@ impl Engine {
                 .into(),
             });
         }
+        infos.sort_by_key(|info| {
+            (
+                !builtin_ids.contains(&info.persona.id),
+                info.persona.id.clone(),
+            )
+        });
         Ok(infos)
     }
 

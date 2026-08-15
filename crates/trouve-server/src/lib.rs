@@ -2122,26 +2122,26 @@ async fn session_usage(
 }
 
 #[derive(Deserialize)]
-struct ListModesQuery {
+struct ListPersonasQuery {
     workspace_id: Option<String>,
 }
 
 #[utoipa::path(get, path = "/v1/personas",
-    params(("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents modes")),
+    params(("workspace_id" = Option<String>, Query, description = "Include personas from the workspace's .agents/personas configuration")),
     responses((status = 200, body = [AgentPersona])))]
 async fn list_personas(
     State(engine): State<Arc<Engine>>,
-    Query(q): Query<ListModesQuery>,
+    Query(q): Query<ListPersonasQuery>,
 ) -> Result<Json<Vec<AgentPersona>>, ApiError> {
     Ok(Json(engine.list_personas(q.workspace_id.as_deref())?))
 }
 
 #[utoipa::path(get, path = "/v1/persona-infos",
-    params(("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents modes")),
+    params(("workspace_id" = Option<String>, Query, description = "Include personas from the workspace's .agents/personas configuration")),
     responses((status = 200, body = [PersonaInfo])))]
 async fn list_persona_infos(
     State(engine): State<Arc<Engine>>,
-    Query(q): Query<ListModesQuery>,
+    Query(q): Query<ListPersonasQuery>,
 ) -> Result<Json<Vec<PersonaInfo>>, ApiError> {
     Ok(Json(engine.list_persona_infos(q.workspace_id.as_deref())?))
 }

@@ -1669,7 +1669,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
                     @change=${(event: Event) => this.#updateThreadSetting(
                       { mode: (event.currentTarget as HTMLSelectElement).value },
-                      "Mode could not be changed.",
+                      "Persona could not be changed.",
                     )}
                   >
                     ${this.#modes.some((mode) => mode.id === thread.mode)

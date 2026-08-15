@@ -2059,14 +2059,22 @@ impl Engine {
         }
         // Code review consumes the canonical persona catalog directly.
         for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None) {
-            let built_in = reviewers
+            let existing = reviewers
                 .iter()
-                .any(|candidate| candidate.id == persona.id && candidate.built_in)
+                .find(|candidate| candidate.id == persona.id)
+                .cloned();
+            let built_in = existing
+                .as_ref()
+                .is_some_and(|candidate| candidate.built_in)
                 || crate::personas::builtin_personas()
                     .iter()
                     .any(|candidate| candidate.id == persona.id);
             reviewers.retain(|reviewer| reviewer.id != persona.id);
-            reviewers.push(crate::reviewers::persona_as_reviewer(&persona, built_in));
+            reviewers.push(crate::reviewers::merge_persona_with_reviewer(
+                &persona,
+                existing.as_ref(),
+                built_in,
+            ));
         }
         Ok(reviewers)
     }

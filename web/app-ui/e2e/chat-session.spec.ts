@@ -543,7 +543,7 @@ const installProtocolFixtures = async (
       }],
       "GET /v1/persona-infos": [{
         origin: "builtin",
-        mode: {
+        persona: {
           id: "code",
           display_name: "Code",
           system_prompt: "Implement the request.",

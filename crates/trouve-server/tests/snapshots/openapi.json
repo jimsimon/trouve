@@ -2050,7 +2050,7 @@
           {
             "name": "workspace_id",
             "in": "query",
-            "description": "Include the workspace's .agents modes",
+            "description": "Include personas from the workspace's .agents/personas configuration",
             "required": false,
             "schema": {
               "type": "string"
@@ -2082,7 +2082,7 @@
           {
             "name": "workspace_id",
             "in": "query",
-            "description": "Include the workspace's .agents modes",
+            "description": "Include personas from the workspace's .agents/personas configuration",
             "required": false,
             "schema": {
               "type": "string"
@@ -3430,6 +3430,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "GitHub OAuth permissions must be renewed",
             "content": {
               "application/json": {
                 "schema": {
@@ -7197,6 +7207,52 @@
                 "type": "string",
                 "enum": [
                   "assistant.delta"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Streamed user-facing progress authored by the agent harness. Progress\nis distinct from both model reasoning and answer text.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The harness explicitly closed the current progress item.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.progress_completed"
                 ]
               }
             }
@@ -12279,6 +12335,35 @@
                 "type": "string",
                 "enum": [
                   "assistant"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "User-facing progress authored by the agent harness rather than model\nreasoning or final answer text.",
+            "required": [
+              "turn",
+              "content",
+              "complete",
+              "kind"
+            ],
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "progress"
                 ]
               },
               "turn": {

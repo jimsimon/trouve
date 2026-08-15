@@ -105,7 +105,6 @@ pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
             "find_related".into(),
             "git_diff".into(),
             "web_fetch".into(),
-            "todo_write".into(),
             "spawn_thread".into(),
             "spawn_output".into(),
         ],
@@ -125,6 +124,28 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
         default_thinking_level: persona.default_thinking_level.clone(),
         built_in,
     }
+}
+
+pub fn merge_persona_with_reviewer(
+    persona: &AgentPersona,
+    existing: Option<&ReviewerProfile>,
+    built_in: bool,
+) -> ReviewerProfile {
+    let mut reviewer = persona_as_reviewer(persona, built_in);
+    if let Some(existing) = existing {
+        if !existing.prompt.trim().is_empty() {
+            reviewer.prompt.clone_from(&existing.prompt);
+        }
+        if existing.model.is_some() {
+            reviewer.model.clone_from(&existing.model);
+        }
+        if existing.default_thinking_level.is_some() {
+            reviewer
+                .default_thinking_level
+                .clone_from(&existing.default_thinking_level);
+        }
+    }
+    reviewer
 }
 
 pub fn default_reviewer_ids() -> Vec<String> {
@@ -157,5 +178,34 @@ mod tests {
             );
         }
         assert!(DEFAULT_REVIEWER_IDS.contains(&"concurrency"));
+    }
+
+    #[test]
+    fn legacy_customized_reviewer_values_survive_persona_overlay() {
+        let persona = AgentPersona {
+            id: "correctness".into(),
+            display_name: "Correctness".into(),
+            system_prompt: "Canonical prompt".into(),
+            allowed_tools: Vec::new(),
+            read_only: true,
+            default_permission_mode: Some(PermissionMode::Ask),
+            default_model: Some("provider/default".into()),
+            default_thinking_level: Some("medium".into()),
+        };
+        let legacy = ReviewerProfile {
+            id: persona.id.clone(),
+            name: "Legacy label".into(),
+            prompt: "Customized prompt".into(),
+            model: Some("provider/custom".into()),
+            default_thinking_level: Some("high".into()),
+            built_in: true,
+        };
+
+        let merged = merge_persona_with_reviewer(&persona, Some(&legacy), true);
+        assert_eq!(merged.name, "Correctness");
+        assert_eq!(merged.prompt, "Customized prompt");
+        assert_eq!(merged.model.as_deref(), Some("provider/custom"));
+        assert_eq!(merged.default_thinking_level.as_deref(), Some("high"));
+        assert!(merged.built_in);
     }
 }

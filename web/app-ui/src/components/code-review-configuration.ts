@@ -16,12 +16,10 @@ import {
   repositoryDraft,
   repositoryKey,
   repositoryUpdateRequest,
-  reviewerDraft,
   sanitizeGithubAppStatus,
   type CodeReviewMode,
   type CodeReviewRoutingMode,
   type RepositoryDraft,
-  type ReviewerDraft,
   type ReviewerOverrideDraft,
   type ReviewerPromptMode,
 } from "./code-review-configuration-model.js";
@@ -248,14 +246,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
   #reviewers: readonly ProtocolReviewerProfile[] = [];
   #models: readonly ProtocolModelInfo[] = [];
   #repositoryDrafts = new Map<string, RepositoryDraft>();
-  #reviewerDrafts = new Map<string, ReviewerDraft>();
-  #newReviewerDraft: ReviewerDraft = reviewerDraft();
   #loading = true;
   #modelsUnavailable = false;
   #busy = "";
   #notice = "";
   #noticeIsError = false;
-  #confirmDeleteReviewer = "";
   #loadGeneration = 0;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -576,11 +571,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         repositoryKey(repository),
         repositoryDraft(repository),
       ]));
-      this.#reviewerDrafts = new Map(dashboard.reviewers.map((profile) => [
-        profile.id,
-        reviewerDraft(profile),
-      ]));
-      this.#confirmDeleteReviewer = "";
       this.#loading = false;
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;

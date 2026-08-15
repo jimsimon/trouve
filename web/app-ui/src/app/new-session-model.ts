@@ -143,7 +143,7 @@ const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined
 
 /** Resolve every inherited new-thread option to the concrete value the server uses. */
 export const resolveNewThreadDefaults = (
-  modes: readonly ProtocolAgentMode[],
+  modes: readonly ProtocolAgentPersona[],
   models: readonly ProtocolModelInfo[],
   providers: ProtocolProvidersResponse | null | undefined,
   overrides: { readonly modeId?: string; readonly modelId?: string } = {},

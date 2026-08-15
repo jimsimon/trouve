@@ -488,6 +488,7 @@ impl ProtocolClient {
     /// Create or update a user-level persona; a built-in id customizes that
     /// built-in.
     pub async fn upsert_persona(&self, id: &str, req: &UpsertPersonaRequest) -> Result<()> {
+        let id = urlencode_path_segment(id);
         let resp = self
             .http
             .put(format!("{}/personas/{id}", self.base))
@@ -508,6 +509,7 @@ impl ProtocolClient {
 
     /// Delete a custom persona / reset a customized built-in.
     pub async fn delete_persona(&self, id: &str) -> Result<()> {
+        let id = urlencode_path_segment(id);
         self.delete(&format!("/personas/{id}")).await
     }
 

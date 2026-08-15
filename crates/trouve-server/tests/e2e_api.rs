@@ -6039,6 +6039,22 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .json()
         .await
         .unwrap();
+    assert!(
+        dashboard["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reviewer| reviewer["id"] != custom_id)
+    );
+    assert!(
+        dashboard["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reviewer| reviewer["id"] == "correctness"
+                && reviewer["model"] != "anthropic/claude"
+                && reviewer["default_thinking_level"] != "high")
+    );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])

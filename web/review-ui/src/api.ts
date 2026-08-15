@@ -144,20 +144,28 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
   });
 const personaId = (reviewer: Pick<ReviewerProfile, "id" | "name">): string =>
   reviewer.id || reviewer.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-export const saveReviewer = (
+export const saveReviewer = async (
   reviewer: Omit<ReviewerProfile, "built_in"> & { built_in?: boolean },
-): Promise<void> =>
-  api(`/personas/${encodeURIComponent(personaId(reviewer))}`, {
+): Promise<void> => {
+  const id = personaId(reviewer);
+  const existing = reviewer.id === ""
+    ? undefined
+    : (await api<PersonaInfo[]>("/persona-infos"))
+      .find((info) => info.persona.id === id)
+      ?.persona;
+  await api(`/personas/${encodeURIComponent(id)}`, {
     method: "PUT",
     body: JSON.stringify({
       display_name: reviewer.name,
       system_prompt: reviewer.prompt,
-      allowed_tools: [],
-      read_only: false,
+      allowed_tools: existing?.allowed_tools ?? [],
+      read_only: existing?.read_only ?? false,
+      default_permission_mode: existing?.default_permission_mode ?? null,
       default_model: reviewer.model || null,
       default_thinking_level: reviewer.default_thinking_level || null,
     }),
   });
+};
 export const deleteReviewer = (id: string): Promise<void> =>
   api(`/personas/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const configureApp = (body: {

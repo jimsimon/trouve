@@ -136,7 +136,7 @@ describe("new session model", () => {
   });
 
   it("resolves concrete mode, model, thinking, and permission defaults", () => {
-    const codeMode: ProtocolAgentMode = {
+    const codeMode: ProtocolAgentPersona = {
       ...mode(),
       default_permission_mode: "allow_list",
       default_thinking_level: "high",

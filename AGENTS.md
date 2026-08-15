@@ -63,7 +63,7 @@ These are load-bearing. Do not violate them without a new ADR.
    protocol-version match because closed wire enums and unions are not
    automatically forward-compatible (ADR 0036).
 6. **Agent personas are data.** Personas (plan/code/review/…) are prompt + tool
-   policy + default permission mode. Adding a mode must not require new Rust
+   policy + default permission mode. Adding a persona must not require new Rust
    control flow.
 7. **One product frontend.** `web/app-ui` is the shared Lit application for
    Wry desktop and the PWA. Native hosts provide only the gateway and typed OS
