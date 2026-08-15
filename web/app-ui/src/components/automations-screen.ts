@@ -809,10 +809,17 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   };
 
   readonly #modeChanged = (event: Event): void => {
+    const modeId = (event.currentTarget as HTMLSelectElement).value;
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
+    const previousModel = this.#effectiveAutomationModel(this.#draft, modes);
+    const nextModel = this.#effectiveAutomationModel(
+      { ...this.#draft, mode: modeId, model: "" },
+      modes,
+    );
     this.#updateDraft({
-      mode: (event.currentTarget as HTMLSelectElement).value,
+      mode: modeId,
       model: "",
-      modelOptions: {},
+      modelOptions: nextModel?.id === previousModel?.id ? this.#draft.modelOptions : {},
     });
   };
 

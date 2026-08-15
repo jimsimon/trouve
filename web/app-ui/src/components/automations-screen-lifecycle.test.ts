@@ -51,4 +51,16 @@ describe("automations screen model-option lifecycle", () => {
     expect(toggle).toContain("await this.#modelForMutation(draft)");
     expect(toggle).toContain("if (model === undefined) return;");
   });
+
+  it("preserves model options when a mode change keeps the effective model", () => {
+    const modeChanged = section(
+      "readonly #modeChanged = (event: Event): void =>",
+      "\n  readonly #modelPicked",
+    );
+    expect(modeChanged).toContain("const previousModel = this.#effectiveAutomationModel");
+    expect(modeChanged).toContain("const nextModel = this.#effectiveAutomationModel");
+    expect(modeChanged).toContain(
+      "nextModel?.id === previousModel?.id ? this.#draft.modelOptions : {}",
+    );
+  });
 });
