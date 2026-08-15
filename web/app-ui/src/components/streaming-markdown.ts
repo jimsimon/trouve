@@ -43,12 +43,16 @@ export const stableMarkdownPrefixLength = (source: string): number => {
           nested?.[1]?.[0] === fence.marker
           && nested[1].length === fence.length
           && nested[2]?.trim() !== ""
+          && !(nested[1][0] === "`" && nested[2]?.includes("`"))
         ) fence.nestedOpen = true;
       }
       continue;
     }
     const opening = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)\r?$/u.exec(line);
-    if (opening?.[1] !== undefined) {
+    if (
+      opening?.[1] !== undefined
+      && !(opening[1][0] === "`" && opening[2]?.includes("`"))
+    ) {
       const language = opening[2]?.trim().split(/\s+/u)[0]?.toLowerCase() ?? "";
       fence = {
         marker: opening[1][0] as "`" | "~",

@@ -57,4 +57,32 @@ describe("streaming Markdown stable prefix", () => {
       partial + outerCloser,
     );
   });
+
+  it("rejects backtick-containing info strings like the batch renderer", () => {
+    const invalidOuter = [
+      "before",
+      "",
+      "```markdown `",
+      "body",
+      "",
+      "after",
+    ].join("\n");
+    expect(invalidOuter.slice(0, stableMarkdownPrefixLength(invalidOuter))).toBe(
+      ["before", "", "```markdown `", "body", "", ""].join("\n"),
+    );
+
+    const invalidNested = [
+      "before",
+      "",
+      "```markdown",
+      "```text`",
+      "body",
+      "```",
+      "",
+      "after",
+    ].join("\n");
+    expect(invalidNested.slice(0, stableMarkdownPrefixLength(invalidNested))).toBe(
+      ["before", "", "```markdown", "```text`", "body", "```", "", ""].join("\n"),
+    );
+  });
 });
