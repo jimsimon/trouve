@@ -274,6 +274,10 @@ pub struct ForkCheckpointResponse {
 pub struct UpdateSessionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Apply the new title only while the persisted title still has this value.
+    /// Used by asynchronous title generation so later manual renames win.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
 }

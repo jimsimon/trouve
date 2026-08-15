@@ -4717,6 +4717,11 @@ export interface components {
         /** @description Partial session update (rename / archive). Omitted fields are unchanged. */
         UpdateSessionRequest: {
             archived?: boolean | null;
+            /**
+             * @description Apply the new title only while the persisted title still has this value.
+             *     Used by asynchronous title generation so later manual renames win.
+             */
+            expected_title?: string | null;
             title?: string | null;
         };
         /**
@@ -7230,6 +7235,14 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

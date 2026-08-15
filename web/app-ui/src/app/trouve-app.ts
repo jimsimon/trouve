@@ -1902,7 +1902,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
         if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
-        const session = await this.#protocolClient.updateSession(sessionId, { title });
+        const session = await this.#protocolClient.updateSession(sessionId, {
+          title,
+          expected_title: provisionalTitle,
+        });
         this.#store.upsertSessionMetadata(session);
       } catch {
         // Naming is cosmetic; the deterministic provisional title remains.

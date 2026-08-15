@@ -269,8 +269,8 @@ impl AgentBackend for CodexBackend {
         if mcp_config.is_null() {
             return None;
         }
-        let guard = self.server.lock().await;
-        let needs_load = match (guard.as_ref(), turn.session.as_deref()) {
+        let cached = self.server.lock().await.clone();
+        let needs_load = match (cached.as_ref(), turn.session.as_deref()) {
             (Some(server), Some(thread_id)) if !server.is_closed() => {
                 !server.thread_config_matches(thread_id, &mcp_config).await
             }
@@ -3358,8 +3358,27 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     }
 }
 
-const THREAD_INSTRUCTION_CACHE_CAP: usize = 256;
+const THREAD_CACHE_CAP: usize = 256;
 
+#[derive(Default)]
+struct LoadedThreadCache {
+    configs: HashMap<String, Value>,
+    order: VecDeque<String>,
+}
+
+impl LoadedThreadCache {
+    fn remember(&mut self, thread_id: &str, mcp_config: Value) {
+        if !self.configs.contains_key(thread_id) {
+            if self.configs.len() >= THREAD_CACHE_CAP
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.configs.remove(&evicted);
+            }
+            self.order.push_back(thread_id.to_string());
+        }
+        self.configs.insert(thread_id.to_string(), mcp_config);
+    }
+}
 struct AppServer {
     stdin: SharedStdin,
     next_id: AtomicI64,
@@ -3377,7 +3396,7 @@ struct AppServer {
     turn_lifecycles: TurnLifecycles,
     /// MCP configuration attached to each thread loaded in this app-server
     /// process. A newly spawned process starts empty.
-    loaded_threads: Mutex<HashMap<String, Value>>,
+    loaded_threads: Mutex<LoadedThreadCache>,
     /// Instruction set known to have reached at least one turn in this
     /// app-server process. This is intentionally process-local: an empty map
     /// after restart is what activates the cold-resume prompt fallback.
@@ -3439,7 +3458,7 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             completed_turns: Arc::new(Mutex::new(CompletedTurnState::default())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            loaded_threads: Mutex::new(HashMap::new()),
+            loaded_threads: Mutex::new(LoadedThreadCache::default()),
             thread_instructions: std::sync::Mutex::new(HashMap::new()),
             child: Arc::new(std::sync::Mutex::new(child)),
             retired_response_tx,
@@ -3457,14 +3476,14 @@ impl AppServer {
 
     async fn thread_config_matches(&self, thread_id: &str, mcp_config: &Value) -> bool {
         let loaded_threads = self.loaded_threads.lock().await;
-        loaded_thread_config_matches(&loaded_threads, thread_id, mcp_config)
+        loaded_thread_config_matches(&loaded_threads.configs, thread_id, mcp_config)
     }
 
     async fn mark_thread_loaded(&self, thread_id: &str, mcp_config: Value) {
         self.loaded_threads
             .lock()
             .await
-            .insert(thread_id.to_string(), mcp_config);
+            .remember(thread_id, mcp_config);
     }
 
     fn instructions_need_prompt_fallback(&self, thread_id: &str, instructions: &str) -> bool {
@@ -3477,7 +3496,7 @@ impl AppServer {
 
     fn remember_thread_instructions(&self, thread_id: &str, instructions: &str) {
         let mut known = self.thread_instructions.lock().unwrap();
-        if known.len() >= THREAD_INSTRUCTION_CACHE_CAP
+        if known.len() >= THREAD_CACHE_CAP
             && !known.contains_key(thread_id)
             && let Some(evicted) = known.keys().next().cloned()
         {
@@ -7376,6 +7395,23 @@ cat > /dev/null
         assert!(loaded_thread_config_matches(&loaded, "thread-1", &first));
         assert!(!loaded_thread_config_matches(&loaded, "thread-1", &changed));
         assert!(!loaded_thread_config_matches(&loaded, "thread-2", &first));
+    }
+
+    #[test]
+    fn loaded_thread_cache_evicts_the_oldest_entry_at_capacity() {
+        let mut loaded = LoadedThreadCache::default();
+        for index in 0..=THREAD_CACHE_CAP {
+            loaded.remember(&format!("thread-{index}"), json!({ "index": index }));
+        }
+
+        assert_eq!(loaded.configs.len(), THREAD_CACHE_CAP);
+        assert!(!loaded.configs.contains_key("thread-0"));
+        assert!(loaded.configs.contains_key("thread-1"));
+        assert!(
+            loaded
+                .configs
+                .contains_key(&format!("thread-{THREAD_CACHE_CAP}"))
+        );
     }
 
     #[test]

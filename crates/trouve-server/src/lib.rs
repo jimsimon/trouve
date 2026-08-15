@@ -1311,7 +1311,11 @@ async fn get_session(
 
 #[utoipa::path(patch, path = "/v1/sessions/{id}", params(("id" = String, Path,)),
     request_body = UpdateSessionRequest,
-    responses((status = 200, body = Session), (status = 404, body = ErrorBody)))]
+    responses(
+        (status = 200, body = Session),
+        (status = 404, body = ErrorBody),
+        (status = 409, body = ErrorBody)
+    ))]
 async fn update_session(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,

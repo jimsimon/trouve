@@ -1324,6 +1324,42 @@ async fn session_and_thread_updates_and_provider_config() {
         .unwrap();
     assert_eq!(updated["title"], "Renamed");
     assert_eq!(updated["archived"], true);
+
+    // Background title generation uses a persistence-boundary compare-and-set:
+    // the matching provisional title can be replaced once, while a stale
+    // result cannot overwrite the newer title.
+    let generated: serde_json::Value = client
+        .patch(format!("{base}/sessions/{session_id}"))
+        .json(&serde_json::json!({
+            "title": "Generated",
+            "expected_title": "Renamed"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(generated["title"], "Generated");
+    let stale = client
+        .patch(format!("{base}/sessions/{session_id}"))
+        .json(&serde_json::json!({
+            "title": "Stale generated title",
+            "expected_title": "Renamed"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    let persisted: serde_json::Value = client
+        .get(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(persisted["title"], "Generated");
     let summaries: serde_json::Value = client
         .get(format!("{base}/session-summaries"))
         .send()

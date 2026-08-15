@@ -565,6 +565,8 @@ fn backend_event_name(event: &BackendEvent) -> &'static str {
     match event {
         BackendEvent::SessionStarted { .. } => "session_started",
         BackendEvent::TextDelta(_) => "text_delta",
+        BackendEvent::ProgressDelta(_) => "progress_delta",
+        BackendEvent::ProgressCompleted => "progress_completed",
         BackendEvent::ThinkingDelta(_) => "thinking_delta",
         BackendEvent::ThinkingCompleted => "thinking_completed",
         BackendEvent::ToolStarted { .. } => "tool_started",
@@ -7725,6 +7727,11 @@ impl Engine {
         {
             return Err(EngineError::BadRequest("title cannot be empty".into()));
         }
+        if req.expected_title.is_some() && req.title.is_none() {
+            return Err(EngineError::BadRequest(
+                "expected_title requires a title update".into(),
+            ));
+        }
         let updated = {
             // Serialize mutation against delete's marker. Besides preserving
             // the session row, this prevents an unarchive from reopening the
@@ -7741,12 +7748,20 @@ impl Engine {
                 .store
                 .session(id)?
                 .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
+            if let Some(expected_title) = req.expected_title.as_deref()
+                && session.title != expected_title
+            {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} title changed before the generated title was ready"
+                )));
+            }
             let newly_archived = req.archived == Some(true) && !session.archived;
             let newly_unarchived = req.archived == Some(false) && session.archived;
             self.store.update_session_with_event(
                 id,
                 req.title.as_deref(),
                 req.archived,
+                req.expected_title.as_deref(),
                 Event::SessionUpdated {
                     session_id: id.to_string(),
                     workspace_id: session.workspace_id.clone(),
@@ -21317,6 +21332,33 @@ default_permission_mode = "ask"
         };
         engine.store.insert_session(&session).unwrap();
 
+        let generated = engine
+            .update_session(
+                &session.id,
+                &UpdateSessionRequest {
+                    title: Some("Generated title".into()),
+                    expected_title: Some("terminal archive".into()),
+                    archived: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(generated.title, "Generated title");
+        assert!(matches!(
+            engine.update_session(
+                &session.id,
+                &UpdateSessionRequest {
+                    title: Some("Stale generated title".into()),
+                    expected_title: Some("terminal archive".into()),
+                    archived: None,
+                },
+            ),
+            Err(EngineError::Conflict(_))
+        ));
+        assert_eq!(
+            engine.get_session(&session.id).unwrap().title,
+            "Generated title"
+        );
+
         engine.open_terminal(&session.id, 80, 24).unwrap();
         engine.create_terminal(&session.id, 80, 24).unwrap();
         assert_eq!(engine.list_terminals(&session.id).unwrap().len(), 2);
@@ -21327,6 +21369,7 @@ default_permission_mode = "ask"
                 &UpdateSessionRequest {
                     title: None,
                     archived: Some(true),
+                    expected_title: None,
                 },
             )
             .unwrap();
@@ -21343,6 +21386,7 @@ default_permission_mode = "ask"
                 &UpdateSessionRequest {
                     title: None,
                     archived: Some(false),
+                    expected_title: None,
                 },
             )
             .unwrap();
