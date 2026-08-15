@@ -314,9 +314,38 @@ export const toolLabel = (tool: string, argsValue: unknown): string => {
     : display;
 };
 
-/** Show a transient status only when the active turn has no durable node that
- * already explains what is happening. Running tools, streamed thoughts,
- * compaction, questions, and response text all own their place on the rail. */
+const runningToolActivityLabel = (tool: string, args: unknown): string => {
+  const effective = effectiveToolCall(tool, args);
+  if (!isFirstPartyToolCall(tool, args)) return "Processing…";
+  const presentation = presentToolCall(tool, args);
+  const normalized = normalizedToolIdentifier(baseToolName(effective.tool));
+  const explicitPath = firstString(
+    effective.args,
+    ["file_path", "path", "abs_path", "target_file", "filePath"],
+  );
+  const subject = presentation.subject
+    || explicitPath?.split(/[\\/]/u).at(-1)
+    || "";
+  const target = subject === "" ? "" : ` ${subject}`;
+  if (["read", "readfile"].includes(normalized)) return `Reading${target}…`;
+  if ([
+    "edit", "multiedit", "notebookedit", "editfile", "hashlineedit",
+    "applypatch", "applypatchfallback", "filechange",
+  ].includes(normalized)) return `Editing${target}…`;
+  if (["write", "writefile", "createfile"].includes(normalized)) {
+    return `Writing${target}…`;
+  }
+  if (normalized === "search" || normalized === "findrelated") return "Searching code…";
+  if (normalized === "searchtranscript") return "Searching transcript…";
+  if (["shell", "bash", "execute", "commandexecution"].includes(normalized)) {
+    return "Running command…";
+  }
+  return "Processing…";
+};
+
+/** Keep a stable transient tail on a running turn. Live tools are folded into
+ * their normal collapsed activity run; this label describes the latest one
+ * without promoting each parallel call to a new top-level rail node. */
 export const runningActivityLabel = (
   items: readonly unknown[],
   thinking: boolean,
@@ -329,13 +358,24 @@ export const runningActivityLabel = (
       break;
     }
   }
+  let runningTool: JsonRecord | undefined;
   for (let index = items.length - 1; index >= start; index -= 1) {
     const item = record(items[index]);
     if (item === undefined) continue;
-    if (
-      item.kind === "tool"
-      && (item.status === "running" || item.status === "awaiting-approval")
-    ) return undefined;
+    if (item.kind === "tool" && item.status === "awaiting-approval") return undefined;
+    if (item.kind === "tool" && item.status === "running" && runningTool === undefined) {
+      runningTool = item;
+    }
+  }
+  if (runningTool !== undefined) {
+    return runningToolActivityLabel(
+      stringValue(runningTool.tool) ?? "",
+      runningTool.args,
+    );
+  }
+  for (let index = items.length - 1; index >= start; index -= 1) {
+    const item = record(items[index]);
+    if (item === undefined) continue;
     if (item.kind === "thinking" && item.complete === false) return undefined;
     if (item.kind === "progress" && item.complete === false) return undefined;
     if (item.kind === "assistant" && item.complete === false) return undefined;
