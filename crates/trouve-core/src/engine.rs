@@ -4539,7 +4539,8 @@ impl Engine {
         workspace_root: Option<&Path>,
     ) -> Result<Vec<AgentPersona>, EngineError> {
         let mut personas: Vec<_> = self
-            .code_review_reviewer_catalog()?
+            .code_review_reviewer_catalog()
+            .unwrap_or_default()
             .iter()
             .map(crate::reviewers::reviewer_as_persona)
             .collect();
@@ -4602,56 +4603,10 @@ impl Engine {
                 .iter()
                 .any(|info| info.persona.id == id && info.origin == "custom");
         if is_custom {
-            for repository in self.store.list_code_review_repositories()? {
-                let referenced = repository
-                    .reviewer_ids
-                    .iter()
-                    .any(|reviewer_id| reviewer_id == id)
-                    || repository
-                        .included_reviewer_ids
-                        .iter()
-                        .any(|reviewer_id| reviewer_id == id)
-                    || repository
-                        .excluded_reviewer_ids
-                        .iter()
-                        .any(|reviewer_id| reviewer_id == id)
-                    || repository
-                        .reviewer_overrides
-                        .iter()
-                        .any(|reviewer_override| reviewer_override.reviewer_id == id);
-                if !referenced {
-                    continue;
-                }
-                let mut reviewer_ids = repository.reviewer_ids;
-                reviewer_ids.retain(|reviewer_id| reviewer_id != id);
-                if reviewer_ids.is_empty() {
-                    reviewer_ids = crate::reviewers::default_reviewer_ids();
-                }
-                let mut included_reviewer_ids = repository.included_reviewer_ids;
-                included_reviewer_ids.retain(|reviewer_id| reviewer_id != id);
-                let mut excluded_reviewer_ids = repository.excluded_reviewer_ids;
-                excluded_reviewer_ids.retain(|reviewer_id| reviewer_id != id);
-                let mut reviewer_overrides = repository.reviewer_overrides;
-                reviewer_overrides.retain(|reviewer_override| reviewer_override.reviewer_id != id);
-                self.store.update_code_review_repository(
-                    &trouve_protocol::UpdateCodeReviewRepositoryRequest {
-                        installation_id: repository.installation_id,
-                        repository: repository.repository,
-                        mode: repository.mode,
-                        model: repository.model,
-                        coordinator_thinking_level: repository.coordinator_thinking_level,
-                        router_model: repository.router_model,
-                        router_thinking_level: repository.router_thinking_level,
-                        prompt: repository.prompt,
-                        reviewer_ids: Some(reviewer_ids),
-                        routing_mode: Some(repository.routing_mode),
-                        semantic_routing: Some(repository.semantic_routing),
-                        included_reviewer_ids: Some(included_reviewer_ids),
-                        excluded_reviewer_ids: Some(excluded_reviewer_ids),
-                        reviewer_overrides: Some(reviewer_overrides),
-                    },
-                )?;
-            }
+            return self
+                .store
+                .delete_persona_references(id, || personas::delete_user_persona(config_dir, id))
+                .map_err(|error| EngineError::BadRequest(format!("{error:#}")));
         }
         personas::delete_user_persona(config_dir, id)
             .map_err(|error| EngineError::BadRequest(format!("{error:#}")))
@@ -6843,7 +6798,7 @@ impl Engine {
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
         let mode_id = req.mode.unwrap_or_else(|| "code".into());
         let mode = personas::find_persona(&all_modes, &mode_id)
-            .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         // Provider availability is validated when a message is sent, not
         // here: a thread must be creatable before any provider is configured.
         // Model precedence: explicit request > the mode's default model >
@@ -7137,7 +7092,7 @@ impl Engine {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
             let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
             personas::find_persona(&all_modes, mode_id)
-                .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
+                .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         }
         if let Some(model) = req.model.as_deref()
             && !model.contains('/')
@@ -13967,7 +13922,7 @@ pub fn spawn_thread_spec() -> ToolSpec {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Provider-qualified model for the child (default: your personal)."
+                    "description": "Provider-qualified model for the child (default: your model)."
                 }
             },
             "required": ["prompt"]
@@ -14009,7 +13964,7 @@ pub fn spawn_session_spec() -> ToolSpec {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Provider-qualified model for the child (default: your personal)."
+                    "description": "Provider-qualified model for the child (default: your model)."
                 }
             },
             "required": ["prompt"]

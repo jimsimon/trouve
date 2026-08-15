@@ -148,6 +148,9 @@ export const saveReviewer = async (
   reviewer: Omit<ReviewerProfile, "built_in"> & { built_in?: boolean },
 ): Promise<void> => {
   const id = personaId(reviewer);
+  if (!id) {
+    throw new Error("Persona name must include at least one ASCII letter or digit.");
+  }
   const existing = reviewer.id === ""
     ? undefined
     : (await api<PersonaInfo[]>("/persona-infos"))

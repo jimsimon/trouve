@@ -419,14 +419,14 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           </label>
 
           <fieldset>
-            <legend>Reviewer routing</legend>
+            <legend>Persona routing</legend>
             <div class="form-grid three">
               <label>
                 Selection mode
                 <select .value=${draft.routingMode} ?disabled=${this.#busy !== ""} @change=${(event: Event) => this.#setRoutingMode(key, (event.currentTarget as HTMLSelectElement).value as CodeReviewRoutingMode)}>
-                  <option value="manual">Selected reviewers only</option>
+                  <option value="manual">Selected personas only</option>
                   <option value="additive">Always include + route</option>
-                  <option value="automatic">Route all reviewers</option>
+                  <option value="automatic">Route all personas</option>
                 </select>
               </label>
               <label>
@@ -445,13 +445,13 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           </fieldset>
 
           ${draft.routingMode === "manual"
-            ? this.#renderReviewerSelection(key, "reviewerIds", "Reviewers run for every requested review", "Select at least one reviewer while reviews are enabled.", draft.reviewerIds)
+            ? this.#renderReviewerSelection(key, "reviewerIds", "Personas run for every requested review", "Select at least one persona while reviews are enabled.", draft.reviewerIds)
             : draft.routingMode === "additive"
               ? html`
-                  ${this.#renderReviewerSelection(key, "includedReviewerIds", "Always included reviewers", "Routing may add other relevant reviewers.", draft.includedReviewerIds)}
-                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these reviewers out of routed review batches.", draft.excludedReviewerIds)}
+                  ${this.#renderReviewerSelection(key, "includedReviewerIds", "Always included personas", "Routing may add other relevant personas.", draft.includedReviewerIds)}
+                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these personas out of routed review batches.", draft.excludedReviewerIds)}
                 `
-              : this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "All other reviewers are eligible for routing.", draft.excludedReviewerIds)}
+              : this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "All other personas are eligible for routing.", draft.excludedReviewerIds)}
 
           ${this.#renderReviewerOverrides(key, draft)}
           <div class="actions">
@@ -474,7 +474,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         <legend>${legend}</legend>
         <p>${description}</p>
         ${this.#reviewers.length === 0
-          ? html`<div class="empty">Create a persona before enabling reviews.</div>`
+          ? html`<div class="empty">No personas are available. Create one under Settings → Personas &amp; Models before enabling reviews.</div>`
           : html`
               <div class="check-grid">
                 ${this.#reviewers.map((reviewer) => html`
@@ -492,8 +492,8 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
   #renderReviewerOverrides(key: string, draft: RepositoryDraft) {
     return html`
       <details class="subdetails">
-        <summary>Reviewer-specific overrides</summary>
-        <p>Override a profile only for this repository. Resetting an override restores profile and repository inheritance.</p>
+        <summary>Persona-specific overrides</summary>
+        <p>Override a persona only for this repository. Resetting an override restores persona and repository inheritance.</p>
         <div class="override-list">
           ${this.#reviewers.length === 0
             ? html`<div class="empty">No personas are available.</div>`
@@ -728,11 +728,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
       return;
     }
     if (draft.mode !== "off" && this.#reviewers.length === 0) {
-      this.#setNotice("Create at least one persona before enabling repository reviews.", true);
+      this.#setNotice("No personas are available. Create one under Settings → Personas & Models before enabling repository reviews.", true);
       return;
     }
     if (draft.mode !== "off" && draft.routingMode === "manual" && draft.reviewerIds.length === 0) {
-      this.#setNotice(`Select at least one reviewer for ${repository.repository}.`, true);
+      this.#setNotice(`Select at least one persona for ${repository.repository}.`, true);
       return;
     }
 

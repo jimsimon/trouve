@@ -5952,6 +5952,38 @@ impl Store {
         Ok(())
     }
 
+    /// Remove a custom persona from every repository and finalize its file
+    /// deletion before committing the database cleanup. If finalization fails,
+    /// dropping the transaction restores every repository reference.
+    pub fn delete_persona_references<F>(&self, id: &str, finalize: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let defaults = serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
+        tx.execute(
+            "UPDATE code_review_repositories SET
+               identity_ids = CASE
+                 WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value != ?1)
+                 THEN (SELECT json_group_array(value) FROM json_each(identity_ids) WHERE value != ?1)
+                 ELSE ?2
+               END,
+               included_reviewer_ids = (SELECT json_group_array(value) FROM json_each(included_reviewer_ids) WHERE value != ?1),
+               excluded_reviewer_ids = (SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids) WHERE value != ?1),
+               reviewer_overrides = (SELECT json_group_array(value) FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') != ?1),
+               updated_at = ?3
+             WHERE EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(included_reviewer_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(excluded_reviewer_ids) WHERE value = ?1)
+                OR EXISTS (SELECT 1 FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') = ?1)",
+            params![id, defaults, chrono::Utc::now().to_rfc3339()],
+        )?;
+        finalize()?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn enqueue_code_review_job(
         &self,
         new_job: &NewCodeReviewJob,
@@ -11691,6 +11723,60 @@ mod tests {
         let reopened = store.list_workspaces().unwrap();
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].id, workspace.id);
+    }
+
+    #[test]
+    fn persona_reference_cleanup_is_atomic_and_restores_default_reviewers() {
+        let store = Store::open_in_memory().unwrap();
+        let request = trouve_protocol::UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: trouve_protocol::CodeReviewMode::Manual,
+            model: Some("openai/reviewer".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            prompt: "keep this".into(),
+            reviewer_ids: Some(vec!["custom".into()]),
+            routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+            semantic_routing: Some(false),
+            included_reviewer_ids: Some(vec!["custom".into(), "reliability".into()]),
+            excluded_reviewer_ids: Some(vec!["custom".into()]),
+            reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                reviewer_id: "custom".into(),
+                model: None,
+                thinking_level: None,
+                prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
+                prompt: "custom prompt".into(),
+            }]),
+        };
+        store.update_code_review_repository(&request).unwrap();
+
+        let error = store
+            .delete_persona_references("custom", || anyhow::bail!("file deletion failed"))
+            .unwrap_err();
+        assert!(error.to_string().contains("file deletion failed"));
+        let unchanged = store.list_code_review_repositories().unwrap().remove(0);
+        assert_eq!(unchanged.reviewer_ids, vec!["custom"]);
+        assert_eq!(
+            unchanged.included_reviewer_ids,
+            vec!["custom", "reliability"]
+        );
+        assert_eq!(unchanged.reviewer_overrides.len(), 1);
+
+        store
+            .delete_persona_references("custom", || Ok(()))
+            .unwrap();
+        let cleaned = store.list_code_review_repositories().unwrap().remove(0);
+        assert_eq!(
+            cleaned.reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
+        );
+        assert_eq!(cleaned.included_reviewer_ids, vec!["reliability"]);
+        assert!(cleaned.excluded_reviewer_ids.is_empty());
+        assert!(cleaned.reviewer_overrides.is_empty());
+        assert_eq!(cleaned.prompt, "keep this");
+        assert_eq!(cleaned.model.as_deref(), Some("openai/reviewer"));
     }
 
     #[test]

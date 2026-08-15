@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use trouve_protocol::{AgentPersona, PersonaInfo};
 
+pub const REVIEW_PERSONA_ID: &str = "review";
+
 pub fn builtin_personas() -> Vec<AgentPersona> {
     vec![
         AgentPersona {
@@ -56,7 +58,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             default_thinking_level: None,
         },
         AgentPersona {
-            id: "review".into(),
+            id: REVIEW_PERSONA_ID.into(),
             display_name: "Review".into(),
             system_prompt: "You are in review persona: examine the changes in this workspace and \
                             report problems — bugs, missed edge cases, style violations — with \
