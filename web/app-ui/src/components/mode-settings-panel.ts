@@ -143,6 +143,7 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
           : { default_thinking_level: thinking === "" ? null : thinking }),
       });
       await this.#load();
+      if (this.#error) return;
       this.#message = "Model defaults saved for new threads.";
       this.requestUpdate();
     } catch {
@@ -164,6 +165,7 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     try {
       await protocol.setDefaultPermissionMode({ permission_mode: permission });
       await this.#load();
+      if (this.#error) return;
       this.#message = "Permission default saved for new threads.";
       this.requestUpdate();
     } catch {

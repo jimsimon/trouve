@@ -544,7 +544,15 @@ test("Modes & Models saves global defaults on change and keeps mode editing focu
   };
   const modelDefaults: Array<Record<string, unknown>> = [];
   const permissionDefaults: Array<Record<string, unknown>> = [];
+  let failProviderRefresh = false;
   await page.route("**/v1/providers", async (route) => {
+    if (failProviderRefresh) {
+      await route.fulfill({
+        status: 503,
+        json: { code: "unavailable", message: "Provider refresh failed" },
+      });
+      return;
+    }
     await route.fulfill({ json: providers });
   });
   await page.route("**/v1/models", async (route) => {
@@ -632,6 +640,18 @@ test("Modes & Models saves global defaults on change and keeps mode editing focu
   const editor = page.locator("form.mode-editor");
   await expect(editor.getByText("Default model", { exact: true })).toHaveCount(0);
   await expect(editor.getByText("Default permissions", { exact: true })).toHaveCount(0);
+
+  failProviderRefresh = true;
+  await page.getByLabel("Global Default Model").selectOption("codex/gpt-5.6-sol");
+  await expect(page.getByText("Modes and model defaults could not be loaded.", { exact: true }))
+    .toBeVisible();
+  await expect(page.getByText("Model defaults saved for new threads.", { exact: true }))
+    .toHaveCount(0);
+  await page.getByLabel("Global Default Permissions").selectOption("ask");
+  await expect(page.getByText("Modes and model defaults could not be loaded.", { exact: true }))
+    .toBeVisible();
+  await expect(page.getByText("Permission default saved for new threads.", { exact: true }))
+    .toHaveCount(0);
 });
 
 test("automation create and edit preserve model and thinking choices", async ({ page }) => {
