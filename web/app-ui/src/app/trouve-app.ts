@@ -2866,7 +2866,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   ${this.#newSessionModes.length === 0
                     ? html`<option value="code">Code</option>`
                     : this.#newSessionModes.map(
-                        (mode) => html`<option value=${mode.id}>${mode.display_name}</option>`,
+                        (mode) => html`<option
+                          value=${mode.id}
+                          .selected=${mode.id === this.#newSessionModeId}
+                        >${mode.display_name}</option>`,
                       )}
                 </select>
               </label>
@@ -2921,9 +2924,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.requestUpdate();
                   }}
                 >
-                  <option value="ask">Ask</option>
-                  <option value="allow_list">Allow list</option>
-                  <option value="yolo">Yolo</option>
+                  <option value="ask" .selected=${this.#newSessionPermissionMode === "ask"}>Ask</option>
+                  <option value="allow_list" .selected=${this.#newSessionPermissionMode === "allow_list"}>Allow list</option>
+                  <option value="yolo" .selected=${this.#newSessionPermissionMode === "yolo"}>Yolo</option>
                 </select>
               </label>
               <label class="new-session-thinking">
@@ -2946,7 +2949,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   ${newSessionThinkingOption === undefined
                     ? html`<option value="">Not supported</option>`
                     : newSessionThinkingOption.values.map(
-                        (value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`,
+                        (value) => html`<option
+                          value=${value}
+                          .selected=${value === this.#newSessionThinking}
+                        >${modelOptionLabel(value)}</option>`,
                       )}
                 </select>
               </label>
