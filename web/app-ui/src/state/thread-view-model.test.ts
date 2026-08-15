@@ -517,6 +517,34 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("closes authored progress automatically when reasoning starts", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.progress",
+      turn: 2,
+      text: "Checking the adapter.",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 2,
+      text: "The streams have different semantics.",
+    }));
+    view.apply(envelope(3, { type: "assistant.thinking_completed", turn: 2 }));
+
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "progress",
+        content: "Checking the adapter.",
+        complete: true,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        content: "The streams have different semantics.",
+        complete: true,
+      }),
+    ]);
+  });
+
   it("restores a completed compaction boundary from a folded snapshot", () => {
     const view = ThreadViewModel.fromSnapshot(12, {
       item_offset: 8,

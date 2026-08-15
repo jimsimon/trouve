@@ -224,6 +224,22 @@ describe("ProtocolClient", () => {
     expect(String(error)).toContain("Re-authenticate GitHub");
   });
 
+  it("bounds structured pull-request error fields", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
+      code: "c".repeat(700),
+      message: `  ${"m".repeat(700)}  `,
+    }, { status: 400 }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+    const error = await client.sessionPrDetail("se_1", 42).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ProtocolClientError);
+    expect((error as ProtocolClientError).status).toBe(400);
+    expect((error as ProtocolClientError).code).toHaveLength(512);
+    expect((error as ProtocolClientError).message).toHaveLength(512);
+  });
+
   it("rejects malformed lazy pull-request file content without exposing it", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async () => Response.json({
       path: "secret.txt",

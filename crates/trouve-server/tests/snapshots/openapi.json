@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.7"
+    "version": "7.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -2897,7 +2897,27 @@
               }
             }
           },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -7264,6 +7284,31 @@
                 "type": "string",
                 "enum": [
                   "turn.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The transient activity label for a running turn changed. This updates\nthe existing activity row; it is not a transcript or tool-rail item.",
+            "required": [
+              "turn",
+              "phase",
+              "type"
+            ],
+            "properties": {
+              "phase": {
+                "$ref": "#/components/schemas/TurnPhase"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.phase_changed"
                 ]
               }
             }
@@ -13047,6 +13092,17 @@
               "minimum": 0
             }
           },
+          "turn_phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnPhase",
+                "description": "Current transient activity for the running turn."
+              }
+            ]
+          },
           "turn_running": {
             "type": "boolean"
           },
@@ -13218,6 +13274,14 @@
           }
         }
       },
+      "TurnPhase": {
+        "type": "string",
+        "description": "Current user-visible startup activity for a running turn.",
+        "enum": [
+          "processing",
+          "connecting_tools"
+        ]
+      },
       "UpdateCodeReviewRepositoryRequest": {
         "type": "object",
         "required": [
@@ -13361,6 +13425,13 @@
               "boolean",
               "null"
             ]
+          },
+          "expected_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Apply the new title only while the persisted title still has this value.\nUsed by asynchronous title generation so later manual renames win."
           },
           "title": {
             "type": [

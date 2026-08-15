@@ -418,6 +418,8 @@ export class ProtocolClientError extends Error {
   }
 }
 
+const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
+
 // Generated protocol types and validators contain closed discriminated
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
@@ -862,9 +864,14 @@ export class ProtocolClient {
         const error: unknown = await response.json();
         if (typeof error === "object" && error !== null) {
           const record = error as Record<string, unknown>;
-          if (typeof record["code"] === "string") code = record["code"];
-          if (typeof record["message"] === "string" && record["message"].trim() !== "") {
-            message = record["message"];
+          if (typeof record["code"] === "string") {
+            code = record["code"].slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+          }
+          if (typeof record["message"] === "string") {
+            const candidate = record["message"].trim();
+            if (candidate !== "") {
+              message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+            }
           }
         }
       } catch {

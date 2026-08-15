@@ -1313,6 +1313,7 @@ async fn get_session(
     request_body = UpdateSessionRequest,
     responses(
         (status = 200, body = Session),
+        (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 409, body = ErrorBody)
     ))]
