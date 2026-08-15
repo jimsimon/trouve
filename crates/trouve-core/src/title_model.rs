@@ -695,53 +695,64 @@ async fn stream_to_part(
 }
 
 fn title_from_response(response: &serde_json::Value) -> Result<String> {
-    let raw = response
-        .pointer("/choices/0/message/content")
-        .and_then(serde_json::Value::as_str)
-        .context("session title model returned no text")?;
-    let (title, line_terminated) = sanitize_title_candidate(raw)?;
-    // An unterminated title can still look like 2-7 whole words after the
-    // model exhausts its budget. A terminated first line is complete and safe
-    // to recover even when ignored trailing output caused the length finish.
-    if response
+    let length_limited = response
         .pointer("/choices/0/finish_reason")
         .and_then(serde_json::Value::as_str)
-        == Some("length")
-        && !line_terminated
-    {
-        bail!("session title generation hit the token limit");
+        == Some("length");
+    let candidate = response
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .context("session title model returned no text")
+        .and_then(sanitize_title_candidate);
+    if length_limited {
+        return match candidate {
+            Ok(candidate) if candidate.recoverable_when_length_limited => Ok(candidate.title),
+            Ok(_) | Err(_) => bail!("session title generation hit the token limit"),
+        };
     }
-    Ok(title)
+    candidate.map(|candidate| candidate.title)
+}
+
+struct SanitizedTitleCandidate {
+    title: String,
+    recoverable_when_length_limited: bool,
 }
 
 #[cfg(test)]
 fn sanitize_title(raw: &str) -> Result<String> {
-    sanitize_title_candidate(raw).map(|(title, _)| title)
+    sanitize_title_candidate(raw).map(|candidate| candidate.title)
 }
 
-fn sanitize_title_candidate(raw: &str) -> Result<(String, bool)> {
+fn sanitize_title_candidate(raw: &str) -> Result<SanitizedTitleCandidate> {
     // A runtime that ignores `chat_template_kwargs` falls back to the
     // prompt-level `/no_think`. Depending on the chat template, content can
-    // contain the whole empty block or only its closing tag. Drop either so
-    // the title after it can be recovered; an unterminated opening block means
-    // thinking consumed the output budget.
+    // contain the whole empty block or only its closing tag. A closed or
+    // externally-opened block is also evidence that following text is title
+    // output rather than a truncated reasoning line.
     let trimmed = raw.trim_start();
-    let raw = match trimmed.strip_prefix("<think>") {
-        Some(rest) => rest
-            .split_once("</think>")
-            .map(|(_, after)| after)
-            .unwrap_or(""),
-        None => trimmed.strip_prefix("</think>").unwrap_or(raw),
+    let (raw, crossed_reasoning_boundary) = match trimmed.strip_prefix("<think>") {
+        Some(rest) => match rest.split_once("</think>") {
+            Some((_, after)) => (after, true),
+            None => ("", false),
+        },
+        None => match trimmed.strip_prefix("</think>") {
+            Some(after) => (after, true),
+            None => (raw, false),
+        },
     };
     let (line, line_terminated) = raw
         .split_inclusive('\n')
         .map(|chunk| (chunk.trim(), chunk.ends_with('\n')))
         .find(|(line, _)| !line.is_empty())
         .context("session title model returned empty text")?;
+    let (line, explicitly_labeled) = if let Some(line) = line.strip_prefix("Title:") {
+        (line, true)
+    } else if let Some(line) = line.strip_prefix("title:") {
+        (line, true)
+    } else {
+        (line, false)
+    };
     let line = line
-        .strip_prefix("Title:")
-        .or_else(|| line.strip_prefix("title:"))
-        .unwrap_or(line)
         .trim()
         .trim_matches(['"', '\'', '`', '*', '#'])
         .trim()
@@ -754,7 +765,11 @@ fn sanitize_title_candidate(raw: &str) -> Result<(String, bool)> {
     {
         bail!("session title model returned an invalid title");
     }
-    Ok((line.to_string(), line_terminated))
+    Ok(SanitizedTitleCandidate {
+        title: line.to_string(),
+        recoverable_when_length_limited: line_terminated
+            && (crossed_reasoning_boundary || explicitly_labeled),
+    })
 }
 
 #[cfg(test)]
@@ -831,7 +846,7 @@ mod tests {
 
     #[test]
     fn recovers_only_complete_titles_from_length_limited_responses() {
-        let response = |content| {
+        let response = |content: serde_json::Value| {
             serde_json::json!({
                 "choices": [{
                     "finish_reason": "length",
@@ -839,13 +854,53 @@ mod tests {
                 }]
             })
         };
+        let assert_token_limit = |content: serde_json::Value| {
+            assert_eq!(
+                title_from_response(&response(content))
+                    .unwrap_err()
+                    .to_string(),
+                "session title generation hit the token limit"
+            );
+        };
 
         assert_eq!(
-            title_from_response(&response("Improve Session Titles\nignored trailing output"))
-                .unwrap(),
+            title_from_response(&response(serde_json::json!(
+                "</think>\nImprove Session Titles\nignored trailing output"
+            )))
+            .unwrap(),
             "Improve Session Titles"
         );
-        assert!(title_from_response(&response("Improve Session Tit")).is_err());
+        assert_eq!(
+            title_from_response(&response(serde_json::json!(
+                "Title: Improve Session Titles\nignored trailing output"
+            )))
+            .unwrap(),
+            "Improve Session Titles"
+        );
+
+        // A newline alone cannot distinguish a complete title from reasoning
+        // when the chat template supplied the opening think tag out of band.
+        assert_token_limit(serde_json::json!("reasoning about the session title\n"));
+        assert_token_limit(serde_json::json!("Improve Session Tit"));
+        assert_token_limit(serde_json::json!("<think>\nstill reasoning about the task"));
+        assert_token_limit(serde_json::json!("one\n"));
+        assert_token_limit(serde_json::json!(""));
+        assert_token_limit(serde_json::Value::Null);
+    }
+
+    #[test]
+    fn accepts_non_length_titles_without_a_trailing_newline() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "Improve Session Titles" }
+            }]
+        });
+
+        assert_eq!(
+            title_from_response(&response).unwrap(),
+            "Improve Session Titles"
+        );
     }
 
     #[test]
