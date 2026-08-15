@@ -74,6 +74,30 @@ describe("chat find model", () => {
     ]);
   });
 
+  it("stops traversing structured content at the node budget", () => {
+    const args: Record<string, unknown> = {};
+    for (let index = 0; index < 20_000; index += 1) {
+      args[`padding-${index}`] = "padding";
+    }
+    Object.defineProperty(args, "unvisited", {
+      enumerable: true,
+      get: () => {
+        throw new Error("the traversal read beyond its node budget");
+      },
+    });
+    const structured: ThreadChatItem[] = [{
+      id: "tool:bounded",
+      kind: "tool",
+      callId: "call-bounded",
+      tool: "read_file",
+      args,
+      status: "ok",
+      result: null,
+      output: { text: "", bytes: 0, omitted: false },
+    }];
+    expect(chatFindUnitIds(structured, "not present", false)).toEqual([]);
+  });
+
   it("preserves an active match during streaming and wraps navigation", () => {
     expect(reconcileChatFind(["a", "b", "c"], "b")).toEqual({
       unitIds: ["a", "b", "c"],

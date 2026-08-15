@@ -10,6 +10,7 @@ interface FixtureEvent extends Record<string, unknown> {
 
 interface ThreadViewFixture {
   readonly cursor?: number;
+  readonly status?: number;
   readonly snapshot: Record<string, unknown>;
 }
 
@@ -420,6 +421,7 @@ const installProtocolFixtures = async (
             beforeValue === null ? undefined : Number(beforeValue),
           );
       await route.fulfill({
+        status: fixture.status ?? 200,
         headers: { "x-trouve-event-cursor": String(fixture.cursor ?? 0) },
         json: fixture.snapshot,
       });
@@ -4786,6 +4788,43 @@ test("prefetches older history before the reader reaches the loaded boundary", a
   // rows require that much data to fill the five-viewport buffer. It must
   // never issue duplicate requests for a boundary while doing so.
   expect(olderBoundaries).toHaveLength(requestedBoundaries.length);
+});
+
+test("find retries a failed history page and discovers its older match", async ({ page }) => {
+  const historyPage = (start: number, content: string, hasOlder: boolean) => ({
+    item_offset: start,
+    total_items: 2,
+    has_older: hasOlder,
+    items: [{
+      kind: "user",
+      turn: 1_000 + start,
+      content,
+      attachments: [],
+    }],
+  });
+  let olderRequests = 0;
+  await installProtocolFixtures(page, { threadViewFixture: (before) => {
+    if (before === undefined) {
+      return { snapshot: historyPage(1, "Recent prompt", true) };
+    }
+    if (before !== 1) throw new Error(`unexpected history boundary ${before}`);
+    olderRequests += 1;
+    if (olderRequests === 1) {
+      return {
+        status: 503,
+        snapshot: { code: "temporarily_unavailable", message: "retry this page" },
+      };
+    }
+    return { snapshot: historyPage(0, "Older retry-only needle", false) };
+  } });
+  await page.goto("/");
+  await replayHistory(page);
+
+  await page.getByRole("button", { name: "Find in chat" }).click();
+  const find = page.getByRole("search", { name: "Find in chat" });
+  await find.getByRole("searchbox", { name: "Search this chat" }).fill("retry-only needle");
+  await expect.poll(() => olderRequests, { timeout: 5_000 }).toBe(2);
+  await expect(find.getByRole("status")).toHaveText("1 of 1");
 });
 
 test("keeps the visible turn fixed when a prepended row lays out during wheel scrolling", async ({

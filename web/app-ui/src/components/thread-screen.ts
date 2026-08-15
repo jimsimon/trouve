@@ -4438,6 +4438,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (generation !== this.#historyGeneration || !this.isConnected) return;
       this.#historyError = "";
       this.requestUpdate();
+      if (this.#chatFindOpen) void this.#loadAllHistoryForFind();
     }, CHAT_HISTORY_RETRY_DELAY_MS);
   }
 

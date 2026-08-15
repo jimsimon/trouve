@@ -7,13 +7,21 @@ export interface ChatFindResult {
 }
 
 const SEARCH_TEXT_LIMIT = 512 * 1024;
+const SEARCH_NODE_LIMIT = 20_000;
 
 const searchableText = (value: unknown): string => {
   const parts: string[] = [];
   const seen = new Set<object>();
   let length = 0;
+  let visited = 0;
   const visit = (candidate: unknown, depth: number): void => {
-    if (length >= SEARCH_TEXT_LIMIT || depth > 12 || candidate == null) return;
+    if (
+      length >= SEARCH_TEXT_LIMIT
+      || visited >= SEARCH_NODE_LIMIT
+      || depth > 12
+      || candidate == null
+    ) return;
+    visited += 1;
     if (typeof candidate === "string") {
       const remaining = SEARCH_TEXT_LIMIT - length;
       const text = candidate.slice(0, remaining);
@@ -24,12 +32,17 @@ const searchableText = (value: unknown): string => {
     if (typeof candidate !== "object" || seen.has(candidate)) return;
     seen.add(candidate);
     if (Array.isArray(candidate)) {
-      for (const item of candidate) visit(item, depth + 1);
+      for (const item of candidate) {
+        visit(item, depth + 1);
+        if (length >= SEARCH_TEXT_LIMIT || visited >= SEARCH_NODE_LIMIT) break;
+      }
       return;
     }
-    for (const [key, item] of Object.entries(candidate)) {
+    for (const key in candidate) {
+      if (!Object.hasOwn(candidate, key)) continue;
       visit(key, depth + 1);
-      visit(item, depth + 1);
+      visit((candidate as Record<string, unknown>)[key], depth + 1);
+      if (length >= SEARCH_TEXT_LIMIT || visited >= SEARCH_NODE_LIMIT) break;
     }
   };
   visit(value, 0);
