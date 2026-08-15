@@ -75,6 +75,15 @@ impl SearchProvider {
             }),
         }
     }
+
+    fn cache_key(&self, normalized_query: &str, max_results: usize) -> String {
+        match self.kind {
+            // Parallel does not accept a result-count argument, so every
+            // requested count represents the same provider request.
+            ProviderKind::Parallel => format!("parallel\n{normalized_query}"),
+            ProviderKind::Exa => format!("exa\n{normalized_query}\n{max_results}"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -184,8 +193,11 @@ impl WebSearch {
         lock
     }
 
-    fn cached(&self, key: &str) -> Option<CachedSearch> {
-        self.cache.lock().unwrap().get(key)
+    fn cached(&self, normalized_query: &str, max_results: usize) -> Option<CachedSearch> {
+        let mut cache = self.cache.lock().unwrap();
+        self.providers
+            .iter()
+            .find_map(|provider| cache.get(&provider.cache_key(normalized_query, max_results)))
     }
 
     async fn wait_for_provider_slot(&self, ctx: &ToolCtx) -> Result<(), SearchError> {
@@ -324,21 +336,26 @@ impl Tool for WebSearch {
             return ToolResult::error("max_results must be between 1 and 10");
         }
         let max_results = max_results as usize;
-        let key = format!("{}\n{max_results}", query.to_lowercase());
+        let normalized_query = query.to_lowercase();
 
-        if let Some(cached) = self.cached(&key) {
+        if let Some(cached) = self.cached(&normalized_query, max_results) {
             return ToolResult::ok(search_result(cached, true));
         }
 
         // Only one call for a normalized query reaches a provider. Followers
         // wait, then consume the newly cached result.
-        let query_lock = self.query_lock(&key);
+        let lock_key = self
+            .providers
+            .first()
+            .map(|provider| provider.cache_key(&normalized_query, max_results))
+            .unwrap_or_else(|| format!("none\n{normalized_query}\n{max_results}"));
+        let query_lock = self.query_lock(&lock_key);
         let _query_guard = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return ToolResult::error("search cancelled"),
             guard = query_lock.lock() => guard,
         };
-        if let Some(cached) = self.cached(&key) {
+        if let Some(cached) = self.cached(&normalized_query, max_results) {
             return ToolResult::ok(search_result(cached, true));
         }
 
@@ -349,7 +366,7 @@ impl Tool for WebSearch {
                     let truncated = content.chars().count() > MAX_RETURN_CHARS;
                     let content: String = content.chars().take(MAX_RETURN_CHARS).collect();
                     self.cache.lock().unwrap().insert(
-                        key,
+                        provider.cache_key(&normalized_query, max_results),
                         provider.name,
                         content.clone(),
                         truncated,
@@ -509,6 +526,8 @@ mod tests {
         assert_eq!(arguments["objective"], "query");
         assert_eq!(arguments["search_queries"], json!(["query"]));
         assert!(arguments.get("session_id").is_none());
+        assert!(arguments.get("max_results").is_none());
+        assert!(arguments.get("numResults").is_none());
     }
 
     #[tokio::test]
@@ -526,6 +545,48 @@ mod tests {
         assert_eq!(first.result["cache"]["hit"], false);
         assert_eq!(second.result["cache"]["hit"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_cache_ignores_result_count_that_the_provider_does_not_accept() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"shared parallel result"}]}}"#;
+        let (endpoint, calls) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(vec![SearchProvider::parallel(endpoint)], Duration::ZERO);
+        let ctx = ToolCtx::default();
+
+        let first = tool
+            .run(&ctx, &json!({"query": "same request", "max_results": 3}))
+            .await;
+        let second = tool
+            .run(&ctx, &json!({"query": "same request", "max_results": 9}))
+            .await;
+
+        assert_eq!(first.result["cache"]["hit"], false);
+        assert_eq!(second.result["cache"]["hit"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exa_cache_retains_result_count_in_its_request_identity() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"exa result"}]}}"#;
+        let (endpoint, calls) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(vec![SearchProvider::exa(endpoint)], Duration::ZERO);
+        let ctx = ToolCtx::default();
+
+        let first = tool
+            .run(&ctx, &json!({"query": "same request", "max_results": 3}))
+            .await;
+        let second = tool
+            .run(&ctx, &json!({"query": "same request", "max_results": 9}))
+            .await;
+        let repeated = tool
+            .run(&ctx, &json!({"query": "same request", "max_results": 3}))
+            .await;
+
+        assert_eq!(first.result["cache"]["hit"], false);
+        assert_eq!(second.result["cache"]["hit"], false);
+        assert_eq!(repeated.result["cache"]["hit"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
