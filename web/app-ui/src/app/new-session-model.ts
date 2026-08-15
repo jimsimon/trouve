@@ -21,6 +21,15 @@ export interface ThinkingOption {
   readonly defaultValue?: string;
 }
 
+export type ResolvedPermissionMode = "ask" | "allow_list" | "yolo";
+
+export interface ResolvedNewThreadDefaults {
+  readonly modeId: string;
+  readonly modelId: string;
+  readonly thinking: string;
+  readonly permissionMode: ResolvedPermissionMode;
+}
+
 export interface NewSessionThreadRequestInput {
   readonly sessionId: string;
   readonly title?: string | null;
@@ -128,6 +137,57 @@ export const resolveNewSessionModel = (
   nonEmpty(explicitModel)
   ?? nonEmpty(selectedMode?.default_model)
   ?? nonEmpty(providers?.default_model);
+
+const validPermissionMode = (value: unknown): ResolvedPermissionMode | undefined =>
+  value === "ask" || value === "allow_list" || value === "yolo" ? value : undefined;
+
+/** Resolve every inherited new-thread option to the concrete value the server uses. */
+export const resolveNewThreadDefaults = (
+  modes: readonly ProtocolAgentMode[],
+  models: readonly ProtocolModelInfo[],
+  providers: ProtocolProvidersResponse | null | undefined,
+  overrides: { readonly modeId?: string; readonly modelId?: string } = {},
+): ResolvedNewThreadDefaults => {
+  const requestedModeId = nonEmpty(overrides.modeId);
+  const mode = modes.find((candidate) => candidate.id === requestedModeId)
+    ?? modes.find((candidate) => candidate.id === "code")
+    ?? modes[0];
+  const resolvedModelId = resolveNewSessionModel(overrides.modelId, mode, providers);
+  const modelId = resolvedModelId !== undefined
+      && models.some((candidate) => candidate.id === resolvedModelId)
+    ? resolvedModelId
+    : models[0]?.id ?? "";
+  const model = models.find((candidate) => candidate.id === modelId);
+  const option = thinkingOption(model);
+  const thinking = [
+    nonEmpty(mode?.default_thinking_level),
+    nonEmpty(providers?.default_thinking_level),
+    option?.defaultValue,
+    option?.values[0],
+  ].find((candidate): candidate is string =>
+    candidate !== undefined && option?.values.includes(candidate) === true) ?? "";
+  const permissionMode = validPermissionMode(mode?.default_permission_mode)
+    ?? validPermissionMode(providers?.default_permission_mode)
+    ?? "ask";
+  return {
+    modeId: mode?.id ?? "code",
+    modelId,
+    thinking,
+    permissionMode,
+  };
+};
+
+/** Prefer conventional trunk branches, then the repository's literal HEAD ref. */
+export const resolveNewSessionBaseRef = (
+  branches: readonly string[],
+  preferredBaseRef = "",
+): string => {
+  const preferred = nonEmpty(preferredBaseRef);
+  if (preferred !== undefined && branches.includes(preferred)) return preferred;
+  if (branches.includes("main")) return "main";
+  if (branches.includes("master")) return "master";
+  return "HEAD";
+};
 
 /**
  * Builds the initial thread request while preserving server-side inheritance.

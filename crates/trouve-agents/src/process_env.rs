@@ -672,7 +672,14 @@ fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std:
     if !child.tree_active {
         return Ok(());
     }
-    signal_unix_process_group(child.process_group)?;
+    if let Err(error) = signal_unix_process_group(child.process_group) {
+        // Some Darwin sandboxes reject a group signal with EPERM even though
+        // the owned leader can still be killed directly. The inherited
+        // sentinel remains the authority for whether any descendant survived.
+        if error.raw_os_error() != Some(libc::EPERM) {
+            return Err(error);
+        }
+    }
     // Darwin may retain killed group members as zombies. Ignore that stale
     // group after signalling, but keep the sentinel armed: a `setsid()` child
     // that survived the group signal must continue to block acknowledgement.
@@ -784,7 +791,14 @@ fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Res
     if !child.tree_active {
         return Ok(());
     }
-    signal_unix_process_group(child.process_group)?;
+    if let Err(error) = signal_unix_process_group(child.process_group) {
+        // Some Darwin sandboxes reject a group signal with EPERM even though
+        // the owned leader can still be killed directly. The inherited
+        // sentinel remains the authority for whether any descendant survived.
+        if error.raw_os_error() != Some(libc::EPERM) {
+            return Err(error);
+        }
+    }
     // Darwin can keep a killed group visible as zombies. Stop consulting that
     // group after signalling, but do not disarm the inherited sentinel: it is
     // the ownership proof for a live descendant that moved to another group.

@@ -1,6 +1,7 @@
 import {
   createNewSessionThreadRequest,
   resolveNewSessionModel,
+  resolveNewThreadDefaults,
   threadTitleFallback,
   thinkingOption,
   type ThinkingOption,
@@ -84,11 +85,6 @@ const knownModel = (
 ): ProtocolModelInfo | undefined =>
   modelId === undefined ? undefined : models.find((model) => model.id === modelId);
 
-const defaultThinking = (model: ProtocolModelInfo | undefined): string => {
-  const option = thinkingOption(model);
-  return option?.defaultValue ?? option?.values[0] ?? "";
-};
-
 export const effectiveNewThreadModel = (
   draft: Pick<NewThreadSetupDraft, "modeId" | "modelId">,
   catalog: NewThreadSetupCatalog,
@@ -103,46 +99,37 @@ export const newThreadThinkingOption = (
   catalog: NewThreadSetupCatalog,
 ): ThinkingOption | undefined => thinkingOption(effectiveNewThreadModel(draft, catalog));
 
-/** Use the established initial code mode and first advertised model. */
+/** Show the concrete server defaults instead of inheritance placeholders. */
 export const createInitialNewThreadDraft = (
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
-  const modeId = catalog.modes.find((mode) => mode.id === "code")?.id
-    ?? catalog.modes[0]?.id
-    ?? "";
-  const modelId = catalog.models[0]?.id ?? "";
+  const defaults = resolveNewThreadDefaults(
+    catalog.modes,
+    catalog.models,
+    catalog.providers,
+  );
   return {
-    modeId,
-    modelId,
-    thinking: defaultThinking(knownModel(catalog.models, modelId)),
-    permissionMode: "",
+    ...defaults,
     prompt: "",
     attachments: [],
   };
 };
 
-/** Selecting a mode adopts its known default model, matching the product picker. */
+/** Selecting a mode adopts all of its effective defaults, matching the product form. */
 export const selectNewThreadMode = (
   draft: NewThreadSetupDraft,
   modeId: string,
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
-  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
-  const mode = knownMode(catalog.modes, modeId);
-  const nextModeId = mode?.id ?? "";
-  const advertisedDefault = nonEmpty(mode?.default_model ?? "");
-  const nextModelId = knownModel(catalog.models, advertisedDefault)?.id ?? draft.modelId;
-  const nextEffectiveModel = effectiveNewThreadModel(
-    { modeId: nextModeId, modelId: nextModelId },
-    catalog,
+  const defaults = resolveNewThreadDefaults(
+    catalog.modes,
+    catalog.models,
+    catalog.providers,
+    { modeId },
   );
   return {
     ...draft,
-    modeId: nextModeId,
-    modelId: nextModelId,
-    ...(nextEffectiveModel?.id === previousEffectiveModelId
-      ? {}
-      : { thinking: defaultThinking(nextEffectiveModel) }),
+    ...defaults,
   };
 };
 
@@ -151,15 +138,16 @@ export const selectNewThreadModel = (
   modelId: string,
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
-  const nextModelId = knownModel(catalog.models, modelId)?.id ?? "";
-  const effective = effectiveNewThreadModel(
-    { modeId: draft.modeId, modelId: nextModelId },
-    catalog,
+  const defaults = resolveNewThreadDefaults(
+    catalog.modes,
+    catalog.models,
+    catalog.providers,
+    { modeId: draft.modeId, modelId },
   );
   return {
     ...draft,
-    modelId: nextModelId,
-    thinking: defaultThinking(effective),
+    modelId: defaults.modelId,
+    thinking: defaults.thinking,
   };
 };
 

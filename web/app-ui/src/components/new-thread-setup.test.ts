@@ -38,6 +38,9 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("@trouve-model-picked=${this.#modelPicked}");
     expect(component).toContain('name="thinking"');
     expect(component).toContain('name="permission_mode"');
+    expect(component).not.toContain("Default mode");
+    expect(component).not.toContain("Mode or server default");
+    expect(component).not.toContain("Model default");
     expect(component).toContain("<span>First message</span>");
     expect(component).not.toContain('name="prompt"\n            required');
     expect(component).toContain('this.#draft.prompt.trim() === "" && this.#draft.attachments.length === 0');
@@ -56,6 +59,20 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("nativeHost.pickFiles()");
     expect(component).toContain("nativeHost.readClipboardImage()");
     expect(component).toContain('types.includes("text/plain")');
+  });
+
+  it("matches the chat composer's autogrow and Enter-to-submit behavior", () => {
+    expect(component).toContain("composerTextareaLayout(");
+    expect(component).toContain("isComposerCompositionKey({");
+    expect(component).toContain("event.key !== \"Enter\" || event.shiftKey");
+    expect(component).toContain(".form?.requestSubmit()");
+    expect(component).toContain("@compositionstart=${this.#promptCompositionStarted}");
+    expect(component).toContain(
+      'this.#optionsTouched = false;\n      this.#promptComposing = false;',
+    );
+    expect(component).toContain(
+      'this.#attachmentGeneration += 1;\n    this.#promptComposing = false;\n    this.#loadedWorkspaceId = "";',
+    );
   });
 
   it("keeps static controls immediate while surfacing busy, warning, and error states", () => {
