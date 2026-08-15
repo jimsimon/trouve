@@ -3149,7 +3149,7 @@ test("active tools join stable collapsed groups behind a transient tail", async 
   await expect(group.getByText("Ran 4 commands", { exact: true })).toBeVisible();
   await expect(group.locator(".activity-group-body")).toHaveCount(0);
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
-  await expect(transientActivity).toContainText("Progress");
+  await expect(transientActivity).toContainText("Processing…");
 });
 
 test("context compaction is an animated durable boundary between tool groups", async ({
@@ -3601,15 +3601,21 @@ test("thought completion clears stale activity while standalone and grouped tool
     ":scope > .turn-timeline > .turn-transient-activity",
   );
   await expect(agent.locator(".thinking-output.running")).toBeVisible();
+  await expect(agent.locator(
+    '.thinking-output.running [data-font-awesome-icon="brain"]',
+  )).toBeVisible();
+  await expect(agent.locator(".thinking-output.running .trouve-icon-spin")).toHaveCount(0);
   await expect(transientActivity).toHaveCount(0);
   await emit(page, threadEvent(74, {
     type: "assistant.thinking_completed",
     turn: 14,
   }));
-  await expect(transientActivity).toContainText("Progress");
-  await expect(transientActivity.locator('[data-font-awesome-icon="message"]'))
+  await expect(transientActivity).toContainText("Processing…");
+  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
     .toBeVisible();
-  await expect(transientActivity.locator(".trouve-icon-spin")).toHaveCount(0);
+  await expect(agent.locator(
+    '.thinking-output.complete [data-font-awesome-icon="brain"]',
+  )).toBeVisible();
 
   await emitBatch(page, [
     threadEvent(75, {
@@ -3682,6 +3688,69 @@ test("thought completion clears stale activity while standalone and grouped tool
     .toContainText("3 commands");
   await expect(timeline.locator(":scope > .tool-card")).toHaveCount(0);
   await expect(transientActivity).toContainText("Running command…");
+});
+
+test("a progress stream replaces the transient spinner with its message icon", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  await emitBatch(page, [
+    threadEvent(70, {
+      type: "turn.started",
+      turn: 14,
+      mode: "code",
+      model: "codex/gpt-5.6-sol",
+    }),
+    threadEvent(71, {
+      type: "user.message",
+      turn: 14,
+      content: "Keep live progress visibly active",
+      attachments: [],
+    }),
+    threadEvent(72, {
+      type: "turn.capacity_acquired",
+      turn: 14,
+      wait_ms: 0,
+      background: false,
+    }),
+  ]);
+
+  const agent = page.locator(".agent-turn-card").last();
+  const progress = agent.locator(".progress-output");
+  const transientActivity = agent.locator(
+    ":scope > .turn-timeline > .turn-transient-activity",
+  );
+  await expect(transientActivity).toContainText("Processing…");
+  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
+    .toBeVisible();
+
+  await emit(page, threadEvent(73, {
+    type: "assistant.progress",
+    turn: 14,
+    text: "Checking the current state.",
+  }));
+  await expect(progress).toHaveClass(/running/u);
+  await expect(progress.locator('[data-font-awesome-icon="message"]')).toBeVisible();
+  await expect(progress.locator(".trouve-icon-spin")).toHaveCount(0);
+  await expect(transientActivity).toHaveCount(0);
+
+  await emit(page, threadEvent(74, {
+    type: "assistant.progress_completed",
+    turn: 14,
+  }));
+  await expect(progress).toHaveClass(/complete/u);
+  await expect(progress.locator('[data-font-awesome-icon="message"]')).toBeVisible();
+  await expect(progress.locator(".trouve-icon-spin")).toHaveCount(0);
+  await expect(transientActivity.locator(".turn-transient-spinner.trouve-icon-spin"))
+    .toBeVisible();
+
+  await emit(page, threadEvent(75, {
+    type: "turn.completed",
+    turn: 14,
+    usage: { input_tokens: 2, output_tokens: 2 },
+    checkpoint_id: null,
+  }));
+  await expect(transientActivity).toHaveCount(0);
 });
 
 test(VIRTUAL_DISCLOSURE_GEOMETRY_TEST, async ({
@@ -5465,7 +5534,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await expect(submit).toHaveText("Cancel");
   const activeAgent = page.locator(".agent-turn-card").last();
   await expect(activeAgent.locator(".turn-transient-activity"))
-    .toContainText("Progress");
+    .toContainText("Processing…");
   await expect.poll(() => page.locator(".chat-stream").evaluate((viewport) =>
     viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop
   )).toBeLessThanOrEqual(1);
@@ -5486,11 +5555,13 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   await page.locator("trouve-app").evaluate((element) => {
     element.setAttribute("data-reduce-motion", "");
   });
-  await expect(activeAgent.locator(
-    '.turn-transient-activity [data-font-awesome-icon="message"]',
-  )).toBeVisible();
-  await expect(activeAgent.locator(".turn-transient-activity .trouve-icon-spin"))
-    .toHaveCount(0);
+  const reducedMotionSpinner = activeAgent.locator(
+    ".turn-transient-activity .turn-transient-spinner.trouve-icon-spin",
+  );
+  await expect(reducedMotionSpinner).toBeVisible();
+  await expect.poll(() => reducedMotionSpinner.evaluate(
+    (element) => getComputedStyle(element).animationName,
+  )).toBe("none");
   await expect(page.locator('[data-virtual-id="ephemeral:activity"]')).toHaveCount(0);
   await expect(submit).toHaveText("Cancel");
   await submit.click();

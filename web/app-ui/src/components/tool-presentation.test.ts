@@ -456,7 +456,7 @@ describe("tool presentation", () => {
   });
 
   it("uses a transient label only when no durable activity node is active", () => {
-    expect(runningActivityLabel([], true)).toBe("Reasoning");
+    expect(runningActivityLabel([], true)).toBe("Thinking…");
     expect(runningActivityLabel([
       { kind: "tool", tool: "WebSearch", args: {}, status: "running" },
       { kind: "turn-status", state: { kind: "running" } },
@@ -528,9 +528,9 @@ describe("tool presentation", () => {
     expect(runningActivityLabel([
       { kind: "tool", tool: "Bash", args: {}, status: "running" },
       { kind: "turn-status", state: { kind: "running" } },
-    ], false)).toBe("Progress");
+    ], false)).toBe("Processing…");
     expect(runningActivityLabel([
       { kind: "turn-status", state: { kind: "running" } },
-    ], false)).toBe("Progress");
+    ], false)).toBe("Processing…");
   });
 });

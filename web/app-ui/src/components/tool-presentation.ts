@@ -384,7 +384,7 @@ export const runningActivityLabel = (
     }
     if (item.kind === "questions" && item.answers === undefined) return undefined;
   }
-  return thinking ? "Reasoning" : "Progress";
+  return thinking ? "Thinking…" : "Processing…";
 };
 
 const diffLine = (
