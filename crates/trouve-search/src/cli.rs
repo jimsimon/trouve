@@ -134,6 +134,11 @@ enum CliCommand {
 enum DebugCommand {
     /// Chunk one file and print the chunks as JSON.
     Chunk { file: PathBuf },
+    /// Print the supported extensions for the selected content types as JSON.
+    Extensions {
+        #[command(flatten)]
+        content: ContentArgs,
+    },
     /// Tokenize text (BM25 tokenizer) and print the tokens as JSON.
     Tokenize { text: String },
     /// Print BM25 scores for a query over a JSON list of documents on stdin.
@@ -322,6 +327,14 @@ fn run_debug(command: DebugCommand) -> ExitCode {
                 })
                 .collect();
             println!("{}", serde_json::Value::Array(out));
+            ExitCode::SUCCESS
+        }
+        DebugCommand::Extensions { content } => {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::languages::get_extensions(&content.resolve()))
+                    .unwrap()
+            );
             ExitCode::SUCCESS
         }
         DebugCommand::Tokenize { text } => {

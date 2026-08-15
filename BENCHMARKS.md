@@ -119,6 +119,44 @@ store sharing (identity is the folder path, not the git common dir) and the
 no-read manifest for clean files — on kubernetes scale that costs roughly
 90–150 ms per invocation.
 
+## Codebase search vs grep and ripgrep
+
+`benchmarks/run_search_comparison.py` measures the tradeoff an agent sees:
+local search latency and the amount of tool output subsequently added to the
+provider context. Five cases in `benchmarks/search_comparison_cases.json` pair
+a natural-language intent for trouve with a hand-written extended regular
+expression for grep and ripgrep. The lexical tools return every matching line;
+trouve returns the top 5 ranked chunks with at most 10 lines each.
+
+Measured on this monorepo at `b2cf65bf` (409 source files), on the test machine
+described above. Each case had one warm-up followed by 10 full CLI invocations;
+the table reports the median across all 50 timed searches. trouve used an
+isolated cache, with the index built once before warm measurements. GNU grep
+3.12 and ripgrep 15.2 searched the authoritative code-extension set reported
+by the same trouve-search binary.
+
+| Tool | Median warm query | Mean provider input tokens | Relative tokens | Cost / 1k searches |
+| --- | ---: | ---: | ---: | ---: |
+| trouve-search | 82.02 ms | 716 | 1.00x | $2.1492 |
+| grep | 32.97 ms | 5,863 | 8.19x | $17.5902 |
+| ripgrep | 6.81 ms | 5,863 | 8.19x | $17.5902 |
+
+The one-time trouve index build plus first query took 385.01 ms. ripgrep is
+12.0x faster than a warm trouve CLI invocation here, while trouve reduces the
+average returned context by 87.8%. At an illustrative provider input price of
+$3 per million tokens, that is $2.15 instead of $17.59 per 1,000 searches. The
+price is a benchmark parameter (`--input-cost-per-million`), not an assumption
+about a particular model.
+
+Token counts estimate provider input as `ceil(UTF-8 output characters / 4)`,
+the same four-characters-per-token convention used by `trouve-search savings`.
+They cover tool stdout only; common prompt and tool-call envelope tokens are
+excluded. grep and ripgrep produce the same matches and output format, hence
+their identical token counts. This benchmark intentionally represents the
+initial agent retrieval step—ranked, bounded semantic context versus exhaustive
+lexical matches. It does not claim the result sets have identical relevance;
+the separate NDCG suite below measures trouve retrieval quality.
+
 ## Resource usage
 
 Peak resident memory (`/usr/bin/time -v`, full CLI invocation) and on-disk
@@ -250,6 +288,10 @@ benchmarks/run_benchmarks.sh
 
 # git vs non-git roots (kubernetes by default; pass any git repo dir)
 benchmarks/run_git_vs_nogit.sh
+
+# agent-facing latency and provider-context comparison with grep/ripgrep
+python3 benchmarks/run_search_comparison.py --runs 10 \
+    --output benchmarks/results/search-comparison.json
 
 # quality suite
 (cd reference/semble && PYTHONPATH=. ../../.venv/bin/python benchmarks/sync_repos.py \
