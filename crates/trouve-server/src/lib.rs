@@ -941,6 +941,7 @@ pub async fn serve_listener(
 ) -> anyhow::Result<()> {
     engine.reconcile_checkpoint_refs().await;
     engine.retry_artifact_cleanup_jobs().await;
+    engine.retry_persona_deletions().await;
     engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
@@ -2154,7 +2155,7 @@ async fn upsert_persona(
     Path(id): Path<String>,
     Json(req): Json<UpsertPersonaRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.upsert_persona(&id, req)?;
+    engine.upsert_persona(&id, req).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2164,7 +2165,7 @@ async fn delete_persona(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.delete_persona(&id)?;
+    engine.delete_persona(&id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

@@ -148,6 +148,13 @@ CREATE TABLE IF NOT EXISTS artifact_cleanup_jobs (
   claim_token TEXT,
   created_at TEXT NOT NULL
 );
+-- Persona deletion is a cross-boundary mutation: repository references stay
+-- intact until the executor confirms the file removal, while this intent
+-- makes a completed file mutation recoverable after a crash.
+CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
+  persona_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
   scope_kind TEXT NOT NULL,
@@ -465,6 +472,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN next_attempt_at TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_until TEXT",
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
+    "CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
+       persona_id TEXT PRIMARY KEY,
+       created_at TEXT NOT NULL
+     )",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE automations ADD COLUMN thinking_level TEXT",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
@@ -5952,22 +5963,59 @@ impl Store {
         Ok(())
     }
 
-    /// Remove a custom persona from every repository and finalize its file
-    /// deletion before committing the database cleanup. If finalization fails,
-    /// dropping the transaction restores every repository reference.
-    pub fn delete_persona_references<F>(&self, id: &str, finalize: F) -> Result<()>
-    where
-        F: FnOnce() -> Result<()>,
-    {
+    /// Record a durable custom-persona deletion before filesystem work begins.
+    /// Repository references deliberately remain unchanged until the executor
+    /// confirms that the persona file was removed.
+    pub fn begin_persona_deletion(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO persona_cleanup_intents (persona_id, created_at)
+             VALUES (?1, ?2)",
+            params![id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn persona_deletion_pending(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM persona_cleanup_intents WHERE persona_id = ?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn pending_persona_deletions(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT persona_id FROM persona_cleanup_intents ORDER BY created_at, persona_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Remove a deleted custom persona from every repository and consume its
+    /// durable intent atomically. Filesystem work has already completed and no
+    /// executor call occurs while the SQLite connection is locked.
+    pub fn complete_persona_deletion(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let defaults = serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
         tx.execute(
             "UPDATE code_review_repositories SET
                identity_ids = CASE
-                 WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value != ?1)
-                 THEN (SELECT json_group_array(value) FROM json_each(identity_ids) WHERE value != ?1)
-                 ELSE ?2
+                 WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value = ?1)
+                 THEN CASE
+                   WHEN EXISTS (SELECT 1 FROM json_each(identity_ids) WHERE value != ?1)
+                   THEN (SELECT json_group_array(value) FROM json_each(identity_ids) WHERE value != ?1)
+                   ELSE ?2
+                 END
+                 ELSE identity_ids
                END,
                included_reviewer_ids = (SELECT json_group_array(value) FROM json_each(included_reviewer_ids) WHERE value != ?1),
                excluded_reviewer_ids = (SELECT json_group_array(value) FROM json_each(excluded_reviewer_ids) WHERE value != ?1),
@@ -5979,7 +6027,11 @@ impl Store {
                 OR EXISTS (SELECT 1 FROM json_each(reviewer_overrides) WHERE json_extract(value, '$.reviewer_id') = ?1)",
             params![id, defaults, chrono::Utc::now().to_rfc3339()],
         )?;
-        finalize()?;
+        let deleted = tx.execute(
+            "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
+            [id],
+        )?;
+        anyhow::ensure!(deleted == 1, "persona deletion intent for {id} is missing");
         tx.commit()?;
         Ok(())
     }
@@ -11726,7 +11778,7 @@ mod tests {
     }
 
     #[test]
-    fn persona_reference_cleanup_is_atomic_and_restores_default_reviewers() {
+    fn persona_reference_cleanup_is_durable_and_preserves_unrelated_selection() {
         let store = Store::open_in_memory().unwrap();
         let request = trouve_protocol::UpdateCodeReviewRepositoryRequest {
             installation_id: 7,
@@ -11751,12 +11803,52 @@ mod tests {
             }]),
         };
         store.update_code_review_repository(&request).unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/empty".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "preserve empty selection".into(),
+                reviewer_ids: Some(Vec::new()),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec!["custom".into()]),
+                excluded_reviewer_ids: Some(vec!["security".into()]),
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/unrelated".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: Some(vec!["reliability".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec!["custom".into()]),
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
 
-        let error = store
-            .delete_persona_references("custom", || anyhow::bail!("file deletion failed"))
-            .unwrap_err();
-        assert!(error.to_string().contains("file deletion failed"));
-        let unchanged = store.list_code_review_repositories().unwrap().remove(0);
+        store.begin_persona_deletion("custom").unwrap();
+        assert!(store.persona_deletion_pending("custom").unwrap());
+        assert_eq!(store.pending_persona_deletions().unwrap(), ["custom"]);
+        let unchanged = store
+            .list_code_review_repositories()
+            .unwrap()
+            .into_iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
         assert_eq!(unchanged.reviewer_ids, vec!["custom"]);
         assert_eq!(
             unchanged.included_reviewer_ids,
@@ -11764,10 +11856,13 @@ mod tests {
         );
         assert_eq!(unchanged.reviewer_overrides.len(), 1);
 
-        store
-            .delete_persona_references("custom", || Ok(()))
+        store.complete_persona_deletion("custom").unwrap();
+        assert!(!store.persona_deletion_pending("custom").unwrap());
+        let repositories = store.list_code_review_repositories().unwrap();
+        let cleaned = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/widgets")
             .unwrap();
-        let cleaned = store.list_code_review_repositories().unwrap().remove(0);
         assert_eq!(
             cleaned.reviewer_ids,
             crate::reviewers::default_reviewer_ids()
@@ -11777,6 +11872,21 @@ mod tests {
         assert!(cleaned.reviewer_overrides.is_empty());
         assert_eq!(cleaned.prompt, "keep this");
         assert_eq!(cleaned.model.as_deref(), Some("openai/reviewer"));
+
+        let empty = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/empty")
+            .unwrap();
+        assert!(empty.reviewer_ids.is_empty());
+        assert!(empty.included_reviewer_ids.is_empty());
+        assert_eq!(empty.excluded_reviewer_ids, ["security"]);
+        assert_eq!(empty.prompt, "preserve empty selection");
+        let unrelated = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/unrelated")
+            .unwrap();
+        assert_eq!(unrelated.reviewer_ids, ["reliability"]);
+        assert!(unrelated.included_reviewer_ids.is_empty());
     }
 
     #[test]

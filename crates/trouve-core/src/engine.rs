@@ -1814,6 +1814,9 @@ pub struct Engine {
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
     provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes persona-file mutations with durable deletion replay so a
+    /// recreate cannot race a pending cleanup of the same user-level file.
+    persona_mutations: tokio::sync::Mutex<()>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -2187,6 +2190,7 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            persona_mutations: tokio::sync::Mutex::new(()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2303,6 +2307,36 @@ impl Engine {
         }
     }
 
+    /// Finish durable persona-file deletions left by an interrupted request.
+    /// The intent keeps repository references untouched until the executor
+    /// confirms the file is gone; a missing file is success only on replay.
+    pub async fn retry_persona_deletions(&self) {
+        let ids = match self.store.pending_persona_deletions() {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "failed to list durable persona deletion intents");
+                return;
+            }
+        };
+        let Some(config_dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        for id in ids {
+            let _mutation = self.persona_mutations.lock().await;
+            if let Err(error) = self
+                .executor
+                .delete_persona_file(config_dir, &id, true)
+                .await
+            {
+                tracing::warn!(persona_id = %id, %error, "persona deletion retry failed");
+                continue;
+            }
+            if let Err(error) = self.store.complete_persona_deletion(&id) {
+                tracing::warn!(persona_id = %id, %error, "finalizing persona deletion retry failed");
+            }
+        }
+    }
+
     /// Keep retrying failed cleanup intents while the process remains alive.
     /// Atomic store claims prevent this worker from overlapping immediate
     /// cleanup or another server instance sharing the database.
@@ -2314,6 +2348,7 @@ impl Engine {
             loop {
                 interval.tick().await;
                 engine.retry_artifact_cleanup_jobs().await;
+                engine.retry_persona_deletions().await;
             }
         });
     }
@@ -4566,7 +4601,7 @@ impl Engine {
 
     /// Create or update a user-level persona. Saving under a built-in id
     /// customizes that built-in; the file lands in `<config>/personas/`.
-    pub fn upsert_persona(
+    pub async fn upsert_persona(
         &self,
         id: &str,
         req: trouve_protocol::UpsertPersonaRequest,
@@ -4594,18 +4629,26 @@ impl Engine {
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
         };
-        personas::upsert_user_persona(config_dir, &persona)
-            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+        let _mutation = self.persona_mutations.lock().await;
+        if self.store.persona_deletion_pending(id)? {
+            self.store.complete_persona_deletion(id)?;
+        }
+        self.executor
+            .upsert_persona_file(config_dir, &persona)
+            .await
+            .map_err(EngineError::BadRequest)
     }
 
     /// Remove a user-level persona file: deletes a custom persona, or resets a
     /// customized built-in to its defaults.
-    pub fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
         validate_persona_id(id)?;
         let config_dir = self
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
+        let _mutation = self.persona_mutations.lock().await;
+        let deletion_pending = self.store.persona_deletion_pending(id)?;
         let system_persona = personas::builtin_personas()
             .iter()
             .any(|persona| persona.id == id)
@@ -4613,18 +4656,26 @@ impl Engine {
                 .code_review_reviewer_catalog()?
                 .iter()
                 .any(|reviewer| reviewer.id == id && reviewer.built_in);
-        let is_custom = !system_persona
-            && personas::resolve_persona_infos(Some(config_dir), None)
-                .iter()
-                .any(|info| info.persona.id == id && info.origin == "custom");
+        let is_custom = deletion_pending
+            || (!system_persona
+                && personas::resolve_persona_infos(Some(config_dir), None)
+                    .iter()
+                    .any(|info| info.persona.id == id && info.origin == "custom"));
         if is_custom {
+            self.store.begin_persona_deletion(id)?;
+            self.executor
+                .delete_persona_file(config_dir, id, deletion_pending)
+                .await
+                .map_err(EngineError::BadRequest)?;
             return self
                 .store
-                .delete_persona_references(id, || personas::delete_user_persona(config_dir, id))
-                .map_err(|error| EngineError::BadRequest(format!("{error:#}")));
+                .complete_persona_deletion(id)
+                .map_err(EngineError::Internal);
         }
-        personas::delete_user_persona(config_dir, id)
-            .map_err(|error| EngineError::BadRequest(format!("{error:#}")))
+        self.executor
+            .delete_persona_file(config_dir, id, false)
+            .await
+            .map_err(EngineError::BadRequest)
     }
 
     /// GitHub repository named by the session's origin remote. Routes to
@@ -14492,8 +14543,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn persona_mutations_reject_unsafe_ids_before_file_access() {
+    struct RejectingPersonaDeletionExecutor {
+        attempted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RejectingPersonaDeletionExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            None
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: &serde_json::Value,
+        ) -> ToolResult {
+            ToolResult::error(format!("unknown tool: {name}"))
+        }
+
+        async fn delete_persona_file(
+            &self,
+            _config_dir: &Path,
+            _id: &str,
+            _allow_missing: bool,
+        ) -> Result<(), String> {
+            self.attempted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("injected persona deletion failure".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_mutations_reject_unsafe_ids_before_file_access() {
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -14508,19 +14594,19 @@ mod tests {
 
         for id in ["", "../escape", "has/slash", "has space", "question?"] {
             assert!(matches!(
-                engine.upsert_persona(id, persona_request("Unsafe")),
+                engine.upsert_persona(id, persona_request("Unsafe")).await,
                 Err(EngineError::BadRequest(_))
             ));
             assert!(matches!(
-                engine.delete_persona(id),
+                engine.delete_persona(id).await,
                 Err(EngineError::BadRequest(_))
             ));
         }
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
     }
 
-    #[test]
-    fn delete_persona_cleans_custom_references_and_resets_system_overrides() {
+    #[tokio::test]
+    async fn delete_persona_cleans_custom_references_and_resets_system_overrides() {
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path().join("config");
         let workspace = tmp.path().join("workspace");
@@ -14533,12 +14619,15 @@ mod tests {
 
         engine
             .upsert_persona("custom", persona_request("Custom persona"))
+            .await
             .unwrap();
         engine
             .upsert_persona("code", persona_request("Customized Code"))
+            .await
             .unwrap();
         engine
             .upsert_persona("correctness", persona_request("Customized Correctness"))
+            .await
             .unwrap();
         let workspace_persona = AgentPersona {
             id: "workspace-only".into(),
@@ -14588,7 +14677,7 @@ mod tests {
             })
             .unwrap();
 
-        engine.delete_persona("custom").unwrap();
+        engine.delete_persona("custom").await.unwrap();
         let repository = engine
             .store
             .list_code_review_repositories()
@@ -14607,8 +14696,8 @@ mod tests {
         assert_eq!(repository.prompt, "preserve this");
         assert_eq!(repository.model.as_deref(), Some("openai/reviewer"));
 
-        engine.delete_persona("code").unwrap();
-        engine.delete_persona("correctness").unwrap();
+        engine.delete_persona("code").await.unwrap();
+        engine.delete_persona("correctness").await.unwrap();
         let infos = engine.list_persona_infos(None).unwrap();
         for (id, customized_name) in [
             ("code", "Customized Code"),
@@ -14620,7 +14709,7 @@ mod tests {
         }
 
         assert!(matches!(
-            engine.delete_persona("workspace-only"),
+            engine.delete_persona("workspace-only").await,
             Err(EngineError::BadRequest(_))
         ));
         let repository = engine
@@ -14633,6 +14722,66 @@ mod tests {
                 .included_reviewer_ids
                 .contains(&"workspace-only".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn failed_executor_persona_deletion_keeps_repository_references_retryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let persona = AgentPersona {
+            id: "custom".into(),
+            display_name: "Custom".into(),
+            system_prompt: "Review carefully.".into(),
+            allowed_tools: Vec::new(),
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        };
+        personas::upsert_user_persona(&config_dir, &persona).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: None,
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: Some(vec!["custom".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+                semantic_routing: Some(false),
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(Some(config_dir.clone()))
+            .with_executor(Arc::new(RejectingPersonaDeletionExecutor {
+                attempted: attempted.clone(),
+            }));
+
+        let error = engine.delete_persona("custom").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected persona deletion failure")
+        );
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.persona_deletion_pending("custom").unwrap());
+        assert_eq!(
+            store
+                .list_code_review_repositories()
+                .unwrap()
+                .remove(0)
+                .reviewer_ids,
+            ["custom"]
+        );
+        assert!(personas::user_persona_file(&config_dir, "custom").is_some());
     }
 
     #[test]

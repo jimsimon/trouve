@@ -435,7 +435,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
             : draft.routingMode === "additive"
               ? html`
                   ${this.#renderReviewerSelection(key, "includedReviewerIds", "Always included personas", "Routing may add other relevant personas.", draft.includedReviewerIds)}
-                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these personas out of routed review batches.", draft.excludedReviewerIds)}
+                  ${this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "Keep these personas out of routed review batches.", draft.excludedReviewerIds, false)}
                 `
               : this.#renderReviewerSelection(key, "excludedReviewerIds", "Excluded from routing", "All other personas are eligible for routing.", draft.excludedReviewerIds)}
 
@@ -454,6 +454,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
     legend: string,
     description: string,
     selected: readonly string[],
+    showEmptyAction = true,
   ) {
     return html`
       <fieldset>
@@ -461,9 +462,10 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         <p>${description}</p>
         ${this.#reviewers.length === 0
           ? html`<div class="empty">
-              No personas are available.
-              <button type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "personas" })}>Open Personas &amp; Models</button>
-              before enabling reviews.
+              <span>No personas are available before enabling reviews.</span>
+              ${showEmptyAction
+                ? html`<button type="button" ?disabled=${this.#busy !== ""} @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "personas" })}>Open Personas &amp; Models</button>`
+                : nothing}
             </div>`
           : html`
               <div class="check-grid">

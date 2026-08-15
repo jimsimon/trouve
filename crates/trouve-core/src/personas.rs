@@ -251,7 +251,7 @@ pub fn resolve_persona_infos(
 
 /// The user-level persona file defining `id`, if any. Prefers `<id>.toml` but
 /// falls back to scanning (files may be named freely).
-fn user_persona_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
     let dir = config_dir.join("personas");
     let canonical = dir.join(format!("{id}.toml"));
     if canonical.exists() {
