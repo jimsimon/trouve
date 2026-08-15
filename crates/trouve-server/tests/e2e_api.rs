@@ -5890,6 +5890,13 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .iter()
             .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
+    let default_correctness = empty["reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|reviewer| reviewer["id"] == "correctness")
+        .unwrap()
+        .clone();
 
     let response = client
         .put(format!("http://{addr}/v1/personas/correctness"))
@@ -6046,29 +6053,27 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .iter()
             .all(|reviewer| reviewer["id"] != custom_id)
     );
-    assert!(
-        dashboard["reviewers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reviewer| reviewer["id"] == "correctness"
-                && reviewer["model"] != "anthropic/claude"
-                && reviewer["default_thinking_level"] != "high")
-    );
+    let reset_correctness = dashboard["reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|reviewer| reviewer["id"] == "correctness")
+        .unwrap();
+    assert_eq!(reset_correctness, &default_correctness);
     assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
-        serde_json::json!(["correctness", custom_id])
+        serde_json::json!(["correctness"])
     );
     assert_eq!(
         dashboard["repositories"][0]["included_reviewer_ids"],
-        serde_json::json!([custom_id, "reliability"])
+        serde_json::json!(["reliability"])
     );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        1
     );
 }
 

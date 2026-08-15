@@ -26,11 +26,11 @@ import {
   openJobEvents,
   openServerEvents,
   requestReview,
-  resetMode,
+  resetPersona,
   retryJob,
   retryPersona,
   saveDefaultModel,
-  saveMode,
+  savePersona,
   saveProvider,
   saveRepository,
   saveReviewSettings,
@@ -1346,7 +1346,7 @@ function JobDetailPane({
         </div>
         <div>
           <dt>Router thinking</dt>
-          <dd>{job.router_thinking_level || "Review mode default"}</dd>
+          <dd>{job.router_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
           <dt>Pending</dt>
@@ -2106,7 +2106,7 @@ function RepositoryEditor({
             <ThinkingSetting
               options={coordinatorThinking}
               value={draft.coordinator_thinking_level ?? ""}
-              inheritLabel="Inherit review mode"
+              inheritLabel="Inherit review persona"
               onChange={(value) =>
                 setDraft({
                   ...draft,
@@ -2115,8 +2115,8 @@ function RepositoryEditor({
               }
             />
             <small>
-              Controls reasoning for the final coordinator. Inherit review mode uses the default
-              configured in Review mode settings.
+              Controls reasoning for the final coordinator. Inherit review persona uses the default
+              configured in Review persona settings.
             </small>
           </label>
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
@@ -2257,7 +2257,7 @@ function RepositoryEditor({
           <p class="field-help">
             Tune a persona for this repository without changing its reusable defaults. Model
             overrides take precedence over the persona and coordinator fallback; thinking
-            overrides take precedence over the persona and Review mode default.
+            overrides take precedence over the persona and Review persona default.
           </p>
           <div class="persona-execution-grid">
             {reviewers.map((reviewer) => {
@@ -2314,7 +2314,7 @@ function RepositoryEditor({
                       inheritLabel={
                         reviewer.default_thinking_level
                           ? `Inherit · ${thinkingLevelLabel(reviewer.default_thinking_level)}`
-                          : "Inherit persona/review mode"
+                          : "Inherit persona/review persona"
                       }
                       onChange={(value) =>
                         updateReviewerOverride(reviewer.id, {
@@ -2508,7 +2508,7 @@ function ReviewerEditor({
         />
         <small>
           Sets this persona's reusable reasoning default. Repository-specific overrides take
-          precedence; otherwise Inherit follows the Review mode default.
+          precedence; otherwise Inherit follows the Review persona default.
         </small>
       </label>
       <div class="action-row">
@@ -2798,8 +2798,8 @@ function SettingsPage({
         title="Settings"
         description="Review execution defaults, GitHub App health, and model-provider authentication."
       />
-      <ReviewModeSettings
-        modeInfo={reviewPersonaInfo}
+      <ReviewPersonaSettings
+        personaInfo={reviewPersonaInfo}
         models={models}
         globalModel={providers?.default_model}
         globalThinking={providers?.default_thinking_level}
@@ -2940,28 +2940,28 @@ function ReviewExecutionSettings({
   );
 }
 
-function ReviewModeSettings({
-  modeInfo,
+function ReviewPersonaSettings({
+  personaInfo,
   models,
   globalModel,
   globalThinking,
   onChanged,
 }: {
-  modeInfo?: PersonaInfo;
+  personaInfo?: PersonaInfo;
   models: Model[];
   globalModel?: string;
   globalThinking?: string;
   onChanged: () => void;
 }) {
-  const mode = modeInfo?.persona;
-  const [model, setModel] = useState(mode?.default_model ?? "");
-  const [thinking, setThinking] = useState(mode?.default_thinking_level ?? "");
+  const persona = personaInfo?.persona;
+  const [model, setModel] = useState(persona?.default_model ?? "");
+  const [thinking, setThinking] = useState(persona?.default_thinking_level ?? "");
   const [busy, setBusy] = useState(false);
   const [message, flash] = useFlash();
-  useEffect(() => setModel(mode?.default_model ?? ""), [mode?.default_model]);
+  useEffect(() => setModel(persona?.default_model ?? ""), [persona?.default_model]);
   useEffect(
-    () => setThinking(mode?.default_thinking_level ?? ""),
-    [mode?.default_thinking_level],
+    () => setThinking(persona?.default_thinking_level ?? ""),
+    [persona?.default_thinking_level],
   );
   const effectiveModel = model || globalModel || "";
   const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
@@ -2971,23 +2971,23 @@ function ReviewModeSettings({
     : "model default";
 
   return (
-    <section class="panel settings-card review-mode-settings">
+    <section class="panel settings-card review-persona-settings">
       <PanelTitle
-        title="Review mode"
-        subtitle="Defaults for review-mode threads. Repository models still take precedence for automated reviews."
+        title="Review persona"
+        subtitle="Defaults for review-persona threads. Repository models still take precedence for automated reviews."
       />
-      {mode ? (
+      {persona ? (
         <form
           onSubmit={async (event) => {
             event.preventDefault();
             setBusy(true);
             try {
-              await saveMode({
-                ...mode,
+              await savePersona({
+                ...persona,
                 default_model: model || undefined,
                 default_thinking_level: thinking || undefined,
               });
-              flash("Review mode defaults saved");
+              flash("Review persona defaults saved");
               onChanged();
             } catch (cause) {
               flash(cause instanceof Error ? cause.message : String(cause));
@@ -3048,9 +3048,9 @@ function ReviewModeSettings({
           </div>
           <div class="action-row">
             <button type="submit" disabled={busy}>
-              {busy ? "Saving…" : "Save review mode"}
+              {busy ? "Saving…" : "Save review persona"}
             </button>
-            {modeInfo?.origin === "customized" && (
+            {personaInfo?.origin === "customized" && (
               <button
                 class="ghost"
                 type="button"
@@ -3058,8 +3058,8 @@ function ReviewModeSettings({
                 onClick={async () => {
                   setBusy(true);
                   try {
-                    await resetMode(mode.id);
-                    flash("Review mode reset to built-in defaults");
+                    await resetPersona(persona.id);
+                    flash("Review persona reset to built-in defaults");
                     onChanged();
                   } catch (cause) {
                     flash(cause instanceof Error ? cause.message : String(cause));
@@ -3075,7 +3075,7 @@ function ReviewModeSettings({
           </div>
         </form>
       ) : (
-        <p class="muted">Review mode configuration is unavailable.</p>
+        <p class="muted">Review persona configuration is unavailable.</p>
       )}
     </section>
   );
@@ -3407,7 +3407,7 @@ function ProviderSettings({
             inheritLabel="Use the model's default"
           />
           <small>
-            Base reasoning setting used when a mode, persona, or repository does not specify its
+            Base reasoning setting used when a persona or repository does not specify its
             own thinking level.
           </small>
         </label>

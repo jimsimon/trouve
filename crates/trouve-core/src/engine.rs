@@ -4590,6 +4590,69 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
+        let system_persona = personas::builtin_personas()
+            .iter()
+            .any(|persona| persona.id == id)
+            || self
+                .code_review_reviewer_catalog()?
+                .iter()
+                .any(|reviewer| reviewer.id == id && reviewer.built_in);
+        let is_custom = !system_persona
+            && personas::resolve_persona_infos(Some(config_dir), None)
+                .iter()
+                .any(|info| info.persona.id == id && info.origin == "custom");
+        if is_custom {
+            for repository in self.store.list_code_review_repositories()? {
+                let referenced = repository
+                    .reviewer_ids
+                    .iter()
+                    .any(|reviewer_id| reviewer_id == id)
+                    || repository
+                        .included_reviewer_ids
+                        .iter()
+                        .any(|reviewer_id| reviewer_id == id)
+                    || repository
+                        .excluded_reviewer_ids
+                        .iter()
+                        .any(|reviewer_id| reviewer_id == id)
+                    || repository
+                        .reviewer_overrides
+                        .iter()
+                        .any(|reviewer_override| reviewer_override.reviewer_id == id);
+                if !referenced {
+                    continue;
+                }
+                let mut reviewer_ids = repository.reviewer_ids;
+                reviewer_ids.retain(|reviewer_id| reviewer_id != id);
+                if reviewer_ids.is_empty() {
+                    reviewer_ids = crate::reviewers::default_reviewer_ids();
+                }
+                let mut included_reviewer_ids = repository.included_reviewer_ids;
+                included_reviewer_ids.retain(|reviewer_id| reviewer_id != id);
+                let mut excluded_reviewer_ids = repository.excluded_reviewer_ids;
+                excluded_reviewer_ids.retain(|reviewer_id| reviewer_id != id);
+                let mut reviewer_overrides = repository.reviewer_overrides;
+                reviewer_overrides.retain(|reviewer_override| reviewer_override.reviewer_id != id);
+                self.store.update_code_review_repository(
+                    &trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                        installation_id: repository.installation_id,
+                        repository: repository.repository,
+                        mode: repository.mode,
+                        model: repository.model,
+                        coordinator_thinking_level: repository.coordinator_thinking_level,
+                        router_model: repository.router_model,
+                        router_thinking_level: repository.router_thinking_level,
+                        prompt: repository.prompt,
+                        reviewer_ids: Some(reviewer_ids),
+                        routing_mode: Some(repository.routing_mode),
+                        semantic_routing: Some(repository.semantic_routing),
+                        included_reviewer_ids: Some(included_reviewer_ids),
+                        excluded_reviewer_ids: Some(excluded_reviewer_ids),
+                        reviewer_overrides: Some(reviewer_overrides),
+                    },
+                )?;
+            }
+        }
         personas::delete_user_persona(config_dir, id)
             .map_err(|error| EngineError::BadRequest(format!("{error:#}")))
     }
@@ -4821,12 +4884,12 @@ impl Engine {
         let mut prs = github
             .prs_for_branch(&session.branch)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         let mut seen: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
         for pr in github
             .open_prs_referenced_by(&evidence.successful_tool_args, &evidence.commit_ids)
             .await
-            .map_err(EngineError::Internal)?
+            .map_err(github_engine_error)?
         {
             self.record_session_pr_numbers(
                 session_id,
@@ -5004,11 +5067,11 @@ impl Engine {
             (Some(base), Some(head)) if !base.is_empty() && !head.is_empty() => github
                 .pr_file_diff_known(file, base, head)
                 .await
-                .map_err(EngineError::Internal),
+                .map_err(github_engine_error),
             _ => github
                 .pr_file_diff(number, path)
                 .await
-                .map_err(EngineError::Internal),
+                .map_err(github_engine_error),
         }
     }
 
@@ -5050,7 +5113,7 @@ impl Engine {
         self.github_for_session(&session)?
             .act_on_pr(&detail, action)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
 
         let mut stale = HashSet::from([Section::Overview]);
         match action {
@@ -5680,7 +5743,7 @@ impl Engine {
         let mut pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
-            .map_err(EngineError::Internal)?;
+            .map_err(github_engine_error)?;
         pr.workspace_id = session.workspace_id.clone();
         self.store.append_event(
             Scope::Session(session.id.clone()),
@@ -5708,7 +5771,7 @@ impl Engine {
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await
-            .map_err(EngineError::Internal)
+            .map_err(github_engine_error)
     }
 
     /// Unified diff of the session worktree against its base ref.

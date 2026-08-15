@@ -1,4 +1,4 @@
-use trouve_protocol::{AgentPersona, PermissionMode, ReviewerProfile};
+use trouve_protocol::{AgentPersona, ReviewerProfile};
 
 pub const DEFAULT_REVIEWER_IDS: &[&str] = &[
     "correctness",
@@ -92,24 +92,17 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
 /// personas are deliberately read-only and receive the same inspection tools
 /// as the built-in Review persona when selected for an interactive thread.
 pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
+    let review_policy = crate::personas::builtin_personas()
+        .into_iter()
+        .find(|persona| persona.id == "review")
+        .expect("built-in review persona");
     AgentPersona {
         id: reviewer.id.clone(),
         display_name: reviewer.name.clone(),
         system_prompt: reviewer.prompt.clone(),
-        allowed_tools: vec![
-            "read_file".into(),
-            "list_dir".into(),
-            "glob".into(),
-            "grep".into(),
-            "search".into(),
-            "find_related".into(),
-            "git_diff".into(),
-            "web_fetch".into(),
-            "spawn_thread".into(),
-            "spawn_output".into(),
-        ],
-        read_only: true,
-        default_permission_mode: Some(PermissionMode::Ask),
+        allowed_tools: review_policy.allowed_tools,
+        read_only: review_policy.read_only,
+        default_permission_mode: review_policy.default_permission_mode,
         default_model: reviewer.model.clone(),
         default_thinking_level: reviewer.default_thinking_level.clone(),
     }
@@ -181,6 +174,24 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_personas_inherit_the_builtin_review_policy() {
+        let reviewer = built_in_reviewers().remove(0);
+        let persona = reviewer_as_persona(&reviewer);
+        let review = crate::personas::builtin_personas()
+            .into_iter()
+            .find(|candidate| candidate.id == "review")
+            .unwrap();
+
+        assert_eq!(persona.allowed_tools, review.allowed_tools);
+        assert_eq!(persona.read_only, review.read_only);
+        assert_eq!(
+            persona.default_permission_mode,
+            review.default_permission_mode
+        );
+        assert_eq!(persona.system_prompt, reviewer.prompt);
+    }
+
+    #[test]
     fn legacy_customized_reviewer_values_survive_persona_overlay() {
         let persona = AgentPersona {
             id: "correctness".into(),
@@ -188,7 +199,7 @@ mod tests {
             system_prompt: "Canonical prompt".into(),
             allowed_tools: Vec::new(),
             read_only: true,
-            default_permission_mode: Some(PermissionMode::Ask),
+            default_permission_mode: Some(trouve_protocol::PermissionMode::Ask),
             default_model: Some("provider/default".into()),
             default_thinking_level: Some("medium".into()),
         };

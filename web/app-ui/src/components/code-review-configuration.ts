@@ -728,7 +728,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
       return;
     }
     if (draft.mode !== "off" && this.#reviewers.length === 0) {
-      this.#setNotice("Create at least one reviewer before enabling repository reviews.", true);
+      this.#setNotice("Create at least one persona before enabling repository reviews.", true);
       return;
     }
     if (draft.mode !== "off" && draft.routingMode === "manual" && draft.reviewerIds.length === 0) {

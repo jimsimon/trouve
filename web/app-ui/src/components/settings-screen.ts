@@ -39,6 +39,7 @@ type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 const SETTINGS_ALIASES: Readonly<Record<string, SettingsSection>> = {
   clis: "providers",
   modes: "personas",
+  "modes-models": "personas",
   "local-models": "providers",
   "provider-api": "providers",
   "personas-models": "personas",

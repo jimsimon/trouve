@@ -177,7 +177,7 @@ export const configureApp = (body: {
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
 export const getModels = (): Promise<Model[]> => api("/models");
 export const getPersonaInfos = (): Promise<PersonaInfo[]> => api("/persona-infos");
-export const saveMode = (persona: PersonaInfo["persona"]): Promise<void> =>
+export const savePersona = (persona: PersonaInfo["persona"]): Promise<void> =>
   api(`/personas/${encodeURIComponent(persona.id)}`, {
     method: "PUT",
     body: JSON.stringify({
@@ -190,7 +190,7 @@ export const saveMode = (persona: PersonaInfo["persona"]): Promise<void> =>
       default_thinking_level: persona.default_thinking_level ?? null,
     }),
   });
-export const resetMode = (id: string): Promise<void> =>
+export const resetPersona = (id: string): Promise<void> =>
   api(`/personas/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const saveDefaultModel = (
   model: string,
