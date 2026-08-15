@@ -1012,8 +1012,9 @@ export const presentToolDetail = (
   }
 
   if (firstParty && normalized === "websearch" && resultRecord !== undefined && typeof resultRecord.content === "string") {
+    const content = resultRecord.content;
     const cache = record(resultRecord.cache);
-    const cacheHit = booleanValue(cache?.hit);
+    const cacheHit = typeof cache?.hit === "boolean" ? cache.hit : undefined;
     const cacheAge = numberValue(cache?.age_seconds);
     return {
       kind: "document",
@@ -1023,13 +1024,13 @@ export const presentToolDetail = (
         detailField("Provider", resultRecord.provider),
         detailField(
           "Cache",
-          cacheHit
+          cacheHit === true
             ? `Hit${cacheAge === undefined ? "" : ` (${String(cacheAge)}s old)`}`
             : cacheHit === false ? "Miss" : undefined,
         ),
       ].filter((field): field is ToolDetailField => field !== undefined),
-      content: resultRecord.content,
-      language: "markdown",
+      content,
+      language: parsedJson(content) === undefined ? "markdown" : "json",
       truncated: booleanValue(resultRecord.truncated),
     };
   }

@@ -24,6 +24,11 @@ enum ProviderKind {
     Exa,
 }
 
+enum SearchError {
+    Cancelled,
+    Failed(String),
+}
+
 #[derive(Clone)]
 struct SearchProvider {
     name: &'static str,
@@ -55,18 +60,12 @@ impl SearchProvider {
         }
     }
 
-    fn arguments(&self, query: &str, max_results: usize, thread_id: &str) -> Value {
+    fn arguments(&self, query: &str, max_results: usize) -> Value {
         match self.kind {
-            ProviderKind::Parallel => {
-                let mut arguments = json!({
-                    "objective": query,
-                    "search_queries": [query],
-                });
-                if !thread_id.is_empty() {
-                    arguments["session_id"] = json!(thread_id);
-                }
-                arguments
-            }
+            ProviderKind::Parallel => json!({
+                "objective": query,
+                "search_queries": [query],
+            }),
             ProviderKind::Exa => json!({
                 "query": query,
                 "type": "auto",
@@ -189,10 +188,10 @@ impl WebSearch {
         self.cache.lock().unwrap().get(key)
     }
 
-    async fn wait_for_provider_slot(&self, ctx: &ToolCtx) -> Result<(), String> {
+    async fn wait_for_provider_slot(&self, ctx: &ToolCtx) -> Result<(), SearchError> {
         let mut last_request = tokio::select! {
             biased;
-            _ = ctx.cancel.cancelled() => return Err("search cancelled".into()),
+            _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
             guard = self.provider_gate.lock() => guard,
         };
         if let Some(last_request_at) = *last_request {
@@ -202,7 +201,7 @@ impl WebSearch {
             if !wait.is_zero() {
                 tokio::select! {
                     biased;
-                    _ = ctx.cancel.cancelled() => return Err("search cancelled".into()),
+                    _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
@@ -217,7 +216,7 @@ impl WebSearch {
         provider: &SearchProvider,
         query: &str,
         max_results: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, SearchError> {
         self.wait_for_provider_slot(ctx).await?;
         let body = json!({
             "jsonrpc": "2.0",
@@ -225,20 +224,23 @@ impl WebSearch {
             "method": "tools/call",
             "params": {
                 "name": provider.tool_name(),
-                "arguments": provider.arguments(query, max_results, &ctx.thread_id),
+                "arguments": provider.arguments(query, max_results),
             }
         });
         let response = tokio::select! {
             biased;
-            _ = ctx.cancel.cancelled() => return Err("search cancelled".into()),
+            _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
             response = self.client
                 .post(&provider.endpoint)
                 .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
                 .json(&body)
-                .send() => response.map_err(|error| format!("request failed: {error}"))?,
+                .send() => response.map_err(|error| SearchError::Failed(format!("request failed: {error}")))?,
         };
         if !response.status().is_success() {
-            return Err(format!("provider returned HTTP {}", response.status()));
+            return Err(SearchError::Failed(format!(
+                "provider returned HTTP {}",
+                response.status()
+            )));
         }
 
         let mut response = response;
@@ -246,20 +248,22 @@ impl WebSearch {
         loop {
             let chunk = tokio::select! {
                 biased;
-                _ = ctx.cancel.cancelled() => return Err("search cancelled".into()),
-                chunk = response.chunk() => chunk.map_err(|error| format!("response failed: {error}"))?,
+                _ = ctx.cancel.cancelled() => return Err(SearchError::Cancelled),
+                chunk = response.chunk() => chunk.map_err(|error| SearchError::Failed(format!("response failed: {error}")))?,
             };
             let Some(chunk) = chunk else {
                 break;
             };
             if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err("provider response exceeded 1 MiB".into());
+                return Err(SearchError::Failed(
+                    "provider response exceeded 1 MiB".into(),
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
         let body = String::from_utf8(bytes)
-            .map_err(|_| "provider returned non-UTF-8 content".to_string())?;
-        extract_mcp_text(&body)
+            .map_err(|_| SearchError::Failed("provider returned non-UTF-8 content".to_string()))?;
+        extract_mcp_text(&body).map_err(SearchError::Failed)
     }
 }
 
@@ -361,10 +365,12 @@ impl Tool for WebSearch {
                         false,
                     ));
                 }
-                Err(error) if error == "search cancelled" => {
-                    return ToolResult::error(error);
+                Err(SearchError::Cancelled) => {
+                    return ToolResult::error("search cancelled");
                 }
-                Err(error) => failures.push(format!("{}: {error}", provider.name)),
+                Err(SearchError::Failed(error)) => {
+                    failures.push(format!("{}: {error}", provider.name));
+                }
             }
         }
 
@@ -484,6 +490,14 @@ mod tests {
         assert_eq!(extract_mcp_text(&sse).unwrap(), "one");
     }
 
+    #[test]
+    fn parallel_arguments_do_not_expose_session_identifiers() {
+        let arguments = SearchProvider::parallel(PARALLEL_ENDPOINT).arguments("query", 8);
+        assert_eq!(arguments["objective"], "query");
+        assert_eq!(arguments["search_queries"], json!(["query"]));
+        assert!(arguments.get("session_id").is_none());
+    }
+
     #[tokio::test]
     async fn caches_normalized_queries() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"result with https://example.com"}]}}"#;
@@ -525,6 +539,27 @@ mod tests {
         let (parallel, parallel_calls) = mock_server("429 Too Many Requests", "limited").await;
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"fallback result"}]}}"#;
         let (exa, exa_calls) = mock_server("200 OK", body).await;
+        let tool = WebSearch::new(
+            vec![SearchProvider::parallel(parallel), SearchProvider::exa(exa)],
+            Duration::ZERO,
+        );
+
+        let result = tool
+            .run(&ToolCtx::default(), &json!({"query": "current topic"}))
+            .await;
+
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(result.result["provider"], "exa");
+        assert_eq!(parallel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exa_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_text_does_not_suppress_failover() {
+        let error = r#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"search cancelled"}]}}"#;
+        let (parallel, parallel_calls) = mock_server("200 OK", error).await;
+        let success = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"fallback result"}]}}"#;
+        let (exa, exa_calls) = mock_server("200 OK", success).await;
         let tool = WebSearch::new(
             vec![SearchProvider::parallel(parallel), SearchProvider::exa(exa)],
             Duration::ZERO,

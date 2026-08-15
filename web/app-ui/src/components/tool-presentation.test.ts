@@ -252,6 +252,23 @@ describe("tool presentation", () => {
       language: "markdown",
       truncated: false,
     });
+
+    expect(presentToolDetail("web_search", {
+      query: "structured result",
+    }, {
+      provider: "exa",
+      content: "{\"results\":[]}",
+    })).toEqual({
+      kind: "document",
+      inputs: [
+        { label: "Query", value: "structured result" },
+        { label: "Results", value: "8" },
+        { label: "Provider", value: "exa" },
+      ],
+      content: "{\"results\":[]}",
+      language: "json",
+      truncated: false,
+    });
   });
 
   it("presents transcript matches and generic MCP content without JSON wrappers", () => {
