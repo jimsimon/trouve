@@ -6416,6 +6416,7 @@ impl Engine {
         let mut changed_jobs = HashSet::new();
         let mut reopened = false;
         let mut state_key = Vec::new();
+        let mut reconciled_finding_ids = Vec::new();
         let mut all_resolved = true;
         for state in &findings {
             let Some(comment_id) = state.finding.github_comment_id else {
@@ -6434,6 +6435,10 @@ impl Engine {
                 thread_id,
                 *is_resolved,
             )?;
+            // Even a closed finding whose remote thread remains resolved must
+            // reach enqueue_code_review_thread_recheck so any pending recheck
+            // marker is consumed. It stays out of the state hash/job trigger.
+            reconciled_finding_ids.push(state.finding.id.clone());
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
                 reopened |= was_resolved && !is_resolved;
@@ -6453,9 +6458,9 @@ impl Engine {
 
         state_key.sort_unstable();
         let state_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&state_key)?));
-        let finding_ids = state_key
+        let finding_ids = reconciled_finding_ids
             .iter()
-            .map(|(finding_id, _, _)| finding_id.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>();
         let new_job = NewCodeReviewJob {
             dedupe_key: format!(

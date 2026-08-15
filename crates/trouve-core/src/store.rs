@@ -8702,6 +8702,18 @@ impl Store {
                      github_thread_generation = ?4,
                      github_thread_recheck_pending =
                        CASE WHEN ?5 THEN 1 ELSE github_thread_recheck_pending END,
+                     collapse_pending = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
+                       ELSE collapse_pending
+                     END,
+                     collapse_attempts = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
+                       ELSE collapse_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       ELSE collapse_next_attempt_at
+                     END,
                      status = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
                        ELSE status
@@ -14209,6 +14221,12 @@ mod tests {
         assert_eq!(resolved[0].finding.status, "fixed");
         assert_eq!(resolved[0].is_resolved, Some(true));
         assert!(!resolved[0].recheck_pending);
+        store
+            .defer_code_review_thread_collapse(&finding.id)
+            .unwrap();
+        store
+            .defer_code_review_thread_collapse(&finding.id)
+            .unwrap();
 
         assert!(
             store
@@ -14223,6 +14241,28 @@ mod tests {
         assert_eq!(reopened[0].finding.status, "open");
         assert_eq!(reopened[0].is_resolved, Some(false));
         assert!(reopened[0].recheck_pending);
+        assert!(
+            store
+                .pending_code_review_thread_collapses(
+                    chrono::Utc::now() + chrono::Duration::hours(2),
+                    16,
+                    &[],
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let collapse_state: (bool, i64, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT collapse_pending, collapse_attempts, collapse_next_attempt_at
+                 FROM code_review_findings WHERE id = ?1",
+                [&finding.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(collapse_state, (false, 0, None));
     }
 
     #[test]
