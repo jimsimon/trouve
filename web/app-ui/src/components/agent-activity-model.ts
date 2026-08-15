@@ -4,6 +4,7 @@ import { effectiveToolCall, toolDisplayName } from "./tool-presentation.js";
 export interface AgentActivityPresentation {
   readonly label: string;
   readonly detail: string;
+  readonly announcementLabel: string;
 }
 
 export interface RunningAgentActivityInput {
@@ -26,7 +27,8 @@ const normalizedToolIdentifier = (tool: string): string =>
 const activity = (
   label: string,
   detail = "",
-): AgentActivityPresentation => ({ label, detail });
+  announcementLabel = label,
+): AgentActivityPresentation => ({ label, detail, announcementLabel });
 
 const runningModelName = (
   models: ReadonlyMap<number, string>,
@@ -172,10 +174,12 @@ export const runningAgentActivity = (
     return activity(
       `Waiting for first response from ${model} · ${compactRunningElapsed(elapsedMs)}`,
       "The turn is running, but no model output has arrived yet.",
+      `Waiting for first response from ${model}…`,
     );
   }
   return activity(
     `Still waiting for ${model} · ${compactRunningElapsed(elapsedMs)}`,
     "No model output has arrived yet. You can keep waiting or cancel and retry.",
+    `Still waiting for ${model}…`,
   );
 };

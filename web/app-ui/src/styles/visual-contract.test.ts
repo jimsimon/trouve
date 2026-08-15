@@ -604,7 +604,7 @@ describe("Trouve visual contract", () => {
     expect(thread).not.toContain("turn-activity-footer");
     expect(thread).toContain('class="turn-rail-node turn-transient-activity"');
     expect(thread).toMatch(
-      /#renderTransientActivityNode\(label: string\).*?fontAwesomeIcon\("spinner", \{\s+className: "turn-transient-spinner",\s+spin: true/s,
+      /#renderTransientActivityNode\(activity: AgentActivityPresentation\).*?fontAwesomeIcon\("spinner", \{\s+className: "turn-transient-spinner",\s+spin: true/s,
     );
     expect(thread).toContain('class="thinking-rail-icon"');
     expect(thread).toContain('fontAwesomeIcon("brain")');

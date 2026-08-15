@@ -2155,6 +2155,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : {
           label: activityOverride,
           detail: "",
+          announcementLabel: activityOverride,
         };
     let nestedActivityUnitId: string | undefined;
     if (activityPresentation !== undefined && activeTurn !== undefined) {
@@ -2719,43 +2720,45 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderActivityRow(activity: AgentActivityPresentation) {
     const accessibleLabel = activity.detail === ""
-      ? activity.label
-      : `${activity.label}. ${activity.detail}`;
-    return html`<div
-      class="activity-row agent-activity"
-      role="status"
-      aria-live="polite"
-      aria-label=${accessibleLabel}
-    >
+      ? activity.announcementLabel
+      : `${activity.announcementLabel}. ${activity.detail}`;
+    return html`<div class="activity-row agent-activity">
       <span class="activity-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-      <span class="agent-activity-copy">
+      <span class="agent-activity-copy" aria-hidden="true">
         <strong>${activity.label}</strong>
         ${activity.detail === "" ? nothing : html`<small>${activity.detail}</small>`}
       </span>
+      <span
+        class="visually-hidden"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >${accessibleLabel}</span>
     </div>`;
   }
 
   #renderTransientActivityNode(activity: AgentActivityPresentation) {
     const accessibleLabel = activity.detail === ""
-      ? activity.label
-      : `${activity.label}. ${activity.detail}`;
+      ? activity.announcementLabel
+      : `${activity.announcementLabel}. ${activity.detail}`;
     return html`
-      <section
-        class="turn-rail-node turn-transient-activity"
-        role="status"
-        aria-live="polite"
-        aria-label=${accessibleLabel}
-      >
+      <section class="turn-rail-node turn-transient-activity">
         <span class="turn-rail-marker transient" aria-hidden="true">
           ${fontAwesomeIcon("spinner", {
             className: "turn-transient-spinner",
             spin: true,
           })}
         </span>
-        <div class="turn-transient-activity-copy">
+        <div class="turn-transient-activity-copy" aria-hidden="true">
           <header class="turn-node-header"><strong>${activity.label}</strong></header>
           ${activity.detail === "" ? nothing : html`<small>${activity.detail}</small>`}
         </div>
+        <span
+          class="visually-hidden"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >${accessibleLabel}</span>
       </section>
     `;
   }

@@ -177,4 +177,23 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(clearActivity).toContain("globalThis.clearInterval");
     expect(disconnected).toContain("this.#clearActivityRefresh();");
   });
+
+  it("keeps timer-only activity text outside polite announcements", () => {
+    const activityRow = section(
+      "#renderActivityRow(activity: AgentActivityPresentation)",
+      "\n  #renderTransientActivityNode(",
+    );
+    const transientActivity = section(
+      "#renderTransientActivityNode(activity: AgentActivityPresentation)",
+      "\n  #renderCompactionMarker(",
+    );
+    for (const renderer of [activityRow, transientActivity]) {
+      expect(renderer).toContain("activity.announcementLabel");
+      expect(renderer).toContain('class="visually-hidden"');
+      expect(renderer).toContain('role="status"');
+      expect(renderer).toContain('aria-live="polite"');
+      expect(renderer).toContain('aria-atomic="true"');
+      expect(renderer).toContain('aria-hidden="true"');
+    }
+  });
 });
