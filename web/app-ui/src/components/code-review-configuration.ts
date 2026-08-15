@@ -512,15 +512,15 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
                       <label>
                         Prompt behavior
                         <select .value=${override.promptMode} ?disabled=${this.#busy !== ""} @change=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { promptMode: (event.currentTarget as HTMLSelectElement).value as ReviewerPromptMode })}>
-                          <option value="inherit">Inherit profile prompt</option>
+                          <option value="inherit">Inherit persona prompt</option>
                           <option value="append">Append instructions</option>
-                          <option value="replace">Replace profile prompt</option>
+                          <option value="replace">Replace persona prompt</option>
                         </select>
                       </label>
                     </div>
                     <label>
                       Prompt override
-                      <textarea .value=${override.prompt} ?disabled=${this.#busy !== "" || override.promptMode === "inherit"} @input=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder=${override.promptMode === "append" ? "Additional instructions" : "Repository-specific reviewer prompt"}></textarea>
+                      <textarea .value=${override.prompt} ?disabled=${this.#busy !== "" || override.promptMode === "inherit"} @input=${(event: Event) => this.#patchReviewerOverride(key, reviewer.id, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder=${override.promptMode === "append" ? "Additional instructions" : "Repository-specific persona prompt"}></textarea>
                     </label>
                   </article>
                 `;
