@@ -263,7 +263,9 @@ pub use requests::*;
 // an explicit authentication-required error instead of an internal failure.
 // 5.2: assistant.progress / assistant.progress_completed events and folded
 // Progress thread items distinguish authored agent updates from reasoning.
-pub const PROTOCOL_VERSION: &str = "5.2";
+// 5.3: account GitHub projections include recently closed, unmerged pull
+// requests so session navigators can render their terminal PR state.
+pub const PROTOCOL_VERSION: &str = "5.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

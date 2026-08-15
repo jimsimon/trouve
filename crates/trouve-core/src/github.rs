@@ -35,9 +35,10 @@ query TrouveViewer {
 
 const DASHBOARD_SEARCH_QUERY: &str = r#"
 query TrouvePullRequestSearch(
-  $openQuery: String!, $reviewQuery: String!, $mergedQuery: String!,
-  $openAfter: String, $reviewAfter: String, $mergedAfter: String,
-  $includeOpen: Boolean!, $includeReview: Boolean!, $includeMerged: Boolean!
+  $openQuery: String!, $reviewQuery: String!, $mergedQuery: String!, $closedQuery: String!,
+  $openAfter: String, $reviewAfter: String, $mergedAfter: String, $closedAfter: String,
+  $includeOpen: Boolean!, $includeReview: Boolean!, $includeMerged: Boolean!,
+  $includeClosed: Boolean!
 ) {
   open: search(query: $openQuery, type: ISSUE, first: 100, after: $openAfter)
     @include(if: $includeOpen) {
@@ -51,6 +52,11 @@ query TrouvePullRequestSearch(
   }
   merged: search(query: $mergedQuery, type: ISSUE, first: 100, after: $mergedAfter)
     @include(if: $includeMerged) {
+    nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
+    pageInfo { hasNextPage endCursor }
+  }
+  closed: search(query: $closedQuery, type: ISSUE, first: 100, after: $closedAfter)
+    @include(if: $includeClosed) {
     nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
     pageInfo { hasNextPage endCursor }
   }
@@ -934,8 +940,29 @@ struct GraphqlSearchData {
     review: Option<GraphqlSearchConnection>,
     #[serde(default)]
     merged: Option<GraphqlSearchConnection>,
+    #[serde(default)]
+    closed: Option<GraphqlSearchConnection>,
     #[serde(rename = "rateLimit")]
     rate_limit: GraphqlRateLimit,
+}
+
+struct DashboardSearchQueries {
+    open: String,
+    review: String,
+    merged: String,
+    closed: String,
+}
+
+fn dashboard_search_queries(viewer: &str, terminal_since: DateTime<Utc>) -> DashboardSearchQueries {
+    let cutoff = terminal_since.to_rfc3339();
+    DashboardSearchQueries {
+        open: format!("is:pr is:open involves:{viewer}"),
+        review: format!("is:pr is:open review-requested:{viewer}"),
+        merged: format!("is:pr is:merged merged:>={cutoff} involves:{viewer}"),
+        // Closed, unmerged PRs are not actionable dashboard rows, but keeping
+        // their terminal summaries lets associated sessions render red badges.
+        closed: format!("is:pr is:closed is:unmerged closed:>={cutoff} involves:{viewer}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1775,19 +1802,19 @@ impl GitHubGraphql {
 
     async fn dashboard_prs(
         &self,
-        merged_since: DateTime<Utc>,
+        terminal_since: DateTime<Utc>,
         cache: &mut GitHubDashboardCache,
     ) -> Result<(String, Vec<PrInfo>)> {
         let viewer = self.viewer().await?;
         cache.begin_viewer(&viewer);
-        let day = merged_since.format("%Y-%m-%d");
-        let mut open = SearchCursor::new(format!("is:pr is:open involves:{viewer}"));
-        let mut review = SearchCursor::new(format!("is:pr is:open review-requested:{viewer}"));
-        let mut merged =
-            SearchCursor::new(format!("is:pr is:merged merged:>={day} involves:{viewer}"));
+        let queries = dashboard_search_queries(&viewer, terminal_since);
+        let mut open = SearchCursor::new(queries.open);
+        let mut review = SearchCursor::new(queries.review);
+        let mut merged = SearchCursor::new(queries.merged);
+        let mut closed = SearchCursor::new(queries.closed);
         let mut probes = BTreeMap::new();
 
-        while open.active || review.active || merged.active {
+        while open.active || review.active || merged.active || closed.active {
             let response: GraphqlSearchData = self
                 .client
                 .graphql(&serde_json::json!({
@@ -1796,12 +1823,15 @@ impl GitHubGraphql {
                         "openQuery": open.query,
                         "reviewQuery": review.query,
                         "mergedQuery": merged.query,
+                        "closedQuery": closed.query,
                         "openAfter": open.after,
                         "reviewAfter": review.after,
                         "mergedAfter": merged.after,
+                        "closedAfter": closed.after,
                         "includeOpen": open.active,
                         "includeReview": review.active,
                         "includeMerged": merged.active,
+                        "includeClosed": closed.active,
                     }
                 }))
                 .await
@@ -1810,6 +1840,7 @@ impl GitHubGraphql {
             consume_search_page(response.open, &mut open, &mut probes);
             consume_search_page(response.review, &mut review, &mut probes);
             consume_search_page(response.merged, &mut merged, &mut probes);
+            consume_search_page(response.closed, &mut closed, &mut probes);
         }
 
         let refresh_ids = probes
@@ -3117,10 +3148,10 @@ impl GitHubAccount {
 
     pub async fn dashboard_prs(
         &self,
-        merged_since: DateTime<Utc>,
+        terminal_since: DateTime<Utc>,
         cache: &mut GitHubDashboardCache,
     ) -> Result<(String, Vec<PrInfo>)> {
-        self.graphql.dashboard_prs(merged_since, cache).await
+        self.graphql.dashboard_prs(terminal_since, cache).await
     }
 }
 
@@ -3938,6 +3969,90 @@ mod tests {
     fn github_oauth_requests_repository_and_team_read_scopes() {
         let config = oauth_config("github.com", "client-id");
         assert_eq!(config.scopes, ["repo", "read:org"]);
+    }
+
+    #[test]
+    fn dashboard_queries_include_recent_closed_unmerged_pull_requests() {
+        let queries = dashboard_search_queries("alice", "2026-07-20T12:34:56Z".parse().unwrap());
+
+        assert_eq!(queries.open, "is:pr is:open involves:alice");
+        assert_eq!(queries.review, "is:pr is:open review-requested:alice");
+        assert_eq!(
+            queries.merged,
+            "is:pr is:merged merged:>=2026-07-20T12:34:56+00:00 involves:alice"
+        );
+        assert_eq!(
+            queries.closed,
+            "is:pr is:closed is:unmerged closed:>=2026-07-20T12:34:56+00:00 involves:alice"
+        );
+        assert!(DASHBOARD_SEARCH_QUERY.contains("closed: search"));
+        assert!(DASHBOARD_SEARCH_QUERY.contains("@include(if: $includeClosed)"));
+    }
+
+    #[test]
+    fn dashboard_closed_search_deserializes_and_consumes_multiple_pages() {
+        let fixtures = [
+            serde_json::json!({
+                "closed": {
+                    "nodes": [{
+                        "id": "PR_closed_1",
+                        "updatedAt": "2026-07-20T12:35:00Z",
+                        "headRefOid": "sha-1",
+                        "mergeable": "UNKNOWN",
+                        "commits": { "nodes": [] }
+                    }],
+                    "pageInfo": {
+                        "hasNextPage": true,
+                        "endCursor": "closed-page-2"
+                    }
+                },
+                "rateLimit": {
+                    "cost": 1,
+                    "remaining": 4999,
+                    "resetAt": "2026-07-20T13:00:00Z"
+                }
+            }),
+            serde_json::json!({
+                "closed": {
+                    "nodes": [{
+                        "id": "PR_closed_2",
+                        "updatedAt": "2026-07-20T12:36:00Z",
+                        "headRefOid": "sha-2",
+                        "mergeable": "CONFLICTING",
+                        "commits": { "nodes": [] }
+                    }],
+                    "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                    }
+                },
+                "rateLimit": {
+                    "cost": 1,
+                    "remaining": 4998,
+                    "resetAt": "2026-07-20T13:00:00Z"
+                }
+            }),
+        ];
+        let queries = dashboard_search_queries("alice", "2026-07-20T12:34:56Z".parse().unwrap());
+        let mut cursor = SearchCursor::new(queries.closed);
+        let mut probes = BTreeMap::new();
+
+        let first: GraphqlSearchData = serde_json::from_value(fixtures[0].clone()).unwrap();
+        consume_search_page(first.closed, &mut cursor, &mut probes);
+        assert!(cursor.active);
+        assert_eq!(cursor.after.as_deref(), Some("closed-page-2"));
+        assert_eq!(cursor.pages, 1);
+        assert!(probes.contains_key("PR_closed_1"));
+
+        let second: GraphqlSearchData = serde_json::from_value(fixtures[1].clone()).unwrap();
+        consume_search_page(second.closed, &mut cursor, &mut probes);
+        assert!(!cursor.active);
+        assert!(cursor.after.is_none());
+        assert_eq!(cursor.pages, 2);
+        assert_eq!(
+            probes.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["PR_closed_1", "PR_closed_2"]
+        );
     }
 
     #[test]

@@ -887,7 +887,7 @@ pub struct PrInfo {
 /// Pull requests relevant to the authenticated account on one GitHub host,
 /// spanning every repository visible to that account. Includes open PRs the
 /// account authored, was asked to review, or participated in, plus recently
-/// merged relevant PRs.
+/// merged or closed relevant PRs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GithubPrList {
     /// Login of the authenticated GitHub user ("" when unknown) — clients
