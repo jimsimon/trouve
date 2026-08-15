@@ -10305,13 +10305,22 @@ impl Engine {
             // an asynchronous thread/turns/list request. A short-lived child
             // can finish before that lookup returns; dropping the late user
             // event leaves the durable transcript with Thought as its first
-            // chat node. Preserve the one missing initial prompt even after
-            // the vendor turn is terminal. The Lit turn layout promotes a
-            // same-turn prompt ahead of already-persisted activity/status.
+            // chat node. Preserve the one missing initial prompt as a display
+            // event even after the vendor turn is terminal. Do not append it
+            // to the provider transcript: finish_backend_collaborator already
+            // stored the completed Assistant message, so doing so would
+            // reverse their causal order for a direct continuation. The
+            // vendor session itself already contains the original prompt.
             if let BackendCollaboratorEvent::UserMessage(content) = event
+                && !content.is_empty()
                 && collaborator.last_user_message.is_none()
             {
-                self.record_backend_collaborator_input(collaborator, content)?;
+                collaborator.persisted.push(Event::UserMessage {
+                    turn: collaborator.turn,
+                    content: content.clone(),
+                    attachments: Vec::new(),
+                });
+                collaborator.last_user_message = Some(content);
                 flush_backend_event_batch(
                     &self.store,
                     &Scope::Thread(collaborator.thread.id.clone()),
@@ -16828,7 +16837,7 @@ default_permission_mode = "ask"
                 .unwrap();
         }
         let late_prompt_events = store
-            .events_after(&Scope::Thread(late_prompt_child_id), 0)
+            .events_after(&Scope::Thread(late_prompt_child_id.clone()), 0)
             .unwrap();
         let completed_cursor = late_prompt_events
             .iter()
@@ -16848,6 +16857,23 @@ default_permission_mode = "ask"
         assert_eq!(recovered_prompts.len(), 1);
         assert_eq!(recovered_prompts[0].1, "Recovered after completion.");
         assert!(recovered_prompts[0].0 > completed_cursor);
+        let provider_messages = store
+            .messages(&late_prompt_child_id)
+            .unwrap()
+            .into_iter()
+            .map(serde_json::from_value::<Message>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matches!(
+            provider_messages.as_slice(),
+            [Message::Assistant { content, .. }] if content.is_empty()
+        ));
+        assert_eq!(
+            store
+                .backend_session(&late_prompt_child_id, "codex")
+                .unwrap(),
+            Some(("vendor-late-prompt".into(), 1))
+        );
 
         engine
             .start_backend_collaborator(
