@@ -68,6 +68,12 @@ describe("root shell parity wiring", () => {
     expect(source).toContain(".selected=${mode.id === this.#newSessionModeId}");
     expect(source).toContain(".selected=${value === this.#newSessionThinking}");
     expect(source).toContain(
+      '.selected=${this.#newSessionPermissionMode === "ask"}',
+    );
+    expect(source).toContain(
+      '.selected=${this.#newSessionPermissionMode === "allow_list"}',
+    );
+    expect(source).toContain(
       '.selected=${this.#newSessionPermissionMode === "yolo"}',
     );
   });
