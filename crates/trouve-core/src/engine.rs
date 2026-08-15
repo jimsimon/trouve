@@ -2323,6 +2323,14 @@ impl Engine {
         };
         for id in ids {
             let _mutation = self.persona_mutations.lock().await;
+            match self.store.persona_deletion_pending(&id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(persona_id = %id, %error, "failed to recheck persona deletion intent");
+                    continue;
+                }
+            }
             if let Err(error) = self
                 .executor
                 .delete_persona_file(config_dir, &id, true)
