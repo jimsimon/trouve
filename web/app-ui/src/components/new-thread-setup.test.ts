@@ -70,6 +70,9 @@ describe("new thread setup component contract", () => {
     expect(component).toContain(
       'this.#optionsTouched = false;\n      this.#promptComposing = false;',
     );
+    expect(component).toContain(
+      'this.#attachmentGeneration += 1;\n    this.#promptComposing = false;\n    this.#loadedWorkspaceId = "";',
+    );
   });
 
   it("keeps static controls immediate while surfacing busy, warning, and error states", () => {

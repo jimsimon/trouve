@@ -296,6 +296,7 @@ export class TrouveNewThreadSetup extends LitElement {
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
     this.#attachmentGeneration += 1;
+    this.#promptComposing = false;
     this.#loadedWorkspaceId = "";
     this.#optionsLoading = false;
     if (this.#optionsRetryTimer !== undefined) {
