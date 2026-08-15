@@ -954,14 +954,14 @@ struct DashboardSearchQueries {
 }
 
 fn dashboard_search_queries(viewer: &str, terminal_since: DateTime<Utc>) -> DashboardSearchQueries {
-    let day = terminal_since.format("%Y-%m-%d");
+    let cutoff = terminal_since.to_rfc3339();
     DashboardSearchQueries {
         open: format!("is:pr is:open involves:{viewer}"),
         review: format!("is:pr is:open review-requested:{viewer}"),
-        merged: format!("is:pr is:merged merged:>={day} involves:{viewer}"),
+        merged: format!("is:pr is:merged merged:>={cutoff} involves:{viewer}"),
         // Closed, unmerged PRs are not actionable dashboard rows, but keeping
         // their terminal summaries lets associated sessions render red badges.
-        closed: format!("is:pr is:closed is:unmerged closed:>={day} involves:{viewer}"),
+        closed: format!("is:pr is:closed is:unmerged closed:>={cutoff} involves:{viewer}"),
     }
 }
 
@@ -3973,20 +3973,86 @@ mod tests {
 
     #[test]
     fn dashboard_queries_include_recent_closed_unmerged_pull_requests() {
-        let queries = dashboard_search_queries("alice", "2026-07-20T12:00:00Z".parse().unwrap());
+        let queries = dashboard_search_queries("alice", "2026-07-20T12:34:56Z".parse().unwrap());
 
         assert_eq!(queries.open, "is:pr is:open involves:alice");
         assert_eq!(queries.review, "is:pr is:open review-requested:alice");
         assert_eq!(
             queries.merged,
-            "is:pr is:merged merged:>=2026-07-20 involves:alice"
+            "is:pr is:merged merged:>=2026-07-20T12:34:56+00:00 involves:alice"
         );
         assert_eq!(
             queries.closed,
-            "is:pr is:closed is:unmerged closed:>=2026-07-20 involves:alice"
+            "is:pr is:closed is:unmerged closed:>=2026-07-20T12:34:56+00:00 involves:alice"
         );
         assert!(DASHBOARD_SEARCH_QUERY.contains("closed: search"));
         assert!(DASHBOARD_SEARCH_QUERY.contains("@include(if: $includeClosed)"));
+    }
+
+    #[test]
+    fn dashboard_closed_search_deserializes_and_consumes_multiple_pages() {
+        let fixtures = [
+            serde_json::json!({
+                "closed": {
+                    "nodes": [{
+                        "id": "PR_closed_1",
+                        "updatedAt": "2026-07-20T12:35:00Z",
+                        "headRefOid": "sha-1",
+                        "mergeable": "UNKNOWN",
+                        "commits": { "nodes": [] }
+                    }],
+                    "pageInfo": {
+                        "hasNextPage": true,
+                        "endCursor": "closed-page-2"
+                    }
+                },
+                "rateLimit": {
+                    "cost": 1,
+                    "remaining": 4999,
+                    "resetAt": "2026-07-20T13:00:00Z"
+                }
+            }),
+            serde_json::json!({
+                "closed": {
+                    "nodes": [{
+                        "id": "PR_closed_2",
+                        "updatedAt": "2026-07-20T12:36:00Z",
+                        "headRefOid": "sha-2",
+                        "mergeable": "CONFLICTING",
+                        "commits": { "nodes": [] }
+                    }],
+                    "pageInfo": {
+                        "hasNextPage": false,
+                        "endCursor": null
+                    }
+                },
+                "rateLimit": {
+                    "cost": 1,
+                    "remaining": 4998,
+                    "resetAt": "2026-07-20T13:00:00Z"
+                }
+            }),
+        ];
+        let queries = dashboard_search_queries("alice", "2026-07-20T12:34:56Z".parse().unwrap());
+        let mut cursor = SearchCursor::new(queries.closed);
+        let mut probes = BTreeMap::new();
+
+        let first: GraphqlSearchData = serde_json::from_value(fixtures[0].clone()).unwrap();
+        consume_search_page(first.closed, &mut cursor, &mut probes);
+        assert!(cursor.active);
+        assert_eq!(cursor.after.as_deref(), Some("closed-page-2"));
+        assert_eq!(cursor.pages, 1);
+        assert!(probes.contains_key("PR_closed_1"));
+
+        let second: GraphqlSearchData = serde_json::from_value(fixtures[1].clone()).unwrap();
+        consume_search_page(second.closed, &mut cursor, &mut probes);
+        assert!(!cursor.active);
+        assert!(cursor.after.is_none());
+        assert_eq!(cursor.pages, 2);
+        assert_eq!(
+            probes.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["PR_closed_1", "PR_closed_2"]
+        );
     }
 
     #[test]

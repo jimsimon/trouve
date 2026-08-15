@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "5.2"
+    "version": "5.3"
   },
   "paths": {
     "/v1/approvals": {
