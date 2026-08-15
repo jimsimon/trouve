@@ -290,6 +290,7 @@ describe("command palette component contract", () => {
   it("renders session results with the shared sidebar status and pull-request indicators", () => {
     expect(component).toContain('class="session-indicator ${item.sessionIndicator.kind}"');
     expect(component).toContain('class="session-pr-badge ${item.pullRequestBadge.tone}"');
+    expect(component).toContain('class="command-palette-trailing"');
     expect(component).toContain('fontAwesomeIcon("code-pull-request")');
     expect(component).not.toContain('class="status-dot ${item.state}"');
     expect(component).toContain("item.sessionIndicator.tooltip");
@@ -301,6 +302,7 @@ describe("command palette component contract", () => {
     expect(styles).toContain(
       ".command-palette-icon .session-indicator { font-family: var(--trouve-font-sans); }",
     );
+    expect(styles).toContain(".command-palette-trailing { display: flex;");
   });
 
   it("uses the trailing badge only for the current result", () => {

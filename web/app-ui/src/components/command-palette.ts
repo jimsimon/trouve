@@ -359,20 +359,24 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
                       ? nothing
                       : fontAwesomeIcon(item.sessionIndicator.icon)}</span>`
                   : item.icon === undefined ? nothing : fontAwesomeIcon(item.icon)}
-                ${item.pullRequestBadge === undefined
-                  ? nothing
-                  : html`<span
-                      class="session-pr-badge ${item.pullRequestBadge.tone}"
-                      title=${item.pullRequestBadge.tooltip}
-                    >${fontAwesomeIcon("code-pull-request")}</span>`}
               </span>
               <span class="command-palette-copy">
                 <strong>${item.label}</strong>
                 <small>${item.detail}</small>
               </span>
-              ${item.current !== true
+              ${item.current !== true && item.pullRequestBadge === undefined
                 ? nothing
-                : html`<span class="command-palette-current">Current</span>`}
+                : html`<span class="command-palette-trailing">
+                    ${item.current !== true
+                      ? nothing
+                      : html`<span class="command-palette-current">Current</span>`}
+                    ${item.pullRequestBadge === undefined
+                      ? nothing
+                      : html`<span
+                          class="session-pr-badge ${item.pullRequestBadge.tone}"
+                          title=${item.pullRequestBadge.tooltip}
+                        >${fontAwesomeIcon("code-pull-request")}</span>`}
+                  </span>`}
             </button>
           `;
         })}

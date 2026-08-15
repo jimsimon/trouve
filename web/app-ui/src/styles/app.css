@@ -1046,15 +1046,16 @@ trouve-command-palette { display: contents; }
 .command-palette-results { max-height: min(520px, calc(100dvh - 160px)); overflow: auto; padding: 5px; }
 .command-palette-group + .command-palette-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--trouve-rule); }
 .command-palette-group h2 { margin: 0; padding: 5px 8px 3px; color: var(--trouve-text-faint); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.command-palette-option { width: 100%; min-height: 42px; display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 5px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
+.command-palette-option { width: 100%; min-height: 42px; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 5px 8px; color: var(--trouve-text); background: transparent; text-align: start; }
 .command-palette-option:hover { background: var(--trouve-hover-bg); }
 .command-palette-option[aria-selected="true"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
-.command-palette-icon { width: 52px; display: flex; align-items: center; justify-content: center; color: var(--trouve-text-mid); font: 14px/1 var(--trouve-font-mono); text-align: center; }
+.command-palette-icon { width: 26px; color: var(--trouve-text-mid); font: 14px/1 var(--trouve-font-mono); text-align: center; }
 .command-palette-icon .session-indicator { font-family: var(--trouve-font-sans); }
 .command-palette-copy { min-width: 0; }
 .command-palette-copy strong, .command-palette-copy small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-palette-copy strong { color: inherit; font-size: 12px; font-weight: 600; }
 .command-palette-copy small { margin-top: 1px; color: var(--trouve-text-dim); font-size: 10px; }
+.command-palette-trailing { display: flex; align-items: center; gap: 4px; }
 .command-palette-current { padding: 2px 6px; border-radius: 999px; color: var(--trouve-ok); background: var(--trouve-pill-bg); font-size: 9px; font-weight: 700; white-space: nowrap; }
 .command-palette-empty { min-height: 150px; display: grid; justify-items: center; align-content: center; gap: 4px; padding: 20px; color: var(--trouve-text-dim); text-align: center; }
 .command-palette-empty strong { color: var(--trouve-text-hi); }
