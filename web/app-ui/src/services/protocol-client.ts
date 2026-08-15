@@ -1677,7 +1677,13 @@ export class ProtocolClient {
       throw new ProtocolClientError("request-failed", "update thread request failed");
     }
     if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "update thread request failed");
+      const error = result.error;
+      throw new ProtocolClientError(
+        "request-failed",
+        error?.message ?? "update thread request failed",
+        result.response.status,
+        error?.code,
+      );
     }
     return validateResponse<ProtocolThread>(
       "Thread",

@@ -1813,7 +1813,7 @@ pub struct Engine {
     questions: Arc<QuestionHub>,
     turn_scheduler: TurnScheduler,
     /// Per-session worktree access. Read-only turns share a read guard;
-    /// mutating turns, checkpoint restoration, and settings changes take the
+    /// mutating turns and checkpoint restoration take the
     /// write guard. This lets review/plan work fan out without weakening the
     /// sessions-own-worktrees serialization invariant.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
@@ -8119,7 +8119,7 @@ impl Engine {
     }
 
     /// Change thread settings (mode/model/options) between turns. Conflicts
-    /// while a turn is running in the thread's session.
+    /// only while a turn is running on this thread.
     pub fn update_thread(
         &self,
         id: &str,
@@ -8133,12 +8133,15 @@ impl Engine {
         }
         let session = self.get_session(&thread.session_id)?;
 
-        // The session lock is held for the duration of a turn; a locked
-        // session means settings would change under a running agent.
-        let lock = self.session_lock(&session.id);
-        let _guard = lock.try_write().map_err(|_| {
-            EngineError::Conflict("cannot change thread settings while a turn is running".into())
-        })?;
+        // Serialize this check with prompt dispatch so a turn cannot start on
+        // this thread until its settings update has been persisted. Sibling
+        // threads have independent settings and do not block one another.
+        let active_threads = self.active_threads.lock().unwrap();
+        if active_threads.contains_key(id) {
+            return Err(EngineError::Conflict(
+                "cannot change thread settings while this thread is running a turn".into(),
+            ));
+        }
         let deleting = self.deleting_sessions.lock().unwrap();
         if deleting.contains(&session.id) {
             return Err(EngineError::Conflict(format!(
@@ -8179,6 +8182,7 @@ impl Engine {
                 session_id: session.id,
             },
         )?;
+        drop(active_threads);
         drop(deleting);
         self.get_thread(id)
     }
