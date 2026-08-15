@@ -43,6 +43,11 @@ const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const REVIEW_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(305);
+/// Keep paginated thread loading inside the surrounding reconciliation
+/// timeout so it can return its graceful incomplete result before the outer
+/// watchdog reports a poll failure.
+const REVIEW_THREAD_LISTING_BUDGET: Duration =
+    REVIEW_RECONCILIATION_TIMEOUT.saturating_sub(Duration::from_secs(15));
 const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_OUTBOX_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -4449,7 +4454,8 @@ impl Engine {
         let publication_lock = self
             .code_review
             .publication_lock(&job.repository, job.pull_number);
-        let _publication_guard = publication_lock.lock().await;
+        let _publication_guard =
+            acquire_review_publication_lock(&publication_lock, superseded).await?;
         ensure_review_current(superseded)?;
         // Reviewer and coordinator work can outlive the installation token
         // used during preparation. Rebuild the client here so the token cache
@@ -6356,7 +6362,7 @@ impl Engine {
                 &repository.repository,
                 pull.number,
                 &targets,
-                Instant::now() + REVIEW_RECONCILIATION_TIMEOUT,
+                Instant::now() + REVIEW_THREAD_LISTING_BUDGET,
             )
             .await?;
         let publication_lock = self
@@ -6420,8 +6426,8 @@ impl Engine {
                 all_resolved = false;
                 continue;
             };
-            let was_resolved =
-                state.is_resolved == Some(true) || state.finding.status == "dismissed";
+            let was_resolved = state.is_resolved == Some(true)
+                || matches!(state.finding.status.as_str(), "fixed" | "dismissed");
             reopened |= state.recheck_pending;
             let (changed, generation) = self.store.record_code_review_thread_state(
                 &state.finding.id,
@@ -6431,6 +6437,12 @@ impl Engine {
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
                 reopened |= was_resolved && !is_resolved;
+            }
+            // Closed findings remain in reconciliation solely so a remotely
+            // reopened thread can restore them to `open`. A thread that is
+            // still resolved must not start another review round.
+            if matches!(state.finding.status.as_str(), "fixed" | "dismissed") && *is_resolved {
+                continue;
             }
             all_resolved &= *is_resolved;
             state_key.push((state.finding.id.clone(), generation, *is_resolved));
@@ -6600,7 +6612,9 @@ fn github_review_event(has_findings: bool) -> &'static str {
     if has_findings {
         "REQUEST_CHANGES"
     } else {
-        "APPROVE"
+        // Review input is untrusted and model output is fallible. A clean
+        // automated pass must not satisfy an approval-based branch rule.
+        "COMMENT"
     }
 }
 
@@ -7454,6 +7468,19 @@ fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
         bail!("stale: review was superseded by a newer revision or review configuration");
     }
     Ok(())
+}
+
+async fn acquire_review_publication_lock<'a>(
+    lock: &'a tokio::sync::Mutex<()>,
+    superseded: &CancellationToken,
+) -> Result<tokio::sync::MutexGuard<'a, ()>> {
+    tokio::select! {
+        biased;
+        _ = superseded.cancelled() => {
+            bail!("stale: review was superseded before publication");
+        }
+        guard = lock.lock() => Ok(guard),
+    }
 }
 
 fn should_replace_manual_review(
@@ -8765,8 +8792,24 @@ mod tests {
 
     #[test]
     fn github_review_verdict_matches_confirmed_findings() {
-        assert_eq!(github_review_event(false), "APPROVE");
+        assert_eq!(github_review_event(false), "COMMENT");
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn publication_lock_wait_stops_when_review_is_superseded() {
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+        let superseded = CancellationToken::new();
+        let wait = acquire_review_publication_lock(&lock, &superseded);
+        superseded.cancel();
+
+        let error = tokio::time::timeout(Duration::from_millis(50), wait)
+            .await
+            .expect("cancelled publication lock wait should finish")
+            .unwrap_err();
+        assert!(error.to_string().contains("superseded before publication"));
+        drop(held);
     }
 
     #[test]
@@ -8858,6 +8901,47 @@ mod tests {
         assert!(
             store
                 .enqueue_code_review_thread_recheck(&request, "state-c", &[], true, 3)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn published_thread_recheck_is_consumed_even_if_later_bookkeeping_fails() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut request = test_review_job_request("acme/widgets#42:published-thread-recheck");
+        request.trigger = "thread-recheck".into();
+        let job = store
+            .enqueue_code_review_thread_recheck(&request, "state-published", &[], true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "failed", "", "post-publication failure")
+            .unwrap();
+
+        assert!(
+            store
+                .enqueue_code_review_thread_recheck(&request, "state-published", &[], false, 3,)
                 .unwrap()
                 .is_none()
         );

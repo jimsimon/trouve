@@ -609,14 +609,6 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
-    let had_review_published = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM pragma_table_info('code_review_jobs')
-           WHERE name = 'review_published'
-         )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
     for sql in MIGRATIONS {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -626,15 +618,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
     backfill_code_review_watermarks(conn)?;
-    if !had_review_published {
-        // Before this column existed, a succeeded job was the durable signal
-        // that its GitHub review had been published. Preserve that history;
-        // subsequent jobs record publication before reaching a terminal state.
-        conn.execute(
-            "UPDATE code_review_jobs SET review_published = 1 WHERE status = 'succeeded'",
-            [],
-        )?;
-    }
+    backfill_legacy_code_review_publications(conn)?;
     backfill_terminal_code_review_task_lifecycle(conn)?;
     migrate_code_review_finding_publication_status(conn)?;
     migrate_general_persona_reviewer_references(conn)?;
@@ -796,6 +780,38 @@ fn backfill_code_review_watermarks(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Marks jobs that succeeded before review_published existed. The data update
+/// and migration marker share one transaction, so a crash cannot leave the
+/// new column present while permanently skipping its historical backfill.
+fn backfill_legacy_code_review_publications(conn: &mut Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "code-review-published-backfill-v1";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let applied = tx
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE code_review_jobs
+         SET review_published = 1
+         WHERE status = 'succeeded' AND review_published = 0",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Releases canonical automatic-review keys held by draft-stale jobs written
 /// by an older binary. This intentionally runs on every startup so restoring a
 /// current binary after a rollback also repairs rows created during rollback.
@@ -814,7 +830,6 @@ fn normalize_draft_stale_code_review_dedupe_keys(conn: &Connection) -> Result<()
     )?;
     Ok(())
 }
-
 /// Arms the durable thread-collapse queue for findings closed before
 /// `collapse_pending` existed: without this, historical conversations with a
 /// published comment would stay uncollapsed forever. The backfill and its
@@ -6832,9 +6847,9 @@ impl Store {
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let current: Option<(i64, String)> = tx
+        let current: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT r.attempt_count, j.status
+                "SELECT r.attempt_count, j.status, j.review_published
                  FROM code_review_thread_rechecks r
                  JOIN code_review_jobs j ON j.id = r.last_job_id
                  WHERE r.repository = ?1 AND r.pull_number = ?2
@@ -6845,7 +6860,7 @@ impl Store {
                     new_job.head_sha,
                     state_key
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         let used_attempts: i64 = tx.query_row(
@@ -6859,11 +6874,11 @@ impl Store {
             ],
             |row| row.get(0),
         )?;
-        let terminal_retry = current
-            .as_ref()
-            .is_some_and(|(_, status)| matches!(status.as_str(), "failed" | "cancelled" | "stale"));
-        let already_consumed = current.as_ref().is_some_and(|(_, status)| {
-            matches!(status.as_str(), "queued" | "running" | "succeeded")
+        let terminal_retry = current.as_ref().is_some_and(|(_, status, published)| {
+            !*published && matches!(status.as_str(), "failed" | "cancelled" | "stale")
+        });
+        let already_consumed = current.as_ref().is_some_and(|(_, status, published)| {
+            *published || matches!(status.as_str(), "queued" | "running" | "succeeded")
         });
         if current.is_none() && !allow_new_state {
             tx.commit()?;
@@ -6884,7 +6899,7 @@ impl Store {
             return Ok(None);
         }
 
-        let attempt = current.as_ref().map_or(1, |(count, _)| count + 1);
+        let attempt = current.as_ref().map_or(1, |(count, _, _)| count + 1);
         let mut request = new_job.clone();
         request.dedupe_key = format!("{}:{state_key}:attempt:{attempt}", request.dedupe_key);
         let inserted = Self::enqueue_code_review_job_conn(&tx, &request)?;
@@ -8581,48 +8596,71 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<CodeReviewFindingThreadState>> {
-        let job_ids: Vec<String> = {
-            let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
+        let base_rows: Vec<CodeReviewFindingThreadState> = {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT f.job_id
+                "SELECT f.id, f.job_id, f.path, f.line, f.side, f.severity,
+                        f.confidence, f.title, f.body,
+                        f.prompt_for_agents, f.status, f.github_comment_id,
+                        f.github_comment_url, f.github_publication_status,
+                        f.github_thread_id, f.resolved_at,
+                        f.github_thread_resolved, f.github_thread_generation,
+                        f.github_thread_recheck_pending
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
                    AND j.review_published = 1
-                   AND f.status IN ('open', 'dismissed')
-                 ORDER BY j.completed_at, f.job_id",
+                   AND f.status IN ('open', 'fixed', 'dismissed')
+                 ORDER BY j.completed_at, f.job_id, f.path, f.line, f.id",
             )?;
-            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
+            stmt.query_map(params![repository, pull_number as i64], |row| {
+                Ok(CodeReviewFindingThreadState {
+                    finding: trouve_protocol::CodeReviewFinding {
+                        id: row.get(0)?,
+                        job_id: row.get(1)?,
+                        path: row.get(2)?,
+                        line: row.get::<_, i64>(3)? as u64,
+                        side: row.get(4)?,
+                        severity: row.get(5)?,
+                        confidence: row.get(6)?,
+                        title: row.get(7)?,
+                        body: row.get(8)?,
+                        prompt_for_agents: row.get(9)?,
+                        status: row.get(10)?,
+                        sources: Vec::new(),
+                        github_comment_id: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+                        github_comment_url: row.get(12)?,
+                        github_publication_status: code_review_publication_status(
+                            &row.get::<_, String>(13)?,
+                        ),
+                        github_thread_id: row.get(14)?,
+                        resolved_at: parse_optional_datetime(row.get(15)?),
+                    },
+                    is_resolved: row.get(16)?,
+                    generation: row.get::<_, i64>(17)? as u64,
+                    recheck_pending: row.get(18)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
         };
-        let mut findings = Vec::new();
-        for job_id in job_ids {
-            for finding in self
-                .code_review_findings(&job_id)?
-                .into_iter()
-                .filter(|finding| matches!(finding.status.as_str(), "open" | "dismissed"))
-            {
-                let (is_resolved, generation, recheck_pending) =
-                    self.conn.lock().unwrap().query_row(
-                        "SELECT github_thread_resolved, github_thread_generation,
-                                github_thread_recheck_pending
-                         FROM code_review_findings WHERE id = ?1",
-                        params![finding.id],
-                        |row| {
-                            Ok((
-                                row.get::<_, Option<bool>>(0)?,
-                                row.get::<_, i64>(1)? as u64,
-                                row.get(2)?,
-                            ))
-                        },
-                    )?;
-                findings.push(CodeReviewFindingThreadState {
-                    finding,
-                    is_resolved,
-                    generation,
-                    recheck_pending,
-                });
-            }
+        let mut findings = Vec::with_capacity(base_rows.len());
+        for mut state in base_rows {
+            let mut stmt = conn.prepare(
+                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
+                 FROM code_review_finding_sources
+                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+            )?;
+            state.finding.sources = stmt
+                .query_map(params![state.finding.id], |row| {
+                    Ok(trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(0)?,
+                        reviewer_name: row.get(1)?,
+                        candidate_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            findings.push(state);
         }
         Ok(findings)
     }
@@ -8649,13 +8687,14 @@ impl Store {
             return Ok((false, 0));
         };
         let state_changed = previous_resolved != Some(is_resolved);
-        let reopened_legacy_dismissal = status == "dismissed";
+        let reopened_closed_finding =
+            matches!(status.as_str(), "fixed" | "dismissed") && !is_resolved;
         let recheck_pending =
-            reopened_legacy_dismissal || (previous_resolved == Some(true) && !is_resolved);
+            reopened_closed_finding || (previous_resolved == Some(true) && !is_resolved);
         let changed = state_changed
-            || reopened_legacy_dismissal
+            || reopened_closed_finding
             || previous_thread_id.as_deref() != Some(thread_id);
-        let generation = generation + i64::from(state_changed || reopened_legacy_dismissal);
+        let generation = generation + i64::from(state_changed || reopened_closed_finding);
         if changed {
             tx.execute(
                 "UPDATE code_review_findings
@@ -8663,8 +8702,14 @@ impl Store {
                      github_thread_generation = ?4,
                      github_thread_recheck_pending =
                        CASE WHEN ?5 THEN 1 ELSE github_thread_recheck_pending END,
-                     status = CASE WHEN status = 'dismissed' THEN 'open' ELSE status END,
-                     resolved_at = CASE WHEN status = 'dismissed' THEN NULL ELSE resolved_at END
+                     status = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
+                       ELSE status
+                     END,
+                     resolved_at = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
+                       ELSE resolved_at
+                     END
                  WHERE id = ?1",
                 params![
                     finding_id,
@@ -8676,10 +8721,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok((
-            state_changed || reopened_legacy_dismissal,
-            generation as u64,
-        ))
+        Ok((state_changed || reopened_closed_finding, generation as u64))
     }
 
     pub fn code_review_job_detail(
@@ -9267,6 +9309,7 @@ impl Store {
                      pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
                      status, model, prompt, identities, config_hash, created_at,
                      review_base_sha, review_scope, retry_of, total_reviewers,
+                     publication_generation,
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
                      coordinator_thinking_level, review_watermark_sha)
@@ -9274,10 +9317,15 @@ impl Store {
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
                     review_base_sha, review_scope, id, total_reviewers,
+                    (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
+                     FROM code_review_jobs AS generation
+                     WHERE generation.repository = source.repository
+                       AND generation.pull_number = source.pull_number
+                       AND generation.head_sha = source.head_sha),
                     routing_mode, semantic_routing, included_reviewer_ids,
                     excluded_reviewer_ids, router_model, router_thinking_level,
                     coordinator_thinking_level, review_watermark_sha
-             FROM code_review_jobs WHERE id = ?1",
+             FROM code_review_jobs AS source WHERE source.id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
         tx.execute(
@@ -9409,7 +9457,7 @@ impl Store {
                          last_reviewed_base_sha, last_reviewed_at)
                  SELECT repository, pull_number, head_sha, base_ref, ?2
                  FROM code_review_jobs
-                 WHERE id = ?1
+                 WHERE id = ?1 AND status != 'stale'
                  ON CONFLICT(repository, pull_number) DO UPDATE SET
                    last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                    last_reviewed_base_sha = excluded.last_reviewed_base_sha,
@@ -9600,8 +9648,9 @@ impl Store {
         let tx = conn.transaction()?;
         let updated = tx.execute(
             "UPDATE code_review_jobs
-             SET review_published = 1, review_url = ?2
-             WHERE id = ?1 AND status = 'running'",
+             SET review_published = 1,
+                 review_url = CASE WHEN ?2 = '' THEN review_url ELSE ?2 END
+             WHERE id = ?1 AND publication_claimed != 0",
             params![id, review_url],
         )?;
         if updated == 0 {
@@ -9611,16 +9660,21 @@ impl Store {
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
                      last_reviewed_base_sha, last_reviewed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             SELECT repository, pull_number, head_sha, base_ref, ?6
+             FROM code_review_jobs
+             WHERE id = ?1 AND status = 'running'
+               AND repository = ?2 AND pull_number = ?3
+               AND base_ref = ?4 AND head_sha = ?5
              ON CONFLICT(repository, pull_number) DO UPDATE SET
                last_reviewed_head_sha = excluded.last_reviewed_head_sha,
                last_reviewed_base_sha = excluded.last_reviewed_base_sha,
                last_reviewed_at = excluded.last_reviewed_at",
             params![
+                id,
                 repository,
                 pull_number as i64,
-                head_sha,
                 base_sha,
+                head_sha,
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
@@ -11162,6 +11216,75 @@ mod tests {
                 finished,
             ),
             15_000
+        );
+    }
+
+    #[test]
+    fn legacy_review_publication_backfill_retries_atomically() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE code_review_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                review_published INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO code_review_jobs (id, status) VALUES
+                ('published', 'succeeded'),
+                ('failed', 'failed');
+             CREATE TRIGGER reject_review_publication_marker
+             BEFORE INSERT ON store_migrations
+             WHEN NEW.id = 'code-review-published-backfill-v1'
+             BEGIN
+                SELECT RAISE(FAIL, 'migration marker write blocked');
+             END;",
+        )
+        .unwrap();
+
+        assert!(backfill_legacy_code_review_publications(&mut conn).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'published'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER reject_review_publication_marker")
+            .unwrap();
+
+        backfill_legacy_code_review_publications(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'published'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT review_published FROM code_review_jobs WHERE id = 'failed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_migrations
+                 WHERE id = 'code-review-published-backfill-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
         );
     }
 
@@ -14017,6 +14140,160 @@ mod tests {
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
         );
+    }
+
+    #[test]
+    fn fixed_findings_are_monitored_without_reopening_resolved_threads() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "medium".into(),
+                    title: "Finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://example/comment",
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .resolve_code_review_finding(&finding.id, "fixed")
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .record_code_review_thread_state(&finding.id, "thread-1", true)
+                .unwrap()
+                .0
+        );
+        let resolved = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].finding.status, "fixed");
+        assert_eq!(resolved[0].is_resolved, Some(true));
+        assert!(!resolved[0].recheck_pending);
+
+        assert!(
+            store
+                .record_code_review_thread_state(&finding.id, "thread-1", false)
+                .unwrap()
+                .0
+        );
+        let reopened = store
+            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+            .unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].finding.status, "open");
+        assert_eq!(reopened[0].is_resolved, Some(false));
+        assert!(reopened[0].recheck_pending);
+    }
+
+    #[test]
+    fn retry_job_receives_the_next_publication_generation() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET publication_generation = 9 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        let retry = store.retry_code_review_job(&job.id).unwrap().unwrap();
+        let generation = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT publication_generation FROM code_review_jobs WHERE id = ?1",
+                params![retry.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 10);
+    }
+
+    #[test]
+    fn stale_job_still_records_an_accepted_publication_without_advancing_pull_state() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&job.id)
+                .unwrap()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'stale' WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+            )
+            .unwrap();
+        let record = store.code_review_job(&job.id).unwrap().unwrap();
+        assert!(record.review_published);
+        assert_eq!(record.job.review_url, "https://example/review");
+        let pull_state = store
+            .code_review_pull_state(&job.repository, job.pull_number)
+            .unwrap();
+        assert!(pull_state.last_reviewed_head_sha.is_empty());
     }
 
     fn enqueue_backoff_test_job(store: &Store) -> trouve_protocol::CodeReviewJob {
