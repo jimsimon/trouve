@@ -364,6 +364,19 @@ describe("buildChatLayout", () => {
     expect(layout.unitIdForItem.get("s7")).toBe(layout.units[0]?.id);
   });
 
+  it("promotes a recovered subagent prompt ahead of earlier thought activity", () => {
+    const items: ThreadChatItem[] = [
+      { id: "thought", kind: "thinking", turn: 8, content: "Finishing quickly.", complete: true },
+      { id: "status", kind: "turn-status", turn: 8, state: { kind: "completed", usage: { input_tokens: 1, output_tokens: 1 } } },
+      { id: "prompt", kind: "user", turn: 8, content: "Recovered after completion.", attachments: [] },
+    ];
+    expect(buildChatLayout(items).units[0]).toMatchObject({
+      prompt: { id: "prompt", content: "Recovered after completion." },
+      items: [{ id: "thought" }],
+      status: { id: "status" },
+    });
+  });
+
   it("keeps a terminal failure in the affected turn", () => {
     const items: ThreadChatItem[] = [
       { id: "s8", kind: "turn-status", turn: 8, state: { kind: "failed", error: "boom" } },
