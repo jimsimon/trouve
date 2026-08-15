@@ -1,6 +1,7 @@
 import { ContextConsumer } from "@lit/context";
 import { css, html, LitElement, nothing } from "lit";
 
+import { thinkingOption } from "../app/new-session-model.js";
 import { appServicesContext } from "../contexts/app-contexts.js";
 import type {
   ProtocolModeInfo,
@@ -17,21 +18,8 @@ import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 type PermissionMode = "ask" | "allow_list" | "yolo";
 
-const asRecord = (value: unknown): Record<string, unknown> | undefined =>
-  typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
-
-const thinkingOptions = (model: ProtocolModelInfo | undefined): readonly string[] => {
-  const schema = asRecord(model?.options_schema);
-  const properties = asRecord(schema?.["properties"]);
-  for (const key of ["thinking_level", "effort"]) {
-    const property = asRecord(properties?.[key]);
-    const values = property?.["enum"];
-    if (Array.isArray(values) && values.every((value) => typeof value === "string")) {
-      return values as string[];
-    }
-  }
-  return [];
-};
+const thinkingOptions = (model: ProtocolModelInfo | undefined): readonly string[] =>
+  thinkingOption(model)?.values ?? [];
 
 const splitTools = (value: string): string[] =>
   value.split(/[\n,]/u).map((tool) => tool.trim()).filter(Boolean);
@@ -48,7 +36,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     .grow { flex: 1 1 12rem; min-width: 0; }
     .identity-row > label { flex: 1 1 12rem; }
     .identity-row > .mode-id-field { flex: 0 0 150px; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     label { display: grid; gap: 4px; color: var(--trouve-muted); }
     label > span { font-size: 0.82rem; font-weight: 600; }
     button, input, select, textarea { box-sizing: border-box; font: inherit; color: var(--trouve-text); border: 1px solid var(--trouve-border); border-radius: 5px; background: var(--trouve-control-bg, var(--trouve-surface)); }
@@ -63,8 +50,7 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     .meta, .status { color: var(--trouve-muted); font-size: 0.83rem; }
     .status { min-height: 1.4em; } .status.error { color: var(--trouve-err); }
     .defaults-form { display: grid; gap: 8px; }
-    .defaults-form > .row > label:first-child { flex: 1 1 100%; }
-    .permission-default { width: 150px; }
+    .global-default-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(140px, 1fr) minmax(150px, 1fr); align-items: end; gap: 10px; }
     .modes-copy { color: var(--trouve-muted); font-size: 11px; }
     .no-models { display: flex; align-items: center; gap: 10px; border-radius: 6px; padding: 10px; color: var(--trouve-warn); background: var(--trouve-surface); font-size: 12px; }
     .no-models span { min-width: 0; flex: 1; }
@@ -72,17 +58,16 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     .mode-row { box-sizing: border-box; height: 52px; display: grid; grid-template-columns: minmax(0, 1fr) 190px auto; align-items: center; gap: 8px; padding: 0 6px 0 10px; }
     .mode-row-copy { min-width: 0; line-height: 1.2; }
     .mode-row-copy > span { display: flex; align-items: center; gap: 6px; min-width: 0; }
-    .mode-row-copy strong, .mode-row-copy small, .mode-row-copy p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mode-row-copy strong, .mode-row-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .mode-row-copy strong { color: var(--trouve-text-hi); font-size: 13px; }
-    .mode-row-copy small, .mode-row-copy p { color: var(--trouve-muted); font-size: 11px; }
-    .mode-row-copy p { margin-top: 2px; }
+    .mode-row-copy small { color: var(--trouve-muted); font-size: 11px; }
     .mode-row-defaults { display: grid; gap: 3px; }
     .mode-row-defaults select { min-height: 28px; }
     .mode-row-actions { display: flex; gap: 5px; }
-    .mode-default-grid { grid-template-columns: 150px minmax(0, 1fr) 190px; align-items: end; }
+    button.icon-button { display: inline-grid; width: 30px; padding: 0; place-items: center; }
     .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
     @media (max-width: 620px) {
-      .grid, .mode-default-grid { grid-template-columns: 1fr; }
+      .global-default-grid { grid-template-columns: 1fr; }
       .row > button { flex: 1 1 auto; }
       .mode-list { height: auto; max-height: 420px; }
       .mode-row { height: auto; min-height: 68px; grid-template-columns: minmax(0, 1fr); align-items: stretch; padding: 8px; }
@@ -103,8 +88,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
   #editingModeId = "";
   #defaultModelDraft = "";
   #defaultThinkingDraft = "";
-  #modeFormModelId = "";
-  #modeFormThinkingDraft: string | undefined;
 
   #availableModels(): readonly ProtocolModelInfo[] {
     const catalog = this.#services.value?.modelCatalog.current;
@@ -144,32 +127,49 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     }
   }
 
-  async #saveDefaults(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async #saveDefaultModel(model: string, thinking: string | undefined): Promise<void> {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || this.#busy) return;
-    const data = new FormData(event.currentTarget as HTMLFormElement);
-    const model = String(data.get("model") ?? "");
-    const permission = String(data.get("permission_mode") ?? "ask") as PermissionMode;
-    const thinking = String(data.get("thinking") ?? "");
-    if (model === "" || !["ask", "allow_list", "yolo"].includes(permission)) return;
+    if (model === "") return;
     this.#busy = true;
-    this.#message = "Saving defaults…";
+    this.#message = "Saving model defaults…";
     this.#error = false;
     this.requestUpdate();
     try {
-      await Promise.all([
-        protocol.setDefaultModel({
-          model,
-          ...(thinking === "" ? {} : { default_thinking_level: thinking }),
-        }),
-        protocol.setDefaultPermissionMode({ permission_mode: permission }),
-      ]);
+      await protocol.setDefaultModel({
+        model,
+        ...(thinking === undefined
+          ? {}
+          : { default_thinking_level: thinking === "" ? null : thinking }),
+      });
       await this.#load();
-      this.#message = "Defaults saved for new threads.";
+      if (this.#error) return;
+      this.#message = "Model defaults saved for new threads.";
       this.requestUpdate();
     } catch {
-      this.#message = "Defaults could not be saved.";
+      this.#message = "Model defaults could not be saved.";
+      this.#error = true;
+      this.#busy = false;
+      this.requestUpdate();
+    }
+  }
+
+  async #saveDefaultPermission(permission: PermissionMode): Promise<void> {
+    const protocol = this.#services.value?.protocol;
+    if (protocol === undefined || this.#busy) return;
+    if (!["ask", "allow_list", "yolo"].includes(permission)) return;
+    this.#busy = true;
+    this.#message = "Saving permission default…";
+    this.#error = false;
+    this.requestUpdate();
+    try {
+      await protocol.setDefaultPermissionMode({ permission_mode: permission });
+      await this.#load();
+      if (this.#error) return;
+      this.#message = "Permission default saved for new threads.";
+      this.requestUpdate();
+    } catch {
+      this.#message = "Permission default could not be saved.";
       this.#error = true;
       this.#busy = false;
       this.requestUpdate();
@@ -185,7 +185,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
     const id = String(data.get("id") ?? existing?.mode.id ?? "").trim();
     const displayName = String(data.get("display_name") ?? "").trim();
     const systemPrompt = String(data.get("system_prompt") ?? "").trim();
-    const permission = String(data.get("default_permission_mode") ?? "");
     if (!/^[a-z0-9][a-z0-9_-]*$/u.test(id) || displayName === "") {
       this.#message = "Mode IDs use lowercase letters, digits, underscore, or dash; a display name is required.";
       this.#error = true;
@@ -197,9 +196,9 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
       system_prompt: systemPrompt,
       allowed_tools: splitTools(String(data.get("allowed_tools") ?? "")),
       read_only: data.get("read_only") === "on",
-      default_model: String(data.get("default_model") ?? "") || null,
-      default_permission_mode: permission === "" ? null : permission as PermissionMode,
-      default_thinking_level: String(data.get("default_thinking_level") ?? "") || null,
+      default_model: existing?.mode.default_model ?? null,
+      default_permission_mode: existing?.mode.default_permission_mode ?? null,
+      default_thinking_level: existing?.mode.default_thinking_level ?? null,
     };
     this.#busy = true;
     this.#message = `Saving ${id}…`;
@@ -209,8 +208,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
       await protocol.upsertMode(id, request);
       if (existing === undefined) form.reset();
       this.#editingModeId = "";
-      this.#modeFormModelId = "";
-      this.#modeFormThinkingDraft = undefined;
       await this.#load();
       this.#message = `Saved mode ${id}.`;
       this.requestUpdate();
@@ -248,10 +245,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
   #modeForm(info?: ProtocolModeInfo) {
     const mode = info?.mode;
     const readOnly = info?.origin === "workspace";
-    const selectedModelId = this.#modeFormModelId || mode?.default_model || this.#providers?.default_model || "";
-    const editorThinking = thinkingOptions(
-      this.#availableModels().find((candidate) => candidate.id === selectedModelId),
-    );
     return html`
       <form class="mode-editor" @submit=${(event: SubmitEvent) => void this.#saveMode(event, info)}>
         <div class="row"><h3 class="grow">${mode === undefined ? "Add mode" : `Edit mode \"${mode.id}\"`}</h3></div>
@@ -262,22 +255,9 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
         <label><span>System prompt (appended to the base prompt):</span><textarea name="system_prompt" .value=${mode?.system_prompt ?? ""} ?disabled=${readOnly}></textarea></label>
         <label><span class="visually-hidden">Allowed tools</span><input name="allowed_tools" placeholder="allowed tools, comma-separated (empty = all tools)" .value=${(mode?.allowed_tools ?? []).join(", ")} ?disabled=${readOnly} /></label>
         <label class="row"><input style="width:auto" type="checkbox" name="read_only" .checked=${mode?.read_only ?? false} ?disabled=${readOnly} /><span>Read-only (never mutates the worktree)</span></label>
-        <div class="grid mode-default-grid">
-          <label><span>Default permissions</span><select name="default_permission_mode" .value=${mode?.default_permission_mode ?? ""} ?disabled=${readOnly}><option value="">Global default</option><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
-          <label><span>Default model</span><select name="default_model" .value=${this.#modeFormModelId || mode?.default_model || ""} ?disabled=${readOnly || this.#availableModels().length === 0} @change=${(event: Event) => {
-            this.#modeFormModelId = (event.currentTarget as HTMLSelectElement).value;
-            const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === this.#modeFormModelId));
-            const current = this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? "";
-            this.#modeFormThinkingDraft = options.includes(current) ? current : "";
-            this.requestUpdate();
-          }}><option value="">Global default</option>${this.#availableModels().map((candidate) => html`<option value=${candidate.id}>${modelSelectorLabel(candidate)}</option>`)}</select></label>
-          ${editorThinking.length === 0
-            ? html`<input type="hidden" name="default_thinking_level" value="" />`
-            : html`<label><span>Default thinking level</span><select name="default_thinking_level" .value=${this.#modeFormThinkingDraft ?? mode?.default_thinking_level ?? ""} ?disabled=${readOnly} @change=${(event: Event) => { this.#modeFormThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Global default</option>${editorThinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
-        </div>
         ${readOnly
           ? html`<p class="meta">Workspace modes are managed by the repository’s .agents configuration.</p>`
-          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add mode" : "Save mode"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = undefined; this.requestUpdate(); }}>Cancel</button></div>`}
+          : html`<div class="row"><button class="primary" type="submit" ?disabled=${this.#busy}>${info === undefined ? "Add mode" : "Save mode"}</button><button type="button" @click=${() => { this.#editingModeId = ""; this.requestUpdate(); }}>Cancel</button></div>`}
       </form>
     `;
   }
@@ -327,7 +307,6 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
       <article class="mode-row">
         <div class="mode-row-copy">
           <span><strong>${mode.display_name}</strong><small>${mode.id}${info.origin === "builtin" ? "" : ` · ${info.origin}`}${mode.read_only ? " · read-only" : ""}</small></span>
-          <p title=${mode.system_prompt}>${mode.system_prompt}</p>
         </div>
         <div class="mode-row-defaults">
           <select
@@ -351,7 +330,7 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
               ><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select>`}
         </div>
         <div class="mode-row-actions">
-          ${readOnly ? nothing : html`<button type="button" @click=${() => { this.#editingModeId = mode.id; this.#modeFormModelId = mode.default_model ?? ""; this.#modeFormThinkingDraft = mode.default_thinking_level ?? ""; this.requestUpdate(); }}>Edit</button>`}
+          ${readOnly ? nothing : html`<button class="icon-button" type="button" title=${`Edit ${mode.display_name}`} aria-label=${`Edit ${mode.display_name}`} ?disabled=${this.#busy} @click=${() => { this.#editingModeId = mode.id; this.requestUpdate(); }}>${fontAwesomeIcon("pen")}</button>`}
           ${info.origin === "customized" || info.origin === "custom"
             ? html`<button class="danger" type="button" ?disabled=${this.#busy} @click=${() => void this.#resetMode(info)}>${info.origin === "custom" ? "Remove" : "Reset"}</button>`
             : nothing}
@@ -370,28 +349,33 @@ export class TrouveModeSettings extends withSignalTracking(LitElement) {
         ${models.length === 0 && !this.#busy
           ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
           : nothing}
-        <form class="defaults-form" @submit=${(event: SubmitEvent) => void this.#saveDefaults(event)}>
-          <p class="meta">Global default model — used by new threads whose mode has no default of its own.</p>
-          <div class="row">
-            <label><span class="visually-hidden">Default model</span><select required name="model" .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || models.length === 0} @change=${(event: Event) => {
-              this.#defaultModelDraft = (event.currentTarget as HTMLSelectElement).value;
-              const options = thinkingOptions(this.#availableModels().find((model) => model.id === this.#defaultModelDraft));
-              if (!options.includes(this.#defaultThinkingDraft)) this.#defaultThinkingDraft = "";
+        <section class="defaults-form" aria-label="Global defaults">
+          <p class="meta">Used by new threads whose mode has no default of its own. Changes save automatically.</p>
+          <div class="global-default-grid">
+            <label><span>Global Default Model</span><select required .value=${this.#defaultModelDraft || this.#providers?.default_model || ""} ?disabled=${this.#busy || models.length === 0} @change=${(event: Event) => {
+              const model = (event.currentTarget as HTMLSelectElement).value;
+              const options = thinkingOptions(this.#availableModels().find((candidate) => candidate.id === model));
+              const thinkingDraft = options.includes(this.#defaultThinkingDraft) ? this.#defaultThinkingDraft : "";
+              this.#defaultModelDraft = model;
+              this.#defaultThinkingDraft = thinkingDraft;
               this.requestUpdate();
+              void this.#saveDefaultModel(model, options.length === 0 ? undefined : thinkingDraft);
             }}><option value="" disabled>Choose model</option>${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_tools ? "" : " · no tools"}</option>`)}</select></label>
+            <label><span>Global Default Thinking</span>${thinking.length === 0
+              ? html`<select disabled><option>Not available</option></select>`
+              : html`<select .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => {
+                const thinkingDraft = (event.currentTarget as HTMLSelectElement).value;
+                this.#defaultThinkingDraft = thinkingDraft;
+                void this.#saveDefaultModel(this.#defaultModelDraft || this.#providers?.default_model || "", thinkingDraft);
+              }}><option value="" .selected=${this.#defaultThinkingDraft === ""}>Model default</option>${thinking.map((value) => html`<option value=${value} .selected=${this.#defaultThinkingDraft === value}>${modelOptionLabel(value)}</option>`)}</select>`}</label>
+            <label><span>Global Default Permissions</span><select .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy} @change=${(event: Event) => void this.#saveDefaultPermission((event.currentTarget as HTMLSelectElement).value as PermissionMode)}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
           </div>
-          ${thinking.length === 0
-            ? html`<input name="thinking" type="hidden" .value=${this.#providers?.default_thinking_level ?? ""} />`
-            : html`<label><span>Global default thinking level</span><select name="thinking" .value=${this.#defaultThinkingDraft} ?disabled=${this.#busy} @change=${(event: Event) => { this.#defaultThinkingDraft = (event.currentTarget as HTMLSelectElement).value; }}><option value="">Model default</option>${thinking.map((value) => html`<option value=${value}>${modelOptionLabel(value)}</option>`)}</select></label>`}
-          <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Set defaults</button></div>
-          <p class="meta">Global default permissions — used by new threads whose mode has no default of its own.</p>
-          <label class="permission-default"><span class="visually-hidden">Default permission</span><select name="permission_mode" .value=${this.#providers?.default_permission_mode ?? "ask"} ?disabled=${this.#busy}><option value="ask">Ask</option><option value="allow_list">Allow list</option><option value="yolo">Yolo</option></select></label>
-        </form>
+        </section>
         <h3 class="section-subtitle">Modes</h3>
         <p class="modes-copy">A mode combines a prompt, tool policy, permissions, model, and thinking defaults. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.</p>
         <section class="mode-list" aria-label="Modes">${this.#modes.map((info) => this.#modeRow(info))}</section>
         ${this.#editingModeId === ""
-          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.#modeFormModelId = ""; this.#modeFormThinkingDraft = ""; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add mode</button></div>`
+          ? html`<div class="row"><button type="button" @click=${() => { this.#editingModeId = "__new__"; this.requestUpdate(); }}>${fontAwesomeIcon("plus")} Add mode</button></div>`
           : this.#editingModeId === "__new__"
             ? this.#modeForm()
             : this.#modeForm(this.#modes.find((info) => info.mode.id === this.#editingModeId))}
