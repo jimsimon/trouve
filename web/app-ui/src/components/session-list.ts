@@ -191,8 +191,6 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const store = this.#store.value;
     const pullRequestBadge = visibleSessionPullRequestBadge(
       store?.sessionPullRequests(session.id) ?? [],
-      session.state,
-      selected,
     );
     const indicator = sessionIndicatorPresentation(session);
     const age = sessionAgePresentation(session.updatedAt, now);

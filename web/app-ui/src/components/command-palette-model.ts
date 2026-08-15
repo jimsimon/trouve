@@ -198,8 +198,6 @@ export const buildCommandPaletteItems = (
     const indicator = sessionIndicatorPresentation(session);
     const pullRequestBadge = visibleSessionPullRequestBadge(
       session.pullRequests,
-      session.state,
-      current,
     );
     const pullRequestNumbers = [...new Set(session.pullRequests.map(({ number }) => number))]
       .sort((left, right) => right - left);

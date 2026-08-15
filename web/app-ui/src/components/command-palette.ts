@@ -325,8 +325,10 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
       >
         <h2 id=${`command-group-${group}`}>${group}</h2>
         ${indexed.map(({ item, index }) => {
-          const stateDescription = item.pullRequestBadge?.tooltip
-            || item.sessionIndicator?.tooltip
+          const stateDescription = [
+            item.sessionIndicator?.tooltip,
+            item.pullRequestBadge?.tooltip,
+          ].filter((part) => part !== undefined && part !== "").join(". ")
             || (item.state === undefined ? "" : stateLabel(item.state));
           const accessibleDescription = [
             item.label,
@@ -347,12 +349,7 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
               @click=${() => this.#activate(item)}
             >
               <span class="command-palette-icon" aria-hidden="true">
-                ${item.pullRequestBadge !== undefined
-                  ? html`<span
-                      class="session-pr-badge ${item.pullRequestBadge.tone}"
-                      title=${item.pullRequestBadge.tooltip}
-                    >${fontAwesomeIcon("code-pull-request")}</span>`
-                  : item.sessionIndicator !== undefined
+                ${item.sessionIndicator !== undefined
                   ? html`<span
                       class="session-indicator ${item.sessionIndicator.kind}"
                       title=${item.sessionIndicator.tooltip === ""
@@ -362,6 +359,12 @@ export class TrouveCommandPalette extends withSignalTracking(LitElement) {
                       ? nothing
                       : fontAwesomeIcon(item.sessionIndicator.icon)}</span>`
                   : item.icon === undefined ? nothing : fontAwesomeIcon(item.icon)}
+                ${item.pullRequestBadge === undefined
+                  ? nothing
+                  : html`<span
+                      class="session-pr-badge ${item.pullRequestBadge.tone}"
+                      title=${item.pullRequestBadge.tooltip}
+                    >${fontAwesomeIcon("code-pull-request")}</span>`}
               </span>
               <span class="command-palette-copy">
                 <strong>${item.label}</strong>

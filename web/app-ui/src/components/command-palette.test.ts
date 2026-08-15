@@ -135,7 +135,7 @@ describe("command palette model", () => {
       },
     });
     expect(items.find((item) => item.id === "session:se-review")?.pullRequestBadge)
-      .toBeUndefined();
+      .toMatchObject({ tone: "blocked", count: 1 });
     expect(items.find((item) => item.id === "session:se-active")).toMatchObject({
       detail: "Trouve search · trouve/web-parity",
       current: true,

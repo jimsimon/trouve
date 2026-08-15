@@ -5,7 +5,6 @@ import type {
 import {
   projectSessionPullRequests,
   type SessionPullRequestIdentity,
-  type SessionVisualState,
 } from "../state/app-store.js";
 
 export type { SessionPullRequestIdentity } from "../state/app-store.js";
@@ -76,18 +75,8 @@ export const sessionPullRequestBadge = (
   });
 };
 
-/** Apply the same precedence used by every session navigator:
- * attention, failure, unread, and busy indicators win over pull-request state.
- * A selected completed session has already cleared its local unread marker, so
- * it can hand off to the pull-request badge during the intervening render. */
+/** Keep pull-request state independent from the session's work status so
+ * navigators can present both indicators at the same time. */
 export const visibleSessionPullRequestBadge = (
   prs: readonly ProtocolPrInfo[],
-  state: SessionVisualState,
-  selected: boolean,
-): SessionPullRequestBadge | undefined => {
-  const badge = sessionPullRequestBadge(prs);
-  if (badge === undefined) return undefined;
-  return state === "idle" || (state === "done" && selected)
-    ? badge
-    : undefined;
-};
+): SessionPullRequestBadge | undefined => sessionPullRequestBadge(prs);
