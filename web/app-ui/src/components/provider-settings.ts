@@ -1008,7 +1008,7 @@ export class TrouveProviderSettings extends LitElement {
     this.requestUpdate();
     try {
       await services.protocol.setProviderOrder({ provider_ids: [...providerIds] });
-      this.#providers = { ...providers, provider_order: [...providerIds] };
+      await this.#load();
       this.#setNotice("Automatic routing priority was updated.", false);
     } catch {
       this.#setNotice("Automatic routing priority could not be saved.", true);

@@ -913,6 +913,18 @@ impl Engine {
                     segment.push_str(&delta);
                     persisted.push(Event::AssistantDelta { turn, text: delta });
                 }
+                BackendEvent::ProgressDelta(delta) => {
+                    if !segment.is_empty() {
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
+                    }
+                    persisted.push(Event::AssistantProgress { turn, text: delta });
+                }
+                BackendEvent::ProgressCompleted => {
+                    persisted.push(Event::AssistantProgressCompleted { turn });
+                }
                 BackendEvent::ThinkingDelta(delta) => {
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {

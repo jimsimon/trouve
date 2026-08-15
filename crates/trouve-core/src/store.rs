@@ -16491,7 +16491,9 @@ mod tests {
             .record_route_failure("provider", "model", 10, 25)
             .unwrap();
         assert_eq!(third.consecutive_failures, 3);
-        assert!(third.retry_after.unwrap() >= now + 25);
+        let third_retry_after = third.retry_after.unwrap();
+        assert!(third_retry_after >= now + 25);
+        assert!(third_retry_after <= chrono::Utc::now().timestamp() + 25);
 
         store.record_route_success("provider", "model").unwrap();
         let health = store.route_health().unwrap();

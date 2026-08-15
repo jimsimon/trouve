@@ -642,20 +642,6 @@ impl ModelCandidate {
     }
 }
 
-#[cfg(test)]
-fn model_selection_id(
-    provider_model: &str,
-    qualified_id: &str,
-    provider_qualified: bool,
-) -> String {
-    if provider_qualified {
-        return qualified_id.to_string();
-    }
-    neutral_model_id(provider_model)
-        .map(|model| format!("auto/{model}"))
-        .unwrap_or_else(|| qualified_id.to_string())
-}
-
 /// Automatic ids are namespaced in the current protocol. Bare names remain
 /// accepted for clients that stored a selection before that namespace existed.
 fn automatic_model_name(selection: &str) -> Option<&str> {
@@ -3489,16 +3475,19 @@ impl Engine {
         // injected/custom providers that can run arbitrary model names and
         // therefore publish no finite catalog.
         if let Some((provider_id, provider_model)) = model.split_once('/') {
-            if let Some(provider) = self.providers.read().unwrap().get(provider_id).cloned() {
+            let provider_qualified = self.offline_capable_provider_ids().contains(provider_id);
+            let provider = self.providers.read().unwrap().get(provider_id).cloned();
+            if let Some(provider) = provider {
                 return Ok(vec![ModelCandidate {
                     provider_id: provider_id.to_string(),
                     provider_model: provider_model.to_string(),
                     info: fallback_model_info(model, provider_model),
                     executor: ModelExecutor::Native(provider),
-                    provider_qualified: self.offline_capable_provider_ids().contains(provider_id),
+                    provider_qualified,
                 }]);
             }
-            if let Some(backend) = self.backends.read().unwrap().get(provider_id).cloned() {
+            let backend = self.backends.read().unwrap().get(provider_id).cloned();
+            if let Some(backend) = backend {
                 return Ok(vec![ModelCandidate {
                     provider_id: provider_id.to_string(),
                     provider_model: provider_model.to_string(),
@@ -21610,20 +21599,42 @@ default_permission_mode = "ask"
         assert_eq!(neutral_model_id("openai/gpt-5.6-sol"), None);
     }
 
+    fn test_model_candidate(
+        provider_id: &str,
+        provider_model: &str,
+        provider_qualified: bool,
+    ) -> ModelCandidate {
+        let qualified_id = format!("{provider_id}/{provider_model}");
+        ModelCandidate {
+            provider_id: provider_id.into(),
+            provider_model: provider_model.into(),
+            info: fallback_model_info(&qualified_id, provider_model),
+            executor: ModelExecutor::Native(Arc::new(CatalogTestProvider {
+                live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+            provider_qualified,
+        }
+    }
+
     #[test]
     fn picker_keeps_local_and_transport_owned_models_provider_qualified() {
+        let local = test_model_candidate("local", "qwen2.5-coder:7b", true);
+        assert_eq!(local.automatic_selection_id(), None);
+        assert_eq!(local.concrete_selection_id(), "local/qwen2.5-coder:7b");
+
+        let hosted = test_model_candidate("openrouter", "qwen2.5-coder:7b", false);
         assert_eq!(
-            model_selection_id("qwen2.5-coder:7b", "local/qwen2.5-coder:7b", true),
-            "local/qwen2.5-coder:7b"
+            hosted.automatic_selection_id().as_deref(),
+            Some("auto/qwen2.5-coder:7b")
         );
         assert_eq!(
-            model_selection_id("qwen2.5-coder:7b", "openrouter/qwen2.5-coder:7b", false),
-            "auto/qwen2.5-coder:7b"
+            hosted.concrete_selection_id(),
+            "openrouter/qwen2.5-coder:7b"
         );
-        assert_eq!(
-            model_selection_id("default", "cursor/default", false),
-            "cursor/default"
-        );
+
+        let transport_owned = test_model_candidate("cursor", "default", false);
+        assert_eq!(transport_owned.automatic_selection_id(), None);
+        assert_eq!(transport_owned.concrete_selection_id(), "cursor/default");
     }
 
     #[test]
@@ -21646,18 +21657,20 @@ default_permission_mode = "ask"
             )
             .unwrap();
 
+        let api_candidate =
+            test_model_candidate("openai", model_name_for_provider("openai", &api.id), false);
+        let codex_candidate =
+            test_model_candidate("codex", model_name_for_provider("codex", &codex.id), false);
         assert_eq!(
-            model_selection_id(model_name_for_provider("openai", &api.id), &api.id, false),
-            "auto/gpt-5.6-sol"
+            api_candidate.automatic_selection_id().as_deref(),
+            Some("auto/gpt-5.6-sol")
         );
         assert_eq!(
-            model_selection_id(
-                model_name_for_provider("codex", &codex.id),
-                &codex.id,
-                false
-            ),
-            "auto/gpt-5.6-sol"
+            codex_candidate.automatic_selection_id().as_deref(),
+            Some("auto/gpt-5.6-sol")
         );
+        assert_eq!(api_candidate.concrete_selection_id(), "openai/gpt-5.6-sol");
+        assert_eq!(codex_candidate.concrete_selection_id(), "codex/gpt-5.6-sol");
         assert_eq!(api.display_name, codex.display_name);
         assert_eq!(api.context_window, codex.context_window);
     }
