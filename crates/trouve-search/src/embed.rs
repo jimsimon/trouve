@@ -162,11 +162,13 @@ impl FastBert {
 static MODEL_CACHE: OnceLock<Mutex<Vec<Arc<EmbeddingModel>>>> = OnceLock::new();
 static MODEL_LOAD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 
+fn lock_ignore_poison<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn model_load_lock(id: &str) -> Arc<Mutex<()>> {
-    let mut locks = MODEL_LOAD_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
+    let mut locks = lock_ignore_poison(MODEL_LOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new())));
     if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
         return lock;
     }
@@ -195,7 +197,7 @@ impl EmbeddingModel {
         // pointers. Serialize that whole load/refresh sequence per model id,
         // while allowing unrelated models to load concurrently.
         let load_lock = model_load_lock(&id);
-        let _load_guard = load_lock.lock().unwrap();
+        let _load_guard = lock_ignore_poison(&load_lock);
         {
             let cached = cache.lock().unwrap();
             if let Some(found) = cached.iter().find(|m| m.model_id == id) {
@@ -794,6 +796,31 @@ mod tests {
         assert!(other.try_lock().is_ok());
         drop(guard);
         assert!(same.try_lock().is_ok());
+    }
+
+    #[test]
+    fn model_load_locks_recover_from_poison() {
+        let registry = MODEL_LOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("poison model-load registry");
+            })
+            .is_err()
+        );
+        let recovered = model_load_lock("test-poisoned-registry-lock");
+        assert!(recovered.try_lock().is_ok());
+
+        let load_lock = model_load_lock("test-poisoned-model-load-lock");
+        let poison_target = load_lock.clone();
+        assert!(
+            std::panic::catch_unwind(move || {
+                let _guard = poison_target.lock().unwrap();
+                panic!("poison per-model load lock");
+            })
+            .is_err()
+        );
+        drop(lock_ignore_poison(&load_lock));
     }
 
     /// WordLevel tokenizer with `words` in the vocabulary (plus [UNK] at 0).
