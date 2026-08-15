@@ -10135,10 +10135,20 @@ impl Engine {
         else {
             return Ok(());
         };
+        let Some(child_prompt) = collaborator
+            .last_user_message
+            .clone()
+            .filter(|prompt| !prompt.is_empty())
+        else {
+            // Some providers announce collaborator activity before an
+            // asynchronous prompt lookup completes. Delay the one durable
+            // parent link until that lookup supplies a real prompt; the event
+            // log is append-only, so an empty event cannot be updated later.
+            return Ok(());
+        };
         let child_thread_id = collaborator.thread.id.clone();
         let child_session_id = collaborator.thread.session_id.clone();
         let child_model = collaborator.thread.model.clone();
-        let child_prompt = collaborator.last_user_message.clone().unwrap_or_default();
         let parent_thread_id = self
             .store
             .spawn_parent(&child_thread_id)?
@@ -11297,6 +11307,13 @@ impl Engine {
                         } else {
                             None
                         };
+                    self.publish_backend_collaborator_spawn(
+                        thread,
+                        turn,
+                        &session_id,
+                        &mut collaborators,
+                    )
+                    .await?;
                     if let Some(thread_id) = terminal_thread {
                         collaborator_claims.release(&thread_id);
                         if completed_successfully {
@@ -16785,6 +16802,27 @@ default_permission_mode = "ask"
             .await
             .unwrap();
         let late_prompt_child_id = vendor_threads["vendor-late-prompt"].clone();
+        engine
+            .publish_backend_collaborator_spawn(
+                &parent,
+                1,
+                "vendor-late-prompt",
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .events_after(&Scope::Thread(parent.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    &event.event,
+                    Event::SubagentSpawned { thread_id, .. }
+                        if thread_id == &late_prompt_child_id
+                )),
+            "an unresolved prompt must not publish an empty parent card"
+        );
         {
             let projection = collaborators.get_mut("vendor-late-prompt").unwrap();
             engine
@@ -16836,6 +16874,40 @@ default_permission_mode = "ask"
                 .await
                 .unwrap();
         }
+        engine
+            .publish_backend_collaborator_spawn(
+                &parent,
+                1,
+                "vendor-late-prompt",
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        engine
+            .publish_backend_collaborator_spawn(
+                &parent,
+                1,
+                "vendor-late-prompt",
+                &mut collaborators,
+            )
+            .await
+            .unwrap();
+        let late_parent_prompts = store
+            .events_after(&Scope::Thread(parent.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                Event::SubagentSpawned {
+                    thread_id, prompt, ..
+                } if thread_id == late_prompt_child_id => Some(prompt),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            late_parent_prompts,
+            vec!["Recovered after completion.".to_string()]
+        );
+        assert!(collaborators["vendor-late-prompt"].spawn_link_published);
         let late_prompt_events = store
             .events_after(&Scope::Thread(late_prompt_child_id.clone()), 0)
             .unwrap();
