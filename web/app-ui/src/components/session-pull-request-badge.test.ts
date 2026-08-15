@@ -74,7 +74,7 @@ describe("session pull-request navigation badges", () => {
     expect(sessionPullRequestBadge([])).toBeUndefined();
   });
 
-  it("keeps the pull-request badge visible alongside every work status", () => {
+  it("returns a ready pull-request badge and no badge for an empty list", () => {
     const ready = [pr(7, { merge_state_status: "clean" })];
     expect(visibleSessionPullRequestBadge(ready)?.tone).toBe("ready");
     expect(visibleSessionPullRequestBadge([])).toBeUndefined();

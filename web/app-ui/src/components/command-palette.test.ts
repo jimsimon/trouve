@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 
+import { render } from "@lit-labs/ssr";
 import { describe, expect, it } from "vitest";
 
 import type { ProtocolPrInfo } from "../services/protocol-client.js";
@@ -10,6 +11,7 @@ import {
   nextCommandPaletteIndex,
   type CommandPaletteInput,
 } from "./command-palette-model.js";
+import { renderCommandPaletteOption } from "./command-palette.js";
 
 const pr = (
   number: number,
@@ -288,12 +290,7 @@ describe("command palette component contract", () => {
   });
 
   it("renders session results with the shared sidebar status and pull-request indicators", () => {
-    expect(component).toContain('class="session-indicator ${item.sessionIndicator.kind}"');
-    expect(component).toContain('class="session-pr-badge ${item.pullRequestBadge.tone}"');
-    expect(component).toContain('class="command-palette-trailing"');
-    expect(component).toContain('fontAwesomeIcon("code-pull-request")');
     expect(component).not.toContain('class="status-dot ${item.state}"');
-    expect(component).toContain("item.sessionIndicator.tooltip");
     expect(styles).toContain(".session-indicator.busy::before");
     expect(styles).toContain(".session-pr-badge.ready { color: var(--trouve-ok); }");
     expect(styles).toContain(".session-pr-badge.blocked { color: var(--trouve-warn); }");
@@ -305,11 +302,48 @@ describe("command palette component contract", () => {
     expect(styles).toContain(".command-palette-trailing { display: flex;");
   });
 
-  it("uses the trailing badge only for the current result", () => {
-    expect(component).toContain('class="command-palette-current">Current</span>');
-    expect(component).not.toContain('class="command-palette-state');
-    expect(styles).toContain(".command-palette-current");
-    expect(styles).toContain("color: var(--trouve-ok)");
+  it("renders representative work statuses with Current before the PR badge", () => {
+    const cases: readonly [
+      Partial<CommandPaletteInput["sessions"][number]>,
+      string,
+      string,
+    ][] = [
+      [{ attention: "approval" }, "approval", "Approval pending"],
+      [{ attention: "question" }, "question", "Question awaiting an answer"],
+      [
+        { attention: "none", outcome: "succeeded", unread: true, state: "done" },
+        "unread",
+        "Unviewed work",
+      ],
+    ];
+    for (const [overrides, kind, workTooltip] of cases) {
+      const item = buildCommandPaletteItems({
+        ...input,
+        route: {
+          kind: "session",
+          workspaceId: "ws-app",
+          sessionId: "se-review",
+          threadId: "th-review",
+        },
+        sessions: input.sessions.map((session) => session.id === "se-review"
+          ? { ...session, ...overrides }
+          : session),
+      }).find(({ id }) => id === "session:se-review");
+      expect(item).toBeDefined();
+      const rendered = [...render(renderCommandPaletteOption(item!, 0, true, () => {}))]
+        .join("");
+      const trailingLabel = rendered.match(
+        /class="command-palette-trailing"\s+aria-label="([^"]+)"/,
+      )?.[1];
+
+      expect(rendered.match(/class="command-palette-trailing"/g)).toHaveLength(1);
+      expect(rendered).toContain(`class="session-indicator ${kind}"`);
+      expect(rendered.indexOf(">Current<")).toBeLessThan(
+        rendered.indexOf('class="session-pr-badge blocked"'),
+      );
+      expect(trailingLabel).toContain(workTooltip);
+      expect(trailingLabel).toContain("Pull request\n#3183 · Unable to merge");
+    }
   });
 
   it("opens the provisional setup for new-thread actions", () => {
