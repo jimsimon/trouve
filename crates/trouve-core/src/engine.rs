@@ -1321,6 +1321,19 @@ fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn validate_persona_id(id: &str) -> Result<(), EngineError> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(EngineError::BadRequest(
+            "persona id must be non-empty and [a-zA-Z0-9_-] only".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
     THINKING_OPTION_KEYS
         .iter()
@@ -4558,6 +4571,7 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertPersonaRequest,
     ) -> Result<(), EngineError> {
+        validate_persona_id(id)?;
         let config_dir = self
             .config_dir
             .as_deref()
@@ -4587,6 +4601,7 @@ impl Engine {
     /// Remove a user-level persona file: deletes a custom persona, or resets a
     /// customized built-in to its defaults.
     pub fn delete_persona(&self, id: &str) -> Result<(), EngineError> {
+        validate_persona_id(id)?;
         let config_dir = self
             .config_dir
             .as_deref()
@@ -14464,6 +14479,161 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
+        trouve_protocol::UpsertPersonaRequest {
+            display_name: display_name.into(),
+            system_prompt: format!("Act as {display_name}."),
+            allowed_tools: vec!["read_file".into()],
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        }
+    }
+
+    #[test]
+    fn persona_mutations_reject_unsafe_ids_before_file_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let outside = config_dir.join("escape.toml");
+        std::fs::write(&outside, "sentinel").unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir));
+
+        for id in ["", "../escape", "has/slash", "has space", "question?"] {
+            assert!(matches!(
+                engine.upsert_persona(id, persona_request("Unsafe")),
+                Err(EngineError::BadRequest(_))
+            ));
+            assert!(matches!(
+                engine.delete_persona(id),
+                Err(EngineError::BadRequest(_))
+            ));
+        }
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn delete_persona_cleans_custom_references_and_resets_system_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let workspace = tmp.path().join("workspace");
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            tmp.path().join("data"),
+            &Config::default(),
+        )
+        .with_config_dir(Some(config_dir.clone()));
+
+        engine
+            .upsert_persona("custom", persona_request("Custom persona"))
+            .unwrap();
+        engine
+            .upsert_persona("code", persona_request("Customized Code"))
+            .unwrap();
+        engine
+            .upsert_persona("correctness", persona_request("Customized Correctness"))
+            .unwrap();
+        let workspace_persona = AgentPersona {
+            id: "workspace-only".into(),
+            display_name: "Workspace only".into(),
+            system_prompt: "Inspect the workspace.".into(),
+            allowed_tools: vec!["read_file".into()],
+            read_only: true,
+            default_permission_mode: None,
+            default_model: None,
+            default_thinking_level: None,
+        };
+        personas::upsert_user_persona(&workspace.join(".agents"), &workspace_persona).unwrap();
+        assert!(
+            personas::resolve_persona_infos(None, Some(&workspace))
+                .iter()
+                .any(|info| info.persona.id == "workspace-only" && info.origin == "workspace")
+        );
+
+        engine
+            .store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Manual,
+                model: Some("openai/reviewer".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: "preserve this".into(),
+                reviewer_ids: Some(vec!["custom".into()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
+                semantic_routing: Some(false),
+                included_reviewer_ids: Some(vec![
+                    "custom".into(),
+                    "code".into(),
+                    "correctness".into(),
+                    "workspace-only".into(),
+                ]),
+                excluded_reviewer_ids: Some(vec!["custom".into()]),
+                reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                    reviewer_id: "custom".into(),
+                    model: None,
+                    thinking_level: None,
+                    prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
+                    prompt: "custom prompt".into(),
+                }]),
+            })
+            .unwrap();
+
+        engine.delete_persona("custom").unwrap();
+        let repository = engine
+            .store
+            .list_code_review_repositories()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repository.reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
+        );
+        assert_eq!(
+            repository.included_reviewer_ids,
+            ["code", "correctness", "workspace-only"]
+        );
+        assert!(repository.excluded_reviewer_ids.is_empty());
+        assert!(repository.reviewer_overrides.is_empty());
+        assert_eq!(repository.prompt, "preserve this");
+        assert_eq!(repository.model.as_deref(), Some("openai/reviewer"));
+
+        engine.delete_persona("code").unwrap();
+        engine.delete_persona("correctness").unwrap();
+        let infos = engine.list_persona_infos(None).unwrap();
+        for (id, customized_name) in [
+            ("code", "Customized Code"),
+            ("correctness", "Customized Correctness"),
+        ] {
+            let info = infos.iter().find(|info| info.persona.id == id).unwrap();
+            assert_eq!(info.origin, "builtin");
+            assert_ne!(info.persona.display_name, customized_name);
+        }
+
+        assert!(matches!(
+            engine.delete_persona("workspace-only"),
+            Err(EngineError::BadRequest(_))
+        ));
+        let repository = engine
+            .store
+            .list_code_review_repositories()
+            .unwrap()
+            .remove(0);
+        assert!(
+            repository
+                .included_reviewer_ids
+                .contains(&"workspace-only".to_string())
+        );
+    }
 
     #[test]
     fn github_permission_failures_require_reauthentication() {

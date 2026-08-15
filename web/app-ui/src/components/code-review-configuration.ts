@@ -200,20 +200,6 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
       border-radius: var(--trouve-radius-sm);
       background: var(--trouve-inset-bg);
     }
-    .persona-copy { display: grid; gap: 5px; }
-    .persona-copy p { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .confirm {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 7px;
-      padding: 9px;
-      border: 1px solid var(--trouve-err);
-      border-radius: var(--trouve-radius-sm);
-      background: var(--trouve-panel-bg);
-    }
-    .confirm span { flex: 1 1 220px; color: var(--trouve-text-hi); }
     .empty { padding: 9px 0; color: var(--trouve-text-dim); }
     .visually-hidden {
       position: absolute;
@@ -474,7 +460,11 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
         <legend>${legend}</legend>
         <p>${description}</p>
         ${this.#reviewers.length === 0
-          ? html`<div class="empty">No personas are available. Create one under Settings → Personas &amp; Models before enabling reviews.</div>`
+          ? html`<div class="empty">
+              No personas are available.
+              <button type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "personas" })}>Open Personas &amp; Models</button>
+              before enabling reviews.
+            </div>`
           : html`
               <div class="check-grid">
                 ${this.#reviewers.map((reviewer) => html`
