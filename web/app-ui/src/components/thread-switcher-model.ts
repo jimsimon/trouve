@@ -113,9 +113,11 @@ export const durableThreadTabCapacity = (
 ): number => Math.max(0, totalCapacity - (provisionalOpen ? 1 : 0));
 
 /**
- * Selects the bounded desktop working set. Pinned threads lead while the
- * current thread always receives a slot; recent and durable open threads fill
- * the remainder.
+ * Selects the bounded desktop working set. Pinned threads receive priority
+ * while the current thread always receives a slot; recent and durable open
+ * threads fill the remainder. Threads retained from the previous working set
+ * keep their slots so selecting a tab never reorders the row. Newly admitted
+ * threads fill the slots vacated by evicted threads.
  */
 export const threadWorkingSet = (
   openThreadIds: readonly string[],
@@ -123,6 +125,7 @@ export const threadWorkingSet = (
   pinnedThreadIds: readonly string[],
   recentThreadIds: readonly string[],
   capacity: number,
+  previousThreadIds: readonly string[] = [],
 ): readonly string[] => {
   if (capacity <= 0 || openThreadIds.length === 0) return [];
   const open = new Set(openThreadIds);
@@ -143,5 +146,24 @@ export const threadWorkingSet = (
   append(currentThreadId);
   for (const id of recentThreadIds) append(id);
   for (const id of openThreadIds) append(id);
-  return selected;
+
+  if (previousThreadIds.length === 0) return selected;
+  const selectedIds = new Set(selected);
+  const placedIds = new Set<string>();
+  const slots: Array<string | undefined> = previousThreadIds
+    .slice(0, capacity)
+    .map((id) => {
+      if (!selectedIds.has(id) || placedIds.has(id)) return undefined;
+      placedIds.add(id);
+      return id;
+    });
+  while (slots.length < selected.length) slots.push(undefined);
+  for (const id of selected) {
+    if (placedIds.has(id)) continue;
+    const vacantIndex = slots.indexOf(undefined);
+    if (vacantIndex < 0) break;
+    slots[vacantIndex] = id;
+    placedIds.add(id);
+  }
+  return slots.filter((id): id is string => id !== undefined);
 };
