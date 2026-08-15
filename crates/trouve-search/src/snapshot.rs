@@ -359,6 +359,18 @@ pub fn open_latest(dir: &Path, model_id: &str, content: &[String]) -> Option<Raw
 
 impl RawSnapshot {
     fn open(path: &Path, expect_hash: Option<&[u8; 32]>) -> Result<RawSnapshot> {
+        let snapshot = Self::open_unvalidated(path, expect_hash)?;
+        snapshot.validate_structure()?;
+        Ok(snapshot)
+    }
+
+    fn open_metadata(path: &Path, expect_hash: Option<&[u8; 32]>) -> Result<RawSnapshot> {
+        let snapshot = Self::open_unvalidated(path, expect_hash)?;
+        snapshot.validate_metadata()?;
+        Ok(snapshot)
+    }
+
+    fn open_unvalidated(path: &Path, expect_hash: Option<&[u8; 32]>) -> Result<RawSnapshot> {
         let file = std::fs::File::open(path)?;
         // SAFETY: the snapshot is private to the trouve cache and replaced
         // only by atomic renames; an existing mapping stays valid after
@@ -452,7 +464,7 @@ impl RawSnapshot {
             bail!("snapshot has trailing bytes");
         }
 
-        let snapshot = RawSnapshot {
+        Ok(RawSnapshot {
             map,
             meta,
             records_off,
@@ -463,9 +475,7 @@ impl RawSnapshot {
             posting_offsets_off,
             postings_off,
             doc_lengths_off,
-        };
-        snapshot.validate_structure()?;
-        Ok(snapshot)
+        })
     }
 
     pub fn manifest(&self) -> &[ManifestEntry] {
@@ -538,10 +548,8 @@ impl RawSnapshot {
         &all[offsets[i] as usize..offsets[i + 1] as usize]
     }
 
-    /// Validate relationships bincode and section bounds cannot express.
-    /// These checks keep corrupt-but-decodable cache files from reaching
-    /// unchecked zero-copy slices in query and patch code.
-    fn validate_structure(&self) -> Result<()> {
+    /// Validate relationships entirely described by snapshot metadata.
+    fn validate_metadata(&self) -> Result<Vec<(usize, usize, &str)>> {
         let n_chunks = self.meta.n_chunks as usize;
         if self.meta.num_docs != self.meta.n_chunks {
             bail!("snapshot chunk/document count mismatch");
@@ -559,6 +567,44 @@ impl RawSnapshot {
         {
             bail!("snapshot contains duplicate file paths");
         }
+
+        let mut manifest_paths = HashSet::with_capacity(self.meta.manifest.len());
+        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
+        for entry in &self.meta.manifest {
+            if !manifest_paths.insert(entry.rel_path.as_str()) {
+                bail!("snapshot manifest contains duplicate paths");
+            }
+            let start = entry.first_row as usize;
+            let end = start
+                .checked_add(entry.n_rows as usize)
+                .context("snapshot manifest row range overflow")?;
+            if end > n_chunks {
+                bail!("snapshot manifest row range out of bounds");
+            }
+            if entry.n_rows > 0 {
+                ranges.push((start, end, entry.rel_path.as_str()));
+            }
+        }
+        ranges.sort_unstable_by_key(|range| range.0);
+        let mut expected_row = 0usize;
+        for &(start, end, _) in &ranges {
+            if start != expected_row {
+                bail!("snapshot manifest row ranges overlap or have gaps");
+            }
+            expected_row = end;
+        }
+        if expected_row != n_chunks {
+            bail!("snapshot manifest does not cover every chunk row");
+        }
+
+        Ok(ranges)
+    }
+
+    /// Validate relationships bincode and section bounds cannot express.
+    /// These checks keep corrupt-but-decodable cache files from reaching
+    /// unchecked zero-copy slices in query and patch code.
+    fn validate_structure(&self) -> Result<()> {
+        let ranges = self.validate_metadata()?;
 
         let records = self.records();
         let texts = self.texts();
@@ -593,38 +639,12 @@ impl RawSnapshot {
             bail!("snapshot file table contains an unreferenced path");
         }
 
-        let mut manifest_paths = HashSet::with_capacity(self.meta.manifest.len());
-        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
-        for entry in &self.meta.manifest {
-            if !manifest_paths.insert(entry.rel_path.as_str()) {
-                bail!("snapshot manifest contains duplicate paths");
-            }
-            let start = entry.first_row as usize;
-            let end = start
-                .checked_add(entry.n_rows as usize)
-                .context("snapshot manifest row range overflow")?;
-            if end > n_chunks {
-                bail!("snapshot manifest row range out of bounds");
-            }
-            if entry.n_rows > 0 {
-                ranges.push((start, end, entry.rel_path.as_str()));
-            }
-        }
-        ranges.sort_unstable_by_key(|range| range.0);
-        let mut expected_row = 0usize;
         for (start, end, path) in ranges {
-            if start != expected_row {
-                bail!("snapshot manifest row ranges overlap or have gaps");
-            }
             for record in &records[start..end] {
                 if self.meta.files[record.file_id as usize] != path {
                     bail!("snapshot manifest path does not own its chunk rows");
                 }
             }
-            expected_row = end;
-        }
-        if expected_row != n_chunks {
-            bail!("snapshot manifest does not cover every chunk row");
         }
 
         let term_offsets = self.term_offsets();
@@ -952,11 +972,11 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
     })
 }
 
-/// Union of store entry keys referenced by every readable snapshot in `dir`:
-/// the mark phase of the store's mark-and-sweep GC. Snapshots that fail to
-/// open (older versions, corruption) contribute nothing, which is correct:
-/// their entries were written under a different store version and can never
-/// be hit by this binary anyway.
+/// Union of store entry keys referenced by every metadata-valid snapshot in
+/// `dir`: the mark phase of the store's mark-and-sweep GC. Payload sections
+/// are not scanned during conservative marking. Snapshots with unreadable or
+/// invalid metadata contribute nothing; their entries cannot be addressed by
+/// this binary anyway.
 pub fn live_entry_keys(dir: &Path) -> std::collections::HashSet<String> {
     let mut live = std::collections::HashSet::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -967,7 +987,7 @@ pub fn live_entry_keys(dir: &Path) -> std::collections::HashSet<String> {
         if path.extension().is_none_or(|x| x != "snap") {
             continue;
         }
-        let Ok(raw) = RawSnapshot::open(&path, None) else {
+        let Ok(raw) = RawSnapshot::open_metadata(&path, None) else {
             continue;
         };
         for m in raw.manifest() {
@@ -1333,6 +1353,23 @@ mod tests {
         // Unreadable snapshots contribute nothing instead of failing.
         std::fs::write(dir.path().join("junk.snap"), b"not a snapshot").unwrap();
         assert_eq!(live_entry_keys(dir.path()), live);
+    }
+
+    #[test]
+    fn live_entry_keys_does_not_scan_snapshot_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [2u8; 32];
+        save_sample(dir.path(), &hash);
+        let expected = live_entry_keys(dir.path());
+        let path = snapshot_path(dir.path(), &hash);
+
+        rewrite_sections(&path, &hash, |raw, bytes| {
+            let last = raw.term_offsets_off + raw.n_terms() * std::mem::size_of::<u32>();
+            bytes[last..last + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        });
+
+        assert!(RawSnapshot::open(&path, Some(&hash)).is_err());
+        assert_eq!(live_entry_keys(dir.path()), expected);
     }
 
     #[test]

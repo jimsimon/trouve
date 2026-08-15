@@ -681,7 +681,9 @@ fn compute_file_entries(
                 let n = entry.chunks.len();
                 entry.embeddings = embeddings[start * dim..(start + n) * dim].to_vec();
                 entry.dim = dim as u32;
-                let _ = store.put(key, entry);
+                if let Err(error) = store.put(key, entry) {
+                    eprintln!("warning: failed to write search cache entry {key}: {error:#}");
+                }
             });
     });
 

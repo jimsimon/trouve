@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use anyhow::{Context, Result, anyhow};
 use memmap2::Mmap;
@@ -160,6 +160,22 @@ impl FastBert {
 }
 
 static MODEL_CACHE: OnceLock<Mutex<Vec<Arc<EmbeddingModel>>>> = OnceLock::new();
+static MODEL_LOAD_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+fn model_load_lock(id: &str) -> Arc<Mutex<()>> {
+    let mut locks = MODEL_LOAD_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(id.to_string(), Arc::downgrade(&lock));
+    lock
+}
 
 impl EmbeddingModel {
     /// Load a model from the Hugging Face Hub or a local path, caching per id.
@@ -174,6 +190,19 @@ impl EmbeddingModel {
                 return Ok(found.clone());
             }
         }
+
+        // Model validation may invalidate and redownload Hub snapshot
+        // pointers. Serialize that whole load/refresh sequence per model id,
+        // while allowing unrelated models to load concurrently.
+        let load_lock = model_load_lock(&id);
+        let _load_guard = load_lock.lock().unwrap();
+        {
+            let cached = cache.lock().unwrap();
+            if let Some(found) = cached.iter().find(|m| m.model_id == id) {
+                return Ok(found.clone());
+            }
+        }
+
         let files = resolve_model_files(&id)?;
         let model = load_model_with_refresh(&id, &files, || refresh_model_files(&id, &files))
             .with_context(|| format!("failed to load embedding model {id:?}"))?;
@@ -753,6 +782,19 @@ fn refresh_model_files(id: &str, files: &ModelFiles) -> Result<Option<ModelFiles
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_load_locks_serialize_per_id() {
+        let first = model_load_lock("test-model-load-lock");
+        let same = model_load_lock("test-model-load-lock");
+        let other = model_load_lock("test-other-model-load-lock");
+
+        let guard = first.lock().unwrap();
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(guard);
+        assert!(same.try_lock().is_ok());
+    }
 
     /// WordLevel tokenizer with `words` in the vocabulary (plus [UNK] at 0).
     fn tokenizer_json(words: &[&str]) -> String {
