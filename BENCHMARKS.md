@@ -132,16 +132,17 @@ Measured on this monorepo at `b2cf65bf` (409 source files), on the test machine
 described above. Each case had one warm-up followed by 10 full CLI invocations;
 the table reports the median across all 50 timed searches. trouve used an
 isolated cache, with the index built once before warm measurements. GNU grep
-3.12 and ripgrep 15.2 searched the same configured source extensions.
+3.12 and ripgrep 15.2 searched the authoritative code-extension set reported
+by the same trouve-search binary.
 
 | Tool | Median warm query | Mean provider input tokens | Relative tokens | Cost / 1k searches |
 | --- | ---: | ---: | ---: | ---: |
-| trouve-search | 80.19 ms | 716 | 1.00x | $2.1492 |
-| grep | 17.82 ms | 5,863 | 8.19x | $17.5902 |
-| ripgrep | 6.37 ms | 5,863 | 8.19x | $17.5902 |
+| trouve-search | 82.02 ms | 716 | 1.00x | $2.1492 |
+| grep | 32.97 ms | 5,863 | 8.19x | $17.5902 |
+| ripgrep | 6.81 ms | 5,863 | 8.19x | $17.5902 |
 
-The one-time trouve index build plus first query took 368.46 ms. ripgrep is
-12.6x faster than a warm trouve CLI invocation here, while trouve reduces the
+The one-time trouve index build plus first query took 385.01 ms. ripgrep is
+12.0x faster than a warm trouve CLI invocation here, while trouve reduces the
 average returned context by 87.8%. At an illustrative provider input price of
 $3 per million tokens, that is $2.15 instead of $17.59 per 1,000 searches. The
 price is a benchmark parameter (`--input-cost-per-million`), not an assumption

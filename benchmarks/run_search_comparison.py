@@ -36,30 +36,7 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_CASES = ROOT / "benchmarks" / "search_comparison_cases.json"
 DEFAULT_BINARY = ROOT / "target" / "release" / "trouve-search"
-DEFAULT_EXTENSIONS = (
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cs",
-    ".go",
-    ".h",
-    ".hpp",
-    ".java",
-    ".js",
-    ".jsx",
-    ".kt",
-    ".kts",
-    ".mjs",
-    ".py",
-    ".rb",
-    ".rs",
-    ".sh",
-    ".swift",
-    ".ts",
-    ".tsx",
-    ".vue",
-    ".zig",
-)
+METADATA_TIMEOUT_SECONDS = 5
 EXCLUDED_DIRS = (
     ".cache",
     ".eggs",
@@ -207,17 +184,54 @@ def invoke(
     return elapsed_ms, process.stdout
 
 
+def metadata_process(command: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=METADATA_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def first_line(command: list[str]) -> str:
-    process = subprocess.run(command, capture_output=True, text=True, check=False)
+    process = metadata_process(command)
+    if process is None:
+        return "unknown"
     output = process.stdout or process.stderr
     return output.splitlines()[0].strip() if output else "unknown"
 
 
 def git_value(repo: pathlib.Path, *arguments: str) -> str | None:
-    process = subprocess.run(
-        ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False
+    process = metadata_process(["git", "-C", str(repo), *arguments])
+    return process.stdout.strip() if process is not None and process.returncode == 0 else None
+
+
+def parse_extensions(output: str) -> tuple[str, ...]:
+    try:
+        values = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"trouve-search returned invalid extension JSON: {error}") from error
+    if not isinstance(values, list) or not values or not all(
+        isinstance(value, str) and value.startswith(".") for value in values
+    ):
+        raise ValueError("trouve-search returned an invalid code-extension list")
+    return tuple(values)
+
+
+def supported_code_extensions(binary: pathlib.Path) -> tuple[str, ...]:
+    process = metadata_process(
+        [str(binary), "debug", "extensions", "--content", "code"]
     )
-    return process.stdout.strip() if process.returncode == 0 else None
+    if process is None:
+        raise ValueError("trouve-search extension discovery failed or timed out")
+    if process.returncode != 0:
+        error = process.stderr.strip() or f"exit code {process.returncode}"
+        raise ValueError(f"trouve-search extension discovery failed: {error}")
+    return parse_extensions(process.stdout)
 
 
 def source_file_count(repo: pathlib.Path, extensions: tuple[str, ...]) -> int:
@@ -289,17 +303,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3.0,
         help="illustrative provider input price in USD (default: 3.0)",
     )
-    parser.add_argument(
-        "--extension",
-        action="append",
-        dest="extensions",
-        help="source extension to scan; repeat to replace the default set",
-    )
     parser.add_argument("--output", type=pathlib.Path, help="write full JSON results")
     args = parser.parse_args(argv)
     if args.runs < 1 or args.warmups < 0 or args.top_k < 1 or args.max_snippet_lines < 0:
         parser.error("runs/top-k must be positive; warmups/snippet lines cannot be negative")
-    if args.input_cost_per_million < 0:
+    if not math.isfinite(args.input_cost_per_million) or args.input_cost_per_million < 0:
         parser.error("input cost cannot be negative")
     return args
 
@@ -317,12 +325,9 @@ def main(argv: list[str] | None = None) -> int:
         if shutil.which(executable) is None:
             sys.exit(f"required executable not found: {executable}")
 
-    extensions = tuple(
-        value if value.startswith(".") else f".{value}"
-        for value in (args.extensions or DEFAULT_EXTENSIONS)
-    )
     try:
         cases = load_cases(cases_path)
+        extensions = supported_code_extensions(binary)
     except ValueError as error:
         sys.exit(str(error))
 

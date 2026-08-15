@@ -5,6 +5,10 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from subprocess import TimeoutExpired
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -12,7 +16,11 @@ from run_search_comparison import (  # noqa: E402
     SearchCase,
     command_for,
     estimated_input_tokens,
+    first_line,
+    git_value,
     load_cases,
+    parse_args,
+    parse_extensions,
     summarize,
 )
 
@@ -40,13 +48,37 @@ class SearchComparisonTests(unittest.TestCase):
 
     def test_commands_use_intent_for_trouve_and_pattern_for_lexical_tools(self):
         case = SearchCase("case", "semantic intent", "literal|names")
-        trouve = command_for("trouve-search", case, pathlib.Path("/bin/trouve"), (".rs",), 5, 10)
-        grep = command_for("grep", case, pathlib.Path("/bin/trouve"), (".rs",), 5, 10)
-        ripgrep = command_for("ripgrep", case, pathlib.Path("/bin/trouve"), (".rs",), 5, 10)
+        extensions = (".ex",)
+        trouve = command_for(
+            "trouve-search", case, pathlib.Path("/bin/trouve"), extensions, 5, 10
+        )
+        grep = command_for("grep", case, pathlib.Path("/bin/trouve"), extensions, 5, 10)
+        ripgrep = command_for(
+            "ripgrep", case, pathlib.Path("/bin/trouve"), extensions, 5, 10
+        )
         self.assertIn("semantic intent", trouve)
         self.assertNotIn("literal|names", trouve)
         self.assertIn("literal|names", grep)
         self.assertIn("literal|names", ripgrep)
+        self.assertIn("--include=*.ex", grep)
+        self.assertIn("*.ex", ripgrep)
+
+    def test_parses_authoritative_extensions_including_less_common_code(self):
+        self.assertEqual(parse_extensions('[".ex", ".rs"]'), (".ex", ".rs"))
+
+    @mock.patch("run_search_comparison.subprocess.run", side_effect=OSError)
+    def test_first_line_falls_back_when_command_is_unavailable(self, _run):
+        self.assertEqual(first_line(["missing"]), "unknown")
+
+    @mock.patch("run_search_comparison.subprocess.run", side_effect=TimeoutExpired("git", 5))
+    def test_git_value_falls_back_when_command_times_out(self, _run):
+        self.assertIsNone(git_value(pathlib.Path("."), "rev-parse", "HEAD"))
+
+    def test_rejects_non_finite_input_costs(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args(["--input-cost-per-million", value])
 
     def test_summary_converts_tokens_to_provider_cost(self):
         cases = [
