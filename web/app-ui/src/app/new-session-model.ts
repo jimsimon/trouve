@@ -152,9 +152,11 @@ export const resolveNewThreadDefaults = (
   const mode = modes.find((candidate) => candidate.id === requestedModeId)
     ?? modes.find((candidate) => candidate.id === "code")
     ?? modes[0];
-  const modelId = resolveNewSessionModel(overrides.modelId, mode, providers)
-    ?? models[0]?.id
-    ?? "";
+  const resolvedModelId = resolveNewSessionModel(overrides.modelId, mode, providers);
+  const modelId = resolvedModelId !== undefined
+      && models.some((candidate) => candidate.id === resolvedModelId)
+    ? resolvedModelId
+    : models[0]?.id ?? "";
   const model = models.find((candidate) => candidate.id === modelId);
   const option = thinkingOption(model);
   const thinking = [

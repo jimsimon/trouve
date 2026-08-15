@@ -163,6 +163,22 @@ describe("new session model", () => {
     });
   });
 
+  it("falls back to an advertised model when inherited defaults are stale", () => {
+    const available = model({}, "provider/available");
+    expect(resolveNewThreadDefaults(
+      [mode("provider/stale-mode")],
+      [available],
+      providers("provider/stale-global"),
+    ).modelId).toBe("provider/available");
+    expect(resolveNewThreadDefaults(
+      [mode(null)],
+      [available],
+      providers("provider/stale-global"),
+    ).modelId).toBe("provider/available");
+    expect(resolveNewThreadDefaults([], [], providers("provider/stale-global")).modelId)
+      .toBe("");
+  });
+
   it("chooses main, master, then literal HEAD for a new session base", () => {
     expect(resolveNewSessionBaseRef(["feature", "master", "main"])).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");

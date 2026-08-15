@@ -312,6 +312,7 @@ export class TrouveNewThreadSetup extends LitElement {
       this.#observedSessionId = sessionId;
       this.#draft = createInitialNewThreadDraft(this.#catalog);
       this.#optionsTouched = false;
+      this.#promptComposing = false;
       this.#attachmentLoading = false;
       this.#attachmentError = "";
       this.#internalError = "";

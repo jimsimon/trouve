@@ -67,6 +67,9 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("event.key !== \"Enter\" || event.shiftKey");
     expect(component).toContain(".form?.requestSubmit()");
     expect(component).toContain("@compositionstart=${this.#promptCompositionStarted}");
+    expect(component).toContain(
+      'this.#optionsTouched = false;\n      this.#promptComposing = false;',
+    );
   });
 
   it("keeps static controls immediate while surfacing busy, warning, and error states", () => {
