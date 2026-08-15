@@ -1435,9 +1435,9 @@ mod tests {
         let mut owner = std::process::Command::new("/bin/true");
         let (sentinel, writer) = install_unix_descendant_sentinel(&mut owner).unwrap();
         let writer_fd = writer.as_raw_fd();
-        let mut unrelated = std::process::Command::new("/bin/sh");
+        let mut unrelated = std::process::Command::new("/bin/sleep");
         unrelated
-            .args(["-c", "sleep 60"])
+            .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
