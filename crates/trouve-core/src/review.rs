@@ -82,6 +82,8 @@ const REVIEW_BATCH_FORMAT_VERSION: &str = "2";
 const REVIEW_BATCH_MAX_PATH_BYTES: usize = 16 * 1024;
 const REVIEW_COORDINATOR_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const REVIEW_DIFF_MAX_FILES: usize = 250;
+const REVIEW_DIFF_MAX_CHANGED_LINES: u64 = 20_000;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
@@ -3491,6 +3493,7 @@ impl Engine {
                     worktree: repository_path.clone(),
                     base_sha: review_watermark_sha.clone(),
                     head_sha: job.head_sha.clone(),
+                    cancel: superseded.clone(),
                 })
                 .await
             {
@@ -3523,6 +3526,7 @@ impl Engine {
                     worktree: repository_path.clone(),
                     base_sha: job.base_ref.clone(),
                     head_sha: job.head_sha.clone(),
+                    cancel: superseded.clone(),
                 })
                 .await
                 .map_err(|error| anyhow!(error))
@@ -3591,6 +3595,9 @@ impl Engine {
                         base_sha: job.review_base_sha.clone(),
                         cancel: superseded.clone(),
                         head_sha: job.head_sha.clone(),
+                        max_files: REVIEW_DIFF_MAX_FILES,
+                        max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
+                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
                     })
                     .await
                     .map_err(|error| anyhow!(error))?,
@@ -3609,6 +3616,7 @@ impl Engine {
                     worktree: session.worktree_path.clone().into(),
                     base_sha: previous_pull_state.last_reviewed_base_sha.clone(),
                     head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
+                    cancel: superseded.clone(),
                 })
                 .await;
             match previous_merge_base {
@@ -3621,6 +3629,9 @@ impl Engine {
                             base_sha: previous_merge_base.clone(),
                             head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
                             cancel: superseded.clone(),
+                            max_files: REVIEW_DIFF_MAX_FILES,
+                            max_changed_lines: REVIEW_DIFF_MAX_CHANGED_LINES,
+                            max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
                         })
                         .await;
                     match previous_diff {
@@ -3969,20 +3980,27 @@ impl Engine {
                                 finding,
                             })
                             .collect::<Vec<_>>();
-                        let task = engine
-                            .store
-                            .finish_code_review_task(
-                                &task.id,
-                                "succeeded",
-                                &turn.output,
-                                candidates.len() as u64,
-                                "",
-                            )?
-                            .ok_or_else(|| anyhow!("review task disappeared while finishing"))?;
+                        let Some(task) = engine.store.finish_code_review_task(
+                            &task.id,
+                            "succeeded",
+                            &turn.output,
+                            candidates.len() as u64,
+                            "",
+                        )?
+                        else {
+                            bail!("stale: review task was superseded while finishing");
+                        };
                         engine.emit_code_review_task(&job.id, task)?;
                         Ok::<_, anyhow::Error>(candidates)
                     }
                     .await;
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().starts_with("stale:"))
+                    {
+                        engine.refresh_code_review_progress(&job.id).await?;
+                        return result;
+                    }
                     if let Err(error) = &result
                         && let Some(task) = engine.store.finish_code_review_task(
                             &task.id,
@@ -4037,16 +4055,11 @@ impl Engine {
         let coordinator_started = Instant::now();
         let parsed = if candidates.is_empty() && previous_findings.is_empty() {
             ReviewOutput {
-                summary: if reused_hunk_count == 0 {
-                    no_candidate_review_summary(selected_reviewer_count, diff_files.len())
-                } else {
-                    format!(
-                        "{} reviewer(s) examined {} changed file(s) after reusing {} unchanged hunk(s) from the prior review; no actionable issues were confirmed.",
-                        selected_reviewer_count,
-                        diff_files.len(),
-                        reused_hunk_count
-                    )
-                },
+                summary: no_candidate_review_summary(
+                    selected_reviewer_count,
+                    diff_files.len(),
+                    reused_hunk_count,
+                ),
                 findings: Vec::new(),
                 rejected_candidates: Vec::new(),
                 resolved_finding_ids: Vec::new(),
@@ -7419,14 +7432,23 @@ fn selected_reviewer_count(
         .len()
 }
 
-fn no_candidate_review_summary(reviewer_count: usize, changed_file_count: usize) -> String {
+fn no_candidate_review_summary(
+    reviewer_count: usize,
+    changed_file_count: usize,
+    reused_hunk_count: usize,
+) -> String {
     if reviewer_count == 0 {
         return format!(
             "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
         );
     }
+    let reuse = if reused_hunk_count == 0 {
+        String::new()
+    } else {
+        format!(" after reusing {reused_hunk_count} unchanged hunk(s) from the prior review")
+    };
     format!(
-        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s); no actionable issues were confirmed."
+        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s){reuse}; no actionable issues were confirmed."
     )
 }
 
@@ -12926,7 +12948,7 @@ mod tests {
         );
         assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 3);
         assert_eq!(
-            no_candidate_review_summary(3, 1),
+            no_candidate_review_summary(3, 1, 0),
             "3 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
         );
     }

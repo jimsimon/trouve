@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use trouve_agents::process_env::{ProcessTreeChild, spawn_process_tree};
 use trouve_protocol::{AgentPersona, ToolStatus};
 use trouve_providers::ToolSpec;
 
@@ -113,111 +114,22 @@ fn review_repository_identity(repository_path: &Path) -> std::result::Result<Pat
     Ok(parent.join(name))
 }
 
-#[cfg(unix)]
-fn isolate_review_git_process(command: &mut tokio::process::Command) {
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn isolate_review_git_process(_command: &mut tokio::process::Command) {}
-
-#[cfg(windows)]
-async fn terminate_windows_review_git_tree(pid: Option<u32>) -> std::io::Result<()> {
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    let status = tokio::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status()
-        .await?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "taskkill exited with {status}"
-        )))
-    }
-}
-
-#[cfg(unix)]
-fn signal_review_git_process_group(pid: Option<u32>, signal: i32) -> std::io::Result<()> {
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    let result = unsafe { libc::kill(-(pid as i32), signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-#[cfg(unix)]
-fn review_git_process_group_exists(pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    let result = unsafe { libc::kill(-(pid as i32), 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(unix)]
-async fn wait_for_review_git_process_group_exit(pid: Option<u32>) -> bool {
-    let deadline = tokio::time::Instant::now() + REVIEW_FETCH_TERMINATION_GRACE;
-    while review_git_process_group_exists(pid) {
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    true
-}
-
-#[cfg(unix)]
-async fn quiesce_review_git_process_group(pid: Option<u32>) -> std::io::Result<()> {
-    if !review_git_process_group_exists(pid) {
-        return Ok(());
-    }
-    let _ = signal_review_git_process_group(pid, libc::SIGTERM);
-    if wait_for_review_git_process_group_exit(pid).await {
-        return Ok(());
-    }
-    signal_review_git_process_group(pid, libc::SIGKILL)?;
-    if wait_for_review_git_process_group_exit(pid).await {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "review git process group remained alive after SIGKILL",
-        ))
-    }
-}
-
 struct ReviewGitChildGuard {
-    child: Option<tokio::process::Child>,
-    pid: Option<u32>,
+    child: Option<ProcessTreeChild>,
     repository_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     armed: bool,
 }
 
 impl ReviewGitChildGuard {
-    fn new(
-        child: tokio::process::Child,
-        repository_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Self {
-        let pid = child.id();
+    fn new(child: ProcessTreeChild, repository_guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         Self {
             child: Some(child),
-            pid,
             repository_guard: Some(repository_guard),
             armed: true,
         }
     }
 
-    fn child_mut(&mut self) -> &mut tokio::process::Child {
+    fn child_mut(&mut self) -> &mut ProcessTreeChild {
         self.child.as_mut().expect("review git child is present")
     }
 
@@ -237,57 +149,27 @@ impl Drop for ReviewGitChildGuard {
         if !self.armed {
             return;
         }
-        #[cfg(unix)]
-        let _ = signal_review_git_process_group(self.pid, libc::SIGKILL);
-        #[cfg(not(any(unix, windows)))]
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let pid = self.pid;
         let repository_guard = self.repository_guard.take();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                #[cfg(windows)]
-                let _ = terminate_windows_review_git_tree(pid).await;
-                let _ = child.wait().await;
-                #[cfg(unix)]
-                let _ = quiesce_review_git_process_group(pid).await;
-                #[cfg(not(any(unix, windows)))]
-                let _ = pid;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = child.terminate_and_reap().await;
+                    drop(repository_guard);
+                });
+            }
+            Err(_) => {
+                drop(child);
                 drop(repository_guard);
-            });
+            }
         }
     }
 }
 
 async fn terminate_review_git_process(guard: &mut ReviewGitChildGuard) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = guard.pid;
-        let _ = signal_review_git_process_group(pid, libc::SIGTERM);
-        match tokio::time::timeout(REVIEW_FETCH_TERMINATION_GRACE, guard.child_mut().wait()).await {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {
-                let _ = signal_review_git_process_group(pid, libc::SIGKILL);
-                guard.child_mut().wait().await?;
-            }
-        }
-        quiesce_review_git_process_group(pid).await
-    }
-    #[cfg(not(unix))]
-    {
-        #[cfg(windows)]
-        terminate_windows_review_git_tree(guard.pid).await?;
-        #[cfg(not(windows))]
-        guard.child_mut().start_kill()?;
-        guard.child_mut().wait().await?;
-        Ok(())
-    }
+    guard.child_mut().terminate_and_reap().await.map(|_| ())
 }
 
 fn cleanup_review_fetch_locks(repository_path: &Path, history_refs: &[String]) {
@@ -352,12 +234,28 @@ struct ReviewHistoryFetch {
     refspec: String,
 }
 
+fn authenticated_review_git_base_command(
+    repository_path: &Path,
+    auth: &str,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(repository_path)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    harden_authenticated_review_git_command(&mut command);
+    command
+}
+
 fn optional_review_fetch_command(
     repository_path: &Path,
     auth: &str,
     refspec: &str,
 ) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("git");
+    let mut command = authenticated_review_git_base_command(repository_path, auth);
     command
         .args([
             "fetch",
@@ -368,17 +266,9 @@ fn optional_review_fetch_command(
             "origin",
             refspec,
         ])
-        .current_dir(repository_path)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    harden_authenticated_review_git_command(&mut command);
-    isolate_review_git_process(&mut command);
+        .stderr(Stdio::piped());
     command
 }
 
@@ -387,16 +277,8 @@ fn authenticated_review_git_command(
     auth: &str,
     args: &[String],
 ) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .args(args)
-        .current_dir(repository_path)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-        .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .kill_on_drop(true);
-    harden_authenticated_review_git_command(&mut command);
+    let mut command = authenticated_review_git_base_command(repository_path, auth);
+    command.args(args);
     command
 }
 
@@ -410,28 +292,16 @@ async fn run_managed_authenticated_review_git_command(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    isolate_review_git_process(&mut command);
-    let child = command
-        .spawn()
-        .map_err(|error| format!("running git: {error}"))?;
+    let child =
+        spawn_process_tree(&mut command).map_err(|error| format!("running git: {error}"))?;
     let mut guard = ReviewGitChildGuard::new(child, repository_guard);
     let stderr = guard
         .child_mut()
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "git did not capture stderr".to_owned())?;
     let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-    let result = match tokio::time::timeout(timeout, guard.child_mut().wait()).await {
-        Ok(Ok(status)) => {
-            #[cfg(unix)]
-            if let Err(error) = quiesce_review_git_process_group(guard.pid).await {
-                Err(format!("stopping git fetch helpers: {error}"))
-            } else {
-                Ok(status)
-            }
-            #[cfg(not(unix))]
-            Ok(status)
-        }
+    let result = match tokio::time::timeout(timeout, guard.child_mut().wait_and_cleanup()).await {
+        Ok(Ok(status)) => Ok(status),
         Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
             Ok(()) => Err(format!("running git: {error}")),
             Err(terminate_error) => Err(format!(
@@ -497,7 +367,7 @@ async fn run_optional_review_fetches(
         let attempts_left = u32::try_from(fetches.len() - index).unwrap_or(1);
         let attempt_timeout = remaining / attempts_left;
         let mut command = optional_review_fetch_command(repository_path, auth, &fetch.refspec);
-        let child = match command.spawn() {
+        let child = match spawn_process_tree(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 failures.push((
@@ -513,7 +383,7 @@ async fn run_optional_review_fetches(
                 .take()
                 .expect("review repository guard is available"),
         );
-        let stderr = match guard.child_mut().stderr.take() {
+        let stderr = match guard.child_mut().take_stderr() {
             Some(stderr) => stderr,
             None => {
                 failures.push((
@@ -524,23 +394,14 @@ async fn run_optional_review_fetches(
             }
         };
         let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-        let result = match tokio::time::timeout(attempt_timeout, guard.child_mut().wait()).await {
-            Ok(Ok(status)) => {
-                #[cfg(unix)]
-                if let Err(error) = quiesce_review_git_process_group(guard.pid).await {
-                    Err(format!("stopping optional git fetch helpers: {error}"))
-                } else if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("optional git fetch exited with {status}"))
-                }
-                #[cfg(not(unix))]
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("optional git fetch exited with {status}"))
-                }
-            }
+        let result = match tokio::time::timeout(
+            attempt_timeout,
+            guard.child_mut().wait_and_cleanup(),
+        )
+        .await
+        {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(format!("optional git fetch exited with {status}")),
             Ok(Err(error)) => match terminate_review_git_process(&mut guard).await {
                 Ok(()) => Err(format!("waiting for optional git fetch: {error}")),
                 Err(terminate_error) => {
@@ -955,6 +816,7 @@ pub trait ToolExecutor: Send + Sync {
                 .collect()
         })
     }
+    /// Resolve one review merge base through the audited executor chokepoint.
     async fn review_repository_merge_base(
         &self,
         _request: &ReviewRepositoryMergeBase,
@@ -1047,12 +909,16 @@ pub struct ReviewRepositoryDiff {
     pub base_sha: String,
     pub head_sha: String,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub max_files: usize,
+    pub max_changed_lines: u64,
+    pub max_bytes: usize,
 }
 
 pub struct ReviewRepositoryMergeBase {
     pub worktree: PathBuf,
     pub base_sha: String,
     pub head_sha: String,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 pub struct ReviewRepositoryHistoryCleanup {
@@ -3061,20 +2927,16 @@ impl ToolExecutor for LocalToolExecutor {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        isolate_review_git_process(&mut command);
-        let child = command
-            .spawn()
+        let child = spawn_process_tree(&mut command)
             .map_err(|error| format!("starting temporary review ref cleanup: {error}"))?;
         let mut guard = ReviewGitChildGuard::new(child, repository_guard);
         let stderr = guard
             .child_mut()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| "temporary review ref cleanup did not capture stderr".to_owned())?;
         let mut stdin = guard
             .child_mut()
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| "temporary review ref cleanup did not capture stdin".to_owned())?;
         let commands = references
             .iter()
@@ -3089,17 +2951,11 @@ impl ToolExecutor for LocalToolExecutor {
         let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
         let status = match tokio::time::timeout(
             REVIEW_HISTORY_CLEANUP_TIMEOUT,
-            guard.child_mut().wait(),
+            guard.child_mut().wait_and_cleanup(),
         )
         .await
         {
-            Ok(Ok(status)) => {
-                #[cfg(unix)]
-                quiesce_review_git_process_group(guard.pid)
-                    .await
-                    .map_err(|error| format!("stopping temporary ref cleanup helpers: {error}"))?;
-                status
-            }
+            Ok(Ok(status)) => status,
             Ok(Err(error)) => {
                 terminate_review_git_process(&mut guard)
                     .await
@@ -3153,17 +3009,54 @@ impl ToolExecutor for LocalToolExecutor {
         &self,
         request: &ReviewRepositoryDiff,
     ) -> Result<Vec<ReviewDiffFile>, String> {
-        self.review_repository_diff_with_metadata(request)
-            .await
-            .map(|files| {
-                files
-                    .into_iter()
-                    .map(|file| ReviewDiffFile {
-                        path: file.path,
-                        diff: file.diff,
-                    })
-                    .collect()
-            })
+        validate_review_commit(&request.base_sha)?;
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let base_sha = request.base_sha.clone();
+        let head_sha = request.head_sha.clone();
+        let cancel = request.cancel.clone();
+        let max_files = request.max_files;
+        let max_changed_lines = request.max_changed_lines;
+        let max_bytes = request.max_bytes;
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err("review repository diff cancelled".into());
+            }
+            let paths = crate::git::diff_files_between(
+                &worktree,
+                &base_sha,
+                &head_sha,
+                max_files,
+                max_changed_lines,
+                max_bytes,
+                &cancel,
+            )
+            .map_err(|error| error.to_string())?;
+            let mut total_bytes = 0_usize;
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                if cancel.is_cancelled() {
+                    return Err("review repository diff cancelled".into());
+                }
+                total_bytes = total_bytes
+                    .checked_add(path.len())
+                    .ok_or_else(|| "review diff byte count overflow".to_owned())?;
+                let remaining = max_bytes
+                    .checked_sub(total_bytes)
+                    .ok_or_else(|| format!("review diff exceeds the {max_bytes}-byte limit"))?;
+                let diff = crate::git::diff_path_between(
+                    &worktree, &base_sha, &head_sha, &path, remaining, &cancel,
+                )
+                .map_err(|error| error.to_string())?;
+                total_bytes = total_bytes
+                    .checked_add(diff.len())
+                    .ok_or_else(|| "review diff byte count overflow".to_owned())?;
+                files.push(ReviewDiffFile { path, diff });
+            }
+            Ok(files)
+        })
+        .await
+        .map_err(|error| format!("review diff manifest task failed: {error}"))?
     }
 
     async fn review_repository_diff_with_metadata(
@@ -3175,13 +3068,16 @@ impl ToolExecutor for LocalToolExecutor {
         let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
         let cancel = request.cancel.clone();
+        let max_files = request.max_files;
+        let max_changed_lines = request.max_changed_lines;
+        let max_bytes = request.max_bytes;
         tokio::task::spawn_blocking(move || {
             crate::git::session_diff_patches_cancellable(
                 &worktree,
                 &base_sha,
-                MAX_REVIEW_DIFF_FILES,
-                MAX_REVIEW_DIFF_CHANGED_LINES,
-                MAX_REVIEW_DIFF_BYTES,
+                max_files,
+                max_changed_lines,
+                max_bytes,
                 &cancel,
                 is_conventional_generated_artifact_path,
             )
@@ -3207,10 +3103,13 @@ impl ToolExecutor for LocalToolExecutor {
         let worktree = request.worktree.clone();
         let base_sha = request.base_sha.clone();
         let head_sha = request.head_sha.clone();
-        tokio::task::spawn_blocking(move || crate::git::merge_base(&worktree, &base_sha, &head_sha))
-            .await
-            .map_err(|error| format!("review merge-base task failed: {error}"))?
-            .map_err(|error| error.to_string())
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::merge_base_cancellable(&worktree, &base_sha, &head_sha, &cancel)
+        })
+        .await
+        .map_err(|error| format!("review merge-base task failed: {error}"))?
+        .map_err(|error| error.to_string())
     }
 
     async fn session_diff(&self, request: &SessionRepositoryDiff) -> Result<String, String> {
@@ -4272,16 +4171,13 @@ mod tests {
     async fn timed_out_review_fetch_process_is_terminated_and_reaped() {
         let mut command = tokio::process::Command::new("sleep");
         command.arg("60").kill_on_drop(true);
-        isolate_review_git_process(&mut command);
-        let child = command.spawn().unwrap();
+        let child = spawn_process_tree(&mut command).unwrap();
         let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut guard = ReviewGitChildGuard::new(child, repository_lock.clone().lock_owned().await);
-        let pid = guard.pid;
 
         terminate_review_git_process(&mut guard).await.unwrap();
+        assert!(guard.child_mut().try_wait().unwrap().is_some());
         guard.disarm();
-
-        assert!(!review_git_process_group_exists(pid));
     }
 
     #[cfg(unix)]
@@ -4330,18 +4226,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn completed_direct_child_does_not_leave_process_group_helpers() {
+    async fn completed_direct_child_cleans_its_owned_process_tree() {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg("sleep 60 &").kill_on_drop(true);
-        isolate_review_git_process(&mut command);
-        let mut child = command.spawn().unwrap();
-        let pid = child.id();
-        child.wait().await.unwrap();
-        assert!(review_git_process_group_exists(pid));
+        let mut child = spawn_process_tree(&mut command).unwrap();
 
-        quiesce_review_git_process_group(pid).await.unwrap();
-
-        assert!(!review_git_process_group_exists(pid));
+        assert!(child.wait_and_cleanup().await.unwrap().success());
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]
@@ -4355,21 +4246,24 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        isolate_review_git_process(&mut command);
-        let child = command.spawn().unwrap();
+        let child = spawn_process_tree(&mut command).unwrap();
         let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut guard = ReviewGitChildGuard::new(child, repository_lock.lock_owned().await);
-        let pid = guard.pid;
-        let stderr = guard.child_mut().stderr.take().unwrap();
+        let stderr = guard.child_mut().take_stderr().unwrap();
         let mut stderr_task = tokio::spawn(read_bounded_review_fetch_stderr(stderr));
-        assert!(guard.child_mut().wait().await.unwrap().success());
+        assert!(
+            guard
+                .child_mut()
+                .wait_and_cleanup()
+                .await
+                .unwrap()
+                .success()
+        );
 
         finish_review_fetch_stderr(&mut guard, &mut stderr_task, Duration::from_millis(50))
             .await
             .unwrap();
         guard.disarm();
-
-        assert!(!review_git_process_group_exists(pid));
     }
 
     #[cfg(unix)]
@@ -4377,9 +4271,7 @@ mod tests {
     async fn cancellation_guard_reaps_descendants_before_releasing_repository() {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg("sleep 60 & wait").kill_on_drop(true);
-        isolate_review_git_process(&mut command);
-        let child = command.spawn().unwrap();
-        let pid = child.id();
+        let child = spawn_process_tree(&mut command).unwrap();
         let repository_lock = Arc::new(tokio::sync::Mutex::new(()));
         let guard = ReviewGitChildGuard::new(child, repository_lock.clone().lock_owned().await);
 
@@ -4391,7 +4283,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!review_git_process_group_exists(pid));
         drop(reacquired);
     }
 }

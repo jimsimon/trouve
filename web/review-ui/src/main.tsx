@@ -1359,7 +1359,7 @@ function JobDetailPane({
         <div>
           <dt>Revision</dt>
           <dd>
-            <code>{job.review_base_sha.slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+            <code>{(job.review_base_sha || job.base_ref).slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
           </dd>
         </div>
         <div>

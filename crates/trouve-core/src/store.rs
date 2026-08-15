@@ -2262,6 +2262,44 @@ fn enqueue_code_review_pending_event(
     Ok(())
 }
 
+fn supersede_code_review_task(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    job_id: &str,
+    completed_at: &str,
+    recovery_message: &str,
+) -> Result<bool> {
+    let updated = tx.execute(
+        "UPDATE code_review_tasks
+         SET status = 'superseded',
+             completed_at = COALESCE(completed_at, ?3),
+             error = CASE
+               WHEN status IN ('succeeded', 'failed', 'cancelled', 'not_applicable')
+                 THEN error
+               ELSE ?4
+             END
+         WHERE id = ?1 AND job_id = ?2 AND status != 'superseded'",
+        params![task_id, job_id, completed_at, recovery_message],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    let task = tx.query_row(
+        &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+        [task_id],
+        row_to_code_review_task,
+    )?;
+    enqueue_code_review_pending_event(
+        tx,
+        job_id,
+        &Event::CodeReviewTaskUpdated {
+            job_id: job_id.to_owned(),
+            task: Box::new(task),
+        },
+    )?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
     pub path: String,
@@ -6700,33 +6738,13 @@ impl Store {
                 "DELETE FROM code_review_routing_decisions WHERE job_id = ?1",
                 [job_id],
             )?;
-            tx.execute(
-                "UPDATE code_review_tasks
-                 SET status = 'superseded',
-                     completed_at = COALESCE(completed_at, ?2),
-                     error = CASE
-                       WHEN status IN ('succeeded', 'failed', 'cancelled', 'not_applicable')
-                         THEN error
-                       ELSE 'effective review diff changed during recovery'
-                     END
-                 WHERE job_id = ?1 AND status != 'superseded'",
-                params![job_id, completed_at],
-            )?;
             for task_id in task_ids {
-                let task = tx.query_row(
-                    &format!(
-                        "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"
-                    ),
-                    [task_id],
-                    row_to_code_review_task,
-                )?;
-                enqueue_code_review_pending_event(
+                supersede_code_review_task(
                     &tx,
+                    &task_id,
                     job_id,
-                    &Event::CodeReviewTaskUpdated {
-                        job_id: job_id.to_owned(),
-                        task: Box::new(task),
-                    },
+                    &completed_at,
+                    "effective review diff changed during recovery",
                 )?;
             }
             enqueue_code_review_pending_event(
@@ -7319,35 +7337,13 @@ impl Store {
         }
         let completed_at = chrono::Utc::now().to_rfc3339();
         for task_id in task_ids {
-            let updated = tx.execute(
-                "UPDATE code_review_tasks
-                 SET status = 'superseded',
-                     completed_at = COALESCE(completed_at, ?3),
-                     error = CASE
-                       WHEN status IN ('succeeded', 'failed', 'cancelled', 'not_applicable')
-                         THEN error
-                       ELSE 'reviewer prompt changed during recovery'
-                     END
-                 WHERE id = ?1 AND job_id = ?2 AND status != 'superseded'",
-                params![task_id, job_id, completed_at],
+            supersede_code_review_task(
+                &tx,
+                task_id,
+                job_id,
+                &completed_at,
+                "reviewer prompt changed during recovery",
             )?;
-            if updated > 0 {
-                let task = tx.query_row(
-                    &format!(
-                        "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"
-                    ),
-                    [task_id],
-                    row_to_code_review_task,
-                )?;
-                enqueue_code_review_pending_event(
-                    &tx,
-                    job_id,
-                    &Event::CodeReviewTaskUpdated {
-                        job_id: job_id.to_owned(),
-                        task: Box::new(task),
-                    },
-                )?;
-            }
         }
         let attempts = {
             let mut stmt = tx.prepare(&format!(

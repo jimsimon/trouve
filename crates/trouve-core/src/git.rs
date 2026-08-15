@@ -10,6 +10,8 @@ use std::io::Read;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,7 @@ const SESSION_DIFF_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_PUSH_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_TREE_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
+const REVIEW_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MATERIALIZED_ATTACHMENTS_PREFIX: &str = ".trouve/attachments/";
 
 fn is_session_internal_path(path: &str) -> bool {
@@ -119,19 +122,6 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = trouve_process::output(&mut command)
         .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
     git_result(dir, args, out.status, out.stdout, out.stderr)
-}
-
-fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
-    if !out.status.success() {
-        return git_result(dir, args, out.status, out.stdout, out.stderr);
-    }
-    String::from_utf8(out.stdout).context("git output is not UTF-8")
 }
 
 enum GitCommandInput {
@@ -249,7 +239,11 @@ impl<'a> GitOperation<'a> {
     }
 }
 
-fn read_bounded_and_drain(mut pipe: impl Read, limit: usize) -> std::io::Result<BoundedGitOutput> {
+fn read_bounded_and_drain(
+    mut pipe: impl Read,
+    limit: usize,
+    limit_exceeded: Option<Arc<AtomicBool>>,
+) -> std::io::Result<BoundedGitOutput> {
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
     let mut buffer = [0_u8; 16 * 1024];
@@ -262,6 +256,11 @@ fn read_bounded_and_drain(mut pipe: impl Read, limit: usize) -> std::io::Result<
         let retained = remaining.min(read);
         bytes.extend_from_slice(&buffer[..retained]);
         truncated |= retained < read;
+        if retained < read
+            && let Some(limit_exceeded) = &limit_exceeded
+        {
+            limit_exceeded.store(true, Ordering::Release);
+        }
     }
     Ok(BoundedGitOutput { bytes, truncated })
 }
@@ -389,8 +388,13 @@ fn run_git_bounded_with_status(
     });
     let stdout = child.take_stdout().context("capturing git stdout")?;
     let stderr = child.take_stderr().context("capturing git stderr")?;
-    let stdout_reader = thread::spawn(move || read_bounded_and_drain(stdout, max_stdout));
-    let stderr_reader = thread::spawn(move || read_bounded_and_drain(stderr, MAX_GIT_STDERR_BYTES));
+    let stdout_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_limit_signal = stdout_limit_exceeded.clone();
+    let stdout_reader = thread::spawn(move || {
+        read_bounded_and_drain(stdout, max_stdout, Some(stdout_limit_signal))
+    });
+    let stderr_reader =
+        thread::spawn(move || read_bounded_and_drain(stderr, MAX_GIT_STDERR_BYTES, None));
     let io_threads = GitIoThreads {
         input: input_writer,
         stdout: stdout_reader,
@@ -407,6 +411,17 @@ fn run_git_bounded_with_status(
             }
             let _ = io_threads.join_until(operation.deadline);
             bail!("{} cancelled", operation.label);
+        }
+        if stdout_limit_exceeded.load(Ordering::Acquire) {
+            if let Err(error) = child.terminate_and_reap_until(operation.deadline) {
+                io_threads.detach();
+                bail!(
+                    "{} output exceeded its bound; process-tree cleanup failed: {error}",
+                    operation.label
+                );
+            }
+            let (stdout, _) = io_threads.join_until(operation.deadline)?;
+            return Ok(stdout);
         }
         if let Some(status) = child
             .try_wait_until(operation.deadline)
@@ -1553,8 +1568,8 @@ fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<Stri
     let stderr = child.take_stderr().context("capturing git stderr")?;
     let io_threads = GitIoThreads {
         input: None,
-        stdout: thread::spawn(move || read_bounded_and_drain(stdout, MAX_SESSION_DIFF_BYTES)),
-        stderr: thread::spawn(move || read_bounded_and_drain(stderr, MAX_GIT_STDERR_BYTES)),
+        stdout: thread::spawn(move || read_bounded_and_drain(stdout, MAX_SESSION_DIFF_BYTES, None)),
+        stderr: thread::spawn(move || read_bounded_and_drain(stderr, MAX_GIT_STDERR_BYTES, None)),
     };
 
     let deadline = Instant::now() + timeout;
@@ -2826,33 +2841,114 @@ fn session_diff_path_with_cancel(
 
 /// Common ancestor used by a pull-request comparison.
 pub fn merge_base(repo: &Path, base_ref: &str, head_ref: &str) -> Result<String> {
+    merge_base_cancellable(
+        repo,
+        base_ref,
+        head_ref,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+pub fn merge_base_cancellable(
+    repo: &Path,
+    base_ref: &str,
+    head_ref: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
     ensure_safe_ref(base_ref)?;
     ensure_safe_ref(head_ref)?;
-    git(repo, &["merge-base", base_ref, head_ref])
+    let operation =
+        GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review merge-base");
+    let output = run_git_bounded(
+        repo,
+        None,
+        &["merge-base", base_ref, head_ref],
+        None,
+        64 * 1024,
+        &operation,
+    )?;
+    if output.truncated {
+        bail!("review merge-base output is unexpectedly large");
+    }
+    Ok(String::from_utf8(output.bytes)
+        .context("review merge-base output is not UTF-8")?
+        .trim()
+        .to_owned())
 }
 
 /// Every changed path between two immutable commits in git's deterministic
 /// diff order. Review orchestration uses this instead of the session helpers,
 /// which intentionally include uncommitted worktree changes.
-pub fn diff_files_between(repo: &Path, base_ref: &str, head_ref: &str) -> Result<Vec<String>> {
+pub fn diff_files_between(
+    repo: &Path,
+    base_ref: &str,
+    head_ref: &str,
+    max_files: usize,
+    max_changed_lines: u64,
+    max_metadata_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<String>> {
     ensure_safe_ref(base_ref)?;
     ensure_safe_ref(head_ref)?;
-    let output = git_untrimmed(
+    let operation = GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review diff");
+    let output = run_git_bounded(
         repo,
+        None,
         &[
             "diff",
-            "--name-only",
+            "--no-renames",
+            "--numstat",
             "-z",
             "--end-of-options",
             base_ref,
             head_ref,
         ],
+        None,
+        max_metadata_bytes,
+        &operation,
     )?;
-    Ok(output
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(str::to_string)
-        .collect())
+    if output.truncated {
+        bail!("review diff metadata exceeds the {max_metadata_bytes}-byte limit");
+    }
+    let mut paths = Vec::new();
+    let mut changed_lines = 0_u64;
+    for entry in output
+        .bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut fields = entry.splitn(3, |byte| *byte == b'\t');
+        let additions = fields
+            .next()
+            .context("review diff metadata omitted additions")?;
+        let deletions = fields
+            .next()
+            .context("review diff metadata omitted deletions")?;
+        let path = fields
+            .next()
+            .context("review diff metadata omitted its path")?;
+        let additions = std::str::from_utf8(additions)
+            .context("review diff additions are not UTF-8")?
+            .parse::<u64>();
+        let deletions = std::str::from_utf8(deletions)
+            .context("review diff deletions are not UTF-8")?
+            .parse::<u64>();
+        if let (Ok(additions), Ok(deletions)) = (additions, deletions) {
+            changed_lines = changed_lines
+                .checked_add(additions)
+                .and_then(|total| total.checked_add(deletions))
+                .context("review diff changed-line count overflow")?;
+        }
+        paths.push(String::from_utf8(path.to_vec()).context("review diff path is not UTF-8")?);
+        if paths.len() > max_files || changed_lines > max_changed_lines {
+            bail!(
+                "review diff is too large ({} files, {changed_lines} changed lines; limit is \
+                 {max_files} files or {max_changed_lines} changed lines)",
+                paths.len()
+            );
+        }
+    }
+    Ok(paths)
 }
 
 /// Unified diff for one path between two immutable commits.
@@ -2861,6 +2957,8 @@ pub fn diff_path_between(
     base_ref: &str,
     head_ref: &str,
     path: &str,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     ensure_safe_ref(base_ref)?;
     ensure_safe_ref(head_ref)?;
@@ -2872,18 +2970,31 @@ pub fn diff_path_between(
     {
         bail!("invalid repository-relative diff path: {path:?}");
     }
-    git_untrimmed(
+    let operation = GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review diff");
+    let output = run_git_bounded(
         repo,
+        None,
         &[
+            "--literal-pathspecs",
             "diff",
             "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
             "--end-of-options",
             base_ref,
             head_ref,
             "--",
             path,
         ],
-    )
+        None,
+        max_bytes,
+        &operation,
+    )?;
+    if output.truncated {
+        bail!("review file diff exceeds the {max_bytes}-byte limit");
+    }
+    String::from_utf8(output.bytes).context("review file diff is not UTF-8")
 }
 
 /// URL of the named remote (usually "origin"), if configured.
@@ -4038,10 +4149,27 @@ mod tests {
             common
         );
         assert_eq!(
-            diff_files_between(tmp.path(), &common, &feature).unwrap(),
+            diff_files_between(
+                tmp.path(),
+                &common,
+                &feature,
+                10,
+                100,
+                64 * 1024,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap(),
             ["a.txt"]
         );
-        let diff = diff_path_between(tmp.path(), &common, &feature, "a.txt").unwrap();
+        let diff = diff_path_between(
+            tmp.path(),
+            &common,
+            &feature,
+            "a.txt",
+            64 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
         assert!(diff.contains("+feature"));
         assert!(!diff.contains("uncommitted"));
     }
@@ -4069,9 +4197,57 @@ mod tests {
         run(tmp.path(), &["commit", "-m", "preserve whitespace"]);
         let head = run(tmp.path(), &["rev-parse", "HEAD"]);
 
-        let diff = diff_path_between(tmp.path(), &base, &head, "a.txt").unwrap();
+        let diff = diff_path_between(
+            tmp.path(),
+            &base,
+            &head,
+            "a.txt",
+            64 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
         assert!(diff.contains("+value  \n"));
         assert!(diff.ends_with('\n'));
+    }
+
+    #[test]
+    fn immutable_review_diff_enforces_limits_and_literal_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join(":(glob)**"), "literal\nchange\n").unwrap();
+        std::fs::write(tmp.path().join("other.txt"), "other\nchange\n").unwrap();
+        run(tmp.path(), &["add", "."]);
+        run(tmp.path(), &["commit", "-m", "add magic-looking path"]);
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let file_error =
+            diff_files_between(tmp.path(), &base, &head, 1, 100, 64 * 1024, &cancel).unwrap_err();
+        assert!(file_error.to_string().contains("limit is 1 files"));
+        let line_error =
+            diff_files_between(tmp.path(), &base, &head, 10, 1, 64 * 1024, &cancel).unwrap_err();
+        assert!(line_error.to_string().contains("1 changed lines"));
+
+        let diff =
+            diff_path_between(tmp.path(), &base, &head, ":(glob)**", 64 * 1024, &cancel).unwrap();
+        assert!(diff.contains("+literal"));
+        assert!(!diff.contains("+other"));
+        let byte_error =
+            diff_path_between(tmp.path(), &base, &head, ":(glob)**", 8, &cancel).unwrap_err();
+        assert!(byte_error.to_string().contains("8-byte limit"));
+    }
+
+    #[test]
+    fn immutable_review_merge_base_observes_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let head = run(tmp.path(), &["rev-parse", "HEAD"]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let error = merge_base_cancellable(tmp.path(), &head, &head, &cancel).unwrap_err();
+        assert!(error.to_string().contains("review merge-base cancelled"));
     }
 
     #[test]
