@@ -9503,7 +9503,7 @@ impl Engine {
                 &session,
                 &thread,
                 turn,
-                &mode,
+                mode.read_only,
                 &call_id,
                 tool,
                 args,
@@ -10568,13 +10568,18 @@ impl Engine {
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
         let supports_steering = tools_enabled && backend.supports_steering();
+        // Some vendor protocols cannot remove their built-in read/search
+        // tools. Keep those turns restricted (no mounted MCP tools and
+        // read-only permission), but reserve strict tool-use rejection for
+        // backends that can actually guarantee a tool-free surface.
+        let strict_tool_free = !tools_enabled && backend.supports_tool_free_turns();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
         // thread's past this one hasn't seen — everything for a vendor
         // joining mid-conversation, the interleaved turns other models ran
         // for a resumed one — is handed off as a digest in the prompt.
-        // A vendor session retains the tools it was created with. Tool-free
+        // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
         let (resume, handoff) = if tools_enabled {
@@ -10634,7 +10639,8 @@ impl Engine {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
 
-        let permission = if mode.read_only {
+        let effective_read_only = !tools_enabled || mode.read_only;
+        let permission = if effective_read_only {
             BackendPermission::ReadOnly
         } else {
             match thread.permission_mode {
@@ -10690,7 +10696,7 @@ impl Engine {
             attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
-            tool_free: !tools_enabled,
+            tool_free: strict_tool_free,
             mcp_bridge,
             mcp_servers,
         };
@@ -11070,7 +11076,7 @@ impl Engine {
                         }
                         continue;
                     }
-                    if !tools_enabled {
+                    if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
@@ -11288,7 +11294,7 @@ impl Engine {
                                     session.clone(),
                                     approval.thread,
                                     approval.turn,
-                                    approval.mode,
+                                    effective_read_only || approval.mode.read_only,
                                     approval.call_id,
                                     approval.tool,
                                     approval.args,
@@ -11391,7 +11397,7 @@ impl Engine {
                     args,
                     responder,
                 } => {
-                    if !tools_enabled {
+                    if strict_tool_free {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
@@ -11408,7 +11414,7 @@ impl Engine {
                         session.clone(),
                         thread.clone(),
                         turn,
-                        mode.clone(),
+                        effective_read_only,
                         call_id,
                         tool,
                         args,
@@ -11611,7 +11617,7 @@ impl Engine {
         session: Session,
         thread: Thread,
         turn: u64,
-        mode: AgentMode,
+        effective_read_only: bool,
         call_id: String,
         tool: String,
         args: serde_json::Value,
@@ -11624,11 +11630,19 @@ impl Engine {
         async move {
             let mut approved = engine
                 .gate_backend_approval(
-                    &session, &thread, turn, &mode, &call_id, &tool, &args, &cancel,
+                    &session,
+                    &thread,
+                    turn,
+                    effective_read_only,
+                    &call_id,
+                    &tool,
+                    &args,
+                    &cancel,
                 )
                 .await;
             let mut mutation_permit = None;
-            if acquire_mutation_permit
+            if !effective_read_only
+                && acquire_mutation_permit
                 && approved.as_ref().is_ok_and(|approved| *approved)
                 && engine.backend_tool_mutates(&tool)
             {
@@ -11662,7 +11676,7 @@ impl Engine {
         session: &Session,
         thread: &Thread,
         turn: u64,
-        mode: &AgentMode,
+        effective_read_only: bool,
         call_id: &str,
         tool: &str,
         args: &serde_json::Value,
@@ -11691,7 +11705,7 @@ impl Engine {
         let mutates = self.backend_tool_mutates(tool);
         let decision = gate(
             thread.permission_mode,
-            mode.read_only,
+            effective_read_only,
             mutates,
             &self.approvals.allow_list(&session.id),
             &key,
@@ -18571,6 +18585,74 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
+    async fn no_tools_vendor_mutation_is_denied_without_approval_or_permit() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let session = Session {
+            id: "se_no_tools_approval".into(),
+            workspace_id: "ws_no_tools_approval".into(),
+            title: "No-tools approval".into(),
+            branch: "trouve/no-tools-approval".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let thread = Thread {
+            id: "th_no_tools_approval".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "cursor/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let mode = modes::find_mode(&modes::builtin_modes(), "code")
+            .unwrap()
+            .clone();
+        let tools_enabled = false;
+        let effective_read_only = !tools_enabled || mode.read_only;
+        let thread_id = thread.id.clone();
+        let (response, _response_rx) = tokio::sync::oneshot::channel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.pending_backend_approval(
+                session,
+                thread,
+                1,
+                effective_read_only,
+                "vendor-no-tools-call".into(),
+                "CommandExecution".into(),
+                serde_json::json!({}),
+                response,
+                tokio_util::sync::CancellationToken::new(),
+                true,
+                None,
+            ),
+        )
+        .await
+        .expect("read-only approval gating should deny without waiting");
+
+        assert!(!outcome.approved.unwrap());
+        assert!(outcome.mutation_permit.is_none());
+        assert_eq!(
+            engine
+                .approvals
+                .resolve(&thread_id, "vendor-no-tools-call", ApprovalDecision::Deny,),
+            ApprovalResolution::NotFound,
+        );
+    }
+
+    #[tokio::test]
     async fn approved_vendor_mutation_waits_for_the_session_tool_lane() {
         let data = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::new(
@@ -18602,16 +18684,13 @@ default_permission_mode = "ask"
             spawned: false,
             todos: Vec::new(),
         };
-        let mode = modes::find_mode(&modes::builtin_modes(), "code")
-            .unwrap()
-            .clone();
         let read_permit = engine.tool_execution_lock(&session.id).read_owned().await;
         let (response, _response_rx) = tokio::sync::oneshot::channel();
         let mut approval = engine.pending_backend_approval(
             session,
             thread,
             1,
-            mode,
+            false,
             "vendor-call".into(),
             "CommandExecution".into(),
             serde_json::json!({}),
