@@ -152,8 +152,18 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
           persona: {
             id: "review",
             display_name: "Reviewer",
-            group: "reviewer",
+            group: "general",
             system_prompt: "Review the current changes for correctness.",
+            read_only: true,
+          },
+        },
+        {
+          origin: "builtin",
+          persona: {
+            id: "maintainability",
+            display_name: "Software Architect",
+            group: "reviewer",
+            system_prompt: "Review maintainability and architectural boundaries.",
             read_only: true,
           },
         },

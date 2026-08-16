@@ -91,7 +91,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
         AgentPersona {
             id: REVIEW_PERSONA_ID.into(),
             display_name: "Reviewer".into(),
-            group: PersonaGroup::Reviewer,
+            group: PersonaGroup::General,
             system_prompt:
                 "You are the Reviewer persona: examine the changes in this workspace and \
                             report problems — bugs, missed edge cases, style violations — with \
@@ -347,16 +347,12 @@ mod tests {
     #[test]
     fn builtin_personas_are_grouped_by_intended_use() {
         let personas = builtin_personas();
-        for id in ["code", "plan", "question"] {
+        for id in ["code", "plan", "review", "question"] {
             assert_eq!(
                 find_persona(&personas, id).unwrap().group,
                 PersonaGroup::General
             );
         }
-        assert_eq!(
-            find_persona(&personas, "review").unwrap().group,
-            PersonaGroup::Reviewer
-        );
     }
 
     #[test]

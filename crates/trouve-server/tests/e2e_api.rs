@@ -5947,6 +5947,13 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .iter()
             .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
+    assert!(
+        empty["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reviewer| reviewer["id"] != "review")
+    );
     let default_correctness = empty["reviewers"]
         .as_array()
         .unwrap()
