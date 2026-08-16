@@ -2523,14 +2523,8 @@ impl ToolExecutor for LocalToolExecutor {
         config_dir: &Path,
         persona: &AgentPersona,
     ) -> Result<(), String> {
-        let config_dir = config_dir.to_path_buf();
-        let persona = persona.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::personas::upsert_user_persona(&config_dir, &persona)
-        })
-        .await
-        .map_err(|error| format!("persona persistence worker failed: {error}"))?
-        .map_err(|error| format!("{error:#}"))
+        crate::personas::upsert_user_persona(config_dir, persona)
+            .map_err(|error| format!("{error:#}"))
     }
 
     async fn delete_persona_file(
@@ -2539,17 +2533,14 @@ impl ToolExecutor for LocalToolExecutor {
         id: &str,
         allow_missing: bool,
     ) -> Result<(), String> {
-        let config_dir = config_dir.to_path_buf();
-        let id = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            if allow_missing && crate::personas::user_persona_file(&config_dir, &id).is_none() {
-                return Ok(());
-            }
-            crate::personas::delete_user_persona(&config_dir, &id)
-        })
-        .await
-        .map_err(|error| format!("persona deletion worker failed: {error}"))?
-        .map_err(|error| format!("{error:#}"))
+        if allow_missing
+            && crate::personas::user_persona_file(config_dir, id)
+                .map_err(|error| format!("{error:#}"))?
+                .is_none()
+        {
+            return Ok(());
+        }
+        crate::personas::delete_user_persona(config_dir, id).map_err(|error| format!("{error:#}"))
     }
 
     async fn checkpoint_worktree(

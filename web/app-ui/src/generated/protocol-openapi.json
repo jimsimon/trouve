@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.2"
+    "version": "7.3"
   },
   "paths": {
     "/v1/approvals": {
@@ -4944,6 +4944,9 @@
           "display_name": {
             "type": "string"
           },
+          "group": {
+            "$ref": "#/components/schemas/PersonaGroup"
+          },
           "id": {
             "type": "string",
             "description": "Stable identifier, e.g. \"code\", \"plan\", \"review\"."
@@ -9268,6 +9271,14 @@
           "yolo"
         ]
       },
+      "PersonaGroup": {
+        "type": "string",
+        "description": "Whether a persona is intended for general interaction or specialized review.",
+        "enum": [
+          "general",
+          "reviewer"
+        ]
+      },
       "PersonaInfo": {
         "type": "object",
         "description": "A persona plus where it came from, for the settings UI.",
@@ -13277,6 +13288,9 @@
           },
           "display_name": {
             "type": "string"
+          },
+          "group": {
+            "$ref": "#/components/schemas/PersonaGroup"
           },
           "read_only": {
             "type": "boolean"

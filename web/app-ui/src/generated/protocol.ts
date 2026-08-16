@@ -1717,6 +1717,10 @@ export interface components {
             /** @description HuggingFace repo id, e.g. "unsloth/Qwen3.6-27B-GGUF". */
             repo: string;
         };
+        /**
+         * @description A data-driven agent persona: prompt + tool policy + model/permission defaults.
+         *     Adding a persona is configuration, not code (AGENTS.md invariant 6).
+         */
         AgentPersona: {
             /** @description Tool names this persona may use; empty means all registered tools. */
             allowed_tools?: string[];
@@ -3292,8 +3296,7 @@ export interface components {
          */
         PermissionMode: "ask" | "allow_list" | "yolo";
         /**
-         * @description A data-driven agent persona: prompt + tool policy + model/permission defaults.
-         *     Adding a persona is configuration, not code (AGENTS.md invariant 6).
+         * @description Whether a persona is intended for general interaction or specialized review.
          * @enum {string}
          */
         PersonaGroup: "general" | "reviewer";

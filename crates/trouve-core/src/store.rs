@@ -492,6 +492,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE artifact_cleanup_jobs ADD COLUMN claim_token TEXT",
     "CREATE TABLE IF NOT EXISTS persona_cleanup_intents (
        persona_id TEXT PRIMARY KEY,
+       claim_until TEXT,
+       claim_token TEXT,
        created_at TEXT NOT NULL
      )",
     "ALTER TABLE persona_cleanup_intents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
@@ -6269,6 +6271,57 @@ impl Store {
             .is_some())
     }
 
+    pub fn claim_persona_deletion(&self, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now();
+        let token = uuid::Uuid::new_v4().to_string();
+        let claimed = tx.execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = ?2, claim_token = ?3
+             WHERE persona_id = ?1
+               AND (claim_token IS NULL OR claim_until IS NULL OR claim_until <= ?4)",
+            params![
+                id,
+                (now + chrono::Duration::minutes(5)).to_rfc3339(),
+                token,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok((claimed == 1).then_some(token))
+    }
+
+    pub fn release_persona_deletion_claim(&self, id: &str, token: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE persona_cleanup_intents
+             SET claim_until = NULL, claim_token = NULL
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token],
+        )?;
+        Ok(())
+    }
+
+    /// Consume a pending deletion because the persona was recreated. Unlike
+    /// deletion completion, repository selections and overrides are retained.
+    pub fn cancel_persona_deletion(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM persona_cleanup_intents WHERE persona_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_claimed_persona_deletion(&self, id: &str, token: &str) -> Result<()> {
+        let deleted = self.conn.lock().unwrap().execute(
+            "DELETE FROM persona_cleanup_intents
+             WHERE persona_id = ?1 AND claim_token = ?2",
+            params![id, token],
+        )?;
+        anyhow::ensure!(deleted == 1, "persona deletion claim for {id} was lost");
+        Ok(())
+    }
+
     pub fn pending_persona_deletions(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
@@ -6359,6 +6412,14 @@ impl Store {
         claim: &PersonaDeletionClaim,
     ) -> Result<()> {
         self.complete_persona_deletion_with_claim(&claim.id, Some(&claim.token))
+    }
+
+    pub(crate) fn complete_claimed_persona_deletion_token(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.complete_persona_deletion_with_claim(id, Some(token))
     }
 
     fn complete_persona_deletion_with_claim(

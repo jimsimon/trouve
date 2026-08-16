@@ -3,7 +3,9 @@
 //! or override personas with TOML files in `<config>/personas/` or a
 //! workspace's `.agents/personas/`.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use trouve_protocol::{AgentPersona, PersonaGroup, PersonaInfo};
@@ -11,6 +13,7 @@ use trouve_protocol::{AgentPersona, PersonaGroup, PersonaInfo};
 pub const REVIEW_PERSONA_ID: &str = "review";
 const RETIRED_ARCHITECT_PERSONA_ID: &str = "architect";
 const RETIRED_RESEARCHER_PERSONA_ID: &str = "question";
+static PERSONA_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn is_valid_persona_id(id: &str) -> bool {
     !id.is_empty()
@@ -167,6 +170,37 @@ fn load_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
     }
 }
 
+fn load_workspace_dir(dir: &Path, personas: &mut Vec<AgentPersona>) {
+    let mut workspace = Vec::new();
+    load_dir(dir, &mut workspace);
+    let restricted_tools = fallback_persona().allowed_tools;
+    for mut persona in workspace {
+        if let Some(base) = personas.iter().find(|candidate| candidate.id == persona.id) {
+            persona.read_only |= base.read_only;
+            if !base.allowed_tools.is_empty() {
+                if persona.allowed_tools.is_empty() {
+                    persona.allowed_tools.clone_from(&base.allowed_tools);
+                } else {
+                    persona
+                        .allowed_tools
+                        .retain(|tool| base.allowed_tools.contains(tool));
+                }
+            }
+        } else {
+            persona.read_only = true;
+            if persona.allowed_tools.is_empty() {
+                persona.allowed_tools.clone_from(&restricted_tools);
+            } else {
+                persona
+                    .allowed_tools
+                    .retain(|tool| restricted_tools.contains(tool));
+            }
+        }
+        personas.retain(|candidate| candidate.id != persona.id);
+        personas.push(persona);
+    }
+}
+
 /// Built-ins, overlaid by `<config>/personas/*.toml`, overlaid by the
 /// workspace's `.agents/personas/*.toml`.
 pub fn resolve_personas(
@@ -175,10 +209,12 @@ pub fn resolve_personas(
 ) -> Vec<AgentPersona> {
     let mut personas = builtin_personas();
     if let Some(dir) = config_dir {
+        load_dir(&dir.join("modes"), &mut personas);
         load_dir(&dir.join("personas"), &mut personas);
     }
     if let Some(root) = workspace_root {
-        load_dir(&root.join(".agents").join("personas"), &mut personas);
+        load_workspace_dir(&root.join(".agents").join("modes"), &mut personas);
+        load_workspace_dir(&root.join(".agents").join("personas"), &mut personas);
     }
     personas
 }
@@ -195,6 +231,17 @@ pub fn find_persona<'a>(personas: &'a [AgentPersona], id: &str) -> Option<&'a Ag
             .then(|| personas.iter().find(|persona| persona.id == "plan"))
             .flatten()
         })
+}
+
+pub fn canonical_persona_id(id: &str) -> &str {
+    if matches!(
+        id,
+        RETIRED_ARCHITECT_PERSONA_ID | RETIRED_RESEARCHER_PERSONA_ID
+    ) {
+        "plan"
+    } else {
+        id
+    }
 }
 
 /// Personas with provenance for the settings UI. Same layering as
@@ -226,11 +273,20 @@ pub fn resolve_persona_infos(
         }
     };
     if let Some(dir) = config_dir {
+        overlay(&dir.join("modes"), "customized", "custom");
         overlay(&dir.join("personas"), "customized", "custom");
     }
     if let Some(root) = workspace_root {
-        let dir = root.join(".agents").join("personas");
-        overlay(&dir, "workspace", "workspace");
+        overlay(
+            &root.join(".agents").join("modes"),
+            "workspace",
+            "workspace",
+        );
+        overlay(
+            &root.join(".agents").join("personas"),
+            "workspace",
+            "workspace",
+        );
     }
     // Stable order: built-ins first in their canonical order, then the rest
     // alphabetically.
@@ -248,27 +304,37 @@ pub fn resolve_persona_infos(
 
 /// The user-level persona file defining `id`, if any. Prefers `<id>.toml` but
 /// falls back to scanning (files may be named freely).
-pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn user_persona_file(config_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
     let dir = config_dir.join("personas");
     let canonical = dir.join(format!("{id}.toml"));
-    if canonical.exists() {
-        return Some(canonical);
+    match std::fs::metadata(&canonical) {
+        Ok(metadata) if metadata.is_file() => return Ok(Some(canonical)),
+        Ok(_) => bail!("persona path {} is not a file", canonical.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", canonical.display()));
+        }
     }
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Ok(persona) = toml::from_str::<AgentPersona>(&text)
-            && persona.id == id
-        {
-            return Some(path);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let persona = toml::from_str::<AgentPersona>(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        if persona.id == id {
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Write (create or replace) the user-level TOML file for a persona. Saving
@@ -277,7 +343,7 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
     if !is_valid_persona_id(&persona.id) {
         bail!("persona id must be non-empty and [a-zA-Z0-9_-] only");
     }
-    let path = user_persona_file(config_dir, &persona.id).unwrap_or_else(|| {
+    let path = user_persona_file(config_dir, &persona.id)?.unwrap_or_else(|| {
         config_dir
             .join("personas")
             .join(format!("{}.toml", persona.id))
@@ -287,14 +353,35 @@ pub fn upsert_user_persona(config_dir: &Path, persona: &AgentPersona) -> Result<
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(persona).context("serializing persona")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let temporary = path.with_extension(format!(
+        "toml.tmp-{}-{}",
+        std::process::id(),
+        PERSONA_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("writing {}", temporary.display()));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("replacing {}", path.display()));
+    }
     Ok(())
 }
 
 /// Remove the user-level file for a persona: deletes a custom persona outright,
 /// or resets a customized built-in back to its defaults.
 pub fn delete_user_persona(config_dir: &Path, id: &str) -> Result<()> {
-    let Some(path) = user_persona_file(config_dir, id) else {
+    let Some(path) = user_persona_file(config_dir, id)? else {
         if builtin_personas().iter().any(|m| m.id == id) {
             bail!("persona '{id}' is a built-in with no user override to remove");
         }

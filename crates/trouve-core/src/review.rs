@@ -2180,6 +2180,16 @@ impl Engine {
     }
 
     pub(crate) fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
+        self.code_review_reviewer_catalog_with_personas(crate::personas::resolve_personas(
+            self.config_dir.as_deref(),
+            None,
+        ))
+    }
+
+    pub(crate) fn code_review_reviewer_catalog_with_personas(
+        &self,
+        personas: Vec<trouve_protocol::AgentPersona>,
+    ) -> Result<Vec<ReviewerProfile>, EngineError> {
         let mut reviewers = crate::reviewers::built_in_reviewers();
         // Pre-unification reviewer records are retained as system personas. They
         // can be customized through the persona catalog, but never deleted.
@@ -2194,7 +2204,11 @@ impl Engine {
             reviewers.push(reviewer);
         }
         // Code review consumes the canonical persona catalog directly.
-        for persona in crate::personas::resolve_personas(self.config_dir.as_deref(), None)
+        let builtin_ids: HashSet<_> = crate::personas::builtin_personas()
+            .into_iter()
+            .map(|persona| persona.id)
+            .collect();
+        for persona in personas
             .into_iter()
             .filter(|persona| persona.group == trouve_protocol::PersonaGroup::Reviewer)
         {
@@ -2205,9 +2219,7 @@ impl Engine {
             let built_in = existing
                 .as_ref()
                 .is_some_and(|candidate| candidate.built_in)
-                || crate::personas::builtin_personas()
-                    .iter()
-                    .any(|candidate| candidate.id == persona.id);
+                || builtin_ids.contains(&persona.id);
             reviewers.retain(|reviewer| reviewer.id != persona.id);
             reviewers.push(crate::reviewers::merge_persona_with_reviewer(
                 &persona,

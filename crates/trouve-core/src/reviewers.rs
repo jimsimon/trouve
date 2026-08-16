@@ -118,24 +118,10 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
 
 pub fn merge_persona_with_reviewer(
     persona: &AgentPersona,
-    existing: Option<&ReviewerProfile>,
+    _existing: Option<&ReviewerProfile>,
     built_in: bool,
 ) -> ReviewerProfile {
-    let mut reviewer = persona_as_reviewer(persona, built_in);
-    if let Some(existing) = existing {
-        if !existing.prompt.trim().is_empty() {
-            reviewer.prompt.clone_from(&existing.prompt);
-        }
-        if existing.model.is_some() {
-            reviewer.model.clone_from(&existing.model);
-        }
-        if existing.default_thinking_level.is_some() {
-            reviewer
-                .default_thinking_level
-                .clone_from(&existing.default_thinking_level);
-        }
-    }
-    reviewer
+    persona_as_reviewer(persona, built_in)
 }
 
 pub fn default_reviewer_ids() -> Vec<String> {
@@ -218,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_customized_reviewer_values_survive_persona_overlay() {
+    fn canonical_persona_values_replace_legacy_reviewer_values() {
         let persona = AgentPersona {
             id: "correctness".into(),
             display_name: "Correctness".into(),
@@ -241,9 +227,9 @@ mod tests {
 
         let merged = merge_persona_with_reviewer(&persona, Some(&legacy), true);
         assert_eq!(merged.name, "Correctness");
-        assert_eq!(merged.prompt, "Customized prompt");
-        assert_eq!(merged.model.as_deref(), Some("provider/custom"));
-        assert_eq!(merged.default_thinking_level.as_deref(), Some("high"));
+        assert_eq!(merged.prompt, "Canonical prompt");
+        assert_eq!(merged.model.as_deref(), Some("provider/default"));
+        assert_eq!(merged.default_thinking_level.as_deref(), Some("medium"));
         assert!(merged.built_in);
     }
 }

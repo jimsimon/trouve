@@ -4643,12 +4643,13 @@ impl Engine {
         &self,
         workspace_root: Option<&Path>,
     ) -> Result<Vec<AgentPersona>, EngineError> {
+        let resolved = personas::resolve_personas(self.config_dir.as_deref(), workspace_root);
         let mut personas: Vec<_> = self
-            .code_review_reviewer_catalog()?
+            .code_review_reviewer_catalog_with_personas(resolved.clone())?
             .iter()
             .map(crate::reviewers::reviewer_as_persona)
             .collect();
-        for persona in personas::resolve_personas(self.config_dir.as_deref(), workspace_root) {
+        for persona in resolved {
             personas.retain(|candidate| candidate.id != persona.id);
             personas.push(persona);
         }
@@ -4687,12 +4688,27 @@ impl Engine {
             default_thinking_level: req.default_thinking_level,
         };
         let _mutation = self.persona_mutations.lock().await;
-        self.executor
+        let replacement_claim = if self.store.persona_deletion_pending(id)? {
+            Some(self.store.claim_persona_deletion(id)?.ok_or_else(|| {
+                EngineError::BadRequest(format!("persona {id} is currently being deleted"))
+            })?)
+        } else {
+            None
+        };
+        if let Err(error) = self
+            .executor
             .upsert_persona_file(config_dir, &persona)
             .await
-            .map_err(EngineError::BadRequest)?;
-        if self.store.persona_deletion_pending(id)? {
-            self.store.complete_persona_deletion(id)?;
+        {
+            if let Some(claim) = replacement_claim.as_deref() {
+                self.store.release_persona_deletion_claim(id, claim)?;
+            }
+            return Err(EngineError::Internal(anyhow::anyhow!(error)));
+        }
+        if let Some(claim) = replacement_claim.as_deref() {
+            self.store
+                .cancel_claimed_persona_deletion(id, claim)
+                .map_err(EngineError::Internal)?;
         }
         Ok(())
     }
@@ -4725,19 +4741,31 @@ impl Engine {
                     .any(|info| info.persona.id == id && info.origin == "custom"));
         if is_custom {
             self.store.begin_persona_deletion(id)?;
-            self.executor
+            let claim = self.store.claim_persona_deletion(id)?.ok_or_else(|| {
+                EngineError::BadRequest(format!("persona {id} is currently being deleted"))
+            })?;
+            if let Err(error) = self
+                .executor
                 .delete_persona_file(config_dir, id, deletion_pending || custom_reviewer)
                 .await
-                .map_err(EngineError::BadRequest)?;
+            {
+                self.store.release_persona_deletion_claim(id, &claim)?;
+                return Err(EngineError::Internal(anyhow::anyhow!(error)));
+            }
             return self
                 .store
-                .complete_persona_deletion(id)
+                .complete_claimed_persona_deletion_token(id, &claim)
                 .map_err(EngineError::Internal);
+        }
+        if !system_persona {
+            return Err(EngineError::BadRequest(format!(
+                "persona {id} is not a user-configurable persona"
+            )));
         }
         self.executor
             .delete_persona_file(config_dir, id, false)
             .await
-            .map_err(EngineError::BadRequest)
+            .map_err(|error| EngineError::Internal(anyhow::anyhow!(error)))
     }
 
     /// GitHub repository named by the session's origin remote. Routes to
@@ -12721,11 +12749,11 @@ impl Engine {
         let child_mode = args
             .get("mode")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(&thread.mode)
-            .to_string();
+            .unwrap_or(&thread.mode);
+        let child_mode = personas::canonical_persona_id(child_mode).to_string();
         // A read-only parent must not launch an agent that can do what it
         // itself cannot.
-        if mode.read_only && child_mode != thread.mode {
+        if mode.read_only && child_mode != personas::canonical_persona_id(&thread.mode) {
             bail!("read-only personas can only spawn children in the same mode");
         }
         let child_model = args
@@ -14937,7 +14965,11 @@ mod tests {
                 .reviewer_ids,
             ["custom"]
         );
-        assert!(personas::user_persona_file(&config_dir, "custom").is_some());
+        assert!(
+            personas::user_persona_file(&config_dir, "custom")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -16979,7 +17011,7 @@ default_permission_mode = "ask"
             .unwrap();
         let audit_child = engine.get_thread(&vendor_threads["vendor-audit"]).unwrap();
         assert!(audit_child.spawned);
-        assert_eq!(audit_child.mode, "review");
+        assert_eq!(audit_child.mode, "plan");
         assert!(engine.subagent_is_read_only(&audit_child).unwrap());
         assert!(matches!(
             engine.send_message(&audit_child.id, "Make a follow-up change".into(), Vec::new()),
